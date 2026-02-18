@@ -126,25 +126,24 @@ To boot on real hardware:
 
 ## Custom Target
 
-x86_64 kernels require a custom target JSON that disables the standard library, disables
-the red zone (corrupted by hardware interrupts), enables soft floats, and sets the
-appropriate ABI:
+The built-in Rust target `x86_64-unknown-none` provides the exact flags needed for
+kernel development:
 
-```json
+```
+$ rustc +nightly --print target-spec-json -Z unstable-options --target x86_64-unknown-none
 {
-  "llvm-target": "x86_64-unknown-none",
-  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64",
-  "os": "none",
   "disable-redzone": true,
-  "features": "-mmx,-sse,+soft-float",
+  "features": "-mmx,-sse,-sse2,...,+soft-float",
   "panic-strategy": "abort",
-  "exe-suffix": "",
-  "executables": true
+  "rustc-abi": "softfloat",
+  ...
 }
 ```
 
-Key flags:
+Key flags (provided automatically):
 - `disable-redzone` — required; hardware interrupts use the stack and would corrupt the red zone
 - `-mmx,-sse` — disable SIMD to avoid needing to save/restore FPU state on every context switch
 - `panic-strategy: abort` — no unwinding in the kernel
+
+A `kernel/x86_64-ostest.json` custom target spec is also provided in the repository for
+reference, matching the original design. The `.cargo/config.toml` uses the built-in target.

@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+
+# Cargo lock is checked in for reproducible builds
+# (uncomment to ignore: !Cargo.lock)
+
+# Disk images and UEFI boot artifacts
+*.img
+*.iso
+*.efi
+
+# QEMU runtime files
+*.qcow2
+*.fd
+OVMF*.fd
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

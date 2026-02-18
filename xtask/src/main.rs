@@ -48,7 +48,9 @@ fn build_kernel() -> PathBuf {
             "--package",
             "kernel",
             "--target",
-            "kernel/x86_64-ostest.json",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
         ])
         .status()
         .expect("failed to run cargo build");
@@ -58,7 +60,7 @@ fn build_kernel() -> PathBuf {
         std::process::exit(1);
     }
 
-    root.join("target/x86_64-ostest/release/kernel")
+    root.join("target/x86_64-unknown-none/release/kernel")
 }
 
 fn create_uefi_image(kernel_binary: &PathBuf) -> PathBuf {

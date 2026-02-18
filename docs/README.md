@@ -18,17 +18,17 @@ userspace shell and programs.
 | [Roadmap](./08-roadmap.md) | Phased implementation plan and open design questions |
 | [Testing](./09-testing.md) | QEMU-based test harness, exit conventions, writing tests |
 
-## Quick Start (future)
+## Quick Start
 
 ```bash
-# Build and run in QEMU
-cargo xtask run
+# Build and run in QEMU (requires nightly Rust, QEMU, OVMF)
+cargo +nightly xtask run
 
-# Build a bootable disk image
-cargo xtask image
+# Build a bootable disk image (UEFI raw + VHDX for Hyper-V)
+cargo +nightly xtask image
 
-# Run tests (QEMU-based)
-cargo xtask test
+# Run tests (QEMU-based) — coming in Phase 2+
+# cargo +nightly xtask test
 ```
 
 ## Design Principles
