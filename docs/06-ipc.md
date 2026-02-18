@@ -15,44 +15,52 @@ The kernel enforces:
 
 ---
 
-## Design Decision: IPC Model
+## IPC Model: Decided
 
-> ⚠️ **This is an open design question.** The choice made here affects the entire
-> architecture. Both options are described below.
+**Synchronous rendezvous + async notification objects (seL4 model).**
 
-### Option A: Synchronous Rendezvous (L4-style) — Recommended for Phase 6
+### Synchronous Rendezvous
 
 Both sender and receiver must be ready simultaneously. The kernel transfers the message
-directly from one thread's registers/stack to the other's, with no intermediate buffer.
+directly from one thread's registers into the other's — no intermediate buffer, no
+allocation on the IPC path.
 
-**Pros:**
-- Very fast (zero-copy, no allocation)
-- Simple to implement correctly
-- Natural backpressure — sender blocks until receiver is ready
-- Used by L4, seL4, Fiasco, OKL4
+This fits all server use cases in ostest perfectly: every interaction between the shell
+and its servers (`console_server`, `vfs_server`, etc.) is request-response by nature.
+The shell blocks waiting for results; there is no benefit to decoupling.
 
-**Cons:**
-- Can cause priority inversion
-- Harder to do "fire and forget"
-- Not natural for async/event-driven servers
+### Async Notification Objects
 
-### Option B: Async Channels (ring buffers)
+A `Notification` is a single machine-word bitfield — each bit is an independent signal
+channel. The kernel can set bits without blocking (safe to call from interrupt handlers).
+A thread can wait on a notification or poll it.
 
-Each endpoint has a bounded ring buffer. Sender writes; receiver reads at its own pace.
+```
+Notification: [bit7 | bit6 | ... | bit1 | bit0]
+                                           ^
+                                    IRQ1 (keyboard)
+```
 
-**Pros:**
-- Decoupled; sender doesn't block
-- Natural for driver/event patterns (keyboard events, network packets)
+This handles the one genuinely async pattern: IRQ delivery to userspace drivers.
+The kernel's interrupt handler sets a notification bit; the driver thread wakes up.
 
-**Cons:**
-- Requires kernel-managed buffers (allocation)
-- More complex to implement and reason about
+### Why not full async channels?
 
-### Recommendation
+Async ring-buffer channels require kernel-managed buffers (allocation on the hot IPC
+path), buffer-full/empty conditions, and a separate wakeup mechanism anyway. They add
+significant complexity with no benefit for the use cases this OS has.
 
-Start with **synchronous rendezvous** for correctness and simplicity. Add **async
-notification objects** (seL4-style) for event delivery (hardware IRQs, etc.) in a
-later phase. This is the approach used by most research microkernels.
+### Framebuffer / large data
+
+IPC carries **control messages only** — never pixel data. For bulk transfers
+(framebuffer updates, file block reads), the pattern is:
+1. Transfer ownership of a physical page into the receiver's address space via a
+   **page capability grant** (atomic, kernel-mediated, zero-copy)
+2. Use sync IPC to signal "data is ready in the shared region"
+
+This is how Mach, L4, and Redox all handle it. It composes cleanly with vsync: the
+display driver fires a notification bit on each vsync interrupt; the compositor wakes,
+composites, and replies to pending client calls.
 
 ---
 
@@ -192,8 +200,7 @@ sequenceDiagram
 
 ## Open Questions
 
-1. **Synchronous vs. async** — Start sync (Phase 6); add async notifications later?
-2. **Capability table size** — Fixed-size per process (simple) or growable?
-3. **Capability delegation depth** — Can a server re-grant capabilities it received?
-4. **Large data transfer** — Page grants immediately, or copy-on-write semantics?
-5. **Timeout on IPC calls** — Should `call()` support a timeout to prevent deadlock?
+1. **Capability table size** — Fixed-size per process (simple) or growable?
+2. **Capability delegation depth** — Can a server re-grant capabilities it received?
+3. **Large data transfer** — Page grants immediately, or copy-on-write semantics?
+4. **Timeout on IPC calls** — Should `call()` support a timeout to prevent deadlock?

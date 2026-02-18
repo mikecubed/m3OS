@@ -110,12 +110,16 @@ The kernel uses a custom syscall convention (see `docs/07-userspace.md`):
 
 `rcx` and `r11` are **clobbered** by the `syscall` instruction — never use them for arguments.
 
-### IPC model is not yet decided — read the doc before implementing
+### IPC model is decided — read the doc before implementing
 
-The IPC implementation (Phase 6) has an **unresolved design decision**: synchronous
-rendezvous (L4-style) vs. async ring-buffer channels. **Read `docs/06-ipc.md` in full
-before touching anything in `kernel/src/ipc/` or adding new syscalls.** The server loop
-pattern below assumes sync rendezvous — the recommended starting point.
+The IPC model is **synchronous rendezvous + async notification objects** (seL4-style).
+Read `docs/06-ipc.md` before touching anything in `kernel/src/ipc/` or adding new
+syscalls. Key points:
+- All server-to-server communication uses sync `call`/`reply_recv`
+- IRQ delivery and vsync use `Notification` objects (a word-sized bitfield, safe to
+  signal from interrupt handlers)
+- Bulk data (framebuffer pixels, file blocks) moves via **page capability grants**, never
+  through IPC message payloads
 
 ### IPC is the only cross-process channel
 

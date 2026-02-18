@@ -156,7 +156,7 @@ These questions need answers before or during the relevant phase:
 
 | Phase | Question | Options |
 |---|---|---|
-| 6 | IPC model | Sync rendezvous (recommended) vs. async channels |
+| ~~6~~ | ~~IPC model~~ | ✅ **Decided**: sync rendezvous + async notification objects (seL4 model) — see `docs/06-ipc.md` |
 | 6 | Capability table | Fixed-size array vs. growable |
 | 6 | Large transfers | Page grant vs. copy |
 | 7 | ELF loading | `init` does it vs. kernel does it |
