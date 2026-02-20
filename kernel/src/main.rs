@@ -25,15 +25,16 @@ fn hlt_loop() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Use _panic_print to avoid deadlock if panic occurs while serial mutex is held
     if let Some(location) = info.location() {
-        serial_println!(
-            "KERNEL PANIC at {}:{}",
+        serial::_panic_print(format_args!(
+            "KERNEL PANIC at {}:{}\n",
             location.file(),
             location.line()
-        );
+        ));
     } else {
-        serial_println!("KERNEL PANIC at unknown location");
+        serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
     }
-    serial_println!("  {}", info.message());
+    serial::_panic_print(format_args!("  {}\n", info.message()));
     hlt_loop();
 }

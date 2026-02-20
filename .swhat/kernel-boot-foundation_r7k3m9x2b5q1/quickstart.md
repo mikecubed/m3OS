@@ -29,7 +29,7 @@ QEMU will remain running (kernel is in HLT loop). Press `Ctrl+A, X` to exit QEMU
 
 After `cargo xtask image`, the VHDX image is at:
 ```
-target/x86_64-ostest/release/boot-uefi-ostest.vhdx
+target/x86_64-unknown-none/release/boot-uefi-ostest.vhdx
 ```
 
 1. Create a Hyper-V Gen 2 VM

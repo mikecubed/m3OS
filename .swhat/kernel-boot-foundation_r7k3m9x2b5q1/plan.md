@@ -18,7 +18,7 @@ Implement Phase 1 of ostest: a bootable Rust microkernel that boots via UEFI usi
   - `x86_64` 0.15.4 (HLT instruction, port I/O)
 **Storage**: N/A (no filesystem in Phase 1)
 **Testing**: QEMU-based via `cargo xtask test` (not yet implemented in Phase 1, just the foundation)
-**Target Platform**: x86_64 bare-metal, custom target `x86_64-ostest.json` (no_std, no redzone, no SIMD, panic=abort)
+**Target Platform**: x86_64 bare-metal, built-in `x86_64-unknown-none` target (no_std, no redzone, no SIMD, panic=abort). Uses the built-in target instead of a custom JSON because it provides additional safety features (kernel code model, stack probes, PIE, and more thorough SIMD disabling) as a tier 2 Rust target.
 **Project Type**: Cargo workspace with two members (`kernel/`, `xtask/`)
 **Performance Goals**: Boot to hello message in <5 seconds in QEMU
 **Constraints**: `no_std` everywhere in kernel; `unsafe` only at hardware boundaries
@@ -38,11 +38,10 @@ Implement Phase 1 of ostest: a bootable Rust microkernel that boots via UEFI usi
 ```text
 ostest/
 ├── .cargo/
-│   └── config.toml              # custom target, build-std, runner
+│   └── config.toml              # default target (x86_64-unknown-none), runner, xtask alias
 ├── Cargo.toml                   # workspace root
 ├── kernel/
 │   ├── Cargo.toml               # depends on bootloader_api, uart_16550, log, spin, x86_64
-│   ├── x86_64-ostest.json       # custom target spec
 │   └── src/
 │       ├── main.rs              # entry_point!, kernel_main, panic handler, hlt_loop
 │       └── serial.rs            # SerialPort init, serial_print!/serial_println! macros, log backend
@@ -54,3 +53,7 @@ ostest/
 ```
 
 **Structure Decision**: Two-crate workspace as prescribed by `docs/02-boot.md`. The kernel is a freestanding binary; xtask is a host tool. No shared library crate needed in Phase 1.
+
+**Target Decision**: Uses the built-in `x86_64-unknown-none` Rust target rather than a custom JSON spec. The built-in target is a strict superset of what the original `x86_64-ostest.json` provided — it includes kernel code model, inline stack probes, PIE, and disables all SIMD extensions (`-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2`), compared to the custom JSON which only disabled `-mmx,-sse`.
+
+**build-std Decision**: The `-Zbuild-std` flags are passed as CLI args by xtask rather than in `.cargo/config.toml`. This avoids forcing host-target std rebuilds when building xtask via the `cargo xtask` alias.
