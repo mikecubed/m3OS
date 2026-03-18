@@ -16,6 +16,8 @@ userspace shell and programs.
 | [IPC](./06-ipc.md) | Interprocess communication — the core microkernel primitive |
 | [Userspace & Syscalls](./07-userspace.md) | Ring 3, address spaces, system call interface, servers |
 | [Roadmap](./08-roadmap.md) | Phased implementation plan and open design questions |
+| [Roadmap Guide](./roadmap/README.md) | Detailed learning-first milestones with per-phase pages and Mermaid diagrams |
+| [Roadmap Task Lists](./roadmap/tasks/README.md) | Actionable per-phase task breakdowns paired with the roadmap milestones |
 | [Testing](./09-testing.md) | QEMU-based test harness, exit conventions, writing tests |
 
 ## Quick Start
