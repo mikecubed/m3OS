@@ -47,3 +47,4 @@ cargo +nightly xtask image
 | [blog_os](https://os.phil-opp.com/) | Primary tutorial for Phases 1–3 |
 | [Redox OS](https://redox-os.org/) | IPC design, server model, VFS architecture |
 | [Theseus OS](https://github.com/theseus-os/Theseus) | Rust ownership ideas for kernel safety |
+| [Legacy C Kernel Analysis](./legacy-os-comparison.md) | Comparison with a prior x86 C kernel — what to adopt, reject, and learn from |
