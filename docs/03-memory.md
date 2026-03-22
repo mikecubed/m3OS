@@ -23,7 +23,7 @@ graph TD
     B -->|Reserved / ACPI / etc.| D["Skip — do not touch"]
     C --> E["FrameAllocator\n(bitmap or free-list)"]
     E --> F["allocate_frame() → PhysFrame"]
-    E --> G["deallocate_frame(PhysFrame)"]
+    E --> G["deallocate_frame(PhysFrame)<br/>(Phase 4+ — not in bump allocator)"]
 ```
 
 ---
@@ -35,6 +35,9 @@ graph TD
 The Phase 2 frame allocator is a **bump allocator** — allocate-only, no free:
 
 - Iterates `BootInfo::memory_regions` in order, skipping non-`Usable` regions
+- Skips all frames below 1 MiB (`ALLOC_MIN_ADDR = 0x0010_0000`) — some UEFI/QEMU
+  memory maps mark conventional low memory as `Usable`, but those frames may hold
+  BIOS data area remnants or be in use by firmware code still running at boot
 - Hands out 4 KiB-aligned frames one at a time by advancing a pointer
 - Never returns a frame once allocated (no deallocation)
 
@@ -124,6 +127,21 @@ graph LR
 The `bootloader` crate sets up an **offset mapping**: the entire physical memory is
 mapped starting at a configurable virtual address (`physical_memory_offset`). This means
 to access a physical address `P`, you just read from `physical_memory_offset + P`.
+
+To receive `physical_memory_offset` in `BootInfo`, the kernel must opt in via a
+`BootloaderConfig` constant at compile time:
+
+```rust
+const BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+```
+
+Without this, `BootInfo::physical_memory_offset` is `None` and the kernel panics on
+the first attempt to walk page tables.
 
 This avoids the complexity of recursive page tables and makes it easy to modify page
 tables from the kernel:

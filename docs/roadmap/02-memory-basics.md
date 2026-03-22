@@ -29,7 +29,8 @@ flowchart TD
 
 ## Implementation Outline
 
-1. Copy the memory map from `BootInfo` into typed kernel structures.
+1. Store a `'static` reference to the bootloader memory map (the regions slice is valid
+   for the kernel's lifetime) and parse it into typed kernel structures.
 2. Implement a simple frame allocator with conservative rules.
 3. Expose page-table operations through safe wrappers around `x86_64`.
 4. Map a small heap and initialize the allocator.
