@@ -158,9 +158,10 @@ This is why the GDT must place user data (0x18) one slot below user code (0x20)
 with `user_cs_base = 0x10`.
 
 **SFMASK** — Phase 5 sets bit 9 (IF) in SFMASK.  The CPU clears IF atomically
-on `SYSCALL` entry, so interrupt handlers cannot fire while the kernel stack is
-in an unknown state.  `sti` is called explicitly when it is safe to do so
-inside the dispatcher.
+on `SYSCALL` entry so interrupt handlers cannot fire while the kernel stack is
+in an unknown state.  Interrupts remain disabled for the entire syscall; the
+user's original RFLAGS (saved in R11 by the CPU) are restored by `SYSRETQ`,
+which re-enables IF.  No explicit `sti` is issued by the dispatcher.
 
 **LSTAR** — written with the address of the assembly stub below.
 
@@ -213,10 +214,14 @@ syscall_entry:
     sysretq                      ; → ring 3, RIP=RCX, RFLAGS=R11
 ```
 
-> **Note:** Phase 5 uses a simplified single-process model without per-CPU GS
-> swapping.  The `swapgs` and per-CPU slot commentary above describes the
-> production pattern; the initial implementation may use a single global kernel
-> stack slot instead.
+> **Note:** The stub above shows a full production-quality entry sequence.
+> Phase 5 differs in two ways:
+> 1. No `swapgs` / per-CPU storage — a single global `SYSCALL_USER_RSP` static
+>    saves the user RSP; the kernel stack top is stored in `SYSCALL_STACK_TOP`.
+> 2. Only **callee-saved** registers (`rbx`, `rbp`, `r12`–`r15`) are preserved,
+>    not the caller-saved set shown above.  The SysV ABI allows the Rust
+>    dispatcher to freely clobber caller-saved registers; only callee-saved ones
+>    must be explicitly saved across the `call syscall_handler`.
 
 ---
 
@@ -283,7 +288,7 @@ Virtual Address Space (Phase 5, shared kernel+user PML4)
 ├────────────────────────────────────┤
 │ (unmapped user space)              │
 ├────────────────────────────────────┤ 0x0000_0000_0040_0000
-│ User code (16 KiB, read+exec)      │ USER_ACCESSIBLE
+│ User code (16 KiB, read+write+exec)│ USER_ACCESSIBLE | WRITABLE (W^X deferred to Phase 6+)
 └────────────────────────────────────┘
 ```
 

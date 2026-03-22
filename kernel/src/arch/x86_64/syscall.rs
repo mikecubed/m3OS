@@ -207,11 +207,17 @@ pub fn init() {
     }
 
     // STAR: kernel CS/SS base (bits 47:32) and user CS/SS SYSRET base (63:48).
+    //
     // Star::write(cs_sysret, ss_sysret, cs_syscall, ss_syscall):
-    //   cs_sysret  = user_code  (0x23) — SYSRET sets CS = stored_base + 16
-    //   ss_sysret  = user_data  (0x1B) — SYSRET sets SS = stored_base + 8
-    //   cs_syscall = kernel_code (0x08) — SYSCALL copies directly to CS
-    //   ss_syscall = kernel_data (0x10) — SYSCALL sets SS = cs_syscall + 8
+    //   cs_sysret  = user_code  (0x23, RPL=3) ─┐  x86_64 stores STAR[63:48] = ss_sysret.0 − 8
+    //   ss_sysret  = user_data  (0x1B, RPL=3) ─┘    = 0x1B − 8 = 0x13
+    //                                               SYSRET: CS = 0x13+16 = 0x23 (user code)
+    //                                                        SS = 0x13+ 8 = 0x1B (user data)
+    //   cs_syscall = kernel_code (0x08, RPL=0)   SYSCALL: CS = 0x08 directly
+    //   ss_syscall = kernel_data (0x10, RPL=0)            SS = 0x08 + 8 = 0x10
+    //
+    // Star::write validates that RPL=3 for the sysret pair and RPL=0 for the
+    // syscall pair, returning Err if the GDT layout is inconsistent.
     Star::write(
         gdt::user_code_selector(),
         gdt::user_data_selector(),
