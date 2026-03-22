@@ -13,7 +13,7 @@ use core::arch::global_asm;
 
 use x86_64::{
     registers::{
-        model_specific::{LStar, SFMask, Star},
+        model_specific::{Efer, EferFlags, LStar, SFMask, Star},
         rflags::RFlags,
     },
     VirtAddr,
@@ -206,4 +206,11 @@ pub fn init() {
     // Clear IF (interrupts) so the entry stub runs with interrupts disabled;
     // the handler may re-enable them if needed.
     SFMask::write(RFlags::INTERRUPT_FLAG);
+
+    // Enable the SYSCALL/SYSRET instructions by setting EFER.SCE (bit 0).
+    // Without this the CPU treats SYSCALL as an invalid opcode (#UD).
+    // Safety: single-CPU init path; no concurrent EFER readers.
+    unsafe {
+        Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+    }
 }

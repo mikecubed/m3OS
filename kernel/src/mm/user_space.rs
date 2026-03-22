@@ -92,8 +92,12 @@ pub fn copy_to_user(virt_base: u64, src: &[u8]) {
 /// Returns the page table mapper that was used (must be rebuilt each call since
 /// we're reusing the kernel's active table).
 pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
-    // Code: user-accessible, present, executable (no NO_EXECUTE flag)
-    let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    // Code: user-accessible, present, writable, executable.
+    // Phase 5 needs WRITABLE so the kernel can copy the binary in before ring-3
+    // entry (CR0.WP prevents ring-0 writes to read-only pages).  W^X enforcement
+    // is deferred to Phase 6+ once we have a proper ELF loader.
+    let code_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     // Stack: user-accessible, present, writable, no-execute
     let stack_flags = PageTableFlags::PRESENT
