@@ -8,6 +8,7 @@ extern crate alloc;
 mod arch;
 mod mm;
 mod serial;
+mod task;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
@@ -73,7 +74,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    hlt_loop();
+    // Register the idle task (selected only when no other task is Ready, P4-T009).
+    task::spawn_idle(idle_task);
+    // Spawn two demo tasks to verify interleaved execution (P4-T007).
+    task::spawn(task_a, "task-a");
+    task::spawn(task_b, "task-b");
+    log::info!("[task] scheduler starting");
+    task::run() // never returns
+}
+
+/// Idle task: runs only when no other task is Ready (P4-T009).
+///
+/// `switch_context` saves and restores RFLAGS as part of the context frame,
+/// so the idle task starts with IF=1 (RFLAGS = 0x202 written by `init_stack`)
+/// and plain `hlt` wakes normally when the timer IRQ fires.
+fn idle_task() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+        task::yield_now();
+    }
+}
+
+/// Demo task A — logs a monotonically increasing counter (P4-T007, P4-T008).
+fn task_a() -> ! {
+    let mut n = 0u32;
+    loop {
+        log::info!("[task A] tick {}", n);
+        n += 1;
+        task::yield_now();
+    }
+}
+
+/// Demo task B — logs a monotonically increasing counter (P4-T007, P4-T008).
+fn task_b() -> ! {
+    let mut n = 0u32;
+    loop {
+        log::info!("[task B] tick {}", n);
+        n += 1;
+        task::yield_now();
+    }
 }
 
 pub fn hlt_loop() -> ! {
