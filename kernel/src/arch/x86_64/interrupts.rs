@@ -41,20 +41,20 @@ pub fn init() {
 // Exception handlers
 // ---------------------------------------------------------------------------
 
-extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     // Use _panic_print to avoid deadlocking on the serial mutex if the exception
     // fires while normal code holds the lock.
-    _panic_print(format_args!("[int] breakpoint\n"));
+    _panic_print(format_args!("[int] breakpoint: {:?}\n", stack_frame));
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    _stack_frame: InterruptStackFrame,
+    stack_frame: InterruptStackFrame,
     err: PageFaultErrorCode,
 ) {
     let addr = x86_64::registers::control::Cr2::read();
     _panic_print(format_args!(
-        "[int] page fault: addr={:?} err={:?}\n",
-        addr, err
+        "[int] page fault: addr={:?} err={:?}\n{:?}\n",
+        addr, err, stack_frame
     ));
     crate::hlt_loop();
 }
@@ -135,6 +135,11 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 // plain `static mut` avoids any mutex in the IRQ path, eliminating the risk of
 // spinning forever if the consumer holds a lock when the IRQ fires.
 const SCANCODE_BUF_SIZE: usize = 64;
+// Bitmask wraparound requires a power-of-two buffer size.
+const _: () = assert!(
+    SCANCODE_BUF_SIZE.is_power_of_two(),
+    "SCANCODE_BUF_SIZE must be a power of two for bitmask wraparound"
+);
 static mut SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
 static SCANCODE_BUF_HEAD: AtomicUsize = AtomicUsize::new(0);
 static SCANCODE_BUF_TAIL: AtomicUsize = AtomicUsize::new(0);
