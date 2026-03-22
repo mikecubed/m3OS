@@ -32,7 +32,7 @@ use alloc::boxed::Box;
 
 pub mod scheduler;
 
-pub use scheduler::{run, signal_reschedule, spawn, yield_now};
+pub use scheduler::{run, signal_reschedule, spawn, spawn_idle, yield_now};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -152,13 +152,13 @@ core::arch::global_asm!(
     "  push r13",
     "  push r14",
     "  push r15",
-    "  mov  [rdi], rsp",
-    "  mov  rsp, rsi",
+    "  mov  [rdi], rsp", // save current RSP into *save_rsp
+    "  mov  rsp, rsi",   // load new task's RSP
     "  pop  r15",
     "  pop  r14",
     "  pop  r13",
     "  pop  r12",
     "  pop  rbp",
     "  pop  rbx",
-    "  ret",
+    "  ret", // pop rip from new stack → jump to resumed task
 );

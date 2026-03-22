@@ -74,8 +74,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // Spawn the idle task first (lowest priority — always ready to run).
-    task::spawn(idle_task, "idle");
+    // Register the idle task (selected only when no other task is Ready, P4-T009).
+    task::spawn_idle(idle_task);
     // Spawn two demo tasks to verify interleaved execution (P4-T007).
     task::spawn(task_a, "task-a");
     task::spawn(task_b, "task-b");
@@ -83,11 +83,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     task::run() // never returns
 }
 
-/// Idle task: halts on each timer tick and immediately yields.
-/// Runs only when no other task is Ready (P4-T009).
+/// Idle task: runs only when no other task is Ready (P4-T009).
+///
+/// Tasks execute with interrupts disabled (inside the scheduler's
+/// `without_interrupts` critical section that protects `switch_context`).
+/// Plain `hlt` with IF=0 would never wake; `enable_and_hlt` atomically
+/// re-enables interrupts and halts, allowing the timer IRQ to fire and set
+/// `RESCHEDULE` before yielding back to the scheduler.
 fn idle_task() -> ! {
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
         task::yield_now();
     }
 }

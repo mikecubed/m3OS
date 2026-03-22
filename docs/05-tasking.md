@@ -109,21 +109,25 @@ There are only two states in Phase 4.  Future phases will add `Blocked`
 
 ### Round-robin
 
-The scheduler keeps all tasks in a `Vec<Task>`.  On each timer tick it picks the
-next `Ready` task starting from the slot _after_ the last one that ran:
+The scheduler keeps all tasks in a `Vec<Task>`.  The idle task is registered
+separately via `spawn_idle` and is excluded from the normal rotation; it is
+selected only when no non-idle task is `Ready` (P4-T009).  On each timer tick
+the scheduler picks the next `Ready` non-idle task starting from the slot
+_after_ the last one that ran:
 
 ```text
-tasks: [idle, task-a, task-b]
-           ↑ last_run = 0
+tasks: [idle*, task-a, task-b]   (* excluded from normal rotation)
+                ↑ last_run = 1 (task-a)
 
-next tick  → start = (0+1)%3 = 1 → task-a  (last_run = 1)
 next tick  → start = (1+1)%3 = 2 → task-b  (last_run = 2)
-next tick  → start = (2+1)%3 = 0 → idle    (last_run = 0)
+next tick  → start = (2+1)%3 = 0 → idle* (skip) → task-a  (last_run = 1)
+next tick  → start = (1+1)%3 = 2 → task-b  (last_run = 2)
 ...
+idle selected only when task-a and task-b are both not Ready
 ```
 
-Each ready task gets exactly one "slot" per round.  If a task is not `Ready` it is
-skipped.
+Each non-idle ready task gets exactly one "slot" per round.  If a task is not
+`Ready` it is skipped.
 
 ### Why round-robin for a teaching OS?
 
@@ -136,7 +140,14 @@ skipped.
 Real production schedulers sacrifice simplicity for throughput and latency.
 Round-robin makes the _concepts_ visible without the noise.
 
-### Timer-driven preemption path
+### Timer-driven scheduling (cooperative)
+
+> **Note:** This is a **cooperative** scheduler.  The timer interrupt sets a
+> flag but does not forcibly preempt a running task.  Tasks must call
+> `yield_now()` to return control to the scheduler.  True preemption — where
+> the IRQ handler itself performs the context switch — is planned as future
+> work once the kernel supports saving and restoring `RFLAGS` as part of the
+> task context.
 
 ```mermaid
 sequenceDiagram
@@ -149,12 +160,11 @@ sequenceDiagram
     PIT->>ISR: fires ~18 Hz
     ISR->>Atom: signal_reschedule() — atomic store true
     ISR->>PIT: EOI
-    Loop->>Loop: hlt wakes on IRQ
-    Loop->>Atom: swap(false) — true returned
+    Loop->>Atom: swap(false) — checks flag before hlt
     Loop->>Task: switch_context(SCHEDULER_RSP, task_rsp)
-    Task->>Task: executes one "slice"
+    Task->>Task: executes one "slice" (interrupts disabled)
     Task->>Loop: yield_now() → switch_context(task_rsp, SCHEDULER_RSP)
-    Loop->>Loop: loop back, hlt again
+    Loop->>Loop: loop back, check RESCHEDULE again
 ```
 
 `signal_reschedule` is the _only_ scheduler function called from the ISR.  It
@@ -163,10 +173,15 @@ interrupt-handler minimalism rule from `docs/04-interrupts.md`.
 
 ### Idle behavior (P4-T005, P4-T009)
 
-When `pick_next` finds no `Ready` task the scheduler loop simply `continue`s back
-to `hlt`.  The dedicated `idle_task` (always `Ready`) ensures there is normally
-something to run, but if it were absent the scheduler would spin in idle-hlt until
-a task becomes ready.
+The idle task is registered via `spawn_idle` and excluded from the normal
+round-robin rotation.  `pick_next` first scans all non-idle tasks; only if none
+are `Ready` does it fall back to the idle task.  This ensures idle truly runs
+only when no other work is available (P4-T009).
+
+The idle task uses `enable_and_hlt()` (atomically enables interrupts and halts)
+rather than plain `hlt()`.  Tasks execute with interrupts disabled inside the
+scheduler's `without_interrupts` critical section; plain `hlt` with `IF=0`
+would never wake from the timer IRQ.
 
 ---
 
