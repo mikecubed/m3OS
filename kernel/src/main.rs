@@ -27,8 +27,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("[ostest] Hello from kernel!");
     log::info!("Kernel initialized");
 
+    // Load GDT/IDT — no IRQs yet.
     arch::init();
-    log::info!("[arch] interrupts enabled");
 
     mm::init(boot_info);
 
@@ -42,16 +42,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let s = String::from("heap works");
     log::info!("[mm] String alloc ok: {}", s);
 
-    // Trigger a breakpoint to verify the IDT is working (P3-T007)
-    x86_64::instructions::interrupts::int3();
-    log::info!("[arch] breakpoint exception handled OK");
+    // Enable PIC and unmask IRQs now that all subsystems are initialized.
+    unsafe { arch::enable_interrupts() };
+    log::info!("[arch] interrupts enabled");
 
-    // Spin briefly and check that the timer IRQ is firing (P3-T008)
-    for _ in 0..1_000_000u64 {
-        core::hint::spin_loop();
+    // Trigger a breakpoint to verify the IDT is working (P3-T007).
+    // Gated on debug builds so production boots don't always trap.
+    if cfg!(debug_assertions) {
+        x86_64::instructions::interrupts::int3();
+        log::info!("[arch] breakpoint exception handled OK");
+    }
+
+    // Wait for at least one timer tick to confirm IRQs are firing (P3-T008).
+    let start = arch::x86_64::interrupts::tick_count();
+    for _ in 0..1000u32 {
+        x86_64::instructions::hlt();
+        if arch::x86_64::interrupts::tick_count().wrapping_sub(start) >= 1 {
+            break;
+        }
     }
     let ticks = arch::x86_64::interrupts::tick_count();
-    log::info!("[arch] timer ticks after spin: {}", ticks);
+    log::info!("[arch] timer ticks after wait: {}", ticks);
 
     hlt_loop();
 }
