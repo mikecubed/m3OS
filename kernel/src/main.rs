@@ -85,14 +85,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 /// Idle task: runs only when no other task is Ready (P4-T009).
 ///
-/// Tasks execute with interrupts disabled (inside the scheduler's
-/// `without_interrupts` critical section that protects `switch_context`).
-/// Plain `hlt` with IF=0 would never wake; `enable_and_hlt` atomically
-/// re-enables interrupts and halts, allowing the timer IRQ to fire and set
-/// `RESCHEDULE` before yielding back to the scheduler.
+/// `switch_context` saves and restores RFLAGS as part of the context frame,
+/// so the idle task starts with IF=1 (RFLAGS = 0x202 written by `init_stack`)
+/// and plain `hlt` wakes normally when the timer IRQ fires.
 fn idle_task() -> ! {
     loop {
-        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::hlt();
         task::yield_now();
     }
 }

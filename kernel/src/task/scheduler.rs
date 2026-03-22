@@ -27,7 +27,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
-use x86_64::instructions::interrupts;
 
 use super::{switch_context, Task, TaskState};
 
@@ -134,10 +133,17 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
 /// the normal round-robin rotation and is selected only when no other task is
 /// `Ready` (P4-T005, P4-T009).
 ///
-/// Must be called at most once before [`run`].
+/// # Panics (debug builds)
+///
+/// Panics if called more than once — the scheduler supports exactly one idle
+/// task.
 pub fn spawn_idle(entry: fn() -> !) {
     let task = Task::new(entry, "idle");
     let mut sched = SCHEDULER.lock();
+    debug_assert!(
+        sched.idle_task.is_none(),
+        "spawn_idle must be called at most once"
+    );
     let idx = sched.tasks.len();
     sched.tasks.push(task);
     sched.idle_task = Some(idx);
@@ -148,9 +154,9 @@ pub fn spawn_idle(entry: fn() -> !) {
 /// Marks the task `Ready`, clears `sched.current`, then context-switches to
 /// the scheduler loop.  Returns when the scheduler dispatches this task again.
 ///
-/// Interrupts are disabled for the duration of `switch_context` to prevent an
-/// IRQ from pushing its frame onto the register-restore window (between
-/// `mov rsp, rsi` and `ret`) and corrupting the return address.
+/// `switch_context` saves RFLAGS (including the IF bit) as part of the
+/// register frame, so the task's interrupt state is preserved across yields
+/// without any extra `cli`/`sti` in the scheduler.
 pub fn yield_now() {
     // Extract a raw pointer to the current task's `saved_rsp` field.  We drop
     // the MutexGuard before calling `switch_context` to avoid holding the lock
@@ -170,9 +176,8 @@ pub fn yield_now() {
     };
     // Safety: SCHEDULER_RSP was written by the scheduler loop in `run()`.
     let sched_rsp = unsafe { SCHEDULER_RSP };
-    // Disable interrupts for the duration of the context switch.
     // Safety: task_rsp_ptr is a valid aligned pointer inside a live Task.
-    interrupts::without_interrupts(|| unsafe { switch_context(task_rsp_ptr, sched_rsp) });
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
     // Execution resumes here when the scheduler dispatches this task again.
 }
 
@@ -181,8 +186,8 @@ pub fn yield_now() {
 ///
 /// Runs on the boot stack.  Checks the `RESCHEDULE` flag before halting to
 /// avoid sleeping through a tick that was set while the previous task was
-/// running (P4-T006).  When a task is found, switches to it with interrupts
-/// disabled to protect the context-switch register-restore window.
+/// running (P4-T006).  `switch_context` saves/restores RFLAGS so each task
+/// carries its own interrupt state — no `without_interrupts` wrapper needed.
 pub fn run() -> ! {
     loop {
         // Check the reschedule flag *before* halting.  If a timer tick fired
@@ -215,15 +220,14 @@ pub fn run() -> ! {
             // last_run is updated inside pick_next for non-idle tasks.
         }
 
-        // Switch to the task with interrupts disabled to protect the
-        // register-restore window in switch_context (between `mov rsp, rsi`
-        // and `ret`) from IRQ-frame corruption.
-        // Returns here when the task calls yield_now().
+        // Switch to the task.  Returns here when the task calls yield_now().
+        // switch_context restores the task's saved RFLAGS (IF=1 for a fresh
+        // task, whatever the task last had for a resumed one).
         // Safety: SCHEDULER_RSP is only written here (single CPU).
         //         task_rsp is the value read from Task::saved_rsp.
-        interrupts::without_interrupts(|| unsafe {
+        unsafe {
             switch_context(core::ptr::addr_of_mut!(SCHEDULER_RSP), task_rsp);
-        });
+        }
 
         // yield_now() has already cleared sched.current and marked the task
         // Ready, so we just loop back to pick the next one.

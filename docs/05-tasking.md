@@ -14,8 +14,8 @@ microkernel).
 
 ### Which registers are saved and why
 
-`switch_context` saves and restores only the six **callee-saved** registers defined
-by the x86-64 System V ABI:
+`switch_context` saves and restores the six **callee-saved** registers defined by
+the x86-64 System V ABI, plus `RFLAGS`:
 
 | Register | Role |
 |---|---|
@@ -25,6 +25,7 @@ by the x86-64 System V ABI:
 | `r13` | General-purpose (callee-saved) |
 | `r14` | General-purpose (callee-saved) |
 | `r15` | General-purpose (callee-saved) |
+| `RFLAGS` | Includes the Interrupt Flag (IF) bit |
 
 **Caller-saved registers** (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are
 _not_ saved by the stub.  The compiler already emits save/restore code for them at
@@ -34,6 +35,11 @@ every call site.  Saving them again in the stub would be redundant work.
 `switch_context` pushes the return address onto the stack, and `ret` at the end of
 the stub pops it back.  From the compiler's perspective `switch_context` looks like
 any other function call.
+
+Saving `RFLAGS` means each task carries its own interrupt state.  A freshly-spawned
+task has `RFLAGS = 0x202` (IF=1) written by `init_stack`, so interrupts are enabled
+automatically the moment `popf` runs on the first dispatch.  No special-case
+`sti` or `enable_and_hlt` is needed anywhere in the scheduler.
 
 ### Assembly stub
 
@@ -45,8 +51,10 @@ switch_context:           ; rdi = *save_rsp,  rsi = load_rsp
   push r13
   push r14
   push r15
+  pushf                   ; save RFLAGS (includes IF bit)
   mov  [rdi], rsp         ; save current RSP into *save_rsp
   mov  rsp, rsi           ; load the new stack
+  popf                    ; restore RFLAGS → IF atomically restored
   pop  r15
   pop  r14
   pop  r13
@@ -69,25 +77,27 @@ subsequent one.
 ```text
 high address ──────────────────────────────
   raw_top   (past-the-end of Box<[u8]>)
-  rip_addr  (16-byte aligned ≤ raw_top)      ← entry fn pointer stored here
+  rip_addr  = (raw_top − 8) & !0xf          ← 16-byte aligned; entry fn stored here
   ...
-  frame_start = rip_addr − 48               ← saved_rsp points here
+  frame_start = rip_addr − 56               ← saved_rsp points here
 
   Offset from frame_start:
-  +48  rip   entry fn address
-  +40  rbx   0
-  +32  rbp   0
-  +24  r12   0
-  +16  r13   0
-  + 8  r14   0
-  + 0  r15   0   ← saved_rsp
+  +56  rip    entry fn address
+  +48  rbx    0
+  +40  rbp    0
+  +32  r12    0
+  +24  r13    0
+  +16  r14    0
+  + 8  r15    0
+  + 0  RFLAGS 0x202 (IF=1)   ← saved_rsp
 low address  ──────────────────────────────
 ```
 
-**Alignment invariant**: `rip_addr` is 16-byte aligned.  Because `48 % 16 == 0`,
-`frame_start` is also 16-byte aligned.  After `ret` pops `rip` and advances RSP by
-8, the entry function sees `RSP ≡ 8 (mod 16)` — exactly what the SysV ABI requires
-at a function call boundary.
+**Alignment invariant**: `rip_addr` is 16-byte aligned (ensured by `& !0xf`).
+Subtracting 8 before masking prevents an out-of-bounds write when `raw_top` is
+already 16-byte aligned.  `frame_start = rip_addr − 56 ≡ −56 ≡ 8 (mod 16)`.
+After `popf` + six `pop`s + `ret`, RSP advances 64 bytes to `frame_start + 64 ≡ 8
+(mod 16)` — exactly what the SysV ABI requires at a function call boundary.
 
 ---
 
@@ -146,8 +156,7 @@ Round-robin makes the _concepts_ visible without the noise.
 > flag but does not forcibly preempt a running task.  Tasks must call
 > `yield_now()` to return control to the scheduler.  True preemption — where
 > the IRQ handler itself performs the context switch — is planned as future
-> work once the kernel supports saving and restoring `RFLAGS` as part of the
-> task context.
+> work.
 
 ```mermaid
 sequenceDiagram
@@ -162,7 +171,7 @@ sequenceDiagram
     ISR->>PIT: EOI
     Loop->>Atom: swap(false) — checks flag before hlt
     Loop->>Task: switch_context(SCHEDULER_RSP, task_rsp)
-    Task->>Task: executes one "slice" (interrupts disabled)
+    Task->>Task: executes one "slice" (IF=1; IRQs delivered normally)
     Task->>Loop: yield_now() → switch_context(task_rsp, SCHEDULER_RSP)
     Loop->>Loop: loop back, check RESCHEDULE again
 ```
@@ -178,10 +187,9 @@ round-robin rotation.  `pick_next` first scans all non-idle tasks; only if none
 are `Ready` does it fall back to the idle task.  This ensures idle truly runs
 only when no other work is available (P4-T009).
 
-The idle task uses `enable_and_hlt()` (atomically enables interrupts and halts)
-rather than plain `hlt()`.  Tasks execute with interrupts disabled inside the
-scheduler's `without_interrupts` critical section; plain `hlt` with `IF=0`
-would never wake from the timer IRQ.
+The idle task uses plain `hlt()`.  Because `switch_context` restores RFLAGS
+(including IF=1) from the saved frame, the idle task runs with interrupts enabled
+and `hlt` wakes normally when the timer IRQ fires.
 
 ---
 

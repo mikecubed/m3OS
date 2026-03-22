@@ -2,27 +2,34 @@
 //!
 //! # Context-switch contract
 //!
-//! [`switch_context`] saves and restores only the six callee-saved registers
-//! (`rbx`, `rbp`, `r12`–`r15`) plus `rip` (via `ret`).  The compiler already
-//! saves/restores caller-saved registers at every call site, so saving them
-//! again in the switch stub would be redundant.
+//! [`switch_context`] saves and restores the six callee-saved registers
+//! (`rbx`, `rbp`, `r12`–`r15`) plus `RFLAGS` (via `pushf`/`popf`) and `rip`
+//! (via `ret`).  The compiler already saves/restores caller-saved registers at
+//! every call site, so saving them again in the switch stub would be redundant.
+//!
+//! Saving RFLAGS means each task carries its own interrupt-flag state.  A
+//! freshly-spawned task starts with `RFLAGS = 0x202` (IF=1), so its first
+//! dispatch restores interrupts automatically without any special-case code in
+//! the scheduler.
 //!
 //! Stack layout written by [`init_stack`] for a freshly-spawned task:
 //!
 //! ```text
 //! high address ──────────────────────────────────
-//!   [frame_start + 48]  rip  ← entry fn pointer
-//!   [frame_start + 40]  rbx
-//!   [frame_start + 32]  rbp
-//!   [frame_start + 24]  r12
-//!   [frame_start + 16]  r13
-//!   [frame_start +  8]  r14
-//!   [frame_start +  0]  r15   ← saved_rsp points here
+//!   [frame_start + 56]  rip  ← entry fn pointer
+//!   [frame_start + 48]  rbx
+//!   [frame_start + 40]  rbp
+//!   [frame_start + 32]  r12
+//!   [frame_start + 24]  r13
+//!   [frame_start + 16]  r14
+//!   [frame_start +  8]  r15
+//!   [frame_start +  0]  RFLAGS = 0x202  ← saved_rsp points here
 //! low address  ──────────────────────────────────
 //! ```
 //!
-//! `saved_rsp` is 16-byte aligned.  After `ret` pops `rip` the entry function
-//! sees `RSP ≡ 8 (mod 16)`, matching the x86-64 SysV ABI.
+//! `saved_rsp` is `≡ 8 (mod 16)`.  After `popf` + six `pop`s + `ret`, RSP
+//! advances 64 bytes, giving RSP `≡ 8 (mod 16)` at the entry function — the
+//! value required by the x86-64 SysV ABI at a call boundary.
 
 #![allow(dead_code)]
 
@@ -101,25 +108,28 @@ impl Task {
 /// Returns the value that should be stored in `Task::saved_rsp`.
 pub(crate) fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
     let raw_top = stack.as_ptr() as usize + stack.len();
-    // Align the rip slot to a 16-byte boundary.
-    // frame_start = rip_addr - 48. Because 48 % 16 == 0, frame_start shares
-    // the same alignment as rip_addr (16-byte aligned).
-    // After `ret` pops rip, RSP = frame_start + 56; (frame_start + 56) % 16
-    // = (0 + 56) % 16 = 8, satisfying the SysV ABI call-entry requirement.
-    let rip_addr = raw_top & !0xf;
-    let frame_start = rip_addr - 6 * 8; // 6 callee-saved regs below rip
+    // Align the rip slot to a 16-byte boundary.  Subtract 8 first so that
+    // when raw_top is already 16-byte aligned we do not write past the end
+    // of the allocation.
+    // frame_start = rip_addr - 56. Because rip_addr ≡ 0 (mod 16),
+    // frame_start ≡ -56 ≡ 8 (mod 16).  After `popf` + 6 `pop`s + `ret`,
+    // RSP = frame_start + 64 ≡ 8 + 64 ≡ 8 (mod 16), satisfying the SysV
+    // ABI call-entry requirement.
+    let rip_addr = (raw_top - 8) & !0xf;
+    let frame_start = rip_addr - 7 * 8; // RFLAGS + 6 callee-saved regs below rip
     let frame = frame_start as *mut u64;
     // Safety: frame_start is inside the allocated stack slice (raw_top is its
-    // past-the-end pointer and we subtract at least 56 bytes to stay inside).
-    // The pointer is 8-byte aligned because frame_start is 16-byte aligned.
+    // past-the-end pointer and we subtract at least 64 bytes to stay inside).
+    // The pointer is 8-byte aligned because frame_start ≡ 8 (mod 16).
     unsafe {
-        frame.write(0); // r15
-        frame.add(1).write(0); // r14
-        frame.add(2).write(0); // r13
-        frame.add(3).write(0); // r12
-        frame.add(4).write(0); // rbp
-        frame.add(5).write(0); // rbx
-        frame.add(6).write(entry as usize as u64); // rip
+        frame.write(0x202); // RFLAGS: IF=1 (bit 9) + reserved bit 1 always set
+        frame.add(1).write(0); // r15
+        frame.add(2).write(0); // r14
+        frame.add(3).write(0); // r13
+        frame.add(4).write(0); // r12
+        frame.add(5).write(0); // rbp
+        frame.add(6).write(0); // rbx
+        frame.add(7).write(entry as usize as u64); // rip
     }
     frame_start as u64
 }
@@ -131,13 +141,17 @@ pub(crate) fn init_stack(stack: &mut [u8], entry: fn() -> !) -> u64 {
 unsafe extern "C" {
     /// Switch from the current execution context to another.
     ///
+    /// Saves callee-saved registers and RFLAGS onto the current stack, stores
+    /// RSP at `*save_rsp`, loads `load_rsp` as the new stack, restores RFLAGS
+    /// and the callee-saved registers, then returns to the new task's `rip`.
+    ///
     /// # Safety
     ///
     /// * `save_rsp` must be a valid, writable 8-byte-aligned pointer inside a
     ///   kernel stack or the `SCHEDULER_RSP` static.
     /// * `load_rsp` must be a value previously written by `switch_context` (or
-    ///   produced by `init_stack`), pointing to a valid callee-saved register
-    ///   frame on a live kernel stack.
+    ///   produced by `init_stack`), pointing to a valid register frame on a
+    ///   live kernel stack.
     /// * Must not be called while holding any spin lock that the resumed task
     ///   may also try to acquire (would deadlock).
     pub(crate) fn switch_context(save_rsp: *mut u64, load_rsp: u64);
@@ -152,8 +166,10 @@ core::arch::global_asm!(
     "  push r13",
     "  push r14",
     "  push r15",
+    "  pushf",           // save RFLAGS (includes IF bit)
     "  mov  [rdi], rsp", // save current RSP into *save_rsp
     "  mov  rsp, rsi",   // load new task's RSP
+    "  popf",            // restore RFLAGS → IF atomically restored
     "  pop  r15",
     "  pop  r14",
     "  pop  r13",
