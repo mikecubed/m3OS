@@ -8,8 +8,8 @@ static INIT_GUARD: Once<()> = Once::new();
 ///
 /// # Safety
 /// - `physical_memory_offset` must be the value from `BootInfo` — it must be
-///   the virtual address at which all physical memory is identity-mapped by the
-///   bootloader.
+///   the virtual base address of the bootloader's physical-memory offset mapping
+///   (i.e. a physical address `P` is accessible at `physical_memory_offset + P`).
 /// - **Must be called exactly once.** A second call panics to prevent aliased
 ///   `&'static mut` references to the active L4 table (which would be UB).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
