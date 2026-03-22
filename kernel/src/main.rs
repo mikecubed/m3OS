@@ -7,6 +7,7 @@ extern crate alloc;
 
 mod arch;
 mod mm;
+mod process;
 mod serial;
 mod task;
 
@@ -74,45 +75,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // Register the idle task (selected only when no other task is Ready, P4-T009).
-    task::spawn_idle(idle_task);
-    // Spawn two demo tasks to verify interleaved execution (P4-T007).
-    task::spawn(task_a, "task-a");
-    task::spawn(task_b, "task-b");
-    log::info!("[task] scheduler starting");
-    task::run() // never returns
-}
-
-/// Idle task: runs only when no other task is Ready (P4-T009).
-///
-/// `switch_context` saves and restores RFLAGS as part of the context frame,
-/// so the idle task starts with IF=1 (RFLAGS = 0x202 written by `init_stack`)
-/// and plain `hlt` wakes normally when the timer IRQ fires.
-fn idle_task() -> ! {
-    loop {
-        x86_64::instructions::hlt();
-        task::yield_now();
-    }
-}
-
-/// Demo task A — logs a monotonically increasing counter (P4-T007, P4-T008).
-fn task_a() -> ! {
-    let mut n = 0u32;
-    loop {
-        log::info!("[task A] tick {}", n);
-        n += 1;
-        task::yield_now();
-    }
-}
-
-/// Demo task B — logs a monotonically increasing counter (P4-T007, P4-T008).
-fn task_b() -> ! {
-    let mut n = 0u32;
-    loop {
-        log::info!("[task B] tick {}", n);
-        n += 1;
-        task::yield_now();
-    }
+    // Phase 5: map user code + stack pages and launch the first ring-3 process.
+    //
+    // `get_mapper` reconstructs the OffsetPageTable from the stored physical
+    // memory offset.  We drop it (and release the &'static mut to the L4 table)
+    // before enter_userspace so no aliased mapper is live during the iretq.
+    let proc = {
+        let mut mapper = unsafe { mm::paging::get_mapper() };
+        unsafe {
+            mm::user_space::setup_user_memory(&mut mapper)
+                .expect("[userspace] failed to map user memory");
+            mm::user_space::copy_to_user(process::USER_CODE_BASE, process::HELLO_BIN);
+        }
+        process::Process::new(process::USER_CODE_BASE, process::USER_STACK_TOP)
+    };
+    log::info!(
+        "[userspace] entering ring 3: entry={:#x} stack={:#x}",
+        proc.entry,
+        proc.stack_top
+    );
+    // Safety: entry and stack_top are freshly mapped user-accessible pages.
+    unsafe { arch::enter_userspace(proc.entry, proc.stack_top) }
 }
 
 pub fn hlt_loop() -> ! {

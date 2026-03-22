@@ -1,5 +1,10 @@
 //! Round-robin kernel scheduler.
 //!
+//! Preserved from Phase 4.  Phase 5 enters userspace directly via
+//! `arch::enter_userspace` and does not use the scheduler.  Phase 6+
+//! will re-activate this module for multi-task userspace scheduling.
+#![allow(dead_code)]
+//!
 //! # Design
 //!
 //! The scheduler owns all [`Task`]s in a `Vec`.  On each timer tick the PIC
