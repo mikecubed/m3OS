@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
+mod arch;
 mod mm;
 mod serial;
 
@@ -25,6 +27,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("[ostest] Hello from kernel!");
     log::info!("Kernel initialized");
 
+    // Load GDT/IDT — no IRQs yet.
+    arch::init();
+
     mm::init(boot_info);
 
     // Smoke-test heap allocations (P2-T007)
@@ -37,10 +42,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let s = String::from("heap works");
     log::info!("[mm] String alloc ok: {}", s);
 
+    // Enable PIC and unmask IRQs now that all subsystems are initialized.
+    unsafe { arch::enable_interrupts() };
+    log::info!("[arch] interrupts enabled");
+
+    // Trigger a breakpoint to verify the IDT is working (P3-T007).
+    // Gated on debug builds so production boots don't always trap.
+    if cfg!(debug_assertions) {
+        x86_64::instructions::interrupts::int3();
+        log::info!("[arch] breakpoint exception handled OK");
+    }
+
+    // Verify timer IRQ is firing (P3-T008) — debug builds only so normal boots
+    // are not slowed by the busy-wait on release hardware.
+    if cfg!(debug_assertions) {
+        let start = arch::x86_64::interrupts::tick_count();
+        let mut ticked = false;
+        for _ in 0..10_000_000u32 {
+            core::hint::spin_loop();
+            if arch::x86_64::interrupts::tick_count().wrapping_sub(start) >= 1 {
+                ticked = true;
+                break;
+            }
+        }
+        let ticks = arch::x86_64::interrupts::tick_count();
+        if ticked {
+            log::info!("[arch] timer ticks after wait: {}", ticks);
+        } else {
+            log::warn!("[arch] no timer ticks observed — IRQs may not be firing");
+        }
+    }
+
     hlt_loop();
 }
 
-fn hlt_loop() -> ! {
+pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }

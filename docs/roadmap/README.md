@@ -47,6 +47,7 @@ flowchart TD
     P7 --> P9
     P3 --> P9
     P8 --> P9
+    P9 -.->|optional| P10["Phase 10<br/>Secure Boot"]
 ```
 
 ## Milestone Summary
@@ -62,6 +63,7 @@ flowchart TD
 | 7 | Core Servers | `init`, console, and keyboard services cooperate | [Phase 7](./07-core-servers.md) | [Tasks](./tasks/07-core-servers-tasks.md) |
 | 8 | Storage and VFS | Simple file access through userspace servers | [Phase 8](./08-storage-and-vfs.md) | [Tasks](./tasks/08-storage-and-vfs-tasks.md) |
 | 9 | Framebuffer and Shell | Text UI and tiny shell become usable | [Phase 9](./09-framebuffer-and-shell.md) | [Tasks](./tasks/09-framebuffer-and-shell-tasks.md) |
+| 10 *(optional)* | Secure Boot | Kernel boots on real hardware with Secure Boot on | [Phase 10](./10-secure-boot.md) | [Tasks](./tasks/10-secure-boot-tasks.md) |
 
 ## Suggested Delivery Rhythm
 

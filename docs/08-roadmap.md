@@ -30,6 +30,7 @@ flowchart TD
     P7 --> P8
     P7 --> P9
     P8 --> P9
+    P9 -.->|optional| P10["10. Secure Boot"]
 ```
 
 ## Detailed Phase Pages
@@ -45,6 +46,7 @@ flowchart TD
 | 7 | `init`, console, keyboard services | [Core Servers](./roadmap/07-core-servers.md) |
 | 8 | VFS and read-only storage | [Storage and VFS](./roadmap/08-storage-and-vfs.md) |
 | 9 | Screen output and shell | [Framebuffer and Shell](./roadmap/09-framebuffer-and-shell.md) |
+| 10 *(optional)* | Secure Boot signing for real hardware | [Secure Boot](./roadmap/10-secure-boot.md) |
 
 ## Documentation Expectation Per Phase
 
