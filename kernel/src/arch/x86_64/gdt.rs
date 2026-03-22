@@ -138,12 +138,13 @@ pub fn syscall_stack_top() -> u64 {
 /// kernel stack. Passing an invalid address will silently corrupt the stack
 /// on the next ring-3 interrupt.
 pub unsafe fn set_kernel_stack(rsp0: u64) {
-    // Safety: TSS is a Lazy<TaskStateSegment> whose inner UnsafeCell is
-    // sound to mutate here because:
-    //   1. We only call this after GDT is loaded (single-CPU init path).
-    //   2. No interrupt handlers reference TSS.privilege_stack_table[0]
-    //      between init and the first userspace entry.
-    let tss_ptr = core::ptr::addr_of!(TSS) as *mut TaskStateSegment;
+    // Safety: `&*TSS` forces the Lazy to initialize and gives us a &TaskStateSegment
+    // at the correct address for the inner value (not the Lazy wrapper).
+    // Casting to *mut is sound here because:
+    //   1. We only call this on the single-CPU init path, before any ring-3 code runs.
+    //   2. No interrupt handler references privilege_stack_table[0] between
+    //      gdt::init() and the first iretq into userspace.
+    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
     (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(rsp0);
 }
 

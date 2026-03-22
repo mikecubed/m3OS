@@ -60,24 +60,26 @@ cooperation.
 
 ```rust
 pub unsafe fn enter_userspace(
-    entry:  u64,   // RIP  — instruction pointer in user image
-    stack:  u64,   // RSP  — top of user stack (must be 16-byte aligned)
-    code_sel: u16, // CS   — user code segment selector (0x23)
-    data_sel: u16, // SS   — user data segment selector (0x1B)
+    entry:          u64, // RIP — instruction pointer in user image
+    user_stack_top: u64, // RSP — top of user stack (grows downward)
 ) -> !
 ```
+
+The user code (CS = `0x23`) and data (SS = `0x1B`) selectors are hardcoded
+from the GDT constants — callers do not supply them.
 
 The function is `unsafe` because it transfers execution to arbitrary ring-3
 code and never returns to the caller.  The `!` return type documents that the
 kernel stack frame that called `enter_userspace` is abandoned — the only way
 back to ring 0 is through an interrupt or a `syscall` instruction.
 
-### RFLAGS value (0x200)
+### RFLAGS value (0x202)
 
-The initial RFLAGS pushed for ring 3 is `0x200`:
+The initial RFLAGS pushed for ring 3 is `0x202`:
 
 | Bit | Name | Value | Meaning |
 |---|---|---|---|
+| 1 | reserved | 1 | Always-1 reserved bit (must be set per Intel SDM) |
 | 9 | IF | 1 | Interrupts enabled |
 | 12–13 | IOPL | 0 | No I/O port access from ring 3 |
 | all others | — | 0 | Default / clear |

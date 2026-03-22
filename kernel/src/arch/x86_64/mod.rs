@@ -26,7 +26,6 @@ pub unsafe fn enable_interrupts() {
 }
 
 /// Transfer execution to ring 3 (userspace).
-#[allow(dead_code)]
 ///
 /// Uses `iretq` to atomically switch to user code segment, user stack, and
 /// the given entry point with interrupts enabled (RFLAGS.IF = 1).
@@ -51,7 +50,7 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
         "iretq",
         ss     = in(reg) u64::from(gdt::USER_DATA_SELECTOR),
         rsp    = in(reg) user_stack_top,
-        rflags = const 0x200u64,
+        rflags = const 0x202u64, // IF=1 (bit 9) + reserved bit 1 (always must be 1)
         cs     = in(reg) u64::from(gdt::USER_CODE_SELECTOR),
         rip    = in(reg) entry,
         options(noreturn)

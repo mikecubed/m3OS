@@ -85,7 +85,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unsafe {
             mm::user_space::setup_user_memory(&mut mapper)
                 .expect("[userspace] failed to map user memory");
-            mm::user_space::copy_to_user(process::USER_CODE_BASE, process::HELLO_BIN);
+            mm::user_space::copy_to_user(process::USER_CODE_BASE, process::HELLO_BIN)
+                .expect("[userspace] failed to copy hello binary");
         }
         process::Process::new(process::USER_CODE_BASE, process::USER_STACK_TOP)
     };

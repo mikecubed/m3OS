@@ -131,8 +131,17 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
     if len > 4096 {
         return u64::MAX;
     }
-    // Safety: user and kernel share one address space in Phase 5.
-    // The caller is responsible for passing a mapped, readable address.
+    // Reject pointers outside the known mapped user address range to avoid
+    // kernel-mode page faults from invalid userspace pointers.
+    // Range covers code (0x400000) through stack top (0x8000_0000).
+    // Keep in sync with mm::user_space::{USER_CODE_BASE, USER_STACK_TOP}.
+    const USER_ADDR_MIN: u64 = 0x0040_0000;
+    const USER_ADDR_MAX: u64 = 0x8000_0000;
+    if ptr < USER_ADDR_MIN || ptr.saturating_add(len) > USER_ADDR_MAX {
+        return u64::MAX;
+    }
+    // Safety: pointer is within the mapped user region, len is capped at 4096,
+    // and kernel + user share one address space in Phase 5.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     if let Ok(s) = core::str::from_utf8(bytes) {
         log::info!("[userspace] {}", s.trim_end_matches('\n'));

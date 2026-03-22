@@ -79,9 +79,17 @@ pub unsafe fn map_user_frames(
 /// Copy `src` bytes into the user-mapped region at `virt_base`.
 ///
 /// The region must already be mapped (e.g. via `map_user_pages`).
-pub fn copy_to_user(virt_base: u64, src: &[u8]) {
+/// Returns an error if `src` is larger than the reserved user code region
+/// (`USER_CODE_PAGES * 4096` bytes), preventing writes into unmapped memory.
+pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
+    let max_bytes = (USER_CODE_PAGES * 4096) as usize;
+    if src.len() > max_bytes {
+        return Err("copy_to_user: src exceeds mapped user code region");
+    }
+    // Safety: caller guarantees virt_base is mapped and we've checked the length.
     let dst = unsafe { core::slice::from_raw_parts_mut(virt_base as *mut u8, src.len()) };
     dst.copy_from_slice(src);
+    Ok(())
 }
 
 /// Set up code and stack regions for a userspace process.
@@ -92,10 +100,11 @@ pub fn copy_to_user(virt_base: u64, src: &[u8]) {
 /// Returns the page table mapper that was used (must be rebuilt each call since
 /// we're reusing the kernel's active table).
 pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
-    // Code: user-accessible, present, writable, executable.
-    // Phase 5 needs WRITABLE so the kernel can copy the binary in before ring-3
-    // entry (CR0.WP prevents ring-0 writes to read-only pages).  W^X enforcement
-    // is deferred to Phase 6+ once we have a proper ELF loader.
+    // Code: user-accessible, present, writable (no NO_EXECUTE flag → executable).
+    // WRITABLE is required so the kernel can copy the binary into these pages
+    // before iretq (CR0.WP prevents ring-0 writes to read-only pages).
+    // W^X (write-xor-execute) enforcement is deferred to Phase 6+ when a proper
+    // ELF loader will let us separate the copy step from the execute step.
     let code_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 

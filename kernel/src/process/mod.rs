@@ -3,10 +3,6 @@
 //! A `Process` holds the virtual addresses needed to enter userspace and
 //! any cleanup information. Full process lifecycle (spawn, wait, exit)
 //! is deferred to Phase 6+.
-//!
-//! # Integration note
-//! Add `mod process;` (or `pub mod process;`) to `kernel/src/main.rs` to
-//! include this module in the kernel crate.
 
 pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
 
