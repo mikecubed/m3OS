@@ -36,8 +36,6 @@
 //! advances 64 bytes, giving RSP `≡ 8 (mod 16)` at the entry function — the
 //! value required by the x86-64 SysV ABI at a call boundary.
 
-#![allow(dead_code)]
-
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -56,6 +54,12 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 4; // 16 KiB
 // Task ID
 // ---------------------------------------------------------------------------
 
+/// Unique identifier for a kernel task.
+///
+/// Not yet consumed outside this module; the allow silences the dead-code
+/// lint for the inner field so the identifier is available for future use
+/// (e.g. IPC, logging, wait-queues).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(pub u64);
 
@@ -74,7 +78,11 @@ pub enum TaskState {
 // ---------------------------------------------------------------------------
 
 pub struct Task {
+    /// Unique task identifier — not yet read outside this module.
+    #[allow(dead_code)]
     pub id: TaskId,
+    /// Human-readable name — not yet read outside this module.
+    #[allow(dead_code)]
     pub name: &'static str,
     pub state: TaskState,
     /// RSP saved by `switch_context` when this task is not running.

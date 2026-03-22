@@ -141,7 +141,7 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
 pub fn spawn_idle(entry: fn() -> !) {
     let task = Task::new(entry, "idle");
     let mut sched = SCHEDULER.lock();
-    debug_assert!(
+    assert!(
         sched.idle_task.is_none(),
         "spawn_idle must be called at most once"
     );
