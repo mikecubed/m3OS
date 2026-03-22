@@ -8,6 +8,11 @@ fn main() {
     match subcommand {
         Some("image") => cmd_image(),
         Some("run") => cmd_run(),
+        Some("check") => cmd_check(),
+        Some("fmt") => {
+            let fix = args.iter().any(|a| a == "--fix");
+            cmd_fmt(fix);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -16,11 +21,11 @@ fn main() {
         }
         Some(other) => {
             eprintln!("Unknown subcommand: {other}");
-            eprintln!("Usage: cargo xtask <image|run|runner>");
+            eprintln!("Usage: cargo xtask <image|run|check|fmt [--fix]|runner>");
             std::process::exit(1);
         }
         None => {
-            eprintln!("Usage: cargo xtask <image|run|runner>");
+            eprintln!("Usage: cargo xtask <image|run|check|fmt [--fix]|runner>");
             std::process::exit(1);
         }
     }
@@ -154,6 +159,75 @@ fn launch_qemu(uefi_image: &PathBuf) {
         .expect("failed to launch QEMU");
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+fn cmd_check() {
+    let root = workspace_root();
+
+    // clippy on the kernel (bare-metal target requires -Zbuild-std)
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run cargo clippy");
+
+    if !status.success() {
+        eprintln!("clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // rustfmt check (host target is fine for formatting)
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(["fmt", "--package", "kernel", "--", "--check"])
+        .status()
+        .expect("failed to run cargo fmt");
+
+    if !status.success() {
+        eprintln!("rustfmt found unformatted code — run `cargo xtask fmt --fix` to fix");
+        std::process::exit(1);
+    }
+
+    println!("check passed: clippy clean, formatting correct");
+}
+
+fn cmd_fmt(fix: bool) {
+    let root = workspace_root();
+    let mut args = vec!["fmt", "--package", "kernel"];
+    if !fix {
+        args.extend(["--", "--check"]);
+    }
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(&args)
+        .status()
+        .expect("failed to run cargo fmt");
+
+    if !status.success() {
+        if fix {
+            eprintln!("rustfmt failed");
+        } else {
+            eprintln!("rustfmt found unformatted code — run `cargo xtask fmt --fix` to fix");
+        }
+        std::process::exit(1);
+    }
+
+    if fix {
+        println!("fmt: formatting applied");
+    } else {
+        println!("fmt: formatting correct");
+    }
 }
 
 fn cmd_image() {

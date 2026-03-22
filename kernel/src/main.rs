@@ -7,7 +7,7 @@ extern crate alloc;
 mod mm;
 mod serial;
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -31,10 +31,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let boxed = Box::new(42u64);
     log::info!("[mm] Box::new(42) = {}", *boxed);
 
-    let mut v: Vec<u32> = Vec::new();
-    v.push(1);
-    v.push(2);
-    v.push(3);
+    let v: Vec<u32> = vec![1, 2, 3];
     log::info!("[mm] Vec alloc ok, len={}", v.len());
 
     let s = String::from("heap works");
