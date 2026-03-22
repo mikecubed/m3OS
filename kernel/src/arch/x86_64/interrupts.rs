@@ -88,8 +88,7 @@ pub enum InterruptIndex {
 // PIC
 // ---------------------------------------------------------------------------
 
-pub static PICS: Mutex<pic8259::ChainedPics> =
-    Mutex::new(unsafe { pic8259::ChainedPics::new(32, 40) });
+static PICS: Mutex<pic8259::ChainedPics> = Mutex::new(unsafe { pic8259::ChainedPics::new(32, 40) });
 
 /// Initialize and unmask the 8259 PIC.
 ///
@@ -106,7 +105,7 @@ pub unsafe fn init_pics() {
 // Timer
 // ---------------------------------------------------------------------------
 
-pub static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Return the current timer tick count (monotonically increasing).
 pub fn tick_count() -> u64 {
@@ -156,7 +155,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 
     let tail = SCANCODE_BUF_TAIL.load(Ordering::Relaxed);
     let next_tail = (tail + 1) % SCANCODE_BUF_SIZE;
-    if next_tail != SCANCODE_BUF_HEAD.load(Ordering::Relaxed) {
+    if next_tail != SCANCODE_BUF_HEAD.load(Ordering::Acquire) {
         // Safety: single producer; tail is only advanced here and never overtakes head.
         unsafe { SCANCODE_BUF[tail] = scancode };
         SCANCODE_BUF_TAIL.store(next_tail, Ordering::Release);

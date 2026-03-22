@@ -149,12 +149,19 @@ The PIC's default IRQ vectors (0–15) overlap with CPU exception vectors (0–3
 **remap** them to vectors 32–47:
 
 ```rust
-// interrupts.rs
-pub static PICS: Mutex<ChainedPics> =
+// interrupts.rs — PICS is private; only this module sends EOI.
+static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(32, 40) });
 
-pub fn init_pics() {
-    unsafe { PICS.lock().initialize(); }
+// Safety: must be called after the IDT is loaded and before interrupts are enabled.
+pub unsafe fn init_pics() {
+    PICS.lock().initialize();
+}
+
+// call site in arch/x86_64/mod.rs:
+pub unsafe fn enable_interrupts() {
+    interrupts::init_pics();
+    x86_64::instructions::interrupts::enable();
 }
 ```
 
@@ -222,4 +229,4 @@ Linux, FreeBSD, and seL4 all follow this path.
 |---|---|
 | `x86_64` | `InterruptDescriptorTable`, `InterruptStackFrame`, `Port`, `TaskStateSegment` |
 | `pic8259` | `ChainedPics` — PIC initialization and EOI |
-| `spin` | `Mutex` for protecting `PICS` and the scancode ring buffer |
+| `spin` | `Mutex` for protecting `PICS`; scancode buffer is lock-free (SPSC atomics, no `Mutex` in the IRQ path) |
