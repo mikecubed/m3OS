@@ -25,12 +25,21 @@ struct AlignedStack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
 /// Static double-fault stack. Must be static so its address is valid for the
 /// entire lifetime of the kernel.
-static DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
+///
+/// `static mut` is required: an immutable `static` may be placed in `.rodata`
+/// (read-only memory) by the linker. The CPU writes to this memory when using
+/// it as a stack during a double fault, so it must be writable.
+static mut DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
 static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.as_ptr());
+        // Safety: we only take the address of the static here; the CPU writes
+        // to it during a double fault, which is the intended use.
+        // `addr_of!` is used instead of `.as_ptr()` to avoid creating a
+        // shared reference to a `static mut`, which is UB in Rust 2024.
+        let stack_start =
+            unsafe { VirtAddr::from_ptr(core::ptr::addr_of!(DOUBLE_FAULT_STACK.0).cast::<u8>()) };
         // Stack grows downward, so the "top" is start + size.
         stack_start + DOUBLE_FAULT_STACK_SIZE as u64
     };
