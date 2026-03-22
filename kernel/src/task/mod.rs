@@ -3,14 +3,19 @@
 //! # Context-switch contract
 //!
 //! [`switch_context`] saves and restores the six callee-saved registers
-//! (`rbx`, `rbp`, `r12`–`r15`) plus `RFLAGS` (via `pushf`/`popf`) and `rip`
-//! (via `ret`).  The compiler already saves/restores caller-saved registers at
-//! every call site, so saving them again in the switch stub would be redundant.
+//! (`rbx`, `rbp`, `r12`–`r15`) plus `RFLAGS` (via `pushf`/`cli`/`popf`) and
+//! `rip` (via `ret`).  The compiler already saves/restores caller-saved
+//! registers at every call site, so saving them again in the switch stub would
+//! be redundant.
 //!
-//! Saving RFLAGS means each task carries its own interrupt-flag state.  A
-//! freshly-spawned task starts with `RFLAGS = 0x202` (IF=1), so its first
-//! dispatch restores interrupts automatically without any special-case code in
-//! the scheduler.
+//! The stub issues `cli` after `pushf` to disable interrupts before switching
+//! RSP, and `popf` atomically re-enables them when loading the new task's
+//! saved RFLAGS.  This keeps the critical stack-swap window (between
+//! `mov rsp, rsi` and `popf`) non-interruptible without requiring callers to
+//! wrap the call in `without_interrupts`.
+//!
+//! A freshly-spawned task starts with `RFLAGS = 0x202` (IF=1), so the first
+//! `popf` on dispatch restores interrupts automatically.
 //!
 //! Stack layout written by [`init_stack`] for a freshly-spawned task:
 //!
@@ -145,6 +150,12 @@ unsafe extern "C" {
     /// RSP at `*save_rsp`, loads `load_rsp` as the new stack, restores RFLAGS
     /// and the callee-saved registers, then returns to the new task's `rip`.
     ///
+    /// Interrupt masking for the critical stack-swap window is handled
+    /// internally: `pushf` captures RFLAGS (including IF), `cli` disables
+    /// interrupts before changing RSP, and `popf` atomically restores IF from
+    /// the new task's saved RFLAGS.  Callers do not need an external
+    /// `without_interrupts` wrapper.
+    ///
     /// # Safety
     ///
     /// * `save_rsp` must be a valid, writable 8-byte-aligned pointer inside a
@@ -167,9 +178,10 @@ core::arch::global_asm!(
     "  push r14",
     "  push r15",
     "  pushf",           // save RFLAGS (includes IF bit)
+    "  cli",             // disable interrupts to protect the stack-swap window
     "  mov  [rdi], rsp", // save current RSP into *save_rsp
-    "  mov  rsp, rsi",   // load new task's RSP
-    "  popf",            // restore RFLAGS → IF atomically restored
+    "  mov  rsp, rsi",   // load new task's RSP (IF=0 while RSP is mid-swap)
+    "  popf",            // restore RFLAGS → atomically re-enables IF if it was set
     "  pop  r15",
     "  pop  r14",
     "  pop  r13",

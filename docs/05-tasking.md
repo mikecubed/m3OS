@@ -38,8 +38,12 @@ any other function call.
 
 Saving `RFLAGS` means each task carries its own interrupt state.  A freshly-spawned
 task has `RFLAGS = 0x202` (IF=1) written by `init_stack`, so interrupts are enabled
-automatically the moment `popf` runs on the first dispatch.  No special-case
-`sti` or `enable_and_hlt` is needed anywhere in the scheduler.
+automatically the moment `popf` runs on the first dispatch.
+
+`cli` after `pushf` disables interrupts before the RSP swap so no IRQ can push a
+frame onto the new stack mid-restore.  `popf` then atomically re-enables IF from the
+saved value, keeping the critical window non-interruptible without requiring callers
+to wrap the call in `without_interrupts`.
 
 ### Assembly stub
 
@@ -52,9 +56,10 @@ switch_context:           ; rdi = *save_rsp,  rsi = load_rsp
   push r14
   push r15
   pushf                   ; save RFLAGS (includes IF bit)
+  cli                     ; disable interrupts to protect the stack-swap window
   mov  [rdi], rsp         ; save current RSP into *save_rsp
-  mov  rsp, rsi           ; load the new stack
-  popf                    ; restore RFLAGS → IF atomically restored
+  mov  rsp, rsi           ; load the new stack (IF=0 while RSP is mid-swap)
+  popf                    ; restore RFLAGS → atomically re-enables IF
   pop  r15
   pop  r14
   pop  r13
@@ -169,11 +174,11 @@ sequenceDiagram
     PIT->>ISR: fires ~18 Hz
     ISR->>Atom: signal_reschedule() — atomic store true
     ISR->>PIT: EOI
-    Loop->>Atom: swap(false) — checks flag before hlt
+    Loop->>Loop: disable() + swap(false) — atomic check, no lost-wakeup
     Loop->>Task: switch_context(SCHEDULER_RSP, task_rsp)
     Task->>Task: executes one "slice" (IF=1; IRQs delivered normally)
     Task->>Loop: yield_now() → switch_context(task_rsp, SCHEDULER_RSP)
-    Loop->>Loop: loop back, check RESCHEDULE again
+    Loop->>Loop: loop back, disable() + check RESCHEDULE again
 ```
 
 `signal_reschedule` is the _only_ scheduler function called from the ISR.  It

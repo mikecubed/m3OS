@@ -27,6 +27,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 use super::{switch_context, Task, TaskState};
 
@@ -188,18 +189,28 @@ pub fn yield_now() {
 /// avoid sleeping through a tick that was set while the previous task was
 /// running (P4-T006).  `switch_context` saves/restores RFLAGS so each task
 /// carries its own interrupt state — no `without_interrupts` wrapper needed.
+///
+/// The idle path uses `disable()` + `enable_and_hlt()` to close the
+/// lost-wakeup race: if a timer IRQ sets `RESCHEDULE` after we clear the flag
+/// but before `hlt`, it is queued while interrupts are disabled and fires
+/// immediately when `enable_and_hlt()` re-enables IF, waking us at once.
 pub fn run() -> ! {
     loop {
-        // Check the reschedule flag *before* halting.  If a timer tick fired
-        // while the last task was running and set RESCHEDULE, we dispatch
-        // immediately instead of sleeping through an unnecessary timer cycle.
+        // Disable interrupts before swapping RESCHEDULE to close the
+        // lost-wakeup race: an IRQ that fires between swap(false) and hlt
+        // would be queued (not lost) and wakes us the moment we re-enable IF.
+        interrupts::disable();
         if !RESCHEDULE.swap(false, Ordering::AcqRel) {
-            // No pending reschedule; halt until the next interrupt.
-            x86_64::instructions::hlt();
+            // No pending reschedule; atomically enable interrupts and halt.
+            // Any IRQ queued while we had interrupts off fires immediately,
+            // so we never sleep with a pending tick.
+            interrupts::enable_and_hlt();
             // After waking, loop back — the IRQ may or may not have been a
             // timer tick, so we re-check RESCHEDULE before dispatching.
             continue;
         }
+        // A tick is pending; re-enable interrupts before picking a task.
+        interrupts::enable();
 
         // Pick the next ready task.
         let next = {
