@@ -1,4 +1,5 @@
 use linked_list_allocator::LockedHeap;
+use spin::Once;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -8,10 +9,22 @@ pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+static HEAP_INIT: Once<()> = Once::new();
+
+/// Map the kernel heap region and initialise the global allocator.
+///
+/// Panics if called more than once — re-initialising `LockedHeap` after
+/// allocations have been made corrupts allocator state.
 pub fn init_heap(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) {
+    assert!(
+        HEAP_INIT.get().is_none(),
+        "heap::init_heap called more than once"
+    );
+    HEAP_INIT.call_once(|| ());
+
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
         let heap_end = heap_start + HEAP_SIZE as u64 - 1u64;

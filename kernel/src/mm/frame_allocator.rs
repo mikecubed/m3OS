@@ -5,6 +5,12 @@ use x86_64::PhysAddr;
 
 const PAGE_SIZE: u64 = 4096;
 
+/// Frames below 1 MiB are skipped even when the region is marked Usable.
+/// Some UEFI/QEMU memory maps mark conventional low memory as Usable, but
+/// those frames may hold BIOS data area remnants or be used by UEFI firmware
+/// code paths that run before ExitBootServices completes.
+const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
+
 struct BumpAllocator {
     regions: Option<&'static [MemoryRegion]>,
     region_index: usize,
@@ -28,15 +34,15 @@ impl BumpAllocator {
         self.next_addr = 0;
         self.frames_allocated = 0;
 
-        // Advance to the first usable region
+        // Advance to the first allocatable region
         self.advance_to_usable();
 
-        // Count and log total usable frames
+        // Count and log total allocatable frames (excluding sub-1MiB)
         let total_frames: u64 = regions
             .iter()
             .filter(|r| r.kind == MemoryRegionKind::Usable)
             .map(|r| {
-                let start = align_up(r.start, PAGE_SIZE);
+                let start = align_up(r.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
                 let end = align_down(r.end, PAGE_SIZE);
                 if end > start {
                     (end - start) / PAGE_SIZE
@@ -47,7 +53,7 @@ impl BumpAllocator {
             .sum();
 
         log::info!(
-            "[mm] frame allocator: {} usable 4KiB frames available",
+            "[mm] frame allocator: {} usable 4KiB frames available (>= 1 MiB)",
             total_frames
         );
     }
@@ -61,7 +67,8 @@ impl BumpAllocator {
         while self.region_index < regions.len() {
             let region = &regions[self.region_index];
             if region.kind == MemoryRegionKind::Usable {
-                let start = align_up(region.start, PAGE_SIZE);
+                // Clamp start to 1 MiB to skip low-memory frames
+                let start = align_up(region.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
                 if start < region.end {
                     self.next_addr = start;
                     return;
@@ -113,22 +120,6 @@ static FRAME_ALLOCATOR: LockedFrameAllocator =
     LockedFrameAllocator(Mutex::new(BumpAllocator::new()));
 
 pub fn init(regions: &'static [MemoryRegion]) {
-    // Verify the allocator invariant: no Usable region starts below 1 MiB.
-    // The first MiB is BIOS/UEFI reserved; handing it out would corrupt real-mode
-    // data structures. Panic early if the bootloader gives us something unexpected.
-    const ONE_MIB: u64 = 0x0010_0000;
-    for region in regions {
-        if region.kind == MemoryRegionKind::Usable {
-            assert!(
-                region.start >= ONE_MIB,
-                "[mm] frame allocator: Usable region {:#x}..{:#x} starts below 1 MiB — \
-                 bootloader memory map is unexpected",
-                region.start,
-                region.end,
-            );
-        }
-    }
-
     FRAME_ALLOCATOR.0.lock().init(regions);
 }
 

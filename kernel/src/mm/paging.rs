@@ -1,10 +1,24 @@
+use spin::Once;
 use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
+static INIT_GUARD: Once<()> = Once::new();
+
+/// Initialise the kernel's page-table mapper.
+///
 /// # Safety
-/// Caller must pass the correct physical memory offset from BootInfo.
-/// Must be called exactly once during kernel init.
+/// - `physical_memory_offset` must be the value from `BootInfo` — it must be
+///   the virtual address at which all physical memory is identity-mapped by the
+///   bootloader.
+/// - **Must be called exactly once.** A second call panics to prevent aliased
+///   `&'static mut` references to the active L4 table (which would be UB).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    assert!(
+        INIT_GUARD.get().is_none(),
+        "paging::init called more than once"
+    );
+    INIT_GUARD.call_once(|| ());
+
     let level_4_table = active_level_4_table(physical_memory_offset);
     let mapper = OffsetPageTable::new(level_4_table, physical_memory_offset);
     log::info!("[mm] page tables initialized");
