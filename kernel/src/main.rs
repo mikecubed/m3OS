@@ -50,14 +50,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     log::info!("[arch] interrupts enabled");
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
-    // Gated on debug builds so production boots don't always trap.
     if cfg!(debug_assertions) {
         x86_64::instructions::interrupts::int3();
         log::info!("[arch] breakpoint exception handled OK");
     }
 
-    // Verify timer IRQ is firing (P3-T008) — debug builds only so normal boots
-    // are not slowed by the busy-wait on release hardware.
+    // Verify timer IRQ is firing (P3-T008) — debug builds only.
     if cfg!(debug_assertions) {
         let start = arch::x86_64::interrupts::tick_count();
         let mut ticked = false;
@@ -76,29 +74,171 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // Phase 5: map user code + stack pages and launch the first ring-3 process.
+    // ---------------------------------------------------------------------------
+    // Phase 6: IPC Core demo
     //
-    // `get_mapper` reconstructs the OffsetPageTable from the stored physical
-    // memory offset.  We drop it (and release the &'static mut to the L4 table)
-    // before enter_userspace so no aliased mapper is live during the iretq.
-    let proc = {
-        let mut mapper = unsafe { mm::paging::get_mapper() };
-        unsafe {
-            mm::user_space::setup_user_memory(&mut mapper)
-                .expect("[userspace] failed to map user memory");
-            mm::user_space::copy_to_user(process::USER_CODE_BASE, process::HELLO_BIN)
-                .expect("[userspace] failed to copy hello binary");
-        }
-        process::Process::new(process::USER_CODE_BASE, process::USER_STACK_TOP)
-    };
-    log::info!(
-        "[userspace] entering ring 3: entry={:#x} stack={:#x}",
-        proc.entry,
-        proc.stack_top
-    );
-    // Safety: entry and stack_top are freshly mapped user-accessible pages.
-    unsafe { arch::enter_userspace(proc.entry, proc.stack_top) }
+    // Demonstrates synchronous rendezvous IPC between two kernel threads:
+    //   - server_task: blocks on recv, processes two messages with reply_recv
+    //   - client_task: calls the server twice and logs each reply
+    //
+    // The scheduler drives the exchange.  The server logs each call it handles;
+    // the client logs each reply it receives.  After the second exchange the
+    // client exits and the system halts via the idle loop.
+    // ---------------------------------------------------------------------------
+
+    // Create a global IPC endpoint.  The server will recv on it; the client
+    // will call it.  The EndpointId is baked into each task's closure via
+    // a static (no_std closures cannot capture from the stack easily, so we
+    // use task::spawn's fn pointer API with a global static for the ID).
+    let ep_id = ipc::endpoint::ENDPOINTS.lock().create();
+    // Safety: single-CPU boot, no concurrent access.
+    unsafe {
+        DEMO_EP = ep_id;
+    }
+
+    // Allocate a notification object for the kbd_server demo (P6-T011).
+    // The keyboard ISR will signal bit 1 each keypress; the kbd_notif_task
+    // blocks on wait() and logs the first keypress it receives.
+    let notif_id = ipc::notification::NOTIFICATIONS.lock().create();
+    ipc::notification::NOTIFICATIONS
+        .lock()
+        .register_irq(1, notif_id);
+    unsafe {
+        DEMO_NOTIF = notif_id;
+    }
+
+    // Spawn the server, client, and kbd_notif tasks.
+    task::spawn(server_task, "ipc-server");
+    task::spawn(client_task, "ipc-client");
+    task::spawn(kbd_notif_task, "kbd-notif");
+    task::spawn_idle(idle_task);
+
+    log::info!("[ipc] demo starting — entering scheduler");
+    task::run()
 }
+
+// ---------------------------------------------------------------------------
+// Demo task state
+// ---------------------------------------------------------------------------
+
+/// The IPC endpoint used by the demo.
+static mut DEMO_EP: ipc::EndpointId = ipc::EndpointId(0);
+/// The notification ID used for keyboard IRQ delivery.
+static mut DEMO_NOTIF: ipc::notification::NotifId = ipc::notification::NotifId(0);
+
+// ---------------------------------------------------------------------------
+// Demo tasks
+// ---------------------------------------------------------------------------
+
+/// Server task: handles two consecutive IPC calls and then exits.
+///
+/// Uses `recv` for the first message, then `reply_recv` for the second,
+/// demonstrating the standard server loop pattern.
+fn server_task() -> ! {
+    // Safety: written once before spawn, read-only from here.
+    let ep_id = unsafe { DEMO_EP };
+    let my_id = task::current_task_id().expect("server: no task id");
+
+    // Register ourselves as the server of this endpoint so reply_recv can
+    // find it.
+    task::set_server_endpoint(my_id, ep_id);
+
+    // Pre-insert an endpoint capability at handle 0.
+    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id));
+
+    log::info!("[ipc-server] waiting for first call");
+
+    // First message: plain recv.
+    let label = ipc::endpoint::recv(my_id, ep_id);
+    log::info!("[ipc-server] received call label={}", label);
+
+    // Reply cap was inserted into our table by recv() on behalf of the client.
+    // Find it: it's at handle 1 (handle 0 is our endpoint cap).
+    let reply_cap_handle: ipc::CapHandle = 1;
+    let caller_id = match task::task_cap(my_id, reply_cap_handle) {
+        Ok(ipc::Capability::Reply(id)) => id,
+        _ => panic!("server: expected reply cap at handle 1"),
+    };
+    let _ = task::remove_task_cap(my_id, reply_cap_handle);
+
+    // Reply + immediately wait for next message.
+    log::info!("[ipc-server] replying and waiting for next call");
+    let reply = ipc::Message::with1(0xBEEF, 42);
+    let label2 = ipc::endpoint::reply_recv(my_id, caller_id, ep_id, reply);
+    log::info!("[ipc-server] received second call label={}", label2);
+
+    // Find the second reply cap (also at handle 1, re-inserted by reply_recv).
+    let caller2_id = match task::task_cap(my_id, reply_cap_handle) {
+        Ok(ipc::Capability::Reply(id)) => id,
+        _ => panic!("server: expected reply cap at handle 1 for second call"),
+    };
+    let _ = task::remove_task_cap(my_id, reply_cap_handle);
+
+    let reply2 = ipc::Message::with1(0xCAFE, 99);
+    ipc::endpoint::reply(caller2_id, reply2);
+    log::info!("[ipc-server] second reply sent — server done");
+
+    // Yield forever; the idle task will keep the system alive.
+    loop {
+        task::yield_now();
+    }
+}
+
+/// Client task: sends two IPC calls to the server and logs the replies.
+fn client_task() -> ! {
+    let ep_id = unsafe { DEMO_EP };
+    let my_id = task::current_task_id().expect("client: no task id");
+
+    // Insert an endpoint capability at handle 0.
+    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id));
+
+    log::info!("[ipc-client] sending first call");
+    let reply_label = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x1234));
+    log::info!("[ipc-client] got first reply label={:#x}", reply_label);
+
+    log::info!("[ipc-client] sending second call");
+    let reply_label2 = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x5678));
+    log::info!("[ipc-client] got second reply label={:#x}", reply_label2);
+
+    log::info!("[ipc-client] IPC demo complete");
+
+    loop {
+        task::yield_now();
+    }
+}
+
+/// Keyboard notification task: blocks until the first keypress, then logs it.
+///
+/// Demonstrates IRQ delivery via notification objects (P6-T007, P6-T011).
+fn kbd_notif_task() -> ! {
+    let notif_id = unsafe { DEMO_NOTIF };
+    let my_id = task::current_task_id().expect("kbd-notif: no task id");
+
+    // Insert a notification capability at handle 0.
+    task::insert_cap(my_id, ipc::Capability::Notification(notif_id));
+
+    log::info!("[kbd-notif] waiting for keyboard IRQ via notification");
+    let bits = ipc::notification::wait(my_id, notif_id);
+    log::info!(
+        "[kbd-notif] keyboard notification received, bits={:#b}",
+        bits
+    );
+
+    loop {
+        task::yield_now();
+    }
+}
+
+/// Idle task: halts the CPU between timer ticks.
+fn idle_task() -> ! {
+    loop {
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel utilities
+// ---------------------------------------------------------------------------
 
 pub fn hlt_loop() -> ! {
     loop {
@@ -108,7 +248,6 @@ pub fn hlt_loop() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Use _panic_print to avoid deadlock if panic occurs while serial mutex is held
     if let Some(location) = info.location() {
         serial::_panic_print(format_args!(
             "KERNEL PANIC at {}:{}\n",

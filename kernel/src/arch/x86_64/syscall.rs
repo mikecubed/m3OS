@@ -117,8 +117,11 @@ global_asm!(
 ///   rdx = arg1          (was rsi at syscall site)
 ///   rcx = arg2          (was rdx at syscall site)
 #[no_mangle]
-pub extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, _arg2: u64) -> u64 {
+pub extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     match number {
+        // IPC syscalls (Phase 6)
+        1..=5 | 7..=8 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
+        // Legacy / debug syscalls
         6 => sys_exit(arg0),
         12 => sys_debug_print(arg0, arg1),
         _ => u64::MAX, // ENOSYS

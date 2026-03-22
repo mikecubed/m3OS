@@ -1,9 +1,15 @@
 //! Minimal process abstraction for Phase 5.
 //!
+//! Phase 6 replaces the single-process demo with multi-task kernel threads.
+//! This module is preserved as reference for Phase 7+ when real userspace
+//! process management is introduced.
+#![allow(dead_code)]
+//!
 //! A `Process` holds the virtual addresses needed to enter userspace and
 //! any cleanup information. Full process lifecycle (spawn, wait, exit)
 //! is deferred to Phase 6+.
 
+#[allow(unused_imports)]
 pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
 
 /// A minimal userspace process descriptor.
