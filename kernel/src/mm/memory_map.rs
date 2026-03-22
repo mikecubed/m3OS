@@ -1,9 +1,15 @@
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Once;
 
 static MEMORY_REGIONS: Once<&'static [MemoryRegion]> = Once::new();
+static MEMORY_MAP_INIT: AtomicBool = AtomicBool::new(false);
 
 pub fn init(regions: &'static [MemoryRegion]) {
+    assert!(
+        !MEMORY_MAP_INIT.swap(true, Ordering::AcqRel),
+        "memory_map::init called more than once"
+    );
     MEMORY_REGIONS.call_once(|| regions);
 
     let total = regions.len();
