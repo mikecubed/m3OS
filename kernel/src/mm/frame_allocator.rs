@@ -46,7 +46,10 @@ impl BumpAllocator {
             })
             .sum();
 
-        log::info!("[mm] frame allocator: {} usable 4KiB frames available", total_frames);
+        log::info!(
+            "[mm] frame allocator: {} usable 4KiB frames available",
+            total_frames
+        );
     }
 
     fn advance_to_usable(&mut self) {
