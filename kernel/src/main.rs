@@ -1,18 +1,21 @@
 #![no_std]
 #![no_main]
 
+mod mm;
 mod serial;
 
 use bootloader_api::{entry_point, BootInfo};
 
 entry_point!(kernel_main);
 
-fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     serial::init_logger();
 
     serial_println!("[ostest] Hello from kernel!");
     log::info!("Kernel initialized");
+
+    mm::init(boot_info);
 
     hlt_loop();
 }
