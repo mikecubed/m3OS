@@ -12,8 +12,8 @@ flowchart LR
 
 ## Implementation Tasks
 
-- [ ] P2-T001 Copy the bootloader memory map into typed kernel-owned structures.
-- [ ] P2-T002 Implement a simple frame allocator for usable physical memory regions.
+- [x] P2-T001 Copy the bootloader memory map into typed kernel-owned structures.
+- [x] P2-T002 Implement a simple frame allocator for usable physical memory regions.
 - [ ] P2-T003 Add safe wrappers around the page-table manipulation needed by the kernel.
 - [ ] P2-T004 Reserve and map a fixed-size kernel heap region.
 - [ ] P2-T005 Initialize `#[global_allocator]` after the heap is mapped.
