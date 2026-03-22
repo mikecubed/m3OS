@@ -216,7 +216,12 @@ pub fn yield_now() {
 // ---------------------------------------------------------------------------
 
 /// Return the [`TaskId`] of the task currently running on the CPU, or `None`
-/// if called from outside a task context (e.g., during boot or in an ISR).
+/// if called from outside a task context (e.g., during early boot before any
+/// task has been dispatched).
+///
+/// **Not ISR-safe** — acquires `SCHEDULER.lock()`.  Must only be called from
+/// task context (syscall handlers, kernel threads).  Calling from an interrupt
+/// handler while a task holds the scheduler lock will deadlock.
 pub fn current_task_id() -> Option<TaskId> {
     let sched = SCHEDULER.lock();
     sched.current.map(|idx| sched.tasks[idx].id)
@@ -259,6 +264,27 @@ pub fn block_current_on_send() {
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
 
+/// Block the current task waiting for a notification bit to be set.
+///
+/// Sets state to [`TaskState::BlockedOnNotif`] and switches to the scheduler.
+/// Returns when another context calls [`wake_task`] on this task or when
+/// [`signal_irq`][crate::ipc::notification::signal_irq] triggers a reschedule
+/// that allows the task to drain pending bits in its [`wait`][crate::ipc::notification::wait] loop.
+pub fn block_current_on_notif() {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => return,
+        };
+        sched.tasks[idx].state = TaskState::BlockedOnNotif;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
 /// Block the current task waiting for a reply after a `call`.
 ///
 /// Sets state to [`TaskState::BlockedOnReply`] and switches to the scheduler.
@@ -280,6 +306,11 @@ pub fn block_current_on_reply() {
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
 ///
 /// No-op if the task is not currently blocked.
+///
+/// **Not ISR-safe** — acquires `SCHEDULER.lock()`.  Must only be called from
+/// task context.  IRQ handlers that need to trigger a wakeup should instead
+/// set a pending bit atomically and call [`signal_reschedule`]; the blocked
+/// task will drain the bits in its wait loop on the next scheduler dispatch.
 pub fn wake_task(id: TaskId) {
     let mut sched = SCHEDULER.lock();
     if let Some(idx) = sched.find(id) {
@@ -308,32 +339,32 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     }
 }
 
-/// Remove and return the pending message for a task.
+/// Remove and return the pending message for a task, or `None` if none is set.
 ///
-/// Returns a zeroed message if no message is pending (should not happen in
-/// a correct IPC flow).
-pub fn take_message(id: TaskId) -> Message {
+/// `None` indicates a scheduler / IPC logic bug — a task was woken without
+/// a corresponding `deliver_message` call.  Callers should `debug_assert` or
+/// propagate the error rather than silently using a zeroed message.
+pub fn take_message(id: TaskId) -> Option<Message> {
     let mut sched = SCHEDULER.lock();
     if let Some(idx) = sched.find(id) {
-        sched.tasks[idx].pending_msg.take().unwrap_or_default()
+        sched.tasks[idx].pending_msg.take()
     } else {
-        Message::default()
+        None
     }
 }
 
 /// Insert a capability into a task's capability table.
 ///
-/// Returns the handle assigned, or panics on a full table (shouldn't happen
-/// in a teaching OS with 64 slots and a handful of services).
-pub fn insert_cap(id: TaskId, cap: Capability) -> CapHandle {
+/// Returns the handle on success, or [`CapError::TableFull`] / [`CapError::InvalidHandle`]
+/// on failure.  Callers in the IPC syscall path should propagate the error as
+/// `u64::MAX` rather than panicking — a full table should be an IPC error, not
+/// a kernel panic.
+pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
     let mut sched = SCHEDULER.lock();
     if let Some(idx) = sched.find(id) {
-        sched.tasks[idx]
-            .caps
-            .insert(cap)
-            .expect("capability table full")
+        sched.tasks[idx].caps.insert(cap)
     } else {
-        panic!("insert_cap: unknown task {:?}", id)
+        Err(CapError::InvalidHandle)
     }
 }
 

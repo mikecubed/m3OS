@@ -99,10 +99,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Allocate a notification object for the kbd_server demo (P6-T011).
     // The keyboard ISR will signal bit 1 each keypress; the kbd_notif_task
     // blocks on wait() and logs the first keypress it receives.
-    let notif_id = ipc::notification::NOTIFICATIONS.lock().create();
-    ipc::notification::NOTIFICATIONS
-        .lock()
-        .register_irq(1, notif_id);
+    //
+    // Wrapped in without_interrupts: register_irq writes IRQ_MAP atomically,
+    // but we want IRQ1 masked until the mapping is fully visible.
+    let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
+        let id = ipc::notification::create();
+        ipc::notification::register_irq(1, id);
+        id
+    });
     unsafe {
         DEMO_NOTIF = notif_id;
     }
@@ -144,7 +148,8 @@ fn server_task() -> ! {
     task::set_server_endpoint(my_id, ep_id);
 
     // Pre-insert an endpoint capability at handle 0.
-    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id));
+    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("server: failed to insert endpoint cap");
 
     log::info!("[ipc-server] waiting for first call");
 
@@ -190,7 +195,8 @@ fn client_task() -> ! {
     let my_id = task::current_task_id().expect("client: no task id");
 
     // Insert an endpoint capability at handle 0.
-    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id));
+    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("server: failed to insert endpoint cap");
 
     log::info!("[ipc-client] sending first call");
     let reply_label = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x1234));
@@ -215,7 +221,8 @@ fn kbd_notif_task() -> ! {
     let my_id = task::current_task_id().expect("kbd-notif: no task id");
 
     // Insert a notification capability at handle 0.
-    task::insert_cap(my_id, ipc::Capability::Notification(notif_id));
+    task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
+        .expect("kbd-notif: failed to insert notification cap");
 
     log::info!("[kbd-notif] waiting for keyboard IRQ via notification");
     let bits = ipc::notification::wait(my_id, notif_id);

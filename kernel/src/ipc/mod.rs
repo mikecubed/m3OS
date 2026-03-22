@@ -16,8 +16,9 @@
 //! and the scheduler picks the next ready task.
 //!
 //! Notification objects handle the one genuinely asynchronous pattern: IRQ
-//! delivery.  An interrupt handler calls [`notification::signal`] (lock-free)
-//! to set a bit; the waiting driver task is woken by the scheduler.
+//! delivery.  An interrupt handler calls [`notification::signal_irq`], which
+//! atomically sets a bit in the lock-free `PENDING` array and signals a
+//! reschedule — no spinlock is acquired in the ISR path.
 //!
 //! # Phase 6 scope
 //!
@@ -45,19 +46,24 @@ pub use notification::NotifId;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// | Number | Operation | Args |
+/// | Number | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|
 /// | 1 | `ipc_recv(ep_cap)` | `arg0 = ep_cap_handle` |
-/// | 2 | `ipc_send(ep_cap, label, d0, d1)` | `arg0..2` |
-/// | 3 | `ipc_call(ep_cap, label, d0, d1)` | `arg0..2` |
-/// | 4 | `ipc_reply(reply_cap, label, d0, d1)` | `arg0..2` |
-/// | 5 | `ipc_reply_recv(reply_cap, label, d0, ep_cap)` | `arg0..3` |
+/// | 2 | `ipc_send(ep_cap, label, data0)` | `arg0..2` |
+/// | 3 | `ipc_call(ep_cap, label, data0)` | `arg0..2` |
+/// | 4 | `ipc_reply(reply_cap, label, data0)` | `arg0..2` |
+/// | 5 | `ipc_reply_recv(reply_cap, label, ep_cap)` | `arg0..2` — ep_cap in arg2 |
 /// | 7 | `notify_wait(notif_cap)` | `arg0 = notif_cap_handle` |
 /// | 8 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
 ///
+/// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
+/// because the syscall ABI currently forwards only 3 arguments through the
+/// assembly stub.  The ep_cap is packed into arg2; the reply's data payload
+/// is not included in the syscall form (kernel threads use the Rust API directly).
+///
 /// Returns the message label (recv/call/reply_recv) or 0 on success, or
 /// `u64::MAX` on any error (invalid handle, wrong type, table full).
-pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, arg4: u64) -> u64 {
+pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::scheduler;
 
     let task_id = match scheduler::current_task_id() {
@@ -114,19 +120,21 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, arg4: 
             }
         }
         5 => {
-            // ipc_reply_recv(reply_cap_handle, label, data0, ep_cap_handle)
+            // ipc_reply_recv(reply_cap_handle, label, ep_cap_handle)
+            // ep_cap is in arg2 (the third syscall argument), fitting the 3-arg
+            // limit of the current syscall asm stub.
             let caller_id = match cap {
                 Capability::Reply(id) => id,
                 _ => return u64::MAX,
             };
-            // Validate the endpoint handle (arg4 carries the ep cap).
-            let ep_id = match scheduler::task_cap(task_id, arg4 as CapHandle) {
+            // Validate the endpoint handle carried in arg2.
+            let ep_id = match scheduler::task_cap(task_id, arg2 as CapHandle) {
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
             // Consume reply cap.
             let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
-            let reply = message::Message::with2(arg1, arg2, 0);
+            let reply = message::Message::new(arg1);
             endpoint::reply_recv(task_id, caller_id, ep_id, reply)
         }
         7 => {

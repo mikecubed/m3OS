@@ -163,7 +163,13 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
             scheduler::deliver_message(receiver, pending.msg);
             if pending.wants_reply {
                 // Insert a one-shot reply cap; sender stays blocked awaiting reply().
-                scheduler::insert_cap(receiver, Capability::Reply(pending.task));
+                // If the table is full, the sender is stranded — log and unblock it.
+                if scheduler::insert_cap(receiver, Capability::Reply(pending.task)).is_err() {
+                    log::warn!(
+                        "[ipc] recv: capability table full, unblocking sender without reply"
+                    );
+                    scheduler::wake_task(pending.task);
+                }
             } else {
                 scheduler::wake_task(pending.task);
             }
@@ -174,7 +180,18 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
         }
     }
     // After waking (or immediate delivery), consume the pending message.
-    scheduler::take_message(receiver).label
+    // None here is always an IPC/scheduler bug: the sender must call
+    // deliver_message before calling wake_task.
+    match scheduler::take_message(receiver) {
+        Some(msg) => msg.label,
+        None => {
+            debug_assert!(
+                false,
+                "[ipc] recv: woke with no pending message — IPC logic bug"
+            );
+            u64::MAX
+        }
+    }
 }
 
 /// Send a message to an endpoint.
@@ -239,7 +256,11 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
             // Insert reply cap into the server's table.
-            scheduler::insert_cap(receiver, Capability::Reply(caller));
+            if scheduler::insert_cap(receiver, Capability::Reply(caller)).is_err() {
+                // Server cap table full — unblock server without reply cap;
+                // server will get a message but no way to reply. Log the error.
+                log::warn!("[ipc] call: server capability table full, reply cap not inserted");
+            }
             scheduler::wake_task(receiver);
         }
         None => {
@@ -249,8 +270,17 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     }
     // Block waiting for reply regardless of whether server was already waiting.
     scheduler::block_current_on_reply();
-    // Woken by reply() — message was delivered into our slot.
-    scheduler::take_message(caller).label
+    // Woken by reply() — reply message was delivered into our slot.
+    match scheduler::take_message(caller) {
+        Some(msg) => msg.label,
+        None => {
+            debug_assert!(
+                false,
+                "[ipc] call: woke with no reply message — IPC logic bug"
+            );
+            u64::MAX
+        }
+    }
 }
 
 /// Reply to a blocked caller.
