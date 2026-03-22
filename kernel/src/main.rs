@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 #![feature(alloc_error_handler)]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
+mod arch;
 mod mm;
 mod serial;
 
@@ -25,6 +27,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("[ostest] Hello from kernel!");
     log::info!("Kernel initialized");
 
+    arch::init();
+    log::info!("[arch] interrupts enabled");
+
     mm::init(boot_info);
 
     // Smoke-test heap allocations (P2-T007)
@@ -37,10 +42,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let s = String::from("heap works");
     log::info!("[mm] String alloc ok: {}", s);
 
+    // Trigger a breakpoint to verify the IDT is working (P3-T007)
+    x86_64::instructions::interrupts::int3();
+    log::info!("[arch] breakpoint exception handled OK");
+
+    // Spin briefly and check that the timer IRQ is firing (P3-T008)
+    for _ in 0..1_000_000u64 {
+        core::hint::spin_loop();
+    }
+    let ticks = arch::x86_64::interrupts::tick_count();
+    log::info!("[arch] timer ticks after spin: {}", ticks);
+
     hlt_loop();
 }
 
-fn hlt_loop() -> ! {
+pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
