@@ -114,7 +114,12 @@ The CPU will use a separate, always-valid stack if we configure the
 // In gdt.rs — IST entry 0 points to the top of a 20 KiB stack.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-static DOUBLE_FAULT_STACK: [u8; 4096 * 5] = [0; 4096 * 5];
+// 16-byte-aligned wrapper — plain [u8; N] is only 1-byte aligned, which
+// violates the x86_64 ABI's 16-byte stack alignment requirement.
+#[repr(align(16))]
+struct AlignedStack([u8; 4096 * 5]);
+
+static DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; 4096 * 5]);
 
 // In the IDT setup:
 idt.double_fault

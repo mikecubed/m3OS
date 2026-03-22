@@ -53,7 +53,7 @@ static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
 
 /// Load the GDT and TSS, and reload the segment registers.
 ///
-/// # Safety
+/// # Note
 ///
 /// Must be called exactly once, before any exception or interrupt can fire.
 pub fn init() {
