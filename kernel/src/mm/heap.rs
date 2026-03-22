@@ -1,5 +1,5 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use linked_list_allocator::LockedHeap;
-use spin::Once;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -9,7 +9,7 @@ pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-static HEAP_INIT: Once<()> = Once::new();
+static HEAP_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Map the kernel heap region and initialise the global allocator.
 ///
@@ -20,10 +20,9 @@ pub fn init_heap(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) {
     assert!(
-        HEAP_INIT.get().is_none(),
+        !HEAP_INIT.swap(true, Ordering::AcqRel),
         "heap::init_heap called more than once"
     );
-    HEAP_INIT.call_once(|| ());
 
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);

@@ -1,4 +1,5 @@
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
@@ -119,7 +120,13 @@ struct LockedFrameAllocator(Mutex<BumpAllocator>);
 static FRAME_ALLOCATOR: LockedFrameAllocator =
     LockedFrameAllocator(Mutex::new(BumpAllocator::new()));
 
+static FRAME_ALLOC_INIT: AtomicBool = AtomicBool::new(false);
+
 pub fn init(regions: &'static [MemoryRegion]) {
+    assert!(
+        !FRAME_ALLOC_INIT.swap(true, Ordering::AcqRel),
+        "frame_allocator::init called more than once"
+    );
     FRAME_ALLOCATOR.0.lock().init(regions);
 }
 

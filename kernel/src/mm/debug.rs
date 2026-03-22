@@ -11,6 +11,8 @@
 use bootloader_api::info::MemoryRegionKind;
 
 const PAGE_SIZE: u64 = 4096;
+/// Must match `frame_allocator::ALLOC_MIN_ADDR`.
+const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
 
 /// Log each memory region (kind, start, end, size in KB) at `debug` level,
 /// followed by an `info`-level summary of usable vs total bytes.
@@ -64,8 +66,9 @@ pub fn log_frame_stats() {
             continue;
         }
 
-        // Align inward: skip partial leading page, drop partial trailing page.
-        let start = align_up(region.start, PAGE_SIZE);
+        // Align inward and clamp to 1 MiB to match the frame allocator's
+        // ALLOC_MIN_ADDR skip — sub-1MiB frames are never handed out.
+        let start = align_up(region.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
         let end = align_down(region.end, PAGE_SIZE);
 
         if end > start {
