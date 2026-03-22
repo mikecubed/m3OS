@@ -30,16 +30,45 @@ graph TD
 
 ## Physical Frame Allocator
 
-A **bitmap allocator** is the simplest approach for a toy kernel:
-- One bit per 4 KiB frame
-- Set = used, clear = free
-- Scan for first free bit on allocation
+### Phase 2 implementation: bump allocator
 
-An alternative is a **free-list** (linked list of free frames stored in the frames
-themselves), which avoids the bitmap overhead but is trickier to implement safely.
+The Phase 2 frame allocator is a **bump allocator** — allocate-only, no free:
 
-For Phase 2 we start with a simple **bump allocator** (allocate-only, no free), then
-upgrade to a proper allocator in Phase 4 when process termination is needed.
+- Iterates `BootInfo::memory_regions` in order, skipping non-`Usable` regions
+- Hands out 4 KiB-aligned frames one at a time by advancing a pointer
+- Never returns a frame once allocated (no deallocation)
+
+```rust
+pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
+    FRAME_ALLOCATOR.0.lock().allocate()
+}
+```
+
+**Limitations:**
+- Cannot reclaim frames — memory consumed during init is gone forever
+- Not suitable for process termination or page-out (Phase 4+)
+- A single freed frame from the middle of a usable region is unrecoverable
+
+### Concepts: physical frames vs virtual pages vs kernel heap
+
+| Concept | What it is | How the kernel uses it |
+|---|---|---|
+| **Physical frame** | A 4 KiB-aligned region of RAM, identified by its physical address | Tracked by the frame allocator; handed to `map_to` when creating mappings |
+| **Virtual page** | A 4 KiB-aligned region of virtual address space | What the kernel and userspace programs actually use; backed by a physical frame via page tables |
+| **Kernel heap** | A fixed virtual address range (`0xFFFF_8000_0000_0000`, 1 MiB) with physical frames mapped behind it | Where `Box`, `Vec`, `Arc`, `String` allocate their backing memory |
+
+The frame allocator works in *physical* space. The page mapper works across the *physical↔virtual* boundary. The heap allocator works entirely in *virtual* space, carving up the already-mapped heap region.
+
+### Future allocator evolution
+
+Mature kernels replace the bump allocator in stages:
+
+1. **Buddy allocator** — splits/merges power-of-two frame blocks; O(log n) alloc/free; easy to reclaim
+2. **SLAB/SLUB allocator** — small-object caching on top of buddy; amortizes `kmalloc` overhead
+3. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries, better throughput for large buffers
+4. **Demand paging / copy-on-write** — don't map physical frames until first access; enables fork() efficiency
+
+For ostest, the bump allocator is sufficient through Phase 5 (userspace entry). Phase 6+ IPC page grants will require a proper frame reclaim path.
 
 ```
 Physical Memory

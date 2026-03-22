@@ -22,6 +22,9 @@ pub fn init(boot_info: &'static mut BootInfo) {
     memory_map::init(static_regions);
     frame_allocator::init(static_regions);
 
+    // Verify reserved regions below 1 MiB are not allocatable (P2-T008)
+    debug::check_reserved_not_allocatable();
+
     let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
     heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
 
