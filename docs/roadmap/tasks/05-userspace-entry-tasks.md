@@ -22,9 +22,9 @@ flowchart LR
 
 ## Validation Tasks
 
-- [ ] P5-T007 Verify a userspace program can print and exit cleanly.
-- [ ] P5-T008 Verify invalid userspace access to kernel memory faults cleanly.
-- [ ] P5-T009 Verify the syscall path returns to the correct userspace location.
+- [x] P5-T007 Verify a userspace program can print and exit cleanly.
+- [x] P5-T008 Verify invalid userspace access to kernel memory faults cleanly.
+- [x] P5-T009 Verify the syscall path returns to the correct userspace location.
 
 ## Documentation Tasks
 
