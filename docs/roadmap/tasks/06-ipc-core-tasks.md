@@ -25,6 +25,7 @@ sequenceDiagram
   - `ipc/capability.rs`: `CapabilityTable` (64 slots), `CapHandle = u32`, `Capability` enum
   - `task/mod.rs`: `Task` now holds `caps: CapabilityTable`
   - Scheduler helpers: `task_cap`, `remove_task_cap`, `insert_cap`
+  - `ipc/mod.rs`: `dispatch()` validates cap handle on every IPC syscall
 - [x] P6-T003 Implement blocking `recv` and `send` primitives.
   - `ipc/endpoint.rs`: `recv()` / `send()` with `block_current_on_{recv,send}` + `wake_task`
   - `task/mod.rs`: `TaskState` gains `BlockedOnRecv`, `BlockedOnSend`, `BlockedOnReply`, `BlockedOnNotif`
@@ -35,23 +36,26 @@ sequenceDiagram
   - `ipc/endpoint.rs`: `reply_recv()` = `reply()` + `recv()` on the server endpoint
 - [x] P6-T006 Implement notification objects for IRQ-style asynchronous events.
   - `ipc/notification.rs`: `signal()` (atomic, ISR-safe) + `wait()` (blocking)
-- [ ] P6-T007 Connect IRQ registration and delivery to the notification mechanism.
-  - Wire `notification::signal_irq(irq)` into `arch/x86_64/interrupts.rs` keyboard handler
-  - Add `sys_notify_register_irq` syscall + kernel API
+- [x] P6-T007 Connect IRQ registration and delivery to the notification mechanism.
+  - `arch/x86_64/interrupts.rs`: `keyboard_handler` calls `notification::signal_irq(1)`
+  - `ipc/notification.rs`: `register_irq(irq, notif_id)` + `NotifRegistry.irq_map`
 
 ## Validation Tasks
 
-- [ ] P6-T008 Verify a client can send a request and receive a reply from a server.
-  - Update `kernel_main` to spawn server + client kernel threads; observe IPC exchange on serial
-- [ ] P6-T009 Verify invalid or forged capability handles are rejected.
-  - Add `debug_assert` / log in syscall dispatch; demonstrate invalid handle returns `u64::MAX`
-- [ ] P6-T010 Verify the server loop can block, reply, and receive the next message predictably.
-  - Multi-message demo: client sends 3 messages; server reply_recv loop handles all
-- [ ] P6-T011 Verify IRQ or signal-style notifications can wake a waiting userspace task.
-  - kbd_server kernel thread blocks on notification; keypress wakes it; scancode logged
+- [x] P6-T008 Verify a client can send a request and receive a reply from a server.
+  - `main.rs`: `client_task` calls `ipc-server` twice; QEMU output: `got first reply label=0xbeef`, `got second reply label=0xcafe`
+- [x] P6-T009 Verify invalid or forged capability handles are rejected.
+  - `ipc/mod.rs` `dispatch()`: `task_cap()` returns `u64::MAX` on invalid handle
+- [x] P6-T010 Verify the server loop can block, reply, and receive the next message predictably.
+  - `main.rs`: `server_task` uses `recv` + `reply_recv` for two sequential calls; verified in QEMU
+- [x] P6-T011 Verify IRQ or signal-style notifications can wake a waiting userspace task.
+  - `main.rs`: `kbd_notif_task` blocks on `notification::wait()`; woken by keyboard IRQ via `signal_irq(1)`
 
 ## Documentation Tasks
 
-- [ ] P6-T012 Document the rendezvous IPC model and why it was chosen for this project.
-- [ ] P6-T013 Document the capability table and the difference between endpoints and notifications.
-- [ ] P6-T014 Add a short note explaining how mature microkernels optimize IPC fast paths.
+- [x] P6-T012 Document the rendezvous IPC model and why it was chosen for this project.
+  - `docs/06-ipc-core.md`: sections "IPC Model" and "Why synchronous rendezvous?"
+- [x] P6-T013 Document the capability table and the difference between endpoints and notifications.
+  - `docs/06-ipc-core.md`: sections "Capability Table" and "Notification Objects"
+- [x] P6-T014 Add a short note explaining how mature microkernels optimize IPC fast paths.
+  - `docs/06-ipc-core.md`: section "How Real Microkernels Differ"
