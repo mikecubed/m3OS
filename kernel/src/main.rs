@@ -8,6 +8,7 @@ extern crate alloc;
 mod arch;
 mod mm;
 mod serial;
+mod task;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
@@ -73,7 +74,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    hlt_loop();
+    // Spawn the idle task first (lowest priority — always ready to run).
+    task::spawn(idle_task, "idle");
+    // Spawn two demo tasks to verify interleaved execution (P4-T007).
+    task::spawn(task_a, "task-a");
+    task::spawn(task_b, "task-b");
+    log::info!("[task] scheduler starting");
+    task::run() // never returns
+}
+
+/// Idle task: halts on each timer tick and immediately yields.
+/// Runs only when no other task is Ready (P4-T009).
+fn idle_task() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+        task::yield_now();
+    }
+}
+
+/// Demo task A — logs a monotonically increasing counter (P4-T007, P4-T008).
+fn task_a() -> ! {
+    let mut n = 0u32;
+    loop {
+        log::info!("[task A] tick {}", n);
+        n += 1;
+        task::yield_now();
+    }
+}
+
+/// Demo task B — logs a monotonically increasing counter (P4-T007, P4-T008).
+fn task_b() -> ! {
+    let mut n = 0u32;
+    loop {
+        log::info!("[task B] tick {}", n);
+        n += 1;
+        task::yield_now();
+    }
 }
 
 pub fn hlt_loop() -> ! {
