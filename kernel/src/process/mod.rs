@@ -38,16 +38,16 @@ impl Process {
 ///   offset 30: ud2                (0F 0B)
 ///   offset 32: "hello world!\n"   (68 65 6C 6C 6F 20 77 6F 72 6C 64 21 0A) 13 bytes
 pub const HELLO_BIN: &[u8] = &[
-    // mov rax, 12  (sys_debug_print)
+    // offset  0: mov rax, 12  (sys_debug_print)
     0xB8, 0x0C, 0x00, 0x00, 0x00,
-    // lea rdi, [rip+0x14]  (points to .msg at offset 32; RIP here = 12)
+    // offset  5: lea rdi, [rip+0x14]  (points to .msg at offset 32; RIP at offset 12)
     0x48, 0x8D, 0x3D, 0x14, 0x00, 0x00, 0x00,
-    // mov rsi, 13  (length of "hello world!\n")
-    0x48, 0xC7, 0xC6, 0x0D, 0x00, 0x00, 0x00, // syscall
-    0x0F, 0x05, // mov rax, 6  (sys_exit)
-    0xB8, 0x06, 0x00, 0x00, 0x00, // xor edi, edi
-    0x31, 0xFF, // syscall
-    0x0F, 0x05, // ud2  (unreachable, safety net)
-    0x0F, 0x0B, // .msg: "hello world!\n"
+    // offset 12: mov rsi, 13  (length of "hello world!\n")
+    0x48, 0xC7, 0xC6, 0x0D, 0x00, 0x00, 0x00, // offset 19: syscall
+    0x0F, 0x05, // offset 21: mov rax, 6  (sys_exit)
+    0xB8, 0x06, 0x00, 0x00, 0x00, // offset 26: xor edi, edi
+    0x31, 0xFF, // offset 28: syscall
+    0x0F, 0x05, // offset 30: ud2  (unreachable, safety net)
+    0x0F, 0x0B, // offset 32: .msg "hello world!\n"
     b'h', b'e', b'l', b'l', b'o', b' ', b'w', b'o', b'r', b'l', b'd', b'!', b'\n',
 ];

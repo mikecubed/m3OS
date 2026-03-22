@@ -55,6 +55,9 @@ global_asm!(
     // --- Switch to kernel stack ---
     "mov [rip + SYSCALL_USER_RSP], rsp",
     "mov rsp, [rip + SYSCALL_STACK_TOP]",
+    // Clear the direction flag — userspace may have set it before the syscall;
+    // Rust string/copy routines assume DF=0 and will corrupt data if it is set.
+    "cld",
     // --- Save return address and user flags ---
     "push rcx", // user RIP  (restored before SYSRETQ)
     "push r11", // user RFLAGS
@@ -66,16 +69,21 @@ global_asm!(
     "push r14",
     "push r15",
     // --- Set up arguments for syscall_handler (SysV calling convention) ---
-    // syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64)
-    //   rdi = number  (was rax)
-    //   rsi = arg0    (was rdi)
-    //   rdx = arg1    (was rsi)
-    //   rcx = arg2    (was rdx)
-    // Note: rcx was already pushed above (user RIP), so it is safe to
+    // Syscall ABI on entry (SYSCALL instruction):
+    //   rax = syscall number,  rdi = arg0, rsi = arg1, rdx = arg2
+    //   (r10/r8/r9 = args 3-5, unused in Phase 5)
+    //
+    // SysV call target: syscall_handler(number, arg0, arg1, arg2)
+    //   rdi = number  (from rax)
+    //   rsi = arg0    (from original rdi, syscall arg0)
+    //   rdx = arg1    (from original rsi, syscall arg1)
+    //   rcx = arg2    (from original rdx, syscall arg2)
+    //
+    // Note: rcx was already pushed above (user RIP) so it is safe to
     // overwrite it here; the saved value on the stack is what we restore.
-    "mov rcx, rdx", // arg2 (SysV 4th param) ← original rdx (syscall arg1)
-    "mov rdx, rsi", // arg1 (SysV 3rd param) ← original rsi (syscall arg0)
-    "mov rsi, rdi", // arg0 (SysV 2nd param) ← original rdi (syscall arg... wait shifted)
+    "mov rcx, rdx", // arg2 (SysV 4th param) ← original rdx (syscall arg2)
+    "mov rdx, rsi", // arg1 (SysV 3rd param) ← original rsi (syscall arg1)
+    "mov rsi, rdi", // arg0 (SysV 2nd param) ← original rdi (syscall arg0)
     "mov rdi, rax", // number (SysV 1st param) ← syscall number
     "call syscall_handler",
     // Return value is in RAX.
@@ -126,21 +134,29 @@ pub extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, _arg2: u64)
 /// # Safety (internal)
 /// In Phase 5 the kernel and user share the same address space, so the
 /// virtual address is directly accessible from ring 0.  We cap `len` at
-/// 4096 to limit the blast radius of a misbehaving caller.
+/// 4096 and validate against the **actual mapped user subranges** (code pages
+/// and stack pages) to avoid ring-0 page faults from pointers into the large
+/// unmapped gap between those regions.
 fn sys_debug_print(ptr: u64, len: u64) -> u64 {
+    use crate::mm::user_space::{
+        USER_CODE_BASE, USER_CODE_PAGES, USER_STACK_PAGES, USER_STACK_TOP,
+    };
+
     if len > 4096 {
         return u64::MAX;
     }
-    // Reject pointers outside the known mapped user address range to avoid
-    // kernel-mode page faults from invalid userspace pointers.
-    // Range covers code (0x400000) through stack top (0x8000_0000).
-    // Keep in sync with mm::user_space::{USER_CODE_BASE, USER_STACK_TOP}.
-    const USER_ADDR_MIN: u64 = 0x0040_0000;
-    const USER_ADDR_MAX: u64 = 0x8000_0000;
-    if ptr < USER_ADDR_MIN || ptr.saturating_add(len) > USER_ADDR_MAX {
+    // Reject pointers outside the actual mapped user regions.
+    // Phase 5 maps two subranges; anything in the gap between them is unmapped
+    // and would trigger a kernel-mode page fault (which halts the machine).
+    let code_end = USER_CODE_BASE + USER_CODE_PAGES * 4096;
+    let stack_start = USER_STACK_TOP - USER_STACK_PAGES * 4096;
+    let ptr_end = ptr.saturating_add(len);
+    let in_code = ptr >= USER_CODE_BASE && ptr_end <= code_end;
+    let in_stack = ptr >= stack_start && ptr_end <= USER_STACK_TOP;
+    if !in_code && !in_stack {
         return u64::MAX;
     }
-    // Safety: pointer is within the mapped user region, len is capped at 4096,
+    // Safety: pointer is within a mapped user region, len is capped at 4096,
     // and kernel + user share one address space in Phase 5.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     if let Ok(s) = core::str::from_utf8(bytes) {

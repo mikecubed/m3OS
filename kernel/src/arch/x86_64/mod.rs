@@ -48,10 +48,10 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
         "push {cs}",
         "push {rip}",
         "iretq",
-        ss     = in(reg) u64::from(gdt::USER_DATA_SELECTOR),
+        ss     = in(reg) u64::from(gdt::user_data_selector().0),
         rsp    = in(reg) user_stack_top,
         rflags = const 0x202u64, // IF=1 (bit 9) + reserved bit 1 (always must be 1)
-        cs     = in(reg) u64::from(gdt::USER_CODE_SELECTOR),
+        cs     = in(reg) u64::from(gdt::user_code_selector().0),
         rip    = in(reg) entry,
         options(noreturn)
     )

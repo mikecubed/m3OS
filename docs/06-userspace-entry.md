@@ -293,8 +293,9 @@ The `USER_ACCESSIBLE` bit (bit 2) in every level of the page table hierarchy
 must be set for a page to be reachable from ring 3.  The bootloader maps all
 kernel memory _without_ this bit.  If ring-3 code attempts to read or write a
 kernel address, the CPU raises a Page Fault (#PF) before any data is
-transferred.  The kernel's page-fault handler then terminates the offending
-process.
+transferred.  In Phase 5 the kernel's page-fault handler prints debug
+information and then halts the machine via `hlt_loop()`.  Per-process fault
+recovery and termination are deferred to a later phase.
 
 ---
 

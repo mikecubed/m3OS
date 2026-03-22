@@ -33,13 +33,23 @@ pub const USER_STACK_PAGES: u64 = 4; // 16 KiB
 ///
 /// # Safety
 /// `mapper` must be the currently-active page table and `virt_base` must not
-/// already be mapped.
+/// already be mapped.  `virt_base` must be 4 KiB-aligned; misaligned bases
+/// cause `Page::containing_address` to round down and map the wrong page.
+///
+/// # Error handling
+/// If `map_to` fails after a frame has been allocated, that frame is leaked
+/// (the frame allocator does not support deallocation in Phase 5).  A mapping
+/// failure at boot is unrecoverable regardless.
 pub unsafe fn map_user_pages(
     mapper: &mut OffsetPageTable,
     virt_base: u64,
     n: u64,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    debug_assert!(
+        virt_base.is_multiple_of(4096),
+        "map_user_pages: virt_base must be 4 KiB-aligned"
+    );
     let mut alloc = GlobalFrameAlloc;
     for i in 0..n {
         let vaddr = VirtAddr::new(virt_base + i * 4096);
@@ -58,12 +68,20 @@ pub unsafe fn map_user_pages(
 ///
 /// Unlike `map_user_pages`, this maps the **given** physical frames rather than
 /// allocating new ones.  Used to map the embedded hello binary at its load address.
+///
+/// # Safety
+/// `virt_base` must be 4 KiB-aligned; misaligned bases cause
+/// `Page::containing_address` to round down and map the wrong page.
 pub unsafe fn map_user_frames(
     mapper: &mut OffsetPageTable,
     virt_base: u64,
     frames: &[PhysFrame<Size4KiB>],
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
+    debug_assert!(
+        virt_base.is_multiple_of(4096),
+        "map_user_frames: virt_base must be 4 KiB-aligned"
+    );
     let mut alloc = GlobalFrameAlloc;
     for (i, &frame) in frames.iter().enumerate() {
         let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
@@ -76,11 +94,11 @@ pub unsafe fn map_user_frames(
     Ok(())
 }
 
-/// Copy `src` bytes into the user-mapped region at `virt_base`.
+/// Copy `src` bytes into the user code region at `virt_base`.
 ///
 /// The region must already be mapped (e.g. via `map_user_pages`).
-/// Returns an error if `src` is larger than the reserved user code region
-/// (`USER_CODE_PAGES * 4096` bytes), preventing writes into unmapped memory.
+/// The bounds check is sized to the **code** region (`USER_CODE_PAGES * 4096`);
+/// do not use this helper to write to the stack or any other user region.
 pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
     let max_bytes = (USER_CODE_PAGES * 4096) as usize;
     if src.len() > max_bytes {
@@ -94,11 +112,13 @@ pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
 
 /// Set up code and stack regions for a userspace process.
 ///
-/// Maps USER_CODE_PAGES pages at USER_CODE_BASE (executable, user-accessible, read-only)
-/// and USER_STACK_PAGES pages below USER_STACK_TOP (read-write, user-accessible).
+/// Maps USER_CODE_PAGES pages at USER_CODE_BASE (read-write + executable, user-accessible)
+/// and USER_STACK_PAGES pages below USER_STACK_TOP (read-write, no-execute, user-accessible).
 ///
-/// Returns the page table mapper that was used (must be rebuilt each call since
-/// we're reusing the kernel's active table).
+/// Code pages are mapped writable so the kernel can copy the binary before `iretq`
+/// (CR0.WP blocks ring-0 writes to read-only pages).  W^X enforcement is deferred to Phase 6+.
+///
+/// Returns `Ok(())` on success, or an error string if any mapping operation fails.
 pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
     // Code: user-accessible, present, writable (no NO_EXECUTE flag → executable).
     // WRITABLE is required so the kernel can copy the binary into these pages
