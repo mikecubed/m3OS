@@ -1,0 +1,112 @@
+//! Helpers for mapping userspace memory regions into the kernel page tables.
+//!
+//! Phase 5 uses a shared address space (kernel + user pages in the same PML4).
+//! User pages are mapped with the USER_ACCESSIBLE flag so ring-3 code can access them.
+//! Kernel pages remain inaccessible from ring 3 due to their page-table permissions.
+
+// These items are public API for Phase 5 integration; callers are added in a later
+// track (main.rs wiring).  Suppress dead-code lints without weakening -D warnings.
+#![allow(dead_code)]
+
+use x86_64::{
+    structures::paging::{Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB},
+    VirtAddr,
+};
+
+use super::{frame_allocator, paging::GlobalFrameAlloc};
+
+/// Virtual base address where userspace code is loaded.
+pub const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
+
+/// Number of pages to reserve for userspace code.
+pub const USER_CODE_PAGES: u64 = 4; // 16 KiB max
+
+/// Virtual address of userspace stack top.
+pub const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000; // 2 GiB
+
+/// Number of pages for userspace stack.
+pub const USER_STACK_PAGES: u64 = 4; // 16 KiB
+
+/// Map `n` pages of physical memory at `virt_base` with user-accessible flags.
+///
+/// Allocates fresh physical frames for each page.
+///
+/// # Safety
+/// `mapper` must be the currently-active page table and `virt_base` must not
+/// already be mapped.
+pub unsafe fn map_user_pages(
+    mapper: &mut OffsetPageTable,
+    virt_base: u64,
+    n: u64,
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let mut alloc = GlobalFrameAlloc;
+    for i in 0..n {
+        let vaddr = VirtAddr::new(virt_base + i * 4096);
+        let page: Page<Size4KiB> = Page::containing_address(vaddr);
+        let frame = frame_allocator::allocate_frame().ok_or("out of physical frames")?;
+        // Safety: frame is freshly allocated, vaddr is within user range.
+        mapper
+            .map_to(page, frame, flags, &mut alloc)
+            .map_err(|_| "map_to failed")?
+            .flush();
+    }
+    Ok(())
+}
+
+/// Map a contiguous run of physical frames (e.g. for embedded code bytes) at `virt_base`.
+///
+/// Unlike `map_user_pages`, this maps the **given** physical frames rather than
+/// allocating new ones.  Used to map the embedded hello binary at its load address.
+pub unsafe fn map_user_frames(
+    mapper: &mut OffsetPageTable,
+    virt_base: u64,
+    frames: &[PhysFrame<Size4KiB>],
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let mut alloc = GlobalFrameAlloc;
+    for (i, &frame) in frames.iter().enumerate() {
+        let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
+        let page: Page<Size4KiB> = Page::containing_address(vaddr);
+        mapper
+            .map_to(page, frame, flags, &mut alloc)
+            .map_err(|_| "map_to failed")?
+            .flush();
+    }
+    Ok(())
+}
+
+/// Copy `src` bytes into the user-mapped region at `virt_base`.
+///
+/// The region must already be mapped (e.g. via `map_user_pages`).
+pub fn copy_to_user(virt_base: u64, src: &[u8]) {
+    let dst = unsafe { core::slice::from_raw_parts_mut(virt_base as *mut u8, src.len()) };
+    dst.copy_from_slice(src);
+}
+
+/// Set up code and stack regions for a userspace process.
+///
+/// Maps USER_CODE_PAGES pages at USER_CODE_BASE (executable, user-accessible, read-only)
+/// and USER_STACK_PAGES pages below USER_STACK_TOP (read-write, user-accessible).
+///
+/// Returns the page table mapper that was used (must be rebuilt each call since
+/// we're reusing the kernel's active table).
+pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
+    // Code: user-accessible, present, executable (no NO_EXECUTE flag)
+    let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+
+    // Stack: user-accessible, present, writable, no-execute
+    let stack_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    map_user_pages(mapper, USER_CODE_BASE, USER_CODE_PAGES, code_flags)?;
+    map_user_pages(
+        mapper,
+        USER_STACK_TOP - USER_STACK_PAGES * 4096,
+        USER_STACK_PAGES,
+        stack_flags,
+    )?;
+    Ok(())
+}
