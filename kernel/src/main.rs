@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod arch;
+mod ipc;
 mod mm;
 mod process;
 mod serial;
