@@ -44,6 +44,7 @@ flowchart TD
     P7 --> P8
     P7 --> P9
     P8 --> P9
+    P9 -.->|optional| P10["Phase 10 Tasks"]
 ```
 
 ## Task Documents
@@ -59,6 +60,7 @@ flowchart TD
 | 7 | Core servers | [Phase 7 Tasks](./07-core-servers-tasks.md) |
 | 8 | Storage and VFS | [Phase 8 Tasks](./08-storage-and-vfs-tasks.md) |
 | 9 | Framebuffer and shell | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
+| 10 *(optional)* | Secure Boot signing | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
 
 ## Suggested Usage
 
