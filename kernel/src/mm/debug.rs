@@ -11,8 +11,7 @@
 use bootloader_api::info::MemoryRegionKind;
 
 const PAGE_SIZE: u64 = 4096;
-/// Must match `frame_allocator::ALLOC_MIN_ADDR`.
-const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
+use super::frame_allocator::ALLOC_MIN_ADDR;
 
 /// Log each memory region (kind, start, end, size in KB) at `debug` level,
 /// followed by an `info`-level summary of usable vs total bytes.

@@ -10,7 +10,7 @@ const PAGE_SIZE: u64 = 4096;
 /// Some UEFI/QEMU memory maps mark conventional low memory as Usable, but
 /// those frames may hold BIOS data area remnants or be used by UEFI firmware
 /// code paths that run before ExitBootServices completes.
-const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
+pub(crate) const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
 
 struct BumpAllocator {
     regions: Option<&'static [MemoryRegion]>,
