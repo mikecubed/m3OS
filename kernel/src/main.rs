@@ -53,23 +53,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         log::info!("[arch] breakpoint exception handled OK");
     }
 
-    // Busy-wait for at least one timer tick to confirm IRQs are firing (P3-T008).
-    // Using spin_loop (not hlt) so we keep checking even if IRQs aren't firing —
-    // hlt would block indefinitely on a misconfigured timer.
-    let start = arch::x86_64::interrupts::tick_count();
-    let mut ticked = false;
-    for _ in 0..10_000_000u32 {
-        core::hint::spin_loop();
-        if arch::x86_64::interrupts::tick_count().wrapping_sub(start) >= 1 {
-            ticked = true;
-            break;
+    // Verify timer IRQ is firing (P3-T008) — debug builds only so normal boots
+    // are not slowed by the busy-wait on release hardware.
+    if cfg!(debug_assertions) {
+        let start = arch::x86_64::interrupts::tick_count();
+        let mut ticked = false;
+        for _ in 0..10_000_000u32 {
+            core::hint::spin_loop();
+            if arch::x86_64::interrupts::tick_count().wrapping_sub(start) >= 1 {
+                ticked = true;
+                break;
+            }
         }
-    }
-    let ticks = arch::x86_64::interrupts::tick_count();
-    if ticked {
-        log::info!("[arch] timer ticks after wait: {}", ticks);
-    } else {
-        log::warn!("[arch] no timer ticks observed — IRQs may not be firing");
+        let ticks = arch::x86_64::interrupts::tick_count();
+        if ticked {
+            log::info!("[arch] timer ticks after wait: {}", ticks);
+        } else {
+            log::warn!("[arch] no timer ticks observed — IRQs may not be firing");
+        }
     }
 
     hlt_loop();

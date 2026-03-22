@@ -15,14 +15,22 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// Size of the dedicated double-fault stack.
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 
+/// 16-byte-aligned wrapper for the double-fault stack.
+///
+/// x86_64 ABI requires the stack pointer to be 16-byte aligned before a CALL.
+/// Using a plain `[u8; N]` only guarantees 1-byte alignment; wrapping it here
+/// ensures the IST pointer we write into the TSS is always correctly aligned.
+#[repr(align(16))]
+struct AlignedStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+
 /// Static double-fault stack. Must be static so its address is valid for the
 /// entire lifetime of the kernel.
-static DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
+static DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]);
 
 static TSS: Lazy<TaskStateSegment> = Lazy::new(|| {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.as_ptr());
+        let stack_start = VirtAddr::from_ptr(DOUBLE_FAULT_STACK.0.as_ptr());
         // Stack grows downward, so the "top" is start + size.
         stack_start + DOUBLE_FAULT_STACK_SIZE as u64
     };

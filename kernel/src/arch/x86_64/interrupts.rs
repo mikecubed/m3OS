@@ -98,7 +98,13 @@ static PICS: Mutex<pic8259::ChainedPics> = Mutex::new(unsafe { pic8259::ChainedP
 /// Calling it out of order can cause IRQs to fire without a registered handler,
 /// resulting in a triple fault.
 pub unsafe fn init_pics() {
-    PICS.lock().initialize();
+    let mut pics = PICS.lock();
+    pics.initialize();
+    // Mask every IRQ line except IRQ0 (timer) and IRQ1 (keyboard).
+    // A set bit disables the line. Any unmasked line without an IDT handler
+    // would vector into an uninitialized entry and cause a triple fault.
+    // master: bits 2–7 masked (0b1111_1100), slave: all 8 lines masked.
+    pics.write_masks(0b1111_1100, 0b1111_1111);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +149,7 @@ pub fn read_scancode() -> Option<u8> {
     }
     // Safety: single consumer; head is only advanced here and never overtakes tail.
     let byte = unsafe { SCANCODE_BUF[head] };
-    SCANCODE_BUF_HEAD.store((head + 1) % SCANCODE_BUF_SIZE, Ordering::Release);
+    SCANCODE_BUF_HEAD.store((head + 1) & (SCANCODE_BUF_SIZE - 1), Ordering::Release);
     Some(byte)
 }
 
@@ -154,7 +160,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let scancode: u8 = unsafe { port.read() };
 
     let tail = SCANCODE_BUF_TAIL.load(Ordering::Relaxed);
-    let next_tail = (tail + 1) % SCANCODE_BUF_SIZE;
+    let next_tail = (tail + 1) & (SCANCODE_BUF_SIZE - 1);
     if next_tail != SCANCODE_BUF_HEAD.load(Ordering::Acquire) {
         // Safety: single producer; tail is only advanced here and never overtakes head.
         unsafe { SCANCODE_BUF[tail] = scancode };
