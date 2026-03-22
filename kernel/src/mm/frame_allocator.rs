@@ -113,11 +113,32 @@ static FRAME_ALLOCATOR: LockedFrameAllocator =
     LockedFrameAllocator(Mutex::new(BumpAllocator::new()));
 
 pub fn init(regions: &'static [MemoryRegion]) {
+    // Verify the allocator invariant: no Usable region starts below 1 MiB.
+    // The first MiB is BIOS/UEFI reserved; handing it out would corrupt real-mode
+    // data structures. Panic early if the bootloader gives us something unexpected.
+    const ONE_MIB: u64 = 0x0010_0000;
+    for region in regions {
+        if region.kind == MemoryRegionKind::Usable {
+            assert!(
+                region.start >= ONE_MIB,
+                "[mm] frame allocator: Usable region {:#x}..{:#x} starts below 1 MiB — \
+                 bootloader memory map is unexpected",
+                region.start,
+                region.end,
+            );
+        }
+    }
+
     FRAME_ALLOCATOR.0.lock().init(regions);
 }
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
     FRAME_ALLOCATOR.0.lock().allocate()
+}
+
+/// Returns how many frames have been handed out since init.
+pub fn allocated_count() -> usize {
+    FRAME_ALLOCATOR.0.lock().frames_allocated
 }
 
 #[inline]

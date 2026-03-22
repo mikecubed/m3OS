@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ostest** is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Goal is a functional userspace shell. Currently at Phase 1 (boot foundation complete).
+**ostest** is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Goal is a functional userspace shell. Currently at Phase 2 (memory basics complete).
 
 ## Build & Run
 
@@ -15,8 +15,8 @@ cargo xtask run          # build + launch in QEMU (primary dev workflow)
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask check        # clippy (-D warnings) + rustfmt check
 cargo xtask fmt --fix    # auto-format all kernel source
-cargo xtask test         # run all kernel tests in QEMU
-cargo xtask test --test <name>  # run a single test
+cargo xtask test         # run all kernel tests in QEMU (Phase 3+, not yet implemented)
+cargo xtask test --test <name>  # run a single test (Phase 3+, not yet implemented)
 ```
 
 Tests cannot use `cargo test` — the kernel is `no_std` and tests run inside QEMU via the xtask harness.

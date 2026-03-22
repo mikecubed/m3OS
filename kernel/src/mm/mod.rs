@@ -7,12 +7,12 @@ pub mod paging;
 use bootloader_api::BootInfo;
 
 pub fn init(boot_info: &'static mut BootInfo) {
-    let regions = &*boot_info.memory_regions;
+    // End mutable access; coerce &'static mut → &'static so the borrow checker
+    // tracks that we no longer hold exclusive access to BootInfo.
+    let boot_info: &'static BootInfo = boot_info;
 
-    // SAFETY: The bootloader guarantees this slice is valid for the lifetime of the kernel.
-    // We transmute to 'static because BootInfo is &'static mut BootInfo.
-    let static_regions: &'static [bootloader_api::info::MemoryRegion] =
-        unsafe { core::mem::transmute(regions) };
+    // The bootloader guarantees this slice is valid for the kernel's lifetime.
+    let static_regions: &'static [bootloader_api::info::MemoryRegion] = &boot_info.memory_regions;
 
     let phys_offset = boot_info
         .physical_memory_offset
@@ -22,8 +22,8 @@ pub fn init(boot_info: &'static mut BootInfo) {
     memory_map::init(static_regions);
     frame_allocator::init(static_regions);
 
-    // Verify reserved regions below 1 MiB are not allocatable (P2-T008)
-    debug::check_reserved_not_allocatable();
+    // Log reserved regions below 1 MiB to confirm allocator skips them (P2-T008)
+    debug::log_reserved_below_1mib();
 
     let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
     heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);

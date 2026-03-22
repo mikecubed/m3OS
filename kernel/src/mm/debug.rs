@@ -2,8 +2,8 @@
 //!
 //! # Precondition
 //! All functions in this module call `super::memory_map::regions()`, which panics
-//! if invoked before `memory_map::init()` has been called. Only use these helpers
-//! after `mm::init()` has completed.
+//! if invoked before `memory_map::init()` has been called. Helpers may be used
+//! as soon as `memory_map::init()` has completed (i.e. during or after `mm::init()`).
 
 // These are on-demand diagnostic helpers, not all called during normal boot.
 #![allow(dead_code)]
@@ -49,10 +49,8 @@ pub fn log_memory_map() {
     );
 }
 
-/// Log a summary of usable physical memory derived from the memory map.
-///
-/// Reports the total number of page-aligned 4 KiB frames available across
-/// all `Usable` regions, and the total usable memory in MiB.
+/// Log a summary of usable physical memory derived from the memory map,
+/// including how many frames have been consumed by the allocator so far.
 ///
 /// # Panics
 /// Panics if `memory_map::init()` has not been called yet.
@@ -83,23 +81,25 @@ pub fn log_frame_stats() {
     }
 
     let total_mib = (total_frames * PAGE_SIZE) / (1024 * 1024);
+    let allocated = super::frame_allocator::allocated_count();
 
     log::info!(
-        "[mm/debug] frame stats: {} usable frames ({} MiB)",
+        "[mm/debug] frame stats: {}/{} frames allocated ({} MiB total usable)",
+        allocated,
         total_frames,
         total_mib,
     );
 }
 
-/// Warn about any non-`Usable` region whose start address is below 1 MiB.
+/// Log non-`Usable` regions whose start address is below 1 MiB.
 ///
-/// These regions cover legacy real-mode structures (IVT, BDA, EBDA, VGA,
-/// ROM) that must never be handed out by the frame allocator. A warning
-/// here confirms the allocator skips them correctly.
+/// These regions cover legacy real-mode structures (IVT, BDA, EBDA, VGA, ROM)
+/// that must never be handed out by the frame allocator. Finding them here
+/// confirms they exist; the allocator skips them by only touching `Usable` regions.
 ///
 /// # Panics
 /// Panics if `memory_map::init()` has not been called yet.
-pub fn check_reserved_not_allocatable() {
+pub fn log_reserved_below_1mib() {
     const ONE_MIB: u64 = 0x0010_0000;
 
     let regions = super::memory_map::regions();
@@ -108,7 +108,7 @@ pub fn check_reserved_not_allocatable() {
     for region in regions {
         if region.kind != MemoryRegionKind::Usable && region.start < ONE_MIB {
             log::debug!(
-                "[mm/debug] WARN: non-usable region below 1 MiB: {:?} {:#010x}..{:#010x}",
+                "[mm/debug] reserved below 1 MiB: {:?} {:#010x}..{:#010x}",
                 region.kind,
                 region.start,
                 region.end,
@@ -119,13 +119,10 @@ pub fn check_reserved_not_allocatable() {
 
     if found {
         log::info!(
-            "[mm/debug] check_reserved_not_allocatable: non-usable regions below 1 MiB present \
-             (expected - allocator must not hand these out)"
+            "[mm/debug] reserved regions below 1 MiB present (expected — allocator skips non-Usable)"
         );
     } else {
-        log::info!(
-            "[mm/debug] check_reserved_not_allocatable: no non-usable regions below 1 MiB found"
-        );
+        log::info!("[mm/debug] no reserved regions below 1 MiB found");
     }
 }
 

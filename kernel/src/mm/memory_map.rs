@@ -1,11 +1,10 @@
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use spin::Once;
 
-static mut MEMORY_REGIONS: Option<&'static [MemoryRegion]> = None;
+static MEMORY_REGIONS: Once<&'static [MemoryRegion]> = Once::new();
 
 pub fn init(regions: &'static [MemoryRegion]) {
-    unsafe {
-        MEMORY_REGIONS = Some(regions);
-    }
+    MEMORY_REGIONS.call_once(|| regions);
 
     let total = regions.len();
     let mut usable = 0usize;
@@ -32,5 +31,5 @@ pub fn init(regions: &'static [MemoryRegion]) {
 }
 
 pub fn regions() -> &'static [MemoryRegion] {
-    unsafe { MEMORY_REGIONS.expect("memory_map::init not called") }
+    MEMORY_REGIONS.get().expect("memory_map::init not called")
 }
