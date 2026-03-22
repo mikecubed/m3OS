@@ -1,5 +1,10 @@
 //! Kernel task management: task structure, stacks, and context switching.
 //!
+//! Phase 5 does not use the kernel scheduler directly — the main thread enters
+//! userspace via `arch::enter_userspace` and never returns.  The task subsystem
+//! is preserved here for Phase 6+ (IPC, blocking, multi-task userspace).
+#![allow(dead_code)]
+//!
 //! # Context-switch contract
 //!
 //! [`switch_context`] saves and restores the six callee-saved registers
@@ -42,6 +47,7 @@ use alloc::boxed::Box;
 
 pub mod scheduler;
 
+#[allow(unused_imports)]
 pub use scheduler::{run, signal_reschedule, spawn, spawn_idle, yield_now};
 
 // ---------------------------------------------------------------------------

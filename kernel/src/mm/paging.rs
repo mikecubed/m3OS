@@ -34,6 +34,22 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     &mut *page_table_ptr
 }
 
+/// Reconstruct the page-table mapper from the stored physical memory offset.
+///
+/// `OffsetPageTable::new` wraps the currently-active CR3 page table.  Only one
+/// mapper may be live at a time — the caller must not hold another mapper when
+/// calling this function.
+///
+/// # Safety
+///
+/// Aliasing `&mut PageTable` is UB.  Call only when no other `OffsetPageTable`
+/// is alive (e.g. after `mm::init` has returned and dropped its local mapper).
+pub unsafe fn get_mapper() -> OffsetPageTable<'static> {
+    let phys_offset = x86_64::VirtAddr::new(super::phys_offset());
+    let level_4_table = active_level_4_table(phys_offset);
+    OffsetPageTable::new(level_4_table, phys_offset)
+}
+
 /// A frame allocator wrapper that delegates to the global bump allocator.
 /// Used during heap setup so `map_to` has a frame allocator to call.
 pub struct GlobalFrameAlloc;
