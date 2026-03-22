@@ -119,7 +119,9 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 #[repr(align(16))]
 struct AlignedStack([u8; 4096 * 5]);
 
-static DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; 4096 * 5]);
+// `static mut` is required: an immutable static may be placed in read-only
+// memory (.rodata). The CPU writes to this memory during a double fault.
+static mut DOUBLE_FAULT_STACK: AlignedStack = AlignedStack([0; 4096 * 5]);
 
 // In the IDT setup:
 idt.double_fault

@@ -13,7 +13,7 @@ flowchart LR
     Sign --> Signed["bootx64-signed.efi"]
     Signed --> USB["bootable USB"]
     USB --> FW["UEFI firmware<br/>Secure Boot ON"]
-    Enrolled["enrolled cert<br/>(MOK db)"] --> FW
+    Enrolled["enrolled cert<br/>(UEFI db or MOK)"] --> FW
     FW --> Boot["kernel boots"]
 ```
 
@@ -48,8 +48,37 @@ screen. Complete Phase 9 first so there is something visible to confirm the boot
 1. Generate a 4096-bit RSA key pair and self-signed X.509 certificate with `openssl`.
 2. Add a `sign` subcommand to `xtask` that calls `sbsign` on the EFI binary produced
    by the `image` subcommand.
-3. Document the one-time MOK enrollment process (`mokutil --import` + reboot).
-4. Verify the signed binary boots with `mokutil --sb-state` reporting Secure Boot on.
+3. Document the one-time certificate enrollment. Two paths exist — choose based on the
+   target machine (see below).
+4. Verify the signed binary boots with `mokutil --sb-state` or `dmesg` reporting
+   Secure Boot enabled.
+
+### Certificate Enrollment: Two Paths
+
+**Path A — Via shim's MOK database (easier on most Linux systems)**
+
+Most Linux machines already boot through shim. On these systems `mokutil` can enroll
+your certificate into shim's MOK (Machine Owner Key) list, which shim checks before
+handing off to the next stage. This does **not** add the key to the UEFI firmware's
+own signature database.
+
+```bash
+mokutil --import ostest.crt   # run on the target machine
+# reboot → MOKManager prompt appears → enroll → reboot again
+```
+
+**Path B — Direct UEFI firmware db enrollment (no shim required)**
+
+On machines where you control the UEFI firmware, you can add your certificate directly
+to the firmware's `db` (allowed signatures) database. This works independently of shim.
+
+- Put the firmware into **Setup Mode** (clear the Platform Key via UEFI setup).
+- Enroll your own PK, KEK, and db certificates using `efi-updatevar` or the firmware
+  setup UI.
+- The firmware then trusts your signed binary directly, without shim.
+
+This gives full control but overwrites the OEM key hierarchy, which may affect Windows
+Secure Boot on dual-boot machines.
 
 ## Acceptance Criteria
 
@@ -81,8 +110,12 @@ The shim approach requires:
 - Signing the shim binary with Microsoft's key.
 - The shim then trusts the distro's own key for subsequent stages.
 
-For a personal or embedded OS, bypassing shim and enrolling a self-signed key directly
-into the firmware's MOK database is simpler and equally secure for single-machine use.
+For a personal OS there are two practical options:
+- **Via shim's MOK** (`mokutil --import`): the easiest path on machines that already
+  boot through shim. The key lives in shim's MOK list, not the UEFI firmware db.
+- **Direct UEFI db enrollment** (`efi-updatevar` or firmware setup): adds the key to
+  the firmware's own signature database, works without shim, but requires putting the
+  firmware into Setup Mode and re-enrolling the PK/KEK hierarchy.
 
 Windows uses a similar hierarchy but its keys are enrolled by the OEM at manufacturing
 time. End users cannot easily add their own keys on consumer hardware that ships with

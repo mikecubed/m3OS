@@ -38,8 +38,10 @@ flowchart LR
 
 - [ ] P10-T007 Verify `sbverify --cert ostest.crt bootx64-signed.efi` exits 0.
 - [ ] P10-T008 Verify the unsigned binary fails `sbverify` against the cert (expected).
-- [ ] P10-T009 On a real machine with Secure Boot enabled: enroll the cert via
-  `mokutil --import ostest.crt`, reboot through MOKManager, confirm boot succeeds.
+- [ ] P10-T009 On a real machine with Secure Boot enabled: enroll the cert using one
+  of the two paths documented in the milestone page — via shim's MOK (`mokutil
+  --import ostest.crt` + reboot through MOKManager) **or** via direct UEFI db
+  enrollment (`efi-updatevar` / firmware setup). Confirm boot succeeds.
 - [ ] P10-T010 On the same machine: temporarily disable the enrolled key and confirm
   the signed binary is rejected by firmware (Secure Boot is actually enforcing).
 
@@ -48,9 +50,11 @@ flowchart LR
 - [ ] P10-T011 Add a `docs/10-secure-boot.md` implementation page covering:
   - the UEFI Secure Boot key hierarchy (PK / KEK / db / dbx)
   - the `gen-secure-boot-keys.sh` + `cargo xtask sign` workflow end-to-end
-  - the MOK enrollment steps (`mokutil --import`, reboot, MOKManager UI)
+  - both enrollment paths clearly: shim MOK (`mokutil --import`) vs direct UEFI db
+    (`efi-updatevar` / firmware setup), with when to use each
   - how to verify Secure Boot state (`mokutil --sb-state`, `dmesg | grep -i secure`)
-- [ ] P10-T012 Add a short note in `docs/10-secure-boot.md` explaining the shim chain
-  and why it is not needed for personal use.
+- [ ] P10-T012 Add a short note in `docs/10-secure-boot.md` explaining what shim is,
+  that `mokutil` manages shim's MOK list (not the UEFI firmware db), and how
+  distribution Secure Boot differs from personal enrollment.
 - [ ] P10-T013 Update `docs/roadmap/README.md` and `docs/08-roadmap.md` to mark
   Phase 10 complete once validation passes on real hardware.
