@@ -7,18 +7,12 @@ A toy bootable operating system written in Rust, targeting **x86_64** with a **m
 > Requires: nightly Rust, QEMU, OVMF
 
 ```bash
-# Build and run in headless QEMU (serial only)
+# Build and run in QEMU
 cargo +nightly xtask run
-
-# Build and run in QEMU with a window for framebuffer + keyboard input
-cargo +nightly xtask run-gui
 
 # Build a bootable disk image (UEFI raw + VHDX for Hyper-V)
 cargo +nightly xtask image
 ```
-
-`run-gui` launches QEMU with an SDL window so the guest PS/2 keyboard can be used.
-Click the QEMU window to grab input, then press `Ctrl+Alt+G` to release it.
 
 ## Project Layout
 

@@ -13,12 +13,6 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QemuDisplayMode {
-    Headless,
-    Gui,
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
@@ -34,7 +28,6 @@ fn main() {
             cmd_image(&image_args);
         }
         Some("run") => cmd_run(),
-        Some("run-gui") => cmd_run_gui(),
         Some("check") => cmd_check(),
         Some("fmt") => {
             let fix = args.iter().any(|a| a == "--fix");
@@ -68,7 +61,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|check|fmt [--fix]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -177,46 +170,16 @@ fn find_ovmf() -> PathBuf {
     std::process::exit(1);
 }
 
-fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
-    let mut args = vec![
-        "-bios".to_string(),
-        ovmf.display().to_string(),
-        "-drive".to_string(),
-        format!("format=raw,file={}", uefi_image.display()),
-        "-serial".to_string(),
-        "stdio".to_string(),
-    ];
-
-    match display_mode {
-        QemuDisplayMode::Headless => {
-            args.extend(["-display".to_string(), "none".to_string()]);
-        }
-        QemuDisplayMode::Gui => {
-            args.extend([
-                "-display".to_string(),
-                "sdl".to_string(),
-                "-audiodev".to_string(),
-                "none,id=noaudio".to_string(),
-                "-machine".to_string(),
-                "pcspk-audiodev=noaudio".to_string(),
-            ]);
-        }
-    }
-
-    args.extend(["-no-reboot".to_string()]);
-    args
-}
-
-fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
+fn launch_qemu(uefi_image: &Path) {
     let ovmf = find_ovmf();
-    let args = qemu_args(uefi_image, &ovmf, display_mode);
-
-    if display_mode == QemuDisplayMode::Gui {
-        println!("QEMU GUI mode: click the window to grab the keyboard, then press Ctrl+Alt+G to release it.");
-    }
 
     let status = Command::new("qemu-system-x86_64")
-        .args(&args)
+        .args(["-bios"])
+        .arg(&ovmf)
+        .args(["-drive", &format!("format=raw,file={}", uefi_image.display())])
+        .args(["-serial", "stdio"])
+        .args(["-display", "none"])
+        .args(["-no-reboot"])
         .status()
         .expect("failed to launch QEMU");
 
@@ -821,19 +784,12 @@ fn cmd_run() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
-    launch_qemu(&uefi_image, QemuDisplayMode::Headless);
-}
-
-fn cmd_run_gui() {
-    let kernel_binary = build_kernel();
-    let uefi_image = create_uefi_image(&kernel_binary);
-    convert_to_vhdx(&uefi_image);
-    launch_qemu(&uefi_image, QemuDisplayMode::Gui);
+    launch_qemu(&uefi_image);
 }
 
 fn cmd_runner(kernel_binary: PathBuf) {
     let uefi_image = create_uefi_image(&kernel_binary);
-    launch_qemu(&uefi_image, QemuDisplayMode::Headless);
+    launch_qemu(&uefi_image);
 }
 
 #[cfg(test)]
@@ -849,34 +805,6 @@ mod tests {
         let unsigned = PathBuf::from("target/bootx64.efi");
 
         assert_eq!(signed_path(&unsigned), PathBuf::from("target/bootx64-signed.efi"));
-    }
-
-    #[test]
-    fn qemu_args_headless_uses_display_none() {
-        let args = qemu_args(
-            Path::new("target/boot-uefi-ostest.img"),
-            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
-            QemuDisplayMode::Headless,
-        );
-
-        assert!(args.windows(2).any(|window| window == ["-display", "none"]));
-        assert!(args.windows(2).any(|window| window == ["-serial", "stdio"]));
-    }
-
-    #[test]
-    fn qemu_args_gui_uses_sdl_and_disables_audio() {
-        let args = qemu_args(
-            Path::new("target/boot-uefi-ostest.img"),
-            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
-            QemuDisplayMode::Gui,
-        );
-
-        assert!(args.windows(2).any(|window| window == ["-display", "sdl"]));
-        assert!(args.windows(2).any(|window| window == ["-audiodev", "none,id=noaudio"]));
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"])
-        );
     }
 
     #[test]
