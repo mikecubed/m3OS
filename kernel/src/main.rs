@@ -330,9 +330,12 @@ fn vfs_server_task() -> ! {
 
     // Find the fat_server backend endpoint — it must already be registered
     // (init_task registers "fat" before spawning vfs_server_task).
+    //
+    // NOTE: call_msg() takes EndpointId directly; no capability insert is
+    // needed here.  Inserting a cap would occupy handle 1, which this server
+    // reserves for incoming Reply caps from clients — causing a permanent
+    // block on the first client call.
     let fat_ep_id = ipc::registry::lookup("fat").expect("[vfs] fat backend not in registry");
-    task::insert_cap(my_id, ipc::Capability::Endpoint(fat_ep_id))
-        .expect("[vfs] failed to insert fat endpoint cap");
 
     log::info!("[vfs] ready, backend={:?}", fat_ep_id);
 

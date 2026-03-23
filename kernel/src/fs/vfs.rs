@@ -2,51 +2,34 @@
 //!
 //! # Phase 8 behaviour
 //!
-//! In Phase 8 the VFS is a pure pass-through: it receives file IPC messages
-//! from kernel-task clients and forwards them directly to the single filesystem
-//! backend — the in-memory ramdisk ([`crate::fs::ramdisk`]).  There is no
-//! path rewriting, no permission checking, and no mount-point selection.
+//! In Phase 8 the VFS enforces the routing boundary at the IPC level:
+//! `vfs_server_task` (in `main.rs`) receives file requests from clients over
+//! the `"vfs"` endpoint and forwards them to `fat_server` over the `"fat"`
+//! endpoint using [`crate::ipc::endpoint::call_msg`].  The two-hop IPC chain
+//! (`client → vfs_server → fat_server`) is the ownership boundary between
+//! path dispatch and file-data access validated by P8-T008.
 //!
 //! # Phase 9+ plans
 //!
-//! When the project gains a real disk and a writable filesystem, the VFS will
-//! consult a mount table to select the correct backend for a given path prefix.
-//! For example:
+//! When the project gains multiple filesystem backends, this module will own a
+//! mount table that maps path prefixes to backend endpoint IDs.  For example:
 //!
-//! - `/`     → ramdisk (read-only initrd)
+//! - `/`     → ramdisk / initrd backend
 //! - `/tmp`  → tmpfs backend
 //! - `/home` → ext2 / FAT backend over a block device
 //!
-//! [`handle`] will inspect `msg.data[0]` (the name pointer / fd) together with
-//! a registered mount table and dispatch to the appropriate backend's `handle`
-//! function.
+//! `vfs_server_task` will call a `route(path) -> EndpointId` function here to
+//! select the backend before forwarding each `FILE_OPEN` request.  `FILE_READ`
+//! and `FILE_CLOSE` will use the fd-to-backend mapping cached at open time.
 //!
 //! # Why keep a separate `vfs` module in Phase 8?
 //!
-//! Even though the pass-through is a single call, the separation is valuable:
+//! Even without routing code, the module establishes the naming and ownership
+//! conventions that Phase 9+ will fill in:
 //!
-//! 1. **Routing boundary** — `vfs` owns path dispatch; `ramdisk` owns file
-//!    data.  Clients only ever call `vfs::handle`; they never import ramdisk
-//!    directly.  This contract is validated by P8-T008.
+//! 1. **Routing boundary** — `vfs_server_task` owns path dispatch; `fat_server`
+//!    owns file data.  Clients only ever hold a `"vfs"` endpoint capability;
+//!    they never hold `"fat"` directly.  The IPC chain enforces this boundary.
 //!
 //! 2. **Zero-cost refactor** — Phase 9 mount-table logic slots in here without
-//!    touching `ramdisk.rs` or any client call site.
-//!
-//! 3. **Test seam** — tests can substitute a mock backend by targeting
-//!    `vfs::handle` and verifying routing behaviour independently of the
-//!    ramdisk implementation.
-
-#![allow(dead_code)]
-
-use crate::ipc::Message;
-
-/// Handle one `vfs_server` IPC message by routing it to the ramdisk backend.
-///
-/// # Phase 8 limitation
-///
-/// There is exactly one backend (the ramdisk), so this is a direct forward.
-/// Phase 9+ will inspect the file path and consult a mount table to select
-/// the appropriate backend before dispatching.
-pub fn handle(msg: &Message) -> Message {
-    crate::fs::ramdisk::handle(msg)
-}
+//!    touching `ramdisk.rs`, `fat_server_task`, or any client.
