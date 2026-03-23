@@ -1,9 +1,11 @@
 //! Asynchronous notification objects.
 //!
 //! A [`Notification`] is a single machine-word bitfield.  Each bit is an
-//! independent signal channel.  The sender sets bits atomically (no blocking,
-//! safe from interrupt handlers); the receiver blocks until at least one bit
-//! is set, then atomically clears and returns the pending bits.
+//! independent signal channel.  [`signal_irq`] sets bits atomically from
+//! interrupt handlers (ISR-safe, lock-free); [`signal`] may only be called
+//! from task context (acquires a mutex to wake the waiter).  The receiver
+//! blocks until at least one bit is set, then atomically clears and returns
+//! the pending bits.
 //!
 //! # ISR-safety design
 //!
@@ -134,9 +136,9 @@ static ALLOCATED: Mutex<[bool; MAX_NOTIFS]> = Mutex::new([false; MAX_NOTIFS]);
 
 /// Allocate a new notification object and return its [`NotifId`].
 ///
-/// # Panics (debug)
+/// # Panics
 ///
-/// Panics if all 16 slots are occupied.
+/// Panics if all 16 slots are occupied (in both debug and release builds).
 pub fn create() -> NotifId {
     let mut alloc = ALLOCATED.lock();
     for (i, slot) in alloc.iter_mut().enumerate() {
@@ -241,6 +243,12 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
                 // Signal arrived in the window — return without blocking.
                 return bits2;
             }
+            // Single-waiter design: assert no other task is already waiting.
+            debug_assert!(
+                waiters[idx].is_none(),
+                "[ipc] notify wait: two tasks waiting on the same notification (notif_id={:?})",
+                notif_id
+            );
             waiters[idx] = Some(waiter);
         }
         // Release WAITERS lock before blocking; signal() can now wake us.

@@ -147,9 +147,13 @@ fn server_task() -> ! {
     // find it.
     task::set_server_endpoint(my_id, ep_id);
 
-    // Pre-insert an endpoint capability at handle 0.
-    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+    // Pre-insert an endpoint capability; the fresh table guarantees handle 0.
+    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
         .expect("server: failed to insert endpoint cap");
+    debug_assert_eq!(
+        ep_handle, 0,
+        "server: endpoint cap not at expected handle 0"
+    );
 
     log::info!("[ipc-server] waiting for first call");
 
@@ -196,7 +200,7 @@ fn client_task() -> ! {
 
     // Insert an endpoint capability at handle 0.
     task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("server: failed to insert endpoint cap");
+        .expect("client: failed to insert endpoint cap");
 
     log::info!("[ipc-client] sending first call");
     let reply_label = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x1234));

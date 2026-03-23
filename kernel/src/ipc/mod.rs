@@ -61,8 +61,13 @@ pub use notification::NotifId;
 /// assembly stub.  The ep_cap is packed into arg2; the reply's data payload
 /// is not included in the syscall form (kernel threads use the Rust API directly).
 ///
-/// Returns the message label (recv/call/reply_recv) or 0 on success, or
-/// `u64::MAX` on any error (invalid handle, wrong type, table full).
+/// Error convention (per-syscall):
+/// - Rendezvous syscalls (1–5): return the message label on success, or
+///   `u64::MAX` on error (invalid handle, wrong capability type, table full).
+/// - `notify_wait` (7): returns the pending-bit word on success, or `0` on
+///   error (invalid handle or wrong type).  Note: `0` cannot be a valid
+///   notification word since `wait` only returns when at least one bit is set.
+/// - `notify_signal` (8): returns `0` on success, `u64::MAX` on error.
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::scheduler;
 

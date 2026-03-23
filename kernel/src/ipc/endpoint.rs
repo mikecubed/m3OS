@@ -71,9 +71,9 @@ impl EndpointRegistry {
 
     /// Allocate a new endpoint and return its [`EndpointId`].
     ///
-    /// # Panics (debug)
+    /// # Panics
     ///
-    /// Panics if all 16 slots are occupied.
+    /// Panics if all 16 slots are occupied (in both debug and release builds).
     pub fn create(&mut self) -> EndpointId {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
@@ -163,11 +163,14 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
             scheduler::deliver_message(receiver, pending.msg);
             if pending.wants_reply {
                 // Insert a one-shot reply cap; sender stays blocked awaiting reply().
-                // If the table is full, the sender is stranded — log and unblock it.
+                // If the table is full, deliver an explicit error reply so the
+                // sender's take_message() returns Some(u64::MAX) rather than None
+                // (which would fire a misleading debug_assert in call()).
                 if scheduler::insert_cap(receiver, Capability::Reply(pending.task)).is_err() {
                     log::warn!(
                         "[ipc] recv: capability table full, unblocking sender without reply"
                     );
+                    scheduler::deliver_message(pending.task, Message::new(u64::MAX));
                     scheduler::wake_task(pending.task);
                 }
             } else {
@@ -255,11 +258,14 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
-            // Insert reply cap into the server's table.
+            // Insert reply cap into the server's table.  If that fails the
+            // server would get the message but have no way to reply, stranding
+            // the caller forever on BlockedOnReply.  Instead return an
+            // immediate error to the caller without blocking.
             if scheduler::insert_cap(receiver, Capability::Reply(caller)).is_err() {
-                // Server cap table full — unblock server without reply cap;
-                // server will get a message but no way to reply. Log the error.
                 log::warn!("[ipc] call: server capability table full, reply cap not inserted");
+                scheduler::wake_task(receiver);
+                return u64::MAX;
             }
             scheduler::wake_task(receiver);
         }

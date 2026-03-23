@@ -290,20 +290,28 @@ Up to 16 notification objects can exist simultaneously (`MAX_NOTIFS = 16`).
 Each object maps to a `NotifId` that is stored in a `Capability::Notification`
 slot.
 
-### signal (ISR-safe)
+### signal_irq (ISR-safe)
 
-`signal(notif_id, bits)` performs an atomic `fetch_or` on the `pending` field.
-This is async-signal-safe: no lock is held during the bit-set, so interrupt
-handlers can call it without risk of deadlock.  After setting the bits it wakes
-any blocked waiter.
+`signal_irq(irq)` looks up the registered `NotifId` for the hardware IRQ line
+and performs an atomic `fetch_or` on the matching `PENDING` slot — no lock
+is held, so it is safe to call directly from an interrupt handler.
+It then calls `signal_reschedule()` so the blocked task runs on the next
+scheduler tick.  It does **not** call `wake_task()`.
+
+### signal (task-context only)
+
+`signal(notif_id, bits)` performs the same lock-free `fetch_or` on `PENDING`,
+then additionally acquires `WAITERS.lock()` to wake the blocked task.  Because
+it takes a spin lock, it **must not** be called from an interrupt handler —
+use `signal_irq` instead.
 
 ### wait (blocking)
 
 `wait(task_id, notif_id)` atomically swaps the `pending` field to zero.  If the
 result is non-zero it returns immediately.  Otherwise it registers the calling
-task as the waiter and calls `block_current_on_recv()`.  On wake it loops back
-to drain the bits (to handle a signal that arrived between the first swap and
-the block).
+task as the waiter and calls `block_current_on_notif()` (sets
+`TaskState::BlockedOnNotif`).  On wake it loops back to drain the bits (to
+handle a signal that arrived between the first swap and the block).
 
 ```mermaid
 sequenceDiagram
@@ -314,11 +322,11 @@ sequenceDiagram
     alt bits already pending
         Kernel->>Driver: return bits immediately
     else no bits pending
-        Kernel->>Driver: register waiter<br/>block_current_on_recv()
+        Kernel->>Driver: register waiter<br/>block_current_on_notif()
         Note over Kernel: time passes ...
-        Kernel->>Kernel: signal() sets bit
-        Kernel->>Driver: wake_task(driver)
-        Driver->>Kernel: loop: swap pending → return bits
+        Kernel->>Kernel: signal_irq() sets bit in PENDING
+        Kernel->>Kernel: signal_reschedule()
+        Driver->>Kernel: loop: swap PENDING → return bits
     end
 ```
 
@@ -335,9 +343,13 @@ The pattern:
 1. At startup `kbd_server` allocates a `Notification` and calls `register_irq(1,
    notif_id)` to bind IRQ1 to it.
 2. Every time IRQ1 fires, the kernel IDT handler calls `signal_irq(1)`.
-3. `signal_irq` looks up the registered `NotifId` for IRQ1 and calls
-   `signal(id, 1 << 1)` — setting bit 1 in the notification word.
-4. `kbd_server` is blocked in `notify_wait(notif_cap)`.  `signal` wakes it.
+3. `signal_irq` looks up the registered `NotifId` for IRQ1 in `IRQ_MAP`
+   (a lock-free `AtomicU8` array) and atomically sets bit 1 in `PENDING[idx]`
+   via `fetch_or`.  It then calls `signal_reschedule()` — **no lock is
+   acquired, `wake_task()` is never called from the ISR**.
+4. On its next scheduler dispatch, `kbd_server` returns from
+   `block_current_on_notif()`, loops back in `wait()`, drains `PENDING`, and
+   returns the accumulated bits.
 5. The driver reads the scancode from I/O port `0x60`, translates it, and sends
    a key-event message to `console_server` via sync IPC.
 
@@ -348,20 +360,21 @@ sequenceDiagram
     participant Notif as Notification object
     participant KbdServer as kbd_server
 
-    KbdServer->>Notif: notify_wait(notif_cap) — blocks
+    KbdServer->>Notif: notify_wait(notif_cap) — block_current_on_notif()
     HW->>IDT: IRQ1 fires
-    IDT->>Notif: signal_irq(1) → signal(notif_id, bit1)
-    Note over Notif: fetch_or sets bit 1<br/>waiter = Some(kbd_server)
-    Notif->>KbdServer: wake_task(kbd_server)
+    IDT->>Notif: signal_irq(1): PENDING[idx].fetch_or(bit1)<br/>signal_reschedule()
+    Note over Notif: lock-free — no wake_task in ISR
+    Notif->>KbdServer: scheduler dispatches kbd_server
+    KbdServer->>KbdServer: wait() loop: swap PENDING → bits
     KbdServer->>KbdServer: in(0x60) → scancode
     KbdServer->>KbdServer: translate → key event
     KbdServer->>KbdServer: ipc_call(console_ep, KEY_EVENT, scancode)
 ```
 
 This is the only place in the kernel where an interrupt handler triggers a
-scheduler operation.  Because `signal` uses only an atomic store and a
-conditional `wake_task` (which itself only does an atomic flag store + mutex
-update), it is safe to call from inside an ISR.
+scheduler operation.  Because `signal_irq` uses only lock-free atomics and
+`signal_reschedule()` (which writes a single atomic flag), it is safe to call
+from inside an ISR.
 
 ---
 
@@ -391,18 +404,20 @@ stateDiagram-v2
 | `BlockedOnSend` | `block_current_on_send()` | `wake_task()` when a receiver picks up |
 | `BlockedOnRecv` | `block_current_on_recv()` | `wake_task()` when a sender delivers |
 | `BlockedOnReply` | `block_current_on_reply()` | `wake_task()` from `reply()` |
-| `BlockedOnNotif` | `block_current_on_recv()` (notification wait) | `wake_task()` from `signal()` |
+| `BlockedOnNotif` | `block_current_on_notif()` | `signal_reschedule()` (ISR) or `wake_task()` from `signal()` |
 
-### How block_current_on_recv Works
+### How the "block and switch" primitives work
 
-All four "block and switch" primitives follow the same pattern:
+All four block primitives (`block_current_on_recv`, `block_current_on_send`,
+`block_current_on_reply`, `block_current_on_notif`) follow the same pattern,
+illustrated here for `block_current_on_notif`:
 
 ```rust
-pub fn block_current_on_recv() {
+pub fn block_current_on_notif() {
     let task_rsp_ptr: *mut u64 = {
         let mut sched = SCHEDULER.lock();
         let idx = sched.current.unwrap();
-        sched.tasks[idx].state = TaskState::BlockedOnRecv;
+        sched.tasks[idx].state = TaskState::BlockedOnNotif;
         sched.current = None;
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
         // lock released here
@@ -422,7 +437,7 @@ Key details:
    reference is live.  The raw pointer is safe because the `Task` outlives the
    switch.
 3. **State is set before the switch** — the scheduler loop reads `.state` to
-   decide what is runnable.  Setting `BlockedOnRecv` before releasing the lock
+   decide what is runnable.  Setting the blocked state before releasing the lock
    ensures the scheduler never sees this task as `Ready` while it is mid-block.
 
 ### Message Delivery
@@ -434,7 +449,7 @@ scheduler provides a per-task `pending_msg: Option<Message>` slot:
 1. `deliver_message(task_id, msg)` — stores the message in the slot.
 2. `wake_task(task_id)` — transitions the task to `Ready`.
 3. When the scheduler dispatches the task, it continues executing after the
-   `switch_context` call inside `block_current_on_recv`.
+   `switch_context` call inside the relevant block primitive.
 4. The task then calls `take_message(task_id)` to drain the slot and return
    the label to the caller.
 
@@ -464,24 +479,31 @@ arguments.
 | 2 | `ipc_send` | `rdi` = ep_cap, `rsi` = label, `rdx` = data[0] | `0` on success, `u64::MAX` on error |
 | 3 | `ipc_call` | `rdi` = ep_cap, `rsi` = label, `rdx` = data[0] | reply label, or `u64::MAX` on error |
 | 4 | `ipc_reply` | `rdi` = reply_cap, `rsi` = label, `rdx` = data[0] | `0` on success, `u64::MAX` on error |
-| 5 | `ipc_reply_recv` | `rdi` = reply_cap, `rsi` = label, `rdx` = data[0], `r8` = ep_cap | next message label, or `u64::MAX` on error |
-| 7 | `notify_wait` | `rdi` = notif_cap_handle | pending bits (non-zero), or `0` on error |
+| 5 | `ipc_reply_recv` | `rdi` = reply_cap, `rsi` = label, `rdx` = ep_cap¹ | next message label, or `u64::MAX` on error |
+| 7 | `notify_wait` | `rdi` = notif_cap_handle | pending bits (non-zero on success), or `0` on error |
 | 8 | `notify_signal` | `rdi` = notif_cap_handle, `rsi` = bits | `0` on success, `u64::MAX` on error |
+
+¹ The Phase 6 asm stub forwards only 3 arguments (rdi/rsi/rdx).  `ipc_reply_recv`
+therefore packs the endpoint cap handle into `rdx` (arg2) rather than the
+full SysV `r8` (arg4) position.  The reply payload (`data[0]`) is not
+forwarded in the syscall form; kernel threads use the Rust API directly.
 
 Note: syscall number 6 is `sys_exit` (Phase 5).  Syscall number 12 is
 `sys_debug_print` (Phase 5).  Numbers 1–5 and 7–8 are reserved for IPC.
 
 ### Error Convention
 
-All IPC syscalls return `u64::MAX` on any error:
+Error returns are per-syscall:
 
-- Invalid capability handle (out of range or empty slot)
-- Wrong capability type (e.g., passing a `Notification` cap to `ipc_recv`)
-- Capability table full (only on `ipc_call`, which inserts a `Reply` cap)
+- **Rendezvous (1–5):** return `u64::MAX` on any error (invalid handle, wrong
+  capability type, capability table full).
+- **`notify_wait` (7):** returns `0` on error (invalid handle or wrong type).
+  A return of `0` cannot be a valid success value because `wait()` only returns
+  when at least one pending bit is set.
+- **`notify_signal` (8):** returns `u64::MAX` on error, `0` on success.
 
-`u64::MAX` is chosen because it cannot be a valid message label, and it
-clearly distinguishes success from failure without requiring a separate
-error-code register.
+`u64::MAX` is chosen for rendezvous errors because it cannot be a valid message
+label, clearly distinguishing success from failure without a separate register.
 
 ---
 
