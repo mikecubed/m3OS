@@ -204,6 +204,10 @@ pub fn yield_now() {
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
         // MutexGuard drops here, releasing the lock before switch_context.
     };
+    // Signal a reschedule so the scheduler loop does not hlt after this
+    // task yields — other tasks may already be Ready and should run
+    // immediately without waiting for the next timer IRQ.
+    RESCHEDULE.store(true, Ordering::Relaxed);
     // Safety: SCHEDULER_RSP was written by the scheduler loop in `run()`.
     let sched_rsp = unsafe { SCHEDULER_RSP };
     // Safety: task_rsp_ptr is a valid aligned pointer inside a live Task.
@@ -242,6 +246,10 @@ pub fn block_current_on_recv() {
         sched.current = None;
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
     };
+    // Signal a reschedule so the scheduler loop does not hlt after this
+    // task blocks — another task may already be Ready and should run
+    // immediately without waiting for the next timer IRQ.
+    RESCHEDULE.store(true, Ordering::Relaxed);
     let sched_rsp = unsafe { SCHEDULER_RSP };
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
@@ -260,6 +268,7 @@ pub fn block_current_on_send() {
         sched.current = None;
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
     };
+    RESCHEDULE.store(true, Ordering::Relaxed);
     let sched_rsp = unsafe { SCHEDULER_RSP };
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
@@ -281,6 +290,7 @@ pub fn block_current_on_notif() {
         sched.current = None;
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
     };
+    RESCHEDULE.store(true, Ordering::Relaxed);
     let sched_rsp = unsafe { SCHEDULER_RSP };
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
@@ -299,6 +309,7 @@ pub fn block_current_on_reply() {
         sched.current = None;
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
     };
+    RESCHEDULE.store(true, Ordering::Relaxed);
     let sched_rsp = unsafe { SCHEDULER_RSP };
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
