@@ -8,6 +8,8 @@
 *.img
 *.iso
 *.efi
+/ostest.key
+/ostest.crt
 
 # QEMU runtime files
 *.qcow2
