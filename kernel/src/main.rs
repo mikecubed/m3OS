@@ -74,169 +74,156 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Phase 6: IPC Core demo
+    // Phase 7: Core Servers demo
     //
-    // Demonstrates synchronous rendezvous IPC between two kernel threads:
-    //   - server_task: blocks on recv, processes two messages with reply_recv
-    //   - client_task: calls the server twice and logs each reply
-    //
-    // The scheduler drives the exchange.  The server logs each call it handles;
-    // the client logs each reply it receives.  After the second exchange the
-    // logical demo is complete; both tasks continue cooperatively yielding
-    // alongside the idle loop.
-    // ---------------------------------------------------------------------------
+    // init_task creates IPC endpoints for console and kbd services, registers
+    // them in the service registry, spawns the server tasks, and then yields.
+    // console_client_task demonstrates service discovery and IPC-based output.
+    task::spawn(init_task, "init");
+    task::spawn_idle(idle_task);
 
-    // Create a global IPC endpoint.  The server will recv on it; the client
-    // will call it.  The EndpointId is baked into each task's closure via
-    // a static (no_std closures cannot capture from the stack easily, so we
-    // use task::spawn's fn pointer API with a global static for the ID).
-    let ep_id = ipc::endpoint::ENDPOINTS.lock().create();
-    // Safety: single-CPU boot, no concurrent access.
-    unsafe {
-        DEMO_EP = ep_id;
+    log::info!("[kernel] entering scheduler — init will start service set");
+    task::run()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 service tasks
+// ---------------------------------------------------------------------------
+
+/// init task: creates service endpoints, registers them, spawns servers.
+fn init_task() -> ! {
+    // Create IPC endpoints for each service.
+    let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
+    let kbd_ep = ipc::endpoint::ENDPOINTS.lock().create();
+
+    // Register in the service registry so clients can look them up by name.
+    ipc::registry::register("console", console_ep)
+        .expect("[init] failed to register console service");
+    ipc::registry::register("kbd", kbd_ep).expect("[init] failed to register kbd service");
+
+    log::info!(
+        "[init] service registry: console={:?} kbd={:?}",
+        console_ep,
+        kbd_ep
+    );
+
+    // Spawn service tasks and a demo client.
+    task::spawn(console_server_task, "console");
+    task::spawn(kbd_server_task, "kbd");
+    task::spawn(console_client_task, "console-client");
+
+    log::info!("[init] service set started — yielding");
+    loop {
+        task::yield_now();
     }
+}
 
-    // Allocate a notification object for the kbd_server demo (P6-T011).
-    // The keyboard ISR will signal bit 1 each keypress; the kbd_notif_task
-    // blocks on wait() and logs the first keypress it receives.
-    //
-    // Wrapped in without_interrupts: clears the CPU IF flag so no keyboard
-    // IRQ can fire between create() and register_irq(), ensuring the ISR
-    // never reads a partially-initialized IRQ_MAP entry.
+/// Console server: receives IPC write requests, logs to serial, replies with ack.
+///
+/// IPC protocol (label=0, CONSOLE_WRITE):
+///   data[0] = pointer to UTF-8 string bytes (kernel address)
+///   data[1] = byte length (capped at 4096)
+/// Reply: label=0 (ack)
+fn console_server_task() -> ! {
+    let my_id = task::current_task_id().expect("[console] no task id");
+
+    // Look up this server's endpoint via the service registry.
+    let ep_id = ipc::registry::lookup("console").expect("[console] endpoint not in registry");
+
+    task::set_server_endpoint(my_id, ep_id);
+
+    // Insert an endpoint capability at handle 0.
+    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("[console] failed to insert endpoint cap");
+    debug_assert_eq!(
+        ep_handle, 0,
+        "[console] endpoint cap not at expected handle 0"
+    );
+
+    log::info!("[console] ready");
+
+    // First receive.
+    let reply_cap_handle: ipc::CapHandle = 1;
+    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
+
+    loop {
+        // Handle the write request: data[0]=ptr, data[1]=len.
+        let ptr = msg.data[0] as *const u8;
+        let len = msg.data[1] as usize;
+        if len > 0 && len <= 4096 {
+            // Safety: In Phase 7, kernel tasks share the kernel address space.
+            // The pointer is a kernel static string address provided by the client.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                log::info!("[console] {}", text.trim_end_matches('\n'));
+            }
+        }
+
+        // Consume the one-shot reply cap inserted by recv_msg.
+        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
+            Ok(ipc::Capability::Reply(id)) => id,
+            _ => panic!("[console] expected reply cap at handle 1"),
+        };
+        let _ = task::remove_task_cap(my_id, reply_cap_handle);
+
+        // Reply (ack) and immediately wait for the next message.
+        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, ipc::Message::new(0));
+    }
+}
+
+/// Keyboard server: waits for IRQ1 notification, logs each keypress.
+///
+/// Creates its own notification object and registers it for IRQ1.
+/// In Phase 7 this server logs events; Phase 8+ will forward them to subscribed clients.
+fn kbd_server_task() -> ! {
+    let my_id = task::current_task_id().expect("[kbd] no task id");
+
+    // Create a notification and register it for IRQ1 with interrupts disabled
+    // to avoid a race between create() and register_irq().
     let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
         let id = ipc::notification::create();
         ipc::notification::register_irq(1, id);
         id
     });
-    unsafe {
-        DEMO_NOTIF = notif_id;
-    }
-
-    // Spawn the server, client, and kbd_notif tasks.
-    task::spawn(server_task, "ipc-server");
-    task::spawn(client_task, "ipc-client");
-    task::spawn(kbd_notif_task, "kbd-notif");
-    task::spawn_idle(idle_task);
-
-    log::info!("[ipc] demo starting — entering scheduler");
-    task::run()
-}
-
-// ---------------------------------------------------------------------------
-// Demo task state
-// ---------------------------------------------------------------------------
-
-/// The IPC endpoint used by the demo.
-static mut DEMO_EP: ipc::EndpointId = ipc::EndpointId(0);
-/// The notification ID used for keyboard IRQ delivery.
-static mut DEMO_NOTIF: ipc::notification::NotifId = ipc::notification::NotifId(0);
-
-// ---------------------------------------------------------------------------
-// Demo tasks
-// ---------------------------------------------------------------------------
-
-/// Server task: handles two consecutive IPC calls, then cooperatively yields.
-///
-/// Uses `recv` for the first message, then `reply_recv` for the second,
-/// demonstrating the standard server loop pattern.  After sending the
-/// second reply the task loops calling `yield_now()` — it does not exit.
-fn server_task() -> ! {
-    // Safety: written once before spawn, read-only from here.
-    let ep_id = unsafe { DEMO_EP };
-    let my_id = task::current_task_id().expect("server: no task id");
-
-    // Register ourselves as the server of this endpoint so reply_recv can
-    // find it.
-    task::set_server_endpoint(my_id, ep_id);
-
-    // Pre-insert an endpoint capability; the fresh table guarantees handle 0.
-    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("server: failed to insert endpoint cap");
-    debug_assert_eq!(
-        ep_handle, 0,
-        "server: endpoint cap not at expected handle 0"
-    );
-
-    log::info!("[ipc-server] waiting for first call");
-
-    // First message: plain recv.
-    let label = ipc::endpoint::recv(my_id, ep_id);
-    log::info!("[ipc-server] received call label={}", label);
-
-    // Reply cap was inserted into our table by recv() on behalf of the client.
-    // Find it: it's at handle 1 (handle 0 is our endpoint cap).
-    let reply_cap_handle: ipc::CapHandle = 1;
-    let caller_id = match task::task_cap(my_id, reply_cap_handle) {
-        Ok(ipc::Capability::Reply(id)) => id,
-        _ => panic!("server: expected reply cap at handle 1"),
-    };
-    let _ = task::remove_task_cap(my_id, reply_cap_handle);
-
-    // Reply + immediately wait for next message.
-    log::info!("[ipc-server] replying and waiting for next call");
-    let reply = ipc::Message::with1(0xBEEF, 42);
-    let label2 = ipc::endpoint::reply_recv(my_id, caller_id, ep_id, reply);
-    log::info!("[ipc-server] received second call label={}", label2);
-
-    // Find the second reply cap (also at handle 1, re-inserted by reply_recv).
-    let caller2_id = match task::task_cap(my_id, reply_cap_handle) {
-        Ok(ipc::Capability::Reply(id)) => id,
-        _ => panic!("server: expected reply cap at handle 1 for second call"),
-    };
-    let _ = task::remove_task_cap(my_id, reply_cap_handle);
-
-    let reply2 = ipc::Message::with1(0xCAFE, 99);
-    ipc::endpoint::reply(caller2_id, reply2);
-    log::info!("[ipc-server] second reply sent — server done");
-
-    // Yield forever; the idle task will keep the system alive.
-    loop {
-        task::yield_now();
-    }
-}
-
-/// Client task: sends two IPC calls to the server and logs the replies.
-fn client_task() -> ! {
-    let ep_id = unsafe { DEMO_EP };
-    let my_id = task::current_task_id().expect("client: no task id");
-
-    // Insert an endpoint capability at handle 0.
-    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("client: failed to insert endpoint cap");
-
-    log::info!("[ipc-client] sending first call");
-    let reply_label = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x1234));
-    log::info!("[ipc-client] got first reply label={:#x}", reply_label);
-
-    log::info!("[ipc-client] sending second call");
-    let reply_label2 = ipc::endpoint::call(my_id, ep_id, ipc::Message::new(0x5678));
-    log::info!("[ipc-client] got second reply label={:#x}", reply_label2);
-
-    log::info!("[ipc-client] IPC demo complete");
-
-    loop {
-        task::yield_now();
-    }
-}
-
-/// Keyboard notification task: blocks until the first keypress, then logs it.
-///
-/// Demonstrates IRQ delivery via notification objects (P6-T007, P6-T011).
-fn kbd_notif_task() -> ! {
-    let notif_id = unsafe { DEMO_NOTIF };
-    let my_id = task::current_task_id().expect("kbd-notif: no task id");
 
     // Insert a notification capability at handle 0.
     task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
-        .expect("kbd-notif: failed to insert notification cap");
+        .expect("[kbd] failed to insert notification cap");
 
-    log::info!("[kbd-notif] waiting for keyboard IRQ via notification");
-    let bits = ipc::notification::wait(my_id, notif_id);
-    log::info!(
-        "[kbd-notif] keyboard notification received, bits={:#b}",
-        bits
-    );
+    log::info!("[kbd] ready, waiting for keyboard IRQ");
+
+    loop {
+        let bits = ipc::notification::wait(my_id, notif_id);
+        log::info!("[kbd] keypress received (notification bits={:#b})", bits);
+        // Phase 8+: forward to subscribed clients via IPC.
+    }
+}
+
+/// Demo client: looks up the console service and sends one write request.
+///
+/// Demonstrates that a client task can discover the console service via the
+/// registry and send output through it without knowing the endpoint ID up front.
+static CONSOLE_MSG: &str = "Hello from console_client!";
+
+fn console_client_task() -> ! {
+    let my_id = task::current_task_id().expect("[console-client] no task id");
+
+    // Discover the console service endpoint via the registry.
+    let ep_id =
+        ipc::registry::lookup("console").expect("[console-client] console service not found");
+
+    // Insert an endpoint capability so we can call it.
+    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("[console-client] failed to insert endpoint cap");
+
+    log::info!("[console-client] sending write request to console service");
+
+    // Send: label=0 (CONSOLE_WRITE), data[0]=ptr, data[1]=len.
+    let msg = ipc::Message::with2(0, CONSOLE_MSG.as_ptr() as u64, CONSOLE_MSG.len() as u64);
+    let reply_label = ipc::endpoint::call(my_id, ep_id, msg);
+    log::info!("[console-client] got ack (label={:#x})", reply_label);
+
+    log::info!("[console-client] Phase 7 core-servers demo complete");
 
     loop {
         task::yield_now();

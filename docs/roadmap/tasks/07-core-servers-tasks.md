@@ -15,12 +15,12 @@ flowchart LR
 
 ## Implementation Tasks
 
-- [ ] P7-T001 Implement `init` as the first userspace process responsible for early service startup.
-- [ ] P7-T002 Add a simple service registry or nameserver model for discovering early services.
-- [ ] P7-T003 Move console output behind `console_server`.
-- [ ] P7-T004 Route keyboard events through `kbd_server`.
-- [ ] P7-T005 Define the IPC contracts used by clients to find and talk to these services.
-- [ ] P7-T006 Keep bootstrap ordering explicit and simple enough to debug from logs.
+- [x] P7-T001 Implement `init` as the first userspace process responsible for early service startup.
+- [x] P7-T002 Add a simple service registry or nameserver model for discovering early services.
+- [x] P7-T003 Move console output behind `console_server`.
+- [x] P7-T004 Route keyboard events through `kbd_server`.
+- [x] P7-T005 Define the IPC contracts used by clients to find and talk to these services.
+- [x] P7-T006 Keep bootstrap ordering explicit and simple enough to debug from logs.
 
 <!-- Phase 7 implementation started 2026-03-23 on branch phase-7-core-servers -->
 
