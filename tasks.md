@@ -11,7 +11,7 @@
 | B | Process table (`process/`) | ✅ done |
 | C | ABI + syscalls | ✅ done |
 | D | Init integration + validation | ✅ done |
-| E | Documentation | ⏳ pending |
+| E | Documentation | ✅ done |
 
 ---
 
@@ -55,16 +55,16 @@
 | P11-T019 | Load minimal ELF calling `exit(0)`; confirm kernel receives code 0 | ✅ |
 | P11-T020 | Binary reads argc/argv, writes to serial; confirm values match | ✅ |
 | P11-T021 | Fork child that exits 42; confirm waitpid returns 42 | ✅ |
-| P11-T022 | Two concurrent processes write counters; no address space corruption | ⏳ |
-| P11-T023 | Malformed ELF (bad magic, wrong arch, truncated) → error, no panic | ⏳ |
-| P11-T024 | Stack overflow in userspace → kernel catches fault, kills process cleanly | ⏳ |
+| P11-T022 | Two concurrent processes write counters; no address space corruption | ✅ |
+| P11-T023 | Malformed ELF (bad magic, wrong arch, truncated) → error, no panic | ✅ |
+| P11-T024 | Stack overflow in userspace → kernel catches fault, kills process cleanly | ✅ |
 
 ## Track E — Documentation
 
 | Task | Description | Status |
 |---|---|---|
-| P11-T025 | ELF loading sequence: parse → validate → alloc → map → zero BSS → stack → enter | ⏳ |
-| P11-T026 | Process struct fields, lifecycle states, state transition diagram | ⏳ |
-| P11-T027 | fork + page tables: why eager copy, what COW would require | ⏳ |
-| P11-T028 | System V AMD64 ABI stack layout: argc, argv, envp, aux vectors, rsp alignment | ⏳ |
-| P11-T029 | "How real OSes differ": COW fork, PT_INTERP, process groups, clone, ptrace | ⏳ |
+| P11-T025 | ELF loading sequence: parse → validate → alloc → map → zero BSS → stack → enter | ✅ |
+| P11-T026 | Process struct fields, lifecycle states, state transition diagram | ✅ |
+| P11-T027 | fork + page tables: why eager copy, what COW would require | ✅ |
+| P11-T028 | System V AMD64 ABI stack layout: argc, argv, envp, aux vectors, rsp alignment | ✅ |
+| P11-T029 | "How real OSes differ": COW fork, PT_INTERP, process groups, clone, ptrace | ✅ |
