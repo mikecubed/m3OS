@@ -614,9 +614,19 @@ fn create_signed_uefi_image(
     );
 
     let fat_partition = NamedTempFile::new().context("failed to create temporary FAT image")?;
-    create_fat_filesystem(&files, fat_partition.path())
+    create_fat_filesystem(
+        &files,
+        fat_partition
+            .reopen()
+            .context("failed to reopen temporary FAT image for formatting")?,
+    )
         .context("failed to create signed FAT filesystem")?;
-    create_gpt_disk(fat_partition.path(), image_path)
+    create_gpt_disk(
+        fat_partition
+            .reopen()
+            .context("failed to reopen temporary FAT image for GPT packaging")?,
+        image_path,
+    )
         .context("failed to create signed GPT disk image")?;
     fat_partition
         .close()
@@ -624,7 +634,7 @@ fn create_signed_uefi_image(
     Ok(())
 }
 
-fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, out_fat_path: &Path) -> anyhow::Result<()> {
+fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, fat_file: File) -> anyhow::Result<()> {
     const MB: u64 = 1024 * 1024;
 
     let mut needed_size = 0;
@@ -632,13 +642,6 @@ fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, out_fat_path: &
         needed_size += source.len()?;
     }
 
-    let fat_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(out_fat_path)
-        .with_context(|| format!("failed to create FAT image at `{}`", out_fat_path.display()))?;
     let fat_size = ((needed_size + 1024 * 64 - 1) / MB + 1) * MB + MB;
     fat_file
         .set_len(fat_size)
@@ -659,7 +662,7 @@ fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, out_fat_path: &
 
     let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
     fatfs::format_volume(&fat_file, format_options).context("failed to format FAT image")?;
-    let filesystem = fatfs::FileSystem::new(&fat_file, fatfs::FsOptions::new())
+    let filesystem = fatfs::FileSystem::new(fat_file, fatfs::FsOptions::new())
         .context("failed to open FAT filesystem")?;
     let root_dir = filesystem.root_dir();
     let result = add_files_to_image(&root_dir, files);
@@ -668,22 +671,21 @@ fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, out_fat_path: &
     result
 }
 
-fn add_files_to_image(
-    root_dir: &Dir<&File>,
+fn add_files_to_image<T: fatfs::ReadWriteSeek>(
+    root_dir: &Dir<'_, T>,
     files: &BTreeMap<&str, FileDataSource>,
 ) -> anyhow::Result<()> {
     for (target_path_raw, source) in files {
-        let target_path = Path::new(target_path_raw);
-        let ancestors: Vec<_> = target_path.ancestors().skip(1).collect();
-        for ancestor in ancestors.into_iter().rev().skip(1) {
-            match root_dir.create_dir(&ancestor.display().to_string()) {
+        let parent_dirs = fat_parent_dirs(target_path_raw);
+        for dir_path in parent_dirs {
+            match root_dir.create_dir(&dir_path) {
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!(
                             "failed to create directory `{}` on FAT filesystem",
-                            ancestor.display()
+                            dir_path
                         )
                     });
                 }
@@ -692,12 +694,12 @@ fn add_files_to_image(
 
         let mut new_file = root_dir
             .create_file(target_path_raw)
-            .with_context(|| format!("failed to create file at `{}`", target_path.display()))?;
+            .with_context(|| format!("failed to create file at `{}`", target_path_raw))?;
         new_file.truncate().context("failed to truncate FAT file")?;
         source.copy_to(&mut new_file).with_context(|| {
             format!(
                 "failed to copy source data to file at `{}`",
-                target_path.display()
+                target_path_raw
             )
         })?;
     }
@@ -705,7 +707,24 @@ fn add_files_to_image(
     Ok(())
 }
 
-fn create_gpt_disk(fat_image: &Path, out_gpt_path: &Path) -> anyhow::Result<()> {
+fn fat_parent_dirs(target_path_raw: &str) -> Vec<String> {
+    let mut dirs = Vec::new();
+    let mut parts = Vec::new();
+    for component in target_path_raw.split('/').filter(|component| !component.is_empty()) {
+        parts.push(component);
+    }
+
+    if parts.len() <= 1 {
+        return dirs;
+    }
+
+    for depth in 1..parts.len() {
+        dirs.push(parts[..depth].join("/"));
+    }
+    dirs
+}
+
+fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<()> {
     let mut disk = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -714,7 +733,8 @@ fn create_gpt_disk(fat_image: &Path, out_gpt_path: &Path) -> anyhow::Result<()> 
         .open(out_gpt_path)
         .with_context(|| format!("failed to create GPT file at `{}`", out_gpt_path.display()))?;
 
-    let partition_size = fs::metadata(fat_image)
+    let partition_size = fat_image
+        .metadata()
         .context("failed to read metadata of FAT image")?
         .len();
     let disk_size = partition_size + 1024 * 64;
@@ -750,13 +770,12 @@ fn create_gpt_disk(fat_image: &Path, out_gpt_path: &Path) -> anyhow::Result<()> 
 
     gpt.write().context("failed to write out GPT changes")?;
 
+    fat_image
+        .seek(io::SeekFrom::Start(0))
+        .context("failed to seek to start of FAT image")?;
     disk.seek(io::SeekFrom::Start(start_offset))
         .context("failed to seek to start offset")?;
-    io::copy(
-        &mut File::open(fat_image).context("failed to open FAT image")?,
-        &mut disk,
-    )
-    .context("failed to copy FAT image to GPT disk")?;
+    io::copy(&mut fat_image, &mut disk).context("failed to copy FAT image to GPT disk")?;
 
     Ok(())
 }
@@ -866,5 +885,48 @@ mod tests {
         fs::write(&candidate, b"efi").unwrap();
 
         assert_eq!(find_uefi_bootloader_in(tempdir.path()).unwrap(), candidate);
+    }
+
+    #[test]
+    fn fat_parent_dirs_builds_forward_slash_paths() {
+        assert_eq!(
+            fat_parent_dirs("efi/boot/bootx64.efi"),
+            vec!["efi".to_string(), "efi/boot".to_string()]
+        );
+        assert!(fat_parent_dirs("kernel-x86_64").is_empty());
+    }
+
+    #[test]
+    fn create_fat_filesystem_writes_expected_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let bootloader_path = tempdir.path().join("bootloader.efi");
+        let kernel_path = tempdir.path().join("kernel.bin");
+        fs::write(&bootloader_path, b"signed-bootloader").unwrap();
+        fs::write(&kernel_path, b"kernel-bytes").unwrap();
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            UEFI_BOOT_FILENAME,
+            FileDataSource::File(bootloader_path.clone()),
+        );
+        files.insert(KERNEL_FILE_NAME, FileDataSource::File(kernel_path.clone()));
+
+        let fat_image = NamedTempFile::new().unwrap();
+        create_fat_filesystem(&files, fat_image.reopen().unwrap()).unwrap();
+
+        let filesystem = fatfs::FileSystem::new(fat_image.reopen().unwrap(), fatfs::FsOptions::new())
+            .unwrap();
+        let root_dir = filesystem.root_dir();
+
+        let mut bootloader = root_dir.open_file(UEFI_BOOT_FILENAME).unwrap();
+        let mut bootloader_bytes = Vec::new();
+        use std::io::Read;
+        bootloader.read_to_end(&mut bootloader_bytes).unwrap();
+        assert_eq!(bootloader_bytes, b"signed-bootloader");
+
+        let mut kernel = root_dir.open_file(KERNEL_FILE_NAME).unwrap();
+        let mut kernel_bytes = Vec::new();
+        kernel.read_to_end(&mut kernel_bytes).unwrap();
+        assert_eq!(kernel_bytes, b"kernel-bytes");
     }
 }
