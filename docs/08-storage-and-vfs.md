@@ -146,15 +146,15 @@ In Phase 8 it is a single-backend pass-through.
 The server loop looks like:
 
 ```
-recv(vfs_ep) -> msg
+recv_msg(vfs_ep) -> msg
 while running:
     match msg.label:
         FILE_OPEN | FILE_READ | FILE_CLOSE =>
-            reply_msg = call(fat_ep, msg)   // forward to backend
+            reply_msg = call_msg(fat_ep, msg)   // forward full message to backend
             reply(msg.client, reply_msg)
         _ =>
             reply(msg.client, Message { label: ERR_UNKNOWN_OP, .. })
-    msg = reply_recv(vfs_ep)
+    msg = reply_recv_msg(vfs_ep)
 ```
 
 ### Why the VFS layer exists as a pass-through
