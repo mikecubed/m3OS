@@ -120,7 +120,7 @@ global_asm!(
 pub extern "C" fn syscall_handler(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     match number {
         // IPC syscalls (Phase 6)
-        1..=5 | 7..=8 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
+        1..=5 | 7..=10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Legacy / debug syscalls
         6 => sys_exit(arg0),
         12 => sys_debug_print(arg0, arg1),

@@ -34,11 +34,14 @@ pub mod capability;
 pub mod endpoint;
 pub mod message;
 pub mod notification;
+pub mod registry;
 
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
 pub use notification::NotifId;
+#[allow(unused_imports)]
+pub use registry::RegistryError;
 
 // ---------------------------------------------------------------------------
 // Syscall dispatcher
@@ -55,6 +58,8 @@ pub use notification::NotifId;
 /// | 5 | `ipc_reply_recv(reply_cap, label, ep_cap)` | `arg0..2` — ep_cap in arg2 |
 /// | 7 | `notify_wait(notif_cap)` | `arg0 = notif_cap_handle` |
 /// | 8 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
+/// | 9 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
+/// | 10 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -70,6 +75,9 @@ pub use notification::NotifId;
 ///   error (invalid handle or wrong type).  Note: `0` cannot be a valid
 ///   notification word since `wait` only returns when at least one bit is set.
 /// - `notify_signal` (8): returns `0` on success, `u64::MAX` on error.
+/// - `ipc_register_service` (9): returns `0` on success, `u64::MAX` on error.
+/// - `ipc_lookup_service` (10): returns the new `CapHandle` as `u64` on
+///   success, or `u64::MAX` on error (not found, cap table full, etc.).
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::scheduler;
 
@@ -80,6 +88,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
         Some(id) => id,
         None => return err_val,
     };
+
+    // Syscall 10 (ipc_lookup_service): arg0 is a name pointer, not a cap
+    // handle.  Handle it before the cap-lookup preamble that applies to all
+    // other syscalls in this dispatcher.
+    if number == 10 {
+        return ipc_lookup_service(task_id, arg0, arg1);
+    }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
     // truncation wrap-around: a userspace caller passing arg0 = 0x1_0000_0000
@@ -178,6 +193,60 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
                 _ => u64::MAX,
             }
         }
+        9 => {
+            // ipc_register_service(ep_cap_handle, name_ptr, name_len)
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_register_service(ep_id, arg1, arg2),
+                _ => u64::MAX,
+            }
+        }
         _ => u64::MAX,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service registry syscall helpers
+// ---------------------------------------------------------------------------
+
+/// Syscall 9: register a named endpoint in the service registry.
+///
+/// `name_ptr` is a kernel-address pointer to `name_len` bytes of UTF-8.
+/// `name_len` is capped at 32.
+fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 {
+    let name_len = name_len.min(32) as usize;
+    // Safety: In Phase 7 the kernel and userspace share the same address space
+    // (kernel threads).  The caller supplies a pointer to a kernel buffer; we
+    // cap the length at 32 bytes and construct a temporary slice only for the
+    // duration of this function.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    match registry::register(name, ep_id) {
+        Ok(()) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Syscall 10: look up a named endpoint and insert it into the caller's cap table.
+///
+/// Returns the new [`CapHandle`] cast to `u64`, or `u64::MAX` on any error.
+fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64) -> u64 {
+    let name_len = name_len.min(32) as usize;
+    // Safety: same reasoning as `ipc_register_service` — Phase 7 kernel/user
+    // share one address space; length is capped at 32 bytes.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len) };
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let ep_id = match registry::lookup(name) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
+    match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
+        Ok(handle) => u64::from(handle),
+        Err(_) => u64::MAX,
     }
 }
