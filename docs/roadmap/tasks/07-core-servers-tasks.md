@@ -26,12 +26,12 @@ flowchart LR
 
 ## Validation Tasks
 
-- [ ] P7-T007 Verify `init` launches the initial service set in the expected order.
-- [ ] P7-T008 Verify userspace clients can discover the console service and send output through it.
-- [ ] P7-T009 Verify keyboard events reach userspace through `kbd_server` rather than ad hoc kernel code.
+- [x] P7-T007 Verify `init` launches the initial service set in the expected order.
+- [x] P7-T008 Verify userspace clients can discover the console service and send output through it.
+- [x] P7-T009 Verify keyboard events reach userspace through `kbd_server` rather than ad hoc kernel code.
 
 ## Documentation Tasks
 
-- [ ] P7-T010 Document the service startup sequence and ownership boundaries between kernel and servers.
-- [ ] P7-T011 Document the registry or nameserver approach used for early bootstrapping.
-- [ ] P7-T012 Add a short note explaining how mature systems usually add supervision, restart policy, and richer service discovery later.
+- [x] P7-T010 Document the service startup sequence and ownership boundaries between kernel and servers.
+- [x] P7-T011 Document the registry or nameserver approach used for early bootstrapping.
+- [x] P7-T012 Add a short note explaining how mature systems usually add supervision, restart policy, and richer service discovery later.
