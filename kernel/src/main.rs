@@ -92,22 +92,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 /// init task: creates service endpoints, registers them, spawns servers.
 fn init_task() -> ! {
-    // Create IPC endpoints for each service.
+    // Create IPC endpoint for the console service.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
-    let kbd_ep = ipc::endpoint::ENDPOINTS.lock().create();
 
-    // Register in the service registry so clients can look them up by name.
+    // Register in the service registry so clients can look it up by name.
     ipc::registry::register("console", console_ep)
         .expect("[init] failed to register console service");
-    ipc::registry::register("kbd", kbd_ep).expect("[init] failed to register kbd service");
 
-    log::info!(
-        "[init] service registry: console={:?} kbd={:?}",
-        console_ep,
-        kbd_ep
-    );
+    log::info!("[init] service registry: console={:?}", console_ep);
 
     // Spawn service tasks and a demo client.
+    // kbd_server_task creates its own notification internally and does not
+    // serve IPC clients in Phase 7 — no endpoint registration needed.
     task::spawn(console_server_task, "console");
     task::spawn(kbd_server_task, "kbd");
     task::spawn(console_client_task, "console-client");
@@ -147,17 +143,30 @@ fn console_server_task() -> ! {
     let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
 
     loop {
-        // Handle the write request: data[0]=ptr, data[1]=len.
-        let ptr = msg.data[0] as *const u8;
-        let len = msg.data[1] as usize;
-        if len > 0 && len <= 4096 {
-            // Safety: In Phase 7, kernel tasks share the kernel address space.
-            // The pointer is a kernel static string address provided by the client.
-            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-            if let Ok(text) = core::str::from_utf8(bytes) {
-                log::info!("[console] {}", text.trim_end_matches('\n'));
+        let reply_msg = match msg.label {
+            CONSOLE_WRITE => {
+                // Handle the write request: data[0]=ptr, data[1]=len.
+                let ptr = msg.data[0] as *const u8;
+                let len = msg.data[1] as usize;
+                if ptr.is_null() || len == 0 || len > 4096 {
+                    // Bad request — reply with error label.
+                    ipc::Message::new(u64::MAX)
+                } else {
+                    // Safety: In Phase 7, kernel tasks share the kernel address space.
+                    // The pointer is a kernel static string address provided by the client.
+                    // ptr is non-null (checked above) and len is in 1..=4096.
+                    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+                    if let Ok(text) = core::str::from_utf8(bytes) {
+                        log::info!("[console] {}", text.trim_end_matches('\n'));
+                    }
+                    ipc::Message::new(0)
+                }
             }
-        }
+            _ => {
+                // Unknown operation — reply with error label.
+                ipc::Message::new(u64::MAX)
+            }
+        };
 
         // Consume the one-shot reply cap inserted by recv_msg.
         let caller_id = match task::task_cap(my_id, reply_cap_handle) {
@@ -166,8 +175,8 @@ fn console_server_task() -> ! {
         };
         let _ = task::remove_task_cap(my_id, reply_cap_handle);
 
-        // Reply (ack) and immediately wait for the next message.
-        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, ipc::Message::new(0));
+        // Reply and immediately wait for the next message.
+        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
     }
 }
 
@@ -195,9 +204,18 @@ fn kbd_server_task() -> ! {
     loop {
         let bits = ipc::notification::wait(my_id, notif_id);
         log::info!("[kbd] keypress received (notification bits={:#b})", bits);
+        // Drain the scancode ring buffer to avoid dropping events on rapid keypresses.
+        while let Some(scancode) = crate::arch::x86_64::interrupts::read_scancode() {
+            log::info!("[kbd] scancode={:#04x}", scancode);
+        }
         // Phase 8+: forward to subscribed clients via IPC.
     }
 }
+
+/// Console IPC operation label: write a UTF-8 string to the serial console.
+///
+/// data[0] = kernel pointer to string bytes, data[1] = byte length (max 4096).
+const CONSOLE_WRITE: u64 = 0;
 
 /// Demo client: looks up the console service and sends one write request.
 ///

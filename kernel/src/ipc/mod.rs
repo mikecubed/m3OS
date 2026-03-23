@@ -213,11 +213,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
 /// `name_ptr` is a kernel-address pointer to `name_len` bytes of UTF-8.
 /// `name_len` is capped at 32.
 fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
     let name_len = name_len.min(32) as usize;
-    // Safety: In Phase 7 the kernel and userspace share the same address space
-    // (kernel threads).  The caller supplies a pointer to a kernel buffer; we
-    // cap the length at 32 bytes and construct a temporary slice only for the
-    // duration of this function.
+    // Safety: Phase 7 only — all callers are kernel tasks sharing the kernel address
+    // space; name_ptr is a valid kernel-memory pointer. Phase 8 will add a
+    // copy-from-user path that validates ring-3 addresses before dereferencing.
     let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len) };
     let name = match core::str::from_utf8(name_bytes) {
         Ok(s) => s,
@@ -233,9 +235,13 @@ fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 
 ///
 /// Returns the new [`CapHandle`] cast to `u64`, or `u64::MAX` on any error.
 fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64) -> u64 {
+    if name_ptr == 0 {
+        return u64::MAX;
+    }
     let name_len = name_len.min(32) as usize;
-    // Safety: same reasoning as `ipc_register_service` — Phase 7 kernel/user
-    // share one address space; length is capped at 32 bytes.
+    // Safety: Phase 7 only — all callers are kernel tasks sharing the kernel address
+    // space; name_ptr is a valid kernel-memory pointer. Phase 8 will add a
+    // copy-from-user path that validates ring-3 addresses before dereferencing.
     let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len) };
     let name = match core::str::from_utf8(name_bytes) {
         Ok(s) => s,
