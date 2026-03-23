@@ -31,15 +31,16 @@ flowchart LR
 ### How the framebuffer is accessed (T001)
 
 `bootloader_api` provides a `&'static mut FrameBuffer` embedded in `BootInfo`. During
-`kernel_main` init, `fb::init()` is called exactly once:
+`kernel_main` init, the kernel first extracts `(buf_ptr, info)` from `BootInfo`, then calls
+`fb::init_from_parts()` after `mm::init()`:
 
 - Extracts the raw pointer, stride, width, height, and pixel format from `BootInfo`.
 - Stores them in a `static Mutex<FbConsole>` (using `spin::Mutex`).
-- The `BootInfo` reference is not retained after `fb::init()` returns.
+- The `BootInfo` reference is not retained after framebuffer init completes.
 
 Why a raw pointer: the CLAUDE.md convention requires that `BootInfo` is not held long-lived.
-`fb::init()` takes ownership of the framebuffer data at boot time, so the rest of the kernel
-interacts with `fb::write_str()` without knowing about `BootInfo` at all.
+`fb::init_from_parts()` takes ownership of the framebuffer data after the one-time extraction, so
+the rest of the kernel interacts with `fb::write_str()` without knowing about `BootInfo` at all.
 
 ### Text rendering (T002)
 
@@ -114,12 +115,13 @@ line buffer.
 
 ### Command dispatch
 
-`shell_task` reads characters from `kbd_server` via `KBD_READ` IPC and accumulates them into a
-line buffer until a newline (`\r` or `\n`) is received. Backspace removes the last character. On
-newline:
+`shell_task` reads scancodes from `kbd_server` via `KBD_READ` IPC, translates them to printable
+ASCII (tracking shift state), and accumulates them into a line buffer. The line is considered
+complete when the Enter make scancode (`0x1C`) is received; Backspace removes the last character.
+On Enter:
 
-1. Split the line on ASCII whitespace.
-2. First token = command name; remaining tokens = arguments.
+1. Split the line once at the first ASCII space character (`splitn(2, ' ')`).
+2. First token = command name; second token (if present) = the rest of the line as one argument string.
 3. Dispatch to the matching built-in handler.
 4. Print the result via `console_server` (which routes to both serial and framebuffer).
 

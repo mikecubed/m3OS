@@ -264,7 +264,7 @@ fn kbd_server_task() -> ! {
     // Handle 0: notification capability.
     let notif_handle = task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
         .expect("[kbd] failed to insert notification cap");
-    assert_eq!(
+    debug_assert_eq!(
         notif_handle, 0,
         "[kbd] notification cap not at expected handle 0"
     );
@@ -726,10 +726,10 @@ fn cmd_cat(
     }
     let fd = open_reply.data[0];
 
-    // FILE_READ (offset=0, max=4096)
+    // FILE_READ (offset=0, max=MAX_READ_LEN)
     let read_msg = ipc::Message {
         label: crate::fs::protocol::FILE_READ,
-        data: [fd, 0, 4096, 0],
+        data: [fd, 0, crate::fs::protocol::MAX_READ_LEN as u64, 0],
     };
     let read_reply = ipc::endpoint::call_msg(my_id, vfs_ep, read_msg);
     let ptr = read_reply.data[0] as *const u8;

@@ -54,6 +54,7 @@ const fn file_name_list_len() -> usize {
 }
 
 const FILE_NAME_LIST_LEN: usize = file_name_list_len();
+const _: [(); 1] = [(); (FILE_NAME_LIST_LEN <= MAX_LIST_LEN) as usize];
 
 const fn build_file_name_list() -> [u8; FILE_NAME_LIST_LEN] {
     let mut buf = [0; FILE_NAME_LIST_LEN];
@@ -77,10 +78,6 @@ const fn build_file_name_list() -> [u8; FILE_NAME_LIST_LEN] {
 static FILE_NAME_LIST: [u8; FILE_NAME_LIST_LEN] = build_file_name_list();
 
 fn name_list() -> (*const u8, usize) {
-    debug_assert!(
-        FILE_NAME_LIST.len() <= MAX_LIST_LEN,
-        "FILE_LIST buffer exceeds protocol limit"
-    );
     (FILE_NAME_LIST.as_ptr(), FILE_NAME_LIST.len())
 }
 

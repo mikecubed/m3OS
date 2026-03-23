@@ -314,16 +314,22 @@ impl FbConsole {
             unsafe { core::slice::from_raw_parts_mut(self.buf.add(offset), self.bytes_per_pixel) };
 
         match self.pixel_format {
-            PixelFormat::Rgb => {
+            PixelFormat::Rgb if self.bytes_per_pixel >= 3 => {
                 pixel[0] = colour.r;
                 pixel[1] = colour.g;
                 pixel[2] = colour.b;
                 // bytes_per_pixel may be 4; 4th byte left as-is (padding).
             }
-            PixelFormat::Bgr => {
+            PixelFormat::Rgb => {
+                // bytes_per_pixel < 3 — nothing we can do safely.
+            }
+            PixelFormat::Bgr if self.bytes_per_pixel >= 3 => {
                 pixel[0] = colour.b;
                 pixel[1] = colour.g;
                 pixel[2] = colour.r;
+            }
+            PixelFormat::Bgr => {
+                // bytes_per_pixel < 3 — nothing we can do safely.
             }
             PixelFormat::U8 => {
                 // Greyscale: use luminance approximation.
@@ -498,10 +504,24 @@ pub fn init(fb: &'static mut FrameBuffer) -> bool {
 ///
 /// Returns `true` if the framebuffer was large enough to enable the text console.
 pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
+    let total_bytes = match info
+        .stride
+        .checked_mul(info.height)
+        .and_then(|pixels| pixels.checked_mul(info.bytes_per_pixel))
+    {
+        Some(total) if total <= info.byte_len => total,
+        _ => {
+            *CONSOLE.lock() = None;
+            return false;
+        }
+    };
+
     if info.width < CHAR_W
         || info.height < CHAR_H
         || info.byte_len == 0
         || info.bytes_per_pixel == 0
+        || matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr)
+            && info.bytes_per_pixel < 3
     {
         *CONSOLE.lock() = None;
         return false;
@@ -509,11 +529,10 @@ pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
 
     let mut console = FbConsole::new(buf_ptr, info);
 
-    // Clear the screen to black before handing over to the cursor logic.
-    // SAFETY: byte_len bytes starting at buf_ptr is the whole framebuffer,
-    // as guaranteed by the caller.
+    // Clear the mapped framebuffer region before handing over to the cursor
+    // logic. `total_bytes` was checked for overflow and bounded by `byte_len`.
     unsafe {
-        core::ptr::write_bytes(buf_ptr, 0x00, info.byte_len);
+        core::ptr::write_bytes(buf_ptr, 0x00, total_bytes);
     }
 
     console.cursor_col = 0;
