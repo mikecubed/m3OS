@@ -274,6 +274,34 @@ of new files, and no way to persist data across reboots. This is intentional: re
 teaches the layering and naming conventions without introducing crash-consistency problems
 (journaling, write-back ordering, fsync).
 
+### Inconsistent error sentinels in the file protocol
+
+`FILE_OPEN` and `FILE_READ` use different conventions to signal errors in their reply messages:
+
+- `FILE_OPEN` error: `data[0] = u64::MAX` (the fd field holds the sentinel)
+- `FILE_READ` error: `data[0] = 0, data[1] = 0` (the len field being zero signals failure;
+  `data[0]` is `0` not `u64::MAX`)
+
+A client that copies the `FILE_OPEN` error-check pattern (`data[0] == u64::MAX`) to a
+`FILE_READ` error check would silently treat a successful read as an error if the content
+pointer happens to be non-null.  The current `fs_client_task` correctly gates on
+`data[1] > 0` (len) rather than inspecting the pointer, but the asymmetry is a latent
+trap.
+
+Phase 9+ should unify the protocol — the simplest fix is to use `data[0] = 0` (null
+pointer) as the consistent error indicator across all operations, with `data[1] = 0`
+for length-carrying replies.  This will be a natural point to revisit when the protocol
+is redesigned for page-capability grants.
+
+### Name-length limits are not shared
+
+`MAX_NAME_LEN` in `fs/protocol.rs` is 64 bytes, while the service registry
+(`ipc/registry.rs`) caps names at 32 bytes.  These are different domains (filenames
+vs. service names), so separate limits are correct.  However, the values are currently
+unrelated magic numbers.  If either limit is raised independently in Phase 9+, the
+mismatch could cause confusion.  Consider a shared constant or at minimum a comment
+cross-referencing the two limits when either is changed.
+
 ### Comparison with a production VFS
 
 | Feature | Phase 8 | Production (e.g., Linux VFS) |
