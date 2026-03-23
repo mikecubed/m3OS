@@ -53,10 +53,13 @@ range. Rendering a character at `(col, row)`:
 4. Pixel address = `framebuffer_base + (y + r) * stride + (x + b) * bytes_per_pixel`.
 
 **Scroll:** When `cursor_row` reaches `height / char_h`, the buffer is shifted up by `char_h`
-rows using a `memmove`-style byte copy (`ptr::copy`), and the bottom row is cleared.
+rows using a `memmove`-style byte copy (`ptr::copy`), and the bottom row is cleared. If the
+framebuffer is too small to fit even one 8×16 glyph cell, the text console stays disabled rather
+than attempting to render or scroll.
 
-**Pixel formats:** `Rgb` and `Bgr` are both supported. Pixels are written as a 4-byte sequence:
-`[r, g, b, 0]` for `Rgb` and `[b, g, r, 0]` for `Bgr`.
+**Pixel formats:** `Rgb` and `Bgr` are both supported. The renderer writes the first three bytes
+of each pixel (`[r, g, b]` or `[b, g, r]`) and leaves any 4th padding byte unchanged. For
+`PixelFormat::U8`, it writes an 8-bit luma value derived from the RGB colour.
 
 ### Console dual output (T003)
 
@@ -65,7 +68,7 @@ calls `fb::write_str(text)` for every string it would write to serial. The frame
 best-effort:
 
 - If `fb::init()` was never called (bootloader provided no framebuffer), `write_str` is a no-op.
-- If the `Mutex` is poisoned (should not happen in a no-panic kernel), output is silently dropped.
+- If the framebuffer is smaller than one character cell, `fb::init()` leaves the console disabled.
 
 This means existing serial logging is unchanged; the framebuffer is an additive output channel.
 
@@ -88,20 +91,22 @@ server loop:
 
 1. Block on `recv(kbd_ep)`.
 2. When a `KBD_READ` message arrives:
-   - If the scancode ring buffer is non-empty, pop one scancode, convert to ASCII, and reply.
+   - If the scancode ring buffer is non-empty, pop one scancode and reply with it.
    - If the ring buffer is empty, block on the keyboard IRQ `Notification` until a scancode
-     arrives, then reply.
-3. Reply contains the ASCII byte in `data[0]` (or `0` for non-ASCII / dropped scancodes).
+     arrives, then reply with that scancode.
+3. Reply contains the raw PS/2 scancode byte in `data[0]`. `kbd_server` does not perform ASCII
+   translation.
 
 The shell calls `KBD_READ` synchronously: one IPC round-trip per keystroke.
 
 ### Scancode-to-ASCII
 
-A compile-time lookup table maps PS/2 scancodes `0x01`–`0x3A` to ASCII characters using the
-US-QWERTY layout. Shift state is maintained by monitoring make/break codes for left shift
-(`0x2A`) and right shift (`0x36`). A shifted lookup table handles uppercase letters and
-punctuation. Function keys, arrow keys, and other non-ASCII scancodes are silently dropped
-(reply `data[0] = 0`).
+The shell performs scancode-to-ASCII translation in userspace. A compile-time lookup table maps
+PS/2 scancodes `0x01`–`0x3A` to ASCII characters using the US-QWERTY layout. Shift state is
+maintained by monitoring make/break codes for left shift (`0x2A`) and right shift (`0x36`). A
+shifted lookup table handles uppercase letters and punctuation. Function keys, arrow keys, and
+other non-ASCII scancodes are ignored by the shell, so they do not append printable bytes to the
+line buffer.
 
 ---
 
@@ -128,7 +133,7 @@ through the buffer, printing each null-terminated name on its own line.
 
 **`cat <file>`** sends `FILE_OPEN` → `FILE_READ` → `FILE_CLOSE` to `vfs_server`, then prints
 the content bytes to the console. On `FILE_OPEN` error (`data[0] == u64::MAX`) it prints
-`cat: <file>: not found`.
+`cat: file not found`.
 
 Both `ls` and `cat` route through `vfs_server` → `fat_server`, exercising the same two-hop IPC
 chain introduced in Phase 8.
@@ -138,7 +143,7 @@ chain introduced in Phase 8.
 - No pipes, redirection, or job control.
 - No command history or cursor movement (only backspace line editing).
 - No process launching; all commands are built-in kernel tasks.
-- Line buffer is fixed-size; oversized input is truncated.
+- Line buffer grows dynamically (`Vec<u8>`), so practical limits are set by the kernel heap.
 
 ---
 

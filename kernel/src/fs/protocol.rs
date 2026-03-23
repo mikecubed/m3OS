@@ -74,5 +74,8 @@ pub const FILE_LIST: u64 = 4;
 /// Maximum byte length of a filename accepted by the file service.
 pub const MAX_NAME_LEN: usize = 64;
 
+/// Maximum byte length of a single `FILE_LIST` reply buffer.
+pub const MAX_LIST_LEN: usize = 4096;
+
 /// Maximum number of bytes returned by a single `FILE_READ` call.
 pub const MAX_READ_LEN: usize = 4096;

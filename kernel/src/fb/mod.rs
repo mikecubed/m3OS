@@ -327,8 +327,8 @@ impl FbConsole {
             }
             PixelFormat::U8 => {
                 // Greyscale: use luminance approximation.
-                let luma =
-                    (colour.r as u16 * 77 + colour.g as u16 * 150 + colour.b as u16 * 29) as u8;
+                let luma = ((colour.r as u16 * 77 + colour.g as u16 * 150 + colour.b as u16 * 29)
+                    >> 8) as u8;
                 pixel[0] = luma;
             }
             // Best-effort for unknown pixel formats: write RGB bytes when
@@ -374,6 +374,14 @@ impl FbConsole {
     fn scroll_up(&mut self) {
         let row_bytes = self.stride * self.bytes_per_pixel * CHAR_H;
         let total = self.stride * self.bytes_per_pixel * self.height;
+        if row_bytes == 0 || total == 0 || row_bytes >= total {
+            // No full text row fits in the framebuffer. Clear what we have and
+            // avoid underflowing `total - row_bytes`.
+            unsafe {
+                core::ptr::write_bytes(self.buf, 0x00, total);
+            }
+            return;
+        }
         // SAFETY: buf is the static framebuffer; total == byte_len; we copy
         // non-overlapping regions (source starts one char_h above dest start).
         unsafe {
@@ -388,6 +396,9 @@ impl FbConsole {
     fn put_char(&mut self, c: char) {
         let rows = self.rows();
         let cols = self.cols();
+        if rows == 0 || cols == 0 {
+            return;
+        }
 
         match c {
             '\n' => {
@@ -398,13 +409,22 @@ impl FbConsole {
                 // Backspace: erase previous cell.
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
-                    self.render_char_at(self.cursor_col, self.cursor_row, ' ');
+                } else if self.cursor_row > 0 {
+                    self.cursor_row -= 1;
+                    self.cursor_col = cols - 1;
+                } else {
+                    return;
                 }
+                self.render_char_at(self.cursor_col, self.cursor_row, ' ');
             }
             _ => {
                 if self.cursor_col >= cols {
                     self.cursor_col = 0;
                     self.cursor_row += 1;
+                    if self.cursor_row >= rows {
+                        self.scroll_up();
+                        self.cursor_row = rows - 1;
+                    }
                 }
                 self.render_char_at(self.cursor_col, self.cursor_row, c);
                 self.cursor_col += 1;
@@ -445,7 +465,9 @@ static CONSOLE: Mutex<Option<FbConsole>> = Mutex::new(None);
 /// # Safety
 /// `fb` must be `&'static mut` (derived from `boot_info.framebuffer`).  The
 /// caller must not access `boot_info.framebuffer` again after this call.
-pub fn init(fb: &'static mut FrameBuffer) {
+///
+/// Returns `true` if the framebuffer was large enough to enable the text console.
+pub fn init(fb: &'static mut FrameBuffer) -> bool {
     let info: FrameBufferInfo = fb.info();
     // Extract the raw mutable pointer from the &'static mut FrameBuffer.
     // SAFETY: fb is &'static mut so the pointer is valid for the kernel
@@ -453,7 +475,7 @@ pub fn init(fb: &'static mut FrameBuffer) {
     // only ever accessed with the lock held, preventing aliased writes.
     let buf_ptr: *mut u8 = fb.buffer_mut().as_mut_ptr();
     // SAFETY: buf_ptr and info are both derived from &'static mut FrameBuffer.
-    unsafe { init_from_parts(buf_ptr, info) };
+    unsafe { init_from_parts(buf_ptr, info) }
 }
 
 /// Initialise the framebuffer text console from pre-extracted raw components.
@@ -470,7 +492,18 @@ pub fn init(fb: &'static mut FrameBuffer) {
 ///   be the `'static` UEFI framebuffer mapping set up by the bootloader).
 /// * No other code may write to the framebuffer memory without holding the
 ///   internal [`CONSOLE`] mutex.
-pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) {
+///
+/// Returns `true` if the framebuffer was large enough to enable the text console.
+pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
+    if info.width < CHAR_W
+        || info.height < CHAR_H
+        || info.byte_len == 0
+        || info.bytes_per_pixel == 0
+    {
+        *CONSOLE.lock() = None;
+        return false;
+    }
+
     let mut console = FbConsole::new(buf_ptr, info);
 
     // Clear the screen to black before handing over to the cursor logic.
@@ -484,6 +517,7 @@ pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) {
     console.cursor_row = 0;
 
     *CONSOLE.lock() = Some(console);
+    true
 }
 
 /// Write a string to the framebuffer console at the current cursor position.

@@ -56,8 +56,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // SAFETY: buf_ptr is derived from boot_info.framebuffer which is
         // &'static mut; the mapping outlives the kernel.  mm::init does not
         // touch the framebuffer region.
-        unsafe { fb::init_from_parts(buf_ptr, info) };
-        log::info!("[fb] framebuffer console initialised");
+        if unsafe { fb::init_from_parts(buf_ptr, info) } {
+            log::info!("[fb] framebuffer console initialised");
+        } else {
+            log::warn!("[fb] framebuffer too small for text console");
+        }
     } else {
         log::warn!("[fb] no framebuffer provided by bootloader");
     }
@@ -246,8 +249,7 @@ fn console_server_task() -> ! {
 ///
 /// Capability table layout:
 ///   handle 0 — Notification(notif_id)  inserted by kbd_server itself
-///   handle 1 — Endpoint(ep_id)         inserted by kbd_server itself
-///   handle 2 — Reply(caller_id)        inserted by recv_msg / call_msg on each client call
+///   handle 1 — Reply(caller_id)        inserted by recv_msg / call_msg on each client call
 fn kbd_server_task() -> ! {
     let my_id = task::current_task_id().expect("[kbd] no task id");
 
@@ -260,21 +262,22 @@ fn kbd_server_task() -> ! {
     });
 
     // Handle 0: notification capability.
-    task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
+    let notif_handle = task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
         .expect("[kbd] failed to insert notification cap");
+    assert_eq!(
+        notif_handle, 0,
+        "[kbd] notification cap not at expected handle 0"
+    );
 
     // Look up the kbd endpoint registered by init_task.
     let ep_id = ipc::registry::lookup("kbd").expect("[kbd] endpoint not in registry");
     task::set_server_endpoint(my_id, ep_id);
 
-    // Handle 1: endpoint capability.
-    let _ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("[kbd] failed to insert endpoint cap");
-
     log::info!("[kbd] ready, waiting for KBD_READ requests");
 
-    // Reply cap is inserted at handle 2 by recv_msg each time a client calls.
-    let reply_cap_handle: ipc::CapHandle = 2;
+    // recv_msg/reply_recv_msg take EndpointId directly, so keep handle 1 free
+    // for the one-shot Reply capability inserted on each client call.
+    let reply_cap_handle: ipc::CapHandle = 1;
 
     // First receive — blocks until a client sends KBD_READ.
     let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
@@ -302,7 +305,7 @@ fn kbd_server_task() -> ! {
         let caller_id = match task::task_cap(my_id, reply_cap_handle) {
             Ok(ipc::Capability::Reply(id)) => id,
             _ => {
-                log::warn!("[kbd] no reply cap at handle 2; sender used send rather than call");
+                log::warn!("[kbd] no reply cap at handle 1; sender used send rather than call");
                 msg = ipc::endpoint::recv_msg(my_id, ep_id);
                 continue;
             }
@@ -665,19 +668,22 @@ fn cmd_ls(
 ) {
     let req = ipc::Message::new(crate::fs::protocol::FILE_LIST);
     let reply = ipc::endpoint::call_msg(my_id, vfs_ep, req);
-    if reply.label == u64::MAX || reply.data[0] == 0 {
+    if reply.label == u64::MAX {
         shell_print(my_id, console_ep, "ls: error\n");
         return;
     }
     let ptr = reply.data[0] as *const u8;
     let len = reply.data[1] as usize;
+    if ptr.is_null() || len > crate::fs::protocol::MAX_LIST_LEN {
+        shell_print(my_id, console_ep, "ls: error\n");
+        return;
+    }
     if len == 0 {
         shell_print(my_id, console_ep, "(no files)\n");
         return;
     }
-    // SAFETY: Phase 9 — fat_server returns a pointer into static FILE_NAME_LIST
-    // ramdisk data.  The pointer is non-null (checked above) and len is
-    // bounded by the static buffer size.
+    // SAFETY: The VFS protocol returns a pointer to a static FILE_LIST buffer.
+    // The pointer is non-null (checked above) and len is capped to MAX_LIST_LEN.
     let list = unsafe { core::slice::from_raw_parts(ptr, len) };
     for name in list.split(|&b| b == 0).filter(|s| !s.is_empty()) {
         if let Ok(s) = core::str::from_utf8(name) {
@@ -718,17 +724,17 @@ fn cmd_cat(
         data: [fd, 0, 4096, 0],
     };
     let read_reply = ipc::endpoint::call_msg(my_id, vfs_ep, read_msg);
-    if read_reply.label == u64::MAX || read_reply.data[0] == 0 {
+    let ptr = read_reply.data[0] as *const u8;
+    let len = read_reply.data[1] as usize;
+    if read_reply.label == u64::MAX || ptr.is_null() || len > crate::fs::protocol::MAX_READ_LEN {
         shell_print(my_id, console_ep, "cat: read error\n");
     } else {
-        let ptr = read_reply.data[0] as *const u8;
-        let len = read_reply.data[1] as usize;
         if len == 0 {
             shell_print(my_id, console_ep, "(empty)\n");
         } else {
             // SAFETY: Phase 9 — fat_server returns a pointer into static ramdisk
-            // content.  Pointer is non-null (data[0] != 0 checked above) and len
-            // is bounded by MAX_READ_LEN (4096).
+            // content. Pointer is non-null (checked above) and len is bounded
+            // by MAX_READ_LEN (4096).
             let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
             if let Ok(text) = core::str::from_utf8(bytes) {
                 shell_print(my_id, console_ep, text);
