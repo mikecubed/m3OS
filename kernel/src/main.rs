@@ -101,8 +101,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The keyboard ISR will signal bit 1 each keypress; the kbd_notif_task
     // blocks on wait() and logs the first keypress it receives.
     //
-    // Wrapped in without_interrupts: register_irq writes IRQ_MAP atomically,
-    // but we want IRQ1 masked until the mapping is fully visible.
+    // Wrapped in without_interrupts: clears the CPU IF flag so no keyboard
+    // IRQ can fire between create() and register_irq(), ensuring the ISR
+    // never reads a partially-initialized IRQ_MAP entry.
     let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
         let id = ipc::notification::create();
         ipc::notification::register_irq(1, id);

@@ -231,10 +231,12 @@ pub fn current_task_id() -> Option<TaskId> {
     sched.current.map(|idx| sched.tasks[idx].id)
 }
 
-/// Block the current task waiting for an IPC message (recv or notification wait).
+/// Block the current task waiting for an IPC message on an endpoint.
 ///
 /// Sets state to [`TaskState::BlockedOnRecv`] and switches to the scheduler.
 /// Returns when another task calls [`wake_task`] on this task.
+///
+/// For notification waits, use [`block_current_on_notif`] instead.
 pub fn block_current_on_recv() {
     let task_rsp_ptr: *mut u64 = {
         let mut sched = SCHEDULER.lock();
