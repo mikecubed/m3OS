@@ -8,6 +8,10 @@ pub mod user_space;
 
 use bootloader_api::BootInfo;
 use spin::Once;
+use x86_64::{
+    structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
+    VirtAddr,
+};
 
 static PHYS_OFFSET: Once<u64> = Once::new();
 
@@ -45,4 +49,65 @@ pub fn init(boot_info: &'static mut BootInfo) {
     heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
 
     log::info!("[mm] Memory subsystem initialized");
+}
+
+// ---------------------------------------------------------------------------
+// Per-process page table helpers (P11-T002 / P11-T013)
+// ---------------------------------------------------------------------------
+
+/// Create a fresh user-space page table that inherits all kernel mappings.
+///
+/// Allocates a new PML4 frame, zeroes it, then copies the upper-half entries
+/// (indices 256–511) from the currently-active PML4 so the new process can
+/// reach kernel code and data without a separate mapping step.
+///
+/// Returns the physical frame of the new PML4, or `None` if frame allocation
+/// fails.
+#[allow(dead_code)]
+pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
+    use x86_64::registers::control::Cr3;
+
+    let frame = frame_allocator::allocate_frame()?;
+    let phys_off = VirtAddr::new(phys_offset());
+
+    // Zero the new PML4 frame.
+    let new_pml4_virt = phys_off + frame.start_address().as_u64();
+    // SAFETY: frame is freshly allocated, no other reference exists.
+    unsafe {
+        core::ptr::write_bytes(new_pml4_virt.as_mut_ptr::<u8>(), 0, 4096);
+    }
+
+    // Copy kernel (upper-half) entries from the current PML4.
+    let (cur_frame, _) = Cr3::read();
+    let cur_pml4_virt = phys_off + cur_frame.start_address().as_u64();
+    // SAFETY: cur_pml4 is the live PML4; new_pml4 is ours alone.
+    unsafe {
+        let cur_pml4: *const PageTable = cur_pml4_virt.as_ptr();
+        let new_pml4: *mut PageTable = new_pml4_virt.as_mut_ptr();
+        for i in 256usize..512 {
+            (&mut (*new_pml4))[i] = (&(*cur_pml4))[i].clone();
+        }
+    }
+
+    Some(frame)
+}
+
+/// Build an `OffsetPageTable` mapper over an arbitrary PML4 frame.
+///
+/// Does **not** switch CR3, so the current address space remains active.
+/// All page-table walks go through the physical-memory offset, allowing the
+/// kernel to manipulate any process's page table without changing CR3.
+///
+/// # Safety
+///
+/// - `cr3_frame` must point to a valid, 4 KiB-aligned PML4.
+/// - No other `OffsetPageTable` over the same frame may be alive at the same
+///   time (aliasing `&mut PageTable` is UB).
+/// - The physical memory offset must be valid (i.e. `mm::init` must have run).
+#[allow(dead_code)]
+pub unsafe fn mapper_for_frame(cr3_frame: PhysFrame<Size4KiB>) -> OffsetPageTable<'static> {
+    let phys_off = VirtAddr::new(phys_offset());
+    let pml4_virt = phys_off + cr3_frame.start_address().as_u64();
+    let pml4: &'static mut PageTable = &mut *pml4_virt.as_mut_ptr();
+    OffsetPageTable::new(pml4, phys_off)
 }

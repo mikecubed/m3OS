@@ -147,6 +147,13 @@ fn handle_open(msg: &Message) -> Message {
 // FILE_READ
 // ---------------------------------------------------------------------------
 
+/// Look up a file by name and return a reference to its static content.
+///
+/// Used by `sys_execve` to read a binary directly without going through IPC.
+pub fn get_file(name: &str) -> Option<&'static [u8]> {
+    FILES.iter().find(|f| f.name == name).map(|f| f.content)
+}
+
 fn handle_read(msg: &Message) -> Message {
     let fd = msg.data[0];
     let offset = msg.data[1] as usize;

@@ -23,6 +23,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
 
+// ---------------------------------------------------------------------------
+// Current-process tracker (single-CPU)
+// ---------------------------------------------------------------------------
+
+/// PID of the userspace process currently running on the CPU.
+///
+/// 0 = no userspace process is running (kernel task context).
+/// Updated by `fork_child_trampoline` and `sys_execve` before entering ring 3.
+pub static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
+
 #[allow(unused_imports)]
 pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
 
@@ -217,6 +227,104 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
+}
+
+/// Create a new process entry with a known page-table root and kernel stack.
+///
+/// Used by `sys_fork` to register the child process before spawning the
+/// fork-child kernel task.
+pub fn spawn_process_with_cr3(
+    ppid: Pid,
+    entry_point: u64,
+    user_stack_top: u64,
+    cr3: x86_64::PhysAddr,
+) -> Pid {
+    let kstack_top = alloc_kernel_stack();
+    let pid = alloc_pid();
+    let proc = Process {
+        pid,
+        ppid,
+        state: ProcessState::Ready,
+        page_table_root: Some(cr3),
+        kernel_stack_top: kstack_top,
+        entry_point,
+        user_stack_top,
+        exit_code: None,
+    };
+    PROCESS_TABLE.lock().insert(proc);
+    pid
+}
+
+// ---------------------------------------------------------------------------
+// Fork child support
+// ---------------------------------------------------------------------------
+
+/// Context passed from `sys_fork` to `fork_child_trampoline`.
+struct ForkChildCtx {
+    pid: Pid,
+    user_rip: u64,
+    user_rsp: u64,
+}
+
+/// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
+///
+/// Uses a `Vec` as a FIFO (push to back, pop from front) — simple for a
+/// single-CPU OS where forks are rare.
+static FORK_CHILD_QUEUE: Mutex<alloc::vec::Vec<ForkChildCtx>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Push a fork-child context so `fork_child_trampoline` can consume it.
+pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
+    FORK_CHILD_QUEUE.lock().push(ForkChildCtx {
+        pid,
+        user_rip,
+        user_rsp,
+    });
+}
+
+/// Kernel-task entry point for a fork child.
+///
+/// Pops the next fork context from `FORK_CHILD_QUEUE`, switches the process's
+/// CR3 if set, updates the kernel stack in TSS/MSR, sets `CURRENT_PID`, then
+/// enters ring 3 at the forked RIP with rax=0.
+pub fn fork_child_trampoline() -> ! {
+    // Pop the context set up by sys_fork.
+    let ctx = {
+        let mut q = FORK_CHILD_QUEUE.lock();
+        q.remove(0) // oldest entry first
+    };
+
+    CURRENT_PID.store(ctx.pid, Ordering::Relaxed);
+
+    // Look up page table root and kernel stack for this process.
+    let (cr3_phys, kstack_top) = {
+        let table = PROCESS_TABLE.lock();
+        let p = table.find(ctx.pid).expect("fork child: process not found");
+        (p.page_table_root, p.kernel_stack_top)
+    };
+
+    // Update TSS.RSP0 and SYSCALL_STACK_TOP for this process's kernel stack.
+    unsafe {
+        crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
+        // SAFETY: SYSCALL_STACK_TOP is written once per context switch.
+        *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) = kstack_top;
+    }
+
+    // If the child has its own page table, switch CR3.
+    if let Some(cr3) = cr3_phys {
+        unsafe {
+            use x86_64::{
+                registers::control::{Cr3, Cr3Flags},
+                structures::paging::{PhysFrame, Size4KiB},
+                PhysAddr,
+            };
+            let frame: PhysFrame<Size4KiB> =
+                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+
+    // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value).
+    unsafe { crate::arch::enter_userspace_with_retval(ctx.user_rip, ctx.user_rsp, 0) }
 }
 
 // ---------------------------------------------------------------------------
