@@ -7,11 +7,11 @@ enabled, without needing to disable the firmware security check.
 
 ```mermaid
 flowchart LR
-    Build["cargo xtask image"] --> EFI["bootx64.efi<br/>(unsigned)"]
-    EFI --> Sign["sbsign"]
+    Build["cargo xtask image --sign"] --> Sign["sign bootloader EFI"]
     Key["private key<br/>+ certificate"] --> Sign
-    Sign --> Signed["bootx64-signed.efi"]
-    Signed --> USB["bootable USB"]
+    Sign --> EFI["bootloader-x86_64-uefi-signed.efi"]
+    Sign --> IMG["boot-uefi-ostest-signed.img"]
+    IMG --> USB["bootable USB"]
     USB --> FW["UEFI firmware<br/>Secure Boot ON"]
     Enrolled["enrolled cert<br/>(UEFI db or MOK)"] --> FW
     FW --> Boot["kernel boots"]
@@ -28,8 +28,9 @@ flowchart LR
 ## Feature Scope
 
 - A key generation script (one-time setup).
-- A `cargo xtask sign` subcommand (or `--sign` flag on `cargo xtask image`).
+- A `cargo xtask sign` subcommand plus a `cargo xtask image --sign` convenience path.
 - Documentation explaining the full signing and enrollment workflow.
+- A signed disk image that can be copied to removable media for Secure Boot tests.
 - The signed image boots with Secure Boot enabled on a real machine.
 
 Out of scope for this phase:
@@ -46,11 +47,13 @@ screen. Complete Phase 9 first so there is something visible to confirm the boot
 ## Implementation Outline
 
 1. Generate a 4096-bit RSA key pair and self-signed X.509 certificate with `openssl`.
-2. Add a `sign` subcommand to `xtask` that calls `sbsign` on the EFI binary produced
-   by the `image` subcommand.
-3. Document the one-time certificate enrollment. Two paths exist — choose based on the
+2. Add `cargo xtask sign <unsigned-efi>` for signing any EFI executable with
+   optional `--key` / `--cert` overrides.
+3. Extend `cargo xtask image` with `--sign` so the build produces a signed bootable
+   disk image in addition to the unsigned image.
+4. Document the one-time certificate enrollment. Two paths exist — choose based on the
    target machine (see below).
-4. Verify the signed binary boots with `mokutil --sb-state` or `dmesg` reporting
+5. Verify the signed binary boots with `mokutil --sb-state` or `dmesg` reporting
    Secure Boot enabled.
 
 ### Certificate Enrollment: Two Paths
@@ -82,10 +85,12 @@ Secure Boot on dual-boot machines.
 
 ## Acceptance Criteria
 
-- `cargo xtask sign` (or `cargo xtask image --sign`) produces a signed EFI binary.
-- The signed binary passes `sbverify --cert ostest.crt bootx64-signed.efi`.
+- `cargo xtask sign <unsigned-efi>` produces a verified `*-signed.efi`.
+- `cargo xtask image --sign` produces `boot-uefi-ostest-signed.img` (and `.vhdx`).
+- The signed EFI passes `sbverify --cert ostest.crt <signed-efi>`.
+- The unsigned EFI fails `sbverify --cert ostest.crt <unsigned-efi>`.
 - The kernel boots on real hardware with Secure Boot enabled after enrolling the cert.
-- Booting the unsigned binary with Secure Boot on is rejected by firmware.
+- Booting the unsigned or untrusted image with Secure Boot on is rejected by firmware.
 
 ## Companion Task List
 
@@ -97,6 +102,7 @@ Secure Boot on dual-boot machines.
 - Document the personal signing workflow end-to-end.
 - Explain what the shim chain is and why it is needed for distribution but not here.
 - Note the limitations: this key is trusted only on machines where it has been enrolled.
+- Link to the implementation notes in [`../10-secure-boot.md`](../10-secure-boot.md).
 
 ## How Real OS Implementations Differ
 

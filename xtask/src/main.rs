@@ -1,6 +1,16 @@
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{self, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::SystemTime;
 
+use anyhow::Context;
+use fatfs::Dir;
+use tempfile::NamedTempFile;
+
+const KERNEL_FILE_NAME: &str = "kernel-x86_64";
+const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 
 fn main() {
@@ -8,7 +18,15 @@ fn main() {
     let subcommand = args.get(1).map(|s| s.as_str());
 
     match subcommand {
-        Some("image") => cmd_image(),
+        Some("image") => {
+            let root = workspace_root();
+            let image_args = parse_image_args(&args[2..], &root).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_image(&image_args);
+        }
         Some("run") => cmd_run(),
         Some("check") => cmd_check(),
         Some("fmt") => {
@@ -43,7 +61,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image|run|check|fmt [--fix]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|check|fmt [--fix]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -80,10 +98,10 @@ fn build_kernel() -> PathBuf {
     root.join("target/x86_64-unknown-none/release/kernel")
 }
 
-fn create_uefi_image(kernel_binary: &PathBuf) -> PathBuf {
+fn create_uefi_image(kernel_binary: &Path) -> PathBuf {
     let uefi_path = kernel_binary.parent().unwrap().join("boot-uefi-ostest.img");
 
-    let builder = bootloader::DiskImageBuilder::new(kernel_binary.clone());
+    let builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
     builder
         .create_uefi_image(&uefi_path)
         .expect("failed to create UEFI disk image");
@@ -92,7 +110,7 @@ fn create_uefi_image(kernel_binary: &PathBuf) -> PathBuf {
     uefi_path
 }
 
-fn convert_to_vhdx(uefi_image: &PathBuf) {
+fn convert_to_vhdx(uefi_image: &Path) {
     let vhdx_path = uefi_image.with_extension("vhdx");
 
     match Command::new("qemu-img")
@@ -152,16 +170,13 @@ fn find_ovmf() -> PathBuf {
     std::process::exit(1);
 }
 
-fn launch_qemu(uefi_image: &PathBuf) {
+fn launch_qemu(uefi_image: &Path) {
     let ovmf = find_ovmf();
 
     let status = Command::new("qemu-system-x86_64")
         .args(["-bios"])
         .arg(&ovmf)
-        .args([
-            "-drive",
-            &format!("format=raw,file={}", uefi_image.display()),
-        ])
+        .args(["-drive", &format!("format=raw,file={}", uefi_image.display())])
         .args(["-serial", "stdio"])
         .args(["-display", "none"])
         .args(["-no-reboot"])
@@ -239,11 +254,48 @@ fn cmd_fmt(fix: bool) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageArgs {
+    sign: bool,
+    key: PathBuf,
+    cert: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SignArgs {
     unsigned_efi: PathBuf,
     signed_efi: PathBuf,
     key: PathBuf,
     cert: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+enum FileDataSource {
+    File(PathBuf),
+}
+
+impl FileDataSource {
+    fn len(&self) -> anyhow::Result<u64> {
+        match self {
+            FileDataSource::File(path) => Ok(fs::metadata(path)
+                .with_context(|| format!("failed to read metadata of file `{}`", path.display()))?
+                .len()),
+        }
+    }
+
+    fn copy_to(&self, target: &mut dyn io::Write) -> anyhow::Result<()> {
+        match self {
+            FileDataSource::File(path) => {
+                io::copy(
+                    &mut File::open(path)
+                        .with_context(|| format!("failed to open `{}` for copying", path.display()))?,
+                    target,
+                )
+                .with_context(|| format!("failed to copy `{}`", path.display()))?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn default_key_path(workspace_root: &Path) -> PathBuf {
@@ -252,6 +304,56 @@ fn default_key_path(workspace_root: &Path) -> PathBuf {
 
 fn default_cert_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join("ostest.crt")
+}
+
+fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs, String> {
+    let mut sign = false;
+    let mut key = None;
+    let mut cert = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--sign" => {
+                sign = true;
+            }
+            "--key" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `--key`".to_string())?;
+                key = Some(PathBuf::from(value));
+            }
+            "--cert" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `--cert`".to_string())?;
+                cert = Some(PathBuf::from(value));
+            }
+            _ if let Some(value) = arg.strip_prefix("--key=") => {
+                key = Some(PathBuf::from(value));
+            }
+            _ if let Some(value) = arg.strip_prefix("--cert=") => {
+                cert = Some(PathBuf::from(value));
+            }
+            _ => {
+                return Err(format!("unknown image flag `{arg}`"));
+            }
+        }
+        index += 1;
+    }
+
+    if !sign && (key.is_some() || cert.is_some()) {
+        return Err("`--key`/`--cert` require `--sign`".to_string());
+    }
+
+    Ok(ImageArgs {
+        sign,
+        key: key.unwrap_or_else(|| default_key_path(workspace_root)),
+        cert: cert.unwrap_or_else(|| default_cert_path(workspace_root)),
+    })
 }
 
 fn parse_sign_args(args: &[String], workspace_root: &Path) -> Result<SignArgs, String> {
@@ -297,30 +399,74 @@ fn parse_sign_args(args: &[String], workspace_root: &Path) -> Result<SignArgs, S
 
     let unsigned_efi = unsigned_efi.ok_or_else(|| "missing unsigned EFI path".to_string())?;
     Ok(SignArgs {
-        signed_efi: signed_efi_path(&unsigned_efi),
+        signed_efi: signed_path(&unsigned_efi),
         unsigned_efi,
         key: key.unwrap_or_else(|| default_key_path(workspace_root)),
         cert: cert.unwrap_or_else(|| default_cert_path(workspace_root)),
     })
 }
 
-fn signed_efi_path(unsigned_efi: &Path) -> PathBuf {
-    let stem = unsigned_efi
+fn signed_path(path: &Path) -> PathBuf {
+    let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("bootx64");
-    let file_name = match unsigned_efi.extension().and_then(|ext| ext.to_str()) {
+    let file_name = match path.extension().and_then(|ext| ext.to_str()) {
         Some(extension) if !extension.is_empty() => format!("{stem}-signed.{extension}"),
         _ => format!("{stem}-signed"),
     };
 
-    match unsigned_efi.parent() {
+    match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
         _ => PathBuf::from(file_name),
     }
 }
 
+fn cmd_image(image_args: &ImageArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    if !image_args.sign {
+        return;
+    }
+
+    require_existing_file("signing key", &image_args.key);
+    require_existing_file("signing certificate", &image_args.cert);
+
+    let unsigned_bootloader = find_uefi_bootloader();
+    let sign_args = SignArgs {
+        signed_efi: signed_path(&unsigned_bootloader),
+        unsigned_efi: unsigned_bootloader,
+        key: image_args.key.clone(),
+        cert: image_args.cert.clone(),
+    };
+    let signed_bootloader = sign_efi(&sign_args);
+    let signed_image = signed_path(&uefi_image);
+    create_signed_uefi_image(&kernel_binary, &signed_bootloader, &signed_image)
+        .unwrap_or_else(|err| {
+            eprintln!("Error: failed to assemble signed UEFI image: {err:#}");
+            std::process::exit(1);
+        });
+    println!("Signed EFI: {}", signed_bootloader.display());
+    println!("Signed UEFI image: {}", signed_image.display());
+    convert_to_vhdx(&signed_image);
+    println!(
+        "Reminder: enroll {} with MOK before Secure Boot tests.",
+        image_args.cert.display()
+    );
+}
+
 fn cmd_sign(sign_args: &SignArgs) {
+    let signed_efi = sign_efi(sign_args);
+    println!("Signed EFI: {}", signed_efi.display());
+    println!(
+        "Reminder: enroll {} with MOK before Secure Boot tests.",
+        sign_args.cert.display()
+    );
+}
+
+fn sign_efi(sign_args: &SignArgs) -> PathBuf {
     require_existing_file("unsigned EFI", &sign_args.unsigned_efi);
     require_existing_file("signing key", &sign_args.key);
     require_existing_file("signing certificate", &sign_args.cert);
@@ -360,11 +506,7 @@ fn cmd_sign(sign_args: &SignArgs) {
         std::process::exit(verify_status.code().unwrap_or(1));
     }
 
-    println!("Signed EFI: {}", sign_args.signed_efi.display());
-    println!(
-        "Reminder: enroll {} with MOK before Secure Boot tests.",
-        sign_args.cert.display()
-    );
+    sign_args.signed_efi.clone()
 }
 
 fn require_existing_file(label: &str, path: &Path) {
@@ -388,10 +530,235 @@ fn run_command_status(command: &mut Command, program: &str) -> ExitStatus {
     }
 }
 
-fn cmd_image() {
-    let kernel_binary = build_kernel();
-    let uefi_image = create_uefi_image(&kernel_binary);
-    convert_to_vhdx(&uefi_image);
+fn xtask_build_dir() -> PathBuf {
+    std::env::current_exe()
+        .expect("failed to locate xtask executable")
+        .parent()
+        .expect("xtask executable unexpectedly missing parent directory")
+        .join("build")
+}
+
+fn find_uefi_bootloader() -> PathBuf {
+    let build_dir = xtask_build_dir();
+    find_uefi_bootloader_in(&build_dir).unwrap_or_else(|err| {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    })
+}
+
+fn find_uefi_bootloader_in(build_dir: &Path) -> Result<PathBuf, String> {
+    let entries = fs::read_dir(build_dir).map_err(|err| {
+        format!(
+            "failed to read xtask build directory `{}`: {err}",
+            build_dir.display()
+        )
+    })?;
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to inspect xtask build directory `{}`: {err}",
+                build_dir.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|err| {
+                format!(
+                    "failed to inspect build artifact type `{}`: {err}",
+                    entry.path().display()
+                )
+            })?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let candidate = entry.path().join("out/bin/bootloader-x86_64-uefi.efi");
+        if !candidate.is_file() {
+            continue;
+        }
+
+        let modified = fs::metadata(&candidate)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        candidates.push((modified, candidate));
+    }
+
+    candidates.sort_by_key(|(modified, _)| *modified);
+    candidates
+        .pop()
+        .map(|(_, path)| path)
+        .ok_or_else(|| {
+            format!(
+                "could not locate bootloader-x86_64-uefi.efi under `{}`; rebuild xtask first",
+                build_dir.display()
+            )
+        })
+}
+
+fn create_signed_uefi_image(
+    kernel_binary: &Path,
+    signed_bootloader: &Path,
+    image_path: &Path,
+) -> anyhow::Result<()> {
+    let mut files = BTreeMap::new();
+    files.insert(
+        UEFI_BOOT_FILENAME,
+        FileDataSource::File(signed_bootloader.to_path_buf()),
+    );
+    files.insert(
+        KERNEL_FILE_NAME,
+        FileDataSource::File(kernel_binary.to_path_buf()),
+    );
+
+    let fat_partition = NamedTempFile::new().context("failed to create temporary FAT image")?;
+    create_fat_filesystem(&files, fat_partition.path())
+        .context("failed to create signed FAT filesystem")?;
+    create_gpt_disk(fat_partition.path(), image_path)
+        .context("failed to create signed GPT disk image")?;
+    fat_partition
+        .close()
+        .context("failed to delete temporary FAT image after disk image creation")?;
+    Ok(())
+}
+
+fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, out_fat_path: &Path) -> anyhow::Result<()> {
+    const MB: u64 = 1024 * 1024;
+
+    let mut needed_size = 0;
+    for source in files.values() {
+        needed_size += source.len()?;
+    }
+
+    let fat_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_fat_path)
+        .with_context(|| format!("failed to create FAT image at `{}`", out_fat_path.display()))?;
+    let fat_size = ((needed_size + 1024 * 64 - 1) / MB + 1) * MB + MB;
+    fat_file
+        .set_len(fat_size)
+        .context("failed to size FAT image file")?;
+
+    let mut label = *b"MY_RUST_OS!";
+    if let Some(FileDataSource::File(path)) = files.get(KERNEL_FILE_NAME) {
+        if let Some(name) = path.file_stem() {
+            let converted = name.to_string_lossy();
+            let name = converted.as_bytes();
+            let mut new_label = [0u8; 11];
+            let name = &name[..usize::min(new_label.len(), name.len())];
+            let slice = &mut new_label[..name.len()];
+            slice.copy_from_slice(name);
+            label = new_label;
+        }
+    }
+
+    let format_options = fatfs::FormatVolumeOptions::new().volume_label(label);
+    fatfs::format_volume(&fat_file, format_options).context("failed to format FAT image")?;
+    let filesystem = fatfs::FileSystem::new(&fat_file, fatfs::FsOptions::new())
+        .context("failed to open FAT filesystem")?;
+    let root_dir = filesystem.root_dir();
+    let result = add_files_to_image(&root_dir, files);
+    drop(root_dir);
+    drop(filesystem);
+    result
+}
+
+fn add_files_to_image(
+    root_dir: &Dir<&File>,
+    files: &BTreeMap<&str, FileDataSource>,
+) -> anyhow::Result<()> {
+    for (target_path_raw, source) in files {
+        let target_path = Path::new(target_path_raw);
+        let ancestors: Vec<_> = target_path.ancestors().skip(1).collect();
+        for ancestor in ancestors.into_iter().rev().skip(1) {
+            match root_dir.create_dir(&ancestor.display().to_string()) {
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to create directory `{}` on FAT filesystem",
+                            ancestor.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        let mut new_file = root_dir
+            .create_file(target_path_raw)
+            .with_context(|| format!("failed to create file at `{}`", target_path.display()))?;
+        new_file.truncate().context("failed to truncate FAT file")?;
+        source.copy_to(&mut new_file).with_context(|| {
+            format!(
+                "failed to copy source data to file at `{}`",
+                target_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn create_gpt_disk(fat_image: &Path, out_gpt_path: &Path) -> anyhow::Result<()> {
+    let mut disk = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(out_gpt_path)
+        .with_context(|| format!("failed to create GPT file at `{}`", out_gpt_path.display()))?;
+
+    let partition_size = fs::metadata(fat_image)
+        .context("failed to read metadata of FAT image")?
+        .len();
+    let disk_size = partition_size + 1024 * 64;
+    disk.set_len(disk_size)
+        .context("failed to set GPT image file length")?;
+
+    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
+        u32::try_from((disk_size / 512) - 1).unwrap_or(0xFF_FF_FF_FF),
+    );
+    mbr.overwrite_lba0(&mut disk)
+        .context("failed to write protective MBR")?;
+
+    let block_size = gpt::disk::LogicalBlockSize::Lb512;
+    let mut gpt = gpt::GptConfig::new()
+        .writable(true)
+        .initialized(false)
+        .logical_block_size(block_size)
+        .create_from_device(Box::new(&mut disk), None)
+        .context("failed to create GPT structure in file")?;
+    gpt.update_partitions(Default::default())
+        .context("failed to update GPT partitions")?;
+
+    let partition_id = gpt
+        .add_partition("boot", partition_size, gpt::partition_types::EFI, 0, None)
+        .context("failed to add boot EFI partition")?;
+    let partition = gpt
+        .partitions()
+        .get(&partition_id)
+        .context("failed to open boot partition after creation")?;
+    let start_offset = partition
+        .bytes_start(block_size)
+        .context("failed to get start offset of boot partition")?;
+
+    gpt.write().context("failed to write out GPT changes")?;
+
+    disk.seek(io::SeekFrom::Start(start_offset))
+        .context("failed to seek to start offset")?;
+    io::copy(
+        &mut File::open(fat_image).context("failed to open FAT image")?,
+        &mut disk,
+    )
+    .context("failed to copy FAT image to GPT disk")?;
+
+    Ok(())
 }
 
 fn cmd_run() {
@@ -410,24 +777,50 @@ fn cmd_runner(kernel_binary: PathBuf) {
 mod tests {
     use super::*;
 
-    fn sign_args(parts: &[&str]) -> Vec<String> {
+    fn string_args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
     }
 
     #[test]
-    fn signed_efi_path_appends_signed_suffix() {
+    fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
 
-        assert_eq!(
-            signed_efi_path(&unsigned),
-            PathBuf::from("target/bootx64-signed.efi")
-        );
+        assert_eq!(signed_path(&unsigned), PathBuf::from("target/bootx64-signed.efi"));
+    }
+
+    #[test]
+    fn parse_image_args_defaults_to_unsigned_image() {
+        let workspace_root = PathBuf::from("/workspace/ostest");
+        let parsed = parse_image_args(&[], &workspace_root).unwrap();
+
+        assert!(!parsed.sign);
+        assert_eq!(parsed.key, workspace_root.join("ostest.key"));
+        assert_eq!(parsed.cert, workspace_root.join("ostest.crt"));
+    }
+
+    #[test]
+    fn parse_image_args_uses_repo_root_defaults_when_signing() {
+        let workspace_root = PathBuf::from("/workspace/ostest");
+        let parsed = parse_image_args(&string_args(&["--sign"]), &workspace_root).unwrap();
+
+        assert!(parsed.sign);
+        assert_eq!(parsed.key, workspace_root.join("ostest.key"));
+        assert_eq!(parsed.cert, workspace_root.join("ostest.crt"));
+    }
+
+    #[test]
+    fn parse_image_args_rejects_key_without_sign() {
+        let workspace_root = PathBuf::from("/workspace/ostest");
+        let error = parse_image_args(&string_args(&["--key", "keys/dev.key"]), &workspace_root)
+            .unwrap_err();
+
+        assert_eq!(error, "`--key`/`--cert` require `--sign`");
     }
 
     #[test]
     fn parse_sign_args_uses_repo_root_defaults() {
         let workspace_root = PathBuf::from("/workspace/ostest");
-        let parsed = parse_sign_args(&sign_args(&["build/bootx64.efi"]), &workspace_root).unwrap();
+        let parsed = parse_sign_args(&string_args(&["build/bootx64.efi"]), &workspace_root).unwrap();
 
         assert_eq!(parsed.unsigned_efi, PathBuf::from("build/bootx64.efi"));
         assert_eq!(parsed.signed_efi, PathBuf::from("build/bootx64-signed.efi"));
@@ -439,7 +832,7 @@ mod tests {
     fn parse_sign_args_accepts_explicit_key_and_cert() {
         let workspace_root = PathBuf::from("/workspace/ostest");
         let parsed = parse_sign_args(
-            &sign_args(&[
+            &string_args(&[
                 "--key=keys/dev.key",
                 "unsigned.efi",
                 "--cert",
@@ -458,8 +851,20 @@ mod tests {
     fn parse_sign_args_requires_unsigned_efi_path() {
         let workspace_root = PathBuf::from("/workspace/ostest");
         let error =
-            parse_sign_args(&sign_args(&["--key", "keys/dev.key"]), &workspace_root).unwrap_err();
+            parse_sign_args(&string_args(&["--key", "keys/dev.key"]), &workspace_root).unwrap_err();
 
         assert_eq!(error, "missing unsigned EFI path");
+    }
+
+    #[test]
+    fn find_uefi_bootloader_in_uses_bootloader_build_artifact() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let candidate = tempdir
+            .path()
+            .join("bootloader-abcd1234/out/bin/bootloader-x86_64-uefi.efi");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        fs::write(&candidate, b"efi").unwrap();
+
+        assert_eq!(find_uefi_bootloader_in(tempdir.path()).unwrap(), candidate);
     }
 }

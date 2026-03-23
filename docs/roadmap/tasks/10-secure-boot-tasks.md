@@ -14,30 +14,30 @@ flowchart LR
 
 ## Setup Tasks
 
-- [ ] P10-T001 Write a `scripts/gen-secure-boot-keys.sh` script that runs `openssl req`
+- [x] P10-T001 Write a `scripts/gen-secure-boot-keys.sh` script that runs `openssl req`
   to generate a 4096-bit RSA key pair (`ostest.key`) and self-signed certificate
   (`ostest.crt`) valid for 10 years, with CN=`ostest Secure Boot Key`. Add both to
   `.gitignore` — the private key must never be committed.
-- [ ] P10-T002 Document the expected output files and where they should be placed
+- [x] P10-T002 Document the expected output files and where they should be placed
   relative to the repo root so `cargo xtask sign` can find them.
 
 ## Implementation Tasks
 
-- [ ] P10-T003 Add a `sign` subcommand to `xtask/src/main.rs` (or a `--sign` flag on
+- [x] P10-T003 Add a `sign` subcommand to `xtask/src/main.rs` (or a `--sign` flag on
   `image`) that accepts optional `--key` and `--cert` path arguments, defaulting to
   `ostest.key` and `ostest.crt` in the repo root.
-- [ ] P10-T004 In the `sign` subcommand, run `sbsign --key <key> --cert <cert>
+- [x] P10-T004 In the `sign` subcommand, run `sbsign --key <key> --cert <cert>
   --output <signed.efi> <unsigned.efi>` via `std::process::Command`. Fail with a clear
   error if `sbsign` is not found (`sbsigntool` package on Debian/Ubuntu).
-- [ ] P10-T005 After signing, run `sbverify --cert <cert> <signed.efi>` to confirm the
+- [x] P10-T005 After signing, run `sbverify --cert <cert> <signed.efi>` to confirm the
   signature is valid before reporting success.
-- [ ] P10-T006 Print the path of the signed EFI binary and a one-line reminder about
+- [x] P10-T006 Print the path of the signed EFI binary and a one-line reminder about
   MOK enrollment on success.
 
 ## Validation Tasks
 
-- [ ] P10-T007 Verify `sbverify --cert ostest.crt bootx64-signed.efi` exits 0.
-- [ ] P10-T008 Verify the unsigned binary fails `sbverify` against the cert (expected).
+- [x] P10-T007 Verify `sbverify --cert ostest.crt <signed-efi>` exits 0.
+- [x] P10-T008 Verify the unsigned EFI fails `sbverify` against the cert (expected).
 - [ ] P10-T009 On a real machine with Secure Boot enabled: enroll the cert using one
   of the two paths documented in the milestone page — via shim's MOK (`mokutil
   --import ostest.crt` + reboot through MOKManager) **or** via direct UEFI db
@@ -47,13 +47,13 @@ flowchart LR
 
 ## Documentation Tasks
 
-- [ ] P10-T011 Add a `docs/10-secure-boot.md` implementation page covering:
+- [x] P10-T011 Add a `docs/10-secure-boot.md` implementation page covering:
   - the UEFI Secure Boot key hierarchy (PK / KEK / db / dbx)
   - the `gen-secure-boot-keys.sh` + `cargo xtask sign` workflow end-to-end
   - both enrollment paths clearly: shim MOK (`mokutil --import`) vs direct UEFI db
     (`efi-updatevar` / firmware setup), with when to use each
   - how to verify Secure Boot state (`mokutil --sb-state`, `dmesg | grep -i secure`)
-- [ ] P10-T012 Add a short note in `docs/10-secure-boot.md` explaining what shim is,
+- [x] P10-T012 Add a short note in `docs/10-secure-boot.md` explaining what shim is,
   that `mokutil` manages shim's MOK list (not the UEFI firmware db), and how
   distribution Secure Boot differs from personal enrollment.
 - [ ] P10-T013 Update `docs/roadmap/README.md` and `docs/08-roadmap.md` to mark
