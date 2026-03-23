@@ -27,6 +27,10 @@ pub unsafe fn enable_interrupts() {
 
 /// Transfer execution to ring 3 (userspace).
 ///
+/// Not used in Phase 6 (kernel-thread IPC demo) — will be re-enabled in
+/// Phase 7+ when multi-process userspace is introduced.
+#[allow(dead_code)]
+///
 /// Uses `iretq` to atomically switch to user code segment, user stack, and
 /// the given entry point with interrupts enabled (RFLAGS.IF = 1).
 ///

@@ -1,8 +1,8 @@
 //! Kernel task management: task structure, stacks, and context switching.
 //!
-//! Phase 5 does not use the kernel scheduler directly — the main thread enters
-//! userspace via `arch::enter_userspace` and never returns.  The task subsystem
-//! is preserved here for Phase 6+ (IPC, blocking, multi-task userspace).
+//! Phase 6 activates the scheduler for multi-task IPC demos.  Each task
+//! carries its own [`CapabilityTable`] and an optional pending [`Message`]
+//! (written by IPC `deliver_message` before waking the task).
 #![allow(dead_code)]
 //!
 //! # Context-switch contract
@@ -45,10 +45,17 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 
+use crate::ipc::{CapabilityTable, Message};
+
 pub mod scheduler;
 
 #[allow(unused_imports)]
-pub use scheduler::{run, signal_reschedule, spawn, spawn_idle, yield_now};
+pub use scheduler::{
+    block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
+    current_task_id, deliver_message, insert_cap, remove_task_cap, run, server_endpoint,
+    set_server_endpoint, signal_reschedule, spawn, spawn_idle, take_message, task_cap, wake_task,
+    yield_now,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -75,8 +82,18 @@ pub struct TaskId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
+    /// Task is runnable and will be dispatched by the scheduler.
     Ready,
+    /// Task is currently executing on the CPU.
     Running,
+    /// Task is blocked waiting to receive a message on an endpoint.
+    BlockedOnRecv,
+    /// Task is blocked waiting for its send to be picked up.
+    BlockedOnSend,
+    /// Task has called an endpoint and is waiting for a reply.
+    BlockedOnReply,
+    /// Task is blocked waiting for a notification bit to be set.
+    BlockedOnNotif,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,15 +101,24 @@ pub enum TaskState {
 // ---------------------------------------------------------------------------
 
 pub struct Task {
-    /// Unique task identifier — not yet read outside this module.
-    #[allow(dead_code)]
+    /// Unique task identifier.
     pub id: TaskId,
-    /// Human-readable name — not yet read outside this module.
+    /// Human-readable name.
     #[allow(dead_code)]
     pub name: &'static str,
     pub state: TaskState,
     /// RSP saved by `switch_context` when this task is not running.
     pub saved_rsp: u64,
+    /// Per-task IPC capability table.
+    pub caps: CapabilityTable,
+    /// Pending message delivered by `deliver_message` before waking this task.
+    ///
+    /// `None` when the task has not yet been sent a message.  Set by the
+    /// sender/IPC core; consumed by `take_message` after the task wakes.
+    pub pending_msg: Option<Message>,
+    /// Endpoint this task is the "server" of (used by `reply_recv` to find
+    /// the endpoint to block on after replying).
+    pub server_endpoint: Option<crate::ipc::EndpointId>,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     _stack: Box<[u8]>,
 }
@@ -112,6 +138,9 @@ impl Task {
             name,
             state: TaskState::Ready,
             saved_rsp,
+            caps: CapabilityTable::new(),
+            pending_msg: None,
+            server_endpoint: None,
             _stack: stack,
         }
     }

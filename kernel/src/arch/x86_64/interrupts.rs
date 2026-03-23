@@ -165,6 +165,7 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let mut port: Port<u8> = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 
+    // Push scancode to the ring buffer for polling consumers.
     let tail = SCANCODE_BUF_TAIL.load(Ordering::Relaxed);
     let next_tail = (tail + 1) & (SCANCODE_BUF_SIZE - 1);
     if next_tail != SCANCODE_BUF_HEAD.load(Ordering::Acquire) {
@@ -172,6 +173,11 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         unsafe { SCANCODE_BUF[tail] = scancode };
         SCANCODE_BUF_TAIL.store(next_tail, Ordering::Release);
     }
+
+    // Signal any notification object registered for IRQ1 (keyboard).
+    // This wakes a kernel task blocked in notification::wait() — the IPC-based
+    // IRQ delivery path used by kbd_server in Phase 7+.
+    crate::ipc::notification::signal_irq(1);
 
     unsafe {
         PICS.lock()

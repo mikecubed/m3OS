@@ -34,13 +34,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{switch_context, Task, TaskState};
+use super::{switch_context, Task, TaskId, TaskState};
+use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message};
 
 // ---------------------------------------------------------------------------
 // Statics
 // ---------------------------------------------------------------------------
 
-static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub(super) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 /// Set by the timer ISR; cleared by the scheduler loop before picking a task.
 static RESCHEDULE: AtomicBool = AtomicBool::new(false);
@@ -55,7 +56,7 @@ static mut SCHEDULER_RSP: u64 = 0;
 // Scheduler struct
 // ---------------------------------------------------------------------------
 
-struct Scheduler {
+pub(super) struct Scheduler {
     tasks: Vec<Task>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
@@ -76,6 +77,29 @@ impl Scheduler {
             current: None,
             idle_task: None,
         }
+    }
+
+    /// Return the index of the task with the given [`TaskId`], if present.
+    fn find(&self, id: TaskId) -> Option<usize> {
+        self.tasks.iter().position(|t| t.id == id)
+    }
+
+    /// Look up a capability in the given task's cap table.
+    pub fn cap(&self, id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
+        let idx = self.find(id).ok_or(CapError::InvalidHandle)?;
+        self.tasks[idx].caps.get(handle)
+    }
+
+    /// Remove a capability from the given task's cap table (consumes one-shot caps).
+    pub fn remove_cap(&mut self, id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
+        let idx = self.find(id).ok_or(CapError::InvalidHandle)?;
+        self.tasks[idx].caps.remove(handle)
+    }
+
+    /// Return the server endpoint registered for this task.
+    pub fn server_endpoint(&self, id: TaskId) -> Option<EndpointId> {
+        let idx = self.find(id)?;
+        self.tasks[idx].server_endpoint
     }
 
     /// Pick the next task to run.
@@ -180,11 +204,209 @@ pub fn yield_now() {
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
         // MutexGuard drops here, releasing the lock before switch_context.
     };
+    // Signal a reschedule so the scheduler loop does not hlt after this
+    // task yields — other tasks may already be Ready and should run
+    // immediately without waiting for the next timer IRQ.
+    RESCHEDULE.store(true, Ordering::Relaxed);
     // Safety: SCHEDULER_RSP was written by the scheduler loop in `run()`.
     let sched_rsp = unsafe { SCHEDULER_RSP };
     // Safety: task_rsp_ptr is a valid aligned pointer inside a live Task.
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
     // Execution resumes here when the scheduler dispatches this task again.
+}
+
+// ---------------------------------------------------------------------------
+// IPC scheduler primitives
+// ---------------------------------------------------------------------------
+
+/// Return the [`TaskId`] of the task currently running on the CPU, or `None`
+/// if called from outside a task context (e.g., during early boot before any
+/// task has been dispatched).
+///
+/// **Not ISR-safe** — acquires `SCHEDULER.lock()`.  Must only be called from
+/// task context (syscall handlers, kernel threads).  Calling from an interrupt
+/// handler while a task holds the scheduler lock will deadlock.
+pub fn current_task_id() -> Option<TaskId> {
+    let sched = SCHEDULER.lock();
+    sched.current.map(|idx| sched.tasks[idx].id)
+}
+
+/// Block the current task waiting for an IPC message on an endpoint.
+///
+/// Sets state to [`TaskState::BlockedOnRecv`] and switches to the scheduler.
+/// Returns when another task calls [`wake_task`] on this task.
+///
+/// For notification waits, use [`block_current_on_notif`] instead.
+pub fn block_current_on_recv() {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => return,
+        };
+        sched.tasks[idx].state = TaskState::BlockedOnRecv;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    // Signal a reschedule so the scheduler loop does not hlt after this
+    // task blocks — another task may already be Ready and should run
+    // immediately without waiting for the next timer IRQ.
+    RESCHEDULE.store(true, Ordering::Relaxed);
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
+/// Block the current task waiting for its send to be picked up.
+///
+/// Sets state to [`TaskState::BlockedOnSend`] and switches to the scheduler.
+pub fn block_current_on_send() {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => return,
+        };
+        sched.tasks[idx].state = TaskState::BlockedOnSend;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    RESCHEDULE.store(true, Ordering::Relaxed);
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
+/// Block the current task waiting for a notification bit to be set.
+///
+/// Sets state to [`TaskState::BlockedOnNotif`] and switches to the scheduler.
+/// Returns when another context calls [`wake_task`] on this task or when
+/// [`signal_irq`][crate::ipc::notification::signal_irq] triggers a reschedule
+/// that allows the task to drain pending bits in its [`wait`][crate::ipc::notification::wait] loop.
+pub fn block_current_on_notif() {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => return,
+        };
+        sched.tasks[idx].state = TaskState::BlockedOnNotif;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    RESCHEDULE.store(true, Ordering::Relaxed);
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
+/// Block the current task waiting for a reply after a `call`.
+///
+/// Sets state to [`TaskState::BlockedOnReply`] and switches to the scheduler.
+pub fn block_current_on_reply() {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => return,
+        };
+        sched.tasks[idx].state = TaskState::BlockedOnReply;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    RESCHEDULE.store(true, Ordering::Relaxed);
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
+/// Wake a blocked task, making it `Ready` for the next scheduler tick.
+///
+/// No-op if the task is not currently blocked.
+///
+/// **Not ISR-safe** — acquires `SCHEDULER.lock()`.  Must only be called from
+/// task context.  IRQ handlers that need to trigger a wakeup should instead
+/// set a pending bit atomically and call [`signal_reschedule`]; the blocked
+/// task will drain the bits in its wait loop on the next scheduler dispatch.
+pub fn wake_task(id: TaskId) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        match sched.tasks[idx].state {
+            TaskState::BlockedOnRecv
+            | TaskState::BlockedOnSend
+            | TaskState::BlockedOnReply
+            | TaskState::BlockedOnNotif => {
+                sched.tasks[idx].state = TaskState::Ready;
+            }
+            _ => {}
+        }
+    }
+    // Signal a reschedule so the scheduler loop picks up the newly-ready task.
+    RESCHEDULE.store(true, Ordering::Relaxed);
+}
+
+/// Store a [`Message`] in a task's pending slot so it can retrieve it on wake.
+///
+/// Overwrites any previously pending message (the task should drain it before
+/// being made ready again).
+pub fn deliver_message(id: TaskId, msg: Message) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].pending_msg = Some(msg);
+    }
+}
+
+/// Remove and return the pending message for a task, or `None` if none is set.
+///
+/// `None` indicates a scheduler / IPC logic bug — a task was woken without
+/// a corresponding `deliver_message` call.  Callers should `debug_assert` or
+/// propagate the error rather than silently using a zeroed message.
+pub fn take_message(id: TaskId) -> Option<Message> {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].pending_msg.take()
+    } else {
+        None
+    }
+}
+
+/// Insert a capability into a task's capability table.
+///
+/// Returns the handle on success, or [`CapError::TableFull`] / [`CapError::InvalidHandle`]
+/// on failure.  Callers in the IPC syscall path should propagate the error as
+/// `u64::MAX` rather than panicking — a full table should be an IPC error, not
+/// a kernel panic.
+pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].caps.insert(cap)
+    } else {
+        Err(CapError::InvalidHandle)
+    }
+}
+
+/// Look up a capability in a task's capability table.
+pub fn task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
+    let sched = SCHEDULER.lock();
+    sched.cap(id, handle)
+}
+
+/// Remove a capability from a task's capability table (consumes one-shot caps).
+pub fn remove_task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
+    let mut sched = SCHEDULER.lock();
+    sched.remove_cap(id, handle)
+}
+
+/// Register the endpoint this task acts as server for.
+///
+/// Stored so that `reply_recv` can find the right endpoint after replying.
+pub fn set_server_endpoint(id: TaskId, ep_id: EndpointId) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].server_endpoint = Some(ep_id);
+    }
+}
+
+/// Return the server endpoint for a task (used by reply_recv).
+pub fn server_endpoint(id: TaskId) -> Option<EndpointId> {
+    let sched = SCHEDULER.lock();
+    sched.server_endpoint(id)
 }
 
 /// The main scheduler loop.  Must be called once after all subsystems are
@@ -217,6 +439,11 @@ pub fn run() -> ! {
         // A tick is pending; re-enable interrupts before picking a task.
         interrupts::enable();
 
+        // Wake any notification waiters whose PENDING bits were set by
+        // signal_irq().  signal_irq() cannot call wake_task() (not ISR-safe),
+        // so we drain here in task context on each scheduler tick.
+        crate::ipc::notification::drain_pending_waiters();
+
         // Pick the next ready task.
         let next = {
             let mut sched = SCHEDULER.lock();
@@ -236,7 +463,8 @@ pub fn run() -> ! {
             // last_run is updated inside pick_next for non-idle tasks.
         }
 
-        // Switch to the task.  Returns here when the task calls yield_now().
+        // Switch to the task.  Returns here when the task calls yield_now() or
+        // one of the block_current_on_* IPC primitives.
         // switch_context restores the task's saved RFLAGS (IF=1 for a fresh
         // task, whatever the task last had for a resumed one).
         // Safety: SCHEDULER_RSP is only written here (single CPU).
@@ -245,7 +473,8 @@ pub fn run() -> ! {
             switch_context(core::ptr::addr_of_mut!(SCHEDULER_RSP), task_rsp);
         }
 
-        // yield_now() has already cleared sched.current and marked the task
-        // Ready, so we just loop back to pick the next one.
+        // The task returned to the scheduler via yield_now() or a block_current
+        // primitive.  Both clear sched.current and set the appropriate state.
+        // Just loop back to pick the next ready task.
     }
 }
