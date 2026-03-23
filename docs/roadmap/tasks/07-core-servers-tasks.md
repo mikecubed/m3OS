@@ -22,6 +22,8 @@ flowchart LR
 - [ ] P7-T005 Define the IPC contracts used by clients to find and talk to these services.
 - [ ] P7-T006 Keep bootstrap ordering explicit and simple enough to debug from logs.
 
+<!-- Phase 7 implementation started 2026-03-23 on branch phase-7-core-servers -->
+
 ## Validation Tasks
 
 - [ ] P7-T007 Verify `init` launches the initial service set in the expected order.
