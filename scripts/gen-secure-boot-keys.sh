@@ -35,6 +35,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 output_dir="${1:-$repo_root}"
 
+umask 077
+
 mkdir -p "$output_dir"
 
 key_path="${output_dir}/ostest.key"
@@ -44,8 +46,6 @@ if [[ -e "$key_path" || -e "$cert_path" ]]; then
     echo "error: refusing to overwrite existing key material in ${output_dir}" >&2
     exit 1
 fi
-
-umask 077
 
 openssl req \
     -x509 \
