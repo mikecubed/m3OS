@@ -1,31 +1,227 @@
-//! Minimal process abstraction for Phase 5.
+//! Userspace process management — Phase 11.
 //!
-//! Phase 6 replaces the single-process demo with multi-task kernel threads.
-//! This module is preserved as reference for Phase 7+ when real userspace
-//! process management is introduced.
+//! This module owns the global process table and the types that describe
+//! a userspace process's lifecycle.  Kernel threads live in
+//! [`crate::task`]; this module is exclusively for ring-3 processes.
+//!
+//! # Design
+//!
+//! Each [`Process`] has its own kernel stack (allocated here, leaked so
+//! the stack lives for the kernel lifetime) and a unique [`Pid`].  The
+//! [`PROCESS_TABLE`] spinlock-protected global table is the single source
+//! of truth for all live processes.
+//!
+//! Process cleanup (freeing kernel stacks, reaping page tables) is
+//! deferred to a later phase.
+
 #![allow(dead_code)]
-//!
-//! A `Process` holds the virtual addresses needed to enter userspace and
-//! any cleanup information. Full process lifecycle (spawn, wait, exit)
-//! is deferred to Phase 6+.
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use spin::Mutex;
 
 #[allow(unused_imports)]
 pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
 
-/// A minimal userspace process descriptor.
+// ---------------------------------------------------------------------------
+// Re-export stack size from task module so we have a single source of truth.
+// ---------------------------------------------------------------------------
+
+use crate::task::KERNEL_STACK_SIZE;
+
+// ---------------------------------------------------------------------------
+// PID type and allocator
+// ---------------------------------------------------------------------------
+
+/// A process identifier.  PID 0 is reserved for the idle concept and is
+/// never assigned to a real process.
+pub type Pid = u32;
+
+/// Monotonically increasing PID counter.  Starts at 1 so that PID 0 is
+/// always "no process / idle".
+static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+
+/// Allocate a fresh PID.  Uses `Relaxed` ordering — PID uniqueness only
+/// requires that each call sees a value not yet returned by a previous
+/// call, which the atomic fetch-add guarantees regardless of memory order.
+fn alloc_pid() -> Pid {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Process state
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a userspace process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    /// Waiting to be scheduled onto the CPU.
+    Ready,
+    /// Currently executing on the CPU.
+    Running,
+    /// Blocked waiting for a resource (I/O, IPC, …).
+    Blocked,
+    /// Exited but not yet reaped by its parent.
+    Zombie,
+}
+
+// ---------------------------------------------------------------------------
+// Process descriptor
+// ---------------------------------------------------------------------------
+
+/// Descriptor for a single userspace process.
 pub struct Process {
-    /// Virtual address of the process entry point.
-    pub entry: u64,
-    /// Virtual address of the process stack top.
-    pub stack_top: u64,
+    /// This process's unique identifier.
+    pub pid: Pid,
+    /// Parent PID.  0 means no parent (init or an orphan).
+    pub ppid: Pid,
+    /// Current lifecycle state.
+    pub state: ProcessState,
+    /// Root physical address of this process's page table.
+    ///
+    /// `None` means the process has not yet been assigned a dedicated
+    /// address space and shares the kernel's mappings (pre-Phase 12).
+    pub page_table_root: Option<x86_64::PhysAddr>,
+    /// Top of this process's kernel-mode stack (virtual address).
+    pub kernel_stack_top: u64,
+    /// Userspace entry-point virtual address.
+    pub entry_point: u64,
+    /// Top of the userspace stack virtual address.
+    pub user_stack_top: u64,
+    /// Exit code written when the process transitions to [`ProcessState::Zombie`].
+    pub exit_code: Option<i32>,
 }
 
 impl Process {
-    /// Create a new process descriptor.
+    /// Backward-compatible constructor kept while `main.rs` still uses the
+    /// old two-argument form.  Will be removed once the call sites are
+    /// updated.
+    #[deprecated(note = "Use spawn_process() instead")]
     pub fn new(entry: u64, stack_top: u64) -> Self {
-        Process { entry, stack_top }
+        let kstack_top = alloc_kernel_stack();
+        let pid = alloc_pid();
+        Process {
+            pid,
+            ppid: 0,
+            state: ProcessState::Ready,
+            page_table_root: None,
+            kernel_stack_top: kstack_top,
+            entry_point: entry,
+            user_stack_top: stack_top,
+            exit_code: None,
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel-stack allocator
+// ---------------------------------------------------------------------------
+
+/// Allocate a kernel stack for a new process and return its top address.
+///
+/// The stack is a heap-allocated `[u8; KERNEL_STACK_SIZE]` array that is
+/// intentionally leaked (`Box::into_raw`) so the memory is never freed.
+/// Process cleanup (and proper stack deallocation) is deferred to a later
+/// phase.
+fn alloc_kernel_stack() -> u64 {
+    // Allocate as a fixed-size array so the allocation is contiguous and
+    // properly aligned.  Box::into_raw prevents the destructor from running.
+    let stack: alloc::boxed::Box<[u8; KERNEL_STACK_SIZE]> =
+        alloc::boxed::Box::new([0u8; KERNEL_STACK_SIZE]);
+    let ptr = alloc::boxed::Box::into_raw(stack) as *mut u8;
+    // SAFETY: ptr is valid for KERNEL_STACK_SIZE bytes; we never free it.
+    // The top of the stack is one byte past the last element.
+    (ptr as u64) + KERNEL_STACK_SIZE as u64
+}
+
+// ---------------------------------------------------------------------------
+// Process table
+// ---------------------------------------------------------------------------
+
+/// Global process table.  All modifications go through `PROCESS_TABLE.lock()`.
+pub static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
+
+/// The kernel's process table — a flat list of all live [`Process`] entries.
+pub struct ProcessTable {
+    processes: Vec<Process>,
+}
+
+impl ProcessTable {
+    /// Create an empty process table.
+    ///
+    /// `const fn` so it can be used to initialise the `static`.
+    pub const fn new() -> Self {
+        ProcessTable {
+            processes: Vec::new(),
+        }
+    }
+
+    /// Insert `proc` into the table and return its PID.
+    pub fn insert(&mut self, proc: Process) -> Pid {
+        let pid = proc.pid;
+        self.processes.push(proc);
+        pid
+    }
+
+    /// Find the process with the given PID (immutable borrow).
+    pub fn find(&self, pid: Pid) -> Option<&Process> {
+        self.processes.iter().find(|p| p.pid == pid)
+    }
+
+    /// Find the process with the given PID (mutable borrow).
+    pub fn find_mut(&mut self, pid: Pid) -> Option<&mut Process> {
+        self.processes.iter_mut().find(|p| p.pid == pid)
+    }
+
+    /// Iterate over all live processes.
+    pub fn iter(&self) -> impl Iterator<Item = &Process> {
+        self.processes.iter()
+    }
+
+    /// Remove and return the process with the given PID (reap it).
+    ///
+    /// Returns `None` if no process with that PID exists.
+    pub fn reap(&mut self, pid: Pid) -> Option<Process> {
+        if let Some(pos) = self.processes.iter().position(|p| p.pid == pid) {
+            Some(self.processes.swap_remove(pos))
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public helper
+// ---------------------------------------------------------------------------
+
+/// Create a new process entry with a fresh kernel stack and an allocated PID.
+///
+/// The process is inserted into [`PROCESS_TABLE`] in the [`ProcessState::Ready`]
+/// state but is **not** handed to the scheduler.  Callers are responsible for
+/// scheduling the process separately (Phase 12+).
+pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
+    let kstack_top = alloc_kernel_stack();
+    let pid = alloc_pid();
+    let proc = Process {
+        pid,
+        ppid,
+        state: ProcessState::Ready,
+        page_table_root: None,
+        kernel_stack_top: kstack_top,
+        entry_point,
+        user_stack_top,
+        exit_code: None,
+    };
+    PROCESS_TABLE.lock().insert(proc);
+    pid
+}
+
+// ---------------------------------------------------------------------------
+// HELLO_BIN — kept for main.rs compatibility (remove when main.rs is updated)
+// ---------------------------------------------------------------------------
 
 /// Embedded hello-world userspace binary (raw x86_64 machine code).
 ///
