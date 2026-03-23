@@ -100,7 +100,7 @@ isolation.
 
 | Criterion | Status | Notes |
 |---|---|---|
-| `init` starts the first service set successfully | Met | `init_task` creates and registers both servers; boot log shows all steps |
+| `init` starts the first service set successfully | Met | `init_task` creates the console endpoint, registers it in the service registry, and spawns both server tasks; the kbd endpoint is managed internally by `kbd_server` via its notification object and is not registered in Phase 7 |
 | Clients can discover the console service and send output to it | Met | `lookup("console")` returns a valid `EndpointId`; `call(console_ep, WRITE)` delivers text to serial |
 | Keyboard events flow through `kbd_server` | Partial | IRQ1 wakes `kbd_server` via notification and logs the notification bits; scancode reading and client forwarding are Phase 8+ |
 | Service startup ordering is documented and easy to follow | Met | Boot log emits one `log::info!` line per step; `docs/07-core-servers.md` documents the sequence |

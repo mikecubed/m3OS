@@ -102,11 +102,9 @@ creates directly; everything else is started by `init_task`.
 
 ```mermaid
 flowchart TD
-    KM["kernel_main"] --> IT["init_task\n(kernel thread)"]
+    KM["kernel_main"] --> IT["init_task<br/>(kernel thread)"]
     IT --> CE["create console endpoint"]
-    IT --> KE["create kbd endpoint"]
     IT --> RC["register console ep"]
-    IT --> RK["register kbd ep"]
     IT --> SC["spawn console_server"]
     IT --> SK["spawn kbd_server"]
     SC --> CS["console_server loop"]
@@ -118,21 +116,18 @@ flowchart TD
 Each step emits a `log::info!` line so the boot log shows the exact sequence:
 
 ```
-[init] creating console endpoint
-[init] creating kbd endpoint
-[init] registering console (ep=1)
-[init] registering kbd (ep=2)
-[init] spawning console_server
-[init] spawning kbd_server
-[init] bootstrap complete
+[init] service registry: console=EndpointId(0)
+[init] service set started — yielding
 ```
 
-The ordering guarantee is intentional: endpoints are registered *before* the server tasks are
-spawned. This means any task that calls `lookup("console")` after init completes will always
-find a valid endpoint — even if `console_server` has not yet executed a single instruction.
+The ordering guarantee is intentional: the console endpoint is registered *before* the server
+tasks are spawned. This means any task that calls `lookup("console")` after init completes
+will always find a valid endpoint — even if `console_server` has not yet executed a single
+instruction.
 
-The server tasks are in `Blocked(Receiving)` state immediately on creation; they will only
-consume CPU time when a client sends them a message.
+`console_server` enters `Blocked(Receiving)` state immediately on creation and will only
+consume CPU time when a client sends it a message. `kbd_server` blocks on its IRQ notification
+object rather than on an IPC recv, so it wakes only when IRQ1 fires.
 
 ### Comparison with real init daemons
 
@@ -209,10 +204,11 @@ removing it. The value is architectural:
 
 ### What it does
 
-`kbd_server` bridges hardware keyboard events to IPC clients. It has two sides:
+`kbd_server` handles hardware keyboard events. In Phase 7 it has one active side:
 
-1. **IRQ side** — waits on a keyboard notification object; woken by each IRQ1
-2. **Client side** — forwards key events to registered clients via IPC
+1. **IRQ side** — waits on a keyboard notification object; woken by each IRQ1, then drains the scancode ring buffer and logs each key
+
+Client-side forwarding (sending `KEY_EVENT` messages to registered clients) is deferred to Phase 8+.
 
 ### IRQ side
 
@@ -225,11 +221,11 @@ let kbd_notif = Notification::new();
 bind_irq(IRQ_KEYBOARD, &kbd_notif, bit: 0);
 
 loop:
-    kbd_notif.wait()              // sleep until IRQ1 fires
-    scancode = port_read(0x60)    // read PS/2 data port
-    pic_eoi(IRQ_KEYBOARD)         // send End Of Interrupt to PIC
-    key_event = translate(scancode)
-    forward(key_event)
+    kbd_notif.wait()              // block until IRQ1 fires
+    // drain scancode ring buffer (populated by the ISR)
+    while scancode = read_scancode():
+        log("[kbd] scancode=0xNN")
+    // Phase 8+: translate and forward to subscribed clients
 ```
 
 The interrupt handler itself does nothing except set the notification bit and return. All
@@ -237,18 +233,17 @@ real work happens in the `kbd_server` task context after the notification wakes 
 why the CLAUDE.md rule says "no allocation, no blocking, no IPC from within an interrupt
 handler" — those operations happen here, in the server, not in the handler.
 
-### Client side
+### Client side (Phase 8+)
 
-In Phase 7, `kbd_server` forwards events to whichever client registered first (typically
-`init` or a future shell task). The forwarding is a simple `send`:
+In Phase 8+, `kbd_server` will forward key events to registered clients via IPC:
 
 ```
-send(client_ep, Message { label: KEY_EVENT, data: [scancode, 0, 0, 0], .. })
+send(client_ep, Message { label: KEY_EVENT, data: [scancode, 0, 0, 0] })
 ```
 
-The server does not wait for a reply before accepting the next IRQ; key events are fire-and-
-forget from `kbd_server`'s perspective. If the client is not ready, the send blocks — which
-is acceptable because the keyboard is slow compared to any task.
+The server will not wait for a reply before accepting the next IRQ; key events are fire-and-forget from `kbd_server`'s perspective.
+
+This is not implemented in Phase 7. Currently `kbd_server` only logs scancodes to the serial output.
 
 ### Comparison with production input stacks
 
