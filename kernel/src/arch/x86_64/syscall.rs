@@ -329,16 +329,22 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
 
     let phys_off = crate::mm::phys_offset();
 
-    let loaded = {
+    let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
-        match unsafe { crate::mm::elf::load_elf_into(&mut mapper, phys_off, data) } {
+        let loaded = match unsafe { crate::mm::elf::load_elf_into(&mut mapper, phys_off, data) } {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("[execve] ELF load failed: {:?}", e);
                 return u64::MAX;
             }
-        }
+        };
+        // Build the SysV AMD64 ABI initial stack with argv[0] = binary name.
+        let argv: &[&[u8]] = &[name.as_bytes()];
+        // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
+        let user_rsp =
+            unsafe { crate::mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+        (loaded, user_rsp)
     };
 
     // Update the process entry with the new CR3 and entry point.
@@ -348,12 +354,12 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
         if let Some(proc) = table.find_mut(pid) {
             proc.page_table_root = Some(x86_64::PhysAddr::new(new_cr3.start_address().as_u64()));
             proc.entry_point = loaded.entry;
-            proc.user_stack_top = loaded.stack_top;
+            proc.user_stack_top = user_rsp;
         }
     }
 
     // Switch to the new page table and enter ring 3.
-    // SAFETY: new_cr3 is valid, entry and stack_top are mapped within it.
+    // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
         use x86_64::registers::control::{Cr3, Cr3Flags};
         Cr3::write(new_cr3, Cr3Flags::empty());
@@ -367,7 +373,7 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
             gdt::set_kernel_stack(kstack_top);
             SYSCALL_STACK_TOP = kstack_top;
         }
-        crate::arch::x86_64::enter_userspace(loaded.entry, loaded.stack_top)
+        crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
 }
 
@@ -377,11 +383,31 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
 /// collects its exit code and reaps it.
 fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
     let target_pid = pid as crate::process::Pid;
+    let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Verify that target_pid is a child of the calling process before blocking.
+    // This prevents one process from reaping another process's children.
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(target_pid) {
+            None => return u64::MAX,
+            Some(p) if p.ppid != calling_pid => {
+                log::warn!(
+                    "[waitpid] pid {} is not a child of calling pid {}",
+                    target_pid,
+                    calling_pid
+                );
+                return u64::MAX;
+            }
+            Some(_) => {}
+        }
+    }
+
     loop {
         let result = {
             let mut table = crate::process::PROCESS_TABLE.lock();
             match table.find(target_pid) {
-                None => return u64::MAX, // no such child
+                None => return u64::MAX, // no such child (reaped between check and loop)
                 Some(p) if p.state == crate::process::ProcessState::Zombie => {
                     let code = p.exit_code.unwrap_or(0);
                     table.reap(target_pid);

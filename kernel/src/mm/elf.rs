@@ -228,6 +228,12 @@ unsafe fn map_load_segment(
         return Ok(());
     }
 
+    // Reject malformed segments where the file image claims to be larger than
+    // the memory region — would write past the mapped range.
+    if phdr.p_filesz > phdr.p_memsz {
+        return Err(ElfError::MappingFailed("p_filesz > p_memsz"));
+    }
+
     let vaddr_start = phdr.p_vaddr;
     let vaddr_end = vaddr_start
         .checked_add(phdr.p_memsz)
@@ -429,6 +435,13 @@ pub unsafe fn setup_abi_stack(
         if !kptr.is_null() {
             (kptr as *mut u64).write(ptr);
         }
+    }
+
+    // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
+    // After placing argc (–8 bytes), cursor must satisfy `cursor % 16 == 8`.
+    // So before the argc write, cursor must be `0 mod 16`.
+    if !cursor.is_multiple_of(16) {
+        cursor -= 8; // add one 8-byte alignment pad (already zeroed by map_user_stack)
     }
 
     // argc.

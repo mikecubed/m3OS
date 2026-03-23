@@ -11,49 +11,46 @@ use core::arch::asm;
 /// Raw one-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall1(num: u64, a0: u64) -> u64 {
-    let ret: u64;
+    let mut rax = num;
     asm!(
         "syscall",
-        in("rax") num,
+        inlateout("rax") rax,
         in("rdi") a0,
-        lateout("rax") ret,
         lateout("rcx") _,
         lateout("r11") _,
-        options(nostack, preserves_flags),
+        options(nostack),
     );
-    ret
+    rax
 }
 
 /// Raw two-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
-    let ret: u64;
+    let mut rax = num;
     asm!(
         "syscall",
-        in("rax") num,
+        inlateout("rax") rax,
         in("rdi") a0,
         in("rsi") a1,
-        lateout("rax") ret,
         lateout("rcx") _,
         lateout("r11") _,
-        options(nostack, preserves_flags),
+        options(nostack),
     );
-    ret
+    rax
 }
 
 /// Raw zero-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall0(num: u64) -> u64 {
-    let ret: u64;
+    let mut rax = num;
     asm!(
         "syscall",
-        in("rax") num,
-        lateout("rax") ret,
+        inlateout("rax") rax,
         lateout("rcx") _,
         lateout("r11") _,
-        options(nostack, preserves_flags),
+        options(nostack),
     );
-    ret
+    rax
 }
 
 // Syscall numbers (kernel/src/arch/x86_64/syscall.rs)

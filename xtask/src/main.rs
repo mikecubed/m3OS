@@ -83,8 +83,8 @@ fn workspace_root() -> PathBuf {
 /// Compile Phase 11 userspace test binaries and copy them into kernel/initrd/.
 ///
 /// Each binary is compiled for `x86_64-unknown-none` (statically linked,
-/// no libc) and stripped of debug sections so the ELF files stay small.
-/// The ELF files are embedded in the kernel's ramdisk via `include_bytes!`.
+/// no libc) in release mode.  The resulting ELF files are copied directly
+/// into `kernel/initrd/` and embedded in the kernel's ramdisk via `include_bytes!`.
 fn build_userspace_bins() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");

@@ -18,7 +18,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -142,9 +142,11 @@ fn alloc_kernel_stack() -> u64 {
     let stack: alloc::boxed::Box<[u8; KERNEL_STACK_SIZE]> =
         alloc::boxed::Box::new([0u8; KERNEL_STACK_SIZE]);
     let ptr = alloc::boxed::Box::into_raw(stack) as *mut u8;
-    // SAFETY: ptr is valid for KERNEL_STACK_SIZE bytes; we never free it.
-    // The top of the stack is one byte past the last element.
-    (ptr as u64) + KERNEL_STACK_SIZE as u64
+    // The top of the stack is one byte past the last element, aligned down
+    // to a 16-byte boundary for the SysV AMD64 ABI (kernel-stack RSP0 and
+    // SYSCALL stack must be 16-byte aligned for call instructions).
+    let top = (ptr as u64) + KERNEL_STACK_SIZE as u64;
+    top & !15
 }
 
 // ---------------------------------------------------------------------------
@@ -268,13 +270,12 @@ struct ForkChildCtx {
 
 /// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
 ///
-/// Uses a `Vec` as a FIFO (push to back, pop from front) — simple for a
-/// single-CPU OS where forks are rare.
-static FORK_CHILD_QUEUE: Mutex<alloc::vec::Vec<ForkChildCtx>> = Mutex::new(alloc::vec::Vec::new());
+/// Uses a `VecDeque` for O(1) pop-from-front semantics.
+static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::new());
 
 /// Push a fork-child context so `fork_child_trampoline` can consume it.
 pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
-    FORK_CHILD_QUEUE.lock().push(ForkChildCtx {
+    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
@@ -287,11 +288,11 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
 /// CR3 if set, updates the kernel stack in TSS/MSR, sets `CURRENT_PID`, then
 /// enters ring 3 at the forked RIP with rax=0.
 pub fn fork_child_trampoline() -> ! {
-    // Pop the context set up by sys_fork.
-    let ctx = {
-        let mut q = FORK_CHILD_QUEUE.lock();
-        q.remove(0) // oldest entry first
-    };
+    // Pop the context set up by sys_fork / run_elf_and_report.
+    let ctx = FORK_CHILD_QUEUE
+        .lock()
+        .pop_front()
+        .expect("fork_child_trampoline: FORK_CHILD_QUEUE is empty — missing push_fork_ctx");
 
     CURRENT_PID.store(ctx.pid, Ordering::Relaxed);
 

@@ -956,7 +956,7 @@ fn test_elf_error_cases() {
 /// then wait for it to exit and log the exit code.
 fn run_elf_and_report(name: &'static str) {
     use mm::elf::load_elf_into;
-    use process::{spawn_process_with_cr3, CURRENT_PID, PROCESS_TABLE};
+    use process::{spawn_process_with_cr3, PROCESS_TABLE};
 
     let data = match fs::ramdisk::get_file(name) {
         Some(d) => d,
@@ -1016,19 +1016,15 @@ fn run_elf_and_report(name: &'static str) {
     );
     log::info!("[p11] {} registered as pid {}", name, pid);
 
-    // Push a fork context so process_trampoline can pick it up.
-    // We use fork_child_trampoline as a generic "enter ring 3" mechanism.
+    // Push a fork context so fork_child_trampoline can pick it up.
+    // fork_child_trampoline sets CURRENT_PID when it runs — the launcher
+    // must not set it here because the launcher kernel task is not the
+    // new userspace process.
     process::push_fork_ctx(pid, loaded.entry, user_rsp);
 
-    // Set the process as the "current" process before spawning.
-    CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
-
     // Spawn the kernel task; it will run fork_child_trampoline which
-    // switches CR3 and enters ring 3.
+    // sets CURRENT_PID, switches CR3, and enters ring 3.
     task::spawn(process::fork_child_trampoline, "p11-elf");
-
-    // Reset current PID (we're back in the launcher kernel task).
-    CURRENT_PID.store(0, core::sync::atomic::Ordering::Relaxed);
 
     // Wait for the process to exit.
     log::info!("[p11] waiting for pid {}...", pid);
