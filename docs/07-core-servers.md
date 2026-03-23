@@ -39,17 +39,19 @@ The registry is a flat array of at most **8 entries**, each holding a name and a
 
 ```
 ServiceEntry {
-    name:   [u8; 32],   // null-terminated, max 31 bytes + NUL
-    ep_id:  EndpointId, // integer index into the kernel endpoint table
-    valid:  bool,
+    name:     [u8; 32],  // raw bytes; not NUL-terminated
+    name_len: usize,     // actual byte count, 0–32
+    ep_id:    EndpointId,
 }
 
 Registry {
-    entries: [ServiceEntry; 8],
+    entries: [Option<Entry>; 8],
 }
 ```
 
 There is no heap allocation. The array lives in a static global protected by a spinlock.
+Slots that have not been populated are `None`; there is no separate validity flag.
+Names are not NUL-terminated; the registry uses an explicit `name_len` field.
 The 8-entry limit is intentional: Phase 7 has four services at most (init, console, kbd, and
 one spare), and a larger table would invite scope creep.
 
@@ -70,8 +72,8 @@ it lives in kernel address space. Two syscalls provide the bridge:
 
 | Syscall | Number | Arguments | Returns |
 |---|---|---|---|
-| `sys_registry_register` | 9 | name ptr + len, endpoint cap | `Result<(), RegistryError>` |
-| `sys_registry_lookup` | 10 | name ptr + len | `Option<EndpointId>` or error |
+| `sys_registry_register` | 9 | endpoint cap handle, name ptr, name len | `u64` — `0` on success; `u64::MAX` on error |
+| `sys_registry_lookup` | 10 | name ptr, name len | `u64` — new endpoint `CapHandle` on success; `u64::MAX` on error |
 
 In Phase 7, these syscalls are wired up but only used internally: all servers are kernel tasks
 and can call the registry functions directly.
@@ -156,7 +158,7 @@ of nodes and contains cycles that require activation-on-demand to break.
 Message format (using the Phase 6 `Message` type):
 
 ```
-label:     CONSOLE_WRITE = 1
+label:     CONSOLE_WRITE = 0
 data[0]:   pointer to string (kernel virtual address)
 data[1]:   string length in bytes
 data[2..]: unused
