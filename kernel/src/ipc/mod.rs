@@ -81,6 +81,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
         None => return err_val,
     };
 
+    // Range-check arg0 before casting to CapHandle (u32) to prevent
+    // truncation wrap-around: a userspace caller passing arg0 = 0x1_0000_0000
+    // would silently become handle 0, bypassing intended handle validation.
+    if arg0 > u64::from(u32::MAX) {
+        return err_val;
+    }
+
     // Look up the capability for arg0 (the primary handle).
     let cap = match scheduler::task_cap(task_id, arg0 as CapHandle) {
         Ok(c) => c,
@@ -140,12 +147,16 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
                 Capability::Reply(id) => id,
                 _ => return u64::MAX,
             };
+            // Range-check arg2 (ep_cap handle) before casting to CapHandle.
+            if arg2 > u64::from(u32::MAX) {
+                return u64::MAX;
+            }
             // Validate the endpoint handle carried in arg2.
             let ep_id = match scheduler::task_cap(task_id, arg2 as CapHandle) {
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
-            // Consume reply cap.
+            // Consume reply cap (arg0 already range-checked above).
             let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
             let reply = message::Message::new(arg1);
             endpoint::reply_recv(task_id, caller_id, ep_id, reply)
