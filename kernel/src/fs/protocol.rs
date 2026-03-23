@@ -55,18 +55,6 @@ pub const FILE_READ: u64 = 2;
 pub const FILE_CLOSE: u64 = 3;
 
 // ---------------------------------------------------------------------------
-// Internal routing label (vfs_server → fat_server)
-// ---------------------------------------------------------------------------
-
-/// Label used by `vfs_server` when forwarding requests to the `fat_server`
-/// backend.  Same layout as the client-facing labels above; `vfs_server`
-/// passes the request through unchanged in Phase 8.
-///
-/// Kept as a named constant so a future multi-backend VFS can translate
-/// labels at the routing layer without changing the protocol.
-pub const BACKEND_FORWARD: u64 = FILE_OPEN; // vfs passes the original label
-
-// ---------------------------------------------------------------------------
 // Constraints
 // ---------------------------------------------------------------------------
 

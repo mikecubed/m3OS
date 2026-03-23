@@ -375,9 +375,8 @@ fn fs_client_task() -> ! {
     let my_id = task::current_task_id().expect("[fs-client] no task id");
 
     // Discover the VFS service endpoint.
+    // call_msg() takes EndpointId directly; no cap insert is needed here.
     let vfs_ep_id = ipc::registry::lookup("vfs").expect("[fs-client] vfs service not found");
-    task::insert_cap(my_id, ipc::Capability::Endpoint(vfs_ep_id))
-        .expect("[fs-client] failed to insert vfs endpoint cap");
 
     // --- Open hello.txt (P8-T006) ---
     let name = "hello.txt";
