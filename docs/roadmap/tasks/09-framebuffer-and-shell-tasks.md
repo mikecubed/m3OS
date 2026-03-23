@@ -1,6 +1,6 @@
 # Phase 9 Tasks - Framebuffer and Shell
 
-**Branch:** `phase-9-framebuffer-and-shell` | **PR:** #8 (draft)
+**Branch:** `phase-9-framebuffer-and-shell` | **PR:** #8 (merged)
 **Depends on:** Phases 7 and 8
 
 ```mermaid
