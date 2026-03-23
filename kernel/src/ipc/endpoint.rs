@@ -11,16 +11,19 @@
 //!
 //! | Function | Who calls it | Effect |
 //! |---|---|---|
-//! | [`recv`] | Server | Block until a sender arrives; dequeue its message |
+//! | [`recv`] | Server | Block until a sender arrives; return message label |
+//! | [`recv_msg`] | Server | Block until a sender arrives; return full [`Message`] |
 //! | [`send`] | Client | Block until a receiver is ready; deliver message |
 //! | [`call`] | Client | `send` + block waiting for a reply |
 //! | [`reply`] | Server | Deliver a reply to the blocked caller |
 //! | [`reply_recv`] | Server | `reply` + immediately `recv` next message |
+//! | [`reply_recv_msg`] | Server | `reply` + immediately `recv_msg` next message |
 //!
-//! # Phase 6 implementation
+//! # Phase 6 / Phase 7 implementation
 //!
-//! This module is implemented by Track A of the parallel-implementation loop.
-//! See `docs/roadmap/tasks/06-ipc-core-tasks.md` tasks P6-T003 through P6-T005.
+//! Phase 6: initial rendezvous IPC (P6-T003 through P6-T005).
+//! Phase 7: adds [`recv_msg`] and [`reply_recv_msg`] so servers can access
+//! the full message payload, not just the label.
 
 extern crate alloc;
 
@@ -129,22 +132,24 @@ impl Endpoint {
 // IPC operations
 // ---------------------------------------------------------------------------
 
-/// Receive a message from an endpoint.
+/// Receive a full message (label + data) from an endpoint.
 ///
 /// If a sender is already waiting, dequeue it, wake it (if it used `send`
-/// rather than `call`), copy its message, and return the message label.
+/// rather than `call`), copy its message, and return the complete [`Message`].
 /// If the endpoint is for a `call`, insert a reply capability into the
 /// server's table instead of waking the sender immediately.
 ///
 /// If no sender is waiting, the calling task blocks until one arrives.
 ///
-/// Returns the message label on success, or `u64::MAX` on error.
-pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
+/// Returns the full [`Message`] on success, or a sentinel message with
+/// `label = u64::MAX` on error.  Use this when the server needs the data
+/// payload; use [`recv`] when only the label is needed.
+pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
     let action = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) => e,
-            None => return u64::MAX,
+            None => return Message::new(u64::MAX),
         };
         if let Some(pending) = ep.senders.pop_front() {
             Some(pending)
@@ -167,7 +172,7 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
                 // (which would fire a misleading debug_assert in call()).
                 if scheduler::insert_cap(receiver, Capability::Reply(pending.task)).is_err() {
                     log::warn!(
-                        "[ipc] recv: capability table full, unblocking sender without reply"
+                        "[ipc] recv_msg: capability table full, unblocking sender without reply"
                     );
                     scheduler::deliver_message(pending.task, Message::new(u64::MAX));
                     scheduler::wake_task(pending.task);
@@ -185,15 +190,25 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
     // None here is always an IPC/scheduler bug: the sender must call
     // deliver_message before calling wake_task.
     match scheduler::take_message(receiver) {
-        Some(msg) => msg.label,
+        Some(msg) => msg,
         None => {
             debug_assert!(
                 false,
-                "[ipc] recv: woke with no pending message — IPC logic bug"
+                "[ipc] recv_msg: woke with no pending message — IPC logic bug"
             );
-            u64::MAX
+            Message::new(u64::MAX)
         }
     }
+}
+
+/// Receive a message from an endpoint.
+///
+/// Identical to [`recv_msg`] but returns only the message label.
+/// Use [`recv_msg`] when the server needs the full data payload.
+///
+/// Returns the message label on success, or `u64::MAX` on error.
+pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
+    recv_msg(receiver, ep_id).label
 }
 
 /// Send a message to an endpoint.
@@ -317,4 +332,19 @@ pub fn reply(caller: TaskId, reply_msg: Message) {
 pub fn reply_recv(server: TaskId, caller: TaskId, ep_id: EndpointId, reply_msg: Message) -> u64 {
     reply(caller, reply_msg);
     recv(server, ep_id)
+}
+
+/// Reply to the current caller and immediately receive the next full message.
+///
+/// Equivalent to [`reply_recv`] but returns the complete [`Message`] instead
+/// of only the label.  Use this in server loops that need access to the data
+/// payload of the next request.
+pub fn reply_recv_msg(
+    server: TaskId,
+    caller: TaskId,
+    ep_id: EndpointId,
+    reply_msg: Message,
+) -> Message {
+    reply(caller, reply_msg);
+    recv_msg(server, ep_id)
 }
