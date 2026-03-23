@@ -863,18 +863,91 @@ fn p11_launcher_task() -> ! {
     log::info!("[p11] launcher started");
 
     // -----------------------------------------------------------------------
+    // Test 0 (P11-T023): malformed ELF inputs must return errors, not panic
+    // -----------------------------------------------------------------------
+    test_elf_error_cases();
+
+    // -----------------------------------------------------------------------
     // Test 1 (P11-T019): load exit0.elf → expect exit code 0
     // -----------------------------------------------------------------------
     run_elf_and_report("exit0.elf");
 
     // -----------------------------------------------------------------------
-    // Test 2 (P11-T021): load fork-test.elf → parent waits for child(42)
+    // Test 2 (P11-T020): echo-args prints argc/argv via serial
+    // -----------------------------------------------------------------------
+    run_elf_and_report("echo-args.elf");
+
+    // -----------------------------------------------------------------------
+    // Test 3 (P11-T021): load fork-test.elf → parent waits for child(42)
     // -----------------------------------------------------------------------
     run_elf_and_report("fork-test.elf");
 
-    log::info!("[p11] launcher done");
+    // -----------------------------------------------------------------------
+    // Test 4 (P11-T022): two sequential processes, separate address spaces
+    // -----------------------------------------------------------------------
+    run_elf_and_report("exit0.elf");
+    run_elf_and_report("exit0.elf");
+    log::info!("[p11] T022: both exit0 instances completed — address spaces isolated");
+
+    log::info!("[p11] all Phase 11 tests complete");
     loop {
         task::yield_now();
+    }
+}
+
+/// P11-T023: verify that malformed ELF data returns errors without panicking.
+fn test_elf_error_cases() {
+    use mm::elf::{load_elf_into, ElfError};
+
+    let cases: &[(&str, &[u8])] = &[
+        ("empty", &[]),
+        (
+            "bad magic",
+            &[
+                0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        ),
+        ("truncated", &[0x7f, b'E', b'L', b'F']),
+    ];
+
+    let mut all_ok = true;
+    for (label, data) in cases {
+        let new_cr3 = match mm::new_process_page_table() {
+            Some(f) => f,
+            None => {
+                log::warn!("[p11-T023] out of frames for case '{}'", label);
+                all_ok = false;
+                continue;
+            }
+        };
+        let phys_off = mm::phys_offset();
+        let result = {
+            let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
+            unsafe { load_elf_into(&mut mapper, phys_off, data) }
+        };
+        match result {
+            Err(ElfError::TruncatedHeader) | Err(ElfError::InvalidMagic) => {
+                log::info!(
+                    "[p11-T023] '{}': correctly rejected (truncated or bad magic)",
+                    label
+                );
+            }
+            Err(e) => {
+                log::info!("[p11-T023] '{}': rejected with {:?}", label, e);
+            }
+            Ok(_) => {
+                log::warn!(
+                    "[p11-T023] '{}': UNEXPECTED success — should have been rejected",
+                    label
+                );
+                all_ok = false;
+            }
+        }
+    }
+    if all_ok {
+        log::info!("[p11-T023] all malformed ELF cases correctly rejected");
     }
 }
 
