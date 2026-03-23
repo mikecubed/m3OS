@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod arch;
+mod fb;
 mod fs;
 mod ipc;
 mod mm;
@@ -34,7 +35,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Load GDT/IDT — no IRQs yet.
     arch::init();
 
+    // P9-T001: parse framebuffer info before mm::init consumes boot_info.
+    // `mm::init` takes `&'static mut BootInfo` which borrows the whole struct
+    // for 'static, so we must extract the raw pointer + layout first.
+    let fb_parts: Option<(*mut u8, bootloader_api::info::FrameBufferInfo)> =
+        boot_info.framebuffer.as_mut().map(|fb| {
+            let info = fb.info();
+            // SAFETY: boot_info is &'static mut so the framebuffer memory is
+            // valid for the kernel lifetime.  We extract a raw pointer here
+            // and hand it to fb::init_from_parts after mm::init returns;
+            // no other code accesses the framebuffer between these two points.
+            let ptr: *mut u8 = fb.buffer_mut().as_mut_ptr();
+            (ptr, info)
+        });
+
     mm::init(boot_info);
+
+    // P9-T002: initialise framebuffer text console (fixed-font renderer).
+    if let Some((buf_ptr, info)) = fb_parts {
+        // SAFETY: buf_ptr is derived from boot_info.framebuffer which is
+        // &'static mut; the mapping outlives the kernel.  mm::init does not
+        // touch the framebuffer region.
+        unsafe { fb::init_from_parts(buf_ptr, info) };
+        log::info!("[fb] framebuffer console initialised");
+    } else {
+        log::warn!("[fb] no framebuffer provided by bootloader");
+    }
 
     // Smoke-test heap allocations (P2-T007)
     let boxed = Box::new(42u64);
@@ -171,6 +197,9 @@ fn console_server_task() -> ! {
                     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
                     if let Ok(text) = core::str::from_utf8(bytes) {
                         log::info!("[console] {}", text.trim_end_matches('\n'));
+                        // P9-T003: mirror output to framebuffer console.
+                        fb::write_str(text);
+                        fb::write_str("\n");
                         ipc::Message::new(0)
                     } else {
                         log::warn!("[console] received invalid UTF-8; rejecting write request");

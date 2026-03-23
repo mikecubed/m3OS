@@ -14,8 +14,20 @@
 
 #![allow(dead_code)]
 
-use crate::fs::protocol::{FILE_CLOSE, FILE_OPEN, FILE_READ, MAX_NAME_LEN, MAX_READ_LEN};
+use crate::fs::protocol::{
+    FILE_CLOSE, FILE_LIST, FILE_OPEN, FILE_READ, MAX_NAME_LEN, MAX_READ_LEN,
+};
 use crate::ipc::Message;
+
+// ---------------------------------------------------------------------------
+// Static name list (null-separated, for FILE_LIST)
+// ---------------------------------------------------------------------------
+
+static FILE_NAME_LIST: &[u8] = b"hello.txt\0readme.txt\0";
+
+fn name_list() -> (*const u8, usize) {
+    (FILE_NAME_LIST.as_ptr(), FILE_NAME_LIST.len())
+}
 
 // ---------------------------------------------------------------------------
 // Static file table
@@ -53,6 +65,14 @@ pub fn handle(msg: &Message) -> Message {
         FILE_OPEN => handle_open(msg),
         FILE_READ => handle_read(msg),
         FILE_CLOSE => Message::new(0),
+        FILE_LIST => {
+            // Return a pointer to the static null-separated name list.
+            let (ptr, len) = name_list();
+            let mut reply = Message::new(0);
+            reply.data[0] = ptr as u64;
+            reply.data[1] = len as u64;
+            reply
+        }
         _ => Message::new(u64::MAX),
     }
 }
