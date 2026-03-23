@@ -203,9 +203,11 @@ fn console_server_task() -> ! {
                     // Bad request — reply with error label.
                     ipc::Message::new(u64::MAX)
                 } else {
-                    // Safety: In Phase 7, kernel tasks share the kernel address space.
-                    // The pointer is a kernel static string address provided by the client.
-                    // ptr is non-null (checked above) and len is in 1..=4096.
+                    // Safety: In Phase 9, clients still share the kernel address
+                    // space with the server. The caller provides a kernel pointer
+                    // to a valid UTF-8 byte range that remains live for the
+                    // duration of this synchronous IPC call. `ptr` is non-null
+                    // (checked above) and `len` is in 1..=MAX_CONSOLE_WRITE_LEN.
                     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
                     if let Ok(text) = core::str::from_utf8(bytes) {
                         crate::serial::_print(format_args!("{}", text));
