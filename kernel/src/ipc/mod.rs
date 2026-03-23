@@ -216,7 +216,10 @@ fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 
     if name_ptr == 0 {
         return u64::MAX;
     }
-    let name_len = name_len.min(32) as usize;
+    if name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
     // Safety: Phase 7 only — all callers are kernel tasks sharing the kernel address
     // space; name_ptr is a valid kernel-memory pointer. Phase 8 will add a
     // copy-from-user path that validates ring-3 addresses before dereferencing.
@@ -238,7 +241,10 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
     if name_ptr == 0 {
         return u64::MAX;
     }
-    let name_len = name_len.min(32) as usize;
+    if name_len > 32 {
+        return u64::MAX;
+    }
+    let name_len = name_len as usize;
     // Safety: Phase 7 only — all callers are kernel tasks sharing the kernel address
     // space; name_ptr is a valid kernel-memory pointer. Phase 8 will add a
     // copy-from-user path that validates ring-3 addresses before dereferencing.

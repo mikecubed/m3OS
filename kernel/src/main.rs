@@ -76,8 +76,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Phase 7: Core Servers demo
     //
-    // init_task creates IPC endpoints for console and kbd services, registers
-    // them in the service registry, spawns the server tasks, and then yields.
+    // init_task creates a console IPC endpoint, registers it in the service
+    // registry, spawns the server tasks, and then yields.
     // console_client_task demonstrates service discovery and IPC-based output.
     task::spawn(init_task, "init");
     task::spawn_idle(idle_task);
@@ -158,8 +158,11 @@ fn console_server_task() -> ! {
                     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
                     if let Ok(text) = core::str::from_utf8(bytes) {
                         log::info!("[console] {}", text.trim_end_matches('\n'));
+                        ipc::Message::new(0)
+                    } else {
+                        log::warn!("[console] received invalid UTF-8; rejecting write request");
+                        ipc::Message::new(u64::MAX)
                     }
-                    ipc::Message::new(0)
                 }
             }
             _ => {
@@ -171,7 +174,13 @@ fn console_server_task() -> ! {
         // Consume the one-shot reply cap inserted by recv_msg.
         let caller_id = match task::task_cap(my_id, reply_cap_handle) {
             Ok(ipc::Capability::Reply(id)) => id,
-            _ => panic!("[console] expected reply cap at handle 1"),
+            _ => {
+                // Sender used send() rather than call() — no reply cap was inserted.
+                // Log a warning and recv the next message without replying.
+                log::warn!("[console] no reply cap at handle 1; sender used send rather than call");
+                msg = ipc::endpoint::recv_msg(my_id, ep_id);
+                continue;
+            }
         };
         let _ = task::remove_task_cap(my_id, reply_cap_handle);
 
