@@ -14,7 +14,8 @@
 //! | [`recv`] | Server | Block until a sender arrives; return message label |
 //! | [`recv_msg`] | Server | Block until a sender arrives; return full [`Message`] |
 //! | [`send`] | Client | Block until a receiver is ready; deliver message |
-//! | [`call`] | Client | `send` + block waiting for a reply |
+//! | [`call`] | Client | `send` + block waiting for a reply; returns label only |
+//! | [`call_msg`] | Client | `send` + block waiting for a reply; returns full [`Message`] |
 //! | [`reply`] | Server | Deliver a reply to the blocked caller |
 //! | [`reply_recv`] | Server | `reply` + immediately `recv` next message |
 //! | [`reply_recv_msg`] | Server | `reply` + immediately `recv_msg` next message |

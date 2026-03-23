@@ -443,9 +443,14 @@ fn fs_client_task() -> ! {
         missing.len() as u64,
     );
     let missing_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_missing);
-    // IPC failure (label=u64::MAX) and protocol not-found (data[0]=u64::MAX) are
-    // both acceptable outcomes for a missing-file lookup in the demo.
-    if missing_reply.label == u64::MAX || missing_reply.data[0] == u64::MAX {
+    if missing_reply.label == u64::MAX {
+        // IPC-level failure (VFS or fat_server unreachable) — unexpected in a healthy system.
+        log::error!(
+            "[fs-client] FILE_OPEN({}) → IPC failure (unexpected)",
+            missing
+        );
+    } else if missing_reply.data[0] == u64::MAX {
+        // Protocol not-found sentinel — the expected outcome for a missing file.
         log::info!("[fs-client] FILE_OPEN({}) → not found (expected)", missing);
     } else {
         log::error!("[fs-client] FILE_OPEN missing file returned fd — unexpected");
