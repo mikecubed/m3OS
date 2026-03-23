@@ -300,8 +300,8 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
     if path_len > 255 {
         return u64::MAX;
     }
-    // Safety: path is in user address space; kernel+user share one AS for now.
-    let name = match path_name(path_ptr, path_len) {
+    let mut name_buf = [0u8; 255];
+    let name = match path_name_buf(path_ptr, path_len, &mut name_buf) {
         Some(n) => n,
         None => return u64::MAX,
     };
@@ -394,9 +394,20 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
         if let Some(code) = result {
             // Write wstatus in Linux-compatible encoding: exit code in bits 15:8.
             if status_ptr != 0 {
-                // Safety: caller guarantees status_ptr is a writable user address.
-                unsafe {
-                    (status_ptr as *mut i32).write(code << 8);
+                // Validate: must be 4-byte aligned and within the user address
+                // range (below the 128 TiB canonical boundary).
+                let ptr_end = status_ptr.saturating_add(4);
+                let in_user = status_ptr.is_multiple_of(4) && ptr_end <= 0x0000_8000_0000_0000u64;
+                if in_user {
+                    // SAFETY: validated above; kernel+user share one AS (Phase 11).
+                    unsafe {
+                        (status_ptr as *mut i32).write(code << 8);
+                    }
+                } else {
+                    log::warn!(
+                        "[waitpid] invalid status_ptr {:#x} — skipping write",
+                        status_ptr
+                    );
                 }
             }
             log::info!("[waitpid] pid {} exited with code {}", target_pid, code);
@@ -413,15 +424,22 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Extract a UTF-8 path string from a userspace pointer + length.
-fn path_name(ptr: u64, len: u64) -> Option<&'static str> {
-    // Safety: kernel + user share one address space.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    // Reborrow as 'static — safe because ramdisk strings are 'static and we
-    // only use this reference within the syscall (no lifetime escape).
-    core::str::from_utf8(bytes).ok().map(|s| {
-        // SAFETY: we extend the lifetime for use within this syscall only.
-        unsafe { core::mem::transmute::<&str, &'static str>(s) }
-    })
+/// Copy at most 255 bytes from a userspace pointer into a stack buffer and
+/// return a reference to the valid UTF-8 prefix.
+///
+/// Using a local buffer avoids the `&'static str` lifetime lie: the resulting
+/// reference is scoped to the caller's stack frame so Rust enforces that it
+/// cannot outlive the buffer.
+fn path_name_buf(ptr: u64, len: u64, buf: &mut [u8; 255]) -> Option<&str> {
+    let copy_len = (len as usize).min(255);
+    if copy_len == 0 || ptr == 0 {
+        return None;
+    }
+    // SAFETY: kernel + user share one address space (Phase 11); ptr is
+    // a userspace stack address pointing to a valid string for this syscall.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, copy_len) };
+    buf[..copy_len].copy_from_slice(bytes);
+    core::str::from_utf8(&buf[..copy_len]).ok()
 }
 
 /// Copy all user-accessible pages from the currently-active page table

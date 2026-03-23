@@ -896,37 +896,38 @@ fn p11_launcher_task() -> ! {
 }
 
 /// P11-T023: verify that malformed ELF data returns errors without panicking.
+///
+/// These tests all fail at header parse time (before any segment mapping),
+/// so we reuse the current address space mapper to avoid allocating and
+/// leaking a per-test PML4 frame.  The mapper is never mutated.
 fn test_elf_error_cases() {
     use mm::elf::{load_elf_into, ElfError};
 
+    // 64-byte "bad magic" ELF-sized buffer with wrong magic bytes.
+    let bad_magic = {
+        let mut b = [0u8; 64];
+        b[0] = 0xFF;
+        b[1] = 0xFF;
+        b[2] = 0xFF;
+        b[3] = 0xFF;
+        b
+    };
+
     let cases: &[(&str, &[u8])] = &[
         ("empty", &[]),
-        (
-            "bad magic",
-            &[
-                0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
-        ),
+        ("bad magic", &bad_magic),
         ("truncated", &[0x7f, b'E', b'L', b'F']),
     ];
 
+    // All cases fail before any page mapping — reuse current mapper to avoid
+    // allocating PML4 frames that cannot be freed (bump allocator).
+    // SAFETY: no other OffsetPageTable over the current CR3 is alive here.
+    let phys_off = mm::phys_offset();
+    let mut mapper = unsafe { mm::paging::get_mapper() };
+
     let mut all_ok = true;
     for (label, data) in cases {
-        let new_cr3 = match mm::new_process_page_table() {
-            Some(f) => f,
-            None => {
-                log::warn!("[p11-T023] out of frames for case '{}'", label);
-                all_ok = false;
-                continue;
-            }
-        };
-        let phys_off = mm::phys_offset();
-        let result = {
-            let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
-            unsafe { load_elf_into(&mut mapper, phys_off, data) }
-        };
+        let result = unsafe { load_elf_into(&mut mapper, phys_off, data) };
         match result {
             Err(ElfError::TruncatedHeader) | Err(ElfError::InvalidMagic) => {
                 log::info!(
@@ -981,36 +982,43 @@ fn run_elf_and_report(name: &'static str) {
     };
 
     let phys_off = mm::phys_offset();
-    let loaded = {
+    let (loaded, user_rsp) = {
         // SAFETY: new_cr3 was just allocated; exclusive.
         let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
-        match unsafe { load_elf_into(&mut mapper, phys_off, data) } {
+        let loaded = match unsafe { load_elf_into(&mut mapper, phys_off, data) } {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("[p11] ELF load failed for {}: {:?}", name, e);
                 return;
             }
-        }
+        };
+        // Build the SysV AMD64 ABI initial stack: [argc, argv[0], NULL, envp NULL, ...]
+        // argv[0] = binary name.
+        let argv: &[&[u8]] = &[name.as_bytes()];
+        // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
+        let user_rsp =
+            unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+        (loaded, user_rsp)
     };
 
     log::info!(
-        "[p11] {} loaded: entry={:#x} stack={:#x}",
+        "[p11] {} loaded: entry={:#x} rsp={:#x}",
         name,
         loaded.entry,
-        loaded.stack_top
+        user_rsp
     );
 
     let pid = spawn_process_with_cr3(
         0,
         loaded.entry,
-        loaded.stack_top,
+        user_rsp,
         x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
     );
     log::info!("[p11] {} registered as pid {}", name, pid);
 
     // Push a fork context so process_trampoline can pick it up.
     // We use fork_child_trampoline as a generic "enter ring 3" mechanism.
-    process::push_fork_ctx(pid, loaded.entry, loaded.stack_top);
+    process::push_fork_ctx(pid, loaded.entry, user_rsp);
 
     // Set the process as the "current" process before spawning.
     CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
