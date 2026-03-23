@@ -253,13 +253,15 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
 
 /// Call an endpoint: send a message and block waiting for a reply.
 ///
-/// Returns the reply message label, or `u64::MAX` on error.
-pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
+/// Returns the full reply [`Message`], or a sentinel message with
+/// `label = u64::MAX` on error.  Use this when the caller needs the reply
+/// data payload (e.g. a VFS server forwarding a fat_server reply to a client).
+pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) => e,
-            None => return u64::MAX,
+            None => return Message::new(u64::MAX),
         };
 
         if let Some(receiver) = ep.receivers.pop_front() {
@@ -280,7 +282,7 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
             // always has a reply cap when it sees the request, or never gets
             // the request at all (consistent failure for the caller).
             if scheduler::insert_cap(receiver, Capability::Reply(caller)).is_err() {
-                log::warn!("[ipc] call: server capability table full, reply cap not inserted");
+                log::warn!("[ipc] call_msg: server capability table full, reply cap not inserted");
                 // Put the receiver back at the front of the queue so it
                 // remains blocked on the endpoint as if this call never arrived.
                 let mut reg = ENDPOINTS.lock();
@@ -291,7 +293,7 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
                     drop(reg);
                     scheduler::wake_task(receiver);
                 }
-                return u64::MAX;
+                return Message::new(u64::MAX);
             }
             scheduler::deliver_message(receiver, msg);
             scheduler::wake_task(receiver);
@@ -305,15 +307,23 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     scheduler::block_current_on_reply();
     // Woken by reply() — reply message was delivered into our slot.
     match scheduler::take_message(caller) {
-        Some(msg) => msg.label,
+        Some(msg) => msg,
         None => {
             debug_assert!(
                 false,
-                "[ipc] call: woke with no reply message — IPC logic bug"
+                "[ipc] call_msg: woke with no reply message — IPC logic bug"
             );
-            u64::MAX
+            Message::new(u64::MAX)
         }
     }
+}
+
+/// Call an endpoint: send a message and block waiting for a reply.
+///
+/// Returns the reply message label, or `u64::MAX` on error.
+/// Use [`call_msg`] when the full reply payload is needed.
+pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
+    call_msg(caller, ep_id, msg).label
 }
 
 /// Reply to a blocked caller.
