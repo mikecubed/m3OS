@@ -45,9 +45,25 @@ flowchart TD
     P7 --> P9
     P8 --> P9
     P9 -.->|optional| P10["Phase 10 Tasks"]
+    P9 --> P11["Phase 11 Tasks"]
+    P8 --> P11
+    P11 --> P12["Phase 12 Tasks"]
+    P8 --> P13["Phase 13 Tasks"]
+    P12 --> P14["Phase 14 Tasks"]
+    P13 --> P14
+    P3 --> P15["Phase 15 Tasks"]
+    P12 --> P16["Phase 16 Tasks"]
+    P15 --> P16
+    P15 --> P17["Phase 17 Tasks"]
+    P4 --> P17
+    P12 --> P18["Phase 18 Tasks"]
+    P13 --> P18
+    P14 --> P18
 ```
 
 ## Task Documents
+
+### Original Phases
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -61,6 +77,19 @@ flowchart TD
 | 8 | Storage and VFS | [Phase 8 Tasks](./08-storage-and-vfs-tasks.md) |
 | 9 | Framebuffer and shell | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot signing | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
+
+### Extended Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 11 | ELF loader and process model | [Phase 11 Tasks](./11-process-model-tasks.md) |
+| 12 | POSIX compatibility layer | [Phase 12 Tasks](./12-posix-compat-tasks.md) |
+| 13 | Writable filesystem | [Phase 13 Tasks](./13-writable-fs-tasks.md) |
+| 14 | Shell and userspace tools | [Phase 14 Tasks](./14-shell-and-tools-tasks.md) |
+| 15 | Hardware discovery (ACPI + PCI) | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
+| 16 | Network stack | [Phase 16 Tasks](./16-network-tasks.md) |
+| 17 | SMP | [Phase 17 Tasks](./17-smp-tasks.md) |
+| 18 | Compiler bootstrap | [Phase 18 Tasks](./18-compiler-bootstrap-tasks.md) |
 
 ## Suggested Usage
 

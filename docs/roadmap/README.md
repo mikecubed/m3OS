@@ -48,9 +48,25 @@ flowchart TD
     P3 --> P9
     P8 --> P9
     P9 -.->|optional| P10["Phase 10<br/>Secure Boot"]
+    P9 --> P11["Phase 11<br/>Process Model"]
+    P8 --> P11
+    P11 --> P12["Phase 12<br/>POSIX Compat"]
+    P8 --> P13["Phase 13<br/>Writable FS"]
+    P12 --> P14["Phase 14<br/>Shell and Tools"]
+    P13 --> P14
+    P3 --> P15["Phase 15<br/>Hardware Discovery"]
+    P12 --> P16["Phase 16<br/>Network"]
+    P15 --> P16
+    P15 --> P17["Phase 17<br/>SMP"]
+    P4 --> P17
+    P12 --> P18["Phase 18<br/>Compiler Bootstrap"]
+    P13 --> P18
+    P14 --> P18
 ```
 
 ## Milestone Summary
+
+### Original Phases (complete)
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
@@ -65,6 +81,19 @@ flowchart TD
 | 9 | Framebuffer and Shell | Text UI and tiny shell become usable | [Phase 9](./09-framebuffer-and-shell.md) | [Tasks](./tasks/09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot | Kernel boots on real hardware with Secure Boot on | [Phase 10](./10-secure-boot.md) | [Tasks](./tasks/10-secure-boot-tasks.md) |
 
+### Extended Phases
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 11 | Process Model | Arbitrary ELF binaries load and run as isolated processes | [Phase 11](./11-process-model.md) | [Tasks](./tasks/11-process-model-tasks.md) |
+| 12 | POSIX Compat | musl-linked C programs run without modification | [Phase 12](./12-posix-compat.md) | [Tasks](./tasks/12-posix-compat-tasks.md) |
+| 13 | Writable FS | Programs can create, write, and delete files | [Phase 13](./13-writable-fs.md) | [Tasks](./tasks/13-writable-fs-tasks.md) |
+| 14 | Shell and Tools | Pipes, redirection, job control, and core utilities | [Phase 14](./14-shell-and-tools.md) | [Tasks](./tasks/14-shell-and-tools-tasks.md) |
+| 15 | Hardware Discovery | ACPI + PCI enumeration; APIC replaces legacy PIC | [Phase 15](./15-hardware-discovery.md) | [Tasks](./tasks/15-hardware-discovery-tasks.md) |
+| 16 | Network | virtio-net driver and minimal TCP/IP stack | [Phase 16](./16-network.md) | [Tasks](./tasks/16-network-tasks.md) |
+| 17 | SMP | All CPU cores run the scheduler simultaneously | [Phase 17](./17-smp.md) | [Tasks](./tasks/17-smp-tasks.md) |
+| 18 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 18](./18-compiler-bootstrap.md) | [Tasks](./tasks/18-compiler-bootstrap-tasks.md) |
+
 ## Suggested Delivery Rhythm
 
 ```mermaid
@@ -73,21 +102,36 @@ gantt
     dateFormat X
     axisFormat Phase %s
 
-    section Foundations
-    Boot Foundation      :p1, 0, 1
-    Memory Basics        :p2, after p1, 1
-    Interrupts           :p3, after p1, 1
+    section Foundations (complete)
+    Boot Foundation      :done, p1, 0, 1
+    Memory Basics        :done, p2, after p1, 1
+    Interrupts           :done, p3, after p1, 1
 
-    section Kernel Core
-    Tasking              :p4, after p2, 1
-    Tasking Dependency   :milestone, after p3, 0
-    Userspace Entry      :p5, after p4, 1
-    IPC Core             :p6, after p5, 1
+    section Kernel Core (complete)
+    Tasking              :done, p4, after p2, 1
+    Userspace Entry      :done, p5, after p4, 1
+    IPC Core             :done, p6, after p5, 1
 
-    section System Services
-    Core Servers         :p7, after p6, 1
-    Storage and VFS      :p8, after p7, 1
-    Framebuffer + Shell  :p9, after p8, 1
+    section System Services (complete)
+    Core Servers         :done, p7, after p6, 1
+    Storage and VFS      :done, p8, after p7, 1
+    Framebuffer + Shell  :done, p9, after p8, 1
+
+    section Process and Compatibility
+    Process Model        :p11, after p9, 1
+    POSIX Compat         :p12, after p11, 1
+    Writable FS          :p13, after p8, 1
+
+    section Usable System
+    Shell and Tools      :p14, after p12, 1
+
+    section Hardware
+    Hardware Discovery   :p15, after p3, 1
+    Network              :p16, after p15, 1
+    SMP                  :p17, after p15, 1
+
+    section Compiler
+    Compiler Bootstrap   :p18, after p14, 1
 ```
 
 ## Required Documentation for Every Phase
@@ -99,22 +143,25 @@ Every phase should ship with documentation in two layers:
 2. An implementation page or section in the relevant subsystem docs that explains the
    data structures, control flow, and important safety boundaries.
 
-Each phase should also include a short "how real OSes differ" section. That section
-should stay high level. The point is to help the reader understand what was simplified,
-what was deferred, and why the toy design is still useful for learning.
+Each phase must include:
 
-## What to Defer Until Later
+- what was implemented and how it works
+- which parts are intentionally simplified vs. a production OS
+- a "how real OSes differ" section explaining what was deferred and why the toy
+  design is still useful for learning
 
-These topics should stay out of the early roadmap unless they are needed to explain a
-core concept:
+## What to Defer Beyond Phase 18
 
-- SMP and per-core scheduling
-- APIC and ACPI-driven hardware discovery
+These topics remain out of scope:
+
 - dynamic linking and shared libraries
-- writable filesystems and crash recovery
-- POSIX compatibility layers
-- advanced shell features, pipes, and job control
-- performance tuning and memory optimization tricks
+- POSIX signal semantics beyond the basics
+- copy-on-write fork
+- journaling filesystems
+- TCP congestion control and retransmit timers
+- NUMA-aware memory allocation
+- GCC or Clang as the native compiler
+- package manager or ports tree
 
 ## Related Documents
 
