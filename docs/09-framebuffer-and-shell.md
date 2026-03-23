@@ -174,7 +174,7 @@ before `kbd_server` and `shell_task` using the same ordering rules documented in
 ```
 [fb] framebuffer console initialised
 [init] service registry: kbd=EndpointId(N)
-[kbd] ready, waiting for keyboard IRQ or KBD_READ
+[kbd] ready, waiting for KBD_READ requests
 [shell] ready — type 'help'
 ```
 
