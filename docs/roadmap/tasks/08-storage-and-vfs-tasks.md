@@ -13,11 +13,13 @@ flowchart LR
 
 ## Implementation Tasks
 
-- [ ] P8-T001 Define a small file-oriented IPC contract for open and read operations.
+- [x] P8-T001 Define a small file-oriented IPC contract for open and read operations.
 - [ ] P8-T002 Implement `vfs_server` as a path router rather than a monolithic filesystem.
 - [ ] P8-T003 Implement one read-only filesystem backend, such as a small FAT-based service.
-- [ ] P8-T004 Add sample files to the boot media or image content used for demos.
+- [x] P8-T004 Add sample files to the boot media or image content used for demos.
 - [ ] P8-T005 Keep write support, caching, and mutation out of the first storage milestone.
+
+<!-- Phase 8 implementation started 2026-03-23 on branch phase-8-storage-and-vfs -->
 
 ## Validation Tasks
 
