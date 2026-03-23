@@ -54,12 +54,28 @@ pub const FILE_READ: u64 = 2;
 /// Reply:   label = 0 (ack).
 pub const FILE_CLOSE: u64 = 3;
 
+/// List all files in the ramdisk.
+///
+/// Request: no data fields used.
+/// Reply:   `data[0]` = pointer to a contiguous byte buffer of null-separated
+///          UTF-8 filenames (e.g. `"hello.txt\0readme.txt\0"`),
+///          `data[1]` = total byte length of that buffer (including trailing `\0`s).
+///          On error: `data[0]` = 0.
+///
+/// Phase 9 limitation: the returned pointer is a kernel virtual address into
+/// static ramdisk data.  This works only while all tasks share the kernel
+/// address space.  Phase 10+ will use page-capability grants.
+pub const FILE_LIST: u64 = 4;
+
 // ---------------------------------------------------------------------------
 // Constraints
 // ---------------------------------------------------------------------------
 
 /// Maximum byte length of a filename accepted by the file service.
 pub const MAX_NAME_LEN: usize = 64;
+
+/// Maximum byte length of a single `FILE_LIST` reply buffer.
+pub const MAX_LIST_LEN: usize = 4096;
 
 /// Maximum number of bytes returned by a single `FILE_READ` call.
 pub const MAX_READ_LEN: usize = 4096;

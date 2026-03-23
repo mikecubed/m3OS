@@ -14,7 +14,9 @@
 
 #![allow(dead_code)]
 
-use crate::fs::protocol::{FILE_CLOSE, FILE_OPEN, FILE_READ, MAX_NAME_LEN, MAX_READ_LEN};
+use crate::fs::protocol::{
+    FILE_CLOSE, FILE_LIST, FILE_OPEN, FILE_READ, MAX_LIST_LEN, MAX_NAME_LEN, MAX_READ_LEN,
+};
 use crate::ipc::Message;
 
 // ---------------------------------------------------------------------------
@@ -26,7 +28,7 @@ struct RamdiskFile {
     content: &'static [u8],
 }
 
-static FILES: &[RamdiskFile] = &[
+const FILES: &[RamdiskFile] = &[
     RamdiskFile {
         name: "hello.txt",
         content: include_bytes!("../../initrd/hello.txt"),
@@ -36,6 +38,48 @@ static FILES: &[RamdiskFile] = &[
         content: include_bytes!("../../initrd/readme.txt"),
     },
 ];
+
+// ---------------------------------------------------------------------------
+// Static name list (null-separated, for FILE_LIST)
+// ---------------------------------------------------------------------------
+
+const fn file_name_list_len() -> usize {
+    let mut total = 0;
+    let mut index = 0;
+    while index < FILES.len() {
+        total += FILES[index].name.len() + 1;
+        index += 1;
+    }
+    total
+}
+
+const FILE_NAME_LIST_LEN: usize = file_name_list_len();
+const _: [(); 1] = [(); (FILE_NAME_LIST_LEN <= MAX_LIST_LEN) as usize];
+
+const fn build_file_name_list() -> [u8; FILE_NAME_LIST_LEN] {
+    let mut buf = [0; FILE_NAME_LIST_LEN];
+    let mut out = 0;
+    let mut file_index = 0;
+    while file_index < FILES.len() {
+        let name = FILES[file_index].name.as_bytes();
+        let mut byte_index = 0;
+        while byte_index < name.len() {
+            buf[out] = name[byte_index];
+            out += 1;
+            byte_index += 1;
+        }
+        buf[out] = 0;
+        out += 1;
+        file_index += 1;
+    }
+    buf
+}
+
+static FILE_NAME_LIST: [u8; FILE_NAME_LIST_LEN] = build_file_name_list();
+
+fn name_list() -> (*const u8, usize) {
+    (FILE_NAME_LIST.as_ptr(), FILE_NAME_LIST.len())
+}
 
 // ---------------------------------------------------------------------------
 // Message handler
@@ -53,6 +97,14 @@ pub fn handle(msg: &Message) -> Message {
         FILE_OPEN => handle_open(msg),
         FILE_READ => handle_read(msg),
         FILE_CLOSE => Message::new(0),
+        FILE_LIST => {
+            // Return a pointer to the static null-separated name list.
+            let (ptr, len) = name_list();
+            let mut reply = Message::new(0);
+            reply.data[0] = ptr as u64;
+            reply.data[1] = len as u64;
+            reply
+        }
         _ => Message::new(u64::MAX),
     }
 }
