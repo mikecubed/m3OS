@@ -426,6 +426,11 @@ pub fn run() -> ! {
         // A tick is pending; re-enable interrupts before picking a task.
         interrupts::enable();
 
+        // Wake any notification waiters whose PENDING bits were set by
+        // signal_irq().  signal_irq() cannot call wake_task() (not ISR-safe),
+        // so we drain here in task context on each scheduler tick.
+        crate::ipc::notification::drain_pending_waiters();
+
         // Pick the next ready task.
         let next = {
             let mut sched = SCHEDULER.lock();

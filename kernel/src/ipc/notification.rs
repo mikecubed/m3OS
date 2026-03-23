@@ -213,6 +213,39 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     scheduler::signal_reschedule();
 }
 
+/// Scan all notifications and wake any task whose PENDING bits are non-zero.
+///
+/// Called from the scheduler loop in task context (after interrupts are
+/// re-enabled, before `pick_next`).  `signal_irq` sets `PENDING` bits
+/// and calls `signal_reschedule`, but it cannot call `wake_task` (not
+/// ISR-safe).  This function closes the gap: on each scheduler tick it
+/// transitions any `BlockedOnNotif` waiter with pending bits to `Ready`.
+///
+/// Safe to call here because `wake_task` is task-context-only and the
+/// scheduler lock is not held when this runs.
+pub fn drain_pending_waiters() {
+    for idx in 0..MAX_NOTIFS {
+        // Fast path: no pending bits → skip without acquiring any lock.
+        if PENDING[idx].load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        // Pending bits exist — check for a blocked waiter.
+        let waiter = {
+            let mut waiters = WAITERS.lock();
+            // Re-check under the lock to close the TOCTOU window where
+            // wait() may have drained PENDING between our load and here.
+            if PENDING[idx].load(Ordering::Acquire) == 0 {
+                None
+            } else {
+                waiters[idx].take()
+            }
+        };
+        if let Some(task) = waiter {
+            scheduler::wake_task(task);
+        }
+    }
+}
+
 /// Wait for any bit to be set on a notification object.
 ///
 /// If bits are already pending, clears and returns them immediately (no

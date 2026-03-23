@@ -35,7 +35,7 @@ sequenceDiagram
 - [x] P6-T005 Add the `reply_recv` server pattern as the primary loop for services.
   - `ipc/endpoint.rs`: `reply_recv()` = `reply()` + `recv()` on the server endpoint
 - [x] P6-T006 Implement notification objects for IRQ-style asynchronous events.
-  - `ipc/notification.rs`: `signal()` (atomic, ISR-safe) + `wait()` (blocking)
+  - `ipc/notification.rs`: `signal_irq()` (lock-free, ISR-safe) + `signal()` (task-context wakeup) + `wait()` (blocking)
 - [x] P6-T007 Connect IRQ registration and delivery to the notification mechanism.
   - `arch/x86_64/interrupts.rs`: `keyboard_handler` calls `notification::signal_irq(1)`
   - `ipc/notification.rs`: `register_irq(irq, notif_id)` + `NotifRegistry.irq_map`

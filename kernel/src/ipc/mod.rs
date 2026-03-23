@@ -71,15 +71,18 @@ pub use notification::NotifId;
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::scheduler;
 
+    // notify_wait (7) errors return 0; all other IPC errors return u64::MAX.
+    let err_val = if number == 7 { 0 } else { u64::MAX };
+
     let task_id = match scheduler::current_task_id() {
         Some(id) => id,
-        None => return u64::MAX,
+        None => return err_val,
     };
 
     // Look up the capability for arg0 (the primary handle).
     let cap = match scheduler::task_cap(task_id, arg0 as CapHandle) {
         Ok(c) => c,
-        Err(_) => return u64::MAX,
+        Err(_) => return err_val,
     };
 
     match number {
@@ -143,10 +146,10 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
             endpoint::reply_recv(task_id, caller_id, ep_id, reply)
         }
         7 => {
-            // notify_wait(notif_cap_handle)
+            // notify_wait(notif_cap_handle) — errors return 0, not u64::MAX
             match cap {
                 Capability::Notification(notif_id) => notification::wait(task_id, notif_id),
-                _ => u64::MAX,
+                _ => 0,
             }
         }
         8 => {

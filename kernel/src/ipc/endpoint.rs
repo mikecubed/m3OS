@@ -257,16 +257,24 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 
     match matched_receiver {
         Some(receiver) => {
-            scheduler::deliver_message(receiver, msg);
-            // Insert reply cap into the server's table.  If that fails the
-            // server would get the message but have no way to reply, stranding
-            // the caller forever on BlockedOnReply.  Instead return an
-            // immediate error to the caller without blocking.
+            // Insert the reply cap BEFORE delivering the message so the server
+            // always has a reply cap when it sees the request, or never gets
+            // the request at all (consistent failure for the caller).
             if scheduler::insert_cap(receiver, Capability::Reply(caller)).is_err() {
                 log::warn!("[ipc] call: server capability table full, reply cap not inserted");
-                scheduler::wake_task(receiver);
+                // Put the receiver back at the front of the queue so it
+                // remains blocked on the endpoint as if this call never arrived.
+                let mut reg = ENDPOINTS.lock();
+                if let Some(ep) = reg.get_mut(ep_id) {
+                    ep.receivers.push_front(receiver);
+                } else {
+                    // Endpoint was destroyed; wake receiver to avoid leaving it blocked.
+                    drop(reg);
+                    scheduler::wake_task(receiver);
+                }
                 return u64::MAX;
             }
+            scheduler::deliver_message(receiver, msg);
             scheduler::wake_task(receiver);
         }
         None => {
