@@ -199,7 +199,7 @@ fn console_server_task() -> ! {
                 // Handle the write request: data[0]=ptr, data[1]=len.
                 let ptr = msg.data[0] as *const u8;
                 let len = msg.data[1] as usize;
-                if ptr.is_null() || len == 0 || len > 4096 {
+                if ptr.is_null() || len == 0 || len > MAX_CONSOLE_WRITE_LEN {
                     // Bad request — reply with error label.
                     ipc::Message::new(u64::MAX)
                 } else {
@@ -208,7 +208,7 @@ fn console_server_task() -> ! {
                     // ptr is non-null (checked above) and len is in 1..=4096.
                     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
                     if let Ok(text) = core::str::from_utf8(bytes) {
-                        log::info!("[console] {}", text.trim_end_matches('\n'));
+                        log::debug!("[console] {}", text.trim_end_matches('\n'));
                         // P9-T003: mirror output to framebuffer console.
                         // Write text exactly as provided — no extra newline added here;
                         // callers are responsible for including '\n' when desired.
@@ -294,7 +294,7 @@ fn kbd_server_task() -> ! {
                     ipc::notification::wait(my_id, notif_id);
                     // After waking, drain will happen on next iteration.
                 };
-                log::info!("[kbd] scancode={:#04x}", scancode);
+                log::debug!("[kbd] scancode={:#04x}", scancode);
                 let mut r = ipc::Message::new(0);
                 r.data[0] = scancode as u64;
                 r
@@ -319,6 +319,7 @@ fn kbd_server_task() -> ! {
 ///
 /// data[0] = kernel pointer to string bytes, data[1] = byte length (max 4096).
 const CONSOLE_WRITE: u64 = 0;
+const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 
 /// Keyboard server IPC operation label: read one scancode.
 ///
@@ -622,8 +623,15 @@ fn shell_print(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, s: &s
     if s.is_empty() {
         return;
     }
-    let msg = ipc::Message::with2(CONSOLE_WRITE, s.as_ptr() as u64, s.len() as u64);
-    let _ = ipc::endpoint::call_msg(my_id, console_ep, msg);
+    let bytes = s.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let chunk_end = (offset + MAX_CONSOLE_WRITE_LEN).min(bytes.len());
+        let chunk = &bytes[offset..chunk_end];
+        let msg = ipc::Message::with2(CONSOLE_WRITE, chunk.as_ptr() as u64, chunk.len() as u64);
+        let _ = ipc::endpoint::call_msg(my_id, console_ep, msg);
+        offset = chunk_end;
+    }
 }
 
 /// Dispatch a parsed command line to the appropriate built-in.
@@ -767,6 +775,7 @@ fn shell_task() -> ! {
 
     let mut line: Vec<u8> = Vec::new();
     let mut shift = false;
+    let mut kbd_error_logged = false;
 
     shell_print(my_id, console_ep, "> ");
 
@@ -774,6 +783,15 @@ fn shell_task() -> ! {
         // Request one scancode from the keyboard server.
         let kbd_req = ipc::Message::new(KBD_READ);
         let kbd_reply = ipc::endpoint::call_msg(my_id, kbd_ep, kbd_req);
+        if kbd_reply.label == u64::MAX {
+            if !kbd_error_logged {
+                log::warn!("[shell] KBD_READ failed; yielding before retry");
+                kbd_error_logged = true;
+            }
+            task::yield_now();
+            continue;
+        }
+        kbd_error_logged = false;
         let sc = kbd_reply.data[0] as u8;
 
         // Key-release (break) codes: bit 7 set.

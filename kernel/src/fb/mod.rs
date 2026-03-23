@@ -382,8 +382,11 @@ impl FbConsole {
             }
             return;
         }
-        // SAFETY: buf is the static framebuffer; total == byte_len; we copy
-        // non-overlapping regions (source starts one char_h above dest start).
+        // SAFETY: `self.buf` points to the framebuffer with `total` bytes. We
+        // intentionally copy the overlapping range `[buf + row_bytes, buf + total)`
+        // down to `[buf, buf + total - row_bytes)` to scroll the contents up.
+        // `core::ptr::copy` is used because it provides memmove semantics for
+        // overlapping source and destination regions.
         unsafe {
             // Shift buffer up by one text row.
             core::ptr::copy(self.buf.add(row_bytes), self.buf, total - row_bytes);
