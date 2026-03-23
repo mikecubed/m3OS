@@ -286,7 +286,7 @@ fn fat_server_task() -> ! {
     // Insert an endpoint capability at handle 0.
     let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
         .expect("[fat] failed to insert endpoint cap");
-    debug_assert_eq!(ep_handle, 0, "[fat] endpoint cap not at expected handle 0");
+    assert_eq!(ep_handle, 0, "[fat] endpoint cap not at expected handle 0");
 
     log::info!("[fat] ready");
 
@@ -326,7 +326,7 @@ fn vfs_server_task() -> ! {
 
     let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
         .expect("[vfs] failed to insert endpoint cap");
-    debug_assert_eq!(ep_handle, 0, "[vfs] endpoint cap not at expected handle 0");
+    assert_eq!(ep_handle, 0, "[vfs] endpoint cap not at expected handle 0");
 
     // Find the fat_server backend endpoint — it must already be registered
     // (init_task registers "fat" before spawning vfs_server_task).
@@ -386,8 +386,10 @@ fn fs_client_task() -> ! {
         name.len() as u64,
     );
     let open_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_msg);
+    // Check the IPC label first: call_msg() returns label=u64::MAX with zeroed
+    // data on IPC-level failure, which would be silently misread as fd=0.
     let fd = open_reply.data[0];
-    if fd == u64::MAX {
+    if open_reply.label == u64::MAX || fd == u64::MAX {
         log::error!("[fs-client] FILE_OPEN(hello.txt) failed — unexpected");
     } else {
         log::info!("[fs-client] opened {} → fd={}", name, fd);
@@ -401,10 +403,14 @@ fn fs_client_task() -> ! {
         let content_ptr = read_reply.data[0] as *const u8;
         let content_len = read_reply.data[1] as usize;
 
-        if content_ptr.is_null() {
-            // data[0]=0 (null ptr) is the FILE_READ error sentinel.
+        if read_reply.label == u64::MAX || content_ptr.is_null() {
+            // IPC failure (label=u64::MAX) or protocol error (data[0]=null ptr).
             // content_len==0 alone is not an error — it indicates EOF.
-            log::error!("[fs-client] FILE_READ failed (null content ptr) — unexpected");
+            log::error!(
+                "[fs-client] FILE_READ failed (label={:#x}, ptr={:?}) — unexpected",
+                read_reply.label,
+                content_ptr
+            );
         } else if content_len == 0 {
             log::info!("[fs-client] FILE_READ returned 0 bytes (EOF or empty file)");
         } else {
@@ -437,7 +443,9 @@ fn fs_client_task() -> ! {
         missing.len() as u64,
     );
     let missing_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_missing);
-    if missing_reply.data[0] == u64::MAX {
+    // IPC failure (label=u64::MAX) and protocol not-found (data[0]=u64::MAX) are
+    // both acceptable outcomes for a missing-file lookup in the demo.
+    if missing_reply.label == u64::MAX || missing_reply.data[0] == u64::MAX {
         log::info!("[fs-client] FILE_OPEN({}) → not found (expected)", missing);
     } else {
         log::error!("[fs-client] FILE_OPEN missing file returned fd — unexpected");
