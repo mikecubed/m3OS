@@ -38,8 +38,8 @@ Phase 8 defines three label numbers in `kernel/src/fs/protocol.rs`. All use the 
 
 | Label | Operation | Request `data` fields | Reply `data` fields |
 |---|---|---|---|
-| `1` | `FILE_OPEN` | `data[0]`: path pointer (kernel vaddr); `data[1]`: path length in bytes | `data[0]`: fd (`u64`); `0` on success, `u64::MAX` on error |
-| `2` | `FILE_READ` | `data[0]`: fd; `data[1]`: byte offset into file; `data[2]`: max bytes to read | `data[0]`: pointer to content in ramdisk (kernel vaddr); `data[1]`: actual bytes from offset (capped to max and file length); `data[1]=0` on error |
+| `1` | `FILE_OPEN` | `data[0]`: path pointer (kernel vaddr); `data[1]`: path length in bytes | `data[0]`: fd index (`u64`); `u64::MAX` if name not found |
+| `2` | `FILE_READ` | `data[0]`: fd; `data[1]`: byte offset into file; `data[2]`: max bytes to read | `data[0]`: pointer to content in ramdisk (0 = error); `data[1]`: actual bytes from offset (0 = EOF or error; distinguish by `data[0]`) |
 | `3` | `FILE_CLOSE` | `data[0]`: fd | `data[0]`: `0` (always succeeds) |
 
 ### Phase 8 limitations
@@ -109,8 +109,10 @@ The fd returned by `FILE_OPEN` is the index of the matched entry in `FILES` cast
 - `readme.txt` → fd `1`
 - Any name not in the table → `u64::MAX` (error)
 
-Valid fd range is `0..FILES.len()`. `FILE_READ` validates the fd against this range before
-accessing any data; an out-of-range fd returns `u64::MAX`.
+Valid fd range is `0..FILES.len()`. `FILE_READ` validates the fd (and requested offset) against
+this range before accessing any data; an invalid fd or an offset past the end of the file is
+reported as a zero-length read by setting `data[0] = 0` (null pointer) and `data[1] = 0`.
+The `u64::MAX` sentinel is used only by `FILE_OPEN` when name lookup fails.
 
 ### Why no fd table is needed
 
@@ -283,15 +285,17 @@ teaches the layering and naming conventions without introducing crash-consistenc
   `data[0]` is `0` not `u64::MAX`)
 
 A client that copies the `FILE_OPEN` error-check pattern (`data[0] == u64::MAX`) to a
-`FILE_READ` error check would silently treat a successful read as an error if the content
-pointer happens to be non-null.  The current `fs_client_task` correctly gates on
-`data[1] > 0` (len) rather than inspecting the pointer, but the asymmetry is a latent
-trap.
+`FILE_READ` error check will **never detect a read error**: `FILE_READ` failures return
+`data[0] = 0, data[1] = 0`, not `data[0] = u64::MAX`, so such a client will silently
+treat every read error as a successful EOF.  The current `fs_client_task` correctly
+checks `data[0]` (the pointer) for null rather than comparing against `u64::MAX`, but
+the asymmetry is a latent trap for future clients.
 
 Phase 9+ should unify the protocol — the simplest fix is to use `data[0] = 0` (null
-pointer) as the consistent error indicator across all operations, with `data[1] = 0`
-for length-carrying replies.  This will be a natural point to revisit when the protocol
-is redesigned for page-capability grants.
+pointer) as the consistent error indicator across all operations, and reserve
+`data[1] = 0` to mean EOF only when `data[0] != 0` in length-carrying replies.  This
+will be a natural point to revisit when the protocol is redesigned for page-capability
+grants.
 
 ### Name-length limits are not shared
 

@@ -343,10 +343,11 @@ fn vfs_server_task() -> ! {
     let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
 
     loop {
-        // Forward the request to the fat_server backend and collect the full reply.
-        let reply_msg = ipc::endpoint::call_msg(my_id, fat_ep_id, msg);
-
-        // Consume the reply cap from the client's call.
+        // Check for the Reply cap before forwarding to the backend.  A client
+        // using send() rather than call() inserts no Reply cap; forwarding via
+        // call_msg() in that case would block the VFS task waiting for a fat
+        // reply that will be discarded.  Skip the backend call entirely when
+        // no reply cap is present.
         let caller_id = match task::task_cap(my_id, reply_cap_handle) {
             Ok(ipc::Capability::Reply(id)) => id,
             _ => {
@@ -355,8 +356,11 @@ fn vfs_server_task() -> ! {
                 continue;
             }
         };
-        let _ = task::remove_task_cap(my_id, reply_cap_handle);
 
+        // Forward the request to the fat_server backend and collect the full reply.
+        let reply_msg = ipc::endpoint::call_msg(my_id, fat_ep_id, msg);
+
+        let _ = task::remove_task_cap(my_id, reply_cap_handle);
         msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
     }
 }
@@ -398,12 +402,17 @@ fn fs_client_task() -> ! {
         let content_ptr = read_reply.data[0] as *const u8;
         let content_len = read_reply.data[1] as usize;
 
-        if content_len == 0 {
-            log::error!("[fs-client] FILE_READ returned 0 bytes — unexpected");
+        if content_ptr.is_null() {
+            // data[0]=0 (null ptr) is the FILE_READ error sentinel.
+            // content_len==0 alone is not an error — it indicates EOF.
+            log::error!("[fs-client] FILE_READ failed (null content ptr) — unexpected");
+        } else if content_len == 0 {
+            log::info!("[fs-client] FILE_READ returned 0 bytes (EOF or empty file)");
         } else {
             // SAFETY: Phase 8 — fat_server returns a pointer into 'static
             // ramdisk content. The pointer is valid for the lifetime of the
-            // kernel, and content_len is bounded by MAX_READ_LEN (4096).
+            // kernel, content_ptr is non-null (checked above), and
+            // content_len is bounded by MAX_READ_LEN (4096).
             let bytes = unsafe { core::slice::from_raw_parts(content_ptr, content_len) };
             if let Ok(text) = core::str::from_utf8(bytes) {
                 log::info!(
