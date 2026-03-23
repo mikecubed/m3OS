@@ -58,9 +58,8 @@ pub struct EndpointRegistry {
 
 impl EndpointRegistry {
     const fn new() -> Self {
-        // SAFETY: `Option<Endpoint>` is valid at all-zero bytes since `Endpoint`
-        // uses `VecDeque` which is heap-allocated and `None` encodes as zeros.
-        // We use a manual const initializer — `[None; N]` requires Copy.
+        // Manual `[None; N]` expansion: `[expr; N]` requires `Copy`, which
+        // `Option<Endpoint>` does not implement (VecDeque is not Copy).
         EndpointRegistry {
             slots: [
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,

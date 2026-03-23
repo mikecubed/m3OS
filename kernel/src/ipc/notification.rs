@@ -255,6 +255,15 @@ pub fn drain_pending_waiters() {
 ///
 /// Returns the bits that were pending (non-zero on success), or 0 on error.
 pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
+    // Verify the caller is blocking itself, not a foreign task.  Passing a
+    // mismatched TaskId would record the wrong ID in WAITERS while the
+    // actual current task blocks forever on block_current_on_notif().
+    debug_assert_eq!(
+        Some(waiter),
+        scheduler::current_task_id(),
+        "[ipc] notification::wait: waiter TaskId does not match current task"
+    );
+
     let idx = notif_id.0 as usize;
     if idx >= MAX_NOTIFS {
         return 0;

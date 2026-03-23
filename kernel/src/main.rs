@@ -135,10 +135,11 @@ static mut DEMO_NOTIF: ipc::notification::NotifId = ipc::notification::NotifId(0
 // Demo tasks
 // ---------------------------------------------------------------------------
 
-/// Server task: handles two consecutive IPC calls and then exits.
+/// Server task: handles two consecutive IPC calls, then cooperatively yields.
 ///
 /// Uses `recv` for the first message, then `reply_recv` for the second,
-/// demonstrating the standard server loop pattern.
+/// demonstrating the standard server loop pattern.  After sending the
+/// second reply the task loops calling `yield_now()` — it does not exit.
 fn server_task() -> ! {
     // Safety: written once before spawn, read-only from here.
     let ep_id = unsafe { DEMO_EP };
