@@ -37,6 +37,19 @@ const FILES: &[RamdiskFile] = &[
         name: "readme.txt",
         content: include_bytes!("../../initrd/readme.txt"),
     },
+    // Phase 11 userspace test binaries (compiled by `cargo xtask run/image`).
+    RamdiskFile {
+        name: "exit0.elf",
+        content: include_bytes!("../../initrd/exit0.elf"),
+    },
+    RamdiskFile {
+        name: "fork-test.elf",
+        content: include_bytes!("../../initrd/fork-test.elf"),
+    },
+    RamdiskFile {
+        name: "echo-args.elf",
+        content: include_bytes!("../../initrd/echo-args.elf"),
+    },
 ];
 
 // ---------------------------------------------------------------------------

@@ -2,16 +2,21 @@
 members = [
     "kernel",
     "xtask",
+    # Phase 11 userspace test binaries
+    "userspace/syscall-lib",
+    "userspace/exit0",
+    "userspace/fork-test",
+    "userspace/echo-args",
+    # Future userspace servers (Phase 12+):
+    # "userspace/init",
+    # "userspace/console_server",
+    # "userspace/vfs_server",
+    # "userspace/fat_server",
+    # "userspace/kbd_server",
+    # "userspace/shell",
 ]
-# userspace members added as they are created:
-# "userspace/init",
-# "userspace/console_server",
-# "userspace/vfs_server",
-# "userspace/fat_server",
-# "userspace/kbd_server",
-# "userspace/shell",
 
-# Exclude xtask from default build — it's a host tool, not part of the OS image
+# Exclude xtask and userspace from default build — kernel only
 default-members = ["kernel"]
 
 resolver = "2"

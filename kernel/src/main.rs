@@ -159,6 +159,9 @@ fn init_task() -> ! {
     // Spawn Phase 9 shell task.
     task::spawn(shell_task, "shell");
 
+    // Phase 11: spawn userspace process launcher task (P11-T017).
+    task::spawn(p11_launcher_task, "p11-launcher");
+
     log::info!("[init] service set started — yielding");
     loop {
         task::yield_now();
@@ -844,6 +847,129 @@ fn shell_task() -> ! {
 fn idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — userspace launcher (P11-T017 / P11-T018)
+// ---------------------------------------------------------------------------
+
+/// Kernel task that demonstrates Phase 11: load ELF binaries from the
+/// ramdisk, run them as ring-3 processes, and collect their exit codes.
+///
+/// This is the initial integration test that validates the ELF loader,
+/// process table, and core process syscalls end-to-end.
+fn p11_launcher_task() -> ! {
+    log::info!("[p11] launcher started");
+
+    // -----------------------------------------------------------------------
+    // Test 1 (P11-T019): load exit0.elf → expect exit code 0
+    // -----------------------------------------------------------------------
+    run_elf_and_report("exit0.elf");
+
+    // -----------------------------------------------------------------------
+    // Test 2 (P11-T021): load fork-test.elf → parent waits for child(42)
+    // -----------------------------------------------------------------------
+    run_elf_and_report("fork-test.elf");
+
+    log::info!("[p11] launcher done");
+    loop {
+        task::yield_now();
+    }
+}
+
+/// Load an ELF from the ramdisk, register it as a process, schedule it,
+/// then wait for it to exit and log the exit code.
+fn run_elf_and_report(name: &'static str) {
+    use mm::elf::load_elf_into;
+    use process::{spawn_process_with_cr3, CURRENT_PID, PROCESS_TABLE};
+
+    let data = match fs::ramdisk::get_file(name) {
+        Some(d) => d,
+        None => {
+            log::warn!("[p11] ELF not found in ramdisk: {}", name);
+            return;
+        }
+    };
+
+    if data.is_empty() {
+        log::warn!("[p11] ELF file is empty (not yet built?): {}", name);
+        return;
+    }
+
+    log::info!("[p11] loading {}: {} bytes", name, data.len());
+
+    let new_cr3 = match mm::new_process_page_table() {
+        Some(f) => f,
+        None => {
+            log::warn!("[p11] out of frames for {}", name);
+            return;
+        }
+    };
+
+    let phys_off = mm::phys_offset();
+    let loaded = {
+        // SAFETY: new_cr3 was just allocated; exclusive.
+        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
+        match unsafe { load_elf_into(&mut mapper, phys_off, data) } {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("[p11] ELF load failed for {}: {:?}", name, e);
+                return;
+            }
+        }
+    };
+
+    log::info!(
+        "[p11] {} loaded: entry={:#x} stack={:#x}",
+        name,
+        loaded.entry,
+        loaded.stack_top
+    );
+
+    let pid = spawn_process_with_cr3(
+        0,
+        loaded.entry,
+        loaded.stack_top,
+        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+    );
+    log::info!("[p11] {} registered as pid {}", name, pid);
+
+    // Push a fork context so process_trampoline can pick it up.
+    // We use fork_child_trampoline as a generic "enter ring 3" mechanism.
+    process::push_fork_ctx(pid, loaded.entry, loaded.stack_top);
+
+    // Set the process as the "current" process before spawning.
+    CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+
+    // Spawn the kernel task; it will run fork_child_trampoline which
+    // switches CR3 and enters ring 3.
+    task::spawn(process::fork_child_trampoline, "p11-elf");
+
+    // Reset current PID (we're back in the launcher kernel task).
+    CURRENT_PID.store(0, core::sync::atomic::Ordering::Relaxed);
+
+    // Wait for the process to exit.
+    log::info!("[p11] waiting for pid {}...", pid);
+    loop {
+        let done = {
+            let table = PROCESS_TABLE.lock();
+            table
+                .find(pid)
+                .map(|p| p.state == process::ProcessState::Zombie)
+                .unwrap_or(false)
+        };
+        if done {
+            let code = {
+                let mut table = PROCESS_TABLE.lock();
+                let code = table.find(pid).and_then(|p| p.exit_code).unwrap_or(-1);
+                table.reap(pid);
+                code
+            };
+            log::info!("[p11] {} (pid {}) exited with code {}", name, pid, code);
+            break;
+        }
+        task::yield_now();
     }
 }
 

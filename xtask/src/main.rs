@@ -80,6 +80,53 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(path.trim()).parent().unwrap().to_path_buf()
 }
 
+/// Compile Phase 11 userspace test binaries and copy them into kernel/initrd/.
+///
+/// Each binary is compiled for `x86_64-unknown-none` (statically linked,
+/// no libc) and stripped of debug sections so the ELF files stay small.
+/// The ELF files are embedded in the kernel's ramdisk via `include_bytes!`.
+fn build_userspace_bins() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+
+    let bins: &[(&str, &str)] = &[
+        ("exit0", "exit0"),
+        ("fork-test", "fork-test"),
+        ("echo-args", "echo-args"),
+    ];
+
+    for (pkg, bin) in bins {
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args([
+                "build",
+                "--release",
+                "--package",
+                pkg,
+                "--bin",
+                bin,
+                "--target",
+                "x86_64-unknown-none",
+                "-Zbuild-std=core,compiler_builtins",
+                "-Zbuild-std-features=compiler-builtins-mem",
+            ])
+            .status()
+            .unwrap_or_else(|_| panic!("failed to build userspace binary {bin}"));
+
+        if !status.success() {
+            eprintln!("userspace build failed for {bin}");
+            std::process::exit(1);
+        }
+
+        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let dst = initrd.join(format!("{bin}.elf"));
+        fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("failed to copy {bin} to initrd: {e}");
+        });
+        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     let status = Command::new(env!("CARGO"))
@@ -460,6 +507,7 @@ fn signed_path(path: &Path) -> PathBuf {
 }
 
 fn cmd_image(image_args: &ImageArgs) {
+    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -818,6 +866,7 @@ fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<(
 }
 
 fn cmd_run() {
+    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -825,6 +874,7 @@ fn cmd_run() {
 }
 
 fn cmd_run_gui() {
+    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
