@@ -1,5 +1,5 @@
 //! Synchronous rendezvous IPC endpoints.
-// Not yet wired to main.rs — suppress dead-code until integration.
+// `send` is exercised via the syscall dispatcher; keep dead-code allowance for unused paths.
 #![allow(dead_code)]
 //!
 //! An [`Endpoint`] is a kernel object through which two tasks exchange a
@@ -201,12 +201,16 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
 ///
 /// If a receiver is already waiting, deliver directly and wake it.
 /// Otherwise, block until a receiver is ready.
-pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) {
+///
+/// Returns `true` on success (message delivered or enqueued), `false` if the
+/// endpoint ID is invalid.  The syscall dispatcher propagates `false` as
+/// `u64::MAX` to the caller.
+pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
             Some(e) => e,
-            None => return,
+            None => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
             Some(receiver)
@@ -230,6 +234,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) {
             scheduler::block_current_on_send();
         }
     }
+    true
 }
 
 /// Call an endpoint: send a message and block waiting for a reply.

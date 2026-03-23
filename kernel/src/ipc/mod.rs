@@ -62,8 +62,10 @@ pub use notification::NotifId;
 /// is not included in the syscall form (kernel threads use the Rust API directly).
 ///
 /// Error convention (per-syscall):
-/// - Rendezvous syscalls (1–5): return the message label on success, or
-///   `u64::MAX` on error (invalid handle, wrong capability type, table full).
+/// - `ipc_recv` (1), `ipc_call` (3), `ipc_reply_recv` (5): return the message
+///   label on success, or `u64::MAX` on error.
+/// - `ipc_send` (2), `ipc_reply` (4): return `0` on success, or `u64::MAX`
+///   on error (invalid handle, wrong capability type).
 /// - `notify_wait` (7): returns the pending-bit word on success, or `0` on
 ///   error (invalid handle or wrong type).  Note: `0` cannot be a valid
 ///   notification word since `wait` only returns when at least one bit is set.
@@ -98,8 +100,11 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
             match cap {
                 Capability::Endpoint(ep_id) => {
                     let msg = message::Message::with2(arg1, arg2, 0);
-                    endpoint::send(task_id, ep_id, msg);
-                    0
+                    if endpoint::send(task_id, ep_id, msg) {
+                        0
+                    } else {
+                        u64::MAX
+                    }
                 }
                 _ => u64::MAX,
             }

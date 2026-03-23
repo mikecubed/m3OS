@@ -1,5 +1,5 @@
 //! IPC message type.
-// Not yet wired to main.rs — suppress dead-code until integration.
+// Some constructors remain unused; keep dead-code allowance until all paths are exercised.
 #![allow(dead_code)]
 //!
 //! A [`Message`] is the unit of information transferred in a single IPC

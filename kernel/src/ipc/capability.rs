@@ -25,8 +25,8 @@
 //! `sys_cap_grant` (transfer of a capability to another process via IPC) is
 //! deferred to Phase 7+.  Phase 6 focuses on the core IPC path.
 
-// Items here are used by endpoint/notification/syscall code, not yet wired
-// to main.rs — suppress dead-code lints until integration.
+// Capability table is integrated with Task and used by the IPC demo and
+// syscall dispatcher; keep dead-code allowance for unused APIs.
 #![allow(dead_code)]
 
 use super::{EndpointId, NotifId};

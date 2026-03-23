@@ -83,7 +83,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     //
     // The scheduler drives the exchange.  The server logs each call it handles;
     // the client logs each reply it receives.  After the second exchange the
-    // client exits and the system halts via the idle loop.
+    // logical demo is complete; both tasks continue cooperatively yielding
+    // alongside the idle loop.
     // ---------------------------------------------------------------------------
 
     // Create a global IPC endpoint.  The server will recv on it; the client

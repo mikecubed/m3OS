@@ -43,7 +43,8 @@
 //!     scancode = in(0x60)
 //!     ... process key event ...
 //! ```
-// Not yet wired to main.rs — suppress dead-code until integration.
+// Wired: notifications allocated/registered in main.rs; keyboard ISR calls signal_irq(1).
+// Keep dead-code allowance for unused APIs.
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -176,7 +177,7 @@ pub fn signal_irq(irq: u8) {
     }
     // Set the bit for this IRQ line atomically (lock-free).
     if let Some(pending) = PENDING.get(idx as usize) {
-        pending.fetch_or(1 << irq, Ordering::Release);
+        pending.fetch_or(1u64 << (irq as u32), Ordering::Release);
     }
     // Trigger a reschedule so the blocked task runs on the next tick and
     // drains the pending bits from its wait() loop.
