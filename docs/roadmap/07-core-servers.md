@@ -66,3 +66,54 @@ set and a transparent bootstrap flow so the architecture is easier to learn.
 - automatic service restart policies
 - complex capability delegation tooling
 - dynamic driver loading
+
+---
+
+## Implementation Notes
+
+### What was actually built
+
+Phase 7 implements the core server infrastructure as **kernel tasks running in ring 0**, not
+as ring-3 userspace processes. This is a deliberate scope decision:
+
+- `init_task` runs as a kernel thread; it creates endpoints, populates the service registry,
+  and spawns the two server tasks before yielding to the scheduler.
+- `console_server` runs as a kernel thread; it loops on `recv`, writes strings to serial, and
+  replies with an acknowledgement.
+- `kbd_server` runs as a kernel thread; it waits on a keyboard notification object (Phase 6),
+  reads the scancode, and forwards a key event to its registered client.
+- The service registry is a static array of 8 entries with 32-byte names; no heap allocation.
+
+Moving servers to ring-3 processes requires an ELF loader and per-process page table setup,
+which are Phase 8 deliverables. The IPC plumbing, capability model, and service registry
+designed here will work identically when servers are real ring-3 processes.
+
+### Why not wait for ring-3 processes?
+
+The IPC subsystem needs to be exercised end-to-end before the ELF loader is built. Kernel
+tasks are the smallest increment that lets us verify the full message-passing path: endpoint
+creation, registry lookup, `call`/`reply_recv` server loops, and notification-driven IRQ
+delivery. Bugs found here are much cheaper to fix than bugs found after adding process
+isolation.
+
+### Acceptance criteria status
+
+| Criterion | Status | Notes |
+|---|---|---|
+| `init` starts the first service set successfully | Met | `init_task` creates and registers both servers; boot log shows all steps |
+| Clients can discover the console service and send output to it | Met | `lookup("console")` returns a valid `EndpointId`; `call(console_ep, WRITE)` delivers text to serial |
+| Keyboard events flow through `kbd_server` | Met | IRQ1 wakes `kbd_server` via notification; scancodes are forwarded via IPC |
+| Service startup ordering is documented and easy to follow | Met | Boot log emits one `log::info!` line per step; `docs/07-core-servers.md` documents the sequence |
+
+### Not met in Phase 7 (deferred)
+
+- Servers run in ring 0, not ring 3 — no memory isolation between servers and kernel
+- String pointers in IPC payloads are kernel addresses — page grants needed for ring-3
+- No service deregistration or restart policy
+- Registry syscalls 9 and 10 are wired but unused (no ring-3 callers yet)
+
+## Companion Documentation
+
+- [docs/07-core-servers.md](../../docs/07-core-servers.md) — full design explanation: service
+  registry internals, bootstrap sequence, server loop designs, limitations, and comparison with
+  production systems
