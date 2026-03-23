@@ -1,0 +1,2 @@
+Hello from the ostest filesystem!
+This file lives in the kernel ramdisk.

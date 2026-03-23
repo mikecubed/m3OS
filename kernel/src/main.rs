@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod arch;
+mod fs;
 mod ipc;
 mod mm;
 mod process;
@@ -92,21 +93,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 /// init task: creates service endpoints, registers them, spawns servers.
 fn init_task() -> ! {
-    // Create IPC endpoint for the console service.
+    // Phase 7: console service endpoint.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
-
-    // Register in the service registry so clients can look it up by name.
     ipc::registry::register("console", console_ep)
         .expect("[init] failed to register console service");
-
     log::info!("[init] service registry: console={:?}", console_ep);
 
-    // Spawn service tasks and a demo client.
-    // kbd_server_task creates its own notification internally and does not
-    // serve IPC clients in Phase 7 — no endpoint registration needed.
+    // Phase 8: fat_server endpoint — must be registered before vfs_server
+    // spawns because vfs_server calls lookup("fat") during its startup.
+    let fat_ep = ipc::endpoint::ENDPOINTS.lock().create();
+    ipc::registry::register("fat", fat_ep).expect("[init] failed to register fat service");
+    log::info!("[init] service registry: fat={:?}", fat_ep);
+
+    // Phase 8: vfs_server endpoint.
+    let vfs_ep = ipc::endpoint::ENDPOINTS.lock().create();
+    ipc::registry::register("vfs", vfs_ep).expect("[init] failed to register vfs service");
+    log::info!("[init] service registry: vfs={:?}", vfs_ep);
+
+    // Spawn Phase 7 service tasks.
+    // kbd_server_task creates its own notification internally.
     task::spawn(console_server_task, "console");
     task::spawn(kbd_server_task, "kbd");
     task::spawn(console_client_task, "console-client");
+
+    // Spawn Phase 8 storage tasks.
+    task::spawn(fat_server_task, "fat");
+    task::spawn(vfs_server_task, "vfs");
+    task::spawn(fs_client_task, "fs-client");
 
     log::info!("[init] service set started — yielding");
     loop {
@@ -251,6 +264,199 @@ fn console_client_task() -> ! {
     log::info!("[console-client] got ack (label={:#x})", reply_label);
 
     log::info!("[console-client] Phase 7 core-servers demo complete");
+
+    loop {
+        task::yield_now();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 storage tasks
+// ---------------------------------------------------------------------------
+
+/// Ramdisk filesystem server: serves FILE_OPEN / FILE_READ / FILE_CLOSE
+/// requests by delegating to the static embedded ramdisk in `fs::ramdisk`.
+fn fat_server_task() -> ! {
+    let my_id = task::current_task_id().expect("[fat] no task id");
+
+    // Look up this server's endpoint via the service registry.
+    let ep_id = ipc::registry::lookup("fat").expect("[fat] endpoint not in registry");
+    task::set_server_endpoint(my_id, ep_id);
+
+    // Insert an endpoint capability at handle 0.
+    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("[fat] failed to insert endpoint cap");
+    assert_eq!(ep_handle, 0, "[fat] endpoint cap not at expected handle 0");
+
+    log::info!("[fat] ready");
+
+    let reply_cap_handle: ipc::CapHandle = 1;
+    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
+
+    loop {
+        // Delegate to the ramdisk handler (T003, T005: read-only, no mutations).
+        let reply_msg = crate::fs::ramdisk::handle(&msg);
+
+        // Consume the one-shot reply cap inserted by recv_msg.
+        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
+            Ok(ipc::Capability::Reply(id)) => id,
+            _ => {
+                log::warn!("[fat] no reply cap at handle 1; sender used send rather than call");
+                msg = ipc::endpoint::recv_msg(my_id, ep_id);
+                continue;
+            }
+        };
+        let _ = task::remove_task_cap(my_id, reply_cap_handle);
+
+        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
+    }
+}
+
+/// VFS routing server: accepts file requests from clients and forwards them
+/// to the fat_server backend via IPC.
+///
+/// In Phase 8 there is one backend (fat_server). Phase 9+ will consult a
+/// mount table to select the backend for each path prefix.
+fn vfs_server_task() -> ! {
+    let my_id = task::current_task_id().expect("[vfs] no task id");
+
+    // Look up this server's own endpoint.
+    let ep_id = ipc::registry::lookup("vfs").expect("[vfs] endpoint not in registry");
+    task::set_server_endpoint(my_id, ep_id);
+
+    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
+        .expect("[vfs] failed to insert endpoint cap");
+    assert_eq!(ep_handle, 0, "[vfs] endpoint cap not at expected handle 0");
+
+    // Find the fat_server backend endpoint — it must already be registered
+    // (init_task registers "fat" before spawning vfs_server_task).
+    //
+    // NOTE: call_msg() takes EndpointId directly; no capability insert is
+    // needed here.  Inserting a cap would occupy handle 1, which this server
+    // reserves for incoming Reply caps from clients — causing a permanent
+    // block on the first client call.
+    let fat_ep_id = ipc::registry::lookup("fat").expect("[vfs] fat backend not in registry");
+
+    log::info!("[vfs] ready, backend={:?}", fat_ep_id);
+
+    let reply_cap_handle: ipc::CapHandle = 1;
+    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
+
+    loop {
+        // Check for the Reply cap before forwarding to the backend.  A client
+        // using send() rather than call() inserts no Reply cap; forwarding via
+        // call_msg() in that case would block the VFS task waiting for a fat
+        // reply that will be discarded.  Skip the backend call entirely when
+        // no reply cap is present.
+        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
+            Ok(ipc::Capability::Reply(id)) => id,
+            _ => {
+                log::warn!("[vfs] no reply cap at handle 1; sender used send rather than call");
+                msg = ipc::endpoint::recv_msg(my_id, ep_id);
+                continue;
+            }
+        };
+
+        // Forward the request to the fat_server backend and collect the full reply.
+        let reply_msg = ipc::endpoint::call_msg(my_id, fat_ep_id, msg);
+
+        let _ = task::remove_task_cap(my_id, reply_cap_handle);
+        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
+    }
+}
+
+/// Demo client: exercises the full VFS stack — open, read, and close two files
+/// through vfs_server → fat_server → ramdisk.
+///
+/// Validates P8-T006 (open and read a known file), P8-T007 (missing file
+/// returns predictable error), and P8-T008 (ownership boundary is exercised
+/// across two IPC hops).
+fn fs_client_task() -> ! {
+    let my_id = task::current_task_id().expect("[fs-client] no task id");
+
+    // Discover the VFS service endpoint.
+    // call_msg() takes EndpointId directly; no cap insert is needed here.
+    let vfs_ep_id = ipc::registry::lookup("vfs").expect("[fs-client] vfs service not found");
+
+    // --- Open hello.txt (P8-T006) ---
+    let name = "hello.txt";
+    let open_msg = ipc::Message::with2(
+        crate::fs::protocol::FILE_OPEN,
+        name.as_ptr() as u64,
+        name.len() as u64,
+    );
+    let open_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_msg);
+    // Check the IPC label first: call_msg() returns label=u64::MAX with zeroed
+    // data on IPC-level failure, which would be silently misread as fd=0.
+    let fd = open_reply.data[0];
+    if open_reply.label == u64::MAX || fd == u64::MAX {
+        log::error!("[fs-client] FILE_OPEN(hello.txt) failed — unexpected");
+    } else {
+        log::info!("[fs-client] opened {} → fd={}", name, fd);
+
+        // Read up to 256 bytes from offset 0.
+        let read_msg = ipc::Message {
+            label: crate::fs::protocol::FILE_READ,
+            data: [fd, 0, 256, 0],
+        };
+        let read_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, read_msg);
+        let content_ptr = read_reply.data[0] as *const u8;
+        let content_len = read_reply.data[1] as usize;
+
+        if read_reply.label == u64::MAX || content_ptr.is_null() {
+            // IPC failure (label=u64::MAX) or protocol error (data[0]=null ptr).
+            // content_len==0 alone is not an error — it indicates EOF.
+            log::error!(
+                "[fs-client] FILE_READ failed (label={:#x}, ptr={:?}) — unexpected",
+                read_reply.label,
+                content_ptr
+            );
+        } else if content_len == 0 {
+            log::info!("[fs-client] FILE_READ returned 0 bytes (EOF or empty file)");
+        } else {
+            // SAFETY: Phase 8 — fat_server returns a pointer into 'static
+            // ramdisk content. The pointer is valid for the lifetime of the
+            // kernel, content_ptr is non-null (checked above), and
+            // content_len is bounded by MAX_READ_LEN (4096).
+            let bytes = unsafe { core::slice::from_raw_parts(content_ptr, content_len) };
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                log::info!(
+                    "[fs-client] read {} bytes: {:?}",
+                    content_len,
+                    text.trim_end_matches('\n')
+                );
+            } else {
+                log::warn!("[fs-client] content is not valid UTF-8");
+            }
+        }
+
+        // Close the fd (no-op in Phase 8, but exercises the close path).
+        let close_msg = ipc::Message::with1(crate::fs::protocol::FILE_CLOSE, fd);
+        let _ = ipc::endpoint::call_msg(my_id, vfs_ep_id, close_msg);
+    }
+
+    // --- Open a missing file (P8-T007: predictable error) ---
+    let missing = "does-not-exist.txt";
+    let open_missing = ipc::Message::with2(
+        crate::fs::protocol::FILE_OPEN,
+        missing.as_ptr() as u64,
+        missing.len() as u64,
+    );
+    let missing_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_missing);
+    if missing_reply.label == u64::MAX {
+        // IPC-level failure (VFS or fat_server unreachable) — unexpected in a healthy system.
+        log::error!(
+            "[fs-client] FILE_OPEN({}) → IPC failure (unexpected)",
+            missing
+        );
+    } else if missing_reply.data[0] == u64::MAX {
+        // Protocol not-found sentinel — the expected outcome for a missing file.
+        log::info!("[fs-client] FILE_OPEN({}) → not found (expected)", missing);
+    } else {
+        log::error!("[fs-client] FILE_OPEN missing file returned fd — unexpected");
+    }
+
+    log::info!("[fs-client] Phase 8 storage demo complete");
 
     loop {
         task::yield_now();
