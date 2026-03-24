@@ -24,6 +24,8 @@
 //! | 110     | getppid       | —                   |
 //! | 231     | exit_group    | code (alias exit)   |
 
+extern crate alloc;
+
 // Linux errno values (negated for syscall return convention).
 #[allow(dead_code)]
 const NEG_EPERM: u64 = (-1_i64) as u64;
@@ -228,11 +230,20 @@ pub extern "C" fn syscall_handler(
         60 | 231 => sys_exit(arg0 as i32),
         61 => sys_waitpid(arg0, arg1),
         63 => sys_linux_uname(arg0),
+        // Phase 13: filesystem mutation syscalls
+        74 => sys_linux_fsync(arg0),
+        76 => sys_linux_truncate(arg0, arg1),
+        77 => sys_linux_ftruncate(arg0, arg1),
         79 => sys_linux_getcwd(arg0, arg1),
         80 => sys_linux_chdir(arg0),
+        82 => sys_linux_rename(arg0, arg1),
+        83 => sys_linux_mkdir(arg0, arg1),
+        84 => sys_linux_rmdir(arg0),
+        87 => sys_linux_unlink(arg0),
         110 => sys_getppid(),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
+        217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // openat: ignore dirfd, treat as open(path, flags)
         257 => sys_linux_open(arg1, arg2),
@@ -765,15 +776,26 @@ const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 /// Maximum number of open file descriptors (FDs 0–2 are stdin/stdout/stderr).
 const MAX_FDS: usize = 32;
 
+/// Backing store for an open file descriptor.
+#[derive(Clone)]
+enum FdBackend {
+    /// Read-only static ramdisk file (pointer + length into kernel .rodata).
+    Ramdisk {
+        content_addr: usize,
+        content_len: usize,
+    },
+    /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
+    /// relative to tmpfs root — no leading `/tmp/`).
+    Tmpfs { path: alloc::string::String },
+}
+
 /// A single open-file entry in the global FD table.
-///
-/// `content_addr` / `content_len` point into the static ramdisk.
-/// `offset` tracks the current read position.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct FdEntry {
-    content_addr: usize,
-    content_len: usize,
+    backend: FdBackend,
     offset: usize,
+    /// True if the file was opened for writing.
+    writable: bool,
 }
 
 const NONE_FD: Option<FdEntry> = None;
@@ -782,7 +804,7 @@ const NONE_FD: Option<FdEntry> = None;
 ///
 /// FD 0 = stdin (not implemented — reads return EAGAIN).
 /// FD 1 = stdout / FD 2 = stderr (writes go to serial).
-/// FD 3+ = ramdisk files opened via `open()`.
+/// FD 3+ = ramdisk or tmpfs files opened via `open()`.
 static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FDS]> = spin::Mutex::new([NONE_FD; MAX_FDS]);
 
 // ---------------------------------------------------------------------------
@@ -801,35 +823,55 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     let entry = {
         let table = FD_TABLE.lock();
-        match table[fd] {
-            Some(e) => e,
+        match &table[fd] {
+            Some(e) => e.clone(),
             None => return NEG_EBADF,
         }
     };
 
-    let remaining = entry.content_len.saturating_sub(entry.offset);
-    let to_read = (count as usize).min(remaining).min(64 * 1024);
-    if to_read == 0 {
-        return 0; // EOF
+    match &entry.backend {
+        FdBackend::Ramdisk {
+            content_addr,
+            content_len,
+        } => {
+            let remaining = content_len.saturating_sub(entry.offset);
+            let to_read = (count as usize).min(remaining).min(64 * 1024);
+            if to_read == 0 {
+                return 0; // EOF
+            }
+
+            // SAFETY: content_addr is a static ramdisk pointer (lives forever).
+            let src = unsafe {
+                core::slice::from_raw_parts((*content_addr + entry.offset) as *const u8, to_read)
+            };
+
+            if crate::mm::user_mem::copy_to_user(buf_ptr, src).is_err() {
+                return NEG_EFAULT;
+            }
+
+            FD_TABLE.lock()[fd].as_mut().unwrap().offset += to_read;
+            to_read as u64
+        }
+        FdBackend::Tmpfs { path } => {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            let data = match tmpfs.read_file(path, entry.offset, count as usize) {
+                Ok(d) => d,
+                Err(_) => return NEG_EBADF,
+            };
+            let to_read = data.len();
+            if to_read == 0 {
+                return 0; // EOF
+            }
+
+            if crate::mm::user_mem::copy_to_user(buf_ptr, data).is_err() {
+                return NEG_EFAULT;
+            }
+
+            drop(tmpfs);
+            FD_TABLE.lock()[fd].as_mut().unwrap().offset += to_read;
+            to_read as u64
+        }
     }
-
-    // SAFETY: content_addr is a static ramdisk pointer (lives forever).
-    let src = unsafe {
-        core::slice::from_raw_parts((entry.content_addr + entry.offset) as *const u8, to_read)
-    };
-
-    if crate::mm::user_mem::copy_to_user(buf_ptr, src).is_err() {
-        return NEG_EFAULT;
-    }
-
-    // Advance offset.
-    FD_TABLE.lock()[fd] = Some(FdEntry {
-        content_addr: entry.content_addr,
-        content_len: entry.content_len,
-        offset: entry.offset + to_read,
-    });
-
-    to_read as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -837,19 +879,71 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    // Only stdout (1) and stderr (2) are supported.
-    if fd != 1 && fd != 2 {
+    // stdout (1) and stderr (2) go to serial.
+    if fd == 1 || fd == 2 {
+        let len = (count as usize).min(4096);
+        let mut buf = [0u8; 4096];
+        if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+            log::info!("[userspace] {}", s.trim_end_matches('\n'));
+        }
+        return len as u64;
+    }
+
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
         return NEG_EBADF;
     }
-    let len = (count as usize).min(4096);
-    let mut buf = [0u8; 4096];
-    if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
-        return NEG_EFAULT;
+
+    let entry = {
+        let table = FD_TABLE.lock();
+        match &table[fd_idx] {
+            Some(e) => e.clone(),
+            None => return NEG_EBADF,
+        }
+    };
+
+    if !entry.writable {
+        return NEG_EBADF;
     }
-    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-        log::info!("[userspace] {}", s.trim_end_matches('\n'));
+
+    match &entry.backend {
+        FdBackend::Ramdisk { .. } => NEG_EBADF, // ramdisk is read-only
+        FdBackend::Tmpfs { path } => {
+            let len = (count as usize).min(64 * 1024);
+            let mut buf = [0u8; 4096];
+            let mut written = 0usize;
+            let mut offset = entry.offset;
+
+            // Write in 4 KiB chunks to avoid huge stack buffers.
+            while written < len {
+                let chunk = (len - written).min(4096);
+                if crate::mm::user_mem::copy_from_user(&mut buf[..chunk], buf_ptr + written as u64)
+                    .is_err()
+                {
+                    if written == 0 {
+                        return NEG_EFAULT;
+                    }
+                    break;
+                }
+                let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                if tmpfs.write_file(path, offset, &buf[..chunk]).is_err() {
+                    if written == 0 {
+                        return NEG_EBADF;
+                    }
+                    break;
+                }
+                drop(tmpfs);
+                written += chunk;
+                offset += chunk;
+            }
+
+            FD_TABLE.lock()[fd_idx].as_mut().unwrap().offset = offset;
+            written as u64
+        }
     }
-    len as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -887,14 +981,88 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
     core::str::from_utf8(&buf[..len]).ok()
 }
 
-fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
+/// Linux open flags.
+const O_WRONLY: u64 = 0o1;
+const O_RDWR: u64 = 0o2;
+const O_CREAT: u64 = 0o100;
+const O_TRUNC: u64 = 0o1000;
+const O_APPEND: u64 = 0o2000;
+
+/// Check if a path targets the tmpfs mount at `/tmp`.
+///
+/// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
+fn tmpfs_relative_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed == "tmp" {
+        Some("")
+    } else if let Some(rest) = trimmed.strip_prefix("tmp/") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Strip leading "/" since ramdisk files are stored without path prefix.
+    let writable = (flags & O_WRONLY != 0) || (flags & O_RDWR != 0);
+    let create = flags & O_CREAT != 0;
+    let truncate = flags & O_TRUNC != 0;
+    let append = flags & O_APPEND != 0;
+
+    // Check if this is a tmpfs path.
+    if let Some(rel) = tmpfs_relative_path(name) {
+        if rel.is_empty() {
+            // Opening /tmp itself — not a file
+            return NEG_ENOENT;
+        }
+
+        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+
+        // Open or create the file.
+        match tmpfs.open_or_create(rel, create) {
+            Ok(_created) => {}
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EINVAL,
+            Err(_) => return NEG_EINVAL,
+        }
+
+        if truncate {
+            let _ = tmpfs.truncate(rel, 0);
+        }
+
+        let initial_offset = if append {
+            tmpfs.file_size(rel).unwrap_or(0)
+        } else {
+            0
+        };
+
+        drop(tmpfs);
+
+        // Allocate an fd slot.
+        let mut table = FD_TABLE.lock();
+        for i in 3..MAX_FDS {
+            if table[i].is_none() {
+                table[i] = Some(FdEntry {
+                    backend: FdBackend::Tmpfs {
+                        path: alloc::string::String::from(rel),
+                    },
+                    offset: initial_offset,
+                    writable,
+                });
+                log::info!("[open] {} → fd {} (tmpfs)", name, i);
+                return i as u64;
+            }
+        }
+        log::warn!("[open] fd table full");
+        return NEG_EMFILE;
+    }
+
+    // Fall through to ramdisk lookup.
     let file_name = name.trim_start_matches('/');
     let content = match crate::fs::ramdisk::get_file(file_name) {
         Some(c) => c,
@@ -904,14 +1072,16 @@ fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
         }
     };
 
-    // Allocate an fd slot (start at 3 to skip stdin/stdout/stderr).
     let mut table = FD_TABLE.lock();
     for i in 3..MAX_FDS {
         if table[i].is_none() {
             table[i] = Some(FdEntry {
-                content_addr: content.as_ptr() as usize,
-                content_len: content.len(),
+                backend: FdBackend::Ramdisk {
+                    content_addr: content.as_ptr() as usize,
+                    content_len: content.len(),
+                },
                 offset: 0,
+                writable: false,
             });
             log::info!("[open] {} → fd {}", name, i);
             return i as u64;
@@ -959,9 +1129,16 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             if fd >= MAX_FDS {
                 return NEG_EBADF;
             }
-            match FD_TABLE.lock()[fd] {
-                Some(e) => e.content_len as u64,
+            let entry = match &FD_TABLE.lock()[fd] {
+                Some(e) => e.clone(),
                 None => return NEG_EBADF,
+            };
+            match &entry.backend {
+                FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
+                FdBackend::Tmpfs { path } => {
+                    let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                    tmpfs.file_size(path).unwrap_or(0) as u64
+                }
             }
         }
     };
@@ -1003,6 +1180,14 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
 
+    let file_len = match &entry.backend {
+        FdBackend::Ramdisk { content_len, .. } => *content_len,
+        FdBackend::Tmpfs { path } => {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            tmpfs.file_size(path).unwrap_or(0)
+        }
+    };
+
     let offset = offset as i64;
 
     let new_offset: i64 = match whence {
@@ -1011,14 +1196,14 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
             Some(v) => v,
             None => return NEG_EINVAL,
         },
-        SEEK_END => match (entry.content_len as i64).checked_add(offset) {
+        SEEK_END => match (file_len as i64).checked_add(offset) {
             Some(v) => v,
             None => return NEG_EINVAL,
         },
         _ => return NEG_EINVAL,
     };
 
-    if new_offset < 0 || new_offset as usize > entry.content_len {
+    if new_offset < 0 || new_offset as usize > file_len {
         return NEG_EINVAL;
     }
 
@@ -1417,6 +1602,32 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Check tmpfs first.
+    if let Some(rel) = tmpfs_relative_path(name) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        let st = match tmpfs.stat(rel) {
+            Ok(s) => s,
+            Err(_) => return NEG_ENOENT,
+        };
+        let mode: u32 = if st.is_dir {
+            0x4000 | 0o755 // S_IFDIR
+        } else {
+            0x8000 | 0o644 // S_IFREG
+        };
+        let mut stat = [0u8; 144];
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        let size = st.size as u64;
+        stat[48..56].copy_from_slice(&size.to_ne_bytes());
+        let blksize: u64 = 4096;
+        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        drop(tmpfs);
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let file_name = name.trim_start_matches('/');
     let size = match crate::fs::ramdisk::get_file(file_name) {
         Some(c) => c.len() as u64,
@@ -1434,6 +1645,222 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         return NEG_EFAULT;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: mkdir(pathname) — syscall 83
+// ---------------------------------------------------------------------------
+
+fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let rel = match tmpfs_relative_path(name) {
+        Some(r) => r,
+        None => return NEG_EPERM, // can only mkdir in tmpfs
+    };
+    if rel.is_empty() {
+        return NEG_EINVAL; // can't mkdir /tmp itself
+    }
+
+    let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+    match tmpfs.mkdir(rel) {
+        Ok(()) => {
+            log::info!("[mkdir] {}", name);
+            0
+        }
+        Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => {
+            const NEG_EEXIST: u64 = (-17_i64) as u64;
+            NEG_EEXIST
+        }
+        Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: rmdir(pathname) — syscall 84
+// ---------------------------------------------------------------------------
+
+fn sys_linux_rmdir(path_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let rel = match tmpfs_relative_path(name) {
+        Some(r) => r,
+        None => return NEG_EPERM,
+    };
+    if rel.is_empty() {
+        return NEG_EINVAL; // can't rmdir /tmp itself
+    }
+
+    let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+    match tmpfs.rmdir(rel) {
+        Ok(()) => {
+            log::info!("[rmdir] {}", name);
+            0
+        }
+        Err(crate::fs::tmpfs::TmpfsError::NotEmpty) => {
+            const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
+            NEG_ENOTEMPTY
+        }
+        Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: unlink(pathname) — syscall 87
+// ---------------------------------------------------------------------------
+
+fn sys_linux_unlink(path_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let rel = match tmpfs_relative_path(name) {
+        Some(r) => r,
+        None => return NEG_EPERM,
+    };
+    if rel.is_empty() {
+        return NEG_EINVAL;
+    }
+
+    let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+    match tmpfs.unlink(rel) {
+        Ok(()) => {
+            log::info!("[unlink] {}", name);
+            0
+        }
+        Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: rename(oldpath, newpath) — syscall 82
+// ---------------------------------------------------------------------------
+
+fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
+    let mut buf1 = [0u8; 512];
+    let old_name = match read_user_cstr(old_ptr, &mut buf1) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+    // Copy old_name to owned string since we need buf for new_name too.
+    let mut old_owned = [0u8; 512];
+    let old_len = old_name.len();
+    old_owned[..old_len].copy_from_slice(old_name.as_bytes());
+
+    let mut buf2 = [0u8; 512];
+    let new_name = match read_user_cstr(new_ptr, &mut buf2) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let old_str = core::str::from_utf8(&old_owned[..old_len]).unwrap();
+    let old_rel = match tmpfs_relative_path(old_str) {
+        Some(r) => r,
+        None => return NEG_EPERM,
+    };
+    let new_rel = match tmpfs_relative_path(new_name) {
+        Some(r) => r,
+        None => return NEG_EPERM,
+    };
+
+    let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+    match tmpfs.rename(old_rel, new_rel) {
+        Ok(()) => {
+            log::info!("[rename] {} → {}", old_str, new_name);
+            0
+        }
+        Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: truncate(path, length) — syscall 76
+// ---------------------------------------------------------------------------
+
+fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let rel = match tmpfs_relative_path(name) {
+        Some(r) => r,
+        None => return NEG_EPERM,
+    };
+
+    let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+    match tmpfs.truncate(rel, length as usize) {
+        Ok(()) => 0,
+        Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: ftruncate(fd, length) — syscall 77
+// ---------------------------------------------------------------------------
+
+fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if !(3..MAX_FDS).contains(&fd_idx) {
+        return NEG_EBADF;
+    }
+
+    let entry = {
+        let table = FD_TABLE.lock();
+        match &table[fd_idx] {
+            Some(e) => e.clone(),
+            None => return NEG_EBADF,
+        }
+    };
+
+    if !entry.writable {
+        return NEG_EBADF;
+    }
+
+    match &entry.backend {
+        FdBackend::Ramdisk { .. } => NEG_EPERM,
+        FdBackend::Tmpfs { path } => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.truncate(path, length as usize) {
+                Ok(()) => 0,
+                Err(_) => NEG_EINVAL,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: fsync(fd) — syscall 74 (no-op for tmpfs)
+// ---------------------------------------------------------------------------
+
+fn sys_linux_fsync(_fd: u64) -> u64 {
+    0 // no-op: tmpfs has no persistence
+}
+
+// ---------------------------------------------------------------------------
+// Phase 13: getdents64(fd, buf, count) — syscall 217
+// ---------------------------------------------------------------------------
+
+fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+    // For now, only support listing tmpfs directories via a special fd.
+    // This is a minimal stub that programs can use.
+    let _ = (fd, buf_ptr, count);
+    NEG_ENOSYS
 }
 
 // ---------------------------------------------------------------------------
