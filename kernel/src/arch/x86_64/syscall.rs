@@ -1011,8 +1011,6 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
 }
 
 /// Linux open flags.
-const O_WRONLY: u64 = 0o1;
-const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
@@ -1038,8 +1036,13 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    let writable = (flags & O_WRONLY != 0) || (flags & O_RDWR != 0);
-    let readable = flags & O_WRONLY == 0; // O_RDONLY(0) or O_RDWR(2) → readable
+    // Decode POSIX access mode (O_ACCMODE = 0o3).
+    let (readable, writable) = match flags & 0o3 {
+        0 => (true, false),     // O_RDONLY
+        1 => (false, true),     // O_WRONLY
+        2 => (true, true),      // O_RDWR
+        _ => return NEG_EINVAL, // invalid combination
+    };
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
@@ -1058,11 +1061,14 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         match tmpfs.open_or_create(rel, create) {
             Ok(_created) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
-            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EINVAL,
+            Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
+                const NEG_EISDIR: u64 = (-21_i64) as u64;
+                return NEG_EISDIR;
+            }
             Err(_) => return NEG_EINVAL,
         }
 
-        if truncate {
+        if truncate && writable {
             let _ = tmpfs.truncate(rel, 0);
         }
 

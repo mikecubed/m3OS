@@ -121,7 +121,9 @@ impl Tmpfs {
     }
 
     /// Navigate to the parent directory of `path` and return it along with
-    /// the final component name.  Returns `None` if path is empty or root.
+    /// the final component name.  Returns `Err(InvalidPath)` if path is
+    /// empty or root, `Err(NotFound)` if an intermediate component is
+    /// missing, or `Err(NotADirectory)` if a component is a file.
     fn parent_and_name<'a, 'b>(
         &'a mut self,
         path: &'b str,
