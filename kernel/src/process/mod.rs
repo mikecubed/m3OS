@@ -125,6 +125,49 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
 }
 
 // ---------------------------------------------------------------------------
+// Signal constants (Phase 14)
+// ---------------------------------------------------------------------------
+
+/// Signal numbers (Linux x86_64).
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGKILL: u32 = 9;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+
+/// What to do when a signal is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAction {
+    /// Perform the default action for this signal.
+    Default,
+    /// Ignore the signal.
+    Ignore,
+}
+
+/// Default action table: terminate or ignore.
+pub fn default_signal_action(sig: u32) -> SignalDisposition {
+    match sig {
+        SIGCHLD => SignalDisposition::Ignore,
+        SIGCONT => SignalDisposition::Continue,
+        SIGSTOP | SIGTSTP => SignalDisposition::Stop,
+        SIGKILL | SIGINT | SIGTERM | SIGHUP => SignalDisposition::Terminate,
+        _ => SignalDisposition::Terminate,
+    }
+}
+
+/// The kernel's resolved action when delivering a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalDisposition {
+    Terminate,
+    Stop,
+    Continue,
+    Ignore,
+}
+
+// ---------------------------------------------------------------------------
 // Process state
 // ---------------------------------------------------------------------------
 
@@ -137,6 +180,8 @@ pub enum ProcessState {
     Running,
     /// Blocked waiting for a resource (I/O, IPC, …).
     Blocked,
+    /// Stopped by a signal (SIGSTOP/SIGTSTP).
+    Stopped,
     /// Exited but not yet reaped by its parent.
     Zombie,
 }
@@ -182,6 +227,10 @@ pub struct Process {
     ///
     /// FDs 0/1/2 are stdin/stdout/stderr.  `fork()` deep-clones this table.
     pub fd_table: [Option<FdEntry>; MAX_FDS],
+    /// Bitfield of pending signals (bit N = signal N is pending).
+    pub pending_signals: u64,
+    /// Per-signal action table (Default or Ignore).
+    pub signal_actions: [SignalAction; 32],
 }
 
 impl Process {
@@ -204,6 +253,8 @@ impl Process {
             brk_current: 0,
             mmap_next: 0,
             fd_table: new_fd_table(),
+            pending_signals: 0,
+            signal_actions: [SignalAction::Default; 32],
         }
     }
 }
@@ -311,6 +362,8 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         brk_current: 0,
         mmap_next: 0,
         fd_table: new_fd_table(),
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -344,6 +397,8 @@ pub fn spawn_process_with_cr3(
         brk_current,
         mmap_next,
         fd_table: new_fd_table(),
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -376,9 +431,96 @@ pub fn spawn_process_with_cr3_and_fds(
         brk_current,
         mmap_next,
         fd_table,
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
+}
+
+// ---------------------------------------------------------------------------
+// Signal helpers (Phase 14)
+// ---------------------------------------------------------------------------
+
+/// Send a signal to a process by PID. Sets the pending bit.
+///
+/// SIGCONT is special: it also resumes a stopped process.
+/// SIGKILL and SIGSTOP cannot be caught or ignored.
+pub fn send_signal(pid: Pid, sig: u32) -> bool {
+    if sig == 0 || sig > 63 {
+        return false;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if sig == SIGCONT {
+        // SIGCONT resumes a stopped process.
+        if proc.state == ProcessState::Stopped {
+            proc.state = ProcessState::Ready;
+            log::info!("[signal] SIGCONT → pid {} (resumed)", pid);
+        }
+        // Clear any pending SIGSTOP/SIGTSTP.
+        proc.pending_signals &= !(1u64 << SIGSTOP) & !(1u64 << SIGTSTP);
+        return true;
+    }
+
+    proc.pending_signals |= 1u64 << sig;
+    true
+}
+
+/// Check and deliver pending signals for a process.
+///
+/// Called on the return-to-userspace path. Returns the action to take.
+/// Clears the delivered signal's pending bit.
+pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.find_mut(pid)?;
+
+    if proc.pending_signals == 0 {
+        return None;
+    }
+
+    // Find the lowest-numbered pending signal.
+    let sig = proc.pending_signals.trailing_zeros();
+    if sig >= 64 {
+        return None;
+    }
+    proc.pending_signals &= !(1u64 << sig);
+
+    // Determine disposition.
+    let action = if sig < 32 {
+        proc.signal_actions[sig as usize]
+    } else {
+        SignalAction::Default
+    };
+
+    let disposition = match action {
+        SignalAction::Ignore => {
+            // SIGKILL and SIGSTOP cannot be ignored.
+            if sig == SIGKILL || sig == SIGSTOP {
+                default_signal_action(sig)
+            } else {
+                SignalDisposition::Ignore
+            }
+        }
+        SignalAction::Default => default_signal_action(sig),
+    };
+
+    Some((sig, disposition))
+}
+
+/// Deliver SIGCHLD to the parent of the given child PID.
+pub fn send_sigchld_to_parent(child_pid: Pid) {
+    let ppid = {
+        let table = PROCESS_TABLE.lock();
+        table.find(child_pid).map(|p| p.ppid).unwrap_or(0)
+    };
+    if ppid != 0 {
+        send_signal(ppid, SIGCHLD);
+    }
 }
 
 // ---------------------------------------------------------------------------

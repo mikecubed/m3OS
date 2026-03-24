@@ -206,7 +206,14 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
+    // Divergent syscalls (exit) never return — handle them first.
     match number {
+        6 => sys_exit_legacy(arg0),
+        60 | 231 => sys_exit(arg0 as i32),
+        _ => {}
+    }
+
+    let result = match number {
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
         1 => sys_linux_write(arg0, arg1, arg2),
@@ -218,21 +225,22 @@ pub extern "C" fn syscall_handler(
         9 => sys_linux_mmap(arg0, arg1),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
+        // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
+        13 => sys_rt_sigaction(arg0, arg1, arg2),
+        14 => sys_rt_sigprocmask(),
         // Linux misc (Phase 12, T023–T026)
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
         20 => sys_linux_writev(arg0, arg1, arg2),
         // IPC syscalls (Phase 6) — kernel-task only.
-        // Numbers 5,8,9 are now Linux fstat/lseek/mmap; only 4,7,10 remain.
         4 | 7 | 10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
-        // Legacy exit (HELLO_BIN compat)
-        6 => sys_exit_legacy(arg0),
-        // Phase 11 + Linux-compatible process syscalls (T021–T022)
+        // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
-        60 | 231 => sys_exit(arg0 as i32),
         61 => sys_waitpid(arg0, arg1),
+        // Phase 14: signal syscalls
+        62 => sys_kill(arg0, arg1),
         63 => sys_linux_uname(arg0),
         // Phase 13: filesystem mutation syscalls
         74 => sys_linux_fsync(arg0),
@@ -256,6 +264,68 @@ pub extern "C" fn syscall_handler(
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
         _ => NEG_ENOSYS,
+    };
+
+    // Phase 14 (P14-T031): check pending signals before returning to userspace.
+    check_pending_signals();
+
+    result
+}
+
+/// Check and deliver pending signals for the current process.
+///
+/// Called after every syscall (except exit/execve which diverge).
+/// For now, only default actions are supported:
+///   - Terminate: kill the process
+///   - Stop: mark as Stopped and yield
+///   - Continue: already handled in send_signal
+///   - Ignore: do nothing
+fn check_pending_signals() {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid == 0 {
+        return; // kernel task, no signals
+    }
+
+    loop {
+        let sig = crate::process::dequeue_signal(pid);
+        match sig {
+            None => break,
+            Some((signum, disposition)) => {
+                use crate::process::SignalDisposition;
+                match disposition {
+                    SignalDisposition::Terminate => {
+                        log::info!("[p{}] killed by signal {}", pid, signum);
+                        // Use negative exit code to indicate signal death.
+                        sys_exit(-(signum as i32));
+                    }
+                    SignalDisposition::Stop => {
+                        log::info!("[p{}] stopped by signal {}", pid, signum);
+                        {
+                            let mut table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(proc) = table.find_mut(pid) {
+                                proc.state = crate::process::ProcessState::Stopped;
+                            }
+                        }
+                        crate::process::send_sigchld_to_parent(pid);
+                        // Yield until SIGCONT resumes us.
+                        while {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            table
+                                .find(pid)
+                                .map(|p| p.state == crate::process::ProcessState::Stopped)
+                                .unwrap_or(false)
+                        } {
+                            crate::task::yield_now();
+                            crate::process::CURRENT_PID
+                                .store(pid, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    SignalDisposition::Continue | SignalDisposition::Ignore => {
+                        // Nothing to do.
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -319,17 +389,128 @@ fn sys_exit(code: i32) -> ! {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] exit({})", pid, code);
     if pid != 0 {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.state = crate::process::ProcessState::Zombie;
-            proc.exit_code = Some(code);
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.state = crate::process::ProcessState::Zombie;
+                proc.exit_code = Some(code);
+            }
         }
+        // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
+        crate::process::send_sigchld_to_parent(pid);
     }
     // Restore kernel page table before yielding so the next scheduled task
     // does not inherit this process's CR3.
     crate::mm::restore_kernel_cr3();
     // Mark the kernel task as dead so the scheduler reclaims it.
     crate::task::mark_current_dead();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: Signal syscalls (P14-T029, T030, T033)
+// ---------------------------------------------------------------------------
+
+/// `kill(pid, sig)` — send a signal to a process (syscall 62).
+fn sys_kill(pid: u64, sig: u64) -> u64 {
+    let sig = sig as u32;
+    let target_pid = pid as i64;
+
+    if sig > 63 {
+        return NEG_EINVAL;
+    }
+
+    // sig=0: permission check only, no signal sent.
+    if sig == 0 {
+        let table = crate::process::PROCESS_TABLE.lock();
+        return if table.find(pid as crate::process::Pid).is_some() {
+            0
+        } else {
+            NEG_EINVAL
+        };
+    }
+
+    if target_pid > 0 {
+        // Send to a specific process.
+        if crate::process::send_signal(target_pid as crate::process::Pid, sig) {
+            0
+        } else {
+            NEG_EINVAL
+        }
+    } else if target_pid < -1 {
+        // Send to process group |pid| (Phase 14, Track G will expand this).
+        let pgid = (-target_pid) as crate::process::Pid;
+        let pids: alloc::vec::Vec<crate::process::Pid> = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table
+                .iter()
+                .filter(|p| p.pid == pgid)
+                .map(|p| p.pid)
+                .collect()
+        };
+        for p in pids {
+            crate::process::send_signal(p, sig);
+        }
+        0
+    } else {
+        // pid=0 or pid=-1: not fully implemented yet.
+        NEG_EINVAL
+    }
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
+///
+/// We only support Default and Ignore (no user signal handlers yet).
+fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
+    let sig = sig as u32;
+    if sig == 0 || sig >= 32 {
+        return NEG_EINVAL;
+    }
+    // SIGKILL and SIGSTOP cannot be caught or ignored.
+    if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
+        return NEG_EINVAL;
+    }
+
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write old action if requested.
+    // struct sigaction: sa_handler (8 bytes) + sa_flags (8 bytes) + sa_restorer (8 bytes) + sa_mask (8 bytes) = 32 bytes min
+    if oldact_ptr != 0 {
+        let mut old_sa = [0u8; 32];
+        let handler: u64 = match proc.signal_actions[sig as usize] {
+            crate::process::SignalAction::Default => 0, // SIG_DFL
+            crate::process::SignalAction::Ignore => 1,  // SIG_IGN
+        };
+        old_sa[0..8].copy_from_slice(&handler.to_ne_bytes());
+        let _ = crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa);
+    }
+
+    // Read new action if provided.
+    if act_ptr != 0 {
+        let mut sa = [0u8; 32];
+        if crate::mm::user_mem::copy_from_user(&mut sa, act_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let handler = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
+        proc.signal_actions[sig as usize] = match handler {
+            0 => crate::process::SignalAction::Default, // SIG_DFL
+            1 => crate::process::SignalAction::Ignore,  // SIG_IGN
+            _ => crate::process::SignalAction::Default, // user handlers → treat as default for now
+        };
+    }
+
+    0
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — stub (syscall 14).
+///
+/// Signal masking is not implemented; always returns success.
+fn sys_rt_sigprocmask() -> u64 {
+    0
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
