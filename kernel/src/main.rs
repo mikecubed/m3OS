@@ -898,6 +898,13 @@ fn p11_launcher_task() -> ! {
     run_elf_and_report("hello.elf");
     log::info!("[p12] T030: hello.elf launch complete");
 
+    // -----------------------------------------------------------------------
+    // Phase 13: tmpfs validation — exercises writable filesystem syscalls
+    // -----------------------------------------------------------------------
+    log::info!("[p13] running tmpfs-test.elf (writable filesystem validation)");
+    run_elf_and_report("tmpfs-test.elf");
+    log::info!("[p13] tmpfs-test.elf launch complete");
+
     loop {
         task::yield_now();
     }

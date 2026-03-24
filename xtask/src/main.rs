@@ -144,7 +144,10 @@ fn build_musl_bins() {
     });
 
     // (source path relative to workspace root, output name)
-    let bins: &[(&str, &str)] = &[("userspace/hello-c/hello.c", "hello")];
+    let bins: &[(&str, &str)] = &[
+        ("userspace/hello-c/hello.c", "hello"),
+        ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
+    ];
 
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
