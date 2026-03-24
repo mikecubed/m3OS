@@ -55,6 +55,11 @@ const FILES: &[RamdiskFile] = &[
         name: "hello.elf",
         content: include_bytes!("../../initrd/hello.elf"),
     },
+    // Phase 13 tmpfs test binary (compiled by `cargo xtask run/image/check`).
+    RamdiskFile {
+        name: "tmpfs-test.elf",
+        content: include_bytes!("../../initrd/tmpfs-test.elf"),
+    },
 ];
 
 // ---------------------------------------------------------------------------
