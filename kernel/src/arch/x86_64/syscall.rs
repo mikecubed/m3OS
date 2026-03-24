@@ -164,14 +164,15 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
         USER_CODE_BASE, USER_CODE_PAGES, USER_STACK_PAGES, USER_STACK_TOP,
     };
 
-    const ELF_STACK_PAGES: u64 = 8;
+    // Reference the loader's constant so stack sizing stays in sync.
+    let elf_stack_pages = crate::mm::elf::STACK_PAGES;
 
     if len > 4096 {
         return u64::MAX;
     }
     let code_end = USER_CODE_BASE + USER_CODE_PAGES * 4096;
     let stack_start = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let elf_stack_start = ELF_STACK_TOP - ELF_STACK_PAGES * 4096;
+    let elf_stack_start = ELF_STACK_TOP - elf_stack_pages * 4096;
     let ptr_end = ptr.saturating_add(len);
 
     let in_code = ptr >= USER_CODE_BASE && ptr_end <= code_end;

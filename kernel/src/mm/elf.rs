@@ -39,7 +39,11 @@ const PF_W: u32 = 0x2; // Write
 /// Virtual address of the top of the user stack (just below 128 TiB).
 pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 /// Number of pages to allocate for the user stack (32 KiB).
-const STACK_PAGES: u64 = 8;
+pub const STACK_PAGES: u64 = 8;
+/// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
+const USER_VADDR_MIN: u64 = 0x0040_0000;
+/// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).
+const USER_VADDR_MAX: u64 = 0x0000_8000_0000_0000;
 
 // ---------------------------------------------------------------------------
 // Ehdr offsets (byte-level access to avoid repr(C) padding concerns)
@@ -239,8 +243,19 @@ unsafe fn map_load_segment(
         .checked_add(phdr.p_memsz)
         .ok_or(ElfError::MappingFailed("segment vaddr overflow"))?;
 
+    // Reject segments outside the canonical userspace range — prevents
+    // a malicious ELF from creating USER_ACCESSIBLE mappings in the
+    // kernel upper half or at the null page.
+    if vaddr_start < USER_VADDR_MIN || vaddr_end > USER_VADDR_MAX {
+        return Err(ElfError::MappingFailed("segment vaddr outside user range"));
+    }
+
     let page_start = vaddr_start & !0xFFF;
-    let page_end = (vaddr_end + 0xFFF) & !0xFFF;
+    // Use checked_add to guard against overflow when vaddr_end is near u64::MAX.
+    let page_end = vaddr_end
+        .checked_add(0xFFF)
+        .ok_or(ElfError::MappingFailed("page_end overflow"))?
+        & !0xFFF;
     let num_pages = (page_end - page_start) / 4096;
 
     let flags = segment_flags(phdr.p_flags);

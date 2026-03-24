@@ -37,13 +37,11 @@ pub extern "C" fn _start() -> ! {
         if arg_ptr.is_null() {
             break;
         }
-        // Find null terminator.
+        // Find null terminator; cap at 4096 bytes to avoid faulting on
+        // unterminated strings. Bound is checked BEFORE reading.
         let mut len = 0usize;
-        while unsafe { arg_ptr.add(len).read() } != 0 {
+        while len < 4096 && unsafe { arg_ptr.add(len).read() } != 0 {
             len += 1;
-            if len > 4096 {
-                break;
-            }
         }
         serial_print("echo-args: argv[");
         print_usize(i);
