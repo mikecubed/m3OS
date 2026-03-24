@@ -1175,6 +1175,10 @@ fn sys_linux_brk(addr: u64) -> u64 {
         Some(v) => v & !0xFFF,
         None => return NEG_EINVAL,
     };
+    // Reject non-canonical / kernel-range addresses.
+    if new_brk > 0x0000_7FFF_FFFF_FFFF {
+        return NEG_EINVAL;
+    }
     let pages_needed = (new_brk - current) / 4096;
 
     use x86_64::{
@@ -1263,6 +1267,10 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             break;
         }
         total += written;
+        // Short write: fewer bytes than requested means we should stop.
+        if written < len {
+            break;
+        }
     }
     total
 }
@@ -1307,6 +1315,10 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             break; // EOF
         }
         total += n;
+        // Short read: fewer bytes than requested means EOF / no more data.
+        if n < len {
+            break;
+        }
     }
     total
 }

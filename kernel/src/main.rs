@@ -896,7 +896,7 @@ fn p11_launcher_task() -> ! {
     // -----------------------------------------------------------------------
     log::info!("[p12] T030: running hello.elf (musl-compiled C binary)");
     run_elf_and_report("hello.elf");
-    log::info!("[p12] T030: hello.elf completed");
+    log::info!("[p12] T030: hello.elf launch complete");
 
     loop {
         task::yield_now();
