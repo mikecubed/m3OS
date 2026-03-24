@@ -1065,6 +1065,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                 const NEG_EISDIR: u64 = (-21_i64) as u64;
                 return NEG_EISDIR;
             }
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
+                const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+                return NEG_ENOTDIR;
+            }
             Err(_) => return NEG_EINVAL,
         }
 
@@ -1833,6 +1837,12 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
+    // Linux truncate() takes a signed off_t.
+    let length_i64 = length as i64;
+    if length_i64 < 0 {
+        return NEG_EINVAL;
+    }
+
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -1843,12 +1853,20 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
         Some(r) => r,
         None => return NEG_EROFS,
     };
+    if rel.is_empty() {
+        const NEG_EISDIR: u64 = (-21_i64) as u64;
+        return NEG_EISDIR;
+    }
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-    match tmpfs.truncate(rel, length as usize) {
+    match tmpfs.truncate(rel, length_i64 as usize) {
         Ok(()) => 0,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
         Err(crate::fs::tmpfs::TmpfsError::NoSpace) => NEG_ENOSPC,
+        Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
+            const NEG_EISDIR: u64 = (-21_i64) as u64;
+            NEG_EISDIR
+        }
         Err(_) => NEG_EINVAL,
     }
 }
@@ -1858,6 +1876,12 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
+    // Linux ftruncate() takes a signed off_t.
+    let length_i64 = length as i64;
+    if length_i64 < 0 {
+        return NEG_EINVAL;
+    }
+
     let fd_idx = fd as usize;
     if !(3..MAX_FDS).contains(&fd_idx) {
         return NEG_EBADF;
@@ -1879,7 +1903,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-            match tmpfs.truncate(path, length as usize) {
+            match tmpfs.truncate(path, length_i64 as usize) {
                 Ok(()) => 0,
                 Err(crate::fs::tmpfs::TmpfsError::NoSpace) => NEG_ENOSPC,
                 Err(_) => NEG_EINVAL,
