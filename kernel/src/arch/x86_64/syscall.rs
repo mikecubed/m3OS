@@ -1823,6 +1823,7 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
     match tmpfs.truncate(rel, length as usize) {
         Ok(()) => 0,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(crate::fs::tmpfs::TmpfsError::NoSpace) => NEG_ENOSPC,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -1855,6 +1856,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.truncate(path, length as usize) {
                 Ok(()) => 0,
+                Err(crate::fs::tmpfs::TmpfsError::NoSpace) => NEG_ENOSPC,
                 Err(_) => NEG_EINVAL,
             }
         }
@@ -1882,8 +1884,8 @@ fn sys_linux_fsync(fd: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    // For now, only support listing tmpfs directories via a special fd.
-    // This is a minimal stub that programs can use.
+    // Not implemented — returns ENOSYS so callers know to fall back.
+    // Directory listing via getdents64 is deferred to a future phase.
     let _ = (fd, buf_ptr, count);
     NEG_ENOSYS
 }
