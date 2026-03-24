@@ -859,7 +859,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return NEG_EFAULT;
             }
 
-            FD_TABLE.lock()[fd].as_mut().unwrap().offset += to_read;
+            if let Some(e) = &mut FD_TABLE.lock()[fd] {
+                e.offset += to_read;
+            }
             to_read as u64
         }
         FdBackend::Tmpfs { path } => {
@@ -880,7 +882,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
 
             drop(tmpfs);
-            FD_TABLE.lock()[fd].as_mut().unwrap().offset += to_read;
+            if let Some(e) = &mut FD_TABLE.lock()[fd] {
+                e.offset += to_read;
+            }
             to_read as u64
         }
     }
@@ -956,7 +960,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 offset += chunk;
             }
 
-            FD_TABLE.lock()[fd_idx].as_mut().unwrap().offset = offset;
+            if let Some(e) = &mut FD_TABLE.lock()[fd_idx] {
+                e.offset = offset;
+            }
             written as u64
         }
     }
@@ -1034,8 +1040,9 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     // Check if this is a tmpfs path.
     if let Some(rel) = tmpfs_relative_path(name) {
         if rel.is_empty() {
-            // Opening /tmp itself — not a file
-            return NEG_ENOENT;
+            // Opening /tmp itself — it's a directory, not a regular file.
+            const NEG_EISDIR: u64 = (-21_i64) as u64;
+            return NEG_EISDIR;
         }
 
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
