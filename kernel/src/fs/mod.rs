@@ -1,22 +1,18 @@
-//! Filesystem services — Phase 8.
+//! Filesystem services — Phase 8 / Phase 13.
 //!
-//! Provides a VFS routing layer and a read-only ramdisk backend so kernel
-//! tasks can open and read files by name without touching hardware I/O.
+//! Provides a VFS routing layer, a read-only ramdisk backend, and a
+//! writable in-memory tmpfs so kernel tasks and userspace processes can
+//! open, read, write, and manage files.
 //!
 //! # Module layout
 //!
 //! - [`protocol`] — IPC message labels and data conventions shared by all
 //!   filesystem servers and their clients.
 //! - [`ramdisk`] — static embedded files and the `fat_server` message handler.
+//! - [`tmpfs`] — RAM-backed writable filesystem mounted at `/tmp` (Phase 13).
 //! - [`vfs`] — path routing and the `vfs_server` message handler.
-//!
-//! # Phase 8 scope
-//!
-//! All filesystem servers are kernel tasks sharing the kernel address space.
-//! No ring-3 processes, no real disk I/O, no writeable filesystem.  The goal
-//! is to validate the IPC contract and the VFS / backend split; moving to
-//! real storage is Phase 9+.
 
 pub mod protocol;
 pub mod ramdisk;
+pub mod tmpfs;
 pub mod vfs;
