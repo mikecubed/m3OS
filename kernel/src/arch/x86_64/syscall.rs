@@ -870,6 +870,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
             let data = match tmpfs.read_file(path, entry.offset, capped_count) {
                 Ok(d) => d,
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
                 Err(_) => return NEG_EBADF,
             };
             let to_read = data.len();
@@ -1780,6 +1781,12 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
         }
         Err(crate::fs::tmpfs::TmpfsError::NotEmpty) => NEG_ENOTEMPTY,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(
+            crate::fs::tmpfs::TmpfsError::WrongType | crate::fs::tmpfs::TmpfsError::NotADirectory,
+        ) => {
+            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+            NEG_ENOTDIR
+        }
         Err(_) => NEG_EINVAL,
     }
 }
@@ -1810,6 +1817,14 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
+            const NEG_EISDIR: u64 = (-21_i64) as u64;
+            NEG_EISDIR
+        }
+        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
+            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+            NEG_ENOTDIR
+        }
         Err(_) => NEG_EINVAL,
     }
 }
