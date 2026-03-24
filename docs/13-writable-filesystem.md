@@ -96,6 +96,10 @@ struct FdEntry {
 - Tmpfs FDs derive `readable`/`writable` from open flags (`O_RDONLY`,
   `O_WRONLY`, `O_RDWR`).  `read()` on a write-only fd returns `-EBADF`.
 - Tmpfs FDs store the relative path and re-lock `TMPFS` on each read/write.
+  As a consequence, if a tmpfs file is `rename`d or `unlink`ed, any existing
+  FDs to that file will fail future I/O because they re-resolve the (now
+  invalid) path; this diverges from POSIX semantics, where open FDs survive
+  `rename`/`unlink`.
 - The FD table is still global (not per-process); this is acceptable for
   the single-user model.
 

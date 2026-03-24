@@ -1018,9 +1018,6 @@ const O_APPEND: u64 = 0o2000;
 /// Check if a path targets the tmpfs mount at `/tmp`.
 ///
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
-/// Check if a path targets the tmpfs mount at `/tmp`.
-///
-/// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
 /// Rejects paths containing `.`, `..`, or empty segments to prevent
 /// traversal outside the `/tmp` mount boundary.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
@@ -1234,10 +1231,14 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    let mut table = FD_TABLE.lock();
-    let entry = match &mut table[fd] {
-        Some(e) => e,
-        None => return NEG_EBADF,
+    // Clone entry and drop FD_TABLE before locking TMPFS to avoid
+    // lock-order inversion (other paths lock TMPFS then FD_TABLE).
+    let entry = {
+        let table = FD_TABLE.lock();
+        match &table[fd] {
+            Some(e) => e.clone(),
+            None => return NEG_EBADF,
+        }
     };
 
     const SEEK_SET: u64 = 0;
@@ -1274,8 +1275,11 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    entry.offset = new_offset as usize;
-    entry.offset as u64
+    // Re-lock to update offset.
+    if let Some(e) = &mut FD_TABLE.lock()[fd] {
+        e.offset = new_offset as usize;
+    }
+    new_offset as u64
 }
 
 // ---------------------------------------------------------------------------
