@@ -386,7 +386,10 @@ pub unsafe fn setup_abi_stack(
             TranslateResult::Mapped { frame, offset, .. } => {
                 (phys_off + frame.start_address().as_u64() + offset) as *mut u8
             }
-            _ => core::ptr::null_mut(),
+            _ => panic!(
+                "setup_abi_stack: unmapped stack address {:#x}; caller must map stack pages first",
+                vaddr
+            ),
         }
     };
 
@@ -401,14 +404,10 @@ pub unsafe fn setup_abi_stack(
         // Write the string bytes (null-terminated).
         for (j, &b) in arg.iter().enumerate() {
             let kptr = virt_to_kptr(cursor + j as u64);
-            if !kptr.is_null() {
-                kptr.write(b);
-            }
+            kptr.write(b);
         }
         let kptr = virt_to_kptr(cursor + arg.len() as u64);
-        if !kptr.is_null() {
-            kptr.write(0); // null terminator
-        }
+        kptr.write(0); // null terminator
         arg_ptrs.push(cursor);
     }
     arg_ptrs.reverse(); // put argv[0] first
@@ -422,34 +421,24 @@ pub unsafe fn setup_abi_stack(
     // Aux vector: two NULLs (AT_NULL = 0, value = 0).
     cursor -= 8;
     let kptr = virt_to_kptr(cursor);
-    if !kptr.is_null() {
-        (kptr as *mut u64).write(0); // AT_NULL value
-    }
+    (kptr as *mut u64).write(0); // AT_NULL value
     cursor -= 8;
     let kptr = virt_to_kptr(cursor);
-    if !kptr.is_null() {
-        (kptr as *mut u64).write(0); // AT_NULL type
-    }
+    (kptr as *mut u64).write(0); // AT_NULL type
 
     // envp: NULL terminator only (P11-T011: minimal empty environment).
     cursor -= 8;
     let kptr = virt_to_kptr(cursor);
-    if !kptr.is_null() {
-        (kptr as *mut u64).write(0);
-    }
+    (kptr as *mut u64).write(0);
 
     // argv: NULL terminator, then pointers in reverse order.
     cursor -= 8;
     let kptr = virt_to_kptr(cursor);
-    if !kptr.is_null() {
-        (kptr as *mut u64).write(0); // argv[argc] = NULL
-    }
+    (kptr as *mut u64).write(0); // argv[argc] = NULL
     for &ptr in arg_ptrs.iter().rev() {
         cursor -= 8;
         let kptr = virt_to_kptr(cursor);
-        if !kptr.is_null() {
-            (kptr as *mut u64).write(ptr);
-        }
+        (kptr as *mut u64).write(ptr);
     }
 
     // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
@@ -462,9 +451,7 @@ pub unsafe fn setup_abi_stack(
     // argc.
     cursor -= 8;
     let kptr = virt_to_kptr(cursor);
-    if !kptr.is_null() {
-        (kptr as *mut u64).write(argv.len() as u64);
-    }
+    (kptr as *mut u64).write(argv.len() as u64);
 
     // Return rsp pointing at argc.
     cursor

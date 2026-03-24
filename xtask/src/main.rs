@@ -134,6 +134,7 @@ fn build_userspace_bins() {
 
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
+    build_userspace_bins();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -277,6 +278,7 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
 
 fn cmd_check() {
     let root = workspace_root();
+    build_userspace_bins();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -512,7 +514,6 @@ fn signed_path(path: &Path) -> PathBuf {
 }
 
 fn cmd_image(image_args: &ImageArgs) {
-    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -871,7 +872,6 @@ fn create_gpt_disk(mut fat_image: File, out_gpt_path: &Path) -> anyhow::Result<(
 }
 
 fn cmd_run() {
-    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -879,7 +879,6 @@ fn cmd_run() {
 }
 
 fn cmd_run_gui() {
-    build_userspace_bins();
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);

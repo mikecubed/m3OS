@@ -178,10 +178,7 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
     let in_code = ptr >= USER_CODE_BASE && ptr_end <= code_end;
     let in_stack = ptr >= stack_start && ptr_end <= USER_STACK_TOP;
     let in_elf_stack = ptr >= elf_stack_start && ptr_end <= ELF_STACK_TOP;
-    // Also allow any user-accessible address in the valid user range.
-    let in_user_range = ptr >= 0x400000 && ptr_end <= 0x0000_8000_0000_0000;
-
-    if !in_code && !in_stack && !in_elf_stack && !in_user_range {
+    if !in_code && !in_stack && !in_elf_stack {
         return u64::MAX;
     }
     // Safety: we checked the bounds; kernel+user share the address space.
