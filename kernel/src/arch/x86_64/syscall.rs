@@ -1018,15 +1018,29 @@ const O_APPEND: u64 = 0o2000;
 /// Check if a path targets the tmpfs mount at `/tmp`.
 ///
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
+/// Check if a path targets the tmpfs mount at `/tmp`.
+///
+/// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
+/// Rejects paths containing `.`, `..`, or empty segments to prevent
+/// traversal outside the `/tmp` mount boundary.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
-    if trimmed == "tmp" {
-        Some("")
-    } else if let Some(rest) = trimmed.strip_prefix("tmp/") {
-        Some(rest)
+    let rest = if trimmed == "tmp" {
+        ""
     } else {
-        None
+        trimmed.strip_prefix("tmp/")?
+    };
+
+    // For non-empty relative paths, reject `.`, `..`, and empty segments.
+    if !rest.is_empty() {
+        for segment in rest.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return None;
+            }
+        }
     }
+
+    Some(rest)
 }
 
 fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
@@ -1184,7 +1198,10 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
                 FdBackend::Tmpfs { path } => {
                     let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                    tmpfs.file_size(path).unwrap_or(0) as u64
+                    match tmpfs.file_size(path) {
+                        Ok(size) => size as u64,
+                        Err(_) => return NEG_ENOENT,
+                    }
                 }
             }
         }
@@ -1231,7 +1248,10 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-            tmpfs.file_size(path).unwrap_or(0)
+            match tmpfs.file_size(path) {
+                Ok(len) => len,
+                Err(_) => return NEG_ENOENT,
+            }
         }
     };
 
