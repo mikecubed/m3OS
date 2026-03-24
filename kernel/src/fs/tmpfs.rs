@@ -357,8 +357,27 @@ impl Tmpfs {
         // Try to insert at destination — rollback on failure.
         match self.parent_and_name(new_path) {
             Ok((new_parent, new_name)) => {
-                if new_parent.children.contains_key(new_name) {
-                    // POSIX rename semantics: overwrite target if it exists.
+                if let Some(existing) = new_parent.children.get(new_name) {
+                    // POSIX rename semantics: validate type compatibility.
+                    let reject = match (&node, existing) {
+                        // File ↔ directory replacement is not allowed.
+                        (TmpfsNode::File(_), TmpfsNode::Dir(_))
+                        | (TmpfsNode::Dir(_), TmpfsNode::File(_)) => Some(TmpfsError::WrongType),
+                        // Replacing a non-empty directory is not allowed.
+                        (_, TmpfsNode::Dir(dst)) if !dst.children.is_empty() => {
+                            Some(TmpfsError::NotEmpty)
+                        }
+                        // Same-type (file↔file, dir↔empty-dir) is OK.
+                        _ => None,
+                    };
+                    if let Some(err) = reject {
+                        // Rollback source.
+                        let (old_parent, old_name) = self
+                            .parent_and_name(old_path)
+                            .expect("rollback: source parent must still exist");
+                        old_parent.children.insert(old_name.to_string(), node);
+                        return Err(err);
+                    }
                     new_parent.children.remove(new_name);
                 }
                 new_parent.children.insert(new_name.to_string(), node);

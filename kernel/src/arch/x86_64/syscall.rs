@@ -1696,6 +1696,11 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
+        Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
+            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+            NEG_ENOTDIR
+        }
         Err(_) => NEG_EINVAL,
     }
 }
