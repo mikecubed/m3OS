@@ -24,6 +24,17 @@
 //! | 110     | getppid       | —                   |
 //! | 231     | exit_group    | code (alias exit)   |
 
+// Linux errno values (negated for syscall return convention).
+#[allow(dead_code)]
+const NEG_EPERM: u64 = (-1_i64) as u64;
+const NEG_ENOENT: u64 = (-2_i64) as u64;
+const NEG_EBADF: u64 = (-9_i64) as u64;
+const NEG_EAGAIN: u64 = (-11_i64) as u64;
+const NEG_EFAULT: u64 = (-14_i64) as u64;
+const NEG_EINVAL: u64 = (-22_i64) as u64;
+const NEG_EMFILE: u64 = (-24_i64) as u64;
+const NEG_ENOSYS: u64 = (-38_i64) as u64;
+
 use core::arch::global_asm;
 
 use x86_64::{
@@ -229,7 +240,7 @@ pub extern "C" fn syscall_handler(
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
-        _ => (-38_i64) as u64, // -ENOSYS
+        _ => NEG_ENOSYS,
     }
 }
 
@@ -759,18 +770,18 @@ static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FDS]> = spin::Mutex::new([NON
 fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     if fd == 0 {
         // stdin: no keyboard input implemented yet — return EAGAIN (-11)
-        return (-11_i64) as u64; // -EAGAIN
+        return NEG_EAGAIN;
     }
     let fd = fd as usize;
     if fd >= MAX_FDS {
-        return u64::MAX;
+        return NEG_EBADF;
     }
 
     let entry = {
         let table = FD_TABLE.lock();
         match table[fd] {
             Some(e) => e,
-            None => return u64::MAX,
+            None => return NEG_EBADF,
         }
     };
 
@@ -786,7 +797,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     };
 
     if crate::mm::user_mem::copy_to_user(buf_ptr, src).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
 
     // Advance offset.
@@ -806,12 +817,12 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     // Only stdout (1) and stderr (2) are supported.
     if fd != 1 && fd != 2 {
-        return u64::MAX;
+        return NEG_EBADF;
     }
     let len = (count as usize).min(4096);
     let mut buf = [0u8; 4096];
     if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
     if let Ok(s) = core::str::from_utf8(&buf[..len]) {
         log::info!("[userspace] {}", s.trim_end_matches('\n'));
@@ -855,7 +866,7 @@ fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
-        None => return u64::MAX,
+        None => return NEG_EFAULT,
     };
 
     // Strip leading "/" since ramdisk files are stored without path prefix.
@@ -864,7 +875,7 @@ fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
         Some(c) => c,
         None => {
             log::warn!("[open] file not found: {}", name);
-            return u64::MAX;
+            return NEG_ENOENT;
         }
     };
 
@@ -883,7 +894,7 @@ fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
     }
 
     log::warn!("[open] fd table full");
-    u64::MAX
+    NEG_EMFILE
 }
 
 // ---------------------------------------------------------------------------
@@ -913,11 +924,11 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         _ => {
             let fd = fd as usize;
             if fd >= MAX_FDS {
-                return u64::MAX;
+                return NEG_EBADF;
             }
             match FD_TABLE.lock()[fd] {
                 Some(e) => e.content_len as u64,
-                None => return u64::MAX,
+                None => return NEG_EBADF,
             }
         }
     };
@@ -934,7 +945,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
 
     if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
     0
 }
@@ -946,13 +957,13 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
 fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     let fd = fd as usize;
     if !(3..MAX_FDS).contains(&fd) {
-        return u64::MAX;
+        return NEG_EBADF;
     }
 
     let mut table = FD_TABLE.lock();
     let entry = match &mut table[fd] {
         Some(e) => e,
-        None => return u64::MAX,
+        None => return NEG_EBADF,
     };
 
     const SEEK_SET: u64 = 0;
@@ -965,17 +976,17 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         SEEK_SET => offset,
         SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
             Some(v) => v,
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         },
         SEEK_END => match (entry.content_len as i64).checked_add(offset) {
             Some(v) => v,
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         },
-        _ => return u64::MAX,
+        _ => return NEG_EINVAL,
     };
 
     if new_offset < 0 || new_offset as usize > entry.content_len {
-        return u64::MAX;
+        return NEG_EINVAL;
     }
 
     entry.offset = new_offset as usize;
@@ -999,11 +1010,11 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
             "[mmap] non-anonymous mmap not supported (flags={:#x})",
             flags
         );
-        return u64::MAX;
+        return NEG_EINVAL;
     }
 
     let len = if len == 0 {
-        return u64::MAX;
+        return NEG_EINVAL;
     } else {
         len
     };
@@ -1016,7 +1027,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         };
         if proc.mmap_next == 0 {
             proc.mmap_next = ANON_MMAP_BASE;
@@ -1026,11 +1037,11 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
         let base = proc.mmap_next;
         let total_size = match pages.checked_mul(4096) {
             Some(s) => s,
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         };
         proc.mmap_next = match base.checked_add(total_size) {
             Some(v) => v,
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         };
         base
     };
@@ -1038,14 +1049,14 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
     // Validate that the entire range fits in canonical user space (< 0x0000_8000_0000_0000).
     let total_size = match pages.checked_mul(4096) {
         Some(s) => s,
-        None => return u64::MAX,
+        None => return NEG_EINVAL,
     };
     let range_end = match base.checked_add(total_size) {
         Some(e) => e,
-        None => return u64::MAX,
+        None => return NEG_EINVAL,
     };
     if range_end > 0x0000_8000_0000_0000 {
-        return u64::MAX;
+        return NEG_EINVAL;
     }
 
     // Map pages in the current address space (current CR3 = this process).
@@ -1069,7 +1080,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
             Some(f) => f,
             None => {
                 log::warn!("[mmap] out of frames at page {}/{}", i, pages);
-                return u64::MAX;
+                return NEG_EINVAL;
             }
         };
         // Zero the frame via physical offset.
@@ -1081,7 +1092,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
         // SAFETY: mapper covers the current CR3; frame was just allocated; page is unmapped.
         if unsafe { mapper.map_to(page, frame, flags_pt, &mut frame_alloc) }.is_err() {
             log::warn!("[mmap] map_to failed at page {}", i);
-            return u64::MAX;
+            return NEG_EINVAL;
         }
         // No TLB flush needed for new mappings (no stale entry to evict).
     }
@@ -1111,7 +1122,7 @@ fn sys_linux_brk(addr: u64) -> u64 {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(pid) {
             Some(p) => (p.brk_current, p.brk_current),
-            None => return u64::MAX,
+            None => return NEG_EINVAL,
         }
     };
 
@@ -1199,7 +1210,7 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             continue;
         }
         let written = sys_linux_write(fd, base, len);
-        if written == u64::MAX {
+        if written as i64 <= 0 {
             break;
         }
         total += written;
@@ -1226,7 +1237,7 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             continue;
         }
         let n = sys_linux_read(fd, base, len);
-        if n == u64::MAX || n == 0 {
+        if (n as i64) <= 0 {
             break;
         }
         total += n;
@@ -1240,11 +1251,11 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 
 fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
     if size < 2 {
-        return u64::MAX;
+        return NEG_EINVAL;
     }
     let cwd = b"/\0";
     if crate::mm::user_mem::copy_to_user(buf_ptr, cwd).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
     buf_ptr // Linux getcwd returns the buffer pointer on success
 }
@@ -1272,13 +1283,13 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             w
         };
         if crate::mm::user_mem::copy_to_user(arg, &winsize).is_err() {
-            return u64::MAX;
+            return NEG_EFAULT;
         }
         return 0;
     }
-    // All other ioctl requests return ENOSYS.
+    // All other ioctl requests return EINVAL.
     let _ = fd;
-    u64::MAX
+    NEG_EINVAL
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,7 +1310,7 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
     fill(&mut utsname[260..325], b"x86_64"); // machine
                                              // domainname left as zero
     if crate::mm::user_mem::copy_to_user(buf_ptr, &utsname).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
     0
 }
@@ -1312,12 +1323,12 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
-        None => return u64::MAX,
+        None => return NEG_EFAULT,
     };
     let file_name = name.trim_start_matches('/');
     let size = match crate::fs::ramdisk::get_file(file_name) {
         Some(c) => c.len() as u64,
-        None => return u64::MAX,
+        None => return NEG_ENOENT,
     };
 
     let mut stat = [0u8; 144];
@@ -1328,7 +1339,7 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
     stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
 
     if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-        return u64::MAX;
+        return NEG_EFAULT;
     }
     0
 }
@@ -1343,10 +1354,14 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_FS: u64 = 0x1002;
     match code {
         ARCH_SET_FS => {
-            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
+            let vaddr = match x86_64::VirtAddr::try_new(addr) {
+                Ok(v) => v,
+                Err(_) => return NEG_EINVAL,
+            };
+            x86_64::registers::model_specific::FsBase::write(vaddr);
             0
         }
-        _ => u64::MAX, // -EINVAL
+        _ => NEG_EINVAL,
     }
 }
 
