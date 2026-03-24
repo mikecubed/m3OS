@@ -418,6 +418,22 @@ pub unsafe fn setup_abi_stack(
     phdr_vaddr: u64,
     phnum: u16,
 ) -> Result<u64, ElfError> {
+    setup_abi_stack_with_envp(stack_top, mapper, phys_off, argv, &[], phdr_vaddr, phnum)
+}
+
+/// Build the SysV AMD64 ABI initial stack with argv and envp.
+///
+/// Phase 14 extension: supports passing environment variables to the
+/// new process via the envp array.
+pub unsafe fn setup_abi_stack_with_envp(
+    stack_top: u64,
+    mapper: &OffsetPageTable<'_>,
+    phys_off: u64,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    phdr_vaddr: u64,
+    phnum: u16,
+) -> Result<u64, ElfError> {
     // Helper: translate a virtual address in the target page table to a kernel
     // writable pointer via the physical-memory offset.
     let virt_to_kptr = |vaddr: u64| -> Result<*mut u8, ElfError> {
@@ -432,22 +448,36 @@ pub unsafe fn setup_abi_stack(
         }
     };
 
-    // Write strings starting just below stack_top, packing downward.
-    let mut cursor: u64 = stack_top;
-    let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-
-    for arg in argv.iter().rev() {
-        // Include the null terminator.
-        let len = arg.len() + 1;
-        cursor -= len as u64;
-        // Write the string bytes (null-terminated).
-        for (j, &b) in arg.iter().enumerate() {
-            let kptr = virt_to_kptr(cursor + j as u64)?;
+    // Helper: write a null-terminated string at the current cursor position,
+    // packing downward. Returns the virtual address of the written string.
+    let write_string = |cursor: &mut u64, s: &[u8]| -> Result<u64, ElfError> {
+        let len = s.len() + 1; // include null terminator
+        *cursor -= len as u64;
+        for (j, &b) in s.iter().enumerate() {
+            let kptr = virt_to_kptr(*cursor + j as u64)?;
             kptr.write(b);
         }
-        let kptr = virt_to_kptr(cursor + arg.len() as u64)?;
+        let kptr = virt_to_kptr(*cursor + s.len() as u64)?;
         kptr.write(0); // null terminator
-        arg_ptrs.push(cursor);
+        Ok(*cursor)
+    };
+
+    // Write strings starting just below stack_top, packing downward.
+    let mut cursor: u64 = stack_top;
+
+    // Write envp strings first (they go at higher addresses).
+    let mut env_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for env in envp.iter().rev() {
+        let ptr = write_string(&mut cursor, env)?;
+        env_ptrs.push(ptr);
+    }
+    env_ptrs.reverse();
+
+    // Write argv strings.
+    let mut arg_ptrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for arg in argv.iter().rev() {
+        let ptr = write_string(&mut cursor, arg)?;
+        arg_ptrs.push(ptr);
     }
     arg_ptrs.reverse(); // put argv[0] first
 
@@ -492,10 +522,15 @@ pub unsafe fn setup_abi_stack(
     push_aux(&mut cursor, AT_PHNUM, phnum as u64)?;
     push_aux(&mut cursor, AT_PHDR, phdr_vaddr)?;
 
-    // envp: NULL terminator only (P11-T011: minimal empty environment).
+    // envp: pointers followed by NULL terminator.
     cursor -= 8;
     let kptr = virt_to_kptr(cursor)?;
-    (kptr as *mut u64).write(0);
+    (kptr as *mut u64).write(0); // envp[N] = NULL
+    for &ptr in env_ptrs.iter().rev() {
+        cursor -= 8;
+        let kptr = virt_to_kptr(cursor)?;
+        (kptr as *mut u64).write(ptr);
+    }
 
     // argv: NULL terminator, then pointers in reverse order.
     cursor -= 8;

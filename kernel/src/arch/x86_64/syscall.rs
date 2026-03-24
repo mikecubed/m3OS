@@ -398,14 +398,61 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     child_pid as u64
 }
 
-/// `execve(path_ptr, path_len, _envp)` — replace the calling process's image
-/// with a new ELF binary read from the ramdisk.
-fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
-    if path_len > 255 {
-        return u64::MAX;
+/// Read a null-terminated array of char* pointers from user memory, copying
+/// each pointed-to C string into a kernel `Vec<Vec<u8>>`.
+///
+/// Returns an empty vec if `array_ptr` is 0 (NULL).
+/// Returns at most `max_entries` strings; each string is capped at 4096 bytes.
+fn read_user_string_array(
+    array_ptr: u64,
+    max_entries: usize,
+) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+    let mut result = alloc::vec::Vec::new();
+    if array_ptr == 0 {
+        return result;
     }
-    let mut name_buf = [0u8; 255];
-    let name = match path_name_buf(path_ptr, path_len, &mut name_buf) {
+    for i in 0..max_entries {
+        let ptr_addr = match array_ptr.checked_add((i * 8) as u64) {
+            Some(a) => a,
+            None => break,
+        };
+        let mut ptr_bytes = [0u8; 8];
+        if crate::mm::user_mem::copy_from_user(&mut ptr_bytes, ptr_addr).is_err() {
+            break;
+        }
+        let str_ptr = u64::from_ne_bytes(ptr_bytes);
+        if str_ptr == 0 {
+            break; // NULL terminator
+        }
+        // Read the C string byte by byte.
+        let mut s = alloc::vec::Vec::new();
+        for j in 0..4096u64 {
+            let addr = match str_ptr.checked_add(j) {
+                Some(a) => a,
+                None => break,
+            };
+            let mut b = [0u8; 1];
+            if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
+                break;
+            }
+            if b[0] == 0 {
+                break;
+            }
+            s.push(b[0]);
+        }
+        result.push(s);
+    }
+    result
+}
+
+/// `execve(filename, argv, envp)` — replace the calling process's image
+/// with a new ELF binary read from the ramdisk.
+///
+/// Phase 14: now parses argv and envp from user memory (Linux ABI).
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    // Read the filename as a null-terminated C string.
+    let mut name_cstr = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
         None => return u64::MAX,
     };
@@ -416,11 +463,18 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
         name
     );
 
+    // Parse argv and envp from user memory.
+    let user_argv = read_user_string_array(argv_ptr, 256);
+    let user_envp = read_user_string_array(envp_ptr, 256);
+
+    // Strip leading "/" or path prefix to get the ramdisk filename.
+    let file_name = name.trim_start_matches('/');
+
     // Read the binary from the ramdisk.
-    let data = match crate::fs::ramdisk::get_file(name) {
+    let data = match crate::fs::ramdisk::get_file(file_name) {
         Some(d) => d,
         None => {
-            log::warn!("[execve] file not found: {}", name);
+            log::warn!("[execve] file not found: {}", file_name);
             return u64::MAX;
         }
     };
@@ -433,6 +487,14 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
 
     let phys_off = crate::mm::phys_offset();
 
+    // Build argv slices: use user-provided argv if non-empty, else [filename].
+    let argv_refs: alloc::vec::Vec<&[u8]> = if user_argv.is_empty() {
+        alloc::vec![name.as_bytes()]
+    } else {
+        user_argv.iter().map(|v| v.as_slice()).collect()
+    };
+    let envp_refs: alloc::vec::Vec<&[u8]> = user_envp.iter().map(|v| v.as_slice()).collect();
+
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
         let mut mapper = unsafe { crate::mm::mapper_for_frame(new_cr3) };
@@ -443,15 +505,14 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
                 return u64::MAX;
             }
         };
-        // Build the SysV AMD64 ABI initial stack with argv[0] = binary name.
-        let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp = match unsafe {
-            crate::mm::elf::setup_abi_stack(
+            crate::mm::elf::setup_abi_stack_with_envp(
                 loaded.stack_top,
                 &mapper,
                 phys_off,
-                argv,
+                &argv_refs,
+                &envp_refs,
                 loaded.phdr_vaddr,
                 loaded.phnum,
             )
@@ -609,24 +670,6 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract a UTF-8 path string from a userspace pointer + length.
-/// Copy at most 255 bytes from a userspace pointer into a stack buffer and
-/// return a reference to the valid UTF-8 prefix.
-///
-/// Using a local buffer avoids the `&'static str` lifetime lie: the resulting
-/// reference is scoped to the caller's stack frame so Rust enforces that it
-/// cannot outlive the buffer.
-fn path_name_buf(ptr: u64, len: u64, buf: &mut [u8; 255]) -> Option<&str> {
-    let copy_len = (len as usize).min(255);
-    if copy_len == 0 || ptr == 0 {
-        return None;
-    }
-    if crate::mm::user_mem::copy_from_user(&mut buf[..copy_len], ptr).is_err() {
-        return None;
-    }
-    core::str::from_utf8(&buf[..copy_len]).ok()
-}
 
 /// Copy all user-accessible pages from the currently-active page table
 /// into `dst_mapper`'s page table.
