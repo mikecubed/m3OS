@@ -330,50 +330,49 @@ impl Tmpfs {
     /// Rename/move a file or directory from `old_path` to `new_path`.
     ///
     /// Cross-directory moves are supported as long as both parent paths
-    /// resolve to existing directories.
+    /// resolve to existing directories.  Moving a directory into its own
+    /// subtree (e.g. "a" → "a/b") is rejected with `InvalidPath`.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), TmpfsError> {
-        // Validate destination first — don't remove the source until we know
-        // the destination is reachable (prevents data loss on error).
-        {
-            // Borrow self immutably to check the new path is valid.
-            let new_trimmed = new_path.trim_start_matches('/');
-            if new_trimmed.is_empty() {
-                return Err(TmpfsError::InvalidPath);
-            }
-            let new_parts: Vec<&str> = Self::components(new_path).collect();
-            if new_parts.is_empty() {
-                return Err(TmpfsError::InvalidPath);
-            }
-            // Walk parent components to verify they exist and are dirs.
-            let mut current = &self.root;
-            for part in &new_parts[..new_parts.len() - 1] {
-                current = match current {
-                    TmpfsNode::Dir(dir) => match dir.children.get(*part) {
-                        Some(child) => child,
-                        None => return Err(TmpfsError::NotFound),
-                    },
-                    TmpfsNode::File(_) => return Err(TmpfsError::NotADirectory),
-                };
-            }
-            if !matches!(current, TmpfsNode::Dir(_)) {
-                return Err(TmpfsError::NotADirectory);
-            }
+        let old_normalized = old_path.trim_start_matches('/');
+        let new_normalized = new_path.trim_start_matches('/');
+
+        if old_normalized.is_empty() || new_normalized.is_empty() {
+            return Err(TmpfsError::InvalidPath);
         }
 
-        // Now safe to remove the source — destination parent is valid.
+        // Reject moving a directory into its own subtree.
+        if new_normalized.starts_with(old_normalized)
+            && new_normalized.as_bytes().get(old_normalized.len()) == Some(&b'/')
+        {
+            return Err(TmpfsError::InvalidPath);
+        }
+
+        // Remove source node.
         let (parent, old_name) = self.parent_and_name(old_path)?;
         let node = parent
             .children
             .remove(old_name)
             .ok_or(TmpfsError::NotFound)?;
 
-        let (new_parent, new_name) = self.parent_and_name(new_path)?;
-        if new_parent.children.contains_key(new_name) {
-            // POSIX rename semantics: overwrite target if it exists.
-            new_parent.children.remove(new_name);
+        // Try to insert at destination — rollback on failure.
+        match self.parent_and_name(new_path) {
+            Ok((new_parent, new_name)) => {
+                if new_parent.children.contains_key(new_name) {
+                    // POSIX rename semantics: overwrite target if it exists.
+                    new_parent.children.remove(new_name);
+                }
+                new_parent.children.insert(new_name.to_string(), node);
+                Ok(())
+            }
+            Err(e) => {
+                // Rollback: re-insert source node at its original location.
+                let (old_parent, old_name) = self
+                    .parent_and_name(old_path)
+                    .expect("rollback: source parent must still exist");
+                old_parent.children.insert(old_name.to_string(), node);
+                Err(e)
+            }
         }
-        new_parent.children.insert(new_name.to_string(), node);
-        Ok(())
     }
 
     /// Truncate a file to `new_size` bytes.

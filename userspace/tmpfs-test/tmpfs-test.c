@@ -93,7 +93,12 @@ static void test_unlink(void) {
         fail("unlink: create", "open returned < 0");
         return;
     }
-    write(fd, "x", 1);
+    ssize_t wr = write(fd, "x", 1);
+    if (wr != 1) {
+        fail("unlink: write", "short write or error");
+        close(fd);
+        return;
+    }
     close(fd);
 
     if (unlink(path) != 0) {
@@ -119,7 +124,12 @@ static void test_truncate(void) {
         fail("truncate: create", "open returned < 0");
         return;
     }
-    write(fd, "abcdefghij", 10);
+    ssize_t nw = write(fd, "abcdefghij", 10);
+    if (nw != 10) {
+        fail("truncate: write", "write failed or short");
+        close(fd);
+        return;
+    }
     /* Truncate to 5 bytes */
     if (ftruncate(fd, 5) != 0) {
         fail("truncate: ftruncate", "ftruncate returned non-zero");
@@ -157,8 +167,18 @@ static void test_append(void) {
         fail("append: create", "open returned < 0");
         return;
     }
-    write(fd, "AAA", 3);
-    write(fd, "BBB", 3);
+    ssize_t n1 = write(fd, "AAA", 3);
+    if (n1 != 3) {
+        fail("append: first write", "write did not return 3");
+        close(fd);
+        return;
+    }
+    ssize_t n2 = write(fd, "BBB", 3);
+    if (n2 != 3) {
+        fail("append: second write", "write did not return 3");
+        close(fd);
+        return;
+    }
     close(fd);
 
     fd = open(path, O_RDONLY);

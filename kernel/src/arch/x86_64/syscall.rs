@@ -35,7 +35,11 @@ const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EFAULT: u64 = (-14_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
+const NEG_EEXIST: u64 = (-17_i64) as u64;
+const NEG_ENOSPC: u64 = (-28_i64) as u64;
+const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
 
 use core::arch::global_asm;
 
@@ -937,9 +941,13 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     break;
                 }
                 let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                if tmpfs.write_file(path, offset, &buf[..chunk]).is_err() {
+                if let Err(e) = tmpfs.write_file(path, offset, &buf[..chunk]) {
                     if written == 0 {
-                        return NEG_EBADF;
+                        return match e {
+                            crate::fs::tmpfs::TmpfsError::NoSpace => NEG_ENOSPC,
+                            crate::fs::tmpfs::TmpfsError::NotFound => NEG_EBADF,
+                            _ => NEG_EINVAL,
+                        };
                     }
                     break;
                 }
@@ -1074,7 +1082,6 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
     if writable {
-        const NEG_EROFS: u64 = (-30_i64) as u64;
         return NEG_EROFS;
     }
 
@@ -1676,7 +1683,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
-        None => return NEG_EPERM, // can only mkdir in tmpfs
+        None => return NEG_EROFS, // can only mkdir in tmpfs
     };
     if rel.is_empty() {
         return NEG_EINVAL; // can't mkdir /tmp itself
@@ -1688,10 +1695,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
             log::info!("[mkdir] {}", name);
             0
         }
-        Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => {
-            const NEG_EEXIST: u64 = (-17_i64) as u64;
-            NEG_EEXIST
-        }
+        Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -1709,7 +1713,7 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
-        None => return NEG_EPERM,
+        None => return NEG_EROFS,
     };
     if rel.is_empty() {
         return NEG_EINVAL; // can't rmdir /tmp itself
@@ -1721,10 +1725,7 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
             log::info!("[rmdir] {}", name);
             0
         }
-        Err(crate::fs::tmpfs::TmpfsError::NotEmpty) => {
-            const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
-            NEG_ENOTEMPTY
-        }
+        Err(crate::fs::tmpfs::TmpfsError::NotEmpty) => NEG_ENOTEMPTY,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
         Err(_) => NEG_EINVAL,
     }
@@ -1743,7 +1744,7 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
-        None => return NEG_EPERM,
+        None => return NEG_EROFS,
     };
     if rel.is_empty() {
         return NEG_EINVAL;
@@ -1784,11 +1785,11 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let old_str = core::str::from_utf8(&old_owned[..old_len]).unwrap();
     let old_rel = match tmpfs_relative_path(old_str) {
         Some(r) => r,
-        None => return NEG_EPERM,
+        None => return NEG_EROFS,
     };
     let new_rel = match tmpfs_relative_path(new_name) {
         Some(r) => r,
-        None => return NEG_EPERM,
+        None => return NEG_EROFS,
     };
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1815,7 +1816,7 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
-        None => return NEG_EPERM,
+        None => return NEG_EROFS,
     };
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1849,7 +1850,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Ramdisk { .. } => NEG_EPERM,
+        FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.truncate(path, length as usize) {

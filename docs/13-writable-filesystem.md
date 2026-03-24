@@ -87,11 +87,14 @@ enum FdBackend {
 struct FdEntry {
     backend: FdBackend,
     offset: usize,
+    readable: bool,
     writable: bool,
 }
 ```
 
-- Ramdisk FDs are read-only (`writable: false`).
+- Ramdisk FDs are read-only (`readable: true, writable: false`).
+- Tmpfs FDs derive `readable`/`writable` from open flags (`O_RDONLY`,
+  `O_WRONLY`, `O_RDWR`).  `read()` on a write-only fd returns `-EBADF`.
 - Tmpfs FDs store the relative path and re-lock `TMPFS` on each read/write.
 - The FD table is still global (not per-process); this is acceptable for
   the single-user model.
