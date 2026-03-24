@@ -890,6 +890,14 @@ fn p11_launcher_task() -> ! {
     log::info!("[p11] T022: both exit0 instances completed — address spaces isolated");
 
     log::info!("[p11] all Phase 11 tests complete");
+
+    // -----------------------------------------------------------------------
+    // Phase 12 T030: musl hello world — exercises Linux syscall ABI end-to-end
+    // -----------------------------------------------------------------------
+    log::info!("[p12] T030: running hello.elf (musl-compiled C binary)");
+    run_elf_and_report("hello.elf");
+    log::info!("[p12] T030: hello.elf completed");
+
     loop {
         task::yield_now();
     }

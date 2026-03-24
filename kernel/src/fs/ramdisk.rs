@@ -50,6 +50,11 @@ const FILES: &[RamdiskFile] = &[
         name: "echo-args.elf",
         content: include_bytes!("../../initrd/echo-args.elf"),
     },
+    // Phase 12 musl-linked C binary (compiled by `cargo xtask run/image/check`).
+    RamdiskFile {
+        name: "hello.elf",
+        content: include_bytes!("../../initrd/hello.elf"),
+    },
 ];
 
 // ---------------------------------------------------------------------------

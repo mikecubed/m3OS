@@ -132,9 +132,45 @@ fn build_userspace_bins() {
     }
 }
 
+/// Compile Phase 12 musl-linked C binaries and copy them into kernel/initrd/.
+///
+/// Requires `musl-gcc` on the host PATH (package `musl-tools` on Debian/Ubuntu).
+/// Each binary is compiled as a fully static ELF with `-static -O2`.
+fn build_musl_bins() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    fs::create_dir_all(&initrd).unwrap_or_else(|e| {
+        panic!("failed to create initrd directory {}: {e}", initrd.display());
+    });
+
+    // (source path relative to workspace root, output name)
+    let bins: &[(&str, &str)] = &[("userspace/hello-c/hello.c", "hello")];
+
+    for (src_rel, name) in bins {
+        let src = root.join(src_rel);
+        let dst = initrd.join(format!("{name}.elf"));
+        let status = Command::new("musl-gcc")
+            .args([
+                "-static",
+                "-O2",
+                src.to_str().expect("non-UTF-8 path"),
+                "-o",
+                dst.to_str().expect("non-UTF-8 path"),
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run musl-gcc for {name}: {e}"));
+        if !status.success() {
+            eprintln!("musl-gcc failed for {name}");
+            std::process::exit(1);
+        }
+        println!("musl: {} → kernel/initrd/{name}.elf", src.display());
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
+    build_musl_bins();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -279,6 +315,7 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
 fn cmd_check() {
     let root = workspace_root();
     build_userspace_bins();
+    build_musl_bins();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
