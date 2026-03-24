@@ -879,7 +879,7 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
         len += 1;
     }
     if len == 0 {
-        return None;
+        return Some("");
     }
     core::str::from_utf8(&buf[..len]).ok()
 }
@@ -1161,7 +1161,7 @@ fn sys_linux_brk(addr: u64) -> u64 {
                 }
                 p.brk_current
             }
-            None => return NEG_EINVAL,
+            None => return 0,
         }
     };
 
@@ -1173,11 +1173,11 @@ fn sys_linux_brk(addr: u64) -> u64 {
     // Align new break up to page boundary.
     let new_brk = match addr.checked_add(0xFFF) {
         Some(v) => v & !0xFFF,
-        None => return NEG_EINVAL,
+        None => return current,
     };
     // Reject non-canonical / kernel-range addresses.
     if new_brk > 0x0000_7FFF_FFFF_FFFF {
-        return NEG_EINVAL;
+        return current;
     }
     let pages_needed = (new_brk - current) / 4096;
 
