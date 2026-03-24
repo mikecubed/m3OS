@@ -2,6 +2,26 @@
 
 **Branch:** `phase-12-posix-compat`
 **Depends on:** Phase 11 (ELF Loader and Process Model) — complete.
+**Status:** ✅ Complete — all 38 tasks done, QEMU-validated.
+**Documentation:** [`docs/12-posix-compatibility-layer.md`](docs/12-posix-compatibility-layer.md)
+
+### Critical fixes discovered during validation
+
+Several architectural issues surfaced while getting musl's `hello.elf` to run.
+These were not in the original task list but were essential for correctness:
+
+| Fix | Files | Problem |
+|---|---|---|
+| Page table isolation | `mm/mod.rs` | `new_process_page_table` only copied PML4[256..512]; kernel binary lives at PML4[2] (virtual offset 0x10000000000) — triple fault on CR3 switch |
+| Kernel CR3 store | `mm/mod.rs` | `new_process_page_table` used `Cr3::read()` which returned a dead process's CR3 after exit — new processes inherited stale user mappings |
+| CR3 restore on exit | `syscall.rs`, `interrupts.rs` | After process exit, CR3 was not restored to kernel PML4 — next scheduled task ran with dead process's address space |
+| CR3 restore in waitpid | `syscall.rs` | After child exit + yield, parent resumed with kernel CR3 — `copy_to_user` failed, then SYSRET to user faulted |
+| Syscall register preservation | `syscall.rs` | Entry stub clobbered rdi/rsi/rdx/r8/r9/r10 when mapping to SysV ABI — Linux requires all except rax/rcx/r11 preserved; musl stores FILE* in r8 across ioctl |
+| Auxiliary vector | `mm/elf.rs` | Stack only had AT_NULL — musl needs AT_PHDR, AT_PHNUM, AT_PAGESZ, AT_RANDOM for TLS init |
+| AT_PHDR computation | `mm/elf.rs` | Used raw `e_phoff` (file offset) instead of `min_vaddr + load_bias + e_phoff` (runtime virtual address) |
+| `arch_prctl` + `set_tid_address` | `syscall.rs` | musl's `__init_tls` requires ARCH_SET_FS (syscall 158) for TLS and set_tid_address (syscall 218) |
+| PIE (ET_DYN) support | `mm/elf.rs` | Phase 11 Rust PIE binaries linked at vaddr 0 — added load_bias = USER_VADDR_MIN for ET_DYN type |
+| CURRENT_PID staleness | `syscall.rs` | After yield in waitpid, child's trampoline had overwritten CURRENT_PID — parent resumed with wrong PID |
 
 ## Track Status
 
