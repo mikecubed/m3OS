@@ -794,6 +794,8 @@ enum FdBackend {
 struct FdEntry {
     backend: FdBackend,
     offset: usize,
+    /// True if the file was opened for reading.
+    readable: bool,
     /// True if the file was opened for writing.
     writable: bool,
 }
@@ -829,6 +831,10 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
     };
 
+    if !entry.readable {
+        return NEG_EBADF;
+    }
+
     match &entry.backend {
         FdBackend::Ramdisk {
             content_addr,
@@ -853,8 +859,10 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             to_read as u64
         }
         FdBackend::Tmpfs { path } => {
+            // Cap count at 64 KiB to match ramdisk path and prevent overflow.
+            let capped_count = (count as usize).min(64 * 1024);
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-            let data = match tmpfs.read_file(path, entry.offset, count as usize) {
+            let data = match tmpfs.read_file(path, entry.offset, capped_count) {
                 Ok(d) => d,
                 Err(_) => return NEG_EBADF,
             };
@@ -1010,6 +1018,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     };
 
     let writable = (flags & O_WRONLY != 0) || (flags & O_RDWR != 0);
+    let readable = flags & O_WRONLY == 0; // O_RDONLY(0) or O_RDWR(2) → readable
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
@@ -1052,6 +1061,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                         path: alloc::string::String::from(rel),
                     },
                     offset: initial_offset,
+                    readable,
                     writable,
                 });
                 log::info!("[open] {} → fd {} (tmpfs)", name, i);
@@ -1062,7 +1072,12 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         return NEG_EMFILE;
     }
 
-    // Fall through to ramdisk lookup.
+    // Fall through to ramdisk lookup — ramdisk is read-only.
+    if writable {
+        const NEG_EROFS: u64 = (-30_i64) as u64;
+        return NEG_EROFS;
+    }
+
     let file_name = name.trim_start_matches('/');
     let content = match crate::fs::ramdisk::get_file(file_name) {
         Some(c) => c,
@@ -1081,6 +1096,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                     content_len: content.len(),
                 },
                 offset: 0,
+                readable: true,
                 writable: false,
             });
             log::info!("[open] {} → fd {}", name, i);
@@ -1848,7 +1864,15 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
 // Phase 13: fsync(fd) — syscall 74 (no-op for tmpfs)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_fsync(_fd: u64) -> u64 {
+fn sys_linux_fsync(fd: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if !(3..MAX_FDS).contains(&fd_idx) {
+        return NEG_EBADF;
+    }
+    let exists = FD_TABLE.lock()[fd_idx].is_some();
+    if !exists {
+        return NEG_EBADF;
+    }
     0 // no-op: tmpfs has no persistence
 }
 

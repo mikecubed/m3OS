@@ -11,7 +11,7 @@
 |---|---|---|
 | A | tmpfs core data structure | ✅ done |
 | B | FD table + write syscalls | ✅ done |
-| C | VFS mount table + protocol | ✅ done |
+| C | Syscall-layer path routing | ✅ done |
 | D | Validation (userspace test + QEMU) | ✅ done |
 | E | Documentation + tasks.md | ✅ done |
 
@@ -43,7 +43,7 @@
 | P13-T015 | sys_linux_fsync (syscall 74) — no-op for tmpfs | ✅ |
 | P13-T016 | Update Linux syscall dispatch table with new entries | ✅ |
 
-## Track C — VFS Mount Table + Protocol
+## Track C — Syscall-Layer Path Routing
 
 | Task | Description | Status |
 |---|---|---|

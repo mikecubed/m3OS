@@ -29,6 +29,12 @@ use spin::Mutex;
 // Error type
 // ---------------------------------------------------------------------------
 
+/// Maximum size of a single tmpfs file (16 MiB).
+///
+/// Prevents userspace from exhausting the kernel heap via unbounded
+/// write/truncate calls.
+pub const MAX_FILE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Errors returned by tmpfs operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmpfsError {
@@ -44,6 +50,8 @@ pub enum TmpfsError {
     NotADirectory,
     /// The path is invalid (empty or malformed).
     InvalidPath,
+    /// File would exceed the maximum size limit.
+    NoSpace,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,9 +100,10 @@ pub struct Tmpfs {
 
 impl Tmpfs {
     /// Create a new empty tmpfs with an empty root directory.
+    ///
+    /// `BTreeMap::new()` is const-evaluable since Rust 1.66, so this
+    /// constructor can initialize the global `TMPFS` at compile time.
     const fn new() -> Self {
-        // BTreeMap::new() is not const, so we use a lazy init pattern.
-        // The actual initialization happens in `init()`.
         Tmpfs {
             root: TmpfsNode::Dir(DirData {
                 children: BTreeMap::new(),
@@ -203,7 +212,10 @@ impl Tmpfs {
         let node = self.get_node_mut(path)?;
         match node {
             TmpfsNode::File(file) => {
-                let end = offset + data.len();
+                let end = offset.checked_add(data.len()).ok_or(TmpfsError::NoSpace)?;
+                if end > MAX_FILE_SIZE {
+                    return Err(TmpfsError::NoSpace);
+                }
                 if end > file.content.len() {
                     file.content.resize(end, 0);
                 }
@@ -230,7 +242,8 @@ impl Tmpfs {
                 if offset >= file.content.len() {
                     return Ok(&[]);
                 }
-                let end = (offset + max_len).min(file.content.len());
+                // Use saturating_add to prevent overflow from userspace-controlled max_len.
+                let end = offset.saturating_add(max_len).min(file.content.len());
                 Ok(&file.content[offset..end])
             }
             TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
@@ -316,22 +329,47 @@ impl Tmpfs {
 
     /// Rename/move a file or directory from `old_path` to `new_path`.
     ///
-    /// Both paths must share the same parent directory in this simplified
-    /// implementation (no cross-directory moves).
+    /// Cross-directory moves are supported as long as both parent paths
+    /// resolve to existing directories.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), TmpfsError> {
-        // Extract the old node first.
+        // Validate destination first — don't remove the source until we know
+        // the destination is reachable (prevents data loss on error).
+        {
+            // Borrow self immutably to check the new path is valid.
+            let new_trimmed = new_path.trim_start_matches('/');
+            if new_trimmed.is_empty() {
+                return Err(TmpfsError::InvalidPath);
+            }
+            let new_parts: Vec<&str> = Self::components(new_path).collect();
+            if new_parts.is_empty() {
+                return Err(TmpfsError::InvalidPath);
+            }
+            // Walk parent components to verify they exist and are dirs.
+            let mut current = &self.root;
+            for part in &new_parts[..new_parts.len() - 1] {
+                current = match current {
+                    TmpfsNode::Dir(dir) => match dir.children.get(*part) {
+                        Some(child) => child,
+                        None => return Err(TmpfsError::NotFound),
+                    },
+                    TmpfsNode::File(_) => return Err(TmpfsError::NotADirectory),
+                };
+            }
+            if !matches!(current, TmpfsNode::Dir(_)) {
+                return Err(TmpfsError::NotADirectory);
+            }
+        }
+
+        // Now safe to remove the source — destination parent is valid.
         let (parent, old_name) = self.parent_and_name(old_path)?;
         let node = parent
             .children
             .remove(old_name)
             .ok_or(TmpfsError::NotFound)?;
 
-        // Now navigate to the new parent and insert.
-        // We need to re-borrow since parent_and_name borrows &mut self.
         let (new_parent, new_name) = self.parent_and_name(new_path)?;
         if new_parent.children.contains_key(new_name) {
-            // If target exists and is the same type, replace it (POSIX rename semantics).
-            // For simplicity, just overwrite.
+            // POSIX rename semantics: overwrite target if it exists.
             new_parent.children.remove(new_name);
         }
         new_parent.children.insert(new_name.to_string(), node);
@@ -343,6 +381,9 @@ impl Tmpfs {
     /// If `new_size` is larger than the current size, the file is extended
     /// with zero bytes.
     pub fn truncate(&mut self, path: &str, new_size: usize) -> Result<(), TmpfsError> {
+        if new_size > MAX_FILE_SIZE {
+            return Err(TmpfsError::NoSpace);
+        }
         let node = self.get_node_mut(path)?;
         match node {
             TmpfsNode::File(file) => {

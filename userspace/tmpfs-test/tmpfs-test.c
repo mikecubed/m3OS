@@ -33,7 +33,7 @@ static void fail(const char *name, const char *reason) {
 static void test_write_read_roundtrip(void) {
     const char *path = "/tmp/test.txt";
     const char *msg = "Hello from tmpfs!";
-    int msg_len = strlen(msg);
+    size_t msg_len = strlen(msg);
 
     /* Create and write */
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -41,8 +41,8 @@ static void test_write_read_roundtrip(void) {
         fail("write-read: open for write", "open returned < 0");
         return;
     }
-    int written = write(fd, msg, msg_len);
-    if (written != msg_len) {
+    ssize_t written = write(fd, msg, msg_len);
+    if (written < 0 || (size_t)written != msg_len) {
         fail("write-read: write", "short write");
         close(fd);
         return;
@@ -57,10 +57,10 @@ static void test_write_read_roundtrip(void) {
     }
     char buf[64];
     memset(buf, 0, sizeof(buf));
-    int nread = read(fd, buf, sizeof(buf));
+    ssize_t nread = read(fd, buf, sizeof(buf));
     close(fd);
 
-    if (nread != msg_len) {
+    if (nread < 0 || (size_t)nread != msg_len) {
         fail("write-read: read length", "wrong byte count");
         return;
     }
@@ -135,7 +135,7 @@ static void test_truncate(void) {
         return;
     }
     char buf[64];
-    int nread = read(fd, buf, sizeof(buf));
+    ssize_t nread = read(fd, buf, sizeof(buf));
     close(fd);
 
     if (nread != 5) {
@@ -167,7 +167,7 @@ static void test_append(void) {
         return;
     }
     char buf[64];
-    int nread = read(fd, buf, sizeof(buf));
+    ssize_t nread = read(fd, buf, sizeof(buf));
     close(fd);
 
     if (nread != 6) {
