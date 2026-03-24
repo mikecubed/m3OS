@@ -147,6 +147,21 @@ fn build_musl_bins() {
     let bins: &[(&str, &str)] = &[
         ("userspace/hello-c/hello.c", "hello"),
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
+        // Phase 14 core utilities
+        ("userspace/coreutils/echo.c", "echo"),
+        ("userspace/coreutils/true.c", "true"),
+        ("userspace/coreutils/false.c", "false"),
+        ("userspace/coreutils/cat.c", "cat"),
+        ("userspace/coreutils/ls.c", "ls"),
+        ("userspace/coreutils/pwd.c", "pwd"),
+        ("userspace/coreutils/mkdir.c", "mkdir"),
+        ("userspace/coreutils/rmdir.c", "rmdir"),
+        ("userspace/coreutils/rm.c", "rm"),
+        ("userspace/coreutils/cp.c", "cp"),
+        ("userspace/coreutils/mv.c", "mv"),
+        ("userspace/coreutils/env.c", "env"),
+        ("userspace/coreutils/sleep.c", "sleep"),
+        ("userspace/coreutils/grep.c", "grep"),
     ];
 
     for (src_rel, name) in bins {

@@ -60,6 +60,63 @@ const FILES: &[RamdiskFile] = &[
         name: "tmpfs-test.elf",
         content: include_bytes!("../../initrd/tmpfs-test.elf"),
     },
+    // Phase 14 core utilities (musl-linked C binaries).
+    RamdiskFile {
+        name: "echo.elf",
+        content: include_bytes!("../../initrd/echo.elf"),
+    },
+    RamdiskFile {
+        name: "true.elf",
+        content: include_bytes!("../../initrd/true.elf"),
+    },
+    RamdiskFile {
+        name: "false.elf",
+        content: include_bytes!("../../initrd/false.elf"),
+    },
+    RamdiskFile {
+        name: "cat.elf",
+        content: include_bytes!("../../initrd/cat.elf"),
+    },
+    RamdiskFile {
+        name: "ls.elf",
+        content: include_bytes!("../../initrd/ls.elf"),
+    },
+    RamdiskFile {
+        name: "pwd.elf",
+        content: include_bytes!("../../initrd/pwd.elf"),
+    },
+    RamdiskFile {
+        name: "mkdir.elf",
+        content: include_bytes!("../../initrd/mkdir.elf"),
+    },
+    RamdiskFile {
+        name: "rmdir.elf",
+        content: include_bytes!("../../initrd/rmdir.elf"),
+    },
+    RamdiskFile {
+        name: "rm.elf",
+        content: include_bytes!("../../initrd/rm.elf"),
+    },
+    RamdiskFile {
+        name: "cp.elf",
+        content: include_bytes!("../../initrd/cp.elf"),
+    },
+    RamdiskFile {
+        name: "mv.elf",
+        content: include_bytes!("../../initrd/mv.elf"),
+    },
+    RamdiskFile {
+        name: "env.elf",
+        content: include_bytes!("../../initrd/env.elf"),
+    },
+    RamdiskFile {
+        name: "sleep.elf",
+        content: include_bytes!("../../initrd/sleep.elf"),
+    },
+    RamdiskFile {
+        name: "grep.elf",
+        content: include_bytes!("../../initrd/grep.elf"),
+    },
 ];
 
 // ---------------------------------------------------------------------------

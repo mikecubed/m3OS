@@ -236,6 +236,8 @@ pub extern "C" fn syscall_handler(
         // Phase 14: pipe and dup2
         22 => sys_pipe(arg0),
         33 => sys_dup2(arg0, arg1),
+        // Phase 14: nanosleep
+        35 => sys_nanosleep(arg0),
         // IPC syscalls (Phase 6) — kernel-task only.
         4 | 7 | 10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
@@ -657,6 +659,40 @@ fn sys_getpgid(pid: u64) -> u64 {
         Some(p) => p.pgid as u64,
         None => NEG_EINVAL,
     }
+}
+
+/// `nanosleep(req, rem)` — sleep for the specified time (syscall 35).
+///
+/// Reads a `timespec` struct from user memory and yield-loops for the
+/// requested number of timer ticks.
+fn sys_nanosleep(req_ptr: u64) -> u64 {
+    if req_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    let mut ts = [0u8; 16]; // struct timespec { tv_sec: i64, tv_nsec: i64 }
+    if crate::mm::user_mem::copy_from_user(&mut ts, req_ptr).is_err() {
+        return NEG_EFAULT;
+    }
+    let secs = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+    // Each PIT tick is ~10ms (100 Hz). Convert seconds to ticks.
+    let ticks = (secs as u64).saturating_mul(100);
+    let start = crate::arch::x86_64::interrupts::tick_count();
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
+        crate::task::yield_now();
+        crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        // Check for signals (e.g., SIGINT during sleep).
+        if pid != 0 {
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table.find(pid) {
+                if p.pending_signals != 0 {
+                    drop(table);
+                    return (-4_i64) as u64; // EINTR
+                }
+            }
+        }
+    }
+    0
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
