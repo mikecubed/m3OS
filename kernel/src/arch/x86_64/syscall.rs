@@ -159,31 +159,16 @@ pub extern "C" fn syscall_handler(
 // ---------------------------------------------------------------------------
 
 fn sys_debug_print(ptr: u64, len: u64) -> u64 {
-    use crate::mm::elf::ELF_STACK_TOP;
-    use crate::mm::user_space::{
-        USER_CODE_BASE, USER_CODE_PAGES, USER_STACK_PAGES, USER_STACK_TOP,
-    };
-
-    // Reference the loader's constant so stack sizing stays in sync.
-    let elf_stack_pages = crate::mm::elf::STACK_PAGES;
-
     if len > 4096 {
         return u64::MAX;
     }
-    let code_end = USER_CODE_BASE + USER_CODE_PAGES * 4096;
-    let stack_start = USER_STACK_TOP - USER_STACK_PAGES * 4096;
-    let elf_stack_start = ELF_STACK_TOP - elf_stack_pages * 4096;
-    let ptr_end = ptr.saturating_add(len);
-
-    let in_code = ptr >= USER_CODE_BASE && ptr_end <= code_end;
-    let in_stack = ptr >= stack_start && ptr_end <= USER_STACK_TOP;
-    let in_elf_stack = ptr >= elf_stack_start && ptr_end <= ELF_STACK_TOP;
-    if !in_code && !in_stack && !in_elf_stack {
+    let mut buf = [0u8; 4096];
+    let dst = &mut buf[..len as usize];
+    if crate::mm::user_mem::copy_from_user(dst, ptr).is_err() {
+        log::warn!("[sys_debug_print] invalid user pointer {:#x}+{}", ptr, len);
         return u64::MAX;
     }
-    // Safety: we checked the bounds; kernel+user share the address space.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    if let Ok(s) = core::str::from_utf8(bytes) {
+    if let Ok(s) = core::str::from_utf8(dst) {
         log::info!("[userspace] {}", s.trim_end_matches('\n'));
     }
     0
@@ -234,12 +219,8 @@ fn sys_exit(code: i32) -> ! {
             proc.exit_code = Some(code);
         }
     }
-    // Block the kernel task permanently; no sender will ever wake it.
-    crate::task::block_current_on_recv();
-    // Unreachable — satisfy the `!` return type.
-    loop {
-        x86_64::instructions::hlt();
-    }
+    // Mark the kernel task as dead so the scheduler reclaims it.
+    crate::task::mark_current_dead();
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
@@ -340,8 +321,15 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
         // Build the SysV AMD64 ABI initial stack with argv[0] = binary name.
         let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
-        let user_rsp =
-            unsafe { crate::mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+        let user_rsp = match unsafe {
+            crate::mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv)
+        } {
+            Ok(rsp) => rsp,
+            Err(e) => {
+                log::warn!("[execve] ABI stack setup failed: {:?}", e);
+                return u64::MAX;
+            }
+        };
         (loaded, user_rsp)
     };
 
@@ -360,7 +348,14 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
         use x86_64::registers::control::{Cr3, Cr3Flags};
+        // Capture old CR3 before switching so we can free its frames after.
+        let (old_cr3, _) = Cr3::read();
+        let old_cr3_phys = old_cr3.start_address().as_u64();
         Cr3::write(new_cr3, Cr3Flags::empty());
+        // Free the old page table's user-space frames now that CR3 no longer
+        // points to it. The bump allocator makes this a no-op today; the
+        // real reclamation happens in Phase 13 when a free list is added.
+        crate::mm::free_process_page_table(old_cr3_phys);
         // Update TSS.RSP0 so interrupts from ring 3 use the correct kernel stack.
         let kstack_top = crate::process::PROCESS_TABLE
             .lock()
@@ -418,20 +413,10 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
         if let Some(code) = result {
             // Write wstatus in Linux-compatible encoding: exit code in bits 15:8.
             if status_ptr != 0 {
-                // Validate: must be 4-byte aligned and within the user address
-                // range (below the 128 TiB canonical boundary).
-                let ptr_end = status_ptr.saturating_add(4);
-                let in_user = status_ptr.is_multiple_of(4) && ptr_end <= 0x0000_8000_0000_0000u64;
-                if in_user {
-                    // SAFETY: validated above; kernel+user share one AS (Phase 11).
-                    unsafe {
-                        (status_ptr as *mut i32).write(code << 8);
-                    }
-                } else {
-                    log::warn!(
-                        "[waitpid] invalid status_ptr {:#x} — skipping write",
-                        status_ptr
-                    );
+                let wstatus = code << 8;
+                let bytes = wstatus.to_ne_bytes();
+                if crate::mm::user_mem::copy_to_user(status_ptr, &bytes).is_err() {
+                    log::warn!("[waitpid] copy_to_user status_ptr {:#x} failed", status_ptr);
                 }
             }
             log::info!("[waitpid] pid {} exited with code {}", target_pid, code);
@@ -459,10 +444,9 @@ fn path_name_buf(ptr: u64, len: u64, buf: &mut [u8; 255]) -> Option<&str> {
     if copy_len == 0 || ptr == 0 {
         return None;
     }
-    // SAFETY: kernel + user share one address space (Phase 11); ptr is
-    // a userspace stack address pointing to a valid string for this syscall.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, copy_len) };
-    buf[..copy_len].copy_from_slice(bytes);
+    if crate::mm::user_mem::copy_from_user(&mut buf[..copy_len], ptr).is_err() {
+        return None;
+    }
     core::str::from_utf8(&buf[..copy_len]).ok()
 }
 
@@ -594,7 +578,7 @@ pub fn init() {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
     unsafe {
         Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
     }

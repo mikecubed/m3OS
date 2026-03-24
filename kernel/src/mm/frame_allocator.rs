@@ -139,6 +139,17 @@ pub fn allocated_count() -> usize {
     FRAME_ALLOCATOR.0.lock().frames_allocated
 }
 
+/// Return a frame to the allocator.
+///
+/// Currently a no-op because the frame allocator is a bump allocator that
+/// cannot reclaim frames. The stub is required so that `free_process_page_table`
+/// compiles. Proper frame reclamation with a free-list is planned for Phase 13.
+#[allow(unused_variables)]
+pub fn free_frame(_phys: u64) {
+    // Bump allocator: frames are not reclaimed.
+    // Phase 13+ will add a free list.
+}
+
 #[inline]
 fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)

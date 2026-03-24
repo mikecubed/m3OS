@@ -385,7 +385,8 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>, phys_off: u64) -> Res
 /// frames so writes are performed via the physical-memory offset — valid
 /// regardless of the currently-active CR3.
 ///
-/// Returns the new RSP value (virtual address of `argc`).
+/// Returns the new RSP value (virtual address of `argc`) or an error if any
+/// stack address is unmapped.
 ///
 /// # Safety
 /// The stack pages `[stack_top - STACK_PAGES*4096, stack_top)` must already
@@ -395,19 +396,18 @@ pub unsafe fn setup_abi_stack(
     mapper: &OffsetPageTable<'_>,
     phys_off: u64,
     argv: &[&[u8]],
-) -> u64 {
+) -> Result<u64, ElfError> {
     // Helper: translate a virtual address in the target page table to a kernel
     // writable pointer via the physical-memory offset.
-    let virt_to_kptr = |vaddr: u64| -> *mut u8 {
+    let virt_to_kptr = |vaddr: u64| -> Result<*mut u8, ElfError> {
         use x86_64::structures::paging::mapper::TranslateResult;
         match mapper.translate(VirtAddr::new(vaddr)) {
             TranslateResult::Mapped { frame, offset, .. } => {
-                (phys_off + frame.start_address().as_u64() + offset) as *mut u8
+                Ok((phys_off + frame.start_address().as_u64() + offset) as *mut u8)
             }
-            _ => panic!(
-                "setup_abi_stack: unmapped stack address {:#x}; caller must map stack pages first",
-                vaddr
-            ),
+            _ => Err(ElfError::MappingFailed(
+                "setup_abi_stack: unmapped stack address",
+            )),
         }
     };
 
@@ -421,10 +421,10 @@ pub unsafe fn setup_abi_stack(
         cursor -= len as u64;
         // Write the string bytes (null-terminated).
         for (j, &b) in arg.iter().enumerate() {
-            let kptr = virt_to_kptr(cursor + j as u64);
+            let kptr = virt_to_kptr(cursor + j as u64)?;
             kptr.write(b);
         }
-        let kptr = virt_to_kptr(cursor + arg.len() as u64);
+        let kptr = virt_to_kptr(cursor + arg.len() as u64)?;
         kptr.write(0); // null terminator
         arg_ptrs.push(cursor);
     }
@@ -438,24 +438,24 @@ pub unsafe fn setup_abi_stack(
 
     // Aux vector: two NULLs (AT_NULL = 0, value = 0).
     cursor -= 8;
-    let kptr = virt_to_kptr(cursor);
+    let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(0); // AT_NULL value
     cursor -= 8;
-    let kptr = virt_to_kptr(cursor);
+    let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(0); // AT_NULL type
 
     // envp: NULL terminator only (P11-T011: minimal empty environment).
     cursor -= 8;
-    let kptr = virt_to_kptr(cursor);
+    let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(0);
 
     // argv: NULL terminator, then pointers in reverse order.
     cursor -= 8;
-    let kptr = virt_to_kptr(cursor);
+    let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(0); // argv[argc] = NULL
     for &ptr in arg_ptrs.iter().rev() {
         cursor -= 8;
-        let kptr = virt_to_kptr(cursor);
+        let kptr = virt_to_kptr(cursor)?;
         (kptr as *mut u64).write(ptr);
     }
 
@@ -468,11 +468,11 @@ pub unsafe fn setup_abi_stack(
 
     // argc.
     cursor -= 8;
-    let kptr = virt_to_kptr(cursor);
+    let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(argv.len() as u64);
 
     // Return rsp pointing at argc.
-    cursor
+    Ok(cursor)
 }
 
 // ---------------------------------------------------------------------------

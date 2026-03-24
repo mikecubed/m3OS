@@ -4,6 +4,7 @@ pub mod frame_allocator;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;
+pub mod user_mem;
 pub mod user_space;
 
 use bootloader_api::BootInfo;
@@ -90,6 +91,72 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
     }
 
     Some(frame)
+}
+
+/// Free all user-space page table frames for the given PML4 physical address.
+///
+/// Walks PML4 indices 0–255 (user half), frees every mapped user-accessible
+/// physical frame, and frees the page-table structure frames themselves.
+///
+/// Frame reclamation is a stub in the bump allocator (no-op); the real benefit
+/// today is correctness — the function documents the ownership transfer and
+/// will become fully effective once Phase 13 adds a free list.
+///
+/// # Safety
+///
+/// `cr3_phys` must be the physical address of a valid, now-unreachable PML4
+/// that is no longer loaded in CR3. No other code may access the page table
+/// after this call.
+#[allow(dead_code)]
+pub fn free_process_page_table(cr3_phys: u64) {
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+    let phys_off = VirtAddr::new(phys_offset());
+    // SAFETY: cr3_phys is a valid PML4 frame being freed. The caller guarantees
+    // it is no longer active (not in CR3) and has exclusive ownership.
+    unsafe {
+        let pml4: &PageTable = &*(phys_off + cr3_phys).as_ptr::<PageTable>();
+        for p4 in 0usize..256 {
+            let p4e = &pml4[p4];
+            if !p4e.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pdpt: &PageTable = &*(phys_off + p4e.addr().as_u64()).as_ptr::<PageTable>();
+            for p3 in 0usize..512 {
+                let p3e = &pdpt[p3];
+                if !p3e.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    continue;
+                }
+                let pd: &PageTable = &*(phys_off + p3e.addr().as_u64()).as_ptr::<PageTable>();
+                for p2 in 0usize..512 {
+                    let p2e = &pd[p2];
+                    if !p2e.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
+                    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let pt: &PageTable = &*(phys_off + p2e.addr().as_u64()).as_ptr::<PageTable>();
+                    for p1 in 0usize..512 {
+                        let pte = &pt[p1];
+                        if !pte.flags().contains(PageTableFlags::PRESENT) {
+                            continue;
+                        }
+                        if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                            continue;
+                        }
+                        frame_allocator::free_frame(pte.addr().as_u64());
+                    }
+                    frame_allocator::free_frame(p2e.addr().as_u64()); // free PT frame
+                }
+                frame_allocator::free_frame(p3e.addr().as_u64()); // free PD frame
+            }
+            frame_allocator::free_frame(p4e.addr().as_u64()); // free PDPT frame
+        }
+        frame_allocator::free_frame(cr3_phys); // free PML4 frame
+    }
 }
 
 /// Build an `OffsetPageTable` mapper over an arbitrary PML4 frame.

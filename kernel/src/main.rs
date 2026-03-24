@@ -1038,7 +1038,13 @@ fn run_elf_and_report(name: &'static str) {
         let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp =
-            unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+            match unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) } {
+                Ok(rsp) => rsp,
+                Err(e) => {
+                    log::warn!("[p11] ABI stack setup failed: {:?}", e);
+                    return;
+                }
+            };
         (loaded, user_rsp)
     };
 
