@@ -645,131 +645,6 @@ fn shell_print(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, s: &s
 }
 
 /// Dispatch a parsed command line to the appropriate built-in.
-fn dispatch_command(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    vfs_ep: ipc::endpoint::EndpointId,
-    line: &str,
-) {
-    if line.is_empty() {
-        return;
-    }
-    let mut parts = line.splitn(2, ' ');
-    let cmd = parts.next().unwrap_or("");
-    let args = parts.next().unwrap_or("").trim();
-    match cmd {
-        "help" => {
-            shell_print(
-                my_id,
-                console_ep,
-                "commands: help  echo <text>  ls  cat <file>\n",
-            );
-        }
-        "echo" => {
-            shell_print(my_id, console_ep, args);
-            shell_print(my_id, console_ep, "\n");
-        }
-        "ls" => cmd_ls(my_id, console_ep, vfs_ep),
-        "cat" => cmd_cat(my_id, console_ep, vfs_ep, args),
-        _ => {
-            let err_msg = alloc::format!("unknown command: {}\n", cmd);
-            shell_print(my_id, console_ep, &err_msg);
-        }
-    }
-}
-
-/// Built-in `ls`: list files via VFS FILE_LIST.
-fn cmd_ls(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    vfs_ep: ipc::endpoint::EndpointId,
-) {
-    let req = ipc::Message::new(crate::fs::protocol::FILE_LIST);
-    let reply = ipc::endpoint::call_msg(my_id, vfs_ep, req);
-    if reply.label == u64::MAX {
-        shell_print(my_id, console_ep, "ls: error\n");
-        return;
-    }
-    let ptr = reply.data[0] as *const u8;
-    let len = reply.data[1] as usize;
-    if ptr.is_null() || len > crate::fs::protocol::MAX_LIST_LEN {
-        shell_print(my_id, console_ep, "ls: error\n");
-        return;
-    }
-    if len == 0 {
-        shell_print(my_id, console_ep, "(no files)\n");
-        return;
-    }
-    // SAFETY: The VFS protocol returns a pointer to a static FILE_LIST buffer.
-    // The pointer is non-null (checked above) and len is capped to MAX_LIST_LEN.
-    let list = unsafe { core::slice::from_raw_parts(ptr, len) };
-    for name in list.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-        if let Ok(s) = core::str::from_utf8(name) {
-            shell_print(my_id, console_ep, s);
-            shell_print(my_id, console_ep, "\n");
-        }
-    }
-}
-
-/// Built-in `cat`: open, read, and print a file via VFS.
-fn cmd_cat(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    vfs_ep: ipc::endpoint::EndpointId,
-    filename: &str,
-) {
-    if filename.is_empty() {
-        shell_print(my_id, console_ep, "usage: cat <file>\n");
-        return;
-    }
-
-    // FILE_OPEN
-    let open_msg = ipc::Message::with2(
-        crate::fs::protocol::FILE_OPEN,
-        filename.as_ptr() as u64,
-        filename.len() as u64,
-    );
-    let open_reply = ipc::endpoint::call_msg(my_id, vfs_ep, open_msg);
-    if open_reply.label == u64::MAX || open_reply.data[0] == u64::MAX {
-        shell_print(my_id, console_ep, "cat: file not found\n");
-        return;
-    }
-    let fd = open_reply.data[0];
-
-    // FILE_READ (offset=0, max=MAX_READ_LEN)
-    let read_msg = ipc::Message {
-        label: crate::fs::protocol::FILE_READ,
-        data: [fd, 0, crate::fs::protocol::MAX_READ_LEN as u64, 0],
-    };
-    let read_reply = ipc::endpoint::call_msg(my_id, vfs_ep, read_msg);
-    let ptr = read_reply.data[0] as *const u8;
-    let len = read_reply.data[1] as usize;
-    if read_reply.label == u64::MAX || ptr.is_null() || len > crate::fs::protocol::MAX_READ_LEN {
-        shell_print(my_id, console_ep, "cat: read error\n");
-    } else {
-        if len == 0 {
-            shell_print(my_id, console_ep, "(empty)\n");
-        } else {
-            // SAFETY: Phase 9 — fat_server returns a pointer into static ramdisk
-            // content. Pointer is non-null (checked above) and len is bounded
-            // by MAX_READ_LEN (4096).
-            let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-            if let Ok(text) = core::str::from_utf8(bytes) {
-                shell_print(my_id, console_ep, text);
-                if !text.ends_with('\n') {
-                    shell_print(my_id, console_ep, "\n");
-                }
-            } else {
-                shell_print(my_id, console_ep, "(binary)\n");
-            }
-        }
-    }
-
-    // FILE_CLOSE
-    let close_msg = ipc::Message::with1(crate::fs::protocol::FILE_CLOSE, fd);
-    let _ = ipc::endpoint::call_msg(my_id, vfs_ep, close_msg);
-}
-
 /// Stdin feeder task (Phase 14, Track E).
 ///
 /// Reads scancodes from the keyboard server, decodes them to characters,
@@ -866,82 +741,473 @@ fn stdin_feeder_task() -> ! {
     }
 }
 
-/// Shell task: interactive line-oriented command interpreter (T005–T007).
+/// Shell task: fork+exec interactive command interpreter (Phase 14, Track H).
 ///
-/// Reads scancodes via KBD_READ IPC, echoes characters to the console,
-/// and dispatches built-in commands (help, echo, ls, cat) on Enter.
+/// Reads lines from the kernel stdin buffer, parses commands with pipes
+/// and redirection, and uses fork+exec to launch external ELF binaries.
 fn shell_task() -> ! {
     let my_id = task::current_task_id().expect("[shell] no task id");
-
-    let console_ep = ipc::registry::lookup("console").expect("[shell] console service not found");
-    let kbd_ep = ipc::registry::lookup("kbd").expect("[shell] kbd service not found");
-    let vfs_ep = ipc::registry::lookup("vfs").expect("[shell] vfs service not found");
+    let console_ep = ipc::registry::lookup("console").expect("[shell] console not found");
 
     shell_print(my_id, console_ep, "[shell] ready — type 'help'\n");
-
-    let mut line: Vec<u8> = Vec::new();
-    let mut shift = false;
-    let mut kbd_error_logged = false;
-
     shell_print(my_id, console_ep, "> ");
 
+    let mut line_buf: Vec<u8> = Vec::new();
+
+    // Environment variables.
+    let mut env: Vec<(String, String)> = Vec::new();
+    env.push((String::from("PATH"), String::from("/bin")));
+
+    // Job list for background processes.
+    let mut bg_jobs: Vec<(u32, crate::process::Pid)> = Vec::new(); // (job_num, pid)
+    let mut next_job: u32 = 1;
+
     loop {
-        // Request one scancode from the keyboard server.
-        let kbd_req = ipc::Message::new(KBD_READ);
-        let kbd_reply = ipc::endpoint::call_msg(my_id, kbd_ep, kbd_req);
-        if kbd_reply.label == u64::MAX {
-            if !kbd_error_logged {
-                log::warn!("[shell] KBD_READ failed; yielding before retry");
-                kbd_error_logged = true;
-            }
+        // Read from stdin buffer.
+        let mut tmp = [0u8; 256];
+        let n = stdin::read(&mut tmp);
+        if n == 0 {
             task::yield_now();
             continue;
         }
-        kbd_error_logged = false;
-        let sc = kbd_reply.data[0] as u8;
 
-        // Key-release (break) codes: bit 7 set.
-        if sc >= 0x80 {
-            let make = sc & 0x7F;
-            if make == 0x2A || make == 0x36 {
-                shift = false;
+        // Accumulate into line buffer.
+        for &b in &tmp[..n] {
+            if b == b'\n' {
+                let line_str = String::from(core::str::from_utf8(&line_buf).unwrap_or("").trim());
+                line_buf.clear();
+
+                if !line_str.is_empty() {
+                    shell_execute(
+                        my_id,
+                        console_ep,
+                        &line_str,
+                        &mut env,
+                        &mut bg_jobs,
+                        &mut next_job,
+                    );
+                }
+
+                // Reap finished background jobs.
+                bg_jobs.retain(|&(job, pid)| {
+                    let table = process::PROCESS_TABLE.lock();
+                    match table.find(pid) {
+                        Some(p) if p.state == process::ProcessState::Zombie => {
+                            drop(table);
+                            let mut table = process::PROCESS_TABLE.lock();
+                            table.reap(pid);
+                            let msg = alloc::format!("[{}] done  pid {}\n", job, pid);
+                            shell_print(my_id, console_ep, &msg);
+                            false
+                        }
+                        None => false,
+                        _ => true,
+                    }
+                });
+
+                shell_print(my_id, console_ep, "> ");
+            } else {
+                line_buf.push(b);
             }
-            continue;
-        }
-
-        // Shift make codes.
-        if sc == 0x2A || sc == 0x36 {
-            shift = true;
-            continue;
-        }
-
-        // Enter (0x1C): process line.
-        if sc == 0x1C {
-            shell_print(my_id, console_ep, "\n");
-            let cmd_line =
-                alloc::string::String::from(core::str::from_utf8(&line).unwrap_or("").trim());
-            line.clear();
-            dispatch_command(my_id, console_ep, vfs_ep, &cmd_line);
-            shell_print(my_id, console_ep, "> ");
-            continue;
-        }
-
-        // Backspace (0x0E): remove last character from buffer.
-        if sc == 0x0E {
-            if line.pop().is_some() {
-                shell_print(my_id, console_ep, "\x08");
-            }
-            continue;
-        }
-
-        // Printable character.
-        if let Some(c) = scancode_to_char(sc, shift) {
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            line.extend_from_slice(s.as_bytes());
-            shell_print(my_id, console_ep, s);
         }
     }
+}
+
+/// Execute a shell command line (may contain pipes and redirection).
+fn shell_execute(
+    my_id: task::TaskId,
+    console_ep: ipc::endpoint::EndpointId,
+    line: &str,
+    env: &mut Vec<(String, String)>,
+    bg_jobs: &mut Vec<(u32, crate::process::Pid)>,
+    next_job: &mut u32,
+) {
+    // Expand $VAR references.
+    let expanded = expand_vars(line, env);
+    let line = expanded.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    // Check for background `&`.
+    let (line, background) = if line.ends_with('&') {
+        (line.trim_end_matches('&').trim(), true)
+    } else {
+        (line, false)
+    };
+
+    // Split on `|` for pipeline.
+    let stages: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
+
+    if stages.len() == 1 {
+        // Single command — check builtins first.
+        let parts: Vec<&str> = stages[0].splitn(2, ' ').collect();
+        let cmd = parts[0];
+        let args_str = if parts.len() > 1 { parts[1].trim() } else { "" };
+
+        match cmd {
+            "help" => {
+                shell_print(my_id, console_ep,
+                    "builtins: help cd exit export unset env fg bg\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
+                return;
+            }
+            "cd" => {
+                // stub: chdir always succeeds in our OS
+                if !args_str.is_empty() {
+                    set_env(env, "PWD", args_str);
+                }
+                return;
+            }
+            "exit" => {
+                shell_print(my_id, console_ep, "exit\n");
+                loop {
+                    task::yield_now();
+                }
+            }
+            "export" => {
+                if let Some(eq) = args_str.find('=') {
+                    let key = &args_str[..eq];
+                    let val = &args_str[eq + 1..];
+                    set_env(env, key, val);
+                }
+                return;
+            }
+            "unset" => {
+                env.retain(|(k, _)| k != args_str);
+                return;
+            }
+            "env" => {
+                for (k, v) in env.iter() {
+                    let line = alloc::format!("{}={}\n", k, v);
+                    shell_print(my_id, console_ep, &line);
+                }
+                return;
+            }
+            "fg" => {
+                if let Some(&(job, pid)) = bg_jobs.last() {
+                    let msg = alloc::format!("[{}] fg  pid {}\n", job, pid);
+                    shell_print(my_id, console_ep, &msg);
+                    // Set foreground group and send SIGCONT.
+                    process::FG_PGID.store(pid, core::sync::atomic::Ordering::Relaxed);
+                    process::send_signal(pid, process::SIGCONT);
+                    // Wait for the process.
+                    wait_for_child(pid);
+                    process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
+                    bg_jobs.retain(|&(_, p)| p != pid);
+                }
+                return;
+            }
+            "bg" => {
+                if let Some(&(_job, pid)) = bg_jobs.last() {
+                    process::send_signal(pid, process::SIGCONT);
+                }
+                return;
+            }
+            _ => {} // fall through to fork+exec
+        }
+
+        // Fork+exec for external command.
+        shell_fork_exec(
+            my_id, console_ep, stages[0], env, background, bg_jobs, next_job,
+        );
+    } else {
+        // Pipeline: fork two children connected by a pipe.
+        shell_pipeline(my_id, console_ep, &stages, env);
+    }
+}
+
+/// Fork and exec a single command (with optional redirection).
+fn shell_fork_exec(
+    my_id: task::TaskId,
+    console_ep: ipc::endpoint::EndpointId,
+    cmd_line: &str,
+    env: &[(String, String)],
+    background: bool,
+    bg_jobs: &mut Vec<(u32, crate::process::Pid)>,
+    next_job: &mut u32,
+) {
+    // Parse redirection: > file, >> file, < file.
+    let mut parts: Vec<&str> = Vec::new();
+    let mut stdout_file: Option<&str> = None;
+    let mut stdout_append = false;
+    let mut stdin_file: Option<&str> = None;
+    let mut iter = cmd_line.split_whitespace();
+    while let Some(tok) = iter.next() {
+        if tok == ">" {
+            stdout_file = iter.next();
+            stdout_append = false;
+        } else if tok == ">>" {
+            stdout_file = iter.next();
+            stdout_append = true;
+        } else if let Some(rest) = tok.strip_prefix('>') {
+            stdout_file = Some(rest);
+            stdout_append = false;
+        } else if tok == "<" {
+            stdin_file = iter.next();
+        } else if let Some(rest) = tok.strip_prefix('<') {
+            stdin_file = Some(rest);
+        } else {
+            parts.push(tok);
+        }
+    }
+
+    if parts.is_empty() {
+        return;
+    }
+
+    let cmd_name = parts[0];
+    // Resolve command: try with .elf extension.
+    let elf_name = if cmd_name.ends_with(".elf") {
+        String::from(cmd_name)
+    } else {
+        alloc::format!("{}.elf", cmd_name)
+    };
+
+    // Check if the ELF exists in ramdisk.
+    if fs::ramdisk::get_file(&elf_name).is_none() {
+        let msg = alloc::format!("{}: command not found\n", cmd_name);
+        shell_print(my_id, console_ep, &msg);
+        return;
+    }
+
+    // Build the child process via run_elf_and_fork.
+    let child_pid = match spawn_user_process(&elf_name, &parts, env) {
+        Some(pid) => pid,
+        None => {
+            shell_print(my_id, console_ep, "fork: failed\n");
+            return;
+        }
+    };
+
+    let _ = (stdout_file, stdout_append, stdin_file); // TODO: wire redirection in a future commit
+
+    if background {
+        let job = *next_job;
+        *next_job += 1;
+        bg_jobs.push((job, child_pid));
+        let msg = alloc::format!("[{}] {}\n", job, child_pid);
+        shell_print(my_id, console_ep, &msg);
+    } else {
+        // Set foreground process group.
+        process::FG_PGID.store(child_pid, core::sync::atomic::Ordering::Relaxed);
+        wait_for_child(child_pid);
+        process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Pipeline: connect two commands with a pipe.
+fn shell_pipeline(
+    my_id: task::TaskId,
+    console_ep: ipc::endpoint::EndpointId,
+    stages: &[&str],
+    env: &[(String, String)],
+) {
+    if stages.len() != 2 {
+        shell_print(my_id, console_ep, "only two-stage pipelines supported\n");
+        return;
+    }
+
+    // Parse each stage.
+    let parts0: Vec<&str> = stages[0].split_whitespace().collect();
+    let parts1: Vec<&str> = stages[1].split_whitespace().collect();
+    if parts0.is_empty() || parts1.is_empty() {
+        return;
+    }
+
+    let elf0 = if parts0[0].ends_with(".elf") {
+        String::from(parts0[0])
+    } else {
+        alloc::format!("{}.elf", parts0[0])
+    };
+    let elf1 = if parts1[0].ends_with(".elf") {
+        String::from(parts1[0])
+    } else {
+        alloc::format!("{}.elf", parts1[0])
+    };
+
+    if fs::ramdisk::get_file(&elf0).is_none() {
+        let msg = alloc::format!("{}: command not found\n", parts0[0]);
+        shell_print(my_id, console_ep, &msg);
+        return;
+    }
+    if fs::ramdisk::get_file(&elf1).is_none() {
+        let msg = alloc::format!("{}: command not found\n", parts1[0]);
+        shell_print(my_id, console_ep, &msg);
+        return;
+    }
+
+    // Create a pipe.
+    let pipe_id = pipe::create_pipe();
+
+    // Spawn first child (stdout → pipe write end).
+    let pid0 = match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id)) {
+        Some(pid) => pid,
+        None => return,
+    };
+
+    // Spawn second child (stdin ← pipe read end).
+    let pid1 = match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None) {
+        Some(pid) => pid,
+        None => return,
+    };
+
+    // Close our copies of the pipe ends so EOF propagates.
+    pipe::pipe_close_writer(pipe_id);
+    pipe::pipe_close_reader(pipe_id);
+
+    // Wait for both children.
+    wait_for_child(pid0);
+    wait_for_child(pid1);
+}
+
+/// Spawn a userspace ELF process with optional pipe redirection.
+///
+/// `stdin_pipe`: if Some, FD 0 reads from this pipe.
+/// `stdout_pipe`: if Some, FD 1 writes to this pipe.
+fn spawn_user_process_with_pipe(
+    elf_name: &str,
+    argv: &[&str],
+    env: &[(String, String)],
+    stdin_pipe: Option<usize>,
+    stdout_pipe: Option<usize>,
+) -> Option<crate::process::Pid> {
+    use crate::mm::elf::load_elf_into;
+
+    let data = fs::ramdisk::get_file(elf_name)?;
+    if data.is_empty() {
+        return None;
+    }
+
+    let new_cr3 = mm::new_process_page_table()?;
+    let phys_off = mm::phys_offset();
+
+    let argv_bytes: Vec<Vec<u8>> = argv.iter().map(|s| Vec::from(s.as_bytes())).collect();
+    let argv_refs: Vec<&[u8]> = argv_bytes.iter().map(|v| v.as_slice()).collect();
+
+    let envp_strs: Vec<String> = env
+        .iter()
+        .map(|(k, v)| alloc::format!("{}={}", k, v))
+        .collect();
+    let envp_refs: Vec<&[u8]> = envp_strs.iter().map(|s| s.as_bytes()).collect();
+
+    let (loaded, user_rsp) = {
+        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
+        let loaded = unsafe { load_elf_into(&mut mapper, phys_off, data) }.ok()?;
+        let user_rsp = unsafe {
+            mm::elf::setup_abi_stack_with_envp(
+                loaded.stack_top,
+                &mapper,
+                phys_off,
+                &argv_refs,
+                &envp_refs,
+                loaded.phdr_vaddr,
+                loaded.phnum,
+            )
+        }
+        .ok()?;
+        (loaded, user_rsp)
+    };
+
+    let mut fd_table = process::new_fd_table_pub();
+
+    // Wire pipe FDs if requested.
+    if let Some(pipe_id) = stdin_pipe {
+        fd_table[0] = Some(process::FdEntry {
+            backend: process::FdBackend::PipeRead { pipe_id },
+            offset: 0,
+            readable: true,
+            writable: false,
+        });
+    }
+    if let Some(pipe_id) = stdout_pipe {
+        fd_table[1] = Some(process::FdEntry {
+            backend: process::FdBackend::PipeWrite { pipe_id },
+            offset: 0,
+            readable: false,
+            writable: true,
+        });
+    }
+
+    let pid = process::spawn_process_with_cr3_and_fds(
+        0,
+        loaded.entry,
+        user_rsp,
+        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+        0,
+        0,
+        fd_table,
+    );
+
+    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    task::spawn(process::fork_child_trampoline, "shell-child");
+
+    Some(pid)
+}
+
+/// Spawn a userspace process (no pipe redirection).
+fn spawn_user_process(
+    elf_name: &str,
+    argv: &[&str],
+    env: &[(String, String)],
+) -> Option<crate::process::Pid> {
+    spawn_user_process_with_pipe(elf_name, argv, env, None, None)
+}
+
+/// Wait for a child process to exit (spin-yield).
+fn wait_for_child(pid: crate::process::Pid) {
+    loop {
+        let state = {
+            let table = process::PROCESS_TABLE.lock();
+            table.find(pid).map(|p| p.state)
+        };
+        match state {
+            Some(process::ProcessState::Zombie) => {
+                let mut table = process::PROCESS_TABLE.lock();
+                table.reap(pid);
+                break;
+            }
+            None => break,
+            _ => {
+                task::yield_now();
+            }
+        }
+    }
+}
+
+/// Expand $VAR references in a string.
+fn expand_vars(s: &str, env: &[(String, String)]) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            let mut var = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_alphanumeric() || nc == '_' {
+                    var.push(nc);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if let Some((_, v)) = env.iter().find(|(k, _)| k == &var) {
+                result.push_str(v);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Set or update an environment variable.
+fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
+    for (k, v) in env.iter_mut() {
+        if k == key {
+            *v = String::from(val);
+            return;
+        }
+    }
+    env.push((String::from(key), String::from(val)));
 }
 
 /// Idle task: halts the CPU between timer ticks.

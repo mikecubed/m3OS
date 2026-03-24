@@ -105,6 +105,12 @@ pub struct FdEntry {
 const NONE_FD: Option<FdEntry> = None;
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
+/// Public accessor for use by the shell task when spawning processes.
+pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
+    new_fd_table()
+}
+
+/// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
 fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
     let mut table = [NONE_FD; MAX_FDS];
     table[0] = Some(FdEntry {
