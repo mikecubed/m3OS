@@ -181,8 +181,11 @@ fn parse_phdr(data: &[u8], base: usize, size: usize) -> Result<Phdr, ElfError> {
     if size < PHDR_MIN_SIZE {
         return Err(ElfError::TruncatedProgramHeader);
     }
+    let end = base
+        .checked_add(size)
+        .ok_or(ElfError::TruncatedProgramHeader)?;
     let ph = data
-        .get(base..base + size)
+        .get(base..end)
         .ok_or(ElfError::TruncatedProgramHeader)?;
 
     Ok(Phdr {
@@ -237,6 +240,13 @@ unsafe fn map_load_segment(
     if phdr.p_filesz > phdr.p_memsz {
         return Err(ElfError::MappingFailed("p_filesz > p_memsz"));
     }
+    let file_image_end = phdr
+        .p_offset
+        .checked_add(phdr.p_filesz)
+        .ok_or(ElfError::TruncatedProgramHeader)?;
+    if file_image_end > data.len() as u64 {
+        return Err(ElfError::TruncatedProgramHeader);
+    }
 
     let vaddr_start = phdr.p_vaddr;
     let vaddr_end = vaddr_start
@@ -289,9 +299,17 @@ unsafe fn map_load_segment(
 
         if copy_start < copy_end {
             let copy_len = (copy_end - copy_start) as usize;
-            let file_off = (phdr.p_offset + (copy_start - vaddr_start)) as usize;
+            let file_off = usize::try_from(
+                phdr.p_offset
+                    .checked_add(copy_start - vaddr_start)
+                    .ok_or(ElfError::TruncatedProgramHeader)?,
+            )
+            .map_err(|_| ElfError::TruncatedProgramHeader)?;
+            let file_end = file_off
+                .checked_add(copy_len)
+                .ok_or(ElfError::TruncatedProgramHeader)?;
             let src = data
-                .get(file_off..file_off + copy_len)
+                .get(file_off..file_end)
                 .ok_or(ElfError::TruncatedProgramHeader)?;
             // Offset within the frame.
             let frame_off = (copy_start - page_va_start) as usize;

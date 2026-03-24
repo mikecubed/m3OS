@@ -913,10 +913,51 @@ fn test_elf_error_cases() {
         b
     };
 
+    // Header with a program-header offset near u64::MAX. This must be rejected
+    // as a truncated program-header table rather than panicking on offset math.
+    let phdr_overflow = {
+        let mut b = [0u8; 64];
+        b[0..4].copy_from_slice(b"\x7FELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // little-endian
+        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[32..40].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        b
+    };
+
+    // Valid ELF header + PT_LOAD phdr, but with a segment file offset near
+    // u64::MAX. This must be rejected as truncated instead of panicking while
+    // computing the backing file range.
+    let segment_offset_overflow = {
+        let mut b = [0u8; 120];
+        b[0..4].copy_from_slice(b"\x7FELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // little-endian
+        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let ph = &mut b[64..120];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&0x5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+        ph[32..40].copy_from_slice(&64u64.to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&64u64.to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        b
+    };
+
     let cases: &[(&str, &[u8])] = &[
         ("empty", &[]),
         ("bad magic", &bad_magic),
         ("truncated", &[0x7f, b'E', b'L', b'F']),
+        ("phdr overflow", &phdr_overflow),
+        ("segment offset overflow", &segment_offset_overflow),
     ];
 
     // All cases fail before any page mapping — reuse current mapper to avoid
