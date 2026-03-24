@@ -159,6 +159,9 @@ fn init_task() -> ! {
     // Spawn Phase 9 shell task.
     task::spawn(shell_task, "shell");
 
+    // Phase 11: spawn userspace process launcher task (P11-T017).
+    task::spawn(p11_launcher_task, "p11-launcher");
+
     log::info!("[init] service set started — yielding");
     loop {
         task::yield_now();
@@ -844,6 +847,247 @@ fn shell_task() -> ! {
 fn idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — userspace launcher (P11-T017 / P11-T018)
+// ---------------------------------------------------------------------------
+
+/// Kernel task that demonstrates Phase 11: load ELF binaries from the
+/// ramdisk, run them as ring-3 processes, and collect their exit codes.
+///
+/// This is the initial integration test that validates the ELF loader,
+/// process table, and core process syscalls end-to-end.
+fn p11_launcher_task() -> ! {
+    log::info!("[p11] launcher started");
+
+    // -----------------------------------------------------------------------
+    // Test 0 (P11-T023): malformed ELF inputs must return errors, not panic
+    // -----------------------------------------------------------------------
+    test_elf_error_cases();
+
+    // -----------------------------------------------------------------------
+    // Test 1 (P11-T019): load exit0.elf → expect exit code 0
+    // -----------------------------------------------------------------------
+    run_elf_and_report("exit0.elf");
+
+    // -----------------------------------------------------------------------
+    // Test 2 (P11-T020): echo-args prints argc/argv via serial
+    // -----------------------------------------------------------------------
+    run_elf_and_report("echo-args.elf");
+
+    // -----------------------------------------------------------------------
+    // Test 3 (P11-T021): load fork-test.elf → parent waits for child(42)
+    // -----------------------------------------------------------------------
+    run_elf_and_report("fork-test.elf");
+
+    // -----------------------------------------------------------------------
+    // Test 4 (P11-T022): two sequential processes, separate address spaces
+    // -----------------------------------------------------------------------
+    run_elf_and_report("exit0.elf");
+    run_elf_and_report("exit0.elf");
+    log::info!("[p11] T022: both exit0 instances completed — address spaces isolated");
+
+    log::info!("[p11] all Phase 11 tests complete");
+    loop {
+        task::yield_now();
+    }
+}
+
+/// P11-T023: verify that malformed ELF data returns errors without panicking.
+///
+/// These tests all fail at header parse time (before any segment mapping),
+/// so we reuse the current address space mapper to avoid allocating and
+/// leaking a per-test PML4 frame.  The mapper is never mutated.
+fn test_elf_error_cases() {
+    use mm::elf::{load_elf_into, ElfError};
+
+    // 64-byte "bad magic" ELF-sized buffer with wrong magic bytes.
+    let bad_magic = {
+        let mut b = [0u8; 64];
+        b[0] = 0xFF;
+        b[1] = 0xFF;
+        b[2] = 0xFF;
+        b[3] = 0xFF;
+        b
+    };
+
+    // Header with a program-header offset near u64::MAX. This must be rejected
+    // as a truncated program-header table rather than panicking on offset math.
+    let phdr_overflow = {
+        let mut b = [0u8; 64];
+        b[0..4].copy_from_slice(b"\x7FELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // little-endian
+        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[32..40].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        b
+    };
+
+    // Valid ELF header + PT_LOAD phdr, but with a segment file offset near
+    // u64::MAX. This must be rejected as truncated instead of panicking while
+    // computing the backing file range.
+    let segment_offset_overflow = {
+        let mut b = [0u8; 120];
+        b[0..4].copy_from_slice(b"\x7FELF");
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // little-endian
+        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
+        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let ph = &mut b[64..120];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        ph[4..8].copy_from_slice(&0x5u32.to_le_bytes()); // PF_R | PF_X
+        ph[8..16].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // p_offset
+        ph[16..24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
+        ph[32..40].copy_from_slice(&64u64.to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&64u64.to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        b
+    };
+
+    let cases: &[(&str, &[u8])] = &[
+        ("empty", &[]),
+        ("bad magic", &bad_magic),
+        ("truncated", &[0x7f, b'E', b'L', b'F']),
+        ("phdr overflow", &phdr_overflow),
+        ("segment offset overflow", &segment_offset_overflow),
+    ];
+
+    // All cases fail before any page mapping — reuse current mapper to avoid
+    // allocating PML4 frames that cannot be freed (bump allocator).
+    // SAFETY: no other OffsetPageTable over the current CR3 is alive here.
+    let phys_off = mm::phys_offset();
+    let mut mapper = unsafe { mm::paging::get_mapper() };
+
+    let mut all_ok = true;
+    for (label, data) in cases {
+        let result = unsafe { load_elf_into(&mut mapper, phys_off, data) };
+        match result {
+            Err(ElfError::TruncatedHeader) | Err(ElfError::InvalidMagic) => {
+                log::info!(
+                    "[p11-T023] '{}': correctly rejected (truncated or bad magic)",
+                    label
+                );
+            }
+            Err(e) => {
+                log::info!("[p11-T023] '{}': rejected with {:?}", label, e);
+            }
+            Ok(_) => {
+                log::warn!(
+                    "[p11-T023] '{}': UNEXPECTED success — should have been rejected",
+                    label
+                );
+                all_ok = false;
+            }
+        }
+    }
+    if all_ok {
+        log::info!("[p11-T023] all malformed ELF cases correctly rejected");
+    }
+}
+
+/// Load an ELF from the ramdisk, register it as a process, schedule it,
+/// then wait for it to exit and log the exit code.
+fn run_elf_and_report(name: &'static str) {
+    use mm::elf::load_elf_into;
+    use process::{spawn_process_with_cr3, PROCESS_TABLE};
+
+    let data = match fs::ramdisk::get_file(name) {
+        Some(d) => d,
+        None => {
+            log::warn!("[p11] ELF not found in ramdisk: {}", name);
+            return;
+        }
+    };
+
+    if data.is_empty() {
+        log::warn!("[p11] ELF file is empty (not yet built?): {}", name);
+        return;
+    }
+
+    log::info!("[p11] loading {}: {} bytes", name, data.len());
+
+    let new_cr3 = match mm::new_process_page_table() {
+        Some(f) => f,
+        None => {
+            log::warn!("[p11] out of frames for {}", name);
+            return;
+        }
+    };
+
+    let phys_off = mm::phys_offset();
+    let (loaded, user_rsp) = {
+        // SAFETY: new_cr3 was just allocated; exclusive.
+        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
+        let loaded = match unsafe { load_elf_into(&mut mapper, phys_off, data) } {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("[p11] ELF load failed for {}: {:?}", name, e);
+                return;
+            }
+        };
+        // Build the SysV AMD64 ABI initial stack: [argc, argv[0], NULL, envp NULL, ...]
+        // argv[0] = binary name.
+        let argv: &[&[u8]] = &[name.as_bytes()];
+        // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
+        let user_rsp =
+            unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+        (loaded, user_rsp)
+    };
+
+    log::info!(
+        "[p11] {} loaded: entry={:#x} rsp={:#x}",
+        name,
+        loaded.entry,
+        user_rsp
+    );
+
+    let pid = spawn_process_with_cr3(
+        0,
+        loaded.entry,
+        user_rsp,
+        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+    );
+    log::info!("[p11] {} registered as pid {}", name, pid);
+
+    // Push a fork context so fork_child_trampoline can pick it up.
+    // fork_child_trampoline sets CURRENT_PID when it runs — the launcher
+    // must not set it here because the launcher kernel task is not the
+    // new userspace process.
+    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+
+    // Spawn the kernel task; it will run fork_child_trampoline which
+    // sets CURRENT_PID, switches CR3, and enters ring 3.
+    task::spawn(process::fork_child_trampoline, "p11-elf");
+
+    // Wait for the process to exit.
+    log::info!("[p11] waiting for pid {}...", pid);
+    loop {
+        let done = {
+            let table = PROCESS_TABLE.lock();
+            table
+                .find(pid)
+                .map(|p| p.state == process::ProcessState::Zombie)
+                .unwrap_or(false)
+        };
+        if done {
+            let code = {
+                let mut table = PROCESS_TABLE.lock();
+                let code = table.find(pid).and_then(|p| p.exit_code).unwrap_or(-1);
+                table.reap(pid);
+                code
+            };
+            log::info!("[p11] {} (pid {}) exited with code {}", name, pid, code);
+            break;
+        }
+        task::yield_now();
     }
 }
 

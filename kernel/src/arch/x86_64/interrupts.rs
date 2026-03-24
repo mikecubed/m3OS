@@ -52,8 +52,34 @@ extern "x86-interrupt" fn page_fault_handler(
     err: PageFaultErrorCode,
 ) {
     let addr = x86_64::registers::control::Cr2::read();
+
+    // Check if the fault came from ring 3 (user mode).
+    // If so, kill the offending process instead of halting the kernel.
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        _panic_print(format_args!(
+            "[int] userspace page fault: pid={} addr={:?} err={:?} — process killed\n",
+            pid, addr, err
+        ));
+        // Mark the process as zombie (SIGSEGV = -11).
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.state = crate::process::ProcessState::Zombie;
+                proc.exit_code = Some(-11);
+            }
+        }
+        // Block the current kernel task permanently — it will never resume
+        // because no one will send to a permanently-blocked task.  Any parent
+        // waiting via waitpid will observe the zombie exit code.
+        crate::task::block_current_on_recv();
+        // Should not be reached.
+        crate::hlt_loop();
+    }
+
+    // Ring-0 page fault: unrecoverable kernel bug.
     _panic_print(format_args!(
-        "[int] page fault: addr={:?} err={:?}\n{:?}\n",
+        "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
         addr, err, stack_frame
     ));
     crate::hlt_loop();
@@ -63,6 +89,23 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     _err: u64,
 ) {
+    // Check if the fault came from ring 3.
+    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        _panic_print(format_args!(
+            "[int] userspace GPF: pid={} — process killed\n{:?}\n",
+            pid, stack_frame
+        ));
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.state = crate::process::ProcessState::Zombie;
+                proc.exit_code = Some(-11);
+            }
+        }
+        crate::task::block_current_on_recv();
+        crate::hlt_loop();
+    }
     _panic_print(format_args!("[int] GPF: {:?}\n", stack_frame));
     crate::hlt_loop();
 }

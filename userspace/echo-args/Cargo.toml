@@ -1,0 +1,11 @@
+[package]
+name = "echo-args"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "echo-args"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

@@ -42,9 +42,6 @@ pub unsafe fn enable_interrupts() {
 /// * Must be called after `init()` so that GDT user segments are loaded.
 pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
     use core::arch::asm;
-    // Push the five values that `iretq` pops in order:
-    //   SS, RSP, RFLAGS, CS, RIP
-    // RFLAGS: bit 9 (IF) set → interrupts enabled in userspace.
     asm!(
         "push {ss}",
         "push {rsp}",
@@ -54,9 +51,37 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
         "iretq",
         ss     = in(reg) u64::from(gdt::user_data_selector().0),
         rsp    = in(reg) user_stack_top,
-        rflags = const 0x202u64, // IF=1 (bit 9) + reserved bit 1 (always must be 1)
+        rflags = const 0x202u64,
         cs     = in(reg) u64::from(gdt::user_code_selector().0),
         rip    = in(reg) entry,
+        options(noreturn)
+    )
+}
+
+/// Enter ring 3 at `rip` with `rsp` as the stack pointer and `rax` as the
+/// return value visible to userspace code (used by `fork` to return 0 to
+/// the child).
+///
+/// # Safety
+/// Same requirements as [`enter_userspace`].  `rax` is placed in RAX before
+/// `iretq` so the child sees it as its syscall return value.
+#[allow(dead_code)]
+pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
+    use core::arch::asm;
+    asm!(
+        "push {ss}",
+        "push {rsp_val}",
+        "push {rflags}",
+        "push {cs}",
+        "push {rip_val}",
+        "mov rax, {rax_val}",
+        "iretq",
+        ss      = in(reg) u64::from(gdt::user_data_selector().0),
+        rsp_val = in(reg) rsp,
+        rflags  = const 0x202u64,
+        cs      = in(reg) u64::from(gdt::user_code_selector().0),
+        rip_val = in(reg) rip,
+        rax_val = in(reg) rax,
         options(noreturn)
     )
 }

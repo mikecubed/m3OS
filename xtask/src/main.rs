@@ -80,8 +80,61 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(path.trim()).parent().unwrap().to_path_buf()
 }
 
+/// Compile Phase 11 userspace test binaries and copy them into kernel/initrd/.
+///
+/// Each binary is compiled for `x86_64-unknown-none` (statically linked,
+/// no libc) in release mode.  The resulting ELF files are copied directly
+/// into `kernel/initrd/` and embedded in the kernel's ramdisk via `include_bytes!`.
+fn build_userspace_bins() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+
+    // Ensure the initrd directory exists before copying.
+    fs::create_dir_all(&initrd).unwrap_or_else(|e| {
+        panic!("failed to create initrd directory {}: {e}", initrd.display());
+    });
+
+    let bins: &[(&str, &str)] = &[
+        ("exit0", "exit0"),
+        ("fork-test", "fork-test"),
+        ("echo-args", "echo-args"),
+    ];
+
+    for (pkg, bin) in bins {
+        let status = Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args([
+                "build",
+                "--release",
+                "--package",
+                pkg,
+                "--bin",
+                bin,
+                "--target",
+                "x86_64-unknown-none",
+                "-Zbuild-std=core,compiler_builtins",
+                "-Zbuild-std-features=compiler-builtins-mem",
+            ])
+            .status()
+            .unwrap_or_else(|_| panic!("failed to build userspace binary {bin}"));
+
+        if !status.success() {
+            eprintln!("userspace build failed for {bin}");
+            std::process::exit(1);
+        }
+
+        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let dst = initrd.join(format!("{bin}.elf"));
+        fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("failed to copy {bin} to initrd: {e}");
+        });
+        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
+    build_userspace_bins();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -225,6 +278,7 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
 
 fn cmd_check() {
     let root = workspace_root();
+    build_userspace_bins();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
