@@ -364,24 +364,28 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
-    // Inherit parent's brk/mmap state so the child's heap is consistent
-    // with the copied address space.
-    let (parent_brk, parent_mmap) = {
+    // Inherit parent's brk/mmap state and FD table so the child's heap
+    // and file descriptors are consistent with the copied address space.
+    let (parent_brk, parent_mmap, parent_fds) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
-            Some(p) => (p.brk_current, p.mmap_next),
-            None => (0, 0),
+            Some(p) => (p.brk_current, p.mmap_next, p.fd_table.clone()),
+            None => (0, 0, {
+                const NONE: Option<crate::process::FdEntry> = None;
+                [NONE; crate::process::MAX_FDS]
+            }),
         }
     };
 
-    // Create child process entry.
-    let child_pid = crate::process::spawn_process_with_cr3(
+    // Create child process entry with cloned FD table (Phase 14, P14-T003).
+    let child_pid = crate::process::spawn_process_with_cr3_and_fds(
         parent_pid,
         user_rip,
         user_rsp,
         x86_64::PhysAddr::new(child_cr3.start_address().as_u64()),
         parent_brk,
         parent_mmap,
+        parent_fds,
     );
 
     // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
@@ -777,62 +781,58 @@ const BRK_BASE: u64 = 0x0000_0002_0000_0000;
 /// Placed at 128 GiB — above the brk heap region and below the stack.
 const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
-/// Maximum number of open file descriptors (FDs 0–2 are stdin/stdout/stderr).
-const MAX_FDS: usize = 32;
+// Re-export FD types from process module (Phase 14 — per-process FD table).
+use crate::process::{FdBackend, FdEntry, MAX_FDS};
 
-/// Backing store for an open file descriptor.
-#[derive(Clone)]
-enum FdBackend {
-    /// Read-only static ramdisk file (pointer + length into kernel .rodata).
-    Ramdisk {
-        content_addr: usize,
-        content_len: usize,
-    },
-    /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
-    /// relative to tmpfs root — no leading `/tmp/`).
-    Tmpfs { path: alloc::string::String },
-}
-
-/// A single open-file entry in the global FD table.
-#[derive(Clone)]
-struct FdEntry {
-    backend: FdBackend,
-    offset: usize,
-    /// True if the file was opened for reading.
-    readable: bool,
-    /// True if the file was opened for writing.
-    writable: bool,
-}
-
-const NONE_FD: Option<FdEntry> = None;
-
-/// Global file descriptor table.
+/// Clone the FD entry at `fd` from the current process's FD table.
 ///
-/// FD 0 = stdin (not implemented — reads return EAGAIN).
-/// FD 1 = stdout / FD 2 = stderr (writes go to serial).
-/// FD 3+ = ramdisk or tmpfs files opened via `open()`.
-static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FDS]> = spin::Mutex::new([NONE_FD; MAX_FDS]);
+/// Returns `None` if no process is running or the FD slot is empty.
+fn current_fd_entry(fd: usize) -> Option<FdEntry> {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let table = crate::process::PROCESS_TABLE.lock();
+    let proc = table.find(pid)?;
+    proc.fd_table.get(fd)?.clone()
+}
+
+/// Mutate the FD entry at `fd` in the current process's FD table.
+fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    if let Some(proc) = table.find_mut(pid) {
+        if let Some(slot) = proc.fd_table.get_mut(fd) {
+            f(slot);
+        }
+    }
+}
+
+/// Allocate the lowest available FD slot (starting from `min_fd`) in the
+/// current process's FD table. Returns the FD number or `None` if full.
+fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = table.find_mut(pid)?;
+    for i in min_fd..MAX_FDS {
+        if proc.fd_table[i].is_none() {
+            proc.fd_table[i] = Some(entry);
+            return Some(i);
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
 
 fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    if fd == 0 {
-        // stdin: no keyboard input implemented yet — return EAGAIN (-11)
-        return NEG_EAGAIN;
-    }
     let fd = fd as usize;
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.readable {
@@ -840,6 +840,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdin => {
+            // stdin: no keyboard input implemented yet — return EAGAIN (-11)
+            NEG_EAGAIN
+        }
+        FdBackend::Stdout => NEG_EBADF,
         FdBackend::Ramdisk {
             content_addr,
             content_len,
@@ -859,9 +864,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return NEG_EFAULT;
             }
 
-            if let Some(e) = &mut FD_TABLE.lock()[fd] {
-                e.offset += to_read;
-            }
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
             to_read as u64
         }
         FdBackend::Tmpfs { path } => {
@@ -883,9 +890,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
 
             drop(tmpfs);
-            if let Some(e) = &mut FD_TABLE.lock()[fd] {
-                e.offset += to_read;
-            }
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
             to_read as u64
         }
     }
@@ -896,30 +905,14 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    // stdout (1) and stderr (2) go to serial.
-    if fd == 1 || fd == 2 {
-        let len = (count as usize).min(4096);
-        let mut buf = [0u8; 4096];
-        if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
-            return NEG_EFAULT;
-        }
-        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-            log::info!("[userspace] {}", s.trim_end_matches('\n'));
-        }
-        return len as u64;
-    }
-
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd_idx] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.writable {
@@ -927,6 +920,19 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdout => {
+            // stdout/stderr go to serial.
+            let len = (count as usize).min(4096);
+            let mut buf = [0u8; 4096];
+            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                log::info!("[userspace] {}", s.trim_end_matches('\n'));
+            }
+            len as u64
+        }
+        FdBackend::Stdin => NEG_EBADF,
         FdBackend::Ramdisk { .. } => NEG_EBADF, // ramdisk is read-only
         FdBackend::Tmpfs { path } => {
             let len = (count as usize).min(64 * 1024);
@@ -968,9 +974,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 offset += chunk;
             }
 
-            if let Some(e) = &mut FD_TABLE.lock()[fd_idx] {
-                e.offset = offset;
-            }
+            with_current_fd_mut(fd_idx, |slot| {
+                if let Some(e) = slot {
+                    e.offset = offset;
+                }
+            });
             written as u64
         }
     }
@@ -1096,24 +1104,25 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 
         drop(tmpfs);
 
-        // Allocate an fd slot.
-        let mut table = FD_TABLE.lock();
-        for i in 3..MAX_FDS {
-            if table[i].is_none() {
-                table[i] = Some(FdEntry {
-                    backend: FdBackend::Tmpfs {
-                        path: alloc::string::String::from(rel),
-                    },
-                    offset: initial_offset,
-                    readable,
-                    writable,
-                });
+        // Allocate an fd slot in the current process's table.
+        let entry = FdEntry {
+            backend: FdBackend::Tmpfs {
+                path: alloc::string::String::from(rel),
+            },
+            offset: initial_offset,
+            readable,
+            writable,
+        };
+        match alloc_fd(3, entry) {
+            Some(i) => {
                 log::info!("[open] {} → fd {} (tmpfs)", name, i);
                 return i as u64;
             }
+            None => {
+                log::warn!("[open] fd table full");
+                return NEG_EMFILE;
+            }
         }
-        log::warn!("[open] fd table full");
-        return NEG_EMFILE;
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
@@ -1130,25 +1139,25 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         }
     };
 
-    let mut table = FD_TABLE.lock();
-    for i in 3..MAX_FDS {
-        if table[i].is_none() {
-            table[i] = Some(FdEntry {
-                backend: FdBackend::Ramdisk {
-                    content_addr: content.as_ptr() as usize,
-                    content_len: content.len(),
-                },
-                offset: 0,
-                readable: true,
-                writable: false,
-            });
+    let entry = FdEntry {
+        backend: FdBackend::Ramdisk {
+            content_addr: content.as_ptr() as usize,
+            content_len: content.len(),
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => {
             log::info!("[open] {} → fd {}", name, i);
-            return i as u64;
+            i as u64
+        }
+        None => {
+            log::warn!("[open] fd table full");
+            NEG_EMFILE
         }
     }
-
-    log::warn!("[open] fd table full");
-    NEG_EMFILE
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,12 +1173,18 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
-    let mut table = FD_TABLE.lock();
-    if table[fd].is_none() {
-        return NEG_EBADF;
+    let mut found = false;
+    with_current_fd_mut(fd, |slot| {
+        if slot.is_some() {
+            *slot = None;
+            found = true;
+        }
+    });
+    if found {
+        0
+    } else {
+        NEG_EBADF
     }
-    table[fd] = None;
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,26 +1196,22 @@ fn sys_linux_close(fd: u64) -> u64 {
 /// Only `st_size` (offset 48) and `st_mode` (offset 24) are filled in;
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
 fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
-    let size = match fd {
-        1 | 2 => 0u64, // stdout/stderr — no meaningful size
-        _ => {
-            let fd = fd as usize;
-            if fd >= MAX_FDS {
-                return NEG_EBADF;
-            }
-            let entry = match &FD_TABLE.lock()[fd] {
-                Some(e) => e.clone(),
-                None => return NEG_EBADF,
-            };
-            match &entry.backend {
-                FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
-                FdBackend::Tmpfs { path } => {
-                    let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                    match tmpfs.file_size(path) {
-                        Ok(size) => size as u64,
-                        Err(_) => return NEG_ENOENT,
-                    }
-                }
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let size = match &entry.backend {
+        FdBackend::Stdout | FdBackend::Stdin => 0u64,
+        FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
+        FdBackend::Tmpfs { path } => {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.file_size(path) {
+                Ok(size) => size as u64,
+                Err(_) => return NEG_ENOENT,
             }
         }
     };
@@ -1232,14 +1243,9 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    // Clone entry and drop FD_TABLE before locking TMPFS to avoid
-    // lock-order inversion (other paths lock TMPFS then FD_TABLE).
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     const SEEK_SET: u64 = 0;
@@ -1247,6 +1253,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_END: u64 = 2;
 
     let file_len = match &entry.backend {
+        FdBackend::Stdout | FdBackend::Stdin => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1276,10 +1283,12 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    // Re-lock to update offset.
-    if let Some(e) = &mut FD_TABLE.lock()[fd] {
-        e.offset = new_offset as usize;
-    }
+    // Update offset in per-process FD table.
+    with_current_fd_mut(fd, |slot| {
+        if let Some(e) = slot {
+            e.offset = new_offset as usize;
+        }
+    });
     new_offset as u64
 }
 
@@ -1931,12 +1940,9 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd_idx] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.writable {
@@ -1944,6 +1950,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdout | FdBackend::Stdin => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1965,8 +1972,7 @@ fn sys_linux_fsync(fd: u64) -> u64 {
     if !(3..MAX_FDS).contains(&fd_idx) {
         return NEG_EBADF;
     }
-    let exists = FD_TABLE.lock()[fd_idx].is_some();
-    if !exists {
+    if current_fd_entry(fd_idx).is_none() {
         return NEG_EBADF;
     }
     0 // no-op: tmpfs has no persistence

@@ -1,4 +1,4 @@
-//! Userspace process management — Phase 11.
+//! Userspace process management — Phase 11 / Phase 14.
 //!
 //! This module owns the global process table and the types that describe
 //! a userspace process's lifecycle.  Kernel threads live in
@@ -11,14 +11,15 @@
 //! [`PROCESS_TABLE`] spinlock-protected global table is the single source
 //! of truth for all live processes.
 //!
-//! Process cleanup (freeing kernel stacks, reaping page tables) is
-//! deferred to a later phase.
+//! Phase 14: each process has its own file descriptor table (`fd_table`).
+//! FDs 0/1/2 are initialized as stdin/stdout/stderr on process creation.
+//! `fork()` deep-clones the parent's FD table into the child.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -59,6 +60,68 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 /// call, which the atomic fetch-add guarantees regardless of memory order.
 fn alloc_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// File descriptor table (Phase 14 — per-process)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of open file descriptors per process.
+pub const MAX_FDS: usize = 32;
+
+/// Backing store for an open file descriptor.
+#[derive(Clone)]
+pub enum FdBackend {
+    /// FD 1/2 stdout/stderr — writes go to serial output.
+    Stdout,
+    /// FD 0 stdin — reads return EAGAIN until stdin integration (Track E).
+    Stdin,
+    /// Read-only static ramdisk file (pointer + length into kernel .rodata).
+    Ramdisk {
+        content_addr: usize,
+        content_len: usize,
+    },
+    /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
+    /// relative to tmpfs root — no leading `/tmp/`).
+    Tmpfs { path: String },
+}
+
+/// A single open-file entry in the per-process FD table.
+#[derive(Clone)]
+pub struct FdEntry {
+    pub backend: FdBackend,
+    pub offset: usize,
+    /// True if the file was opened for reading.
+    pub readable: bool,
+    /// True if the file was opened for writing.
+    pub writable: bool,
+}
+
+/// Const sentinel for empty FD slots (used in array init).
+const NONE_FD: Option<FdEntry> = None;
+
+/// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
+fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
+    let mut table = [NONE_FD; MAX_FDS];
+    table[0] = Some(FdEntry {
+        backend: FdBackend::Stdin,
+        offset: 0,
+        readable: true,
+        writable: false,
+    });
+    table[1] = Some(FdEntry {
+        backend: FdBackend::Stdout,
+        offset: 0,
+        readable: false,
+        writable: true,
+    });
+    table[2] = Some(FdEntry {
+        backend: FdBackend::Stdout,
+        offset: 0,
+        readable: false,
+        writable: true,
+    });
+    table
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +178,10 @@ pub struct Process {
     /// Initialized to ANON_MMAP_BASE on first use; grows upward with
     /// each allocation. Kept per-process so fork children start fresh.
     pub mmap_next: u64,
+    /// Per-process file descriptor table (Phase 14).
+    ///
+    /// FDs 0/1/2 are stdin/stdout/stderr.  `fork()` deep-clones this table.
+    pub fd_table: [Option<FdEntry>; MAX_FDS],
 }
 
 impl Process {
@@ -136,6 +203,7 @@ impl Process {
             exit_code: None,
             brk_current: 0,
             mmap_next: 0,
+            fd_table: new_fd_table(),
         }
     }
 }
@@ -242,6 +310,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         exit_code: None,
         brk_current: 0,
         mmap_next: 0,
+        fd_table: new_fd_table(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -274,6 +343,39 @@ pub fn spawn_process_with_cr3(
         exit_code: None,
         brk_current,
         mmap_next,
+        fd_table: new_fd_table(),
+    };
+    PROCESS_TABLE.lock().insert(proc);
+    pid
+}
+
+/// Create a new process entry inheriting the parent's FD table.
+///
+/// Used by `sys_fork` to deep-clone the parent's file descriptors into
+/// the child process (Phase 14, P14-T003).
+pub fn spawn_process_with_cr3_and_fds(
+    ppid: Pid,
+    entry_point: u64,
+    user_stack_top: u64,
+    cr3: x86_64::PhysAddr,
+    brk_current: u64,
+    mmap_next: u64,
+    fd_table: [Option<FdEntry>; MAX_FDS],
+) -> Pid {
+    let kstack_top = alloc_kernel_stack();
+    let pid = alloc_pid();
+    let proc = Process {
+        pid,
+        ppid,
+        state: ProcessState::Ready,
+        page_table_root: Some(cr3),
+        kernel_stack_top: kstack_top,
+        entry_point,
+        user_stack_top,
+        exit_code: None,
+        brk_current,
+        mmap_next,
+        fd_table,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
