@@ -1680,7 +1680,12 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         let st = match tmpfs.stat(rel) {
             Ok(s) => s,
-            Err(_) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
+                const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+                return NEG_ENOTDIR;
+            }
+            Err(_) => return NEG_EINVAL,
         };
         let mode: u32 = if st.is_dir {
             0x4000 | 0o755 // S_IFDIR
