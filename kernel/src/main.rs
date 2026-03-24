@@ -1103,7 +1103,14 @@ fn shell_pipeline(
     pipe::pipe_close_writer(pipe_id);
     pipe::pipe_close_reader(pipe_id);
 
-    // Set foreground process group to the first child so Ctrl-C works.
+    // Put both children in the same process group so Ctrl-C/Ctrl-Z
+    // signals both stages of the pipeline.
+    {
+        let mut table = process::PROCESS_TABLE.lock();
+        if let Some(p) = table.find_mut(pid1) {
+            p.pgid = pid0;
+        }
+    }
     process::FG_PGID.store(pid0, core::sync::atomic::Ordering::Relaxed);
 
     // Wait for both children.
@@ -1192,6 +1199,7 @@ fn spawn_user_process_with_pipe(
         0,
         0,
         fd_table,
+        0, // pgid=0 → use own pid
     );
 
     process::push_fork_ctx(pid, loaded.entry, user_rsp);

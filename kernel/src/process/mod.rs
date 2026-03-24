@@ -124,6 +124,28 @@ pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
     }
 }
 
+/// Close all open file descriptors for a process.
+///
+/// Decrements pipe ref-counts for any open pipe FDs so that EOF/EPIPE
+/// propagates correctly. Called by `sys_exit` before marking the process
+/// as a zombie.
+pub fn close_all_fds_for(pid: Pid) {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return,
+    };
+    for slot in proc.fd_table.iter_mut() {
+        if let Some(entry) = slot.take() {
+            match &entry.backend {
+                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
 fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
     let mut table = [NONE_FD; MAX_FDS];
@@ -442,6 +464,9 @@ pub fn spawn_process_with_cr3(
 ///
 /// Used by `sys_fork` to deep-clone the parent's file descriptors into
 /// the child process (Phase 14, P14-T003).
+/// `inherit_pgid`: if non-zero, use this as the child's pgid (for fork);
+/// if zero, default to the child's own pid (for exec/spawn).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_process_with_cr3_and_fds(
     ppid: Pid,
     entry_point: u64,
@@ -450,9 +475,11 @@ pub fn spawn_process_with_cr3_and_fds(
     brk_current: u64,
     mmap_next: u64,
     fd_table: [Option<FdEntry>; MAX_FDS],
+    inherit_pgid: Pid,
 ) -> Pid {
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
+    let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
     let proc = Process {
         pid,
         ppid,
@@ -465,7 +492,7 @@ pub fn spawn_process_with_cr3_and_fds(
         stop_signal: 0,
         brk_current,
         mmap_next,
-        pgid: pid,
+        pgid,
         fd_table,
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],

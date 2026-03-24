@@ -70,11 +70,10 @@ impl StdinState {
             let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
             self.buf[write_pos] = b'\n';
             self.count += 1;
-            // Only clear the flushed portion; retain any overflow.
-            self.line.drain(..flushed);
-            self.line.clear(); // newline was appended; line is done
+            // Newline was appended; the line is complete, so discard the buffer.
+            self.line.clear();
         } else {
-            // Couldn't even fit the newline; retain unflushed portion.
+            // Couldn't even fit the newline; retain unflushed portion so it can be retried.
             self.line.drain(..flushed);
         }
     }

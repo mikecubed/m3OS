@@ -399,6 +399,8 @@ fn sys_exit(code: i32) -> ! {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] exit({})", pid, code);
     if pid != 0 {
+        // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+        crate::process::close_all_fds_for(pid);
         {
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = table.find_mut(pid) {
@@ -563,8 +565,9 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
     };
 
     // Write [read_fd, write_fd] as two i32s to user memory.
-    let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
-    let bytes: [u8; 8] = unsafe { core::mem::transmute(fds) };
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
+    bytes[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
     if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
         // Clean up on failure.
         with_current_fd_mut(read_fd, |slot| *slot = None);
@@ -734,14 +737,19 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
     // and file descriptors are consistent with the copied address space.
-    let (parent_brk, parent_mmap, parent_fds) = {
+    let (parent_brk, parent_mmap, parent_fds, parent_pgid) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
-            Some(p) => (p.brk_current, p.mmap_next, p.fd_table.clone()),
-            None => (0, 0, {
-                const NONE: Option<crate::process::FdEntry> = None;
-                [NONE; crate::process::MAX_FDS]
-            }),
+            Some(p) => (p.brk_current, p.mmap_next, p.fd_table.clone(), p.pgid),
+            None => (
+                0,
+                0,
+                {
+                    const NONE: Option<crate::process::FdEntry> = None;
+                    [NONE; crate::process::MAX_FDS]
+                },
+                0,
+            ),
         }
     };
 
@@ -749,6 +757,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     crate::process::add_pipe_refs(&parent_fds);
 
     // Create child process entry with cloned FD table (Phase 14, P14-T003).
+    // Inherit parent's pgid so fork children are in the same process group.
     let child_pid = crate::process::spawn_process_with_cr3_and_fds(
         parent_pid,
         user_rip,
@@ -757,6 +766,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_brk,
         parent_mmap,
         parent_fds,
+        parent_pgid,
     );
 
     // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
@@ -801,19 +811,24 @@ fn read_user_string_array(
         }
         // Read the C string byte by byte.
         let mut s = alloc::vec::Vec::new();
+        let mut found_nul = false;
         for j in 0..4096u64 {
             let addr = match str_ptr.checked_add(j) {
                 Some(a) => a,
-                None => break,
+                None => return Err(()),
             };
             let mut b = [0u8; 1];
             if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
-                break;
+                return Err(());
             }
             if b[0] == 0 {
+                found_nul = true;
                 break;
             }
             s.push(b[0]);
+        }
+        if !found_nul {
+            return Err(());
         }
         result.push(s);
     }
