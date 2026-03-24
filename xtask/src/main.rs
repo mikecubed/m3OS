@@ -162,6 +162,18 @@ fn build_musl_bins() {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("warning: musl-gcc not found — skipping C binary builds (install musl-tools to enable)");
+                // Create empty placeholders so include_bytes! doesn't fail.
+                for (_, name) in bins {
+                    let dst = initrd.join(format!("{name}.elf"));
+                    if !dst.exists() {
+                        fs::write(&dst, b"").unwrap_or_else(|e| {
+                            eprintln!(
+                                "warning: failed to create placeholder {}: {e}",
+                                dst.display()
+                            );
+                        });
+                    }
+                }
                 return;
             }
             Err(e) => panic!("failed to run musl-gcc for {name}: {e}"),

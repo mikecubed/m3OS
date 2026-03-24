@@ -903,10 +903,18 @@ fn sys_linux_open(path_ptr: u64, _flags: u64) -> u64 {
 
 fn sys_linux_close(fd: u64) -> u64 {
     let fd = fd as usize;
-    if !(3..MAX_FDS).contains(&fd) {
-        return 0; // closing stdin/stdout/stderr or invalid: always ok
+    // stdin/stdout/stderr (0–2) are virtual and cannot be closed.
+    if fd < 3 {
+        return 0;
     }
-    FD_TABLE.lock()[fd] = None;
+    if fd >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let mut table = FD_TABLE.lock();
+    if table[fd].is_none() {
+        return NEG_EBADF;
+    }
+    table[fd] = None;
     0
 }
 
@@ -1142,7 +1150,10 @@ fn sys_linux_brk(addr: u64) -> u64 {
     let _ = base;
 
     // Align new break up to page boundary.
-    let new_brk = (addr + 0xFFF) & !0xFFF;
+    let new_brk = match addr.checked_add(0xFFF) {
+        Some(v) => v & !0xFFF,
+        None => return NEG_EINVAL,
+    };
     let pages_needed = (new_brk - current) / 4096;
 
     use x86_64::{
@@ -1199,7 +1210,14 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
     let mut total = 0u64;
     for i in 0..iovcnt {
         // struct iovec { void *base (8B), size_t len (8B) }
-        let iov_addr = iov_ptr + (i * 16) as u64;
+        let offset = match (i as u64).checked_mul(16) {
+            Some(v) => v,
+            None => return NEG_EFAULT,
+        };
+        let iov_addr = match iov_ptr.checked_add(offset) {
+            Some(a) => a,
+            None => return NEG_EFAULT,
+        };
         let mut iov_bytes = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
             break;
@@ -1226,7 +1244,14 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
     let iovcnt = (iovcnt as usize).min(16);
     let mut total = 0u64;
     for i in 0..iovcnt {
-        let iov_addr = iov_ptr + (i * 16) as u64;
+        let offset = match (i as u64).checked_mul(16) {
+            Some(v) => v,
+            None => return NEG_EFAULT,
+        };
+        let iov_addr = match iov_ptr.checked_add(offset) {
+            Some(a) => a,
+            None => return NEG_EFAULT,
+        };
         let mut iov_bytes = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
             break;
