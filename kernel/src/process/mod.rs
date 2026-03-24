@@ -341,7 +341,6 @@ pub fn fork_child_trampoline() -> ! {
             Cr3::write(frame, Cr3Flags::empty());
         }
     }
-
     // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value).
     unsafe { crate::arch::enter_userspace_with_retval(ctx.user_rip, ctx.user_rsp, 0) }
 }

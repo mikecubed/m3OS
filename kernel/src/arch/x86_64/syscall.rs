@@ -87,31 +87,29 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // --- Save caller-saved registers that Linux preserves across syscalls ---
+    // The Linux ABI guarantees all registers except rax, rcx, r11 are preserved.
+    // Our SysV rearrangement clobbers rdi/rsi/rdx/r8/r9, and r10 is used for
+    // mmap flags, so we must save and restore them here.
+    "push rdi",
+    "push rsi",
+    "push rdx",
+    "push r10",
+    "push r8",
+    "push r9",
     // --- Set up SysV arguments for syscall_handler ---
-    // Stack layout at this point:
-    //   rsp+ 0: r15
-    //   rsp+ 8: r14
-    //   rsp+16: r13
-    //   rsp+24: r12
-    //   rsp+32: rbp
-    //   rsp+40: rbx
-    //   rsp+48: r11 (user RFLAGS)
-    //   rsp+56: rcx (user RIP)
+    // Stack layout (14 pushes):
+    //   rsp+  0: r9     rsp+ 48: r15    rsp+ 96: r11 (user RFLAGS)
+    //   rsp+  8: r8     rsp+ 56: r14    rsp+104: rcx (user RIP)
+    //   rsp+ 16: r10    rsp+ 64: r13
+    //   rsp+ 24: rdx    rsp+ 72: r12
+    //   rsp+ 32: rsi    rsp+ 80: rbp
+    //   rsp+ 40: rdi    rsp+ 88: rbx
     //
-    // SysV params:
-    //   rdi = syscall number  (from rax)
-    //   rsi = arg0            (from original rdi)
-    //   rdx = arg1            (from original rsi)
-    //   rcx = arg2            (from original rdx) — note: overwrites saved rcx
-    //   r8  = user_rip        (loaded from saved rcx on stack)
-    //   r9  = user_rsp        (loaded from SYSCALL_USER_RSP)
-    //
-    // Save r10 (Linux syscall arg3, e.g. mmap flags) to SYSCALL_ARG3 before
-    // r8/r9 are overwritten.  r10 is a caller-saved register not passed to
-    // syscall_handler, so this static capture is the only way to retrieve it.
+    // Save r10 for kernel-side access (mmap flags, etc.)
     "mov [rip + SYSCALL_ARG3], r10",
-    // Load r8 BEFORE overwriting rcx.
-    "mov r8, [rsp + 56]",               // user_rip (5th param)
+    // Load r8 (user_rip) BEFORE overwriting rcx.
+    "mov r8, [rsp + 104]",              // user_rip (5th param)
     "mov r9, [rip + SYSCALL_USER_RSP]", // user_rsp (6th param)
     "mov rcx, rdx",                     // arg2
     "mov rdx, rsi",                     // arg1
@@ -120,6 +118,13 @@ global_asm!(
     "call syscall_handler",
     // Return value is in RAX.
 
+    // --- Restore caller-saved registers (Linux-preserved) ---
+    "pop r9",
+    "pop r8",
+    "pop r10",
+    "pop rdx",
+    "pop rsi",
+    "pop rdi",
     // --- Restore callee-saved registers ---
     "pop r15",
     "pop r14",
@@ -170,6 +175,8 @@ global_asm!(
 /// |      79 | getcwd      | always returns "/"    |
 /// |      80 | chdir       | stub (always ok)      |
 /// |     110 | getppid     | ✓ same as Phase 11    |
+/// |     158 | arch_prctl  | ARCH_SET_FS only       |
+/// |     218 | set_tid_addr| stub, returns PID      |
 /// |     231 | exit_group  | ✓ same as Phase 11    |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
@@ -213,6 +220,9 @@ pub extern "C" fn syscall_handler(
         79 => sys_linux_getcwd(arg0, arg1),
         80 => sys_linux_chdir(arg0),
         110 => sys_getppid(),
+        // musl TLS init (Phase 12, T030 dependency)
+        158 => sys_linux_arch_prctl(arg0, arg1),
+        218 => sys_linux_set_tid_address(),
         // openat: ignore dirfd, treat as open(path, flags)
         257 => sys_linux_open(arg1, arg2),
         // newfstatat: fstat via path lookup
@@ -288,6 +298,9 @@ fn sys_exit(code: i32) -> ! {
             proc.exit_code = Some(code);
         }
     }
+    // Restore kernel page table before yielding so the next scheduled task
+    // does not inherit this process's CR3.
+    crate::mm::restore_kernel_cr3();
     // Mark the kernel task as dead so the scheduler reclaims it.
     crate::task::mark_current_dead();
 }
@@ -391,7 +404,14 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
         let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp = match unsafe {
-            crate::mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv)
+            crate::mm::elf::setup_abi_stack(
+                loaded.stack_top,
+                &mapper,
+                phys_off,
+                argv,
+                loaded.phdr_vaddr,
+                loaded.phnum,
+            )
         } {
             Ok(rsp) => rsp,
             Err(e) => {
@@ -480,6 +500,27 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
         };
 
         if let Some(code) = result {
+            // The child's sys_exit called restore_kernel_cr3() before dying, so
+            // CR3 may now be the kernel PML4.  copy_to_user needs the caller's
+            // page table, so restore it explicitly before writing status.
+            // Also update CURRENT_PID — the child's trampoline may have changed it.
+            let caller_cr3_phys = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(calling_pid).and_then(|p| p.page_table_root)
+            };
+            if let Some(phys) = caller_cr3_phys {
+                // SAFETY: phys is the caller's live PML4 frame from the process table.
+                unsafe {
+                    use x86_64::{
+                        registers::control::{Cr3, Cr3Flags},
+                        structures::paging::PhysFrame,
+                    };
+                    let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
+                    Cr3::write(frame, Cr3Flags::empty());
+                }
+            }
+            crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+
             // Write wstatus in Linux-compatible encoding: exit code in bits 15:8.
             if status_ptr != 0 {
                 let wstatus = code << 8;
@@ -494,6 +535,8 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
 
         // Child is still running; yield and try again.
         crate::task::yield_now();
+        // Restore CURRENT_PID after yield: child's trampoline may have changed it.
+        crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1240,4 +1283,32 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         return u64::MAX;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// arch_prctl(code, addr) — syscall 158 (musl TLS initialization)
+// ---------------------------------------------------------------------------
+
+/// Handles `ARCH_SET_FS` (0x1002) which musl uses to set the FS.base MSR for
+/// thread-local storage.  Other sub-commands return -EINVAL.
+fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
+    const ARCH_SET_FS: u64 = 0x1002;
+    match code {
+        ARCH_SET_FS => {
+            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(addr));
+            0
+        }
+        _ => u64::MAX, // -EINVAL
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_tid_address(tidptr) — syscall 218 (musl TLS initialization)
+// ---------------------------------------------------------------------------
+
+/// Stub: stores nothing, returns the caller's PID (which is also the TID in
+/// our single-threaded model).  musl calls this during `__init_tls` to record
+/// the `clear_child_tid` pointer; we can safely ignore the pointer.
+fn sys_linux_set_tid_address() -> u64 {
+    crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed) as u64
 }

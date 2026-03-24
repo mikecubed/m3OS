@@ -27,6 +27,8 @@ use super::{frame_allocator, paging::GlobalFrameAlloc};
 const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1; // little-endian
+const ET_EXEC: u16 = 2; // fixed-address executable
+const ET_DYN: u16 = 3; // position-independent executable (PIE)
 const EM_X86_64: u16 = 0x3E;
 
 const PT_LOAD: u32 = 1;
@@ -53,6 +55,7 @@ const EI_MAG0: usize = 0;
 const EI_CLASS: usize = 4;
 const EI_DATA: usize = 5;
 
+const EH_TYPE: usize = 16; // u16
 const EH_MACHINE: usize = 18; // u16
 const EH_ENTRY: usize = 24; // u64
 const EH_PHOFF: usize = 32; // u64
@@ -116,6 +119,11 @@ pub struct LoadedElf {
     pub entry: u64,
     /// Virtual address of the top of the allocated user stack.
     pub stack_top: u64,
+    /// Virtual address of the program header table in the loaded image.
+    /// Used to populate AT_PHDR in the auxiliary vector for musl/glibc.
+    pub phdr_vaddr: u64,
+    /// Number of program header entries (for AT_PHNUM).
+    pub phnum: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +131,7 @@ pub struct LoadedElf {
 // ---------------------------------------------------------------------------
 
 struct Ehdr {
+    e_type: u16,
     entry: u64,
     phoff: u64,
     phentsize: u16,
@@ -144,6 +153,7 @@ fn parse_ehdr(data: &[u8]) -> Result<Ehdr, ElfError> {
         return Err(ElfError::NotLittleEndian);
     }
 
+    let e_type = read_u16_le(data, EH_TYPE).ok_or(ElfError::TruncatedHeader)?;
     let machine = read_u16_le(data, EH_MACHINE).ok_or(ElfError::TruncatedHeader)?;
     if machine != EM_X86_64 {
         return Err(ElfError::NotX86_64);
@@ -155,6 +165,7 @@ fn parse_ehdr(data: &[u8]) -> Result<Ehdr, ElfError> {
     let phnum = read_u16_le(data, EH_PHNUM).ok_or(ElfError::TruncatedHeader)?;
 
     Ok(Ehdr {
+        e_type,
         entry,
         phoff,
         phentsize,
@@ -222,14 +233,19 @@ fn segment_flags(p_flags: u32) -> PageTableFlags {
 /// so the function works for any `mapper` — including one for a page table
 /// that is **not** currently loaded into CR3.
 ///
+/// `load_bias` is added to each segment's p_vaddr — non-zero for PIE (ET_DYN)
+/// binaries where segments are linked at a virtual base of 0.
+///
 /// # Safety
 /// `mapper` must own exclusive access to its PML4. The virtual range
-/// `[phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz)` must not already be mapped.
+/// `[phdr.p_vaddr + load_bias, phdr.p_vaddr + load_bias + phdr.p_memsz)` must
+/// not already be mapped.
 unsafe fn map_load_segment(
     mapper: &mut OffsetPageTable<'_>,
     phys_off: u64,
     data: &[u8],
     phdr: &Phdr,
+    load_bias: u64,
 ) -> Result<(), ElfError> {
     if phdr.p_memsz == 0 {
         return Ok(());
@@ -248,7 +264,10 @@ unsafe fn map_load_segment(
         return Err(ElfError::TruncatedProgramHeader);
     }
 
-    let vaddr_start = phdr.p_vaddr;
+    let vaddr_start = phdr
+        .p_vaddr
+        .checked_add(load_bias)
+        .ok_or(ElfError::MappingFailed("segment vaddr+bias overflow"))?;
     let vaddr_end = vaddr_start
         .checked_add(phdr.p_memsz)
         .ok_or(ElfError::MappingFailed("segment vaddr overflow"))?;
@@ -396,6 +415,8 @@ pub unsafe fn setup_abi_stack(
     mapper: &OffsetPageTable<'_>,
     phys_off: u64,
     argv: &[&[u8]],
+    phdr_vaddr: u64,
+    phnum: u16,
 ) -> Result<u64, ElfError> {
     // Helper: translate a virtual address in the target page table to a kernel
     // writable pointer via the physical-memory offset.
@@ -433,16 +454,43 @@ pub unsafe fn setup_abi_stack(
     // Align cursor down to 8 bytes.
     cursor &= !7;
 
-    // Now build the pointer table growing downward:
-    // aux NULL, envp NULL, argv NULLs + pointers, argc
+    // Write 16 bytes of pseudo-random data on the stack for AT_RANDOM.
+    // musl uses this for stack canary / ASLR seed.  A fixed pattern is
+    // fine for a toy OS — the important thing is that the pointer is valid.
+    cursor -= 16;
+    let at_random_ptr = cursor;
+    for i in 0u64..16 {
+        let kptr = virt_to_kptr(cursor + i)?;
+        kptr.write((0xAB ^ i as u8).wrapping_add(i as u8));
+    }
+    cursor &= !7; // realign to 8 bytes
 
-    // Aux vector: two NULLs (AT_NULL = 0, value = 0).
-    cursor -= 8;
-    let kptr = virt_to_kptr(cursor)?;
-    (kptr as *mut u64).write(0); // AT_NULL value
-    cursor -= 8;
-    let kptr = virt_to_kptr(cursor)?;
-    (kptr as *mut u64).write(0); // AT_NULL type
+    // Now build the pointer table growing downward:
+    // aux vector, envp NULL, argv NULLs + pointers, argc
+
+    // Auxiliary vector (key, value pairs, terminated by AT_NULL).
+    const AT_PHDR: u64 = 3;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_RANDOM: u64 = 25;
+    const AT_NULL: u64 = 0;
+
+    // Helper to push one auxv entry (type, value).
+    let push_aux = |cursor: &mut u64, key: u64, val: u64| -> Result<(), ElfError> {
+        *cursor -= 8;
+        let kptr = virt_to_kptr(*cursor)?;
+        (kptr as *mut u64).write(val);
+        *cursor -= 8;
+        let kptr = virt_to_kptr(*cursor)?;
+        (kptr as *mut u64).write(key);
+        Ok(())
+    };
+
+    push_aux(&mut cursor, AT_NULL, 0)?;
+    push_aux(&mut cursor, AT_RANDOM, at_random_ptr)?;
+    push_aux(&mut cursor, AT_PAGESZ, 4096)?;
+    push_aux(&mut cursor, AT_PHNUM, phnum as u64)?;
+    push_aux(&mut cursor, AT_PHDR, phdr_vaddr)?;
 
     // envp: NULL terminator only (P11-T011: minimal empty environment).
     cursor -= 8;
@@ -500,6 +548,35 @@ pub unsafe fn load_elf_into(
     let phentsize = ehdr.phentsize as usize;
     let phnum = ehdr.phnum as usize;
 
+    // Find minimum LOAD segment vaddr (needed for load_bias and phdr_vaddr).
+    let mut min_vaddr = u64::MAX;
+    for i in 0..phnum {
+        let base = phoff
+            .checked_add(
+                i.checked_mul(phentsize)
+                    .ok_or(ElfError::TruncatedProgramHeader)?,
+            )
+            .ok_or(ElfError::TruncatedProgramHeader)?;
+        let phdr = parse_phdr(data, base, phentsize)?;
+        if phdr.p_type == PT_LOAD && phdr.p_memsz > 0 {
+            min_vaddr = min_vaddr.min(phdr.p_vaddr);
+        }
+    }
+
+    // For PIE (ET_DYN) binaries the segments are linked at vaddr 0.
+    // Compute a load bias so they land at USER_VADDR_MIN (4 MiB).
+    let load_bias = if ehdr.e_type == ET_DYN {
+        if min_vaddr == u64::MAX {
+            0 // no LOAD segments — bias has no effect
+        } else {
+            USER_VADDR_MIN.saturating_sub(min_vaddr)
+        }
+    } else if ehdr.e_type == ET_EXEC {
+        0
+    } else {
+        return Err(ElfError::MappingFailed("unsupported ELF type"));
+    };
+
     for i in 0..phnum {
         let base = phoff
             .checked_add(
@@ -510,15 +587,27 @@ pub unsafe fn load_elf_into(
 
         let phdr = parse_phdr(data, base, phentsize)?;
         if phdr.p_type == PT_LOAD {
-            map_load_segment(mapper, phys_off, data, &phdr)?;
+            map_load_segment(mapper, phys_off, data, &phdr, load_bias)?;
         }
     }
 
     let stack_top = map_user_stack(mapper, phys_off)?;
 
+    // Compute the virtual address of the program header table in the loaded
+    // image.  The phdrs sit at file offset e_phoff, which falls inside the
+    // first LOAD segment (offset=0, vaddr=min_vaddr typically).  Their
+    // runtime vaddr is therefore min_vaddr + load_bias + e_phoff.
+    let phdr_vaddr = if min_vaddr < u64::MAX {
+        min_vaddr + load_bias + ehdr.phoff
+    } else {
+        0
+    };
+
     Ok(LoadedElf {
-        entry: ehdr.entry,
+        entry: ehdr.entry + load_bias,
         stack_top,
+        phdr_vaddr,
+        phnum: ehdr.phnum,
     })
 }
 

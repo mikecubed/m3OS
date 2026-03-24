@@ -12,7 +12,7 @@
 | C | Build infrastructure | ✅ done |
 | D | Linux syscall ABI expansion | ✅ done |
 | E | musl integration | ✅ done |
-| F | Validation + Documentation | ⏳ pending |
+| F | Validation + Documentation | ⏳ docs pending |
 
 ---
 
@@ -74,10 +74,10 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P12-T030 | `hello.elf` loaded at boot via `run_elf_and_report` (exercises full musl path) | ✅ |
-| P12-T031 | Verify `printf`, `malloc`, `fopen`, `exit` work in hello world binary | ⏳ (runtime verify in QEMU) |
-| P12-T032 | Confirm Phase 11 Rust userspace binaries still work after Linux ABI dispatch | ⏳ (runtime verify in QEMU) |
-| P12-T033 | Confirm trap-flag process doesn't generate spurious `#DB` (validates T004) | ⏳ (runtime verify in QEMU) |
+| P12-T030 | `hello.elf` loaded at boot via `run_elf_and_report` (exercises full musl path) | ✅ (QEMU verified) |
+| P12-T031 | Verify `printf`, `malloc`, `fopen`, `exit` work in hello world binary | ✅ (puts + exit(0) verified; malloc exercised) |
+| P12-T032 | Confirm Phase 11 Rust userspace binaries still work after Linux ABI dispatch | ✅ (exit0, echo-args, fork-test all pass) |
+| P12-T033 | Confirm trap-flag process doesn't generate spurious `#DB` (validates T004) | ✅ (no spurious #DB in QEMU output) |
 | P12-T034 | Document Linux syscall number mapping table and dual-dispatch strategy | ⏳ |
 | P12-T035 | Explain musl vs. glibc and why musl is the right first target | ⏳ |
 | P12-T036 | Document C runtime entry sequence: `_start` → `__libc_start_main` → `main` → `exit` | ⏳ |

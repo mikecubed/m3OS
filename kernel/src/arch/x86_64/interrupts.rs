@@ -25,6 +25,7 @@ static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 /// context-switching (which are forbidden inside an ISR) can happen safely.
 fn fault_kill_trampoline() -> ! {
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
+    log::warn!("[fault_kill] trampoline running for pid {}", pid);
     // Mark the process zombie with SIGSEGV exit code.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -33,6 +34,8 @@ fn fault_kill_trampoline() -> ! {
             proc.exit_code = Some(-11);
         }
     }
+    // Restore kernel page table before yielding — same reason as sys_exit.
+    crate::mm::restore_kernel_cr3();
     // Permanently remove the kernel task — the process is dead.
     crate::task::mark_current_dead();
 }
@@ -89,8 +92,11 @@ extern "x86-interrupt" fn page_fault_handler(
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
         let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
         _panic_print(format_args!(
-            "[int] userspace page fault: pid={} addr={:?} err={:?} — process killed\n",
-            pid, addr, err
+            "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
+            pid,
+            addr,
+            err,
+            stack_frame.instruction_pointer.as_u64()
         ));
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.

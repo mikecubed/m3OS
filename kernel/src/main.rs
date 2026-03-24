@@ -1045,14 +1045,22 @@ fn run_elf_and_report(name: &'static str) {
         // argv[0] = binary name.
         let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
-        let user_rsp =
-            match unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) } {
-                Ok(rsp) => rsp,
-                Err(e) => {
-                    log::warn!("[p11] ABI stack setup failed: {:?}", e);
-                    return;
-                }
-            };
+        let user_rsp = match unsafe {
+            mm::elf::setup_abi_stack(
+                loaded.stack_top,
+                &mapper,
+                phys_off,
+                argv,
+                loaded.phdr_vaddr,
+                loaded.phnum,
+            )
+        } {
+            Ok(rsp) => rsp,
+            Err(e) => {
+                log::warn!("[p11] ABI stack setup failed: {:?}", e);
+                return;
+            }
+        };
         (loaded, user_rsp)
     };
 
@@ -1060,7 +1068,7 @@ fn run_elf_and_report(name: &'static str) {
         "[p11] {} loaded: entry={:#x} rsp={:#x}",
         name,
         loaded.entry,
-        user_rsp
+        user_rsp,
     );
 
     let pid = spawn_process_with_cr3(
