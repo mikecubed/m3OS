@@ -70,12 +70,14 @@ ELF_STACK_TOP = 0x0000_7FFF_FFFF_F000
 
 ### 5. Enter ring 3
 
-After loading, the kernel either:
-- calls `enter_userspace(entry, stack_top)` (new process, simple path), or
-- calls `enter_userspace_with_retval(entry, stack_top, 0)` (fork child, rax=0).
+After loading, `setup_abi_stack` is called to build the SysV initial stack and return
+the ABI RSP (the virtual address of `argc`). The kernel then either:
+- calls `enter_userspace(entry, user_rsp)` (new process via execve), or
+- calls `enter_userspace_with_retval(entry, user_rsp, 0)` (fork child, rax=0).
 
-Both use `iretq` with CS set to the user code selector (ring-3 RPL=3) and SS to the user
-data selector, RFLAGS with `IF` set.
+`user_rsp` points to `argc` on the ABI stack — **not** the raw top of the stack
+allocation. Both helpers use `iretq` with CS set to the user code selector (ring-3
+RPL=3), SS to the user data selector, and RFLAGS with `IF` set.
 
 ---
 
@@ -210,9 +212,11 @@ Key ABI rules:
 - `[rsp + 8*(1+argc)]` = NULL (argv terminator).
 - `[rsp + 8*(2+argc)]` = NULL (envp terminator — minimal empty environment).
 - `[rsp + 8*(3+argc)]` = AT_NULL type = 0; `[rsp + 8*(4+argc)]` = AT_NULL value = 0.
-- On entry `rsp` is 16-byte aligned **before** the `call` instruction in the C runtime.
-  Because `_start` is called directly (no `call` pushes a return address in our ELFs),
-  `rsp` must be 16-byte aligned at `_start`.
+- On entry `rsp % 16 == 8` — the same state as after a `call` instruction has pushed
+  a return address. The SysV AMD64 ABI requires `(rsp + 8) % 16 == 0` so that when
+  `_start` calls its first function the stack is 16-byte aligned. Because our ELFs
+  enter at `_start` directly (no `call` wraps it), `setup_abi_stack` pads to ensure
+  the returned RSP satisfies this requirement.
 
 The `setup_abi_stack` function builds this layout by writing through the physical-memory
 offset so the writes are valid even when the target page table is not the current CR3.

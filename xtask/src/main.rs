@@ -89,6 +89,11 @@ fn build_userspace_bins() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
 
+    // Ensure the initrd directory exists before copying.
+    fs::create_dir_all(&initrd).unwrap_or_else(|e| {
+        panic!("failed to create initrd directory {}: {e}", initrd.display());
+    });
+
     let bins: &[(&str, &str)] = &[
         ("exit0", "exit0"),
         ("fork-test", "fork-test"),

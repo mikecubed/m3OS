@@ -99,7 +99,9 @@ pub struct Process {
     pub kernel_stack_top: u64,
     /// Userspace entry-point virtual address.
     pub entry_point: u64,
-    /// Top of the userspace stack virtual address.
+    /// Initial userspace RSP: the virtual address of `argc` on the ABI stack,
+    /// as returned by `setup_abi_stack`.  This is **not** the raw top of the
+    /// stack allocation — it points into the stack, below the argv/envp data.
     pub user_stack_top: u64,
     /// Exit code written when the process transitions to [`ProcessState::Zombie`].
     pub exit_code: Option<i32>,
