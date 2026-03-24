@@ -40,8 +40,8 @@ pub fn phys_offset() -> u64 {
 /// # Safety
 ///
 /// Must only be called with interrupts disabled or inside a syscall handler
-/// where re-entrancy is not a concern.  Safe to call from any privilege level
-/// as long as the kernel PML4 is valid (i.e. after `mm::init`).
+/// where re-entrancy is not a concern.  Only callable from ring 0 (Cr3::write
+/// is a privileged operation).
 pub fn restore_kernel_cr3() {
     use x86_64::{
         registers::control::{Cr3, Cr3Flags},

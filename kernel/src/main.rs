@@ -1076,6 +1076,8 @@ fn run_elf_and_report(name: &'static str) {
         loaded.entry,
         user_rsp,
         x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+        0,
+        0,
     );
     log::info!("[p11] {} registered as pid {}", name, pid);
 

@@ -250,12 +250,16 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
 /// Create a new process entry with a known page-table root and kernel stack.
 ///
 /// Used by `sys_fork` to register the child process before spawning the
-/// fork-child kernel task.
+/// fork-child kernel task.  Inherits `brk_current` and `mmap_next` from the
+/// parent so the child's heap and mmap state are consistent with the copied
+/// address space.
 pub fn spawn_process_with_cr3(
     ppid: Pid,
     entry_point: u64,
     user_stack_top: u64,
     cr3: x86_64::PhysAddr,
+    brk_current: u64,
+    mmap_next: u64,
 ) -> Pid {
     let kstack_top = alloc_kernel_stack();
     let pid = alloc_pid();
@@ -268,8 +272,8 @@ pub fn spawn_process_with_cr3(
         entry_point,
         user_stack_top,
         exit_code: None,
-        brk_current: 0,
-        mmap_next: 0,
+        brk_current,
+        mmap_next,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

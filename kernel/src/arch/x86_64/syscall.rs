@@ -297,8 +297,9 @@ fn sys_getppid() -> u64 {
 
 /// `exit(code)` / `exit_group(code)` — terminate the calling process.
 ///
-/// Marks the process as a zombie, stores the exit code, then permanently
-/// blocks the kernel task so it is never rescheduled.
+/// Marks the process as a zombie, stores the exit code, restores the kernel
+/// CR3 (so the next scheduled task has a consistent address space), then marks
+/// the kernel task as dead so it is never rescheduled.
 fn sys_exit(code: i32) -> ! {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] exit({})", pid, code);
@@ -348,12 +349,24 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
+    // Inherit parent's brk/mmap state so the child's heap is consistent
+    // with the copied address space.
+    let (parent_brk, parent_mmap) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(parent_pid) {
+            Some(p) => (p.brk_current, p.mmap_next),
+            None => (0, 0),
+        }
+    };
+
     // Create child process entry.
     let child_pid = crate::process::spawn_process_with_cr3(
         parent_pid,
         user_rip,
         user_rsp,
         x86_64::PhysAddr::new(child_cr3.start_address().as_u64()),
+        parent_brk,
+        parent_mmap,
     );
 
     // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
@@ -434,6 +447,7 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
     };
 
     // Update the process entry with the new CR3 and entry point.
+    // Reset brk/mmap state since the address space is completely replaced.
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -441,6 +455,8 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
             proc.page_table_root = Some(x86_64::PhysAddr::new(new_cr3.start_address().as_u64()));
             proc.entry_point = loaded.entry;
             proc.user_stack_top = user_rsp;
+            proc.brk_current = 0;
+            proc.mmap_next = 0;
         }
     }
 
@@ -546,9 +562,15 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
                 }
             }
 
-            // Write wstatus in Linux-compatible encoding: exit code in bits 15:8.
+            // Write wstatus in Linux-compatible encoding:
+            //   Normal exit (code >= 0): (code & 0xff) << 8
+            //   Signal kill  (code <  0): (-code) & 0x7f  (signal number in low 7 bits)
             if status_ptr != 0 {
-                let wstatus = code << 8;
+                let wstatus = if code >= 0 {
+                    (code & 0xff) << 8
+                } else {
+                    (-code) & 0x7f
+                };
                 let bytes = wstatus.to_ne_bytes();
                 if crate::mm::user_mem::copy_to_user(status_ptr, &bytes).is_err() {
                     log::warn!("[waitpid] copy_to_user status_ptr {:#x} failed", status_ptr);
@@ -1126,28 +1148,27 @@ fn sys_linux_munmap(_addr: u64, _len: u64) -> u64 {
 fn sys_linux_brk(addr: u64) -> u64 {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
 
-    let (current, base) = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(pid) {
-            Some(p) => (p.brk_current, p.brk_current),
+    // Always initialise brk_current to BRK_BASE if it is still 0, regardless
+    // of the requested addr.  This ensures that even a first call with a
+    // nonzero addr has a valid base to grow from, and if page mapping fails
+    // later we still have a consistent brk_current.
+    let current = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        match table.find_mut(pid) {
+            Some(p) => {
+                if p.brk_current == 0 {
+                    p.brk_current = BRK_BASE;
+                }
+                p.brk_current
+            }
             None => return NEG_EINVAL,
         }
     };
 
-    // Initialise on first call.
-    let current = if current == 0 { BRK_BASE } else { current };
-
     // brk(0) or no-advance: just return current break.
     if addr == 0 || addr <= current {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(p) = table.find_mut(pid) {
-            if p.brk_current == 0 {
-                p.brk_current = BRK_BASE;
-            }
-        }
         return current;
     }
-    let _ = base;
 
     // Align new break up to page boundary.
     let new_brk = match addr.checked_add(0xFFF) {
@@ -1206,7 +1227,10 @@ fn sys_linux_brk(addr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
-    let iovcnt = (iovcnt as usize).min(16);
+    if iovcnt > 1024 {
+        return NEG_EINVAL;
+    }
+    let iovcnt = iovcnt as usize;
     let mut total = 0u64;
     for i in 0..iovcnt {
         // struct iovec { void *base (8B), size_t len (8B) }
@@ -1228,7 +1252,14 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             continue;
         }
         let written = sys_linux_write(fd, base, len);
-        if written as i64 <= 0 {
+        if (written as i64) < 0 {
+            // If no bytes transferred yet, propagate the error.
+            if total == 0 {
+                return written;
+            }
+            break;
+        }
+        if written == 0 {
             break;
         }
         total += written;
@@ -1241,7 +1272,10 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
-    let iovcnt = (iovcnt as usize).min(16);
+    if iovcnt > 1024 {
+        return NEG_EINVAL;
+    }
+    let iovcnt = iovcnt as usize;
     let mut total = 0u64;
     for i in 0..iovcnt {
         let offset = match (i as u64).checked_mul(16) {
@@ -1262,8 +1296,15 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             continue;
         }
         let n = sys_linux_read(fd, base, len);
-        if (n as i64) <= 0 {
+        if (n as i64) < 0 {
+            // If no bytes transferred yet, propagate the error.
+            if total == 0 {
+                return n;
+            }
             break;
+        }
+        if n == 0 {
+            break; // EOF
         }
         total += n;
     }
