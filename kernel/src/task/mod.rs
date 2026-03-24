@@ -52,9 +52,9 @@ pub mod scheduler;
 #[allow(unused_imports)]
 pub use scheduler::{
     block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
-    current_task_id, deliver_message, insert_cap, remove_task_cap, run, server_endpoint,
-    set_server_endpoint, signal_reschedule, spawn, spawn_idle, take_message, task_cap, wake_task,
-    yield_now,
+    current_task_id, deliver_message, insert_cap, mark_current_dead, remove_task_cap, run,
+    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle, take_message,
+    task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,6 +94,8 @@ pub enum TaskState {
     BlockedOnReply,
     /// Task is blocked waiting for a notification bit to be set.
     BlockedOnNotif,
+    /// Task has permanently exited; the scheduler will remove it on next pass.
+    Dead,
 }
 
 // ---------------------------------------------------------------------------

@@ -890,6 +890,14 @@ fn p11_launcher_task() -> ! {
     log::info!("[p11] T022: both exit0 instances completed — address spaces isolated");
 
     log::info!("[p11] all Phase 11 tests complete");
+
+    // -----------------------------------------------------------------------
+    // Phase 12 T030: musl hello world — exercises Linux syscall ABI end-to-end
+    // -----------------------------------------------------------------------
+    log::info!("[p12] T030: running hello.elf (musl-compiled C binary)");
+    run_elf_and_report("hello.elf");
+    log::info!("[p12] T030: hello.elf launch complete");
+
     loop {
         task::yield_now();
     }
@@ -1037,8 +1045,22 @@ fn run_elf_and_report(name: &'static str) {
         // argv[0] = binary name.
         let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
-        let user_rsp =
-            unsafe { mm::elf::setup_abi_stack(loaded.stack_top, &mapper, phys_off, argv) };
+        let user_rsp = match unsafe {
+            mm::elf::setup_abi_stack(
+                loaded.stack_top,
+                &mapper,
+                phys_off,
+                argv,
+                loaded.phdr_vaddr,
+                loaded.phnum,
+            )
+        } {
+            Ok(rsp) => rsp,
+            Err(e) => {
+                log::warn!("[p11] ABI stack setup failed: {:?}", e);
+                return;
+            }
+        };
         (loaded, user_rsp)
     };
 
@@ -1046,7 +1068,7 @@ fn run_elf_and_report(name: &'static str) {
         "[p11] {} loaded: entry={:#x} rsp={:#x}",
         name,
         loaded.entry,
-        user_rsp
+        user_rsp,
     );
 
     let pid = spawn_process_with_cr3(
@@ -1054,6 +1076,8 @@ fn run_elf_and_report(name: &'static str) {
         loaded.entry,
         user_rsp,
         x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+        0,
+        0,
     );
     log::info!("[p11] {} registered as pid {}", name, pid);
 

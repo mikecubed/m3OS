@@ -102,6 +102,40 @@ impl Scheduler {
         self.tasks[idx].server_endpoint
     }
 
+    /// Remove all tasks in the `Dead` state from the task vec.
+    ///
+    /// Also repairs `idle_task` and `last_run` indices after the drain so
+    /// subsequent `pick_next` calls see a consistent view.
+    fn drain_dead(&mut self) {
+        // Walk backwards so that removing an element does not shift earlier
+        // indices and invalidate `i`.
+        let mut i = self.tasks.len();
+        while i > 0 {
+            i -= 1;
+            if self.tasks[i].state == TaskState::Dead {
+                self.tasks.remove(i);
+                // Fix up idle_task index.
+                self.idle_task = self.idle_task.and_then(|idle| {
+                    if idle == i {
+                        None // the idle task itself was removed (unusual)
+                    } else if idle > i {
+                        Some(idle - 1)
+                    } else {
+                        Some(idle)
+                    }
+                });
+                // Adjust last_run: elements below `i` shifted left by one.
+                if self.tasks.is_empty() {
+                    self.last_run = 0;
+                } else if i < self.last_run {
+                    self.last_run -= 1;
+                } else {
+                    self.last_run = self.last_run.min(self.tasks.len() - 1);
+                }
+            }
+        }
+    }
+
     /// Pick the next task to run.
     ///
     /// Prefers non-idle `Ready` tasks using round-robin starting after
@@ -118,6 +152,10 @@ impl Scheduler {
             let idx = (start + i) % n;
             // Skip the idle task in the main rotation.
             if Some(idx) == self.idle_task {
+                continue;
+            }
+            // Skip dead tasks (they will be drained before pick_next is called).
+            if self.tasks[idx].state == TaskState::Dead {
                 continue;
             }
             if self.tasks[idx].state == TaskState::Ready {
@@ -297,6 +335,40 @@ pub fn block_current_on_notif() {
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
 
+/// Permanently mark the current task as dead and switch back to the scheduler.
+///
+/// The scheduler loop will remove the dead task entry on its next iteration.
+/// This function never returns.
+///
+/// Called from `sys_exit` and `fault_kill_trampoline` — locations that run in
+/// ring-0 task context (never inside an ISR) so locking and context-switching
+/// are safe.
+pub fn mark_current_dead() -> ! {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match sched.current {
+            Some(i) => i,
+            None => {
+                // Not in a task context — just halt.
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        };
+        sched.tasks[idx].state = TaskState::Dead;
+        sched.current = None;
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    RESCHEDULE.store(true, Ordering::Relaxed);
+    let sched_rsp = unsafe { SCHEDULER_RSP };
+    // Safety: same preconditions as block_current_on_recv.
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+    // Unreachable — the dead task is never rescheduled.
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 /// Block the current task waiting for a reply after a `call`.
 ///
 /// Sets state to [`TaskState::BlockedOnReply`] and switches to the scheduler.
@@ -443,6 +515,13 @@ pub fn run() -> ! {
         // signal_irq().  signal_irq() cannot call wake_task() (not ISR-safe),
         // so we drain here in task context on each scheduler tick.
         crate::ipc::notification::drain_pending_waiters();
+
+        // Remove any tasks that exited (Dead state) since the last tick.
+        // This reclaims kernel stack memory and keeps the task vec bounded.
+        {
+            let mut sched = SCHEDULER.lock();
+            sched.drain_dead();
+        }
 
         // Pick the next ready task.
         let next = {

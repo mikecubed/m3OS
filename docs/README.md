@@ -19,6 +19,8 @@ userspace shell and programs.
 | [Roadmap Guide](./roadmap/README.md) | Detailed learning-first milestones with per-phase pages and Mermaid diagrams |
 | [Roadmap Task Lists](./roadmap/tasks/README.md) | Actionable per-phase task breakdowns paired with the roadmap milestones |
 | [Testing](./09-testing.md) | QEMU-based test harness, exit conventions, writing tests |
+| [ELF Loader & Process Model](./11-elf-loader-and-process-model.md) | ELF loading, per-process page tables, fork, process lifecycle |
+| [POSIX Compatibility Layer](./12-posix-compatibility-layer.md) | Linux syscall ABI, musl libc, TLS, C runtime startup, user-memory safety |
 
 ## Quick Start
 

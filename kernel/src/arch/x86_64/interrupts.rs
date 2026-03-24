@@ -1,11 +1,47 @@
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::VirtAddr;
 
 use crate::serial::_panic_print;
 
 use super::gdt;
+
+// ---------------------------------------------------------------------------
+// Two-phase fault kill path (T001)
+// ---------------------------------------------------------------------------
+
+/// PID of the process that triggered a ring-3 exception.
+///
+/// Written by the exception handler (in interrupt context, interrupts
+/// disabled) and read by `fault_kill_trampoline` (in task context, outside
+/// interrupt). Single-CPU: no concurrent writers.
+static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Ring-0 trampoline that runs *outside* interrupt context.
+///
+/// The exception handler redirects IRET here so that locking and
+/// context-switching (which are forbidden inside an ISR) can happen safely.
+fn fault_kill_trampoline() -> ! {
+    // Disable interrupts immediately — IRET restored user RFLAGS which may
+    // have IF set, and we must not take interrupts before acquiring locks.
+    x86_64::instructions::interrupts::disable();
+    let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
+    log::warn!("[fault_kill] trampoline running for pid {}", pid);
+    // Mark the process zombie with SIGSEGV exit code.
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.state = crate::process::ProcessState::Zombie;
+            proc.exit_code = Some(-11);
+        }
+    }
+    // Restore kernel page table before yielding — same reason as sys_exit.
+    crate::mm::restore_kernel_cr3();
+    // Permanently remove the kernel task — the process is dead.
+    crate::task::mark_current_dead();
+}
 
 // ---------------------------------------------------------------------------
 // IDT
@@ -48,33 +84,38 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     err: PageFaultErrorCode,
 ) {
     let addr = x86_64::registers::control::Cr2::read();
 
     // Check if the fault came from ring 3 (user mode).
-    // If so, kill the offending process instead of halting the kernel.
+    // If so, redirect IRET to the fault_kill_trampoline instead of calling
+    // block_current_on_recv() from interrupt context (which is forbidden).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
         _panic_print(format_args!(
-            "[int] userspace page fault: pid={} addr={:?} err={:?} — process killed\n",
-            pid, addr, err
+            "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
+            pid,
+            addr,
+            err,
+            stack_frame.instruction_pointer.as_u64()
         ));
-        // Mark the process as zombie (SIGSEGV = -11).
-        {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
-                proc.state = crate::process::ProcessState::Zombie;
-                proc.exit_code = Some(-11);
-            }
+        // Store the PID for the trampoline. Safe: interrupts are disabled
+        // during exception handling on a single CPU.
+        FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+        // Redirect the interrupted context to fault_kill_trampoline, which
+        // runs in ring 0 outside interrupt context where locking is safe.
+        // SAFETY: we modify the interrupt return frame while interrupts are
+        // disabled. The trampoline is a valid kernel function pointer.
+        unsafe {
+            stack_frame.as_mut().update(|f| {
+                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
+                f.code_segment = gdt::kernel_code_selector();
+                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+            });
         }
-        // Block the current kernel task permanently — it will never resume
-        // because no one will send to a permanently-blocked task.  Any parent
-        // waiting via waitpid will observe the zombie exit code.
-        crate::task::block_current_on_recv();
-        // Should not be reached.
-        crate::hlt_loop();
+        return;
     }
 
     // Ring-0 page fault: unrecoverable kernel bug.
@@ -86,25 +127,28 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
-    stack_frame: InterruptStackFrame,
+    mut stack_frame: InterruptStackFrame,
     _err: u64,
 ) {
     // Check if the fault came from ring 3.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
         _panic_print(format_args!(
             "[int] userspace GPF: pid={} — process killed\n{:?}\n",
             pid, stack_frame
         ));
-        {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
-                proc.state = crate::process::ProcessState::Zombie;
-                proc.exit_code = Some(-11);
-            }
+        // Store the PID and redirect to the kill trampoline (same pattern as
+        // page_fault_handler — no blocking allowed inside an ISR).
+        FAULT_KILL_PID.store(pid, Ordering::Relaxed);
+        // SAFETY: same as page_fault_handler above.
+        unsafe {
+            stack_frame.as_mut().update(|f| {
+                f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
+                f.code_segment = gdt::kernel_code_selector();
+                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+            });
         }
-        crate::task::block_current_on_recv();
-        crate::hlt_loop();
+        return;
     }
     _panic_print(format_args!("[int] GPF: {:?}\n", stack_frame));
     crate::hlt_loop();
