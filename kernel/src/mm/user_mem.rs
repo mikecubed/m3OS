@@ -1,0 +1,155 @@
+//! Safe user-memory access primitives (P12-T005).
+//!
+//! Kernel syscall handlers must never dereference userspace pointers directly:
+//! an unmapped-but-in-range address triggers a ring-0 page fault rather than
+//! gracefully returning an error.
+//!
+//! These functions validate the user virtual address range via page-table
+//! translation before copying, returning `Err(())` on any unmapped page.
+//! They use the physical-memory offset to reach the underlying frames so they
+//! work regardless of which CR3 is active.
+
+use x86_64::{
+    structures::paging::{mapper::TranslateResult, PageTableFlags, Translate},
+    VirtAddr,
+};
+
+/// Maximum length (bytes) accepted for a single copy_from_user / copy_to_user
+/// call. Prevents pathological syscall arguments from scanning huge ranges.
+const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
+
+/// Copy `len` bytes from userspace virtual address `src_vaddr` into `dst`.
+///
+/// Validates each 4 KiB page of the source range using the page tables
+/// (must be `PRESENT` and `USER_ACCESSIBLE`). Returns `Err(())` if any page
+/// is unmapped, the address range is not in canonical user space, or `len`
+/// exceeds `MAX_COPY_LEN`.
+///
+/// # Safety
+///
+/// The physical-memory offset (from `crate::mm::phys_offset()`) must be
+/// correct and the kernel's page table walk must be coherent with the
+/// currently-active CR3. On single-CPU without kernel preemption this holds
+/// as long as `mm::init` has run.
+pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
+    let len = dst.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if len > MAX_COPY_LEN {
+        return Err(());
+    }
+    // Reject non-canonical or kernel-space pointers.
+    let src_end = src_vaddr.checked_add(len as u64).ok_or(())?;
+    if src_vaddr < 0x1000 || src_end > 0x0000_8000_0000_0000u64 {
+        return Err(());
+    }
+
+    let phys_off = crate::mm::phys_offset();
+    let mapper = unsafe { crate::mm::paging::get_mapper() };
+
+    let mut copied = 0usize;
+    let mut vaddr = src_vaddr;
+
+    while copied < len {
+        let page_offset = (vaddr & 0xFFF) as usize;
+        let page_base = vaddr & !0xFFF;
+        let avail = (0x1000 - page_offset).min(len - copied);
+
+        // Translate the page and validate flags.
+        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+
+        // Verify USER_ACCESSIBLE via page-table walk.
+        if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
+            return Err(());
+        }
+
+        let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
+        // SAFETY: frame_virt is a kernel virtual address for a mapped frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                frame_virt as *const u8,
+                dst[copied..].as_mut_ptr(),
+                avail,
+            );
+        }
+
+        copied += avail;
+        vaddr += avail as u64;
+    }
+
+    Ok(())
+}
+
+/// Copy `src` bytes into userspace virtual address `dst_vaddr`.
+///
+/// Same validation rules as `copy_from_user`; additionally requires pages to
+/// be `WRITABLE`.
+pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
+    let len = src.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if len > MAX_COPY_LEN {
+        return Err(());
+    }
+    let dst_end = dst_vaddr.checked_add(len as u64).ok_or(())?;
+    if dst_vaddr < 0x1000 || dst_end > 0x0000_8000_0000_0000u64 {
+        return Err(());
+    }
+
+    let phys_off = crate::mm::phys_offset();
+    let mapper = unsafe { crate::mm::paging::get_mapper() };
+
+    let mut copied = 0usize;
+    let mut vaddr = dst_vaddr;
+
+    while copied < len {
+        let page_offset = (vaddr & 0xFFF) as usize;
+        let page_base = vaddr & !0xFFF;
+        let avail = (0x1000 - page_offset).min(len - copied);
+
+        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+
+        if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
+            return Err(());
+        }
+
+        let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
+        // SAFETY: frame_virt is a kernel virtual address for a mapped writable frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src[copied..].as_ptr(), frame_virt as *mut u8, avail);
+        }
+
+        copied += avail;
+        vaddr += avail as u64;
+    }
+
+    Ok(())
+}
+
+/// Check whether the page at `vaddr` is mapped USER_ACCESSIBLE.
+fn is_user_accessible(
+    mapper: &x86_64::structures::paging::OffsetPageTable<'_>,
+    vaddr: VirtAddr,
+) -> bool {
+    match mapper.translate(vaddr) {
+        TranslateResult::Mapped { flags, .. } => {
+            flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+        }
+        _ => false,
+    }
+}
+
+/// Check whether the page at `vaddr` is USER_ACCESSIBLE and WRITABLE.
+fn is_user_writable(
+    mapper: &x86_64::structures::paging::OffsetPageTable<'_>,
+    vaddr: VirtAddr,
+) -> bool {
+    match mapper.translate(vaddr) {
+        TranslateResult::Mapped { flags, .. } => flags.contains(
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
+        ),
+        _ => false,
+    }
+}

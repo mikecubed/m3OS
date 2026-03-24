@@ -60,7 +60,9 @@ pub const SYS_WAITPID: u64 = 61;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_EXECVE: u64 = 59;
-pub const SYS_DEBUG_PRINT: u64 = 12;
+/// Custom kernel debug-print syscall (moved from 12 to avoid conflict with
+/// Linux brk = 12 added in Phase 12). musl programs never call this.
+pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 
 /// Write a UTF-8 string to the kernel serial log.
 pub fn serial_print(s: &str) {

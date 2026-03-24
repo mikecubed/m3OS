@@ -105,6 +105,16 @@ pub struct Process {
     pub user_stack_top: u64,
     /// Exit code written when the process transitions to [`ProcessState::Zombie`].
     pub exit_code: Option<i32>,
+    /// Current program break (heap top). 0 = not yet initialized.
+    ///
+    /// Set to BRK_BASE on first `sys_brk(0)` call; grows upward as
+    /// the process requests more heap via `sys_brk(new_addr)`.
+    pub brk_current: u64,
+    /// Next virtual address available for anonymous `mmap` allocations.
+    ///
+    /// Initialized to ANON_MMAP_BASE on first use; grows upward with
+    /// each allocation. Kept per-process so fork children start fresh.
+    pub mmap_next: u64,
 }
 
 impl Process {
@@ -124,6 +134,8 @@ impl Process {
             entry_point: entry,
             user_stack_top: stack_top,
             exit_code: None,
+            brk_current: 0,
+            mmap_next: 0,
         }
     }
 }
@@ -228,6 +240,8 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         entry_point,
         user_stack_top,
         exit_code: None,
+        brk_current: 0,
+        mmap_next: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -254,6 +268,8 @@ pub fn spawn_process_with_cr3(
         entry_point,
         user_stack_top,
         exit_code: None,
+        brk_current: 0,
+        mmap_next: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
