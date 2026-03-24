@@ -204,7 +204,7 @@ pub extern "C" fn syscall_handler(
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
         1 => sys_linux_write(arg0, arg1, arg2),
-        2 => sys_linux_open(arg0, 0),
+        2 => sys_linux_open(arg0, arg1),
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
         8 => sys_linux_lseek(arg0, arg1, arg2),
@@ -878,6 +878,9 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
         buf[len] = b[0];
         len += 1;
     }
+    if len >= buf.len() {
+        return None; // no NUL terminator found within buffer
+    }
     if len == 0 {
         return Some("");
     }
@@ -1120,11 +1123,13 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
             core::ptr::write_bytes(ptr, 0, 4096);
         }
         // SAFETY: mapper covers the current CR3; frame was just allocated; page is unmapped.
-        if unsafe { mapper.map_to(page, frame, flags_pt, &mut frame_alloc) }.is_err() {
-            log::warn!("[mmap] map_to failed at page {}", i);
-            return NEG_EINVAL;
+        match unsafe { mapper.map_to(page, frame, flags_pt, &mut frame_alloc) } {
+            Ok(flush) => flush.flush(),
+            Err(_) => {
+                log::warn!("[mmap] map_to failed at page {}", i);
+                return NEG_EINVAL;
+            }
         }
-        // No TLB flush needed for new mappings (no stale entry to evict).
     }
 
     log::info!("[mmap] anon {}×4K @ {:#x}", pages, base);
@@ -1209,9 +1214,12 @@ fn sys_linux_brk(addr: u64) -> u64 {
             core::ptr::write_bytes(ptr, 0, 4096);
         }
         // SAFETY: mapper covers current CR3; frame was just allocated; page is unmapped.
-        if unsafe { mapper.map_to(page, frame, flags, &mut frame_alloc) }.is_err() {
-            log::warn!("[brk] map_to failed at page {}", i);
-            return current;
+        match unsafe { mapper.map_to(page, frame, flags, &mut frame_alloc) } {
+            Ok(flush) => flush.flush(),
+            Err(_) => {
+                log::warn!("[brk] map_to failed at page {}", i);
+                return current;
+            }
         }
     }
 
@@ -1248,6 +1256,9 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
         };
         let mut iov_bytes = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
+            if total == 0 {
+                return NEG_EFAULT;
+            }
             break;
         }
         let base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());
@@ -1296,6 +1307,9 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
         };
         let mut iov_bytes = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
+            if total == 0 {
+                return NEG_EFAULT;
+            }
             break;
         }
         let base = u64::from_ne_bytes(iov_bytes[0..8].try_into().unwrap());
