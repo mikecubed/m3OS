@@ -6,8 +6,9 @@
 //!
 //! These functions validate the user virtual address range via page-table
 //! translation before copying, returning `Err(())` on any unmapped page.
-//! They use the physical-memory offset to reach the underlying frames so they
-//! work regardless of which CR3 is active.
+//! They use `paging::get_mapper()` (which operates on the current CR3) to walk
+//! the page tables, so callers must ensure the correct CR3 is active — i.e. the
+//! target process's page table must be loaded before calling these functions.
 
 use x86_64::{
     structures::paging::{mapper::TranslateResult, PageTableFlags, Translate},

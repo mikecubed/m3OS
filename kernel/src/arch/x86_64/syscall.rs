@@ -229,7 +229,7 @@ pub extern "C" fn syscall_handler(
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
-        _ => u64::MAX, // ENOSYS
+        _ => (-38_i64) as u64, // -ENOSYS
     }
 }
 
@@ -504,9 +504,14 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
             // CR3 may now be the kernel PML4.  copy_to_user needs the caller's
             // page table, so restore it explicitly before writing status.
             // Also update CURRENT_PID — the child's trampoline may have changed it.
-            let caller_cr3_phys = {
+            let (caller_cr3_phys, kstack_top) = {
                 let table = crate::process::PROCESS_TABLE.lock();
-                table.find(calling_pid).and_then(|p| p.page_table_root)
+                let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
+                let kst = table
+                    .find(calling_pid)
+                    .map(|p| p.kernel_stack_top)
+                    .unwrap_or(0);
+                (cr3, kst)
             };
             if let Some(phys) = caller_cr3_phys {
                 // SAFETY: phys is the caller's live PML4 frame from the process table.
@@ -520,6 +525,15 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
                 }
             }
             crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+
+            // Restore kernel stack pointers for this process.
+            if kstack_top != 0 {
+                unsafe {
+                    crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
+                    *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
+                        kstack_top;
+                }
+            }
 
             // Write wstatus in Linux-compatible encoding: exit code in bits 15:8.
             if status_ptr != 0 {
@@ -745,7 +759,7 @@ static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FDS]> = spin::Mutex::new([NON
 fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     if fd == 0 {
         // stdin: no keyboard input implemented yet — return EAGAIN (-11)
-        return u64::MAX; // -1 = error
+        return (-11_i64) as u64; // -EAGAIN
     }
     let fd = fd as usize;
     if fd >= MAX_FDS {
@@ -761,7 +775,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     };
 
     let remaining = entry.content_len.saturating_sub(entry.offset);
-    let to_read = (count as usize).min(remaining);
+    let to_read = (count as usize).min(remaining).min(64 * 1024);
     if to_read == 0 {
         return 0; // EOF
     }
@@ -821,7 +835,8 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
     let mut len = 0usize;
     while len < 512 {
         let mut b = [0u8; 1];
-        if crate::mm::user_mem::copy_from_user(&mut b, ptr + len as u64).is_err() {
+        let addr = ptr.checked_add(len as u64)?;
+        if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
             return None;
         }
         if b[0] == 0 {
@@ -944,14 +959,26 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
 
-    let new_offset = match whence {
-        SEEK_SET => offset as usize,
-        SEEK_CUR => entry.offset.saturating_add(offset as usize),
-        SEEK_END => entry.content_len.saturating_add(offset as usize),
+    let offset = offset as i64;
+
+    let new_offset: i64 = match whence {
+        SEEK_SET => offset,
+        SEEK_CUR => match (entry.offset as i64).checked_add(offset) {
+            Some(v) => v,
+            None => return u64::MAX,
+        },
+        SEEK_END => match (entry.content_len as i64).checked_add(offset) {
+            Some(v) => v,
+            None => return u64::MAX,
+        },
         _ => return u64::MAX,
     };
 
-    entry.offset = new_offset.min(entry.content_len);
+    if new_offset < 0 || new_offset as usize > entry.content_len {
+        return u64::MAX;
+    }
+
+    entry.offset = new_offset as usize;
     entry.offset as u64
 }
 
@@ -997,9 +1024,29 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
         // Hint address is ignored: always allocate linearly.
         let _ = addr_hint;
         let base = proc.mmap_next;
-        proc.mmap_next = base + pages * 4096;
+        let total_size = match pages.checked_mul(4096) {
+            Some(s) => s,
+            None => return u64::MAX,
+        };
+        proc.mmap_next = match base.checked_add(total_size) {
+            Some(v) => v,
+            None => return u64::MAX,
+        };
         base
     };
+
+    // Validate that the entire range fits in canonical user space (< 0x0000_8000_0000_0000).
+    let total_size = match pages.checked_mul(4096) {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+    let range_end = match base.checked_add(total_size) {
+        Some(e) => e,
+        None => return u64::MAX,
+    };
+    if range_end > 0x0000_8000_0000_0000 {
+        return u64::MAX;
+    }
 
     // Map pages in the current address space (current CR3 = this process).
     use x86_64::{
@@ -1015,6 +1062,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
     let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
 
     for i in 0..pages {
+        // SAFETY: canonical range validated above.
         let vaddr = VirtAddr::new(base + i * 4096);
         let page: Page<Size4KiB> = Page::containing_address(vaddr);
         let frame = match crate::mm::frame_allocator::allocate_frame() {

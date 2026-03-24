@@ -598,7 +598,10 @@ pub unsafe fn load_elf_into(
     // first LOAD segment (offset=0, vaddr=min_vaddr typically).  Their
     // runtime vaddr is therefore min_vaddr + load_bias + e_phoff.
     let phdr_vaddr = if min_vaddr < u64::MAX {
-        min_vaddr + load_bias + ehdr.phoff
+        min_vaddr
+            .checked_add(load_bias)
+            .and_then(|v| v.checked_add(ehdr.phoff))
+            .ok_or(ElfError::MappingFailed("phdr vaddr overflow"))?
     } else {
         0
     };

@@ -124,11 +124,13 @@ impl Scheduler {
                         Some(idle)
                     }
                 });
-                // Keep last_run in-bounds.
-                if !self.tasks.is_empty() {
-                    self.last_run = self.last_run.min(self.tasks.len() - 1);
-                } else {
+                // Adjust last_run: elements below `i` shifted left by one.
+                if self.tasks.is_empty() {
                     self.last_run = 0;
+                } else if i < self.last_run {
+                    self.last_run -= 1;
+                } else {
+                    self.last_run = self.last_run.min(self.tasks.len() - 1);
                 }
             }
         }

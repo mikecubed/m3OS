@@ -24,6 +24,9 @@ static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 /// The exception handler redirects IRET here so that locking and
 /// context-switching (which are forbidden inside an ISR) can happen safely.
 fn fault_kill_trampoline() -> ! {
+    // Disable interrupts immediately — IRET restored user RFLAGS which may
+    // have IF set, and we must not take interrupts before acquiring locks.
+    x86_64::instructions::interrupts::disable();
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
     // Mark the process zombie with SIGSEGV exit code.
@@ -109,6 +112,7 @@ extern "x86-interrupt" fn page_fault_handler(
             stack_frame.as_mut().update(|f| {
                 f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
                 f.code_segment = gdt::kernel_code_selector();
+                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
             });
         }
         return;
@@ -141,6 +145,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             stack_frame.as_mut().update(|f| {
                 f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
                 f.code_segment = gdt::kernel_code_selector();
+                f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
             });
         }
         return;

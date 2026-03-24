@@ -13,9 +13,9 @@ directly:
 
 | Linux # | Name          | Implementation              | Notes                          |
 |---------|---------------|-----------------------------|--------------------------------|
-| 0       | read          | `sys_linux_read`            | VFS IPC path                   |
-| 1       | write         | `sys_linux_write`           | stdout/stderr → console_server |
-| 2       | open          | `sys_linux_open`            | ramdisk VFS path               |
+| 0       | read          | `sys_linux_read`            | reads from static ramdisk fd table |
+| 1       | write         | `sys_linux_write`           | stdout/stderr to kernel serial log |
+| 2       | open          | `sys_linux_open`            | static ramdisk path lookup     |
 | 3       | close         | `sys_linux_close`           | fd table release               |
 | 5       | fstat         | `sys_linux_fstat`           | minimal stat struct            |
 | 8       | lseek         | `sys_linux_lseek`           | per-fd offset update           |
@@ -49,7 +49,7 @@ The Phase 11 kernel-native syscall numbers (4, 6, 7, 10) overlap with Linux numb
 2. Keeping IPC syscalls on numbers 4, 7, 10 (Phase 6 kernel-task-only paths).
 3. Adding Linux numbers for all musl-required calls.
 
-Unrecognised syscall numbers return `u64::MAX` (treated as -ENOSYS by musl).
+Unrecognised syscall numbers return `-ENOSYS` (negative errno convention) so musl's raw syscall wrappers observe a standard error.
 
 ### Syscall register ABI
 
@@ -153,8 +153,8 @@ The kernel populates the auxiliary vector on the user stack in `setup_abi_stack`
 
 ### Real implementations (behaviour matches Linux semantics)
 
-- **read/write/writev/readv**: Full IPC path to console_server / vfs_server.
-- **open/close**: Ramdisk file lookup, per-process fd table.
+- **read/write/writev/readv**: Global kernel-side FD table; reads from static ramdisk, writes to kernel serial log.
+- **open/close**: Global FD table with ramdisk file lookup.
 - **fstat/fstatat**: Returns file size, mode, block size from ramdisk.
 - **lseek**: Per-fd offset tracking with SEEK_SET/CUR/END.
 - **mmap**: Anonymous MAP_PRIVATE|MAP_ANONYMOUS with frame allocation.
@@ -219,11 +219,10 @@ Both functions in `kernel/src/mm/user_mem.rs` follow the same pattern:
    This confirms the user actually has access to the page.
 
 3. **Physical-memory copy**: Read/write through `phys_offset + frame_addr + offset`,
-   which is always valid in the kernel's address space regardless of the current CR3.
+   which is always valid in the kernel's address space.
 
-This design means user-memory access works correctly even when the kernel is
-operating on a different process's page table (e.g., during fork or execve
-where `mapper_for_frame` targets a not-yet-active PML4).
+Because `paging::get_mapper()` operates on the current CR3, callers must ensure the
+target process's page table is active before calling `copy_from_user` / `copy_to_user`.
 
 ---
 

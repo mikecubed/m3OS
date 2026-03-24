@@ -149,7 +149,7 @@ fn build_musl_bins() {
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
         let dst = initrd.join(format!("{name}.elf"));
-        let status = Command::new("musl-gcc")
+        let status = match Command::new("musl-gcc")
             .args([
                 "-static",
                 "-O2",
@@ -158,7 +158,14 @@ fn build_musl_bins() {
                 dst.to_str().expect("non-UTF-8 path"),
             ])
             .status()
-            .unwrap_or_else(|e| panic!("failed to run musl-gcc for {name}: {e}"));
+        {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("warning: musl-gcc not found — skipping C binary builds (install musl-tools to enable)");
+                return;
+            }
+            Err(e) => panic!("failed to run musl-gcc for {name}: {e}"),
+        };
         if !status.success() {
             eprintln!("musl-gcc failed for {name}");
             std::process::exit(1);
