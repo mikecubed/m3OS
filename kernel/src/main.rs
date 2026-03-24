@@ -13,6 +13,7 @@ mod mm;
 mod pipe;
 mod process;
 mod serial;
+mod stdin;
 mod task;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
@@ -159,6 +160,9 @@ fn init_task() -> ! {
 
     // Spawn Phase 9 shell task.
     task::spawn(shell_task, "shell");
+
+    // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
+    task::spawn(stdin_feeder_task, "stdin-feeder");
 
     // Phase 11: spawn userspace process launcher task (P11-T017).
     task::spawn(p11_launcher_task, "p11-launcher");
@@ -764,6 +768,72 @@ fn cmd_cat(
     // FILE_CLOSE
     let close_msg = ipc::Message::with1(crate::fs::protocol::FILE_CLOSE, fd);
     let _ = ipc::endpoint::call_msg(my_id, vfs_ep, close_msg);
+}
+
+/// Stdin feeder task (Phase 14, Track E).
+///
+/// Reads scancodes from the keyboard server, decodes them to characters,
+/// echoes to the console, handles line buffering and backspace, and feeds
+/// completed lines into the kernel stdin buffer for `read(0, ...)`.
+fn stdin_feeder_task() -> ! {
+    let my_id = task::current_task_id().expect("[stdin] no task id");
+
+    let console_ep = ipc::registry::lookup("console").expect("[stdin] console not found");
+    let kbd_ep = ipc::registry::lookup("kbd").expect("[stdin] kbd not found");
+
+    log::info!("[stdin] feeder ready");
+
+    let mut shift = false;
+
+    loop {
+        // Request one scancode from the keyboard server.
+        let kbd_req = ipc::Message::new(KBD_READ);
+        let kbd_reply = ipc::endpoint::call_msg(my_id, kbd_ep, kbd_req);
+        if kbd_reply.label == u64::MAX {
+            task::yield_now();
+            continue;
+        }
+        let sc = kbd_reply.data[0] as u8;
+
+        // Key-release (break) codes: bit 7 set.
+        if sc >= 0x80 {
+            let make = sc & 0x7F;
+            if make == 0x2A || make == 0x36 {
+                shift = false;
+            }
+            continue;
+        }
+
+        // Shift make codes.
+        if sc == 0x2A || sc == 0x36 {
+            shift = true;
+            continue;
+        }
+
+        // Enter (0x1C): flush line buffer to stdin.
+        if sc == 0x1C {
+            shell_print(my_id, console_ep, "\n");
+            stdin::flush_line();
+            continue;
+        }
+
+        // Backspace (0x0E): remove last character.
+        if sc == 0x0E {
+            if stdin::backspace() {
+                shell_print(my_id, console_ep, "\x08 \x08");
+            }
+            continue;
+        }
+
+        // Printable character.
+        if let Some(c) = scancode_to_char(sc, shift) {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            stdin::push_char(s.as_bytes()[0]);
+            // Echo to console.
+            shell_print(my_id, console_ep, s);
+        }
+    }
 }
 
 /// Shell task: interactive line-oriented command interpreter (T005–T007).

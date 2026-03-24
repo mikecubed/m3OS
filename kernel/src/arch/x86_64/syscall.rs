@@ -31,6 +31,7 @@ extern crate alloc;
 const NEG_EPERM: u64 = (-1_i64) as u64;
 const NEG_ENOENT: u64 = (-2_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
+#[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EFAULT: u64 = (-14_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
@@ -1163,8 +1164,24 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     match &entry.backend {
         FdBackend::Stdin => {
-            // stdin: no keyboard input implemented yet — return EAGAIN (-11)
-            NEG_EAGAIN
+            // Read from kernel stdin buffer (Phase 14, Track E).
+            // Yield-loop until data is available (line-buffered).
+            let capped = (count as usize).min(4096);
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            loop {
+                if crate::stdin::has_data() {
+                    let mut tmp = [0u8; 4096];
+                    let n = crate::stdin::read(&mut tmp[..capped]);
+                    if n > 0 {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        return n as u64;
+                    }
+                }
+                crate::task::yield_now();
+                crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         FdBackend::Stdout => NEG_EBADF,
         FdBackend::Ramdisk {
