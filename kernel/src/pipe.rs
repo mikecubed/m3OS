@@ -2,10 +2,11 @@
 //!
 //! Each pipe is a 4 KiB ring buffer shared between a read end and a write end.
 //! Pipes are identified by a global `pipe_id` index.  The read and write ends
-//! are tracked via reference counts (reader_open, writer_open) so that:
-//!   - `read()` returns EOF (0) when the writer has closed
-//!   - `write()` returns EPIPE when the reader has closed
-//!   - The pipe is freed when both ends are closed
+//! are tracked via reference counts so that fork/dup2 can create multiple
+//! references to the same pipe end:
+//!   - `read()` returns EOF (0) when the writer ref-count reaches 0
+//!   - `write()` returns EPIPE when the reader ref-count reaches 0
+//!   - The pipe is freed when both counts reach 0
 
 extern crate alloc;
 
@@ -15,17 +16,17 @@ use spin::Mutex;
 /// Size of each pipe's ring buffer.
 const PIPE_BUF_SIZE: usize = 4096;
 
-/// A kernel pipe: ring buffer with reader/writer state.
+/// A kernel pipe: ring buffer with ref-counted reader/writer ends.
 pub struct Pipe {
     buf: [u8; PIPE_BUF_SIZE],
     /// Read position in the ring buffer.
     read_pos: usize,
     /// Number of valid bytes in the buffer (0 = empty, PIPE_BUF_SIZE = full).
     count: usize,
-    /// True while the read end is open.
-    pub reader_open: bool,
-    /// True while the write end is open.
-    pub writer_open: bool,
+    /// Number of open read-end references (FDs pointing to PipeRead for this pipe).
+    pub reader_count: u32,
+    /// Number of open write-end references (FDs pointing to PipeWrite for this pipe).
+    pub writer_count: u32,
 }
 
 impl Pipe {
@@ -34,8 +35,8 @@ impl Pipe {
             buf: [0u8; PIPE_BUF_SIZE],
             read_pos: 0,
             count: 0,
-            reader_open: true,
-            writer_open: true,
+            reader_count: 1,
+            writer_count: 1,
         }
     }
 
@@ -71,6 +72,16 @@ impl Pipe {
     pub fn is_full(&self) -> bool {
         self.count == PIPE_BUF_SIZE
     }
+
+    /// Check if any writer is still open.
+    pub fn has_writer(&self) -> bool {
+        self.writer_count > 0
+    }
+
+    /// Check if any reader is still open.
+    pub fn has_reader(&self) -> bool {
+        self.reader_count > 0
+    }
 }
 
 /// Global pipe table.
@@ -91,6 +102,22 @@ pub fn create_pipe() -> usize {
     id
 }
 
+/// Increment the reader ref-count (called by fork/dup2 when cloning a PipeRead FD).
+pub fn pipe_add_reader(pipe_id: usize) {
+    let mut table = PIPE_TABLE.lock();
+    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+        pipe.reader_count += 1;
+    }
+}
+
+/// Increment the writer ref-count (called by fork/dup2 when cloning a PipeWrite FD).
+pub fn pipe_add_writer(pipe_id: usize) {
+    let mut table = PIPE_TABLE.lock();
+    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+        pipe.writer_count += 1;
+    }
+}
+
 /// Read from a pipe. Returns:
 ///   - `Ok(n)` — n bytes read (0 = EOF if writer closed)
 ///   - `Err(true)` — buffer empty but writer still open (would block)
@@ -102,7 +129,7 @@ pub fn pipe_read(pipe_id: usize, dst: &mut [u8]) -> Result<usize, bool> {
     };
 
     if pipe.is_empty() {
-        if !pipe.writer_open {
+        if !pipe.has_writer() {
             return Ok(0); // EOF
         }
         return Err(true); // would block
@@ -122,7 +149,7 @@ pub fn pipe_write(pipe_id: usize, src: &[u8]) -> Result<usize, bool> {
         None => return Err(false),
     };
 
-    if !pipe.reader_open {
+    if !pipe.has_reader() {
         return Err(false); // EPIPE
     }
 
@@ -133,23 +160,23 @@ pub fn pipe_write(pipe_id: usize, src: &[u8]) -> Result<usize, bool> {
     Ok(pipe.write(src))
 }
 
-/// Close one end of a pipe. Frees the pipe when both ends are closed.
+/// Decrement reader ref-count. Frees the pipe when both counts reach 0.
 pub fn pipe_close_reader(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
     if let Some(Some(pipe)) = table.get_mut(pipe_id) {
-        pipe.reader_open = false;
-        if !pipe.writer_open {
+        pipe.reader_count = pipe.reader_count.saturating_sub(1);
+        if pipe.reader_count == 0 && pipe.writer_count == 0 {
             table[pipe_id] = None;
         }
     }
 }
 
-/// Close the write end of a pipe.
+/// Decrement writer ref-count. Frees the pipe when both counts reach 0.
 pub fn pipe_close_writer(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
     if let Some(Some(pipe)) = table.get_mut(pipe_id) {
-        pipe.writer_open = false;
-        if !pipe.reader_open {
+        pipe.writer_count = pipe.writer_count.saturating_sub(1);
+        if pipe.reader_count == 0 && pipe.writer_count == 0 {
             table[pipe_id] = None;
         }
     }

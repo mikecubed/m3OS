@@ -313,6 +313,7 @@ fn check_pending_signals() {
                             let mut table = crate::process::PROCESS_TABLE.lock();
                             if let Some(proc) = table.find_mut(pid) {
                                 proc.state = crate::process::ProcessState::Stopped;
+                                proc.stop_signal = signum;
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
@@ -610,6 +611,13 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         sys_linux_close(newfd as u64);
     }
 
+    // Increment pipe ref-count for the duplicated FD.
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        _ => {}
+    }
+
     // Copy the FD entry to the new slot.
     with_current_fd_mut(newfd, |slot| {
         *slot = Some(entry);
@@ -674,22 +682,19 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
         return NEG_EFAULT;
     }
     let secs = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
-    // Each PIT tick is ~10ms (100 Hz). Convert seconds to ticks.
-    let ticks = (secs as u64).saturating_mul(100);
+    let nsecs = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+    if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
+        return NEG_EINVAL;
+    }
+    // Each PIT tick is ~10ms (100 Hz). Convert seconds+nsec to ticks.
+    let ticks = (secs as u64).saturating_mul(100) + (nsecs as u64) / 10_000_000;
     let start = crate::arch::x86_64::interrupts::tick_count();
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
         crate::task::yield_now();
         crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
-        // Check for signals (e.g., SIGINT during sleep).
-        if pid != 0 {
-            let table = crate::process::PROCESS_TABLE.lock();
-            if let Some(p) = table.find(pid) {
-                if p.pending_signals != 0 {
-                    drop(table);
-                    return (-4_i64) as u64; // EINTR
-                }
-            }
+        if has_pending_signal() {
+            return NEG_EINTR;
         }
     }
     0
@@ -740,6 +745,9 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     };
 
+    // Increment pipe ref-counts for cloned FDs before creating the child.
+    crate::process::add_pipe_refs(&parent_fds);
+
     // Create child process entry with cloned FD table (Phase 14, P14-T003).
     let child_pid = crate::process::spawn_process_with_cr3_and_fds(
         parent_pid,
@@ -766,22 +774,26 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
 ///
 /// Returns an empty vec if `array_ptr` is 0 (NULL).
 /// Returns at most `max_entries` strings; each string is capped at 4096 bytes.
+/// Read a null-terminated array of `char*` pointers from user memory.
+///
+/// Returns `Ok(vec)` on success, `Err(())` if a user pointer is invalid
+/// (caller should return EFAULT).
 fn read_user_string_array(
     array_ptr: u64,
     max_entries: usize,
-) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, ()> {
     let mut result = alloc::vec::Vec::new();
     if array_ptr == 0 {
-        return result;
+        return Ok(result);
     }
     for i in 0..max_entries {
         let ptr_addr = match array_ptr.checked_add((i * 8) as u64) {
             Some(a) => a,
-            None => break,
+            None => return Err(()),
         };
         let mut ptr_bytes = [0u8; 8];
         if crate::mm::user_mem::copy_from_user(&mut ptr_bytes, ptr_addr).is_err() {
-            break;
+            return Err(());
         }
         let str_ptr = u64::from_ne_bytes(ptr_bytes);
         if str_ptr == 0 {
@@ -805,7 +817,7 @@ fn read_user_string_array(
         }
         result.push(s);
     }
-    result
+    Ok(result)
 }
 
 /// `execve(filename, argv, envp)` — replace the calling process's image
@@ -827,8 +839,14 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     );
 
     // Parse argv and envp from user memory.
-    let user_argv = read_user_string_array(argv_ptr, 256);
-    let user_envp = read_user_string_array(envp_ptr, 256);
+    let user_argv = match read_user_string_array(argv_ptr, 256) {
+        Ok(v) => v,
+        Err(()) => return NEG_EFAULT,
+    };
+    let user_envp = match read_user_string_array(envp_ptr, 256) {
+        Ok(v) => v,
+        Err(()) => return NEG_EFAULT,
+    };
 
     // Strip leading "/" or path prefix to get the ramdisk filename.
     let file_name = name.trim_start_matches('/');
@@ -991,13 +1009,14 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 if report_stopped && proc.state == crate::process::ProcessState::Stopped {
                     found_pid = Some(proc.pid);
                     found_stopped = true;
+                    found_code = Some(proc.stop_signal as i32);
                     break;
                 }
             }
 
             if let Some(pid) = found_pid {
                 if found_stopped {
-                    Some((pid, None, true)) // stopped
+                    Some((pid, found_code, true)) // stopped
                 } else {
                     let code = found_code.unwrap_or(0);
                     table.reap(pid);
@@ -1016,7 +1035,8 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
             if status_ptr != 0 {
                 let wstatus = if stopped {
                     // WIFSTOPPED: (sig << 8) | 0x7f
-                    (crate::process::SIGTSTP as i32) << 8 | 0x7f
+                    let sig = code_opt.unwrap_or(crate::process::SIGTSTP as i32);
+                    (sig & 0xff) << 8 | 0x7f
                 } else {
                     let code = code_opt.unwrap_or(0);
                     if code >= 0 {
@@ -1076,6 +1096,22 @@ fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Check if the current process has pending signals.
+/// Returns true if a signal is pending (caller should return EINTR).
+fn has_pending_signal() -> bool {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid == 0 {
+        return false;
+    }
+    let table = crate::process::PROCESS_TABLE.lock();
+    table
+        .find(pid)
+        .map(|p| p.pending_signals != 0)
+        .unwrap_or(false)
+}
+
+const NEG_EINTR: u64 = (-4_i64) as u64;
 
 /// Copy all user-accessible pages from the currently-active page table
 /// into `dst_mapper`'s page table.
@@ -1305,6 +1341,10 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return n as u64;
                     }
                 }
+                // Check for pending signals so Ctrl-C works while blocked.
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
                 crate::task::yield_now();
                 crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
             }
@@ -1378,6 +1418,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return n as u64;
                     }
                     Err(_would_block) => {
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
                         crate::task::yield_now();
                         crate::process::CURRENT_PID
                             .store(pid, core::sync::atomic::Ordering::Relaxed);
@@ -1489,6 +1532,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     Err(true) => {
                         // Would block — yield and retry.
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
                         crate::task::yield_now();
                         crate::process::CURRENT_PID
                             .store(pid, core::sync::atomic::Ordering::Relaxed);

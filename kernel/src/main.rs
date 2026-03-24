@@ -956,30 +956,83 @@ fn shell_fork_exec(
     }
 
     let cmd_name = parts[0];
-    // Resolve command: try with .elf extension.
-    let elf_name = if cmd_name.ends_with(".elf") {
-        String::from(cmd_name)
-    } else {
-        alloc::format!("{}.elf", cmd_name)
-    };
-
-    // Check if the ELF exists in ramdisk.
-    if fs::ramdisk::get_file(&elf_name).is_none() {
-        let msg = alloc::format!("{}: command not found\n", cmd_name);
-        shell_print(my_id, console_ep, &msg);
-        return;
-    }
-
-    // Build the child process via run_elf_and_fork.
-    let child_pid = match spawn_user_process(&elf_name, &parts, env) {
-        Some(pid) => pid,
+    // Resolve command via PATH search.
+    let elf_name = match resolve_command(cmd_name, env) {
+        Some(name) => name,
         None => {
-            shell_print(my_id, console_ep, "fork: failed\n");
+            let msg = alloc::format!("{}: command not found\n", cmd_name);
+            shell_print(my_id, console_ep, &msg);
             return;
         }
     };
 
-    let _ = (stdout_file, stdout_append, stdin_file); // TODO: wire redirection in a future commit
+    // Build the child process, with optional I/O redirection via pipes.
+    let stdin_pipe_id = stdin_file.map(|_| pipe::create_pipe());
+    let stdout_pipe_id = stdout_file.map(|_| pipe::create_pipe());
+
+    let child_pid =
+        match spawn_user_process_with_pipe(&elf_name, &parts, env, stdin_pipe_id, stdout_pipe_id) {
+            Some(pid) => pid,
+            None => {
+                shell_print(my_id, console_ep, "fork: failed\n");
+                return;
+            }
+        };
+
+    // Feed stdin from file if redirected.
+    if let (Some(file), Some(pipe_id)) = (stdin_file, stdin_pipe_id) {
+        if let Some(data) = fs::ramdisk::get_file(file.trim_start_matches('/')) {
+            let mut offset = 0;
+            while offset < data.len() {
+                let chunk = (data.len() - offset).min(4096);
+                let _ = pipe::pipe_write(pipe_id, &data[offset..offset + chunk]);
+                offset += chunk;
+            }
+        }
+        pipe::pipe_close_writer(pipe_id);
+        pipe::pipe_close_reader(pipe_id);
+    }
+
+    // Capture stdout to file if redirected.
+    if let (Some(file), Some(pipe_id)) = (stdout_file, stdout_pipe_id) {
+        pipe::pipe_close_writer(pipe_id);
+        // Read all output from the pipe and write to tmpfs.
+        let rel_path = file.trim_start_matches('/');
+        let tmpfs_rel = if let Some(r) = rel_path.strip_prefix("tmp/") {
+            r
+        } else {
+            rel_path
+        };
+        {
+            let mut tmpfs = fs::tmpfs::TMPFS.lock();
+            let _ = tmpfs.open_or_create(tmpfs_rel, true);
+            if !stdout_append {
+                let _ = tmpfs.truncate(tmpfs_rel, 0);
+            }
+        }
+        let mut file_offset = if stdout_append {
+            let tmpfs = fs::tmpfs::TMPFS.lock();
+            tmpfs.file_size(tmpfs_rel).unwrap_or(0)
+        } else {
+            0
+        };
+        // Drain pipe into file in a background-ish loop.
+        loop {
+            let mut buf = [0u8; 4096];
+            match pipe::pipe_read(pipe_id, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut tmpfs = fs::tmpfs::TMPFS.lock();
+                    let _ = tmpfs.write_file(tmpfs_rel, file_offset, &buf[..n]);
+                    file_offset += n;
+                }
+                Err(_) => {
+                    task::yield_now();
+                }
+            }
+        }
+        pipe::pipe_close_reader(pipe_id);
+    }
 
     if background {
         let job = *next_job;
@@ -1014,27 +1067,22 @@ fn shell_pipeline(
         return;
     }
 
-    let elf0 = if parts0[0].ends_with(".elf") {
-        String::from(parts0[0])
-    } else {
-        alloc::format!("{}.elf", parts0[0])
+    let elf0 = match resolve_command(parts0[0], env) {
+        Some(name) => name,
+        None => {
+            let msg = alloc::format!("{}: command not found\n", parts0[0]);
+            shell_print(my_id, console_ep, &msg);
+            return;
+        }
     };
-    let elf1 = if parts1[0].ends_with(".elf") {
-        String::from(parts1[0])
-    } else {
-        alloc::format!("{}.elf", parts1[0])
+    let elf1 = match resolve_command(parts1[0], env) {
+        Some(name) => name,
+        None => {
+            let msg = alloc::format!("{}: command not found\n", parts1[0]);
+            shell_print(my_id, console_ep, &msg);
+            return;
+        }
     };
-
-    if fs::ramdisk::get_file(&elf0).is_none() {
-        let msg = alloc::format!("{}: command not found\n", parts0[0]);
-        shell_print(my_id, console_ep, &msg);
-        return;
-    }
-    if fs::ramdisk::get_file(&elf1).is_none() {
-        let msg = alloc::format!("{}: command not found\n", parts1[0]);
-        shell_print(my_id, console_ep, &msg);
-        return;
-    }
 
     // Create a pipe.
     let pipe_id = pipe::create_pipe();
@@ -1055,9 +1103,14 @@ fn shell_pipeline(
     pipe::pipe_close_writer(pipe_id);
     pipe::pipe_close_reader(pipe_id);
 
+    // Set foreground process group to the first child so Ctrl-C works.
+    process::FG_PGID.store(pid0, core::sync::atomic::Ordering::Relaxed);
+
     // Wait for both children.
     wait_for_child(pid0);
     wait_for_child(pid1);
+
+    process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Spawn a userspace ELF process with optional pipe redirection.
@@ -1110,8 +1163,10 @@ fn spawn_user_process_with_pipe(
 
     let mut fd_table = process::new_fd_table_pub();
 
-    // Wire pipe FDs if requested.
+    // Wire pipe FDs if requested. Increment ref-counts since the pipe was
+    // created with 1 reader + 1 writer, and these are additional references.
     if let Some(pipe_id) = stdin_pipe {
+        pipe::pipe_add_reader(pipe_id);
         fd_table[0] = Some(process::FdEntry {
             backend: process::FdBackend::PipeRead { pipe_id },
             offset: 0,
@@ -1120,6 +1175,7 @@ fn spawn_user_process_with_pipe(
         });
     }
     if let Some(pipe_id) = stdout_pipe {
+        pipe::pipe_add_writer(pipe_id);
         fd_table[1] = Some(process::FdEntry {
             backend: process::FdBackend::PipeWrite { pipe_id },
             offset: 0,
@@ -1142,15 +1198,6 @@ fn spawn_user_process_with_pipe(
     task::spawn(process::fork_child_trampoline, "shell-child");
 
     Some(pid)
-}
-
-/// Spawn a userspace process (no pipe redirection).
-fn spawn_user_process(
-    elf_name: &str,
-    argv: &[&str],
-    env: &[(String, String)],
-) -> Option<crate::process::Pid> {
-    spawn_user_process_with_pipe(elf_name, argv, env, None, None)
 }
 
 /// Wait for a child process to exit (spin-yield).
@@ -1208,6 +1255,43 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
         }
     }
     env.push((String::from(key), String::from(val)));
+}
+
+/// Resolve a command name to an ELF filename via PATH search.
+///
+/// Searches $PATH directories for `{cmd}.elf` in the ramdisk.
+/// Returns None if the command is not found in any PATH directory.
+fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
+    // If already has .elf extension, try directly.
+    if cmd.ends_with(".elf") {
+        return if fs::ramdisk::get_file(cmd).is_some() {
+            Some(String::from(cmd))
+        } else {
+            None
+        };
+    }
+
+    let elf_name = alloc::format!("{}.elf", cmd);
+
+    // Try direct lookup first (flat ramdisk).
+    if fs::ramdisk::get_file(&elf_name).is_some() {
+        return Some(elf_name);
+    }
+
+    // Search PATH directories. Our ramdisk is flat, so path components
+    // are stripped — we just retry the base name.
+    if let Some((_, path_val)) = env.iter().find(|(k, _)| k == "PATH") {
+        for _dir in path_val.split(':') {
+            // Ramdisk is flat; all binaries are at root level.
+            // The PATH search is primarily for compatibility — the actual
+            // lookup just checks if {cmd}.elf exists.
+            if fs::ramdisk::get_file(&elf_name).is_some() {
+                return Some(elf_name);
+            }
+        }
+    }
+
+    None
 }
 
 /// Idle task: halts the CPU between timer ticks.

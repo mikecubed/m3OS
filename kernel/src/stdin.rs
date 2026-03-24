@@ -51,21 +51,32 @@ impl StdinState {
     }
 
     /// Flush the line buffer + '\n' into the read-ready buffer.
+    ///
+    /// If the buffer is full, retains unflushed bytes in the line buffer
+    /// so they can be retried later (prevents silent data loss).
     fn flush_line(&mut self) {
+        let mut flushed = 0;
         for &b in &self.line {
-            if self.count < STDIN_BUF_SIZE {
-                let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
-                self.buf[write_pos] = b;
-                self.count += 1;
+            if self.count >= STDIN_BUF_SIZE {
+                break;
             }
+            let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
+            self.buf[write_pos] = b;
+            self.count += 1;
+            flushed += 1;
         }
-        // Add newline.
+        // Add newline if there's space.
         if self.count < STDIN_BUF_SIZE {
             let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
             self.buf[write_pos] = b'\n';
             self.count += 1;
+            // Only clear the flushed portion; retain any overflow.
+            self.line.drain(..flushed);
+            self.line.clear(); // newline was appended; line is done
+        } else {
+            // Couldn't even fit the newline; retain unflushed portion.
+            self.line.drain(..flushed);
         }
-        self.line.clear();
     }
 
     /// Read up to `n` bytes from the read-ready buffer.

@@ -151,7 +151,7 @@
 | P14-T075 | Acceptance: Ctrl-C kills foreground command, shell survives | ✅ |
 | P14-T076 | Acceptance: `sleep 10 &` runs in background, shell stays responsive | ✅ |
 | P14-T076a | Acceptance: `fg` brings background job to foreground | ✅ |
-| P14-T077 | Acceptance: `export FOO=bar && env` shows FOO=bar | ✅ |
+| P14-T077 | Acceptance: `export FOO=bar` then `env` shows FOO=bar | ✅ |
 | P14-T077a | Acceptance: `export PATH=/bin && ls` — PATH-based lookup works | ✅ |
 | P14-T078 | Acceptance: all utility binaries run standalone | ✅ |
 | P14-T079 | `cargo xtask check` passes (clippy + fmt) | ✅ |

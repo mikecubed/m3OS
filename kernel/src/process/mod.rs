@@ -74,7 +74,7 @@ pub const MAX_FDS: usize = 32;
 pub enum FdBackend {
     /// FD 1/2 stdout/stderr — writes go to serial output.
     Stdout,
-    /// FD 0 stdin — reads return EAGAIN until stdin integration (Track E).
+    /// FD 0 stdin — reads block until data is available from the kernel stdin buffer.
     Stdin,
     /// Read-only static ramdisk file (pointer + length into kernel .rodata).
     Ramdisk {
@@ -108,6 +108,20 @@ const NONE_FD: Option<FdEntry> = None;
 /// Public accessor for use by the shell task when spawning processes.
 pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
     new_fd_table()
+}
+
+/// Increment pipe ref-counts for all pipe FDs in a cloned FD table.
+///
+/// Must be called after cloning a process's FD table (fork/dup2) so that
+/// pipe reader/writer counts stay consistent with the number of open FDs.
+pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
+    for entry in fd_table.iter().flatten() {
+        match &entry.backend {
+            FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+            FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+            _ => {}
+        }
+    }
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
@@ -223,6 +237,8 @@ pub struct Process {
     pub user_stack_top: u64,
     /// Exit code written when the process transitions to [`ProcessState::Zombie`].
     pub exit_code: Option<i32>,
+    /// Signal that caused the process to stop (set when transitioning to Stopped).
+    pub stop_signal: u32,
     /// Current program break (heap top). 0 = not yet initialized.
     ///
     /// Set to BRK_BASE on first `sys_brk(0)` call; grows upward as
@@ -262,6 +278,7 @@ impl Process {
             entry_point: entry,
             user_stack_top: stack_top,
             exit_code: None,
+            stop_signal: 0,
             brk_current: 0,
             mmap_next: 0,
             pgid: pid,
@@ -372,6 +389,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         entry_point,
         user_stack_top,
         exit_code: None,
+        stop_signal: 0,
         brk_current: 0,
         mmap_next: 0,
         pgid: pid,
@@ -408,6 +426,7 @@ pub fn spawn_process_with_cr3(
         entry_point,
         user_stack_top,
         exit_code: None,
+        stop_signal: 0,
         brk_current,
         mmap_next,
         pgid: pid,
@@ -443,6 +462,7 @@ pub fn spawn_process_with_cr3_and_fds(
         entry_point,
         user_stack_top,
         exit_code: None,
+        stop_signal: 0,
         brk_current,
         mmap_next,
         pgid: pid,
