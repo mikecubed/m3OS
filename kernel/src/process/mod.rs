@@ -227,6 +227,8 @@ pub struct Process {
     /// Initialized to ANON_MMAP_BASE on first use; grows upward with
     /// each allocation. Kept per-process so fork children start fresh.
     pub mmap_next: u64,
+    /// Process group ID (Phase 14). Defaults to own PID.
+    pub pgid: Pid,
     /// Per-process file descriptor table (Phase 14).
     ///
     /// FDs 0/1/2 are stdin/stdout/stderr.  `fork()` deep-clones this table.
@@ -256,6 +258,7 @@ impl Process {
             exit_code: None,
             brk_current: 0,
             mmap_next: 0,
+            pgid: pid,
             fd_table: new_fd_table(),
             pending_signals: 0,
             signal_actions: [SignalAction::Default; 32],
@@ -365,6 +368,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         exit_code: None,
         brk_current: 0,
         mmap_next: 0,
+        pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
@@ -400,6 +404,7 @@ pub fn spawn_process_with_cr3(
         exit_code: None,
         brk_current,
         mmap_next,
+        pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
@@ -434,12 +439,36 @@ pub fn spawn_process_with_cr3_and_fds(
         exit_code: None,
         brk_current,
         mmap_next,
+        pgid: pid,
         fd_table,
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
+}
+
+// ---------------------------------------------------------------------------
+// Foreground process group (Phase 14, Track G)
+// ---------------------------------------------------------------------------
+
+/// The PID of the foreground process group. Ctrl-C/Ctrl-Z signals
+/// are delivered to all processes in this group.
+pub static FG_PGID: AtomicU32 = AtomicU32::new(0);
+
+/// Send a signal to all processes in a process group.
+pub fn send_signal_to_group(pgid: Pid, sig: u32) {
+    let pids: alloc::vec::Vec<Pid> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|p| p.pgid == pgid)
+            .map(|p| p.pid)
+            .collect()
+    };
+    for pid in pids {
+        send_signal(pid, sig);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -242,7 +242,7 @@ pub extern "C" fn syscall_handler(
         39 => sys_getpid(),
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
-        61 => sys_waitpid(arg0, arg1),
+        61 => sys_waitpid(arg0, arg1, arg2),
         // Phase 14: signal syscalls
         62 => sys_kill(arg0, arg1),
         63 => sys_linux_uname(arg0),
@@ -256,7 +256,10 @@ pub extern "C" fn syscall_handler(
         83 => sys_linux_mkdir(arg0, arg1),
         84 => sys_linux_rmdir(arg0),
         87 => sys_linux_unlink(arg0),
+        // Phase 14: process group syscalls
+        109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
+        121 => sys_getpgid(arg0),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
@@ -441,18 +444,19 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
             NEG_EINVAL
         }
     } else if target_pid < -1 {
-        // Send to process group |pid| (Phase 14, Track G will expand this).
+        // Send to process group |pid|.
         let pgid = (-target_pid) as crate::process::Pid;
-        let pids: alloc::vec::Vec<crate::process::Pid> = {
+        crate::process::send_signal_to_group(pgid, sig);
+        0
+    } else if target_pid == 0 {
+        // Send to caller's process group.
+        let caller_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pgid = {
             let table = crate::process::PROCESS_TABLE.lock();
-            table
-                .iter()
-                .filter(|p| p.pid == pgid)
-                .map(|p| p.pid)
-                .collect()
+            table.find(caller_pid).map(|p| p.pgid).unwrap_or(0)
         };
-        for p in pids {
-            crate::process::send_signal(p, sig);
+        if pgid != 0 {
+            crate::process::send_signal_to_group(pgid, sig);
         }
         0
     } else {
@@ -610,6 +614,49 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     });
 
     newfd as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: process group syscalls (P14-T035)
+// ---------------------------------------------------------------------------
+
+/// `setpgid(pid, pgid)` — set process group ID (syscall 109).
+fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
+    let caller = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let target = if pid == 0 {
+        caller
+    } else {
+        pid as crate::process::Pid
+    };
+    let new_pgid = if pgid == 0 {
+        target
+    } else {
+        pgid as crate::process::Pid
+    };
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    match table.find_mut(target) {
+        Some(p) => {
+            p.pgid = new_pgid;
+            0
+        }
+        None => NEG_EINVAL,
+    }
+}
+
+/// `getpgid(pid)` — get process group ID (syscall 121).
+fn sys_getpgid(pid: u64) -> u64 {
+    let target = if pid == 0 {
+        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed)
+    } else {
+        pid as crate::process::Pid
+    };
+
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(target) {
+        Some(p) => p.pgid as u64,
+        None => NEG_EINVAL,
+    }
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
@@ -850,100 +897,143 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 ///
 /// Spins with `yield_now()` until the target child is a zombie, then
 /// collects its exit code and reaps it.
-fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
-    let target_pid = pid as crate::process::Pid;
+/// `waitpid(pid, status_ptr, options)` — wait for a child to exit or stop.
+///
+/// Supports pid > 0 (specific child), pid == -1 (any child), pid == 0
+/// (any child in caller's process group).
+/// WUNTRACED (0x2): also report stopped children.
+fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
+    let target_pid = pid as i64;
     let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    const WUNTRACED: u64 = 0x2;
+    let report_stopped = options & WUNTRACED != 0;
 
-    // Verify that target_pid is a child of the calling process before blocking.
-    // This prevents one process from reaping another process's children.
-    {
+    // For specific PID: verify it's a child.
+    if target_pid > 0 {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(target_pid) {
+        match table.find(target_pid as crate::process::Pid) {
             None => return u64::MAX,
-            Some(p) if p.ppid != calling_pid => {
-                log::warn!(
-                    "[waitpid] pid {} is not a child of calling pid {}",
-                    target_pid,
-                    calling_pid
-                );
-                return u64::MAX;
-            }
+            Some(p) if p.ppid != calling_pid => return u64::MAX,
             Some(_) => {}
         }
     }
 
     loop {
+        // Scan for a matching child that is zombie (or stopped if WUNTRACED).
         let result = {
             let mut table = crate::process::PROCESS_TABLE.lock();
-            match table.find(target_pid) {
-                None => return u64::MAX, // no such child (reaped between check and loop)
-                Some(p) if p.state == crate::process::ProcessState::Zombie => {
-                    let code = p.exit_code.unwrap_or(0);
-                    table.reap(target_pid);
-                    Some(code)
+            let mut found_pid = None;
+            let mut found_code = None;
+            let mut found_stopped = false;
+
+            for proc in table.iter() {
+                if proc.ppid != calling_pid {
+                    continue;
                 }
-                Some(_) => None, // not yet done
+                let matches = match target_pid {
+                    p if p > 0 => proc.pid == p as crate::process::Pid,
+                    -1 => true, // any child
+                    0 => {
+                        // Same process group as caller.
+                        let caller_pgid = table
+                            .find(calling_pid)
+                            .map(|p| p.pgid)
+                            .unwrap_or(calling_pid);
+                        proc.pgid == caller_pgid
+                    }
+                    neg => proc.pgid == (-neg) as crate::process::Pid,
+                };
+                if !matches {
+                    continue;
+                }
+
+                if proc.state == crate::process::ProcessState::Zombie {
+                    found_pid = Some(proc.pid);
+                    found_code = proc.exit_code;
+                    break;
+                }
+                if report_stopped && proc.state == crate::process::ProcessState::Stopped {
+                    found_pid = Some(proc.pid);
+                    found_stopped = true;
+                    break;
+                }
+            }
+
+            if let Some(pid) = found_pid {
+                if found_stopped {
+                    Some((pid, None, true)) // stopped
+                } else {
+                    let code = found_code.unwrap_or(0);
+                    table.reap(pid);
+                    Some((pid, Some(code), false))
+                }
+            } else {
+                None
             }
         };
 
-        if let Some(code) = result {
-            // The child's sys_exit called restore_kernel_cr3() before dying, so
-            // CR3 may now be the kernel PML4.  copy_to_user needs the caller's
-            // page table, so restore it explicitly before writing status.
-            // Also update CURRENT_PID — the child's trampoline may have changed it.
-            let (caller_cr3_phys, kstack_top) = {
-                let table = crate::process::PROCESS_TABLE.lock();
-                let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
-                let kst = table
-                    .find(calling_pid)
-                    .map(|p| p.kernel_stack_top)
-                    .unwrap_or(0);
-                (cr3, kst)
-            };
-            if let Some(phys) = caller_cr3_phys {
-                // SAFETY: phys is the caller's live PML4 frame from the process table.
-                unsafe {
-                    use x86_64::{
-                        registers::control::{Cr3, Cr3Flags},
-                        structures::paging::PhysFrame,
-                    };
-                    let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
-                    Cr3::write(frame, Cr3Flags::empty());
-                }
-            }
-            crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+        if let Some((child_pid, code_opt, stopped)) = result {
+            // Restore caller context.
+            waitpid_restore_caller(calling_pid);
 
-            // Restore kernel stack pointers for this process.
-            if kstack_top != 0 {
-                unsafe {
-                    crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
-                    *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
-                        kstack_top;
-                }
-            }
-
-            // Write wstatus in Linux-compatible encoding:
-            //   Normal exit (code >= 0): (code & 0xff) << 8
-            //   Signal kill  (code <  0): (-code) & 0x7f  (signal number in low 7 bits)
+            // Write wstatus.
             if status_ptr != 0 {
-                let wstatus = if code >= 0 {
-                    (code & 0xff) << 8
+                let wstatus = if stopped {
+                    // WIFSTOPPED: (sig << 8) | 0x7f
+                    (crate::process::SIGTSTP as i32) << 8 | 0x7f
                 } else {
-                    (-code) & 0x7f
+                    let code = code_opt.unwrap_or(0);
+                    if code >= 0 {
+                        (code & 0xff) << 8 // WIFEXITED
+                    } else {
+                        (-code) & 0x7f // WIFSIGNALED
+                    }
                 };
                 let bytes = wstatus.to_ne_bytes();
-                if crate::mm::user_mem::copy_to_user(status_ptr, &bytes).is_err() {
-                    log::warn!("[waitpid] copy_to_user status_ptr {:#x} failed", status_ptr);
-                }
+                let _ = crate::mm::user_mem::copy_to_user(status_ptr, &bytes);
             }
-            log::info!("[waitpid] pid {} exited with code {}", target_pid, code);
-            return target_pid as u64;
+            log::info!(
+                "[waitpid] pid {} {}",
+                child_pid,
+                if stopped { "stopped" } else { "exited" }
+            );
+            return child_pid as u64;
         }
 
-        // Child is still running; yield and try again.
+        // No matching child ready; yield and try again.
         crate::task::yield_now();
-        // Restore CURRENT_PID after yield: child's trampoline may have changed it.
         crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Restore the caller's CR3 and kernel stack after waitpid.
+fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
+    let (caller_cr3_phys, kstack_top) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
+        let kst = table
+            .find(calling_pid)
+            .map(|p| p.kernel_stack_top)
+            .unwrap_or(0);
+        (cr3, kst)
+    };
+    if let Some(phys) = caller_cr3_phys {
+        unsafe {
+            use x86_64::{
+                registers::control::{Cr3, Cr3Flags},
+                structures::paging::PhysFrame,
+            };
+            let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+    crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+    if kstack_top != 0 {
+        unsafe {
+            crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
+            *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
+                kstack_top;
+        }
     }
 }
 

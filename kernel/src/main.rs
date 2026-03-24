@@ -784,6 +784,7 @@ fn stdin_feeder_task() -> ! {
     log::info!("[stdin] feeder ready");
 
     let mut shift = false;
+    let mut ctrl = false;
 
     loop {
         // Request one scancode from the keyboard server.
@@ -801,12 +802,41 @@ fn stdin_feeder_task() -> ! {
             if make == 0x2A || make == 0x36 {
                 shift = false;
             }
+            if make == 0x1D {
+                ctrl = false;
+            }
+            continue;
+        }
+
+        // Ctrl make code (left Ctrl = 0x1D).
+        if sc == 0x1D {
+            ctrl = true;
             continue;
         }
 
         // Shift make codes.
         if sc == 0x2A || sc == 0x36 {
             shift = true;
+            continue;
+        }
+
+        // Ctrl-C (scancode 0x2E = 'C'): send SIGINT to foreground group.
+        if ctrl && sc == 0x2E {
+            let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+            if fg != 0 {
+                shell_print(my_id, console_ep, "^C\n");
+                process::send_signal_to_group(fg, process::SIGINT);
+            }
+            continue;
+        }
+
+        // Ctrl-Z (scancode 0x2C = 'Z'): send SIGTSTP to foreground group.
+        if ctrl && sc == 0x2C {
+            let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+            if fg != 0 {
+                shell_print(my_id, console_ep, "^Z\n");
+                process::send_signal_to_group(fg, process::SIGTSTP);
+            }
             continue;
         }
 
