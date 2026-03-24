@@ -8,15 +8,15 @@
 
 | Track | Scope | Status |
 |---|---|---|
-| A | Per-process FD table | in progress |
-| B | Pipe syscall + kernel pipe buffer | pending (blocked on A) |
-| C | dup2 syscall | pending (blocked on A) |
-| D | Argv/envp in execve | pending |
-| E | Stdin integration (keyboard → FD 0) | pending (blocked on A, B) |
-| F | Signal infrastructure | pending |
-| G | Process groups + job control | pending (blocked on F) |
-| H | Shell rewrite (fork+exec, pipes, redirection) | pending (blocked on A–G) |
-| I | Core utilities (standalone ELF binaries) | pending (blocked on D) |
+| A | Per-process FD table | ✅ done |
+| B | Pipe syscall + kernel pipe buffer | ✅ done |
+| C | dup2 syscall | ✅ done |
+| D | Argv/envp in execve | ✅ done |
+| E | Stdin integration (keyboard → FD 0) | pending |
+| F | Signal infrastructure | ✅ done |
+| G | Process groups + job control | pending (blocked on F ✅) |
+| H | Shell rewrite (fork+exec, pipes, redirection) | pending |
+| I | Core utilities (standalone ELF binaries) | pending |
 | J | Validation + documentation | pending (blocked on H, I) |
 
 ---
@@ -25,42 +25,42 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T001 | Add `fd_table: [Option<FdEntry>; MAX_FDS]` field to `Process` struct | |
-| P14-T002 | Initialize FDs 0/1/2 (stdin/stdout/stderr) when creating a new process | |
-| P14-T003 | Modify `sys_fork` to deep-clone parent's `fd_table` into child | |
-| P14-T004 | Modify all FD syscalls to index into calling process's `fd_table` | |
-| P14-T005 | Remove the global `FD_TABLE` static | |
-| P14-T006 | Verify existing Phase 11–13 tests still pass after migration | |
+| P14-T001 | Add `fd_table: [Option<FdEntry>; MAX_FDS]` field to `Process` struct | ✅ |
+| P14-T002 | Initialize FDs 0/1/2 (stdin/stdout/stderr) when creating a new process | ✅ |
+| P14-T003 | Modify `sys_fork` to deep-clone parent's `fd_table` into child | ✅ |
+| P14-T004 | Modify all FD syscalls to index into calling process's `fd_table` | ✅ |
+| P14-T005 | Remove the global `FD_TABLE` static | ✅ |
+| P14-T006 | Verify existing Phase 11–13 tests still pass after migration | ✅ |
 
 ## Track B — Pipe Syscall
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T007 | Define `Pipe` struct: ring buffer (4 KiB), read/write offsets, reader/writer-open flags | |
-| P14-T008 | Add `FdBackend::PipeRead { pipe_id }` and `FdBackend::PipeWrite { pipe_id }` variants | |
-| P14-T009 | Implement `sys_pipe(pipefd_ptr)`: allocate Pipe, allocate two FD slots | |
-| P14-T010 | Implement pipe-aware `read()`: block if empty + writer open; EOF if writer closed | |
-| P14-T011 | Implement pipe-aware `write()`: block if full + reader open; EPIPE if reader closed | |
-| P14-T012 | Implement pipe-aware `close()`: mark reader/writer as closed; free when both closed | |
-| P14-T013 | Add syscall 22 to dispatch table | |
+| P14-T007 | Define `Pipe` struct: ring buffer (4 KiB), read/write offsets, reader/writer-open flags | ✅ |
+| P14-T008 | Add `FdBackend::PipeRead { pipe_id }` and `FdBackend::PipeWrite { pipe_id }` variants | ✅ |
+| P14-T009 | Implement `sys_pipe(pipefd_ptr)`: allocate Pipe, allocate two FD slots | ✅ |
+| P14-T010 | Implement pipe-aware `read()`: block if empty + writer open; EOF if writer closed | ✅ |
+| P14-T011 | Implement pipe-aware `write()`: block if full + reader open; EPIPE if reader closed | ✅ |
+| P14-T012 | Implement pipe-aware `close()`: mark reader/writer as closed; free when both closed | ✅ |
+| P14-T013 | Add syscall 22 to dispatch table | ✅ |
 
 ## Track C — dup2 Syscall
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T014 | Implement `sys_dup2(oldfd, newfd)`: close newfd if open, copy FdEntry | |
-| P14-T015 | Handle edge case: `dup2(fd, fd)` returns fd without closing | |
-| P14-T016 | Add syscall 33 to dispatch table | |
+| P14-T014 | Implement `sys_dup2(oldfd, newfd)`: close newfd if open, copy FdEntry | ✅ |
+| P14-T015 | Handle edge case: `dup2(fd, fd)` returns fd without closing | ✅ |
+| P14-T016 | Add syscall 33 to dispatch table | ✅ |
 
 ## Track D — Argv/Envp in Execve
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T017 | Parse argv pointer array from user memory (null-terminated char* array) | |
-| P14-T018 | Parse envp pointer array from user memory (same format) | |
-| P14-T019 | Copy argv/envp strings into kernel buffers via `copy_from_user` | |
-| P14-T020 | Pass argv/envp to `setup_abi_stack` instead of hardcoded `&[name]` / empty | |
-| P14-T021 | Verify echo-args.elf receives correct arguments when launched with argv | |
+| P14-T017 | Parse argv pointer array from user memory (null-terminated char* array) | ✅ |
+| P14-T018 | Parse envp pointer array from user memory (same format) | ✅ |
+| P14-T019 | Copy argv/envp strings into kernel buffers via `copy_from_user` | ✅ |
+| P14-T020 | Pass argv/envp to `setup_abi_stack` instead of hardcoded `&[name]` / empty | ✅ |
+| P14-T021 | Verify echo-args.elf receives correct arguments when launched with argv | ✅ |
 
 ## Track E — Stdin Integration
 
@@ -76,14 +76,14 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T027 | Add `pending_signals: u64` bitfield to `Process` | |
-| P14-T028 | Add `signal_action: [SignalAction; 32]` table to `Process` | |
-| P14-T029 | Implement `sys_kill(pid, sig)` (syscall 62) | |
-| P14-T030 | Implement `sys_rt_sigaction(sig, act, oldact)` (syscall 13) | |
-| P14-T031 | Check pending signals on return to userspace; deliver default actions | |
-| P14-T032 | Implement SIGCONT: resume a stopped process | |
-| P14-T033 | Add syscalls 62, 13, 14 to dispatch table | |
-| P14-T033a | Deliver SIGCHLD to parent when child exits or stops | |
+| P14-T027 | Add `pending_signals: u64` bitfield to `Process` | ✅ |
+| P14-T028 | Add `signal_action: [SignalAction; 32]` table to `Process` | ✅ |
+| P14-T029 | Implement `sys_kill(pid, sig)` (syscall 62) | ✅ |
+| P14-T030 | Implement `sys_rt_sigaction(sig, act, oldact)` (syscall 13) | ✅ |
+| P14-T031 | Check pending signals on return to userspace; deliver default actions | ✅ |
+| P14-T032 | Implement SIGCONT: resume a stopped process | ✅ |
+| P14-T033 | Add syscalls 62, 13, 14 to dispatch table | ✅ |
+| P14-T033a | Deliver SIGCHLD to parent when child exits or stops | ✅ |
 
 ## Track G — Process Groups and Job Control
 
