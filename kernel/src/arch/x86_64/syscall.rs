@@ -936,9 +936,16 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Write in 4 KiB chunks to avoid huge stack buffers.
             while written < len {
                 let chunk = (len - written).min(4096);
-                if crate::mm::user_mem::copy_from_user(&mut buf[..chunk], buf_ptr + written as u64)
-                    .is_err()
-                {
+                let user_ptr = match buf_ptr.checked_add(written as u64) {
+                    Some(p) => p,
+                    None => {
+                        if written == 0 {
+                            return NEG_EFAULT;
+                        }
+                        break;
+                    }
+                };
+                if crate::mm::user_mem::copy_from_user(&mut buf[..chunk], user_ptr).is_err() {
                     if written == 0 {
                         return NEG_EFAULT;
                     }

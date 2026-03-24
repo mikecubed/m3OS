@@ -333,8 +333,8 @@ impl Tmpfs {
     /// resolve to existing directories.  Moving a directory into its own
     /// subtree (e.g. "a" → "a/b") is rejected with `InvalidPath`.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), TmpfsError> {
-        let old_normalized = old_path.trim_start_matches('/');
-        let new_normalized = new_path.trim_start_matches('/');
+        let old_normalized = old_path.trim_start_matches('/').trim_end_matches('/');
+        let new_normalized = new_path.trim_start_matches('/').trim_end_matches('/');
 
         if old_normalized.is_empty() || new_normalized.is_empty() {
             return Err(TmpfsError::InvalidPath);

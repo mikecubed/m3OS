@@ -159,8 +159,8 @@ static void test_truncate(void) {
     pass("ftruncate");
 }
 
-/* Test 5: write appends at correct offset */
-static void test_append(void) {
+/* Test 5: sequential writes advance the fd offset correctly */
+static void test_sequential_write(void) {
     const char *path = "/tmp/append.txt";
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -198,7 +198,7 @@ static void test_append(void) {
         fail("append: content", "sequential writes not contiguous");
         return;
     }
-    pass("sequential write (append)");
+    pass("sequential write");
 }
 
 /* Clean up test files */
@@ -216,7 +216,7 @@ int main(void) {
     test_mkdir_rmdir();
     test_unlink();
     test_truncate();
-    test_append();
+    test_sequential_write();
     cleanup();
 
     printf("[tmpfs-test] results: %d passed, %d failed\n",
