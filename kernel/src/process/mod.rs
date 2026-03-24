@@ -84,6 +84,10 @@ pub enum FdBackend {
     /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
     /// relative to tmpfs root — no leading `/tmp/`).
     Tmpfs { path: String },
+    /// Read end of a kernel pipe (Phase 14).
+    PipeRead { pipe_id: usize },
+    /// Write end of a kernel pipe (Phase 14).
+    PipeWrite { pipe_id: usize },
 }
 
 /// A single open-file entry in the per-process FD table.

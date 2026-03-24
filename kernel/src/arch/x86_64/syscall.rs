@@ -232,6 +232,9 @@ pub extern "C" fn syscall_handler(
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
         20 => sys_linux_writev(arg0, arg1, arg2),
+        // Phase 14: pipe and dup2
+        22 => sys_pipe(arg0),
+        33 => sys_dup2(arg0, arg1),
         // IPC syscalls (Phase 6) — kernel-task only.
         4 | 7 | 10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
@@ -511,6 +514,101 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
 /// Signal masking is not implemented; always returns success.
 fn sys_rt_sigprocmask() -> u64 {
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: pipe (P14-T009) and dup2 (P14-T014)
+// ---------------------------------------------------------------------------
+
+/// `pipe(pipefd_ptr)` — create a pipe (syscall 22).
+///
+/// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
+fn sys_pipe(pipefd_ptr: u64) -> u64 {
+    let pipe_id = crate::pipe::create_pipe();
+
+    let read_entry = FdEntry {
+        backend: FdBackend::PipeRead { pipe_id },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    let write_entry = FdEntry {
+        backend: FdBackend::PipeWrite { pipe_id },
+        offset: 0,
+        readable: false,
+        writable: true,
+    };
+
+    let read_fd = match alloc_fd(3, read_entry) {
+        Some(fd) => fd,
+        None => return NEG_EMFILE,
+    };
+    let write_fd = match alloc_fd(3, write_entry) {
+        Some(fd) => fd,
+        None => {
+            // Clean up the read fd we just allocated.
+            with_current_fd_mut(read_fd, |slot| *slot = None);
+            crate::pipe::pipe_close_reader(pipe_id);
+            crate::pipe::pipe_close_writer(pipe_id);
+            return NEG_EMFILE;
+        }
+    };
+
+    // Write [read_fd, write_fd] as two i32s to user memory.
+    let fds: [i32; 2] = [read_fd as i32, write_fd as i32];
+    let bytes: [u8; 8] = unsafe { core::mem::transmute(fds) };
+    if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
+        // Clean up on failure.
+        with_current_fd_mut(read_fd, |slot| *slot = None);
+        with_current_fd_mut(write_fd, |slot| *slot = None);
+        crate::pipe::pipe_close_reader(pipe_id);
+        crate::pipe::pipe_close_writer(pipe_id);
+        return NEG_EFAULT;
+    }
+
+    log::info!(
+        "[pipe] created pipe_id={} → fd[{}(r), {}(w)]",
+        pipe_id,
+        read_fd,
+        write_fd
+    );
+    0
+}
+
+/// `dup2(oldfd, newfd)` — duplicate a file descriptor (syscall 33).
+fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+    let oldfd = oldfd as usize;
+    let newfd = newfd as usize;
+
+    if oldfd >= MAX_FDS || newfd >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    // dup2(fd, fd) returns fd without closing.
+    if oldfd == newfd {
+        return if current_fd_entry(oldfd).is_some() {
+            newfd as u64
+        } else {
+            NEG_EBADF
+        };
+    }
+
+    let entry = match current_fd_entry(oldfd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    // Close newfd if it's open (including pipe cleanup).
+    if current_fd_entry(newfd).is_some() {
+        sys_linux_close(newfd as u64);
+    }
+
+    // Copy the FD entry to the new slot.
+    with_current_fd_mut(newfd, |slot| {
+        *slot = Some(entry);
+    });
+
+    newfd as u64
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
@@ -1121,6 +1219,30 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
+        FdBackend::PipeRead { pipe_id } => {
+            let pipe_id = *pipe_id;
+            let capped = (count as usize).min(4096);
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            // Yield-loop until data is available or writer closes.
+            loop {
+                let mut tmp = [0u8; 4096];
+                match crate::pipe::pipe_read(pipe_id, &mut tmp[..capped]) {
+                    Ok(0) => return 0, // EOF
+                    Ok(n) => {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        return n as u64;
+                    }
+                    Err(_would_block) => {
+                        crate::task::yield_now();
+                        crate::process::CURRENT_PID
+                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        FdBackend::PipeWrite { .. } => NEG_EBADF,
     }
 }
 
@@ -1205,6 +1327,33 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             written as u64
         }
+        FdBackend::PipeWrite { pipe_id } => {
+            let pipe_id = *pipe_id;
+            let len = (count as usize).min(4096);
+            let mut buf = [0u8; 4096];
+            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            // Yield-loop until space is available or reader closes.
+            loop {
+                match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
+                    Ok(n) => return n as u64,
+                    Err(false) => {
+                        // Reader closed — EPIPE.
+                        const NEG_EPIPE: u64 = (-32_i64) as u64;
+                        return NEG_EPIPE;
+                    }
+                    Err(true) => {
+                        // Would block — yield and retry.
+                        crate::task::yield_now();
+                        crate::process::CURRENT_PID
+                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        FdBackend::PipeRead { .. } => NEG_EBADF,
     }
 }
 
@@ -1397,6 +1546,14 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
+    // Check if this FD is a pipe end; if so, close it in the pipe table.
+    if let Some(entry) = current_fd_entry(fd) {
+        match &entry.backend {
+            FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+            FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+            _ => {}
+        }
+    }
     let mut found = false;
     with_current_fd_mut(fd, |slot| {
         if slot.is_some() {
@@ -1429,7 +1586,10 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         None => return NEG_EBADF,
     };
     let size = match &entry.backend {
-        FdBackend::Stdout | FdBackend::Stdin => 0u64,
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => 0u64,
         FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1477,7 +1637,10 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_END: u64 = 2;
 
     let file_len = match &entry.backend {
-        FdBackend::Stdout | FdBackend::Stdin => return NEG_EINVAL, // not seekable
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -2174,7 +2337,10 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Stdout | FdBackend::Stdin => NEG_EINVAL,
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();

@@ -10,6 +10,7 @@ mod fb;
 mod fs;
 mod ipc;
 mod mm;
+mod pipe;
 mod process;
 mod serial;
 mod task;
