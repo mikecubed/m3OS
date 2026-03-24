@@ -11,6 +11,10 @@
 /ostest.key
 /ostest.crt
 
+# Generated userspace ELF binaries (produced by cargo xtask / build_userspace_bins).
+# Built from source at build time; committing binaries creates noisy diffs.
+/kernel/initrd/*.elf
+
 # QEMU runtime files
 *.qcow2
 *.fd
