@@ -8,9 +8,9 @@
 
 | Track | Scope | Status |
 |---|---|---|
-| A | virtio-net driver | 🚧 in progress |
-| B | Ethernet + ARP | ⬜ pending |
-| C | IPv4 + ICMP | ⬜ pending |
+| A | virtio-net driver | ✅ done |
+| B | Ethernet + ARP | ✅ done |
+| C | IPv4 + ICMP | 🚧 in progress |
 | D | UDP | ⬜ pending |
 | E | TCP | ⬜ pending |
 | F | Socket API + net_server | ⬜ pending |
@@ -22,34 +22,34 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T001 | Find virtio-net device in PCI device list | ⬜ |
-| P16-T002 | Read BARs to locate virtio configuration regions | ⬜ |
-| P16-T003 | Implement virtio device reset sequence | ⬜ |
-| P16-T004 | Implement feature negotiation | ⬜ |
-| P16-T005 | Define `Virtqueue` struct | ⬜ |
-| P16-T006 | Implement `virtqueue_init(queue_index)` | ⬜ |
-| P16-T007 | Initialize RX and TX virtqueues | ⬜ |
-| P16-T008 | Implement `virtio_net_recv()` | ⬜ |
-| P16-T009 | Implement `virtio_net_send(frame)` | ⬜ |
-| P16-T010 | Read device MAC address | ⬜ |
-| P16-T011 | Route virtio-net IRQ through I/O APIC | ⬜ |
-| P16-T012 | Implement interrupt-driven receive | ⬜ |
+| P16-T001 | Find virtio-net device in PCI device list | ✅ |
+| P16-T002 | Read BARs to locate virtio configuration regions | ✅ |
+| P16-T003 | Implement virtio device reset sequence | ✅ |
+| P16-T004 | Implement feature negotiation | ✅ |
+| P16-T005 | Define `Virtqueue` struct | ✅ |
+| P16-T006 | Implement `virtqueue_init(queue_index)` | ✅ |
+| P16-T007 | Initialize RX and TX virtqueues | ✅ |
+| P16-T008 | Implement `virtio_net_recv()` | ✅ |
+| P16-T009 | Implement `virtio_net_send(frame)` | ✅ |
+| P16-T010 | Read device MAC address | ✅ |
+| P16-T011 | Route virtio-net IRQ through I/O APIC | ✅ |
+| P16-T012 | Implement interrupt-driven receive | ✅ |
 
 ## Track B — Ethernet and ARP
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T013 | Define `EthernetFrame` struct | ⬜ |
-| P16-T014 | Implement `ethernet_parse()` | ⬜ |
-| P16-T015 | Implement `ethernet_build()` | ⬜ |
-| P16-T016 | Implement EtherType dispatch | ⬜ |
-| P16-T017 | Define ARP packet structure | ⬜ |
-| P16-T018 | Implement ARP parse/build | ⬜ |
-| P16-T019 | Implement ARP cache | ⬜ |
-| P16-T020 | Implement `arp_resolve()` | ⬜ |
-| P16-T021 | Implement ARP request path | ⬜ |
-| P16-T022 | Implement ARP reply handler | ⬜ |
-| P16-T023 | Implement ARP request responder | ⬜ |
+| P16-T013 | Define `EthernetFrame` struct | ✅ |
+| P16-T014 | Implement `ethernet_parse()` | ✅ |
+| P16-T015 | Implement `ethernet_build()` | ✅ |
+| P16-T016 | Implement EtherType dispatch | ✅ |
+| P16-T017 | Define ARP packet structure | ✅ |
+| P16-T018 | Implement ARP parse/build | ✅ |
+| P16-T019 | Implement ARP cache | ✅ |
+| P16-T020 | Implement `arp_resolve()` | ✅ |
+| P16-T021 | Implement ARP request path | ✅ |
+| P16-T022 | Implement ARP reply handler | ✅ |
+| P16-T023 | Implement ARP request responder | ✅ |
 
 ## Track C — IPv4 and ICMP
 
