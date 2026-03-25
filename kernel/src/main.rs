@@ -92,6 +92,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     unsafe { arch::enable_interrupts() };
     log::info!("[arch] interrupts enabled");
 
+    // Phase 15: switch from PIC to APIC interrupt routing.
+    arch::x86_64::apic::init();
+
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
         x86_64::instructions::interrupts::int3();
