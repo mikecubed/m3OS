@@ -149,7 +149,7 @@ Commands are looked up as `{cmd}.elf` in the ramdisk.
 | echo | write |
 | true/false | exit |
 | cat | open, read, write, close |
-| ls | open, getdents64, write, close |
+| ls | open, getdents64 (stub — returns ENOSYS), write, close |
 | pwd | getcwd, write |
 | mkdir | mkdir |
 | rmdir | rmdir |
