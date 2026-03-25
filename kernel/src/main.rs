@@ -996,23 +996,26 @@ fn shell_fork_exec(
     // Capture stdout to file if redirected.
     if let (Some(file), Some(pipe_id)) = (stdout_file, stdout_pipe_id) {
         pipe::pipe_close_writer(pipe_id);
-        // Read all output from the pipe and write to tmpfs.
-        let rel_path = file.trim_start_matches('/');
-        let tmpfs_rel = if let Some(r) = rel_path.strip_prefix("tmp/") {
-            r
-        } else {
-            rel_path
+        // Validate and extract tmpfs-relative path.
+        let tmpfs_rel = match validate_tmpfs_path(file) {
+            Some(r) => r,
+            None => {
+                let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
+                shell_print(my_id, console_ep, &msg);
+                pipe::pipe_close_reader(pipe_id);
+                return;
+            }
         };
         {
             let mut tmpfs = fs::tmpfs::TMPFS.lock();
-            let _ = tmpfs.open_or_create(tmpfs_rel, true);
+            let _ = tmpfs.open_or_create(&tmpfs_rel, true);
             if !stdout_append {
-                let _ = tmpfs.truncate(tmpfs_rel, 0);
+                let _ = tmpfs.truncate(&tmpfs_rel, 0);
             }
         }
         let mut file_offset = if stdout_append {
             let tmpfs = fs::tmpfs::TMPFS.lock();
-            tmpfs.file_size(tmpfs_rel).unwrap_or(0)
+            tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
         } else {
             0
         };
@@ -1023,7 +1026,7 @@ fn shell_fork_exec(
                 Ok(0) => break,
                 Ok(n) => {
                     let mut tmpfs = fs::tmpfs::TMPFS.lock();
-                    let _ = tmpfs.write_file(tmpfs_rel, file_offset, &buf[..n]);
+                    let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
                     file_offset += n;
                 }
                 Err(_) => {
@@ -1269,6 +1272,26 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
 ///
 /// Searches $PATH directories for `{cmd}.elf` in the ramdisk.
 /// Returns None if the command is not found in any PATH directory.
+/// Validate a redirection target path as a writable tmpfs path.
+///
+/// Returns the tmpfs-relative path (e.g. "/tmp/foo" → "foo"), or None
+/// if the path is outside /tmp or contains traversal segments.
+fn validate_tmpfs_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_start_matches('/');
+    let rest = if trimmed == "tmp" {
+        return None; // /tmp itself is a directory
+    } else {
+        trimmed.strip_prefix("tmp/")?
+    };
+    // Reject `.`, `..`, and empty segments.
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
+        }
+    }
+    Some(String::from(rest))
+}
+
 fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
     // If already has .elf extension, try directly.
     if cmd.ends_with(".elf") {

@@ -3,6 +3,15 @@
 #include <fcntl.h>
 #include <string.h>
 
+static void write_all(int fd, const char *buf, ssize_t len) {
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
 static void grep_fd(int fd, const char *pattern) {
     char buf[4096];
     ssize_t n;
@@ -24,8 +33,8 @@ static void grep_fd(int fd, const char *pattern) {
             }
             *nl = '\0';
             if (strstr(p, pattern)) {
-                write(1, p, nl - p);
-                write(1, "\n", 1);
+                write_all(1, p, nl - p);
+                write_all(1, "\n", 1);
             }
             p = nl + 1;
             line_start = 0;
@@ -35,8 +44,8 @@ static void grep_fd(int fd, const char *pattern) {
     if (line_start > 0) {
         buf[line_start] = '\0';
         if (strstr(buf, pattern)) {
-            write(1, buf, line_start);
-            write(1, "\n", 1);
+            write_all(1, buf, line_start);
+            write_all(1, "\n", 1);
         }
     }
 }

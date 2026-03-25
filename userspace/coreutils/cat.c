@@ -2,11 +2,20 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+static void write_all(int fd, const char *buf, ssize_t len) {
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
 static void cat_fd(int fd) {
     char buf[4096];
     ssize_t n;
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        write(1, buf, n);
+        write_all(1, buf, n);
     }
 }
 

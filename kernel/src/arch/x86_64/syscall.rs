@@ -499,7 +499,9 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
             crate::process::SignalAction::Ignore => 1,  // SIG_IGN
         };
         old_sa[0..8].copy_from_slice(&handler.to_ne_bytes());
-        let _ = crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa);
+        if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
+            return NEG_EFAULT;
+        }
     }
 
     // Read new action if provided.
@@ -987,6 +989,8 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         }
     }
 
+    const NEG_ECHILD: u64 = (-10_i64) as u64;
+
     loop {
         // Scan for a matching child that is zombie (or stopped if WUNTRACED).
         let result = {
@@ -994,6 +998,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
             let mut found_pid = None;
             let mut found_code = None;
             let mut found_stopped = false;
+            let mut has_eligible_child = false;
 
             for proc in table.iter() {
                 if proc.ppid != calling_pid {
@@ -1015,6 +1020,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 if !matches {
                     continue;
                 }
+                has_eligible_child = true;
 
                 if proc.state == crate::process::ProcessState::Zombie {
                     found_pid = Some(proc.pid);
@@ -1027,6 +1033,10 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     found_code = Some(proc.stop_signal as i32);
                     break;
                 }
+            }
+
+            if !has_eligible_child {
+                return NEG_ECHILD;
             }
 
             if let Some(pid) = found_pid {
