@@ -108,7 +108,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Route the virtio-net PCI interrupt through the I/O APIC.
         // The PCI interrupt line was read during PCI enumeration; look it up
         // from the virtio-net device.
-        if let Some(dev) = find_pci_virtio_net() {
+        if let Some(dev) = net::virtio_net::find_virtio_net_device() {
             if acpi::io_apic_address().is_some() {
                 arch::x86_64::apic::route_pci_irq(
                     dev.interrupt_line,
@@ -1717,27 +1717,45 @@ fn run_elf_and_report(name: &'static str) {
 /// Polls the virtio-net driver for received frames and dispatches them through
 /// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
 fn net_task() -> ! {
+    use arch::x86_64::interrupts::USING_APIC;
+
+    let has_apic_routing = USING_APIC.load(core::sync::atomic::Ordering::Relaxed);
+    if !has_apic_routing {
+        log::info!("[net] no APIC routing — using periodic poll mode");
+    }
     log::info!("[net] network processing task started");
+
+    let mut last_poll_tick: u64 = 0;
+
     loop {
-        // Drain any pending virtio-net work signaled by the IRQ flag.
-        while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-            .swap(false, core::sync::atomic::Ordering::Acquire)
-        {
-            net::dispatch::process_rx();
-        }
+        if has_apic_routing {
+            // IRQ-driven path: drain work signaled by the IRQ flag.
+            while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+                .swap(false, core::sync::atomic::Ordering::Acquire)
+            {
+                net::dispatch::process_rx();
+            }
 
-        // Give other tasks a chance to run.
-        task::yield_now();
+            task::yield_now();
 
-        // Race-free sleep: disable interrupts, re-check the flag, then
-        // enable_and_hlt atomically so we never miss a wakeup.
-        x86_64::instructions::interrupts::disable();
-        if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-            .load(core::sync::atomic::Ordering::Acquire)
-        {
-            x86_64::instructions::interrupts::enable_and_hlt();
+            // Race-free sleep.
+            x86_64::instructions::interrupts::disable();
+            if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                x86_64::instructions::interrupts::enable_and_hlt();
+            } else {
+                x86_64::instructions::interrupts::enable();
+            }
         } else {
-            x86_64::instructions::interrupts::enable();
+            // Legacy PIC fallback: the virtio-net IRQ is not routed, so poll
+            // process_rx() every ~10 ticks (~100ms at 100 Hz).
+            let now = arch::x86_64::interrupts::tick_count();
+            if now.wrapping_sub(last_poll_tick) >= 10 {
+                net::dispatch::process_rx();
+                last_poll_tick = now;
+            }
+            task::yield_now();
         }
     }
 }
@@ -1827,22 +1845,6 @@ pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
-}
-
-/// Find the virtio-net PCI device for IRQ routing.
-fn find_pci_virtio_net() -> Option<pci::PciDevice> {
-    let mut i = 0;
-    while let Some(dev) = pci::pci_device(i) {
-        if dev.vendor_id == 0x1AF4
-            && (dev.device_id == 0x1000 || dev.device_id == 0x1041)
-            && dev.class_code == 0x02
-            && dev.subclass == 0x00
-        {
-            return Some(dev);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[panic_handler]

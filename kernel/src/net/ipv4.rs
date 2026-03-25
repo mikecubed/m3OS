@@ -116,7 +116,15 @@ pub fn checksum(data: &[u8]) -> u16 {
 /// Build a raw IPv4 packet with the given protocol and payload.
 ///
 /// Uses TTL=64, no fragmentation, auto-computed checksum.
+/// Payloads larger than 65515 bytes are truncated to fit the 16-bit total length.
 pub fn build(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> Vec<u8> {
+    // IPv4 total_length is 16 bits and includes the 20-byte header.
+    let max_payload = (u16::MAX as usize) - 20;
+    let payload = if payload.len() > max_payload {
+        &payload[..max_payload]
+    } else {
+        payload
+    };
     let total_length = 20 + payload.len() as u16;
 
     let mut pkt = Vec::with_capacity(total_length as usize);

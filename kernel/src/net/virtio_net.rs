@@ -178,7 +178,15 @@ impl Virtqueue {
             log::warn!("[virtio-net] queue {} size is 0 — skipping", queue_index);
             return None;
         }
-        let queue_size = queue_size.min(MAX_QUEUE_SIZE);
+        if queue_size > MAX_QUEUE_SIZE {
+            log::warn!(
+                "[virtio-net] queue {} size {} exceeds MAX_QUEUE_SIZE {} — skipping",
+                queue_index,
+                queue_size,
+                MAX_QUEUE_SIZE
+            );
+            return None;
+        }
 
         let alloc_size = Self::calc_size(queue_size);
         let pages_needed = alloc_size.div_ceil(4096);
@@ -457,8 +465,21 @@ pub fn send_frame(frame: &[u8]) {
         }
     };
 
+    // Reject oversize frames before allocating to avoid wasteful allocations
+    // that send_buffer() would drop anyway.
+    let total = VIRTIO_NET_HDR_SIZE + frame.len();
+    if total > BUF_SIZE {
+        log::warn!(
+            "[virtio-net] send_frame: frame too large ({} + {} > {} bytes) — dropping",
+            VIRTIO_NET_HDR_SIZE,
+            frame.len(),
+            BUF_SIZE
+        );
+        return;
+    }
+
     // Build: virtio-net header (10 bytes of zeros) + Ethernet frame.
-    let mut buf = vec![0u8; VIRTIO_NET_HDR_SIZE + frame.len()];
+    let mut buf = vec![0u8; total];
     buf[VIRTIO_NET_HDR_SIZE..].copy_from_slice(frame);
 
     driver.tx_queue.send_buffer(&buf);
@@ -620,7 +641,7 @@ pub fn init() {
 ///
 /// Looks for vendor 0x1AF4, device 0x1000 (transitional) or 0x1041 (modern),
 /// class 0x02 / subclass 0x00 (Ethernet controller).
-fn find_virtio_net_device() -> Option<pci::PciDevice> {
+pub fn find_virtio_net_device() -> Option<pci::PciDevice> {
     let mut index = 0;
     while let Some(dev) = pci::pci_device(index) {
         if dev.vendor_id == 0x1AF4
