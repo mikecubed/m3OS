@@ -408,4 +408,4 @@ gantt
 
 ---
 
-*Generated 2026-03-18 — based on analysis of `/home/mikecubed/projects/oldprojects/os/kernel` vs. `/home/mikecubed/projects/ostest`*
+*Generated 2026-03-18 — based on analysis of `/home/mikecubed/projects/oldprojects/os/kernel` vs. `/home/mikecubed/projects/m3os`*

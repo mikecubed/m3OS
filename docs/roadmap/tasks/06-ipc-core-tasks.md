@@ -2,7 +2,7 @@
 
 **Depends on:** Phase 5
 **Branch:** `phase-6-ipc-core`
-**PR:** https://github.com/mikecubed/ostest/pull/5
+**PR:** https://github.com/mikecubed/m3OS/pull/5
 
 ```mermaid
 sequenceDiagram
