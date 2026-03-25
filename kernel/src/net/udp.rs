@@ -48,14 +48,23 @@ pub fn parse(data: &[u8]) -> Option<(UdpHeader, &[u8])> {
 // ===========================================================================
 
 /// Build a UDP datagram. Checksum is set to 0 (optional for UDP over IPv4).
+///
+/// Payloads larger than 65527 bytes are truncated to fit the 16-bit length field.
 pub fn build(src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
-    let length = 8 + payload.len() as u16;
+    // UDP length field is 16 bits and includes the 8-byte header.
+    let max_payload = (u16::MAX as usize).saturating_sub(8);
+    let effective = if payload.len() > max_payload {
+        &payload[..max_payload]
+    } else {
+        payload
+    };
+    let length = 8 + effective.len() as u16;
     let mut pkt = Vec::with_capacity(length as usize);
     pkt.extend_from_slice(&src_port.to_be_bytes());
     pkt.extend_from_slice(&dst_port.to_be_bytes());
     pkt.extend_from_slice(&length.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum = 0
-    pkt.extend_from_slice(payload);
+    pkt.extend_from_slice(effective);
     pkt
 }
 

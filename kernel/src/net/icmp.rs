@@ -1,7 +1,7 @@
 //! ICMP echo request/reply (P16-T031 through P16-T033).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use super::ipv4::{self, Ipv4Header};
 
@@ -82,8 +82,24 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
             );
         }
         ICMP_ECHO_REPLY => {
-            // Record the reply for the ping function.
+            let id = u16::from_be_bytes([icmp_hdr.rest[0], icmp_hdr.rest[1]]);
             let seq = u16::from_be_bytes([icmp_hdr.rest[2], icmp_hdr.rest[3]]);
+
+            // Only accept replies matching the outstanding request's
+            // identifier and sequence number to avoid stale/mismatched replies.
+            let expected_id = PING_EXPECTED_ID.load(Ordering::Acquire);
+            let expected_seq = PING_EXPECTED_SEQ.load(Ordering::Acquire);
+            if id != expected_id || seq != expected_seq {
+                log::debug!(
+                    "[icmp] ignoring echo reply id={} seq={} (expected id={} seq={})",
+                    id,
+                    seq,
+                    expected_id,
+                    expected_seq
+                );
+                return;
+            }
+
             let tick = crate::arch::x86_64::interrupts::tick_count();
             PING_REPLY_TICK.store(tick, Ordering::Release);
             PING_REPLY_RECEIVED.store(true, Ordering::Release);
@@ -108,12 +124,18 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
 pub static PING_REPLY_RECEIVED: AtomicBool = AtomicBool::new(false);
 /// Tick count when the ping reply was received.
 pub static PING_REPLY_TICK: AtomicU64 = AtomicU64::new(0);
+/// Expected ICMP identifier for the outstanding ping request.
+static PING_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
+/// Expected ICMP sequence number for the outstanding ping request.
+static PING_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
 
 /// Send an ICMP echo request to the given IP address.
 ///
 /// Returns the tick count at which the request was sent, for RTT calculation.
 pub fn ping(target_ip: super::arp::Ipv4Addr, seq: u16) -> u64 {
     PING_REPLY_RECEIVED.store(false, Ordering::Release);
+    PING_EXPECTED_ID.store(1, Ordering::Release); // identifier = 0x0001
+    PING_EXPECTED_SEQ.store(seq, Ordering::Release);
 
     let rest = [
         0x00,

@@ -390,46 +390,54 @@ pub fn create(local_port: u16) -> Option<usize> {
 /// Start an active connection (client).
 pub fn connect(conn_idx: usize, remote_ip: Ipv4Addr, remote_port: u16) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.conns[conn_idx].as_mut() {
-        conn.connect(remote_ip, remote_port);
+    if let Some(slot) = conns.conns.get_mut(conn_idx) {
+        if let Some(conn) = slot.as_mut() {
+            conn.connect(remote_ip, remote_port);
+        }
     }
 }
 
 /// Put a connection into Listen state (server).
 pub fn listen(conn_idx: usize) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.conns[conn_idx].as_mut() {
-        conn.listen();
+    if let Some(slot) = conns.conns.get_mut(conn_idx) {
+        if let Some(conn) = slot.as_mut() {
+            conn.listen();
+        }
     }
 }
 
 /// Send data on an established connection.
 pub fn send(conn_idx: usize, data: &[u8]) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.conns[conn_idx].as_mut() {
-        conn.tcp_send(data);
+    if let Some(slot) = conns.conns.get_mut(conn_idx) {
+        if let Some(conn) = slot.as_mut() {
+            conn.tcp_send(data);
+        }
     }
 }
 
 /// Read received data from a connection.
 pub fn recv(conn_idx: usize, buf: &mut [u8]) -> usize {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.conns[conn_idx].as_mut() {
-        let n = buf.len().min(conn.recv_buf.len());
-        for byte in buf.iter_mut().take(n) {
-            *byte = conn.recv_buf.pop_front().unwrap();
-        }
-        n
-    } else {
-        0
+    let conn = match conns.conns.get_mut(conn_idx).and_then(|s| s.as_mut()) {
+        Some(c) => c,
+        None => return 0,
+    };
+    let n = buf.len().min(conn.recv_buf.len());
+    for byte in buf.iter_mut().take(n) {
+        *byte = conn.recv_buf.pop_front().unwrap();
     }
+    n
 }
 
 /// Get the state of a connection.
 pub fn state(conn_idx: usize) -> TcpState {
     let conns = TCP_CONNS.lock();
-    conns.conns[conn_idx]
-        .as_ref()
+    conns
+        .conns
+        .get(conn_idx)
+        .and_then(|s| s.as_ref())
         .map(|c| c.state)
         .unwrap_or(TcpState::Closed)
 }
@@ -437,15 +445,19 @@ pub fn state(conn_idx: usize) -> TcpState {
 /// Close a connection.
 pub fn close(conn_idx: usize) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.conns[conn_idx].as_mut() {
-        conn.close();
+    if let Some(slot) = conns.conns.get_mut(conn_idx) {
+        if let Some(conn) = slot.as_mut() {
+            conn.close();
+        }
     }
 }
 
 /// Destroy a connection (free the slot).
 pub fn destroy(conn_idx: usize) {
     let mut conns = TCP_CONNS.lock();
-    conns.conns[conn_idx] = None;
+    if let Some(slot) = conns.conns.get_mut(conn_idx) {
+        *slot = None;
+    }
 }
 
 // ===========================================================================

@@ -289,12 +289,22 @@ impl Virtqueue {
             return;
         }
 
+        // Reject oversize frames instead of silently truncating.
+        if data.len() > BUF_SIZE {
+            log::warn!(
+                "[virtio-net] TX packet too large ({} > {} bytes) — dropping",
+                data.len(),
+                BUF_SIZE
+            );
+            return;
+        }
+
         let desc_idx = self.next_avail % self.queue_size;
         self.next_avail = self.next_avail.wrapping_add(1);
         let i = desc_idx as usize;
 
         // Copy data to the pre-allocated buffer.
-        let copy_len = data.len().min(BUF_SIZE);
+        let copy_len = data.len();
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.buffers[i], copy_len);
         }
@@ -410,6 +420,7 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
 
     let completed = driver.rx_queue.poll_used();
     let mut frames = Vec::new();
+    let reposted = !completed.is_empty();
 
     for (desc_idx, len) in completed {
         if (len as usize) > VIRTIO_NET_HDR_SIZE {
@@ -419,6 +430,14 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
         }
         // Re-post the buffer for future receives.
         driver.rx_queue.post_recv_buffer(desc_idx);
+    }
+
+    // Notify the device that new RX buffers are available so reception
+    // doesn't stall once the initial batch is consumed.
+    if reposted {
+        unsafe {
+            Port::<u16>::new(driver.io_base + VIRTIO_QUEUE_NOTIFY).write(0);
+        }
     }
 
     frames

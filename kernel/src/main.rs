@@ -1719,17 +1719,26 @@ fn run_elf_and_report(name: &'static str) {
 fn net_task() -> ! {
     log::info!("[net] network processing task started");
     loop {
-        // Wait until the virtio-net IRQ signals that frames may be available,
-        // rather than busy-polling. This lets the CPU enter an idle state
-        // between interrupts.
-        if arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+        // Drain any pending virtio-net work signaled by the IRQ flag.
+        while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
             .swap(false, core::sync::atomic::Ordering::Acquire)
         {
             net::dispatch::process_rx();
         }
-        // Yield to other tasks, then halt until the next interrupt.
+
+        // Give other tasks a chance to run.
         task::yield_now();
-        x86_64::instructions::hlt();
+
+        // Race-free sleep: disable interrupts, re-check the flag, then
+        // enable_and_hlt atomically so we never miss a wakeup.
+        x86_64::instructions::interrupts::disable();
+        if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        } else {
+            x86_64::instructions::interrupts::enable();
+        }
     }
 }
 
