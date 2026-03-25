@@ -475,7 +475,8 @@ pub fn init() {
             };
             if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
                 let low = redir_entry_low(32, active_low, level_triggered, true); // masked
-                ioapic_write_redir(pin, low, 0);
+                let bsp_id = lapic_read(LAPIC_ID) & 0xFF00_0000;
+                ioapic_write_redir(pin, low, bsp_id);
             }
         }
 
