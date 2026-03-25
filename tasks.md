@@ -2,7 +2,8 @@
 
 **Branch:** `phase-15-hardware-discovery`
 **Depends on:** Phase 3 (Interrupts) ✅, Phase 14 (Shell) ✅
-**Status:** 🔧 In Progress — Track F remaining
+**Status:** ✅ Complete — all 49 tasks done, QEMU-validated.
+**Documentation:** [`docs/15-hardware-discovery.md`](docs/15-hardware-discovery.md)
 
 ## Track Status
 
@@ -13,7 +14,7 @@
 | C | I/O APIC initialization | ✅ done |
 | D | Timer migration (PIT → LAPIC timer) | ✅ done |
 | E | PCI bus enumeration | ✅ done |
-| F | Validation + documentation | 🔧 in progress |
+| F | Validation + documentation | ✅ done |
 
 ---
 
@@ -94,4 +95,4 @@
 | P15-T046 | Acceptance: shell, pipes, utilities work without regression | ✅ |
 | P15-T047 | `cargo xtask check` passes | ✅ |
 | P15-T048 | QEMU boot validation — no panics | ✅ |
-| P15-T049 | Write `docs/15-hardware-discovery.md` | ⬜ |
+| P15-T049 | Write `docs/15-hardware-discovery.md` | ✅ |
