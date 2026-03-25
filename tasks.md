@@ -1,159 +1,97 @@
-# Phase 14 — Shell and Userspace Tools
+# Phase 15 — Hardware Discovery (ACPI + PCI)
 
-**Branch:** `phase-14-shell-and-tools`
-**Depends on:** Phase 12 (POSIX Compat) ✅, Phase 13 (Writable FS) ✅
-**Status:** ✅ Complete — all 86 tasks done, QEMU-validated.
-**Documentation:** [`docs/14-shell-and-tools.md`](docs/14-shell-and-tools.md)
+**Branch:** `phase-15-hardware-discovery`
+**Depends on:** Phase 3 (Interrupts) ✅, Phase 14 (Shell) ✅
+**Status:** 🔧 In Progress
 
 ## Track Status
 
 | Track | Scope | Status |
 |---|---|---|
-| A | Per-process FD table | ✅ done |
-| B | Pipe syscall + kernel pipe buffer | ✅ done |
-| C | dup2 syscall | ✅ done |
-| D | Argv/envp in execve | ✅ done |
-| E | Stdin integration (keyboard → FD 0) | ✅ done |
-| F | Signal infrastructure | ✅ done |
-| G | Process groups + job control | ✅ done |
-| H | Shell rewrite (fork+exec, pipes, redirection) | ✅ done |
-| I | Core utilities (standalone ELF binaries) | ✅ done |
-| J | Validation + documentation | ✅ done |
+| A | ACPI table discovery and parsing | 🔧 in progress |
+| B | Local APIC initialization | ⬜ blocked on A |
+| C | I/O APIC initialization | ⬜ blocked on A, B |
+| D | Timer migration (PIT → LAPIC timer) | ⬜ blocked on B, C |
+| E | PCI bus enumeration | 🔧 in progress |
+| F | Validation + documentation | ⬜ blocked on all |
 
 ---
 
-## Track A — Per-Process FD Table
+## Track A — ACPI Table Discovery
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T001 | Add `fd_table: [Option<FdEntry>; MAX_FDS]` field to `Process` struct | ✅ |
-| P14-T002 | Initialize FDs 0/1/2 (stdin/stdout/stderr) when creating a new process | ✅ |
-| P14-T003 | Modify `sys_fork` to deep-clone parent's `fd_table` into child | ✅ |
-| P14-T004 | Modify all FD syscalls to index into calling process's `fd_table` | ✅ |
-| P14-T005 | Remove the global `FD_TABLE` static | ✅ |
-| P14-T006 | Verify existing Phase 11–13 tests still pass after migration | ✅ |
+| P15-T001 | Read `boot_info.rsdp_addr` and store in global `Once<PhysAddr>` | ⬜ |
+| P15-T002 | Define RSDP v1/v2 structures | ⬜ |
+| P15-T003 | Implement `validate_rsdp()`: verify signature and checksum | ⬜ |
+| P15-T004 | Define ACPI SDT header struct | ⬜ |
+| P15-T005 | Implement `parse_rsdt()` / `parse_xsdt()` | ⬜ |
+| P15-T006 | Implement SDT signature lookup | ⬜ |
+| P15-T007 | Define MADT structures (Local APIC, I/O APIC, ISO entries) | ⬜ |
+| P15-T008 | Implement `parse_madt()` | ⬜ |
+| P15-T009 | Define FADT structure (minimal) | ⬜ |
+| P15-T010 | Log ACPI discovery results | ⬜ |
 
-## Track B — Pipe Syscall
-
-| Task | Description | Status |
-|---|---|---|
-| P14-T007 | Define `Pipe` struct: ring buffer (4 KiB), read/write offsets, reader/writer-open flags | ✅ |
-| P14-T008 | Add `FdBackend::PipeRead { pipe_id }` and `FdBackend::PipeWrite { pipe_id }` variants | ✅ |
-| P14-T009 | Implement `sys_pipe(pipefd_ptr)`: allocate Pipe, allocate two FD slots | ✅ |
-| P14-T010 | Implement pipe-aware `read()`: block if empty + writer open; EOF if writer closed | ✅ |
-| P14-T011 | Implement pipe-aware `write()`: block if full + reader open; EPIPE if reader closed | ✅ |
-| P14-T012 | Implement pipe-aware `close()`: mark reader/writer as closed; free when both closed | ✅ |
-| P14-T013 | Add syscall 22 to dispatch table | ✅ |
-
-## Track C — dup2 Syscall
+## Track B — Local APIC Initialization
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T014 | Implement `sys_dup2(oldfd, newfd)`: close newfd if open, copy FdEntry | ✅ |
-| P14-T015 | Handle edge case: `dup2(fd, fd)` returns fd without closing | ✅ |
-| P14-T016 | Add syscall 33 to dispatch table | ✅ |
+| P15-T011 | Read Local APIC base address from MADT / MSR fallback | ⬜ |
+| P15-T012 | Verify LAPIC MMIO page accessible via `physical_memory_offset` | ⬜ |
+| P15-T013 | Define LAPIC register offsets | ⬜ |
+| P15-T014 | Implement `lapic_init()`: enable LAPIC via Spurious register | ⬜ |
+| P15-T015 | Add spurious interrupt handler at vector 0xFF | ⬜ |
+| P15-T016 | Implement `lapic_eoi()` | ⬜ |
 
-## Track D — Argv/Envp in Execve
-
-| Task | Description | Status |
-|---|---|---|
-| P14-T017 | Parse argv pointer array from user memory (null-terminated char* array) | ✅ |
-| P14-T018 | Parse envp pointer array from user memory (same format) | ✅ |
-| P14-T019 | Copy argv/envp strings into kernel buffers via `copy_from_user` | ✅ |
-| P14-T020 | Pass argv/envp to `setup_abi_stack` instead of hardcoded `&[name]` / empty | ✅ |
-| P14-T021 | Verify echo-args.elf receives correct arguments when launched with argv | ✅ |
-
-## Track E — Stdin Integration
+## Track C — I/O APIC Initialization
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T022 | Add a kernel-level stdin ring buffer: kbd_server writes chars into it | ✅ |
-| P14-T023 | Wire FD 0 in new processes to the stdin buffer | ✅ |
-| P14-T024 | Implement line-buffered mode: accumulate until Enter, then make available | ✅ |
-| P14-T025 | Echo typed characters to stdout (console) as they arrive | ✅ |
-| P14-T026 | Handle Backspace in the line buffer | ✅ |
+| P15-T017 | Read I/O APIC base address from MADT | ⬜ |
+| P15-T018 | Implement I/O APIC register access (IOREGSEL/IOWIN) | ⬜ |
+| P15-T019 | Read I/O APIC Version register | ⬜ |
+| P15-T020 | Define redirection table entry format | ⬜ |
+| P15-T021 | Program redirection for IRQ 1 (keyboard) | ⬜ |
+| P15-T022 | Program redirection for IRQ 4 (COM1 serial) | ⬜ |
+| P15-T023 | Mask all unused I/O APIC redirection entries | ⬜ |
+| P15-T024 | Disable legacy 8259 PIC | ⬜ |
+| P15-T025 | Update keyboard IRQ handler → `lapic_eoi()` | ⬜ |
+| P15-T026 | Update serial IRQ handler → `lapic_eoi()` | ⬜ |
 
-## Track F — Signal Infrastructure
-
-| Task | Description | Status |
-|---|---|---|
-| P14-T027 | Add `pending_signals: u64` bitfield to `Process` | ✅ |
-| P14-T028 | Add `signal_action: [SignalAction; 32]` table to `Process` | ✅ |
-| P14-T029 | Implement `sys_kill(pid, sig)` (syscall 62) | ✅ |
-| P14-T030 | Implement `sys_rt_sigaction(sig, act, oldact)` (syscall 13) | ✅ |
-| P14-T031 | Check pending signals on return to userspace; deliver default actions | ✅ |
-| P14-T032 | Implement SIGCONT: resume a stopped process | ✅ |
-| P14-T033 | Add syscalls 62, 13, 14 to dispatch table | ✅ |
-| P14-T033a | Deliver SIGCHLD to parent when child exits or stops | ✅ |
-
-## Track G — Process Groups and Job Control
+## Track D — Timer Migration (PIT → LAPIC Timer)
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T034 | Add `pgid: Pid` field to `Process`; default to own PID | ✅ |
-| P14-T035 | Implement `sys_setpgid` (109) and `sys_getpgid` (121) | ✅ |
-| P14-T036 | Extend `sys_kill` for negative PID (kill process group) | ✅ |
-| P14-T037 | Track foreground process group (`FG_PGID`) | ✅ |
-| P14-T038 | Wire Ctrl-C → SIGINT to `FG_PGID` | ✅ |
-| P14-T039 | Wire Ctrl-Z → SIGTSTP to `FG_PGID` | ✅ |
-| P14-T040 | Implement `waitpid(-1, ...)` to wait for any child | ✅ |
-| P14-T041 | Implement `WUNTRACED` flag in waitpid | ✅ |
-| P14-T041a | Encode waitpid status: WIFEXITED, WIFSTOPPED, WIFSIGNALED | ✅ |
+| P15-T027 | Calibrate LAPIC timer using PIT one-shot | ⬜ |
+| P15-T028 | Store calibrated ticks-per-ms value | ⬜ |
+| P15-T029 | Configure LAPIC timer in periodic mode (vector 32, ~10ms) | ⬜ |
+| P15-T030 | Update timer IRQ handler → `lapic_eoi()` | ⬜ |
+| P15-T031 | Verify TICK_COUNT increments and scheduler fires | ⬜ |
+| P15-T032 | Stop the PIT after LAPIC timer is running | ⬜ |
 
-## Track H — Shell Rewrite
+## Track E — PCI Bus Enumeration
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T042 | Shell main loop: read line from stdin, parse, execute, loop | ✅ |
-| P14-T043 | Command parser: split on `\|`, handle `>`, `<`, `>>`, `&` | ✅ |
-| P14-T044 | Simple command execution: fork → child execve → parent waitpid | ✅ |
-| P14-T045 | Pipeline execution: fork two children, connect with pipe + dup2 | ✅ |
-| P14-T046 | Output redirection: `cmd > file` | ✅ |
-| P14-T047 | Input redirection: `cmd < file` | ✅ |
-| P14-T048 | Append redirection: `cmd >> file` | ✅ |
-| P14-T049 | Background execution: `cmd &` | ✅ |
-| P14-T050 | Environment variables: `export KEY=val`, `$KEY` expansion | ✅ |
-| P14-T051 | Built-in `cd`: chdir syscall | ✅ |
-| P14-T052 | Built-in `exit` | ✅ |
-| P14-T053 | Built-in `export` / `unset` / `env` | ✅ |
-| P14-T054 | Built-in `fg` / `bg` | ✅ |
-| P14-T055 | Built-in `help` | ✅ |
-| P14-T056 | PATH search for commands | ✅ |
+| P15-T033 | Implement `pci_config_read_u32(bus, device, function, offset)` | ⬜ |
+| P15-T034 | Implement `pci_config_read_u16` and `pci_config_read_u8` helpers | ⬜ |
+| P15-T035 | Define `PciDevice` struct | ⬜ |
+| P15-T036 | Implement `pci_scan()`: iterate bus/device/function space | ⬜ |
+| P15-T037 | Read class, subclass, BARs, interrupt line for each device | ⬜ |
+| P15-T038 | Store devices in static array | ⬜ |
+| P15-T039 | Expose `pci_device_list()` read-only accessor | ⬜ |
+| P15-T040 | Log full PCI device list at boot | ⬜ |
 
-## Track I — Core Utilities
+## Track F — Validation and Documentation
 
 | Task | Description | Status |
 |---|---|---|
-| P14-T057 | `echo` — print arguments to stdout | ✅ |
-| P14-T058 | `true` / `false` — exit 0 / exit 1 | ✅ |
-| P14-T059 | `cat` — read file(s) and write to stdout | ✅ |
-| P14-T060 | `ls` — list directory entries via getdents64 | ✅ |
-| P14-T061 | `pwd` — print working directory via getcwd | ✅ |
-| P14-T062 | `mkdir` / `rmdir` — create/remove directories | ✅ |
-| P14-T063 | `rm` — remove files via unlink | ✅ |
-| P14-T064 | `cp` — copy file: open+read source, open+write dest | ✅ |
-| P14-T065 | `mv` — rename file via rename syscall | ✅ |
-| P14-T066 | `env` — print all environment variables | ✅ |
-| P14-T067 | `sleep` — sleep for N seconds | ✅ |
-| P14-T067a | `grep` — search stdin or files for a fixed string | ✅ |
-| P14-T068 | Implement `sys_nanosleep` (syscall 35) | ✅ |
-| P14-T069 | `getdents64` (syscall 217) — stub returns ENOSYS (deferred) | ✅ |
-| P14-T070 | Add all utility binaries to musl build + ramdisk | ✅ |
-
-## Track J — Validation and Documentation
-
-| Task | Description | Status |
-|---|---|---|
-| P14-T071 | Acceptance: `echo hello` prints "hello" | ✅ |
-| P14-T072 | Acceptance: `cat /tmp/test.txt` prints file contents | ✅ |
-| P14-T073 | Acceptance: `cat file.txt > /tmp/copy.txt` creates copy via redirection | ✅ |
-| P14-T074 | Acceptance: `ls \| grep txt` produces filtered listing | ✅ |
-| P14-T075 | Acceptance: Ctrl-C kills foreground command, shell survives | ✅ |
-| P14-T076 | Acceptance: `sleep 10 &` runs in background, shell stays responsive | ✅ |
-| P14-T076a | Acceptance: `fg` brings background job to foreground | ✅ |
-| P14-T077 | Acceptance: `export FOO=bar` then `env` shows FOO=bar | ✅ |
-| P14-T077a | Acceptance: `export PATH=/bin && ls` — PATH-based lookup works | ✅ |
-| P14-T078 | Acceptance: all utility binaries run standalone | ✅ |
-| P14-T079 | `cargo xtask check` passes (clippy + fmt) | ✅ |
-| P14-T080 | QEMU boot validation — no panics, no regressions | ✅ |
-| P14-T081 | Write `docs/14-shell-and-tools.md` | ✅ |
+| P15-T041 | Acceptance: kernel boots using LAPIC timer | ⬜ |
+| P15-T042 | Acceptance: keyboard via I/O APIC works | ⬜ |
+| P15-T043 | Acceptance: legacy 8259 PIC fully masked/disabled | ⬜ |
+| P15-T044 | Acceptance: boot log prints PCI device list | ⬜ |
+| P15-T045 | Acceptance: ACPI logs CPU count and APIC IDs | ⬜ |
+| P15-T046 | Acceptance: shell, pipes, utilities work without regression | ⬜ |
+| P15-T047 | `cargo xtask check` passes | ⬜ |
+| P15-T048 | QEMU boot validation — no panics | ⬜ |
+| P15-T049 | Write `docs/15-hardware-discovery.md` | ⬜ |
