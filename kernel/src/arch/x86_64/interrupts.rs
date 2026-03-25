@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -7,6 +7,15 @@ use x86_64::VirtAddr;
 use crate::serial::_panic_print;
 
 use super::gdt;
+
+// ---------------------------------------------------------------------------
+// APIC / PIC mode flag
+// ---------------------------------------------------------------------------
+
+/// When `true`, interrupt handlers send EOI to the Local APIC instead of the
+/// legacy 8259 PIC. Set by `apic::init()` after the APIC subsystem is fully
+/// programmed.
+pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Two-phase fault kill path (T001)
@@ -64,6 +73,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // Hardware IRQs
     idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
+
+    // APIC spurious interrupt vector — must NOT send EOI.
+    idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
 
     idt
 });
@@ -169,6 +181,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
 pub enum InterruptIndex {
     Timer = 32,
     Keyboard = 33,
+    Spurious = 0xFF,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,9 +221,13 @@ pub fn tick_count() -> u64 {
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::task::signal_reschedule();
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Timer as u8);
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Timer as u8);
+        }
     }
 }
 
@@ -266,8 +283,23 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // IRQ delivery path used by kbd_server in Phase 7+.
     crate::ipc::notification::signal_irq(1);
 
-    unsafe {
-        PICS.lock()
-            .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Keyboard as u8);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// APIC spurious interrupt handler
+// ---------------------------------------------------------------------------
+
+/// Spurious interrupt handler (vector 0xFF). The LAPIC generates spurious
+/// interrupts when the interrupt source disappears before the CPU acknowledges
+/// it. No EOI must be sent for spurious interrupts.
+extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
+    // Intentionally empty — no EOI for spurious interrupts.
 }

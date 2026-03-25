@@ -5,11 +5,13 @@
 
 extern crate alloc;
 
+mod acpi;
 mod arch;
 mod fb;
 mod fs;
 mod ipc;
 mod mm;
+mod pci;
 mod pipe;
 mod process;
 mod serial;
@@ -51,6 +53,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             (ptr, info)
         });
 
+    // P15-T001: extract RSDP address before mm::init consumes boot_info.
+    let rsdp_addr: Option<u64> = boot_info.rsdp_addr.into_option();
+
     mm::init(boot_info);
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
@@ -67,6 +72,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         log::warn!("[fb] no framebuffer provided by bootloader");
     }
 
+    // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
+    acpi::init(rsdp_addr);
+
     // Smoke-test heap allocations (P2-T007)
     let boxed = Box::new(42u64);
     log::info!("[mm] Box::new(42) = {}", *boxed);
@@ -77,9 +85,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let s = String::from("heap works");
     log::info!("[mm] String alloc ok: {}", s);
 
+    // P15: Enumerate PCI buses and log discovered devices.
+    pci::init();
+
     // Enable PIC and unmask IRQs now that all subsystems are initialized.
     unsafe { arch::enable_interrupts() };
     log::info!("[arch] interrupts enabled");
+
+    // Phase 15: switch from PIC to APIC interrupt routing.
+    // Only attempt APIC init if ACPI MADT data is available; otherwise the
+    // kernel falls back to the legacy PIC (which is already running).
+    if acpi::io_apic_address().is_some() {
+        arch::x86_64::apic::init();
+    } else {
+        log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
+    }
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
