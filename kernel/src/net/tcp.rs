@@ -60,6 +60,10 @@ pub fn parse(data: &[u8]) -> Option<(TcpHeader, &[u8])> {
     }
 
     let data_offset = data[12] >> 4;
+    // Minimum data offset is 5 (20-byte header). Reject malformed segments.
+    if data_offset < 5 {
+        return None;
+    }
     let header_len = (data_offset as usize) * 4;
     if data.len() < header_len {
         return None;
@@ -473,17 +477,33 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
         }
     }
 
-    // No matching connection — send RST if not a RST itself.
+    // No matching connection — send RST per RFC 793 Section 3.4.
     if tcp_hdr.flags & TCP_RST == 0 {
         let local_ip = super::config::our_ip();
+        let has_ack = tcp_hdr.flags & TCP_ACK != 0;
+
+        // RFC 793: If the incoming segment has ACK, the RST takes its
+        // sequence number from the ACK field. Otherwise, the RST has
+        // sequence 0, the ACK flag is set, and the ACK field is set to
+        // SEQ + segment_length (SYN and FIN each count as one).
+        let seg_len = tcp_data.len() as u32
+            + if tcp_hdr.flags & TCP_SYN != 0 { 1 } else { 0 }
+            + if tcp_hdr.flags & TCP_FIN != 0 { 1 } else { 0 };
+
+        let (rst_seq, rst_ack, rst_flags) = if has_ack {
+            (tcp_hdr.ack, 0u32, TCP_RST)
+        } else {
+            (0u32, tcp_hdr.seq.wrapping_add(seg_len), TCP_RST | TCP_ACK)
+        };
+
         let p = TcpBuildParams {
             src_ip: local_ip,
             dst_ip: ip_header.src,
             src_port: tcp_hdr.dst_port,
             dst_port: tcp_hdr.src_port,
-            seq: 0,
-            ack: tcp_hdr.seq.wrapping_add(1),
-            flags: TCP_RST | TCP_ACK,
+            seq: rst_seq,
+            ack: rst_ack,
+            flags: rst_flags,
             window: 0,
         };
         let rst = build(&p, &[]);

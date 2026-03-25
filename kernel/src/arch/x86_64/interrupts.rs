@@ -312,6 +312,8 @@ pub static VIRTIO_NET_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 
 extern "x86-interrupt" fn virtio_net_handler(_stack_frame: InterruptStackFrame) {
     // Read ISR status to acknowledge the interrupt on the device side.
+    // This is lock-free (reads io_base from an atomic) to avoid deadlock
+    // if the interrupt fires while send_frame/recv_frames holds the DRIVER lock.
     let _isr = crate::net::virtio_net::isr_status();
 
     // Signal to the network processing task that frames may be available.

@@ -8,7 +8,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -103,8 +103,8 @@ struct VirtqUsedHeader {
 /// Maximum queue size we support.
 const MAX_QUEUE_SIZE: u16 = 256;
 
-/// Size of each RX/TX buffer in bytes (MTU 1514 + virtio-net header 12).
-const BUF_SIZE: usize = 1526;
+/// Size of each RX/TX buffer in bytes (MTU 1514 + virtio-net header 10).
+const BUF_SIZE: usize = 1514 + VIRTIO_NET_HDR_SIZE;
 
 /// virtio-net header prepended to every frame (legacy, no mergeable buffers).
 pub const VIRTIO_NET_HDR_SIZE: usize = 10;
@@ -245,15 +245,17 @@ impl Virtqueue {
     /// Post a buffer to the available ring (for RX: device writes into it).
     fn post_recv_buffer(&mut self, desc_idx: u16) {
         let i = desc_idx as usize;
-        // Set up the descriptor.
-        let desc = unsafe { &mut *self.desc_base.add(i) };
-        desc.addr = self.buf_phys[i];
-        desc.len = BUF_SIZE as u32;
-        desc.flags = VIRTQ_DESC_F_WRITE; // device writes to this buffer
-        desc.next = 0;
+        // Set up the descriptor using volatile writes (device-visible memory).
+        let desc = self.desc_base.wrapping_add(i);
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*desc).addr, self.buf_phys[i]);
+            core::ptr::write_volatile(&raw mut (*desc).len, BUF_SIZE as u32);
+            core::ptr::write_volatile(&raw mut (*desc).flags, VIRTQ_DESC_F_WRITE);
+            core::ptr::write_volatile(&raw mut (*desc).next, 0);
+        }
 
         // Add to available ring.
-        let avail_idx = unsafe { (*self.avail_base).idx };
+        let avail_idx = unsafe { core::ptr::read_volatile(&raw const (*self.avail_base).idx) };
         let ring_entry = avail_idx % self.queue_size;
         let ring_ptr = unsafe { (self.avail_base as *mut u16).add(2 + ring_entry as usize) };
         unsafe {
@@ -264,13 +266,29 @@ impl Virtqueue {
         core::sync::atomic::fence(Ordering::Release);
 
         unsafe {
-            (*self.avail_base).idx = avail_idx.wrapping_add(1);
+            core::ptr::write_volatile(&raw mut (*self.avail_base).idx, avail_idx.wrapping_add(1));
         }
     }
 
     /// Send a buffer (for TX: device reads from it).
+    ///
+    /// Reclaims completed TX descriptors first. Drops the packet if the ring
+    /// is full (no free descriptors).
     #[allow(dead_code)]
     fn send_buffer(&mut self, data: &[u8]) {
+        // Reclaim completed TX descriptors so we know which are free.
+        self.poll_used();
+
+        // Check for ring-full: if we've posted `queue_size` descriptors without
+        // any being consumed, the ring is full — drop the packet.
+        let avail_idx = unsafe { core::ptr::read_volatile(&raw const (*self.avail_base).idx) };
+        let used_idx = unsafe { core::ptr::read_volatile(&raw const (*self.used_base).idx) };
+        let in_flight = avail_idx.wrapping_sub(used_idx);
+        if in_flight >= self.queue_size {
+            log::warn!("[virtio-net] TX ring full — dropping packet");
+            return;
+        }
+
         let desc_idx = self.next_avail % self.queue_size;
         self.next_avail = self.next_avail.wrapping_add(1);
         let i = desc_idx as usize;
@@ -281,15 +299,16 @@ impl Virtqueue {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.buffers[i], copy_len);
         }
 
-        // Set up the descriptor.
-        let desc = unsafe { &mut *self.desc_base.add(i) };
-        desc.addr = self.buf_phys[i];
-        desc.len = copy_len as u32;
-        desc.flags = 0; // device reads from this buffer
-        desc.next = 0;
+        // Set up the descriptor using volatile writes (device-visible memory).
+        let desc = self.desc_base.wrapping_add(i);
+        unsafe {
+            core::ptr::write_volatile(&raw mut (*desc).addr, self.buf_phys[i]);
+            core::ptr::write_volatile(&raw mut (*desc).len, copy_len as u32);
+            core::ptr::write_volatile(&raw mut (*desc).flags, 0u16);
+            core::ptr::write_volatile(&raw mut (*desc).next, 0u16);
+        }
 
         // Add to available ring.
-        let avail_idx = unsafe { (*self.avail_base).idx };
         let ring_entry = avail_idx % self.queue_size;
         let ring_ptr = unsafe { (self.avail_base as *mut u16).add(2 + ring_entry as usize) };
         unsafe {
@@ -297,7 +316,7 @@ impl Virtqueue {
         }
         core::sync::atomic::fence(Ordering::Release);
         unsafe {
-            (*self.avail_base).idx = avail_idx.wrapping_add(1);
+            core::ptr::write_volatile(&raw mut (*self.avail_base).idx, avail_idx.wrapping_add(1));
         }
 
         // Notify the device.
@@ -362,6 +381,12 @@ static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
 /// Set to true once the driver is initialized and ready.
 pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 
+/// Lock-free copy of io_base for use in the interrupt handler.
+/// Set once during init() and never changes. The ISR reads this instead of
+/// taking the DRIVER mutex, avoiding deadlock when an IRQ fires while
+/// send_frame/recv_frames holds the lock.
+static ISR_IO_BASE: AtomicU16 = AtomicU16::new(0);
+
 /// Returns the MAC address of the virtio-net device, if initialized.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<MacAddr> {
@@ -421,12 +446,15 @@ pub fn send_frame(frame: &[u8]) {
 }
 
 /// Read and clear the ISR status register. Called from the interrupt handler.
+///
+/// This is lock-free — reads io_base from an atomic rather than taking the
+/// DRIVER mutex, so it is safe to call from an ISR context.
 pub fn isr_status() -> u8 {
-    let driver = DRIVER.lock();
-    match driver.as_ref() {
-        Some(d) => unsafe { Port::<u8>::new(d.io_base + VIRTIO_ISR_STATUS).read() },
-        None => 0,
+    let base = ISR_IO_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return 0;
     }
+    unsafe { Port::<u8>::new(base + VIRTIO_ISR_STATUS).read() }
 }
 
 // ===========================================================================
@@ -556,6 +584,9 @@ pub fn init() {
         Port::<u16>::new(io_base + VIRTIO_QUEUE_NOTIFY).write(0);
     }
 
+    // Store io_base for lock-free ISR access before publishing driver state.
+    ISR_IO_BASE.store(io_base, Ordering::Release);
+
     *DRIVER.lock() = Some(driver);
     VIRTIO_NET_READY.store(true, Ordering::Release);
 
@@ -610,15 +641,14 @@ fn alloc_contiguous_frames(count: usize) -> Option<u64> {
         let frame = frame_allocator::allocate_frame()?;
         let expected = base + (i as u64) * 4096;
         if frame.start_address().as_u64() != expected {
-            log::warn!(
-                "[virtio-net] frame {} not contiguous: got {:#x}, expected {:#x}",
+            log::error!(
+                "[virtio-net] frame {} not contiguous: got {:#x}, expected {:#x} — \
+                 virtqueue requires contiguous physical memory",
                 i,
                 frame.start_address().as_u64(),
                 expected
             );
-            // Still usable — the bump allocator should give contiguous frames
-            // from a large region. If not, the virtqueue won't work correctly.
-            // In practice QEMU provides large contiguous regions.
+            return None;
         }
     }
     Some(base)

@@ -40,7 +40,7 @@ Uses the legacy (0.9.5) virtio register layout via PCI BAR0 I/O ports:
   - Descriptor table: 16 bytes per entry (addr, len, flags, next)
   - Available ring: producer (driver) posts buffer indices
   - Used ring: consumer (device) reports completed buffers
-- **Buffers**: Pre-allocated 1526-byte buffers (MTU 1514 + 12-byte virtio header)
+- **Buffers**: Pre-allocated 1524-byte buffers (MTU 1514 + 10-byte legacy virtio-net header)
 - **IRQ**: Routed through I/O APIC, handler sets a flag for polling
 
 ### Ethernet (`net/ethernet.rs`)

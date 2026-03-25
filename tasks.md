@@ -13,7 +13,7 @@
 | C | IPv4 + ICMP | ✅ done |
 | D | UDP | ✅ done |
 | E | TCP | ✅ done |
-| F | Socket API + net_server | ✅ done |
+| F | Net task + ping (socket API deferred) | ✅ done |
 | G | Validation + documentation | ✅ done |
 
 ---
