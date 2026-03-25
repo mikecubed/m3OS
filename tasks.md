@@ -117,7 +117,7 @@
 | Task | Description | Status |
 |---|---|---|
 | P16-T065 | Acceptance: virtio-net detected and MAC logged | ✅ |
-| P16-T066 | Acceptance: `ping 10.0.2.2` works | ✅ (requires interactive QEMU) |
+| P16-T066 | Acceptance: `ping 10.0.2.2` works | ⏳ pending interactive QEMU validation |
 | P16-T067 | Acceptance: UDP echo test | ⏭️ deferred (needs nc utility) |
 | P16-T068 | Acceptance: TCP client test | ⏭️ deferred (needs nc utility) |
 | P16-T069 | Acceptance: TCP server test | ⏭️ deferred (needs nc utility) |

@@ -134,9 +134,9 @@ Production network stacks are typically 50,000-200,000 lines of code and include
 - **Multiplexing**: epoll/kqueue for thousands of concurrent connections
 - **Userspace stacks**: DPDK, io_uring for bypassing kernel overhead
 
-This implementation is intentionally minimal — one connection at a time, no
-retransmission, no congestion control, static IP — but demonstrates every layer
-of the network model from NIC driver to transport protocol.
+This implementation is intentionally minimal — up to 4 concurrent TCP connections
+with no retransmission, no congestion control, and static IP — but demonstrates
+every layer of the network model from NIC driver to transport protocol.
 
 ## Deferred Items
 
