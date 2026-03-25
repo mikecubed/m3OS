@@ -106,15 +106,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     net::virtio_net::init();
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
         // Route the virtio-net PCI interrupt through the I/O APIC.
-        // The PCI interrupt line was read during PCI enumeration; look it up
-        // from the virtio-net device.
+        let mut irq_routed = false;
         if let Some(dev) = net::virtio_net::find_virtio_net_device() {
-            if acpi::io_apic_address().is_some() {
+            if acpi::io_apic_address().is_some() && dev.interrupt_line != 0xFF {
                 arch::x86_64::apic::route_pci_irq(
                     dev.interrupt_line,
                     arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
                 );
+                irq_routed = true;
             }
+        }
+        VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
+        if !irq_routed {
+            log::warn!("[net] virtio-net IRQ not routed — net_task will use periodic polling");
         }
     }
 
@@ -1712,15 +1716,18 @@ fn run_elf_and_report(name: &'static str) {
 // Network task (P16-T055)
 // ---------------------------------------------------------------------------
 
+/// Whether the virtio-net IRQ was successfully routed through the I/O APIC.
+/// Set during kernel_main init; read by net_task to choose IRQ vs polling mode.
+static VIRTIO_NET_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Background task that processes incoming network frames.
 ///
 /// Polls the virtio-net driver for received frames and dispatches them through
 /// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
 fn net_task() -> ! {
-    use arch::x86_64::interrupts::USING_APIC;
-
-    let has_apic_routing = USING_APIC.load(core::sync::atomic::Ordering::Relaxed);
-    if !has_apic_routing {
+    let has_irq_routing = VIRTIO_NET_IRQ_ROUTED.load(core::sync::atomic::Ordering::Acquire);
+    if !has_irq_routing {
         log::info!("[net] no APIC routing — using periodic poll mode");
     }
     log::info!("[net] network processing task started");
@@ -1728,7 +1735,7 @@ fn net_task() -> ! {
     let mut last_poll_tick: u64 = 0;
 
     loop {
-        if has_apic_routing {
+        if has_irq_routing {
             // IRQ-driven path: drain work signaled by the IRQ flag.
             while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
                 .swap(false, core::sync::atomic::Ordering::Acquire)

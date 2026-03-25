@@ -95,7 +95,7 @@
 | P16-T051 | Implement RST handling | ✅ |
 | P16-T052 | Implement simple flow control | ✅ |
 
-## Track F — Socket API and net_server
+## Track F — Net Task + Ping (Socket API Deferred)
 
 | Task | Description | Status |
 |---|---|---|

@@ -34,9 +34,9 @@ flowchart TD
 
 Uses the legacy (0.9.5) virtio register layout via PCI BAR0 I/O ports:
 
-- **Device discovery**: Finds vendor 0x1AF4, device 0x1000 on the PCI bus
+- **Device discovery**: Finds vendor 0x1AF4, device 0x1000 (legacy/transitional) on the PCI bus
 - **Reset and feature negotiation**: Supports MAC and STATUS features
-- **Virtqueues**: Two queues (RX index 0, TX index 1), each 256 entries
+- **Virtqueues**: Two queues (RX index 0, TX index 1), size read from device (up to 256 entries)
   - Descriptor table: 16 bytes per entry (addr, len, flags, next)
   - Available ring: producer (driver) posts buffer indices
   - Used ring: consumer (device) reports completed buffers

@@ -639,13 +639,14 @@ pub fn init() {
 
 /// Find the virtio-net device in the PCI device list.
 ///
-/// Looks for vendor 0x1AF4, device 0x1000 (transitional) or 0x1041 (modern),
-/// class 0x02 / subclass 0x00 (Ethernet controller).
+/// Only matches vendor 0x1AF4, device 0x1000 (legacy/transitional virtio-net).
+/// Device 0x1041 (modern virtio-net) is not supported — the driver only
+/// implements the legacy I/O-port register layout.
 pub fn find_virtio_net_device() -> Option<pci::PciDevice> {
     let mut index = 0;
     while let Some(dev) = pci::pci_device(index) {
         if dev.vendor_id == 0x1AF4
-            && (dev.device_id == 0x1000 || dev.device_id == 0x1041)
+            && dev.device_id == 0x1000
             && dev.class_code == 0x02
             && dev.subclass == 0x00
         {
