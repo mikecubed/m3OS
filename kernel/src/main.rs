@@ -11,6 +11,7 @@ mod fb;
 mod fs;
 mod ipc;
 mod mm;
+mod net;
 mod pci;
 mod pipe;
 mod process;
@@ -99,6 +100,22 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         arch::x86_64::apic::init();
     } else {
         log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
+    }
+
+    // Phase 16: Initialize virtio-net driver and route its IRQ.
+    net::virtio_net::init();
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        // Route the virtio-net PCI interrupt through the I/O APIC.
+        // The PCI interrupt line was read during PCI enumeration; look it up
+        // from the virtio-net device.
+        if let Some(dev) = find_pci_virtio_net() {
+            if acpi::io_apic_address().is_some() {
+                arch::x86_64::apic::route_pci_irq(
+                    dev.interrupt_line,
+                    arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
+                );
+            }
+        }
     }
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
@@ -1690,6 +1707,22 @@ pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
+}
+
+/// Find the virtio-net PCI device for IRQ routing.
+fn find_pci_virtio_net() -> Option<pci::PciDevice> {
+    let mut i = 0;
+    while let Some(dev) = pci::pci_device(i) {
+        if dev.vendor_id == 0x1AF4
+            && (dev.device_id == 0x1000 || dev.device_id == 0x1041)
+            && dev.class_code == 0x02
+            && dev.subclass == 0x00
+        {
+            return Some(dev);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[panic_handler]

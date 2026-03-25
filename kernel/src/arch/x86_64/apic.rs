@@ -428,6 +428,53 @@ pub fn disable_legacy_pic() {
 }
 
 // ===========================================================================
+// Public helpers for routing additional IRQs (P16-T011)
+// ===========================================================================
+
+/// Route a PCI interrupt line through the I/O APIC to the given IDT vector.
+///
+/// PCI interrupt lines are GSIs in the I/O APIC. This function programs the
+/// redirection entry for `irq_line` to deliver `vector` to the BSP.
+///
+/// Level-triggered, active-low is the standard for PCI interrupts.
+pub fn route_pci_irq(irq_line: u8, vector: u8) {
+    let max_redir = match IOAPIC_MAX_REDIR.get() {
+        Some(&m) => m,
+        None => {
+            log::warn!("[apic] route_pci_irq: I/O APIC not initialized");
+            return;
+        }
+    };
+
+    let gsi_base = crate::acpi::ioapic_gsi_base();
+    let gsi = gsi_base + irq_line as u32;
+
+    if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
+        let bsp_id = unsafe { lapic_read(LAPIC_ID) & 0xFF00_0000 };
+        // PCI interrupts: level-triggered, active-low.
+        let low = redir_entry_low(vector, true, true, false);
+        unsafe {
+            ioapic_write_redir(pin, low, bsp_id);
+        }
+        log::info!(
+            "[apic] I/O APIC: PCI IRQ {} → GSI {} (pin {}) → vector {} (level, active-low)",
+            irq_line,
+            gsi,
+            pin,
+            vector
+        );
+    } else {
+        log::warn!(
+            "[apic] I/O APIC: PCI IRQ {} GSI {} not routable (base={}, max_pin={})",
+            irq_line,
+            gsi,
+            gsi_base,
+            max_redir
+        );
+    }
+}
+
+// ===========================================================================
 // Orchestration
 // ===========================================================================
 
