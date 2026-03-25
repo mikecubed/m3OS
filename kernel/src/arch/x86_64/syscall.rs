@@ -433,11 +433,12 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 
     // sig=0: permission check only, no signal sent.
     if sig == 0 {
+        const NEG_ESRCH: u64 = (-3_i64) as u64;
         let table = crate::process::PROCESS_TABLE.lock();
         return if table.find(pid as crate::process::Pid).is_some() {
             0
         } else {
-            NEG_EINVAL
+            NEG_ESRCH
         };
     }
 

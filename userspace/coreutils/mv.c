@@ -1,4 +1,4 @@
-/* mv — rename file (fallback: cp + rm) */
+/* mv — rename file via rename syscall */
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>

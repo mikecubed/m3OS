@@ -3,6 +3,15 @@
 #include <fcntl.h>
 #include <string.h>
 
+static void write_all(int fd, const char *buf, ssize_t len) {
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w <= 0) break;
+        off += w;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         const char *msg = "usage: cp <src> <dst>\n";
@@ -25,7 +34,7 @@ int main(int argc, char **argv) {
     char buf[4096];
     ssize_t n;
     while ((n = read(src, buf, sizeof(buf))) > 0) {
-        write(dst, buf, n);
+        write_all(dst, buf, n);
     }
     close(src);
     close(dst);

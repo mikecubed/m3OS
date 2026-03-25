@@ -852,7 +852,9 @@ fn shell_execute(
                 return;
             }
             "cd" => {
-                // stub: chdir always succeeds in our OS
+                // The shell is a kernel task, so there's no user-space chdir to call.
+                // chdir syscall (80) is a no-op in our OS (single global cwd).
+                // Update $PWD so child processes see the new directory.
                 if !args_str.is_empty() {
                     set_env(env, "PWD", args_str);
                 }
