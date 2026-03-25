@@ -10,9 +10,9 @@
 |---|---|---|
 | A | virtio-net driver | ✅ done |
 | B | Ethernet + ARP | ✅ done |
-| C | IPv4 + ICMP | 🚧 in progress |
-| D | UDP | ⬜ pending |
-| E | TCP | ⬜ pending |
+| C | IPv4 + ICMP | ✅ done |
+| D | UDP | 🚧 in progress |
+| E | TCP | 🚧 in progress |
 | F | Socket API + net_server | ⬜ pending |
 | G | Validation + documentation | ⬜ pending |
 
@@ -55,16 +55,16 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T024 | Define `Ipv4Header` struct | ⬜ |
-| P16-T025 | Implement `ipv4_parse()` | ⬜ |
-| P16-T026 | Implement IPv4 header checksum | ⬜ |
-| P16-T027 | Implement `ipv4_build()` | ⬜ |
-| P16-T028 | Implement `ipv4_send()` | ⬜ |
-| P16-T029 | Configure static IP (10.0.2.15/24, gw 10.0.2.2) | ⬜ |
-| P16-T030 | Implement protocol dispatch | ⬜ |
-| P16-T031 | Define ICMP header struct | ⬜ |
-| P16-T032 | Implement ICMP echo reply | ⬜ |
-| P16-T033 | Implement `ping(target_ip)` | ⬜ |
+| P16-T024 | Define `Ipv4Header` struct | ✅ |
+| P16-T025 | Implement `ipv4_parse()` | ✅ |
+| P16-T026 | Implement IPv4 header checksum | ✅ |
+| P16-T027 | Implement `ipv4_build()` | ✅ |
+| P16-T028 | Implement `ipv4_send()` | ✅ |
+| P16-T029 | Configure static IP (10.0.2.15/24, gw 10.0.2.2) | ✅ |
+| P16-T030 | Implement protocol dispatch | ✅ |
+| P16-T031 | Define ICMP header struct | ✅ |
+| P16-T032 | Implement ICMP echo reply | ✅ |
+| P16-T033 | Implement `ping(target_ip)` | ✅ |
 
 ## Track D — UDP
 

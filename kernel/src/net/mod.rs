@@ -10,4 +10,8 @@ pub mod config;
 pub mod dispatch;
 #[allow(dead_code)]
 pub mod ethernet;
+#[allow(dead_code)]
+pub mod icmp;
+#[allow(dead_code)]
+pub mod ipv4;
 pub mod virtio_net;

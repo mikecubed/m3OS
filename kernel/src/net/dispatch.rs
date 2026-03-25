@@ -5,6 +5,7 @@
 
 use super::arp;
 use super::ethernet;
+use super::ipv4;
 use super::virtio_net;
 
 /// Process all pending received frames.
@@ -27,7 +28,9 @@ pub fn process_rx() {
                 }
             }
             ethernet::ETHERTYPE_IPV4 => {
-                // IPv4 dispatch will be added in Track C.
+                if let Some((header, payload)) = ipv4::parse(&frame.payload) {
+                    ipv4::handle_ipv4(&header, payload);
+                }
             }
             _ => {
                 // Unknown EtherType — drop silently.
