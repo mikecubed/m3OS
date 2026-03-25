@@ -461,16 +461,20 @@ pub fn init() {
         }
 
         // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
+        //    Preserve the override's polarity/trigger flags in case the entry
+        //    is ever unmasked or inspected later.
         unsafe {
             let gsi_base = crate::acpi::ioapic_gsi_base();
             let max_redir = *IOAPIC_MAX_REDIR.get().unwrap();
-            let gsi = if let Some(ovr) = crate::acpi::irq_override(0) {
-                ovr.global_system_interrupt
+            let (gsi, active_low, level_triggered) = if let Some(ovr) = crate::acpi::irq_override(0)
+            {
+                let (al, lt) = decode_override_flags(ovr.flags);
+                (ovr.global_system_interrupt, al, lt)
             } else {
-                gsi_base
+                (gsi_base, false, false)
             };
             if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
-                let low = redir_entry_low(32, false, false, true); // masked
+                let low = redir_entry_low(32, active_low, level_triggered, true); // masked
                 ioapic_write_redir(pin, low, 0);
             }
         }

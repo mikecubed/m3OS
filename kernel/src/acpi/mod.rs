@@ -139,13 +139,15 @@ fn validate_rsdp(addr: PhysAddr) -> Option<u8> {
     let revision = v1.revision;
 
     if revision >= 2 {
-        // v2 checksum: sum of all 36 bytes must be 0 mod 256.
-        let v2_bytes = unsafe {
-            core::slice::from_raw_parts(virt as *const u8, core::mem::size_of::<RsdpDescriptorV2>())
-        };
+        // v2 checksum: sum of `length` bytes must be 0 mod 256.
+        // Read the length field from the v2 header (offset 20, u32).
+        let v2_len = unsafe { ptr::read_unaligned((virt + 20) as *const u32) } as usize;
+        // Sanity-check: must be at least 36 (minimum v2 RSDP) and at most 256.
+        let check_len = v2_len.clamp(core::mem::size_of::<RsdpDescriptorV2>(), 256);
+        let v2_bytes = unsafe { core::slice::from_raw_parts(virt as *const u8, check_len) };
         let sum2: u8 = v2_bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         if sum2 != 0 {
-            log::warn!("[acpi] RSDP v2 checksum invalid");
+            log::warn!("[acpi] RSDP v2 checksum invalid (length={})", v2_len);
             return None;
         }
     }

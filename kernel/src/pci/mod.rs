@@ -198,6 +198,7 @@ fn pci_scan() {
     for i in 0..MAX_PCI_DEVICES {
         list.devices[i] = None;
     }
+    let mut overflow_logged = false;
 
     for bus in 0..=255u16 {
         let bus = bus as u8;
@@ -210,11 +211,12 @@ fn pci_scan() {
 
             // Probe function 0.
             let dev0 = probe_function(bus, device, 0);
-            if !list.push(dev0) {
+            if !list.push(dev0) && !overflow_logged {
                 log::warn!(
-                    "[pci] device list full ({} devices); continuing scan but not storing",
+                    "[pci] device list full ({} devices); additional devices not stored",
                     MAX_PCI_DEVICES
                 );
+                overflow_logged = true;
             }
 
             // Check multi-function bit (bit 7 of header_type at function 0).
