@@ -11,6 +11,7 @@ mod fb;
 mod fs;
 mod ipc;
 mod mm;
+mod net;
 mod pci;
 mod pipe;
 mod process;
@@ -101,6 +102,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
     }
 
+    // Phase 16: Initialize virtio-net driver and route its IRQ.
+    net::virtio_net::init();
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        // Route the virtio-net PCI interrupt through the I/O APIC.
+        let mut irq_routed = false;
+        if let Some(dev) = net::virtio_net::find_virtio_net_device() {
+            if acpi::io_apic_address().is_some() && dev.interrupt_line != 0xFF {
+                arch::x86_64::apic::route_pci_irq(
+                    dev.interrupt_line,
+                    arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
+                );
+                irq_routed = true;
+            }
+        }
+        VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
+        if !irq_routed {
+            log::warn!("[net] virtio-net IRQ not routed — net_task will use periodic polling");
+        }
+    }
+
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
         x86_64::instructions::interrupts::int3();
@@ -177,6 +198,11 @@ fn init_task() -> ! {
     task::spawn(fat_server_task, "fat");
     task::spawn(vfs_server_task, "vfs");
     task::spawn(fs_client_task, "fs-client");
+
+    // Spawn Phase 16 network processing task.
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        task::spawn(net_task, "net");
+    }
 
     // Spawn Phase 9 shell task.
     task::spawn(shell_task, "shell");
@@ -879,7 +905,7 @@ fn shell_execute(
         match cmd {
             "help" => {
                 shell_print(my_id, console_ep,
-                    "builtins: help cd exit export unset env fg bg\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
+                    "builtins: help cd exit export unset env fg bg ping\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
                 return;
             }
             "cd" => {
@@ -937,6 +963,10 @@ fn shell_execute(
                 if let Some(&(_job, pid)) = bg_jobs.last() {
                     process::send_signal(pid, process::SIGCONT);
                 }
+                return;
+            }
+            "ping" => {
+                shell_ping(my_id, console_ep, args_str);
                 return;
             }
             _ => {} // fall through to fork+exec
@@ -1679,6 +1709,138 @@ fn run_elf_and_report(name: &'static str) {
             break;
         }
         task::yield_now();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network task (P16-T055)
+// ---------------------------------------------------------------------------
+
+/// Whether the virtio-net IRQ was successfully routed through the I/O APIC.
+/// Set during kernel_main init; read by net_task to choose IRQ vs polling mode.
+static VIRTIO_NET_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Background task that processes incoming network frames.
+///
+/// Polls the virtio-net driver for received frames and dispatches them through
+/// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
+fn net_task() -> ! {
+    let has_irq_routing = VIRTIO_NET_IRQ_ROUTED.load(core::sync::atomic::Ordering::Acquire);
+    if !has_irq_routing {
+        log::info!("[net] no APIC routing — using periodic poll mode");
+    }
+    log::info!("[net] network processing task started");
+
+    let mut last_poll_tick: u64 = 0;
+
+    loop {
+        if has_irq_routing {
+            // IRQ-driven path: drain work signaled by the IRQ flag.
+            while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+                .swap(false, core::sync::atomic::Ordering::Acquire)
+            {
+                net::dispatch::process_rx();
+            }
+
+            task::yield_now();
+
+            // Race-free sleep.
+            x86_64::instructions::interrupts::disable();
+            if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                x86_64::instructions::interrupts::enable_and_hlt();
+            } else {
+                x86_64::instructions::interrupts::enable();
+            }
+        } else {
+            // Legacy PIC fallback: the virtio-net IRQ is not routed, so poll
+            // process_rx() every ~10 ticks (~100ms at 100 Hz).
+            let now = arch::x86_64::interrupts::tick_count();
+            if now.wrapping_sub(last_poll_tick) >= 10 {
+                net::dispatch::process_rx();
+                last_poll_tick = now;
+            }
+            task::yield_now();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell `ping` command (P16-T063)
+// ---------------------------------------------------------------------------
+
+/// Parse a dotted-decimal IPv4 address string.
+fn parse_ipv4(s: &str) -> Option<net::arp::Ipv4Addr> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut addr = [0u8; 4];
+    for (i, part) in parts.iter().enumerate() {
+        addr[i] = part.parse::<u8>().ok()?;
+    }
+    Some(addr)
+}
+
+/// `ping <ip>` — send ICMP echo requests and wait for replies.
+fn shell_ping(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, args: &str) {
+    let target = match parse_ipv4(args.trim()) {
+        Some(ip) => ip,
+        None => {
+            shell_print(my_id, console_ep, "usage: ping <ip>\n");
+            return;
+        }
+    };
+
+    if !net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        shell_print(my_id, console_ep, "ping: network not available\n");
+        return;
+    }
+
+    let msg = alloc::format!(
+        "PING {}.{}.{}.{}\n",
+        target[0],
+        target[1],
+        target[2],
+        target[3]
+    );
+    shell_print(my_id, console_ep, &msg);
+
+    for seq in 0..4u16 {
+        let send_tick = net::icmp::ping(target, seq);
+
+        // Wait up to ~2 seconds for a reply (200 ticks at ~100 Hz).
+        let mut got_reply = false;
+        for _ in 0..200u32 {
+            // Process incoming frames to handle the reply.
+            net::dispatch::process_rx();
+
+            if net::icmp::PING_REPLY_RECEIVED.load(core::sync::atomic::Ordering::Acquire) {
+                let recv_tick =
+                    net::icmp::PING_REPLY_TICK.load(core::sync::atomic::Ordering::Acquire);
+                let rtt_ticks = recv_tick.wrapping_sub(send_tick);
+                let rtt_ms = rtt_ticks * 10; // ~10ms per tick at 100 Hz
+                let reply_msg = alloc::format!(
+                    "reply from {}.{}.{}.{}: seq={} time={}ms\n",
+                    target[0],
+                    target[1],
+                    target[2],
+                    target[3],
+                    seq,
+                    rtt_ms
+                );
+                shell_print(my_id, console_ep, &reply_msg);
+                got_reply = true;
+                break;
+            }
+            task::yield_now();
+        }
+        if !got_reply {
+            let timeout_msg = alloc::format!("request timeout for seq {}\n", seq);
+            shell_print(my_id, console_ep, &timeout_msg);
+        }
     }
 }
 

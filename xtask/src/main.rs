@@ -329,6 +329,14 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         }
     }
 
+    // Phase 16: virtio-net NIC with QEMU user-mode networking.
+    args.extend([
+        "-device".to_string(),
+        "virtio-net-pci,netdev=net0".to_string(),
+        "-netdev".to_string(),
+        "user,id=net0".to_string(),
+    ]);
+
     args.extend(["-no-reboot".to_string()]);
     args
 }

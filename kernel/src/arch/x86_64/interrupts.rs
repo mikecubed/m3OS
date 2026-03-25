@@ -73,6 +73,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // Hardware IRQs
     idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
+    idt[InterruptIndex::VirtioNet as u8].set_handler_fn(virtio_net_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
@@ -181,6 +182,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
 pub enum InterruptIndex {
     Timer = 32,
     Keyboard = 33,
+    VirtioNet = 34,
     Spurious = 0xFF,
 }
 
@@ -297,9 +299,32 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 // APIC spurious interrupt handler
 // ---------------------------------------------------------------------------
 
-/// Spurious interrupt handler (vector 0xFF). The LAPIC generates spurious
-/// interrupts when the interrupt source disappears before the CPU acknowledges
-/// it. No EOI must be sent for spurious interrupts.
 extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
-    // Intentionally empty — no EOI for spurious interrupts.
+    // Spurious interrupt (vector 0xFF) — no EOI must be sent.
+}
+
+// ---------------------------------------------------------------------------
+// virtio-net IRQ handler (P16-T011, P16-T012)
+// ---------------------------------------------------------------------------
+
+/// Tracks whether a virtio-net interrupt has fired (for polling by the net task).
+pub static VIRTIO_NET_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "x86-interrupt" fn virtio_net_handler(_stack_frame: InterruptStackFrame) {
+    // Read ISR status to acknowledge the interrupt on the device side.
+    // This is lock-free (reads io_base from an atomic) to avoid deadlock
+    // if the interrupt fires while send_frame/recv_frames holds the DRIVER lock.
+    let _isr = crate::net::virtio_net::isr_status();
+
+    // Signal to the network processing task that frames may be available.
+    VIRTIO_NET_IRQ_PENDING.store(true, Ordering::Release);
+
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::VirtioNet as u8);
+        }
+    }
 }
