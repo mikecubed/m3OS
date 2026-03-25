@@ -314,6 +314,7 @@ fn check_pending_signals() {
                             if let Some(proc) = table.find_mut(pid) {
                                 proc.state = crate::process::ProcessState::Stopped;
                                 proc.stop_signal = signum;
+                                proc.stop_reported = false;
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
@@ -1033,7 +1034,10 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     found_code = proc.exit_code;
                     break;
                 }
-                if report_stopped && proc.state == crate::process::ProcessState::Stopped {
+                if report_stopped
+                    && proc.state == crate::process::ProcessState::Stopped
+                    && !proc.stop_reported
+                {
                     found_pid = Some(proc.pid);
                     found_stopped = true;
                     found_code = Some(proc.stop_signal as i32);
@@ -1047,6 +1051,10 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 
             if let Some(pid) = found_pid {
                 if found_stopped {
+                    // Mark as reported so subsequent waitpid calls don't re-report.
+                    if let Some(p) = table.find_mut(pid) {
+                        p.stop_reported = true;
+                    }
                     Some((pid, found_code, true)) // stopped
                 } else {
                     let code = found_code.unwrap_or(0);

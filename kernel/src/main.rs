@@ -892,10 +892,13 @@ fn shell_execute(
                     // Set foreground group and send SIGCONT.
                     process::FG_PGID.store(pid, core::sync::atomic::Ordering::Relaxed);
                     process::send_signal(pid, process::SIGCONT);
-                    // Wait for the process.
-                    wait_for_child(pid);
+                    // Wait for the process (may stop again via Ctrl-Z).
+                    let exited = wait_for_child(pid);
                     process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
-                    bg_jobs.retain(|&(_, p)| p != pid);
+                    if exited {
+                        bg_jobs.retain(|&(_, p)| p != pid);
+                    }
+                    // If stopped, leave in bg_jobs so fg can resume again.
                 }
                 return;
             }
@@ -1060,8 +1063,16 @@ fn shell_fork_exec(
     } else {
         // Set foreground process group.
         process::FG_PGID.store(child_pid, core::sync::atomic::Ordering::Relaxed);
-        wait_for_child(child_pid);
+        let exited = wait_for_child(child_pid);
         process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
+        if !exited {
+            // Child was stopped (Ctrl-Z) — add to background jobs.
+            let job = *next_job;
+            *next_job += 1;
+            bg_jobs.push((job, child_pid));
+            let msg = alloc::format!("[{}] stopped  pid {}\n", job, child_pid);
+            shell_print(my_id, console_ep, &msg);
+        }
     }
 }
 
@@ -1234,7 +1245,9 @@ fn spawn_user_process_with_pipe(
 }
 
 /// Wait for a child process to exit (spin-yield).
-fn wait_for_child(pid: crate::process::Pid) {
+/// Returns `true` if the child exited (reaped), `false` if it was stopped
+/// (Ctrl-Z). A stopped child is not reaped — it can be resumed with `fg`.
+fn wait_for_child(pid: crate::process::Pid) -> bool {
     loop {
         let state = {
             let table = process::PROCESS_TABLE.lock();
@@ -1244,9 +1257,12 @@ fn wait_for_child(pid: crate::process::Pid) {
             Some(process::ProcessState::Zombie) => {
                 let mut table = process::PROCESS_TABLE.lock();
                 table.reap(pid);
-                break;
+                return true;
             }
-            None => break,
+            Some(process::ProcessState::Stopped) => {
+                return false; // stopped by signal — return to shell
+            }
+            None => return true,
             _ => {
                 task::yield_now();
             }

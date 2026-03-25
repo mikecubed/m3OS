@@ -261,6 +261,8 @@ pub struct Process {
     pub exit_code: Option<i32>,
     /// Signal that caused the process to stop (set when transitioning to Stopped).
     pub stop_signal: u32,
+    /// True after waitpid has reported this stop; prevents re-reporting.
+    pub stop_reported: bool,
     /// Current program break (heap top). 0 = not yet initialized.
     ///
     /// Set to BRK_BASE on first `sys_brk(0)` call; grows upward as
@@ -301,6 +303,7 @@ impl Process {
             user_stack_top: stack_top,
             exit_code: None,
             stop_signal: 0,
+            stop_reported: false,
             brk_current: 0,
             mmap_next: 0,
             pgid: pid,
@@ -412,6 +415,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         user_stack_top,
         exit_code: None,
         stop_signal: 0,
+        stop_reported: false,
         brk_current: 0,
         mmap_next: 0,
         pgid: pid,
@@ -449,6 +453,7 @@ pub fn spawn_process_with_cr3(
         user_stack_top,
         exit_code: None,
         stop_signal: 0,
+        stop_reported: false,
         brk_current,
         mmap_next,
         pgid: pid,
@@ -490,6 +495,7 @@ pub fn spawn_process_with_cr3_and_fds(
         user_stack_top,
         exit_code: None,
         stop_signal: 0,
+        stop_reported: false,
         brk_current,
         mmap_next,
         pgid,

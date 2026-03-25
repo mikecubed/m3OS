@@ -16,7 +16,7 @@ int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "/tmp";
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
-        /* Fallback: list ramdisk files via a simpler method. */
+        /* Failed to open directory: report error and exit. */
         const char *msg = "ls: cannot open directory\n";
         write(2, msg, strlen(msg));
         return 1;
