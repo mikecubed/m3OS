@@ -185,8 +185,9 @@ fn gsi_to_pin(gsi: u32, gsi_base: u32, max_redir: u32) -> Option<u32> {
 
 /// Program the I/O APIC redirection table.
 ///
-/// Routes keyboard (IRQ 1) to vector 33 and COM1 (IRQ 4) to vector 36 on the
-/// BSP. All other entries are masked.
+/// Routes keyboard (IRQ 1) to vector 33 and configures COM1 (IRQ 4) to use
+/// vector 36 on the BSP, but keeps the COM1 entry masked until a serial IRQ
+/// handler is installed. All other entries are masked.
 fn ioapic_init() {
     unsafe {
         // Read the maximum redirection entry count from version register (reg 1).
@@ -197,6 +198,7 @@ fn ioapic_init() {
             ver & 0xFF,
             max_redir + 1
         );
+        IOAPIC_MAX_REDIR.call_once(|| max_redir);
 
         // BSP LAPIC ID in the high byte of the destination field.
         let bsp_lapic_id = lapic_read(LAPIC_ID) & 0xFF00_0000; // already in bits 24-31
@@ -305,6 +307,7 @@ fn ioapic_init() {
 // LAPIC timer calibration (via PIT channel 2)
 // ===========================================================================
 
+static IOAPIC_MAX_REDIR: Once<u32> = Once::new();
 static LAPIC_TICKS_PER_MS: Once<u32> = Once::new();
 
 /// Calibrate the LAPIC timer by using PIT channel 2 as a ~10 ms reference.
@@ -460,12 +463,13 @@ pub fn init() {
         // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
         unsafe {
             let gsi_base = crate::acpi::ioapic_gsi_base();
+            let max_redir = *IOAPIC_MAX_REDIR.get().unwrap();
             let gsi = if let Some(ovr) = crate::acpi::irq_override(0) {
                 ovr.global_system_interrupt
             } else {
                 gsi_base
             };
-            if let Some(pin) = gsi.checked_sub(gsi_base) {
+            if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
                 let low = redir_entry_low(32, false, false, true); // masked
                 ioapic_write_redir(pin, low, 0);
             }

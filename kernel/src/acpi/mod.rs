@@ -610,7 +610,8 @@ pub fn irq_override(irq: u8) -> Option<&'static IrqSourceOverride> {
     let info = MADT_INFO.get()?;
     for i in 0..info.irq_override_count {
         if let Some(ref ovr) = info.irq_overrides[i] {
-            if ovr.source == irq {
+            // Only match ISA bus (bus 0) overrides — callers assume ISA IRQs.
+            if ovr.bus == 0 && ovr.source == irq {
                 return Some(ovr);
             }
         }

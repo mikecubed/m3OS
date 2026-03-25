@@ -40,8 +40,9 @@ five IRQ source overrides (notably IRQ 0 → GSI 2 for the PIT timer).
 ### FADT (Fixed ACPI Description Table)
 
 The kernel reads the `IAPC_BOOT_ARCH` flags (offset 109) to detect whether
-the firmware indicates a legacy 8259 PIC.  This is informational only — the
-kernel always migrates to the APIC regardless.
+the firmware indicates a legacy 8259 PIC.  The kernel will migrate to the
+APIC when MADT/I/O APIC information is available, but falls back to the
+legacy PIC if that data is missing or incomplete.
 
 ## Local APIC
 
@@ -72,12 +73,12 @@ APICs via redirection table entries:
 | ISA IRQ | GSI | Vector | Purpose |
 |---------|-----|--------|---------|
 | 1 | 1 | 33 | PS/2 Keyboard |
-| 4 | 4 | 36 | COM1 Serial |
+| 4 | 4 | 36 | COM1 Serial (programmed but kept masked until a serial IRQ handler is installed) |
 | 0 | 2* | 32 | PIT Timer (used during calibration only, then masked) |
 
 \* IRQ 0 has a MADT source override mapping it to GSI 2 on QEMU.
 
-All other redirection entries are masked.  The MADT Interrupt Source Override
+All other redirection entries, including COM1's, are masked.  The MADT Interrupt Source Override
 entries are applied when programming each IRQ — the override's `flags` field
 determines polarity (active-high vs active-low) and trigger mode (edge vs
 level).

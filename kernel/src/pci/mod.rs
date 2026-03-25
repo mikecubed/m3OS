@@ -43,6 +43,11 @@ fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 
 /// Read a 16-bit value from PCI configuration space.
 pub fn pci_config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
+    debug_assert_eq!(
+        offset & 1,
+        0,
+        "PCI config u16 offset must be 2-byte aligned"
+    );
     let dword = pci_config_read_u32(bus, device, function, offset);
     // Bit 1 of the offset selects which 16-bit half of the 32-bit dword.
     let shift = ((offset & 2) as u32) * 8;
@@ -206,8 +211,10 @@ fn pci_scan() {
             // Probe function 0.
             let dev0 = probe_function(bus, device, 0);
             if !list.push(dev0) {
-                log::warn!("[pci] device list full, stopping scan");
-                return;
+                log::warn!(
+                    "[pci] device list full ({} devices); continuing scan but not storing",
+                    MAX_PCI_DEVICES
+                );
             }
 
             // Check multi-function bit (bit 7 of header_type at function 0).
@@ -223,10 +230,7 @@ fn pci_scan() {
                     continue;
                 }
                 let dev = probe_function(bus, device, function);
-                if !list.push(dev) {
-                    log::warn!("[pci] device list full, stopping scan");
-                    return;
-                }
+                let _ = list.push(dev);
             }
         }
     }
