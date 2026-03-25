@@ -171,6 +171,18 @@ fn redir_entry_low(vector: u8, active_low: bool, level_triggered: bool, masked: 
     low
 }
 
+/// Convert a GSI to an I/O APIC pin index and validate it fits in the
+/// redirection table. Returns `None` if the GSI is below `gsi_base` or
+/// the resulting pin exceeds `max_redir`.
+fn gsi_to_pin(gsi: u32, gsi_base: u32, max_redir: u32) -> Option<u32> {
+    let pin = gsi.checked_sub(gsi_base)?;
+    if pin <= max_redir {
+        Some(pin)
+    } else {
+        None
+    }
+}
+
 /// Program the I/O APIC redirection table.
 ///
 /// Routes keyboard (IRQ 1) to vector 33 and COM1 (IRQ 4) to vector 36 on the
@@ -190,9 +202,9 @@ fn ioapic_init() {
         let bsp_lapic_id = lapic_read(LAPIC_ID) & 0xFF00_0000; // already in bits 24-31
 
         // --- Mask all entries first ---
-        for gsi in 0..=max_redir {
+        for pin in 0..=max_redir {
             let low = redir_entry_low(0, false, false, true); // masked
-            ioapic_write_redir(gsi, low, 0);
+            ioapic_write_redir(pin, low, 0);
         }
 
         let gsi_base = crate::acpi::ioapic_gsi_base();
@@ -206,19 +218,21 @@ fn ioapic_init() {
             } else {
                 (gsi_base + 1, false, false) // ISA default: active-high, edge
             };
-            if gsi <= max_redir {
+            if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
                 let low = redir_entry_low(33, active_low, level_triggered, false);
-                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                ioapic_write_redir(pin, low, bsp_lapic_id);
                 log::info!(
-                    "[apic] I/O APIC: IRQ 1 → GSI {} → vector 33 (active_low={}, level={})",
+                    "[apic] I/O APIC: IRQ 1 → GSI {} (pin {}) → vector 33 (active_low={}, level={})",
                     gsi,
+                    pin,
                     active_low,
                     level_triggered
                 );
             } else {
                 log::warn!(
-                    "[apic] I/O APIC: IRQ 1 GSI {} exceeds max redir {}; skipped",
+                    "[apic] I/O APIC: IRQ 1 GSI {} not routable (base={}, max_pin={}); skipped",
                     gsi,
+                    gsi_base,
                     max_redir
                 );
             }
@@ -236,17 +250,19 @@ fn ioapic_init() {
             } else {
                 (gsi_base + 4, false, false)
             };
-            if gsi <= max_redir {
+            if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
                 let low = redir_entry_low(36, active_low, level_triggered, true); // masked
-                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                ioapic_write_redir(pin, low, bsp_lapic_id);
                 log::info!(
-                    "[apic] I/O APIC: IRQ 4 → GSI {} → vector 36 (masked, no handler yet)",
+                    "[apic] I/O APIC: IRQ 4 → GSI {} (pin {}) → vector 36 (masked, no handler yet)",
                     gsi,
+                    pin,
                 );
             } else {
                 log::warn!(
-                    "[apic] I/O APIC: IRQ 4 GSI {} exceeds max redir {}; skipped",
+                    "[apic] I/O APIC: IRQ 4 GSI {} not routable (base={}, max_pin={}); skipped",
                     gsi,
+                    gsi_base,
                     max_redir
                 );
             }
@@ -265,17 +281,19 @@ fn ioapic_init() {
             } else {
                 (gsi_base, false, false)
             };
-            if gsi <= max_redir {
+            if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
                 let low = redir_entry_low(32, active_low, level_triggered, false);
-                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                ioapic_write_redir(pin, low, bsp_lapic_id);
                 log::info!(
-                    "[apic] I/O APIC: IRQ 0 → GSI {} → vector 32 (for PIT calibration)",
+                    "[apic] I/O APIC: IRQ 0 → GSI {} (pin {}) → vector 32 (for PIT calibration)",
                     gsi,
+                    pin,
                 );
             } else {
                 log::warn!(
-                    "[apic] I/O APIC: IRQ 0 GSI {} exceeds max redir {}; skipped",
+                    "[apic] I/O APIC: IRQ 0 GSI {} not routable (base={}, max_pin={}); skipped",
                     gsi,
+                    gsi_base,
                     max_redir
                 );
             }
@@ -441,13 +459,16 @@ pub fn init() {
 
         // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
         unsafe {
+            let gsi_base = crate::acpi::ioapic_gsi_base();
             let gsi = if let Some(ovr) = crate::acpi::irq_override(0) {
                 ovr.global_system_interrupt
             } else {
-                crate::acpi::ioapic_gsi_base()
+                gsi_base
             };
-            let low = redir_entry_low(32, false, false, true); // masked
-            ioapic_write_redir(gsi, low, 0);
+            if let Some(pin) = gsi.checked_sub(gsi_base) {
+                let low = redir_entry_low(32, false, false, true); // masked
+                ioapic_write_redir(pin, low, 0);
+            }
         }
 
         // 6. Disable legacy PIC entirely before switching handlers to APIC EOIs.
