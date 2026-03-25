@@ -1,4 +1,4 @@
-//! Userspace process management — Phase 11.
+//! Userspace process management — Phase 11 / Phase 14.
 //!
 //! This module owns the global process table and the types that describe
 //! a userspace process's lifecycle.  Kernel threads live in
@@ -11,14 +11,15 @@
 //! [`PROCESS_TABLE`] spinlock-protected global table is the single source
 //! of truth for all live processes.
 //!
-//! Process cleanup (freeing kernel stacks, reaping page tables) is
-//! deferred to a later phase.
+//! Phase 14: each process has its own file descriptor table (`fd_table`).
+//! FDs 0/1/2 are initialized as stdin/stdout/stderr on process creation.
+//! `fork()` deep-clones the parent's FD table into the child.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -62,6 +63,170 @@ fn alloc_pid() -> Pid {
 }
 
 // ---------------------------------------------------------------------------
+// File descriptor table (Phase 14 — per-process)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of open file descriptors per process.
+pub const MAX_FDS: usize = 32;
+
+/// Backing store for an open file descriptor.
+#[derive(Clone)]
+pub enum FdBackend {
+    /// FD 1/2 stdout/stderr — writes go to serial output.
+    Stdout,
+    /// FD 0 stdin — reads block until data is available from the kernel stdin buffer.
+    Stdin,
+    /// Read-only static ramdisk file (pointer + length into kernel .rodata).
+    Ramdisk {
+        content_addr: usize,
+        content_len: usize,
+    },
+    /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
+    /// relative to tmpfs root — no leading `/tmp/`).
+    Tmpfs { path: String },
+    /// Read end of a kernel pipe (Phase 14).
+    PipeRead { pipe_id: usize },
+    /// Write end of a kernel pipe (Phase 14).
+    PipeWrite { pipe_id: usize },
+}
+
+/// A single open-file entry in the per-process FD table.
+#[derive(Clone)]
+pub struct FdEntry {
+    pub backend: FdBackend,
+    pub offset: usize,
+    /// True if the file was opened for reading.
+    pub readable: bool,
+    /// True if the file was opened for writing.
+    pub writable: bool,
+}
+
+/// Const sentinel for empty FD slots (used in array init).
+const NONE_FD: Option<FdEntry> = None;
+
+/// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
+/// Public accessor for use by the shell task when spawning processes.
+pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
+    new_fd_table()
+}
+
+/// Increment pipe ref-counts for all pipe FDs in a cloned FD table.
+///
+/// Must be called after cloning a process's FD table (fork/dup2) so that
+/// pipe reader/writer counts stay consistent with the number of open FDs.
+pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
+    for entry in fd_table.iter().flatten() {
+        match &entry.backend {
+            FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+            FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+            _ => {}
+        }
+    }
+}
+
+/// Close all open file descriptors for a process.
+///
+/// Decrements pipe ref-counts for any open pipe FDs so that EOF/EPIPE
+/// propagates correctly. Called by `sys_exit` before marking the process
+/// as a zombie.
+pub fn close_all_fds_for(pid: Pid) {
+    // Collect pipe IDs under the process table lock, then close them
+    // after releasing the lock to avoid holding PROCESS_TABLE while
+    // locking PIPE_TABLE.
+    let mut readers = alloc::vec::Vec::new();
+    let mut writers = alloc::vec::Vec::new();
+    {
+        let mut table = PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return,
+        };
+        for slot in proc.fd_table.iter_mut() {
+            if let Some(entry) = slot.take() {
+                match &entry.backend {
+                    FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
+                    FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                    _ => {}
+                }
+            }
+        }
+    }
+    for id in readers {
+        crate::pipe::pipe_close_reader(id);
+    }
+    for id in writers {
+        crate::pipe::pipe_close_writer(id);
+    }
+}
+
+/// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
+fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
+    let mut table = [NONE_FD; MAX_FDS];
+    table[0] = Some(FdEntry {
+        backend: FdBackend::Stdin,
+        offset: 0,
+        readable: true,
+        writable: false,
+    });
+    table[1] = Some(FdEntry {
+        backend: FdBackend::Stdout,
+        offset: 0,
+        readable: false,
+        writable: true,
+    });
+    table[2] = Some(FdEntry {
+        backend: FdBackend::Stdout,
+        offset: 0,
+        readable: false,
+        writable: true,
+    });
+    table
+}
+
+// ---------------------------------------------------------------------------
+// Signal constants (Phase 14)
+// ---------------------------------------------------------------------------
+
+/// Signal numbers (Linux x86_64).
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGKILL: u32 = 9;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+
+/// What to do when a signal is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalAction {
+    /// Perform the default action for this signal.
+    Default,
+    /// Ignore the signal.
+    Ignore,
+}
+
+/// Default action table: terminate or ignore.
+pub fn default_signal_action(sig: u32) -> SignalDisposition {
+    match sig {
+        SIGCHLD => SignalDisposition::Ignore,
+        SIGCONT => SignalDisposition::Continue,
+        SIGSTOP | SIGTSTP => SignalDisposition::Stop,
+        SIGKILL | SIGINT | SIGTERM | SIGHUP => SignalDisposition::Terminate,
+        _ => SignalDisposition::Terminate,
+    }
+}
+
+/// The kernel's resolved action when delivering a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalDisposition {
+    Terminate,
+    Stop,
+    Continue,
+    Ignore,
+}
+
+// ---------------------------------------------------------------------------
 // Process state
 // ---------------------------------------------------------------------------
 
@@ -74,6 +239,8 @@ pub enum ProcessState {
     Running,
     /// Blocked waiting for a resource (I/O, IPC, …).
     Blocked,
+    /// Stopped by a signal (SIGSTOP/SIGTSTP).
+    Stopped,
     /// Exited but not yet reaped by its parent.
     Zombie,
 }
@@ -105,6 +272,10 @@ pub struct Process {
     pub user_stack_top: u64,
     /// Exit code written when the process transitions to [`ProcessState::Zombie`].
     pub exit_code: Option<i32>,
+    /// Signal that caused the process to stop (set when transitioning to Stopped).
+    pub stop_signal: u32,
+    /// True after waitpid has reported this stop; prevents re-reporting.
+    pub stop_reported: bool,
     /// Current program break (heap top). 0 = not yet initialized.
     ///
     /// Set to BRK_BASE on first `sys_brk(0)` call; grows upward as
@@ -115,6 +286,16 @@ pub struct Process {
     /// Initialized to ANON_MMAP_BASE on first use; grows upward with
     /// each allocation. Kept per-process so fork children start fresh.
     pub mmap_next: u64,
+    /// Process group ID (Phase 14). Defaults to own PID.
+    pub pgid: Pid,
+    /// Per-process file descriptor table (Phase 14).
+    ///
+    /// FDs 0/1/2 are stdin/stdout/stderr.  `fork()` deep-clones this table.
+    pub fd_table: [Option<FdEntry>; MAX_FDS],
+    /// Bitfield of pending signals (bit N = signal N is pending).
+    pub pending_signals: u64,
+    /// Per-signal action table (Default or Ignore).
+    pub signal_actions: [SignalAction; 32],
 }
 
 impl Process {
@@ -134,8 +315,14 @@ impl Process {
             entry_point: entry,
             user_stack_top: stack_top,
             exit_code: None,
+            stop_signal: 0,
+            stop_reported: false,
             brk_current: 0,
             mmap_next: 0,
+            pgid: pid,
+            fd_table: new_fd_table(),
+            pending_signals: 0,
+            signal_actions: [SignalAction::Default; 32],
         }
     }
 }
@@ -240,8 +427,14 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         entry_point,
         user_stack_top,
         exit_code: None,
+        stop_signal: 0,
+        stop_reported: false,
         brk_current: 0,
         mmap_next: 0,
+        pgid: pid,
+        fd_table: new_fd_table(),
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -272,11 +465,167 @@ pub fn spawn_process_with_cr3(
         entry_point,
         user_stack_top,
         exit_code: None,
+        stop_signal: 0,
+        stop_reported: false,
         brk_current,
         mmap_next,
+        pgid: pid,
+        fd_table: new_fd_table(),
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
+}
+
+/// Create a new process entry inheriting the parent's FD table.
+///
+/// Used by `sys_fork` to deep-clone the parent's file descriptors into
+/// the child process (Phase 14, P14-T003).
+/// `inherit_pgid`: if non-zero, use this as the child's pgid (for fork);
+/// if zero, default to the child's own pid (for exec/spawn).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_with_cr3_and_fds(
+    ppid: Pid,
+    entry_point: u64,
+    user_stack_top: u64,
+    cr3: x86_64::PhysAddr,
+    brk_current: u64,
+    mmap_next: u64,
+    fd_table: [Option<FdEntry>; MAX_FDS],
+    inherit_pgid: Pid,
+) -> Pid {
+    let kstack_top = alloc_kernel_stack();
+    let pid = alloc_pid();
+    let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
+    let proc = Process {
+        pid,
+        ppid,
+        state: ProcessState::Ready,
+        page_table_root: Some(cr3),
+        kernel_stack_top: kstack_top,
+        entry_point,
+        user_stack_top,
+        exit_code: None,
+        stop_signal: 0,
+        stop_reported: false,
+        brk_current,
+        mmap_next,
+        pgid,
+        fd_table,
+        pending_signals: 0,
+        signal_actions: [SignalAction::Default; 32],
+    };
+    PROCESS_TABLE.lock().insert(proc);
+    pid
+}
+
+// ---------------------------------------------------------------------------
+// Foreground process group (Phase 14, Track G)
+// ---------------------------------------------------------------------------
+
+/// The PID of the foreground process group. Ctrl-C/Ctrl-Z signals
+/// are delivered to all processes in this group.
+pub static FG_PGID: AtomicU32 = AtomicU32::new(0);
+
+/// Send a signal to all processes in a process group.
+pub fn send_signal_to_group(pgid: Pid, sig: u32) {
+    let pids: alloc::vec::Vec<Pid> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|p| p.pgid == pgid)
+            .map(|p| p.pid)
+            .collect()
+    };
+    for pid in pids {
+        send_signal(pid, sig);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal helpers (Phase 14)
+// ---------------------------------------------------------------------------
+
+/// Send a signal to a process by PID. Sets the pending bit.
+///
+/// SIGCONT is special: it also resumes a stopped process.
+/// SIGKILL and SIGSTOP cannot be caught or ignored.
+pub fn send_signal(pid: Pid, sig: u32) -> bool {
+    if sig == 0 || sig > 63 {
+        return false;
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if sig == SIGCONT {
+        // SIGCONT resumes a stopped process.
+        if proc.state == ProcessState::Stopped {
+            proc.state = ProcessState::Ready;
+            log::info!("[signal] SIGCONT → pid {} (resumed)", pid);
+        }
+        // Clear any pending SIGSTOP/SIGTSTP.
+        proc.pending_signals &= !(1u64 << SIGSTOP) & !(1u64 << SIGTSTP);
+        return true;
+    }
+
+    proc.pending_signals |= 1u64 << sig;
+    true
+}
+
+/// Check and deliver pending signals for a process.
+///
+/// Called on the return-to-userspace path. Returns the action to take.
+/// Clears the delivered signal's pending bit.
+pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.find_mut(pid)?;
+
+    if proc.pending_signals == 0 {
+        return None;
+    }
+
+    // Find the lowest-numbered pending signal.
+    let sig = proc.pending_signals.trailing_zeros();
+    if sig >= 64 {
+        return None;
+    }
+    proc.pending_signals &= !(1u64 << sig);
+
+    // Determine disposition.
+    let action = if sig < 32 {
+        proc.signal_actions[sig as usize]
+    } else {
+        SignalAction::Default
+    };
+
+    let disposition = match action {
+        SignalAction::Ignore => {
+            // SIGKILL and SIGSTOP cannot be ignored.
+            if sig == SIGKILL || sig == SIGSTOP {
+                default_signal_action(sig)
+            } else {
+                SignalDisposition::Ignore
+            }
+        }
+        SignalAction::Default => default_signal_action(sig),
+    };
+
+    Some((sig, disposition))
+}
+
+/// Deliver SIGCHLD to the parent of the given child PID.
+pub fn send_sigchld_to_parent(child_pid: Pid) {
+    let ppid = {
+        let table = PROCESS_TABLE.lock();
+        table.find(child_pid).map(|p| p.ppid).unwrap_or(0)
+    };
+    if ppid != 0 {
+        send_signal(ppid, SIGCHLD);
+    }
 }
 
 // ---------------------------------------------------------------------------

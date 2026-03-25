@@ -31,6 +31,7 @@ extern crate alloc;
 const NEG_EPERM: u64 = (-1_i64) as u64;
 const NEG_ENOENT: u64 = (-2_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
+#[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EFAULT: u64 = (-14_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
@@ -206,7 +207,14 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
+    // Divergent syscalls (exit) never return — handle them first.
     match number {
+        6 => sys_exit_legacy(arg0),
+        60 | 231 => sys_exit(arg0 as i32),
+        _ => {}
+    }
+
+    let result = match number {
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
         1 => sys_linux_write(arg0, arg1, arg2),
@@ -218,21 +226,27 @@ pub extern "C" fn syscall_handler(
         9 => sys_linux_mmap(arg0, arg1),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
+        // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
+        13 => sys_rt_sigaction(arg0, arg1, arg2),
+        14 => sys_rt_sigprocmask(),
         // Linux misc (Phase 12, T023–T026)
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
         20 => sys_linux_writev(arg0, arg1, arg2),
+        // Phase 14: pipe and dup2
+        22 => sys_pipe(arg0),
+        33 => sys_dup2(arg0, arg1),
+        // Phase 14: nanosleep
+        35 => sys_nanosleep(arg0),
         // IPC syscalls (Phase 6) — kernel-task only.
-        // Numbers 5,8,9 are now Linux fstat/lseek/mmap; only 4,7,10 remain.
         4 | 7 | 10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
-        // Legacy exit (HELLO_BIN compat)
-        6 => sys_exit_legacy(arg0),
-        // Phase 11 + Linux-compatible process syscalls (T021–T022)
+        // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
-        60 | 231 => sys_exit(arg0 as i32),
-        61 => sys_waitpid(arg0, arg1),
+        61 => sys_waitpid(arg0, arg1, arg2),
+        // Phase 14: signal syscalls
+        62 => sys_kill(arg0, arg1),
         63 => sys_linux_uname(arg0),
         // Phase 13: filesystem mutation syscalls
         74 => sys_linux_fsync(arg0),
@@ -244,7 +258,10 @@ pub extern "C" fn syscall_handler(
         83 => sys_linux_mkdir(arg0, arg1),
         84 => sys_linux_rmdir(arg0),
         87 => sys_linux_unlink(arg0),
+        // Phase 14: process group syscalls
+        109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
+        121 => sys_getpgid(arg0),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
@@ -256,6 +273,70 @@ pub extern "C" fn syscall_handler(
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
         _ => NEG_ENOSYS,
+    };
+
+    // Phase 14 (P14-T031): check pending signals before returning to userspace.
+    check_pending_signals();
+
+    result
+}
+
+/// Check and deliver pending signals for the current process.
+///
+/// Called after every syscall (except exit/execve which diverge).
+/// For now, only default actions are supported:
+///   - Terminate: kill the process
+///   - Stop: mark as Stopped and yield
+///   - Continue: already handled in send_signal
+///   - Ignore: do nothing
+fn check_pending_signals() {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid == 0 {
+        return; // kernel task, no signals
+    }
+
+    loop {
+        let sig = crate::process::dequeue_signal(pid);
+        match sig {
+            None => break,
+            Some((signum, disposition)) => {
+                use crate::process::SignalDisposition;
+                match disposition {
+                    SignalDisposition::Terminate => {
+                        log::info!("[p{}] killed by signal {}", pid, signum);
+                        // Use negative exit code to indicate signal death.
+                        sys_exit(-(signum as i32));
+                    }
+                    SignalDisposition::Stop => {
+                        log::info!("[p{}] stopped by signal {}", pid, signum);
+                        {
+                            let mut table = crate::process::PROCESS_TABLE.lock();
+                            if let Some(proc) = table.find_mut(pid) {
+                                proc.state = crate::process::ProcessState::Stopped;
+                                proc.stop_signal = signum;
+                                proc.stop_reported = false;
+                            }
+                        }
+                        crate::process::send_sigchld_to_parent(pid);
+                        // Yield until SIGCONT resumes us.
+                        while {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            table
+                                .find(pid)
+                                .map(|p| p.state == crate::process::ProcessState::Stopped)
+                                .unwrap_or(false)
+                        } {
+                            crate::task::yield_now();
+                            crate::process::CURRENT_PID
+                                .store(pid, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    SignalDisposition::Continue | SignalDisposition::Ignore => {
+                        // Nothing to do.
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -319,17 +400,316 @@ fn sys_exit(code: i32) -> ! {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] exit({})", pid, code);
     if pid != 0 {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.state = crate::process::ProcessState::Zombie;
-            proc.exit_code = Some(code);
+        // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+        crate::process::close_all_fds_for(pid);
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.state = crate::process::ProcessState::Zombie;
+                proc.exit_code = Some(code);
+            }
         }
+        // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
+        crate::process::send_sigchld_to_parent(pid);
     }
     // Restore kernel page table before yielding so the next scheduled task
     // does not inherit this process's CR3.
     crate::mm::restore_kernel_cr3();
     // Mark the kernel task as dead so the scheduler reclaims it.
     crate::task::mark_current_dead();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: Signal syscalls (P14-T029, T030, T033)
+// ---------------------------------------------------------------------------
+
+/// `kill(pid, sig)` — send a signal to a process (syscall 62).
+fn sys_kill(pid: u64, sig: u64) -> u64 {
+    let sig = sig as u32;
+    let target_pid = pid as i64;
+
+    if sig > 63 {
+        return NEG_EINVAL;
+    }
+
+    // sig=0: permission check only, no signal sent.
+    if sig == 0 {
+        const NEG_ESRCH: u64 = (-3_i64) as u64;
+        let table = crate::process::PROCESS_TABLE.lock();
+        return if table.find(pid as crate::process::Pid).is_some() {
+            0
+        } else {
+            NEG_ESRCH
+        };
+    }
+
+    const NEG_ESRCH_KILL: u64 = (-3_i64) as u64;
+    if target_pid > 0 {
+        // Send to a specific process.
+        if crate::process::send_signal(target_pid as crate::process::Pid, sig) {
+            0
+        } else {
+            NEG_ESRCH_KILL
+        }
+    } else if target_pid < -1 {
+        // Send to process group |pid|.
+        let pgid = (-target_pid) as crate::process::Pid;
+        crate::process::send_signal_to_group(pgid, sig);
+        0
+    } else if target_pid == 0 {
+        // Send to caller's process group.
+        let caller_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let pgid = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(caller_pid).map(|p| p.pgid).unwrap_or(0)
+        };
+        if pgid != 0 {
+            crate::process::send_signal_to_group(pgid, sig);
+        }
+        0
+    } else {
+        // pid=0 or pid=-1: not fully implemented yet.
+        NEG_EINVAL
+    }
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
+///
+/// We only support Default and Ignore (no user signal handlers yet).
+fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
+    let sig = sig as u32;
+    if sig == 0 || sig >= 32 {
+        return NEG_EINVAL;
+    }
+    // SIGKILL and SIGSTOP cannot be caught or ignored.
+    if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
+        return NEG_EINVAL;
+    }
+
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write old action if requested.
+    // struct sigaction: sa_handler (8 bytes) + sa_flags (8 bytes) + sa_restorer (8 bytes) + sa_mask (8 bytes) = 32 bytes min
+    if oldact_ptr != 0 {
+        let mut old_sa = [0u8; 32];
+        let handler: u64 = match proc.signal_actions[sig as usize] {
+            crate::process::SignalAction::Default => 0, // SIG_DFL
+            crate::process::SignalAction::Ignore => 1,  // SIG_IGN
+        };
+        old_sa[0..8].copy_from_slice(&handler.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Read new action if provided.
+    if act_ptr != 0 {
+        let mut sa = [0u8; 32];
+        if crate::mm::user_mem::copy_from_user(&mut sa, act_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let handler = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
+        proc.signal_actions[sig as usize] = match handler {
+            0 => crate::process::SignalAction::Default, // SIG_DFL
+            1 => crate::process::SignalAction::Ignore,  // SIG_IGN
+            _ => crate::process::SignalAction::Default, // user handlers → treat as default for now
+        };
+    }
+
+    0
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — stub (syscall 14).
+///
+/// Signal masking is not implemented; always returns success.
+fn sys_rt_sigprocmask() -> u64 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: pipe (P14-T009) and dup2 (P14-T014)
+// ---------------------------------------------------------------------------
+
+/// `pipe(pipefd_ptr)` — create a pipe (syscall 22).
+///
+/// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
+fn sys_pipe(pipefd_ptr: u64) -> u64 {
+    let pipe_id = crate::pipe::create_pipe();
+
+    let read_entry = FdEntry {
+        backend: FdBackend::PipeRead { pipe_id },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    let write_entry = FdEntry {
+        backend: FdBackend::PipeWrite { pipe_id },
+        offset: 0,
+        readable: false,
+        writable: true,
+    };
+
+    let read_fd = match alloc_fd(3, read_entry) {
+        Some(fd) => fd,
+        None => {
+            crate::pipe::pipe_close_reader(pipe_id);
+            crate::pipe::pipe_close_writer(pipe_id);
+            return NEG_EMFILE;
+        }
+    };
+    let write_fd = match alloc_fd(3, write_entry) {
+        Some(fd) => fd,
+        None => {
+            // Clean up the read fd we just allocated.
+            with_current_fd_mut(read_fd, |slot| *slot = None);
+            crate::pipe::pipe_close_reader(pipe_id);
+            crate::pipe::pipe_close_writer(pipe_id);
+            return NEG_EMFILE;
+        }
+    };
+
+    // Write [read_fd, write_fd] as two i32s to user memory.
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
+    bytes[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
+    if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
+        // Clean up on failure.
+        with_current_fd_mut(read_fd, |slot| *slot = None);
+        with_current_fd_mut(write_fd, |slot| *slot = None);
+        crate::pipe::pipe_close_reader(pipe_id);
+        crate::pipe::pipe_close_writer(pipe_id);
+        return NEG_EFAULT;
+    }
+
+    log::info!(
+        "[pipe] created pipe_id={} → fd[{}(r), {}(w)]",
+        pipe_id,
+        read_fd,
+        write_fd
+    );
+    0
+}
+
+/// `dup2(oldfd, newfd)` — duplicate a file descriptor (syscall 33).
+fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+    let oldfd = oldfd as usize;
+    let newfd = newfd as usize;
+
+    if oldfd >= MAX_FDS || newfd >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    // dup2(fd, fd) returns fd without closing.
+    if oldfd == newfd {
+        return if current_fd_entry(oldfd).is_some() {
+            newfd as u64
+        } else {
+            NEG_EBADF
+        };
+    }
+
+    let entry = match current_fd_entry(oldfd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    // Close newfd if it's open (including pipe cleanup).
+    if current_fd_entry(newfd).is_some() {
+        sys_linux_close(newfd as u64);
+    }
+
+    // Increment pipe ref-count for the duplicated FD.
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        _ => {}
+    }
+
+    // Copy the FD entry to the new slot.
+    with_current_fd_mut(newfd, |slot| {
+        *slot = Some(entry);
+    });
+
+    newfd as u64
+}
+
+// ---------------------------------------------------------------------------
+// Phase 14: process group syscalls (P14-T035)
+// ---------------------------------------------------------------------------
+
+/// `setpgid(pid, pgid)` — set process group ID (syscall 109).
+fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
+    let caller = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let target = if pid == 0 {
+        caller
+    } else {
+        pid as crate::process::Pid
+    };
+    let new_pgid = if pgid == 0 {
+        target
+    } else {
+        pgid as crate::process::Pid
+    };
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    match table.find_mut(target) {
+        Some(p) => {
+            p.pgid = new_pgid;
+            0
+        }
+        None => NEG_EINVAL,
+    }
+}
+
+/// `getpgid(pid)` — get process group ID (syscall 121).
+fn sys_getpgid(pid: u64) -> u64 {
+    let target = if pid == 0 {
+        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed)
+    } else {
+        pid as crate::process::Pid
+    };
+
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(target) {
+        Some(p) => p.pgid as u64,
+        None => NEG_EINVAL,
+    }
+}
+
+/// `nanosleep(req, rem)` — sleep for the specified time (syscall 35).
+///
+/// Reads a `timespec` struct from user memory and yield-loops for the
+/// requested number of timer ticks.
+fn sys_nanosleep(req_ptr: u64) -> u64 {
+    if req_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    let mut ts = [0u8; 16]; // struct timespec { tv_sec: i64, tv_nsec: i64 }
+    if crate::mm::user_mem::copy_from_user(&mut ts, req_ptr).is_err() {
+        return NEG_EFAULT;
+    }
+    let secs = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+    let nsecs = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+    if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
+        return NEG_EINVAL;
+    }
+    // Each PIT tick is ~10ms (100 Hz). Convert seconds+nsec to ticks.
+    let ticks = (secs as u64).saturating_mul(100) + (nsecs as u64) / 10_000_000;
+    let start = crate::arch::x86_64::interrupts::tick_count();
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
+        crate::task::yield_now();
+        crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+    }
+    0
 }
 
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
@@ -364,24 +744,38 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
-    // Inherit parent's brk/mmap state so the child's heap is consistent
-    // with the copied address space.
-    let (parent_brk, parent_mmap) = {
+    // Inherit parent's brk/mmap state and FD table so the child's heap
+    // and file descriptors are consistent with the copied address space.
+    let (parent_brk, parent_mmap, parent_fds, parent_pgid) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
-            Some(p) => (p.brk_current, p.mmap_next),
-            None => (0, 0),
+            Some(p) => (p.brk_current, p.mmap_next, p.fd_table.clone(), p.pgid),
+            None => (
+                0,
+                0,
+                {
+                    const NONE: Option<crate::process::FdEntry> = None;
+                    [NONE; crate::process::MAX_FDS]
+                },
+                0,
+            ),
         }
     };
 
-    // Create child process entry.
-    let child_pid = crate::process::spawn_process_with_cr3(
+    // Increment pipe ref-counts for cloned FDs before creating the child.
+    crate::process::add_pipe_refs(&parent_fds);
+
+    // Create child process entry with cloned FD table (Phase 14, P14-T003).
+    // Inherit parent's pgid so fork children are in the same process group.
+    let child_pid = crate::process::spawn_process_with_cr3_and_fds(
         parent_pid,
         user_rip,
         user_rsp,
         x86_64::PhysAddr::new(child_cr3.start_address().as_u64()),
         parent_brk,
         parent_mmap,
+        parent_fds,
+        parent_pgid,
     );
 
     // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
@@ -394,16 +788,72 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     child_pid as u64
 }
 
-/// `execve(path_ptr, path_len, _envp)` — replace the calling process's image
-/// with a new ELF binary read from the ramdisk.
-fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
-    if path_len > 255 {
-        return u64::MAX;
+/// Read a null-terminated array of char* pointers from user memory, copying
+/// each pointed-to C string into a kernel `Vec<Vec<u8>>`.
+///
+/// Returns an empty vec if `array_ptr` is 0 (NULL).
+/// Returns at most `max_entries` strings; each string is capped at 4096 bytes.
+/// Read a null-terminated array of `char*` pointers from user memory.
+///
+/// Returns `Ok(vec)` on success, `Err(())` if a user pointer is invalid
+/// (caller should return EFAULT).
+fn read_user_string_array(
+    array_ptr: u64,
+    max_entries: usize,
+) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, ()> {
+    let mut result = alloc::vec::Vec::new();
+    if array_ptr == 0 {
+        return Ok(result);
     }
-    let mut name_buf = [0u8; 255];
-    let name = match path_name_buf(path_ptr, path_len, &mut name_buf) {
+    for i in 0..max_entries {
+        let ptr_addr = match array_ptr.checked_add((i * 8) as u64) {
+            Some(a) => a,
+            None => return Err(()),
+        };
+        let mut ptr_bytes = [0u8; 8];
+        if crate::mm::user_mem::copy_from_user(&mut ptr_bytes, ptr_addr).is_err() {
+            return Err(());
+        }
+        let str_ptr = u64::from_ne_bytes(ptr_bytes);
+        if str_ptr == 0 {
+            break; // NULL terminator
+        }
+        // Read the C string byte by byte.
+        let mut s = alloc::vec::Vec::new();
+        let mut found_nul = false;
+        for j in 0..4096u64 {
+            let addr = match str_ptr.checked_add(j) {
+                Some(a) => a,
+                None => return Err(()),
+            };
+            let mut b = [0u8; 1];
+            if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
+                return Err(());
+            }
+            if b[0] == 0 {
+                found_nul = true;
+                break;
+            }
+            s.push(b[0]);
+        }
+        if !found_nul {
+            return Err(());
+        }
+        result.push(s);
+    }
+    Ok(result)
+}
+
+/// `execve(filename, argv, envp)` — replace the calling process's image
+/// with a new ELF binary read from the ramdisk.
+///
+/// Phase 14: now parses argv and envp from user memory (Linux ABI).
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    // Read the filename as a null-terminated C string.
+    let mut name_cstr = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
-        None => return u64::MAX,
+        None => return NEG_EFAULT,
     };
 
     log::info!(
@@ -412,22 +862,44 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
         name
     );
 
+    // Parse argv and envp from user memory.
+    let user_argv = match read_user_string_array(argv_ptr, 256) {
+        Ok(v) => v,
+        Err(()) => return NEG_EFAULT,
+    };
+    let user_envp = match read_user_string_array(envp_ptr, 256) {
+        Ok(v) => v,
+        Err(()) => return NEG_EFAULT,
+    };
+
+    // Strip leading "/" or path prefix to get the ramdisk filename.
+    let file_name = name.trim_start_matches('/');
+
     // Read the binary from the ramdisk.
-    let data = match crate::fs::ramdisk::get_file(name) {
+    let data = match crate::fs::ramdisk::get_file(file_name) {
         Some(d) => d,
         None => {
-            log::warn!("[execve] file not found: {}", name);
-            return u64::MAX;
+            log::warn!("[execve] file not found: {}", file_name);
+            return NEG_ENOENT;
         }
     };
 
     // Allocate a fresh page table for the new image.
+    const NEG_ENOMEM: u64 = (-12_i64) as u64;
     let new_cr3 = match crate::mm::new_process_page_table() {
         Some(f) => f,
-        None => return u64::MAX,
+        None => return NEG_ENOMEM,
     };
 
     let phys_off = crate::mm::phys_offset();
+
+    // Build argv slices: use user-provided argv if non-empty, else [filename].
+    let argv_refs: alloc::vec::Vec<&[u8]> = if user_argv.is_empty() {
+        alloc::vec![name.as_bytes()]
+    } else {
+        user_argv.iter().map(|v| v.as_slice()).collect()
+    };
+    let envp_refs: alloc::vec::Vec<&[u8]> = user_envp.iter().map(|v| v.as_slice()).collect();
 
     let (loaded, user_rsp) = {
         // SAFETY: new_cr3 is freshly allocated; no other mapper exists.
@@ -436,18 +908,17 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("[execve] ELF load failed: {:?}", e);
-                return u64::MAX;
+                return NEG_ENOENT; // treat invalid ELF as "not found"
             }
         };
-        // Build the SysV AMD64 ABI initial stack with argv[0] = binary name.
-        let argv: &[&[u8]] = &[name.as_bytes()];
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
         let user_rsp = match unsafe {
-            crate::mm::elf::setup_abi_stack(
+            crate::mm::elf::setup_abi_stack_with_envp(
                 loaded.stack_top,
                 &mapper,
                 phys_off,
-                argv,
+                &argv_refs,
+                &envp_refs,
                 loaded.phdr_vaddr,
                 loaded.phnum,
             )
@@ -455,7 +926,7 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
             Ok(rsp) => rsp,
             Err(e) => {
                 log::warn!("[execve] ABI stack setup failed: {:?}", e);
-                return u64::MAX;
+                return NEG_ENOMEM;
             }
         };
         (loaded, user_rsp)
@@ -505,100 +976,161 @@ fn sys_execve(path_ptr: u64, path_len: u64, _arg2: u64) -> u64 {
 ///
 /// Spins with `yield_now()` until the target child is a zombie, then
 /// collects its exit code and reaps it.
-fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
-    let target_pid = pid as crate::process::Pid;
+/// `waitpid(pid, status_ptr, options)` — wait for a child to exit or stop.
+///
+/// Supports pid > 0 (specific child), pid == -1 (any child), pid == 0
+/// (any child in caller's process group).
+/// WUNTRACED (0x2): also report stopped children.
+fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
+    let target_pid = pid as i64;
     let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    const WUNTRACED: u64 = 0x2;
+    let report_stopped = options & WUNTRACED != 0;
 
-    // Verify that target_pid is a child of the calling process before blocking.
-    // This prevents one process from reaping another process's children.
-    {
+    // For specific PID: verify it's a child.
+    if target_pid > 0 {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(target_pid) {
-            None => return u64::MAX,
-            Some(p) if p.ppid != calling_pid => {
-                log::warn!(
-                    "[waitpid] pid {} is not a child of calling pid {}",
-                    target_pid,
-                    calling_pid
-                );
-                return u64::MAX;
-            }
+        const NEG_ECHILD_PRE: u64 = (-10_i64) as u64;
+        match table.find(target_pid as crate::process::Pid) {
+            None => return NEG_ECHILD_PRE,
+            Some(p) if p.ppid != calling_pid => return NEG_ECHILD_PRE,
             Some(_) => {}
         }
     }
 
+    const NEG_ECHILD: u64 = (-10_i64) as u64;
+
     loop {
+        // Scan for a matching child that is zombie (or stopped if WUNTRACED).
         let result = {
             let mut table = crate::process::PROCESS_TABLE.lock();
-            match table.find(target_pid) {
-                None => return u64::MAX, // no such child (reaped between check and loop)
-                Some(p) if p.state == crate::process::ProcessState::Zombie => {
-                    let code = p.exit_code.unwrap_or(0);
-                    table.reap(target_pid);
-                    Some(code)
+            let mut found_pid = None;
+            let mut found_code = None;
+            let mut found_stopped = false;
+            let mut has_eligible_child = false;
+
+            for proc in table.iter() {
+                if proc.ppid != calling_pid {
+                    continue;
                 }
-                Some(_) => None, // not yet done
+                let matches = match target_pid {
+                    p if p > 0 => proc.pid == p as crate::process::Pid,
+                    -1 => true, // any child
+                    0 => {
+                        // Same process group as caller.
+                        let caller_pgid = table
+                            .find(calling_pid)
+                            .map(|p| p.pgid)
+                            .unwrap_or(calling_pid);
+                        proc.pgid == caller_pgid
+                    }
+                    neg => proc.pgid == (-neg) as crate::process::Pid,
+                };
+                if !matches {
+                    continue;
+                }
+                has_eligible_child = true;
+
+                if proc.state == crate::process::ProcessState::Zombie {
+                    found_pid = Some(proc.pid);
+                    found_code = proc.exit_code;
+                    break;
+                }
+                if report_stopped
+                    && proc.state == crate::process::ProcessState::Stopped
+                    && !proc.stop_reported
+                {
+                    found_pid = Some(proc.pid);
+                    found_stopped = true;
+                    found_code = Some(proc.stop_signal as i32);
+                    break;
+                }
+            }
+
+            if !has_eligible_child {
+                return NEG_ECHILD;
+            }
+
+            if let Some(pid) = found_pid {
+                if found_stopped {
+                    // Mark as reported so subsequent waitpid calls don't re-report.
+                    if let Some(p) = table.find_mut(pid) {
+                        p.stop_reported = true;
+                    }
+                    Some((pid, found_code, true)) // stopped
+                } else {
+                    let code = found_code.unwrap_or(0);
+                    table.reap(pid);
+                    Some((pid, Some(code), false))
+                }
+            } else {
+                None
             }
         };
 
-        if let Some(code) = result {
-            // The child's sys_exit called restore_kernel_cr3() before dying, so
-            // CR3 may now be the kernel PML4.  copy_to_user needs the caller's
-            // page table, so restore it explicitly before writing status.
-            // Also update CURRENT_PID — the child's trampoline may have changed it.
-            let (caller_cr3_phys, kstack_top) = {
-                let table = crate::process::PROCESS_TABLE.lock();
-                let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
-                let kst = table
-                    .find(calling_pid)
-                    .map(|p| p.kernel_stack_top)
-                    .unwrap_or(0);
-                (cr3, kst)
-            };
-            if let Some(phys) = caller_cr3_phys {
-                // SAFETY: phys is the caller's live PML4 frame from the process table.
-                unsafe {
-                    use x86_64::{
-                        registers::control::{Cr3, Cr3Flags},
-                        structures::paging::PhysFrame,
-                    };
-                    let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
-                    Cr3::write(frame, Cr3Flags::empty());
-                }
-            }
-            crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+        if let Some((child_pid, code_opt, stopped)) = result {
+            // Restore caller context.
+            waitpid_restore_caller(calling_pid);
 
-            // Restore kernel stack pointers for this process.
-            if kstack_top != 0 {
-                unsafe {
-                    crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
-                    *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
-                        kstack_top;
-                }
-            }
-
-            // Write wstatus in Linux-compatible encoding:
-            //   Normal exit (code >= 0): (code & 0xff) << 8
-            //   Signal kill  (code <  0): (-code) & 0x7f  (signal number in low 7 bits)
+            // Write wstatus.
             if status_ptr != 0 {
-                let wstatus = if code >= 0 {
-                    (code & 0xff) << 8
+                let wstatus = if stopped {
+                    // WIFSTOPPED: (sig << 8) | 0x7f
+                    let sig = code_opt.unwrap_or(crate::process::SIGTSTP as i32);
+                    (sig & 0xff) << 8 | 0x7f
                 } else {
-                    (-code) & 0x7f
+                    let code = code_opt.unwrap_or(0);
+                    if code >= 0 {
+                        (code & 0xff) << 8 // WIFEXITED
+                    } else {
+                        (-code) & 0x7f // WIFSIGNALED
+                    }
                 };
                 let bytes = wstatus.to_ne_bytes();
-                if crate::mm::user_mem::copy_to_user(status_ptr, &bytes).is_err() {
-                    log::warn!("[waitpid] copy_to_user status_ptr {:#x} failed", status_ptr);
-                }
+                let _ = crate::mm::user_mem::copy_to_user(status_ptr, &bytes);
             }
-            log::info!("[waitpid] pid {} exited with code {}", target_pid, code);
-            return target_pid as u64;
+            log::info!(
+                "[waitpid] pid {} {}",
+                child_pid,
+                if stopped { "stopped" } else { "exited" }
+            );
+            return child_pid as u64;
         }
 
-        // Child is still running; yield and try again.
+        // No matching child ready; yield and try again.
         crate::task::yield_now();
-        // Restore CURRENT_PID after yield: child's trampoline may have changed it.
         crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Restore the caller's CR3 and kernel stack after waitpid.
+fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
+    let (caller_cr3_phys, kstack_top) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
+        let kst = table
+            .find(calling_pid)
+            .map(|p| p.kernel_stack_top)
+            .unwrap_or(0);
+        (cr3, kst)
+    };
+    if let Some(phys) = caller_cr3_phys {
+        unsafe {
+            use x86_64::{
+                registers::control::{Cr3, Cr3Flags},
+                structures::paging::PhysFrame,
+            };
+            let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
+            Cr3::write(frame, Cr3Flags::empty());
+        }
+    }
+    crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+    if kstack_top != 0 {
+        unsafe {
+            crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
+            *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
+                kstack_top;
+        }
     }
 }
 
@@ -606,23 +1138,49 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract a UTF-8 path string from a userspace pointer + length.
-/// Copy at most 255 bytes from a userspace pointer into a stack buffer and
-/// return a reference to the valid UTF-8 prefix.
+/// Check if the current process has pending signals that would interrupt.
 ///
-/// Using a local buffer avoids the `&'static str` lifetime lie: the resulting
-/// reference is scoped to the caller's stack frame so Rust enforces that it
-/// cannot outlive the buffer.
-fn path_name_buf(ptr: u64, len: u64, buf: &mut [u8; 255]) -> Option<&str> {
-    let copy_len = (len as usize).min(255);
-    if copy_len == 0 || ptr == 0 {
-        return None;
+/// Only returns true for signals whose disposition is not Ignore (e.g.,
+/// SIGCHLD defaults to Ignore and should not cause EINTR).
+fn has_pending_signal() -> bool {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid == 0 {
+        return false;
     }
-    if crate::mm::user_mem::copy_from_user(&mut buf[..copy_len], ptr).is_err() {
-        return None;
+    let table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+    if proc.pending_signals == 0 {
+        return false;
     }
-    core::str::from_utf8(&buf[..copy_len]).ok()
+    // Check if any pending signal has a non-Ignore disposition.
+    for sig in 0..64u32 {
+        if proc.pending_signals & (1u64 << sig) != 0 {
+            let action = if sig < 32 {
+                proc.signal_actions[sig as usize]
+            } else {
+                crate::process::SignalAction::Default
+            };
+            let disposition = match action {
+                crate::process::SignalAction::Ignore => {
+                    if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
+                        return true; // cannot be ignored
+                    }
+                    crate::process::SignalDisposition::Ignore
+                }
+                crate::process::SignalAction::Default => crate::process::default_signal_action(sig),
+            };
+            if disposition != crate::process::SignalDisposition::Ignore {
+                return true;
+            }
+        }
+    }
+    false
 }
+
+const NEG_EINTR: u64 = (-4_i64) as u64;
 
 /// Copy all user-accessible pages from the currently-active page table
 /// into `dst_mapper`'s page table.
@@ -777,62 +1335,58 @@ const BRK_BASE: u64 = 0x0000_0002_0000_0000;
 /// Placed at 128 GiB — above the brk heap region and below the stack.
 const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
-/// Maximum number of open file descriptors (FDs 0–2 are stdin/stdout/stderr).
-const MAX_FDS: usize = 32;
+// Re-export FD types from process module (Phase 14 — per-process FD table).
+use crate::process::{FdBackend, FdEntry, MAX_FDS};
 
-/// Backing store for an open file descriptor.
-#[derive(Clone)]
-enum FdBackend {
-    /// Read-only static ramdisk file (pointer + length into kernel .rodata).
-    Ramdisk {
-        content_addr: usize,
-        content_len: usize,
-    },
-    /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
-    /// relative to tmpfs root — no leading `/tmp/`).
-    Tmpfs { path: alloc::string::String },
-}
-
-/// A single open-file entry in the global FD table.
-#[derive(Clone)]
-struct FdEntry {
-    backend: FdBackend,
-    offset: usize,
-    /// True if the file was opened for reading.
-    readable: bool,
-    /// True if the file was opened for writing.
-    writable: bool,
-}
-
-const NONE_FD: Option<FdEntry> = None;
-
-/// Global file descriptor table.
+/// Clone the FD entry at `fd` from the current process's FD table.
 ///
-/// FD 0 = stdin (not implemented — reads return EAGAIN).
-/// FD 1 = stdout / FD 2 = stderr (writes go to serial).
-/// FD 3+ = ramdisk or tmpfs files opened via `open()`.
-static FD_TABLE: spin::Mutex<[Option<FdEntry>; MAX_FDS]> = spin::Mutex::new([NONE_FD; MAX_FDS]);
+/// Returns `None` if no process is running or the FD slot is empty.
+fn current_fd_entry(fd: usize) -> Option<FdEntry> {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let table = crate::process::PROCESS_TABLE.lock();
+    let proc = table.find(pid)?;
+    proc.fd_table.get(fd)?.clone()
+}
+
+/// Mutate the FD entry at `fd` in the current process's FD table.
+fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    if let Some(proc) = table.find_mut(pid) {
+        if let Some(slot) = proc.fd_table.get_mut(fd) {
+            f(slot);
+        }
+    }
+}
+
+/// Allocate the lowest available FD slot (starting from `min_fd`) in the
+/// current process's FD table. Returns the FD number or `None` if full.
+fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = table.find_mut(pid)?;
+    for i in min_fd..MAX_FDS {
+        if proc.fd_table[i].is_none() {
+            proc.fd_table[i] = Some(entry);
+            return Some(i);
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
 
 fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    if fd == 0 {
-        // stdin: no keyboard input implemented yet — return EAGAIN (-11)
-        return NEG_EAGAIN;
-    }
     let fd = fd as usize;
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.readable {
@@ -840,6 +1394,31 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdin => {
+            // Read from kernel stdin buffer (Phase 14, Track E).
+            // Yield-loop until data is available (line-buffered).
+            let capped = (count as usize).min(4096);
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            loop {
+                if crate::stdin::has_data() {
+                    let mut tmp = [0u8; 4096];
+                    let n = crate::stdin::read(&mut tmp[..capped]);
+                    if n > 0 {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        return n as u64;
+                    }
+                }
+                // Check for pending signals so Ctrl-C works while blocked.
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+                crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        FdBackend::Stdout => NEG_EBADF,
         FdBackend::Ramdisk {
             content_addr,
             content_len,
@@ -859,9 +1438,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return NEG_EFAULT;
             }
 
-            if let Some(e) = &mut FD_TABLE.lock()[fd] {
-                e.offset += to_read;
-            }
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
             to_read as u64
         }
         FdBackend::Tmpfs { path } => {
@@ -883,11 +1464,40 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
 
             drop(tmpfs);
-            if let Some(e) = &mut FD_TABLE.lock()[fd] {
-                e.offset += to_read;
-            }
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
             to_read as u64
         }
+        FdBackend::PipeRead { pipe_id } => {
+            let pipe_id = *pipe_id;
+            let capped = (count as usize).min(4096);
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            // Yield-loop until data is available or writer closes.
+            loop {
+                let mut tmp = [0u8; 4096];
+                match crate::pipe::pipe_read(pipe_id, &mut tmp[..capped]) {
+                    Ok(0) => return 0, // EOF
+                    Ok(n) => {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        return n as u64;
+                    }
+                    Err(_would_block) => {
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        crate::process::CURRENT_PID
+                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        FdBackend::PipeWrite { .. } => NEG_EBADF,
     }
 }
 
@@ -896,30 +1506,14 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    // stdout (1) and stderr (2) go to serial.
-    if fd == 1 || fd == 2 {
-        let len = (count as usize).min(4096);
-        let mut buf = [0u8; 4096];
-        if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
-            return NEG_EFAULT;
-        }
-        if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-            log::info!("[userspace] {}", s.trim_end_matches('\n'));
-        }
-        return len as u64;
-    }
-
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd_idx] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.writable {
@@ -927,6 +1521,19 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdout => {
+            // stdout/stderr go to serial.
+            let len = (count as usize).min(4096);
+            let mut buf = [0u8; 4096];
+            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+                log::info!("[userspace] {}", s.trim_end_matches('\n'));
+            }
+            len as u64
+        }
+        FdBackend::Stdin => NEG_EBADF,
         FdBackend::Ramdisk { .. } => NEG_EBADF, // ramdisk is read-only
         FdBackend::Tmpfs { path } => {
             let len = (count as usize).min(64 * 1024);
@@ -968,11 +1575,43 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 offset += chunk;
             }
 
-            if let Some(e) = &mut FD_TABLE.lock()[fd_idx] {
-                e.offset = offset;
-            }
+            with_current_fd_mut(fd_idx, |slot| {
+                if let Some(e) = slot {
+                    e.offset = offset;
+                }
+            });
             written as u64
         }
+        FdBackend::PipeWrite { pipe_id } => {
+            let pipe_id = *pipe_id;
+            let len = (count as usize).min(4096);
+            let mut buf = [0u8; 4096];
+            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            // Yield-loop until space is available or reader closes.
+            loop {
+                match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
+                    Ok(n) => return n as u64,
+                    Err(false) => {
+                        // Reader closed — EPIPE.
+                        const NEG_EPIPE: u64 = (-32_i64) as u64;
+                        return NEG_EPIPE;
+                    }
+                    Err(true) => {
+                        // Would block — yield and retry.
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        crate::process::CURRENT_PID
+                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        FdBackend::PipeRead { .. } => NEG_EBADF,
     }
 }
 
@@ -1096,24 +1735,25 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 
         drop(tmpfs);
 
-        // Allocate an fd slot.
-        let mut table = FD_TABLE.lock();
-        for i in 3..MAX_FDS {
-            if table[i].is_none() {
-                table[i] = Some(FdEntry {
-                    backend: FdBackend::Tmpfs {
-                        path: alloc::string::String::from(rel),
-                    },
-                    offset: initial_offset,
-                    readable,
-                    writable,
-                });
+        // Allocate an fd slot in the current process's table.
+        let entry = FdEntry {
+            backend: FdBackend::Tmpfs {
+                path: alloc::string::String::from(rel),
+            },
+            offset: initial_offset,
+            readable,
+            writable,
+        };
+        match alloc_fd(3, entry) {
+            Some(i) => {
                 log::info!("[open] {} → fd {} (tmpfs)", name, i);
                 return i as u64;
             }
+            None => {
+                log::warn!("[open] fd table full");
+                return NEG_EMFILE;
+            }
         }
-        log::warn!("[open] fd table full");
-        return NEG_EMFILE;
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
@@ -1130,25 +1770,25 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         }
     };
 
-    let mut table = FD_TABLE.lock();
-    for i in 3..MAX_FDS {
-        if table[i].is_none() {
-            table[i] = Some(FdEntry {
-                backend: FdBackend::Ramdisk {
-                    content_addr: content.as_ptr() as usize,
-                    content_len: content.len(),
-                },
-                offset: 0,
-                readable: true,
-                writable: false,
-            });
+    let entry = FdEntry {
+        backend: FdBackend::Ramdisk {
+            content_addr: content.as_ptr() as usize,
+            content_len: content.len(),
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => {
             log::info!("[open] {} → fd {}", name, i);
-            return i as u64;
+            i as u64
+        }
+        None => {
+            log::warn!("[open] fd table full");
+            NEG_EMFILE
         }
     }
-
-    log::warn!("[open] fd table full");
-    NEG_EMFILE
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,12 +1804,26 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
-    let mut table = FD_TABLE.lock();
-    if table[fd].is_none() {
-        return NEG_EBADF;
+    // Check if this FD is a pipe end; if so, close it in the pipe table.
+    if let Some(entry) = current_fd_entry(fd) {
+        match &entry.backend {
+            FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
+            FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+            _ => {}
+        }
     }
-    table[fd] = None;
-    0
+    let mut found = false;
+    with_current_fd_mut(fd, |slot| {
+        if slot.is_some() {
+            *slot = None;
+            found = true;
+        }
+    });
+    if found {
+        0
+    } else {
+        NEG_EBADF
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,26 +1835,25 @@ fn sys_linux_close(fd: u64) -> u64 {
 /// Only `st_size` (offset 48) and `st_mode` (offset 24) are filled in;
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
 fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
-    let size = match fd {
-        1 | 2 => 0u64, // stdout/stderr — no meaningful size
-        _ => {
-            let fd = fd as usize;
-            if fd >= MAX_FDS {
-                return NEG_EBADF;
-            }
-            let entry = match &FD_TABLE.lock()[fd] {
-                Some(e) => e.clone(),
-                None => return NEG_EBADF,
-            };
-            match &entry.backend {
-                FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
-                FdBackend::Tmpfs { path } => {
-                    let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                    match tmpfs.file_size(path) {
-                        Ok(size) => size as u64,
-                        Err(_) => return NEG_ENOENT,
-                    }
-                }
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let size = match &entry.backend {
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => 0u64,
+        FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
+        FdBackend::Tmpfs { path } => {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.file_size(path) {
+                Ok(size) => size as u64,
+                Err(_) => return NEG_ENOENT,
             }
         }
     };
@@ -1232,14 +1885,9 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    // Clone entry and drop FD_TABLE before locking TMPFS to avoid
-    // lock-order inversion (other paths lock TMPFS then FD_TABLE).
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     const SEEK_SET: u64 = 0;
@@ -1247,6 +1895,10 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     const SEEK_END: u64 = 2;
 
     let file_len = match &entry.backend {
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1276,10 +1928,12 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    // Re-lock to update offset.
-    if let Some(e) = &mut FD_TABLE.lock()[fd] {
-        e.offset = new_offset as usize;
-    }
+    // Update offset in per-process FD table.
+    with_current_fd_mut(fd, |slot| {
+        if let Some(e) = slot {
+            e.offset = new_offset as usize;
+        }
+    });
     new_offset as u64
 }
 
@@ -1931,12 +2585,9 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    let entry = {
-        let table = FD_TABLE.lock();
-        match &table[fd_idx] {
-            Some(e) => e.clone(),
-            None => return NEG_EBADF,
-        }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
     };
 
     if !entry.writable {
@@ -1944,6 +2595,10 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
     }
 
     match &entry.backend {
+        FdBackend::Stdout
+        | FdBackend::Stdin
+        | FdBackend::PipeRead { .. }
+        | FdBackend::PipeWrite { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -1965,8 +2620,7 @@ fn sys_linux_fsync(fd: u64) -> u64 {
     if !(3..MAX_FDS).contains(&fd_idx) {
         return NEG_EBADF;
     }
-    let exists = FD_TABLE.lock()[fd_idx].is_some();
-    if !exists {
+    if current_fd_entry(fd_idx).is_none() {
         return NEG_EBADF;
     }
     0 // no-op: tmpfs has no persistence
