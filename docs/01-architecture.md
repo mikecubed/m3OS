@@ -2,7 +2,7 @@
 
 ## Overview
 
-ostest follows a **microkernel architecture**: the kernel runs in privileged mode (ring 0)
+m³OS follows a **microkernel architecture**: the kernel runs in privileged mode (ring 0)
 and does the absolute minimum — memory management, thread scheduling, IPC, and interrupt
 routing. Everything else (drivers, filesystems, network stack) runs in **userspace servers**
 communicating via IPC.

@@ -25,7 +25,7 @@ Both sender and receiver must be ready simultaneously. The kernel transfers the 
 directly from one thread's registers into the other's — no intermediate buffer, no
 allocation on the IPC path.
 
-This fits all server use cases in ostest perfectly: every interaction between the shell
+This fits all server use cases in m³OS perfectly: every interaction between the shell
 and its servers (`console_server`, `vfs_server`, etc.) is request-response by nature.
 The shell blocks waiting for results; there is no benefit to decoupling.
 

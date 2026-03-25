@@ -248,7 +248,7 @@ A `Blocked` state requires a complementary wakeup mechanism.  Common patterns:
 - **Notification objects** (seL4 / Phase 5 plan): a word-sized bitfield that ISRs
   signal atomically.  A server blocks on `wait()` and wakes when any bit is set.
 
-Adding sleep and wakeup to ostest is planned for Phase 5 (IPC), where the first
+Adding sleep and wakeup to m³OS is planned for Phase 5 (IPC), where the first
 real inter-task communication will require tasks to block on endpoint receive.
 
 ---

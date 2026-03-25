@@ -232,7 +232,7 @@ fn build_kernel() -> PathBuf {
 }
 
 fn create_uefi_image(kernel_binary: &Path) -> PathBuf {
-    let uefi_path = kernel_binary.parent().unwrap().join("boot-uefi-ostest.img");
+    let uefi_path = kernel_binary.parent().unwrap().join("boot-uefi-m3os.img");
 
     let builder = bootloader::DiskImageBuilder::new(kernel_binary.to_path_buf());
     builder
@@ -464,11 +464,11 @@ impl FileDataSource {
 }
 
 fn default_key_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("ostest.key")
+    workspace_root.join("m3os.key")
 }
 
 fn default_cert_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join("ostest.crt")
+    workspace_root.join("m3os.crt")
 }
 
 fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs, String> {
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn qemu_args_headless_uses_display_none() {
         let args = qemu_args(
-            Path::new("target/boot-uefi-ostest.img"),
+            Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             QemuDisplayMode::Headless,
         );
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn qemu_args_gui_uses_sdl_and_disables_audio() {
         let args = qemu_args(
-            Path::new("target/boot-uefi-ostest.img"),
+            Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             QemuDisplayMode::Gui,
         );
@@ -1009,27 +1009,27 @@ mod tests {
 
     #[test]
     fn parse_image_args_defaults_to_unsigned_image() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let parsed = parse_image_args(&[], &workspace_root).unwrap();
 
         assert!(!parsed.sign);
-        assert_eq!(parsed.key, workspace_root.join("ostest.key"));
-        assert_eq!(parsed.cert, workspace_root.join("ostest.crt"));
+        assert_eq!(parsed.key, workspace_root.join("m3os.key"));
+        assert_eq!(parsed.cert, workspace_root.join("m3os.crt"));
     }
 
     #[test]
     fn parse_image_args_uses_repo_root_defaults_when_signing() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let parsed = parse_image_args(&string_args(&["--sign"]), &workspace_root).unwrap();
 
         assert!(parsed.sign);
-        assert_eq!(parsed.key, workspace_root.join("ostest.key"));
-        assert_eq!(parsed.cert, workspace_root.join("ostest.crt"));
+        assert_eq!(parsed.key, workspace_root.join("m3os.key"));
+        assert_eq!(parsed.cert, workspace_root.join("m3os.crt"));
     }
 
     #[test]
     fn parse_image_args_rejects_key_without_sign() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let error = parse_image_args(&string_args(&["--key", "keys/dev.key"]), &workspace_root)
             .unwrap_err();
 
@@ -1038,18 +1038,18 @@ mod tests {
 
     #[test]
     fn parse_sign_args_uses_repo_root_defaults() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let parsed = parse_sign_args(&string_args(&["build/bootx64.efi"]), &workspace_root).unwrap();
 
         assert_eq!(parsed.unsigned_efi, PathBuf::from("build/bootx64.efi"));
         assert_eq!(parsed.signed_efi, PathBuf::from("build/bootx64-signed.efi"));
-        assert_eq!(parsed.key, workspace_root.join("ostest.key"));
-        assert_eq!(parsed.cert, workspace_root.join("ostest.crt"));
+        assert_eq!(parsed.key, workspace_root.join("m3os.key"));
+        assert_eq!(parsed.cert, workspace_root.join("m3os.crt"));
     }
 
     #[test]
     fn parse_sign_args_accepts_explicit_key_and_cert() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let parsed = parse_sign_args(
             &string_args(&[
                 "--key=keys/dev.key",
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn parse_sign_args_requires_unsigned_efi_path() {
-        let workspace_root = PathBuf::from("/workspace/ostest");
+        let workspace_root = PathBuf::from("/workspace/m3os");
         let error =
             parse_sign_args(&string_args(&["--key", "keys/dev.key"]), &workspace_root).unwrap_err();
 

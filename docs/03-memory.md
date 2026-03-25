@@ -71,7 +71,7 @@ Mature kernels replace the bump allocator in stages:
 3. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries, better throughput for large buffers
 4. **Demand paging / copy-on-write** — don't map physical frames until first access; enables fork() efficiency
 
-For ostest, the bump allocator is sufficient through Phase 5 (userspace entry). Phase 6+ IPC page grants will require a proper frame reclaim path.
+For m³OS, the bump allocator is sufficient through Phase 5 (userspace entry). Phase 6+ IPC page grants will require a proper frame reclaim path.
 
 ```
 Physical Memory

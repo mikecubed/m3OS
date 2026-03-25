@@ -21,7 +21,7 @@ current build pipeline.
 The boot path has one job: get from a host-side Cargo command to running Rust code in a
 `no_std` kernel with enough early diagnostics to understand what happened.
 
-In `ostest`, that means:
+In m³OS, that means:
 
 - `xtask` builds the kernel
 - the `bootloader` crate wraps the kernel in a UEFI-bootable image

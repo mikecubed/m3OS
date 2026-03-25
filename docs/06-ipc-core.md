@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 6 turns ostest into a real microkernel by wiring up the IPC subsystem
+Phase 6 turns m³OS into a real microkernel by wiring up the IPC subsystem
 that all future userspace servers depend on.  By the end of this phase the
 kernel:
 
@@ -47,7 +47,7 @@ kills the task, cleans up its capabilities, and the supervisor can restart it.
 
 ## IPC Model: Synchronous Rendezvous + Async Notifications
 
-ostest follows the **seL4 model**:
+m³OS follows the **seL4 model**:
 
 ### Synchronous Rendezvous
 
@@ -56,7 +56,7 @@ copies the message directly through registers — no intermediate buffer, no hea
 allocation on the hot path.  Whichever party arrives first at the endpoint
 blocks until its counterpart shows up.
 
-This fits every server use case in ostest perfectly.  Every interaction between
+This fits every server use case in m³OS perfectly.  Every interaction between
 the shell and its servers (`console_server`, `vfs_server`) is request-response
 by nature.  The shell blocks waiting for results; there is no benefit to
 decoupling the two sides with a buffered channel.
@@ -85,7 +85,7 @@ on the notification object; when a bit is set the scheduler wakes it.
 Async ring-buffer channels require kernel-managed buffers (heap allocation on
 the hot IPC path), buffer-full/empty conditions, and a separate wakeup
 mechanism anyway.  They add significant complexity for no benefit given the
-synchronous request-response pattern all ostest services use.
+synchronous request-response pattern all m³OS services use.
 
 ### Bulk Data Transfers
 
@@ -136,7 +136,7 @@ address.
 ### What a Capability Is
 
 A **capability** is an unforgeable token that grants the holder specific rights
-to a kernel object.  In ostest, capabilities are integer handles — indices into
+to a kernel object.  In m³OS, capabilities are integer handles — indices into
 a per-task `CapabilityTable`.  The kernel validates every handle on every IPC
 syscall.  Passing an out-of-range or empty-slot index returns `u64::MAX`
 immediately; no kernel state changes.
@@ -510,7 +510,7 @@ label, clearly distinguishing success from failure without a separate register.
 ## Phase 6 Simplifications vs. Real Microkernels
 
 Phase 6 deliberately keeps the IPC contract small.  Here is what a production
-microkernel does that ostest does not (yet):
+microkernel does that m³OS does not (yet):
 
 ### seL4
 
@@ -522,7 +522,7 @@ read-write endpoint access), capability revocation trees, and priority-aware
 IPC scheduling where a high-priority client can temporarily boost the
 server's priority ("priority inheritance for IPC").
 
-ostest Phase 6 has none of these.  Capability rights are all-or-nothing,
+m³OS Phase 6 has none of these.  Capability rights are all-or-nothing,
 revocation is not implemented, and the round-robin scheduler has no priority
 concept.
 
@@ -533,7 +533,7 @@ capability handles).  Messages can carry out-of-line data (copy-on-write pages)
 and port rights in the same message.  The Mach IPC path is notoriously complex;
 its performance was a major critique that drove the L4 lineage.
 
-ostest Phase 6 carries only inline data (no out-of-line pages) and defers
+m³OS Phase 6 carries only inline data (no out-of-line pages) and defers
 capability grants in messages to Phase 7+.
 
 ### L4 / Fiasco.OC / Genode
@@ -542,11 +542,11 @@ L4-family kernels use typed message words and "message items" for capability
 transfer.  Fiasco.OC has kernel-object reference counting.  Genode adds a
 capability-based component framework on top.
 
-ostest does not have reference-counted kernel objects or typed message words.
+m³OS does not have reference-counted kernel objects or typed message words.
 The 64-slot fixed capability table is sufficient for a teaching OS; a real
 system would need growable per-process tables or a tree structure.
 
-### What all of them share with ostest
+### What all of them share with m³OS
 
 All production microkernels use:
 

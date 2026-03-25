@@ -1,4 +1,4 @@
-# ostest — Toy Bootable OS in Rust
+# m³OS — Toy Bootable OS in Rust
 
 A toy bootable operating system built in Rust, following a **microkernel architecture**
 targeting **x86_64**. Designed for learning, with the eventual goal of running a real

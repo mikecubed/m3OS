@@ -8,8 +8,8 @@
 *.img
 *.iso
 *.efi
-/ostest.key
-/ostest.crt
+/m3os.key
+/m3os.crt
 
 # Generated userspace ELF binaries (produced by cargo xtask / build_userspace_bins).
 # Also includes musl-compiled C binaries (build_musl_bins).

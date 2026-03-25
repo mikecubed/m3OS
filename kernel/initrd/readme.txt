@@ -1,4 +1,4 @@
-ostest Phase 8 — read-only ramdisk demo.
+m³OS Phase 8 — read-only ramdisk demo.
 
 Files in this image:
   hello.txt  - greeting from the filesystem layer
