@@ -65,6 +65,10 @@ pub fn parse(data: &[u8]) -> Option<(Ipv4Header, &[u8])> {
     src.copy_from_slice(&data[12..16]);
     dst.copy_from_slice(&data[16..20]);
 
+    // Guard: total_length must be at least as large as the header.
+    if (total_length as usize) < header_len {
+        return None;
+    }
     let payload_end = (total_length as usize).min(data.len());
     let payload = &data[header_len..payload_end];
 

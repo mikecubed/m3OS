@@ -210,7 +210,17 @@ impl Virtqueue {
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
         // Tell the device the page frame number of the queue.
-        let pfn = (phys_base / 4096) as u32;
+        // Legacy virtio uses a 32-bit PFN register; fail if memory is above 4 GiB.
+        let pfn_u64 = phys_base / 4096;
+        if pfn_u64 > u32::MAX as u64 {
+            log::error!(
+                "[virtio-net] queue {}: phys {:#x} too high for 32-bit legacy PFN",
+                queue_index,
+                phys_base
+            );
+            return None;
+        }
+        let pfn = pfn_u64 as u32;
         unsafe {
             Port::<u32>::new(io_base + VIRTIO_QUEUE_ADDRESS).write(pfn);
         }
