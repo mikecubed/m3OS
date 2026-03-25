@@ -442,12 +442,13 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
         };
     }
 
+    const NEG_ESRCH_KILL: u64 = (-3_i64) as u64;
     if target_pid > 0 {
         // Send to a specific process.
         if crate::process::send_signal(target_pid as crate::process::Pid, sig) {
             0
         } else {
-            NEG_EINVAL
+            NEG_ESRCH_KILL
         }
     } else if target_pid < -1 {
         // Send to process group |pid|.
@@ -554,7 +555,11 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
 
     let read_fd = match alloc_fd(3, read_entry) {
         Some(fd) => fd,
-        None => return NEG_EMFILE,
+        None => {
+            crate::pipe::pipe_close_reader(pipe_id);
+            crate::pipe::pipe_close_writer(pipe_id);
+            return NEG_EMFILE;
+        }
     };
     let write_fd = match alloc_fd(3, write_entry) {
         Some(fd) => fd,
@@ -1123,18 +1128,46 @@ fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check if the current process has pending signals.
-/// Returns true if a signal is pending (caller should return EINTR).
+/// Check if the current process has pending signals that would interrupt.
+///
+/// Only returns true for signals whose disposition is not Ignore (e.g.,
+/// SIGCHLD defaults to Ignore and should not cause EINTR).
 fn has_pending_signal() -> bool {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     if pid == 0 {
         return false;
     }
     let table = crate::process::PROCESS_TABLE.lock();
-    table
-        .find(pid)
-        .map(|p| p.pending_signals != 0)
-        .unwrap_or(false)
+    let proc = match table.find(pid) {
+        Some(p) => p,
+        None => return false,
+    };
+    if proc.pending_signals == 0 {
+        return false;
+    }
+    // Check if any pending signal has a non-Ignore disposition.
+    for sig in 0..64u32 {
+        if proc.pending_signals & (1u64 << sig) != 0 {
+            let action = if sig < 32 {
+                proc.signal_actions[sig as usize]
+            } else {
+                crate::process::SignalAction::Default
+            };
+            let disposition = match action {
+                crate::process::SignalAction::Ignore => {
+                    if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
+                        return true; // cannot be ignored
+                    }
+                    crate::process::SignalDisposition::Ignore
+                }
+                crate::process::SignalAction::Default => crate::process::default_signal_action(sig),
+            };
+            if disposition != crate::process::SignalDisposition::Ignore {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 const NEG_EINTR: u64 = (-4_i64) as u64;

@@ -935,12 +935,15 @@ fn shell_fork_exec(
     let mut stdin_file: Option<&str> = None;
     let mut iter = cmd_line.split_whitespace();
     while let Some(tok) = iter.next() {
-        if tok == ">" {
-            stdout_file = iter.next();
-            stdout_append = false;
-        } else if tok == ">>" {
+        if tok == ">>" {
             stdout_file = iter.next();
             stdout_append = true;
+        } else if let Some(rest) = tok.strip_prefix(">>") {
+            stdout_file = Some(rest);
+            stdout_append = true;
+        } else if tok == ">" {
+            stdout_file = iter.next();
+            stdout_append = false;
         } else if let Some(rest) = tok.strip_prefix('>') {
             stdout_file = Some(rest);
             stdout_append = false;
@@ -976,6 +979,15 @@ fn shell_fork_exec(
         match spawn_user_process_with_pipe(&elf_name, &parts, env, stdin_pipe_id, stdout_pipe_id) {
             Some(pid) => pid,
             None => {
+                // Clean up any pipes created for redirection.
+                if let Some(id) = stdin_pipe_id {
+                    pipe::pipe_close_reader(id);
+                    pipe::pipe_close_writer(id);
+                }
+                if let Some(id) = stdout_pipe_id {
+                    pipe::pipe_close_reader(id);
+                    pipe::pipe_close_writer(id);
+                }
                 shell_print(my_id, console_ep, "fork: failed\n");
                 return;
             }
@@ -1095,13 +1107,21 @@ fn shell_pipeline(
     // Spawn first child (stdout → pipe write end).
     let pid0 = match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id)) {
         Some(pid) => pid,
-        None => return,
+        None => {
+            pipe::pipe_close_reader(pipe_id);
+            pipe::pipe_close_writer(pipe_id);
+            return;
+        }
     };
 
     // Spawn second child (stdin ← pipe read end).
     let pid1 = match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None) {
         Some(pid) => pid,
-        None => return,
+        None => {
+            pipe::pipe_close_reader(pipe_id);
+            pipe::pipe_close_writer(pipe_id);
+            return;
+        }
     };
 
     // Close our copies of the pipe ends so EOF propagates.

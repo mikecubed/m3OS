@@ -132,7 +132,7 @@
 | P14-T062 | `mkdir` / `rmdir` — create/remove directories | ✅ |
 | P14-T063 | `rm` — remove files via unlink | ✅ |
 | P14-T064 | `cp` — copy file: open+read source, open+write dest | ✅ |
-| P14-T065 | `mv` — rename file via rename, fallback to cp+rm | ✅ |
+| P14-T065 | `mv` — rename file via rename syscall | ✅ |
 | P14-T066 | `env` — print all environment variables | ✅ |
 | P14-T067 | `sleep` — sleep for N seconds | ✅ |
 | P14-T067a | `grep` — search stdin or files for a fixed string | ✅ |
