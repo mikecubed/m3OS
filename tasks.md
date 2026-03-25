@@ -8,11 +8,11 @@
 
 | Track | Scope | Status |
 |---|---|---|
-| A | ACPI table discovery and parsing | 🔧 in progress |
-| B | Local APIC initialization | ⬜ blocked on A |
-| C | I/O APIC initialization | ⬜ blocked on A, B |
+| A | ACPI table discovery and parsing | ✅ done |
+| B | Local APIC initialization | 🔧 in progress |
+| C | I/O APIC initialization | ⬜ blocked on B |
 | D | Timer migration (PIT → LAPIC timer) | ⬜ blocked on B, C |
-| E | PCI bus enumeration | 🔧 in progress |
+| E | PCI bus enumeration | ✅ done |
 | F | Validation + documentation | ⬜ blocked on all |
 
 ---
@@ -21,16 +21,16 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T001 | Read `boot_info.rsdp_addr` and store in global `Once<PhysAddr>` | ⬜ |
-| P15-T002 | Define RSDP v1/v2 structures | ⬜ |
-| P15-T003 | Implement `validate_rsdp()`: verify signature and checksum | ⬜ |
-| P15-T004 | Define ACPI SDT header struct | ⬜ |
-| P15-T005 | Implement `parse_rsdt()` / `parse_xsdt()` | ⬜ |
-| P15-T006 | Implement SDT signature lookup | ⬜ |
-| P15-T007 | Define MADT structures (Local APIC, I/O APIC, ISO entries) | ⬜ |
-| P15-T008 | Implement `parse_madt()` | ⬜ |
-| P15-T009 | Define FADT structure (minimal) | ⬜ |
-| P15-T010 | Log ACPI discovery results | ⬜ |
+| P15-T001 | Read `boot_info.rsdp_addr` and store in global `Once<PhysAddr>` | ✅ |
+| P15-T002 | Define RSDP v1/v2 structures | ✅ |
+| P15-T003 | Implement `validate_rsdp()`: verify signature and checksum | ✅ |
+| P15-T004 | Define ACPI SDT header struct | ✅ |
+| P15-T005 | Implement `parse_rsdt()` / `parse_xsdt()` | ✅ |
+| P15-T006 | Implement SDT signature lookup | ✅ |
+| P15-T007 | Define MADT structures (Local APIC, I/O APIC, ISO entries) | ✅ |
+| P15-T008 | Implement `parse_madt()` | ✅ |
+| P15-T009 | Define FADT structure (minimal) | ✅ |
+| P15-T010 | Log ACPI discovery results | ✅ |
 
 ## Track B — Local APIC Initialization
 
@@ -73,14 +73,14 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T033 | Implement `pci_config_read_u32(bus, device, function, offset)` | ⬜ |
-| P15-T034 | Implement `pci_config_read_u16` and `pci_config_read_u8` helpers | ⬜ |
-| P15-T035 | Define `PciDevice` struct | ⬜ |
-| P15-T036 | Implement `pci_scan()`: iterate bus/device/function space | ⬜ |
-| P15-T037 | Read class, subclass, BARs, interrupt line for each device | ⬜ |
-| P15-T038 | Store devices in static array | ⬜ |
-| P15-T039 | Expose `pci_device_list()` read-only accessor | ⬜ |
-| P15-T040 | Log full PCI device list at boot | ⬜ |
+| P15-T033 | Implement `pci_config_read_u32(bus, device, function, offset)` | ✅ |
+| P15-T034 | Implement `pci_config_read_u16` and `pci_config_read_u8` helpers | ✅ |
+| P15-T035 | Define `PciDevice` struct | ✅ |
+| P15-T036 | Implement `pci_scan()`: iterate bus/device/function space | ✅ |
+| P15-T037 | Read class, subclass, BARs, interrupt line for each device | ✅ |
+| P15-T038 | Store devices in static array | ✅ |
+| P15-T039 | Expose `pci_device_list()` read-only accessor | ✅ |
+| P15-T040 | Log full PCI device list at boot | ✅ |
 
 ## Track F — Validation and Documentation
 
