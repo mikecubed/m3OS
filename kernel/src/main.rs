@@ -195,6 +195,11 @@ fn init_task() -> ! {
     task::spawn(vfs_server_task, "vfs");
     task::spawn(fs_client_task, "fs-client");
 
+    // Spawn Phase 16 network processing task.
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        task::spawn(net_task, "net");
+    }
+
     // Spawn Phase 9 shell task.
     task::spawn(shell_task, "shell");
 
@@ -896,7 +901,7 @@ fn shell_execute(
         match cmd {
             "help" => {
                 shell_print(my_id, console_ep,
-                    "builtins: help cd exit export unset env fg bg\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
+                    "builtins: help cd exit export unset env fg bg ping\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
                 return;
             }
             "cd" => {
@@ -954,6 +959,10 @@ fn shell_execute(
                 if let Some(&(_job, pid)) = bg_jobs.last() {
                     process::send_signal(pid, process::SIGCONT);
                 }
+                return;
+            }
+            "ping" => {
+                shell_ping(my_id, console_ep, args_str);
                 return;
             }
             _ => {} // fall through to fork+exec
@@ -1696,6 +1705,100 @@ fn run_elf_and_report(name: &'static str) {
             break;
         }
         task::yield_now();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network task (P16-T055)
+// ---------------------------------------------------------------------------
+
+/// Background task that processes incoming network frames.
+///
+/// Polls the virtio-net driver for received frames and dispatches them through
+/// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
+fn net_task() -> ! {
+    log::info!("[net] network processing task started");
+    loop {
+        // Process any pending received frames.
+        net::dispatch::process_rx();
+        task::yield_now();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell `ping` command (P16-T063)
+// ---------------------------------------------------------------------------
+
+/// Parse a dotted-decimal IPv4 address string.
+fn parse_ipv4(s: &str) -> Option<net::arp::Ipv4Addr> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut addr = [0u8; 4];
+    for (i, part) in parts.iter().enumerate() {
+        addr[i] = part.parse::<u8>().ok()?;
+    }
+    Some(addr)
+}
+
+/// `ping <ip>` — send ICMP echo requests and wait for replies.
+fn shell_ping(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, args: &str) {
+    let target = match parse_ipv4(args.trim()) {
+        Some(ip) => ip,
+        None => {
+            shell_print(my_id, console_ep, "usage: ping <ip>\n");
+            return;
+        }
+    };
+
+    if !net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+        shell_print(my_id, console_ep, "ping: network not available\n");
+        return;
+    }
+
+    let msg = alloc::format!(
+        "PING {}.{}.{}.{}\n",
+        target[0],
+        target[1],
+        target[2],
+        target[3]
+    );
+    shell_print(my_id, console_ep, &msg);
+
+    for seq in 0..4u16 {
+        let send_tick = net::icmp::ping(target, seq);
+
+        // Wait up to ~2 seconds for a reply (200 ticks at ~100 Hz).
+        let mut got_reply = false;
+        for _ in 0..200u32 {
+            // Process incoming frames to handle the reply.
+            net::dispatch::process_rx();
+
+            if net::icmp::PING_REPLY_RECEIVED.load(core::sync::atomic::Ordering::Acquire) {
+                let recv_tick =
+                    net::icmp::PING_REPLY_TICK.load(core::sync::atomic::Ordering::Acquire);
+                let rtt_ticks = recv_tick.wrapping_sub(send_tick);
+                let rtt_ms = rtt_ticks * 10; // ~10ms per tick at 100 Hz
+                let reply_msg = alloc::format!(
+                    "reply from {}.{}.{}.{}: seq={} time={}ms\n",
+                    target[0],
+                    target[1],
+                    target[2],
+                    target[3],
+                    seq,
+                    rtt_ms
+                );
+                shell_print(my_id, console_ep, &reply_msg);
+                got_reply = true;
+                break;
+            }
+            task::yield_now();
+        }
+        if !got_reply {
+            let timeout_msg = alloc::format!("request timeout for seq {}\n", seq);
+            shell_print(my_id, console_ep, &timeout_msg);
+        }
     }
 }
 

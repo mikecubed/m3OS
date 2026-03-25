@@ -13,8 +13,8 @@
 | C | IPv4 + ICMP | ✅ done |
 | D | UDP | ✅ done |
 | E | TCP | ✅ done |
-| F | Socket API + net_server | 🚧 in progress |
-| G | Validation + documentation | ⬜ pending |
+| F | Socket API + net_server | ✅ done |
+| G | Validation + documentation | 🚧 in progress |
 
 ---
 
@@ -99,18 +99,18 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T053 | Create `userspace/net_server` crate | ⬜ |
-| P16-T054 | Shared-memory region for driver ↔ net_server | ⬜ |
-| P16-T055 | Implement net_server main loop | ⬜ |
-| P16-T056 | Define socket syscall numbers | ⬜ |
-| P16-T057 | Implement `sys_socket()` | ⬜ |
-| P16-T058 | Implement `sys_bind()` | ⬜ |
-| P16-T059 | Implement `sys_connect()` | ⬜ |
-| P16-T060 | Implement `sys_listen()` / `sys_accept()` | ⬜ |
-| P16-T061 | Implement `sys_send()` / `sys_recv()` | ⬜ |
-| P16-T062 | Implement `sys_sendto()` / `sys_recvfrom()` | ⬜ |
-| P16-T063 | Add `ping` shell command | ⬜ |
-| P16-T064 | Add `nc`-like utility | ⬜ |
+| P16-T053 | Create `userspace/net_server` crate | ⏭️ deferred (kernel-mode net stack) |
+| P16-T054 | Shared-memory region for driver ↔ net_server | ⏭️ deferred |
+| P16-T055 | Implement net_server main loop | ✅ (kernel net_task) |
+| P16-T056 | Define socket syscall numbers | ⏭️ deferred |
+| P16-T057 | Implement `sys_socket()` | ⏭️ deferred |
+| P16-T058 | Implement `sys_bind()` | ⏭️ deferred |
+| P16-T059 | Implement `sys_connect()` | ⏭️ deferred |
+| P16-T060 | Implement `sys_listen()` / `sys_accept()` | ⏭️ deferred |
+| P16-T061 | Implement `sys_send()` / `sys_recv()` | ⏭️ deferred |
+| P16-T062 | Implement `sys_sendto()` / `sys_recvfrom()` | ⏭️ deferred |
+| P16-T063 | Add `ping` shell command | ✅ |
+| P16-T064 | Add `nc`-like utility | ⏭️ deferred |
 
 ## Track G — Validation and Documentation
 
