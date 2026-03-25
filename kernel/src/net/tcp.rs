@@ -36,8 +36,13 @@ pub struct TcpHeader {
 // TCP checksum (P16-T041)
 // ===========================================================================
 
+/// Maximum TCP segment size that fits in an IPv4 packet (65535 - 20 byte IP header).
+const MAX_TCP_SEGMENT: usize = 65515;
+
 /// Compute TCP checksum with pseudo-header.
 fn tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8]) -> u16 {
+    // tcp_data.len() must fit in u16 for the pseudo-header length field.
+    // Callers (build) enforce MAX_TCP_SEGMENT which guarantees this.
     let tcp_len = tcp_data.len() as u16;
     let mut pseudo = Vec::with_capacity(12 + tcp_data.len());
     pseudo.extend_from_slice(&src_ip);
@@ -97,7 +102,16 @@ struct TcpBuildParams {
 }
 
 /// Build a TCP segment with auto-computed checksum.
+///
+/// Payload is capped so the total segment fits in a single IPv4 packet
+/// and the pseudo-header length field doesn't overflow u16.
 fn build(p: &TcpBuildParams, payload: &[u8]) -> Vec<u8> {
+    let max_payload = MAX_TCP_SEGMENT - 20; // 20-byte TCP header
+    let payload = if payload.len() > max_payload {
+        &payload[..max_payload]
+    } else {
+        payload
+    };
     let data_offset: u8 = 5; // 20 bytes, no options
     let total_len = 20 + payload.len();
     let mut pkt = Vec::with_capacity(total_len);

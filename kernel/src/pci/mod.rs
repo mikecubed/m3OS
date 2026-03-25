@@ -62,6 +62,32 @@ pub fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     ((dword >> shift) & 0xFF) as u8
 }
 
+/// Write a 16-bit value to PCI configuration space.
+#[allow(dead_code)]
+pub fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    debug_assert_eq!(
+        offset & 1,
+        0,
+        "PCI config u16 offset must be 2-byte aligned"
+    );
+    let addr = config_address(bus, device, function, offset);
+    interrupts::without_interrupts(|| {
+        // Read-modify-write: read the 32-bit dword, patch the 16-bit half.
+        // SAFETY: standard PCI configuration space mechanism #1.
+        unsafe {
+            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+            let mut data_port = Port::<u32>::new(CONFIG_DATA);
+            addr_port.write(addr);
+            let dword = data_port.read();
+            let shift = ((offset & 2) as u32) * 8;
+            let mask = !(0xFFFFu32 << shift);
+            let patched = (dword & mask) | ((value as u32) << shift);
+            addr_port.write(addr);
+            data_port.write(patched);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // PciDevice (P15-T035)
 // ---------------------------------------------------------------------------

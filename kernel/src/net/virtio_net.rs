@@ -544,6 +544,14 @@ pub fn init() {
     let io_base = (bar0 & 0xFFFF_FFFC) as u16;
     log::info!("[virtio-net] BAR0 I/O base: {:#x}", io_base);
 
+    // Ensure PCI command register has I/O space (bit 0) and bus mastering
+    // (bit 2) enabled — required for port I/O and DMA respectively.
+    let cmd = pci::pci_config_read_u16(dev.bus, dev.device, dev.function, 0x04);
+    if cmd & 0x05 != 0x05 {
+        pci::pci_config_write_u16(dev.bus, dev.device, dev.function, 0x04, cmd | 0x05);
+        log::info!("[virtio-net] PCI command: enabled I/O space + bus mastering");
+    }
+
     // P16-T003: Reset sequence.
     unsafe {
         // Reset the device.

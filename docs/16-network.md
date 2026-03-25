@@ -6,6 +6,12 @@ Phase 16 adds a minimal TCP/IP network stack over a virtio-net NIC. The OS can
 now send and receive Ethernet frames, resolve IP addresses via ARP, respond to
 and initiate ICMP pings, and handle UDP datagrams and TCP connections.
 
+> **Note:** In Phase 16 the network stack is implemented inside the kernel
+> (`kernel/src/net/*`) and runs as `net_task`. This is a temporary kernel-mode
+> implementation to get a working TCP/IP stack. The long-term plan is to move
+> these layers behind a userspace `net_server` with socket-style syscalls, in
+> line with the microkernel architecture described in `docs/01-architecture.md`.
+
 ## Architecture
 
 ```mermaid
