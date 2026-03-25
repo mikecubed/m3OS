@@ -853,7 +853,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let mut name_cstr = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
-        None => return u64::MAX,
+        None => return NEG_EFAULT,
     };
 
     log::info!(
@@ -880,14 +880,15 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Some(d) => d,
         None => {
             log::warn!("[execve] file not found: {}", file_name);
-            return u64::MAX;
+            return NEG_ENOENT;
         }
     };
 
     // Allocate a fresh page table for the new image.
+    const NEG_ENOMEM: u64 = (-12_i64) as u64;
     let new_cr3 = match crate::mm::new_process_page_table() {
         Some(f) => f,
-        None => return u64::MAX,
+        None => return NEG_ENOMEM,
     };
 
     let phys_off = crate::mm::phys_offset();
@@ -907,7 +908,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             Ok(l) => l,
             Err(e) => {
                 log::warn!("[execve] ELF load failed: {:?}", e);
-                return u64::MAX;
+                return NEG_ENOENT; // treat invalid ELF as "not found"
             }
         };
         // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
@@ -925,7 +926,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             Ok(rsp) => rsp,
             Err(e) => {
                 log::warn!("[execve] ABI stack setup failed: {:?}", e);
-                return u64::MAX;
+                return NEG_ENOMEM;
             }
         };
         (loaded, user_rsp)
@@ -989,9 +990,10 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     // For specific PID: verify it's a child.
     if target_pid > 0 {
         let table = crate::process::PROCESS_TABLE.lock();
+        const NEG_ECHILD_PRE: u64 = (-10_i64) as u64;
         match table.find(target_pid as crate::process::Pid) {
-            None => return u64::MAX,
-            Some(p) if p.ppid != calling_pid => return u64::MAX,
+            None => return NEG_ECHILD_PRE,
+            Some(p) if p.ppid != calling_pid => return NEG_ECHILD_PRE,
             Some(_) => {}
         }
     }
