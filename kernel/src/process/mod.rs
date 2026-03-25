@@ -130,19 +130,32 @@ pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
 /// propagates correctly. Called by `sys_exit` before marking the process
 /// as a zombie.
 pub fn close_all_fds_for(pid: Pid) {
-    let mut table = PROCESS_TABLE.lock();
-    let proc = match table.find_mut(pid) {
-        Some(p) => p,
-        None => return,
-    };
-    for slot in proc.fd_table.iter_mut() {
-        if let Some(entry) = slot.take() {
-            match &entry.backend {
-                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
-                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-                _ => {}
+    // Collect pipe IDs under the process table lock, then close them
+    // after releasing the lock to avoid holding PROCESS_TABLE while
+    // locking PIPE_TABLE.
+    let mut readers = alloc::vec::Vec::new();
+    let mut writers = alloc::vec::Vec::new();
+    {
+        let mut table = PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return,
+        };
+        for slot in proc.fd_table.iter_mut() {
+            if let Some(entry) = slot.take() {
+                match &entry.backend {
+                    FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
+                    FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                    _ => {}
+                }
             }
         }
+    }
+    for id in readers {
+        crate::pipe::pipe_close_reader(id);
+    }
+    for id in writers {
+        crate::pipe::pipe_close_writer(id);
     }
 }
 

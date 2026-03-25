@@ -137,7 +137,7 @@
 | P14-T067 | `sleep` — sleep for N seconds | ✅ |
 | P14-T067a | `grep` — search stdin or files for a fixed string | ✅ |
 | P14-T068 | Implement `sys_nanosleep` (syscall 35) | ✅ |
-| P14-T069 | Implement `getdents64` (syscall 217) for real | ✅ |
+| P14-T069 | `getdents64` (syscall 217) — stub returns ENOSYS (deferred) | ✅ |
 | P14-T070 | Add all utility binaries to musl build + ramdisk | ✅ |
 
 ## Track J — Validation and Documentation
