@@ -202,10 +202,10 @@ pub fn handle_ipv4(header: &Ipv4Header, payload: &[u8]) {
             super::icmp::handle_icmp(header, payload);
         }
         PROTO_UDP => {
-            // Will be added in Track D.
+            super::udp::handle_udp(header, payload);
         }
         PROTO_TCP => {
-            // Will be added in Track E.
+            super::tcp::handle_tcp(header, payload);
         }
         _ => {}
     }

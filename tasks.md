@@ -11,9 +11,9 @@
 | A | virtio-net driver | ✅ done |
 | B | Ethernet + ARP | ✅ done |
 | C | IPv4 + ICMP | ✅ done |
-| D | UDP | 🚧 in progress |
-| E | TCP | 🚧 in progress |
-| F | Socket API + net_server | ⬜ pending |
+| D | UDP | ✅ done |
+| E | TCP | ✅ done |
+| F | Socket API + net_server | 🚧 in progress |
 | G | Validation + documentation | ⬜ pending |
 
 ---
@@ -70,30 +70,30 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T034 | Define `UdpHeader` struct | ⬜ |
-| P16-T035 | Implement `udp_parse()` | ⬜ |
-| P16-T036 | Implement `udp_build()` | ⬜ |
-| P16-T037 | Implement UDP port binding table | ⬜ |
-| P16-T038 | Implement `udp_send()` | ⬜ |
-| P16-T039 | Implement `udp_recv()` | ⬜ |
+| P16-T034 | Define `UdpHeader` struct | ✅ |
+| P16-T035 | Implement `udp_parse()` | ✅ |
+| P16-T036 | Implement `udp_build()` | ✅ |
+| P16-T037 | Implement UDP port binding table | ✅ |
+| P16-T038 | Implement `udp_send()` | ✅ |
+| P16-T039 | Implement `udp_recv()` | ✅ |
 
 ## Track E — TCP
 
 | Task | Description | Status |
 |---|---|---|
-| P16-T040 | Define `TcpHeader` struct | ⬜ |
-| P16-T041 | Implement TCP checksum | ⬜ |
-| P16-T042 | Implement TCP parse/build | ⬜ |
-| P16-T043 | Define `TcpState` enum | ⬜ |
-| P16-T044 | Define `TcpConnection` struct | ⬜ |
-| P16-T045 | Implement active open (client connect) | ⬜ |
-| P16-T046 | Implement passive open (server listen) | ⬜ |
-| P16-T047 | Implement data send | ⬜ |
-| P16-T048 | Implement data receive | ⬜ |
-| P16-T049 | Implement connection close (active) | ⬜ |
-| P16-T050 | Implement connection close (passive) | ⬜ |
-| P16-T051 | Implement RST handling | ⬜ |
-| P16-T052 | Implement simple flow control | ⬜ |
+| P16-T040 | Define `TcpHeader` struct | ✅ |
+| P16-T041 | Implement TCP checksum | ✅ |
+| P16-T042 | Implement TCP parse/build | ✅ |
+| P16-T043 | Define `TcpState` enum | ✅ |
+| P16-T044 | Define `TcpConnection` struct | ✅ |
+| P16-T045 | Implement active open (client connect) | ✅ |
+| P16-T046 | Implement passive open (server listen) | ✅ |
+| P16-T047 | Implement data send | ✅ |
+| P16-T048 | Implement data receive | ✅ |
+| P16-T049 | Implement connection close (active) | ✅ |
+| P16-T050 | Implement connection close (passive) | ✅ |
+| P16-T051 | Implement RST handling | ✅ |
+| P16-T052 | Implement simple flow control | ✅ |
 
 ## Track F — Socket API and net_server
 

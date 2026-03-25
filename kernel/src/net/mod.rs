@@ -14,4 +14,8 @@ pub mod ethernet;
 pub mod icmp;
 #[allow(dead_code)]
 pub mod ipv4;
+#[allow(dead_code)]
+pub mod tcp;
+#[allow(dead_code)]
+pub mod udp;
 pub mod virtio_net;
