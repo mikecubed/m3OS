@@ -159,14 +159,27 @@ fn validate_rsdp(addr: PhysAddr) -> Option<u8> {
 
 /// Validate an SDT's checksum (sum of all bytes in the table == 0 mod 256).
 fn validate_sdt(header_virt: usize) -> bool {
-    // SAFETY: header_virt points to identity-mapped ACPI table memory that
-    // is valid for `length` bytes as reported by the firmware.
+    const MIN_SDT_LENGTH: usize = core::mem::size_of::<AcpiSdtHeader>();
+    const MAX_SDT_LENGTH: usize = 1024 * 1024; // 1 MiB upper bound
+
     // SAFETY: reading the `length` field from a packed SDT header at a
     // potentially unaligned address via raw pointer arithmetic.
     let length = unsafe {
         let hdr_ptr = header_virt as *const u8;
         ptr::read_unaligned(hdr_ptr.add(4) as *const u32)
     } as usize;
+
+    if !(MIN_SDT_LENGTH..=MAX_SDT_LENGTH).contains(&length) {
+        log::warn!(
+            "[acpi] SDT length out of bounds: {} (expected {}..={})",
+            length,
+            MIN_SDT_LENGTH,
+            MAX_SDT_LENGTH
+        );
+        return false;
+    }
+
+    // SAFETY: length is bounded above; the ACPI region is identity-mapped.
     let bytes = unsafe { core::slice::from_raw_parts(header_virt as *const u8, length) };
     let sum: u8 = bytes.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
     sum == 0
@@ -581,6 +594,14 @@ pub fn io_apic_address() -> Option<u32> {
     MADT_INFO
         .get()
         .and_then(|m| m.io_apic.map(|io| io.io_apic_address))
+}
+
+/// Returns the I/O APIC's Global System Interrupt base, or 0 if unknown.
+pub fn ioapic_gsi_base() -> u32 {
+    MADT_INFO
+        .get()
+        .and_then(|m| m.io_apic.map(|io| io.global_system_interrupt_base))
+        .unwrap_or(0)
 }
 
 /// Look up an IRQ source override by its ISA source IRQ number.

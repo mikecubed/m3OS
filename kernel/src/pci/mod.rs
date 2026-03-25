@@ -44,7 +44,7 @@ fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
 /// Read a 16-bit value from PCI configuration space.
 pub fn pci_config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     let dword = pci_config_read_u32(bus, device, function, offset);
-    // The offset's low bit selects which 16-bit half of the 32-bit value.
+    // Bit 1 of the offset selects which 16-bit half of the 32-bit dword.
     let shift = ((offset & 2) as u32) * 8;
     ((dword >> shift) & 0xFFFF) as u16
 }

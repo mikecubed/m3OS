@@ -195,6 +195,8 @@ fn ioapic_init() {
             ioapic_write_redir(gsi, low, 0);
         }
 
+        let gsi_base = crate::acpi::ioapic_gsi_base();
+
         // --- Keyboard: ISA IRQ 1 → vector 33 ---
         {
             let (gsi, active_low, level_triggered) = if let Some(ovr) = crate::acpi::irq_override(1)
@@ -202,16 +204,24 @@ fn ioapic_init() {
                 let (al, lt) = decode_override_flags(ovr.flags);
                 (ovr.global_system_interrupt, al, lt)
             } else {
-                (1u32, false, false) // ISA default: active-high, edge
+                (gsi_base + 1, false, false) // ISA default: active-high, edge
             };
-            let low = redir_entry_low(33, active_low, level_triggered, false);
-            ioapic_write_redir(gsi, low, bsp_lapic_id);
-            log::info!(
-                "[apic] I/O APIC: IRQ 1 → GSI {} → vector 33 (active_low={}, level={})",
-                gsi,
-                active_low,
-                level_triggered
-            );
+            if gsi <= max_redir {
+                let low = redir_entry_low(33, active_low, level_triggered, false);
+                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                log::info!(
+                    "[apic] I/O APIC: IRQ 1 → GSI {} → vector 33 (active_low={}, level={})",
+                    gsi,
+                    active_low,
+                    level_triggered
+                );
+            } else {
+                log::warn!(
+                    "[apic] I/O APIC: IRQ 1 GSI {} exceeds max redir {}; skipped",
+                    gsi,
+                    max_redir
+                );
+            }
         }
 
         // --- COM1: ISA IRQ 4 → vector 36 ---
@@ -224,14 +234,22 @@ fn ioapic_init() {
                 let (al, lt) = decode_override_flags(ovr.flags);
                 (ovr.global_system_interrupt, al, lt)
             } else {
-                (4u32, false, false)
+                (gsi_base + 4, false, false)
             };
-            let low = redir_entry_low(36, active_low, level_triggered, true); // masked
-            ioapic_write_redir(gsi, low, bsp_lapic_id);
-            log::info!(
-                "[apic] I/O APIC: IRQ 4 → GSI {} → vector 36 (masked, no handler yet)",
-                gsi,
-            );
+            if gsi <= max_redir {
+                let low = redir_entry_low(36, active_low, level_triggered, true); // masked
+                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                log::info!(
+                    "[apic] I/O APIC: IRQ 4 → GSI {} → vector 36 (masked, no handler yet)",
+                    gsi,
+                );
+            } else {
+                log::warn!(
+                    "[apic] I/O APIC: IRQ 4 GSI {} exceeds max redir {}; skipped",
+                    gsi,
+                    max_redir
+                );
+            }
         }
 
         // --- Timer: ISA IRQ 0 ---
@@ -245,16 +263,22 @@ fn ioapic_init() {
                 let (al, lt) = decode_override_flags(ovr.flags);
                 (ovr.global_system_interrupt, al, lt)
             } else {
-                (0u32, false, false)
+                (gsi_base, false, false)
             };
-            // Route PIT to vector 32 (same as Timer vector) — needed during
-            // calibration while the PIC is still active.
-            let low = redir_entry_low(32, active_low, level_triggered, false);
-            ioapic_write_redir(gsi, low, bsp_lapic_id);
-            log::info!(
-                "[apic] I/O APIC: IRQ 0 → GSI {} → vector 32 (for PIT calibration)",
-                gsi,
-            );
+            if gsi <= max_redir {
+                let low = redir_entry_low(32, active_low, level_triggered, false);
+                ioapic_write_redir(gsi, low, bsp_lapic_id);
+                log::info!(
+                    "[apic] I/O APIC: IRQ 0 → GSI {} → vector 32 (for PIT calibration)",
+                    gsi,
+                );
+            } else {
+                log::warn!(
+                    "[apic] I/O APIC: IRQ 0 GSI {} exceeds max redir {}; skipped",
+                    gsi,
+                    max_redir
+                );
+            }
         }
     }
 }
@@ -326,21 +350,41 @@ fn calibrate_lapic_timer() -> u32 {
 /// Configure the LAPIC timer in periodic mode.
 ///
 /// `period_ms` — timer period in milliseconds (e.g. 10 for 100 Hz).
-fn start_lapic_timer(period_ms: u32) {
+/// Returns `true` if the timer was successfully started.
+fn start_lapic_timer(period_ms: u32) -> bool {
     let tpm = *LAPIC_TICKS_PER_MS
         .get()
         .expect("LAPIC timer not calibrated");
+
+    if tpm == 0 {
+        log::error!("[apic] LAPIC timer calibration returned 0 ticks/ms; timer not started");
+        return false;
+    }
+
+    // Use u64 to avoid overflow on fast systems.
+    let init_count_64 = tpm as u64 * period_ms as u64;
+    let init_count = if init_count_64 > u32::MAX as u64 {
+        log::warn!(
+            "[apic] LAPIC timer initial count {} exceeds u32::MAX; clamping",
+            init_count_64
+        );
+        u32::MAX
+    } else {
+        init_count_64 as u32
+    };
+
     unsafe {
         // LVT Timer: vector 32, periodic mode (bit 17 set).
         lapic_write(LAPIC_LVT_TIMER, 32 | (1 << 17));
         lapic_write(LAPIC_TIMER_DIVIDE_CONFIG, 0x03); // divide-by-16
-        lapic_write(LAPIC_TIMER_INIT_COUNT, tpm * period_ms);
+        lapic_write(LAPIC_TIMER_INIT_COUNT, init_count);
     }
     log::info!(
         "[apic] LAPIC timer: periodic, {}ms, {} ticks/ms",
         period_ms,
         tpm
     );
+    true
 }
 
 // ===========================================================================
@@ -390,15 +434,17 @@ pub fn init() {
         LAPIC_TICKS_PER_MS.call_once(|| tpm);
 
         // 4. Start LAPIC timer (10 ms periodic → 100 Hz).
-        start_lapic_timer(10);
+        if !start_lapic_timer(10) {
+            log::error!("[apic] LAPIC timer failed to start; staying on PIC");
+            return;
+        }
 
         // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
         unsafe {
-            let (gsi, _, _) = if let Some(ovr) = crate::acpi::irq_override(0) {
-                let (al, lt) = decode_override_flags(ovr.flags);
-                (ovr.global_system_interrupt, al, lt)
+            let gsi = if let Some(ovr) = crate::acpi::irq_override(0) {
+                ovr.global_system_interrupt
             } else {
-                (0u32, false, false)
+                crate::acpi::ioapic_gsi_base()
             };
             let low = redir_entry_low(32, false, false, true); // masked
             ioapic_write_redir(gsi, low, 0);
@@ -408,7 +454,10 @@ pub fn init() {
         disable_legacy_pic();
 
         // 7. Switch interrupt handlers to APIC EOI path now that the PIC is off.
-        USING_APIC.store(true, core::sync::atomic::Ordering::Release);
+        // Relaxed is sufficient: the entire transition runs with interrupts
+        // disabled, so no handler can observe the flag until after this
+        // closure returns and interrupts are re-enabled.
+        USING_APIC.store(true, core::sync::atomic::Ordering::Relaxed);
 
         log::info!("[apic] APIC interrupt routing active");
     });
