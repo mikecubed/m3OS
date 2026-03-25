@@ -187,14 +187,13 @@ pub fn send(dst_ip: Ipv4Addr, protocol: u8, payload: &[u8]) {
         config::gateway_ip()
     };
 
-    // Try ARP cache first; if miss, send request and use broadcast as fallback.
+    // Try ARP cache first; if miss, send ARP request and drop this packet.
+    // The ARP reply will populate the cache so subsequent sends succeed.
     let dst_mac = match arp::resolve(next_hop) {
         Some(mac) => mac,
         None => {
-            // Send ARP request and use broadcast for this first packet.
-            // The reply will populate the cache for subsequent packets.
             arp::send_request(next_hop);
-            ethernet::MAC_BROADCAST
+            return;
         }
     };
 
