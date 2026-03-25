@@ -2,18 +2,18 @@
 
 **Branch:** `phase-15-hardware-discovery`
 **Depends on:** Phase 3 (Interrupts) ✅, Phase 14 (Shell) ✅
-**Status:** 🔧 In Progress
+**Status:** 🔧 In Progress — Track F remaining
 
 ## Track Status
 
 | Track | Scope | Status |
 |---|---|---|
 | A | ACPI table discovery and parsing | ✅ done |
-| B | Local APIC initialization | 🔧 in progress |
-| C | I/O APIC initialization | ⬜ blocked on B |
-| D | Timer migration (PIT → LAPIC timer) | ⬜ blocked on B, C |
+| B | Local APIC initialization | ✅ done |
+| C | I/O APIC initialization | ✅ done |
+| D | Timer migration (PIT → LAPIC timer) | ✅ done |
 | E | PCI bus enumeration | ✅ done |
-| F | Validation + documentation | ⬜ blocked on all |
+| F | Validation + documentation | 🔧 in progress |
 
 ---
 
@@ -36,38 +36,38 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T011 | Read Local APIC base address from MADT / MSR fallback | ⬜ |
-| P15-T012 | Verify LAPIC MMIO page accessible via `physical_memory_offset` | ⬜ |
-| P15-T013 | Define LAPIC register offsets | ⬜ |
-| P15-T014 | Implement `lapic_init()`: enable LAPIC via Spurious register | ⬜ |
-| P15-T015 | Add spurious interrupt handler at vector 0xFF | ⬜ |
-| P15-T016 | Implement `lapic_eoi()` | ⬜ |
+| P15-T011 | Read Local APIC base address from MADT / MSR fallback | ✅ |
+| P15-T012 | Verify LAPIC MMIO page accessible via `physical_memory_offset` | ✅ |
+| P15-T013 | Define LAPIC register offsets | ✅ |
+| P15-T014 | Implement `lapic_init()`: enable LAPIC via Spurious register | ✅ |
+| P15-T015 | Add spurious interrupt handler at vector 0xFF | ✅ |
+| P15-T016 | Implement `lapic_eoi()` | ✅ |
 
 ## Track C — I/O APIC Initialization
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T017 | Read I/O APIC base address from MADT | ⬜ |
-| P15-T018 | Implement I/O APIC register access (IOREGSEL/IOWIN) | ⬜ |
-| P15-T019 | Read I/O APIC Version register | ⬜ |
-| P15-T020 | Define redirection table entry format | ⬜ |
-| P15-T021 | Program redirection for IRQ 1 (keyboard) | ⬜ |
-| P15-T022 | Program redirection for IRQ 4 (COM1 serial) | ⬜ |
-| P15-T023 | Mask all unused I/O APIC redirection entries | ⬜ |
-| P15-T024 | Disable legacy 8259 PIC | ⬜ |
-| P15-T025 | Update keyboard IRQ handler → `lapic_eoi()` | ⬜ |
-| P15-T026 | Update serial IRQ handler → `lapic_eoi()` | ⬜ |
+| P15-T017 | Read I/O APIC base address from MADT | ✅ |
+| P15-T018 | Implement I/O APIC register access (IOREGSEL/IOWIN) | ✅ |
+| P15-T019 | Read I/O APIC Version register | ✅ |
+| P15-T020 | Define redirection table entry format | ✅ |
+| P15-T021 | Program redirection for IRQ 1 (keyboard) | ✅ |
+| P15-T022 | Program redirection for IRQ 4 (COM1 serial) | ✅ |
+| P15-T023 | Mask all unused I/O APIC redirection entries | ✅ |
+| P15-T024 | Disable legacy 8259 PIC | ✅ |
+| P15-T025 | Update keyboard IRQ handler → `lapic_eoi()` | ✅ |
+| P15-T026 | Update serial IRQ handler → `lapic_eoi()` | ✅ |
 
 ## Track D — Timer Migration (PIT → LAPIC Timer)
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T027 | Calibrate LAPIC timer using PIT one-shot | ⬜ |
-| P15-T028 | Store calibrated ticks-per-ms value | ⬜ |
-| P15-T029 | Configure LAPIC timer in periodic mode (vector 32, ~10ms) | ⬜ |
-| P15-T030 | Update timer IRQ handler → `lapic_eoi()` | ⬜ |
-| P15-T031 | Verify TICK_COUNT increments and scheduler fires | ⬜ |
-| P15-T032 | Stop the PIT after LAPIC timer is running | ⬜ |
+| P15-T027 | Calibrate LAPIC timer using PIT one-shot | ✅ |
+| P15-T028 | Store calibrated ticks-per-ms value | ✅ |
+| P15-T029 | Configure LAPIC timer in periodic mode (vector 32, ~10ms) | ✅ |
+| P15-T030 | Update timer IRQ handler → `lapic_eoi()` | ✅ |
+| P15-T031 | Verify TICK_COUNT increments and scheduler fires | ✅ |
+| P15-T032 | Stop the PIT after LAPIC timer is running | ✅ |
 
 ## Track E — PCI Bus Enumeration
 
@@ -86,12 +86,12 @@
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T041 | Acceptance: kernel boots using LAPIC timer | ⬜ |
-| P15-T042 | Acceptance: keyboard via I/O APIC works | ⬜ |
-| P15-T043 | Acceptance: legacy 8259 PIC fully masked/disabled | ⬜ |
-| P15-T044 | Acceptance: boot log prints PCI device list | ⬜ |
-| P15-T045 | Acceptance: ACPI logs CPU count and APIC IDs | ⬜ |
-| P15-T046 | Acceptance: shell, pipes, utilities work without regression | ⬜ |
-| P15-T047 | `cargo xtask check` passes | ⬜ |
-| P15-T048 | QEMU boot validation — no panics | ⬜ |
+| P15-T041 | Acceptance: kernel boots using LAPIC timer | ✅ |
+| P15-T042 | Acceptance: keyboard via I/O APIC works | ✅ |
+| P15-T043 | Acceptance: legacy 8259 PIC fully masked/disabled | ✅ |
+| P15-T044 | Acceptance: boot log prints PCI device list | ✅ |
+| P15-T045 | Acceptance: ACPI logs CPU count and APIC IDs | ✅ |
+| P15-T046 | Acceptance: shell, pipes, utilities work without regression | ✅ |
+| P15-T047 | `cargo xtask check` passes | ✅ |
+| P15-T048 | QEMU boot validation — no panics | ✅ |
 | P15-T049 | Write `docs/15-hardware-discovery.md` | ⬜ |
