@@ -93,7 +93,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     log::info!("[arch] interrupts enabled");
 
     // Phase 15: switch from PIC to APIC interrupt routing.
-    arch::x86_64::apic::init();
+    // Only attempt APIC init if ACPI MADT data is available; otherwise the
+    // kernel falls back to the legacy PIC (which is already running).
+    if acpi::io_apic_address().is_some() {
+        arch::x86_64::apic::init();
+    } else {
+        log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
+    }
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {

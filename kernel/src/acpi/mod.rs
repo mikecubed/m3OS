@@ -190,7 +190,16 @@ fn parse_rsdt(phys: u32) -> Option<SdtEntries> {
     // SAFETY: virt points to a valid RSDT in identity-mapped memory.
     let header: AcpiSdtHeader = unsafe { ptr::read_unaligned(virt as *const AcpiSdtHeader) };
     let header_size = core::mem::size_of::<AcpiSdtHeader>();
-    let entry_count = (header.length as usize - header_size) / 4;
+    let header_len = header.length as usize;
+    if header_len < header_size {
+        log::warn!(
+            "[acpi] RSDT length too small: length={} header_size={}",
+            header_len,
+            header_size
+        );
+        return None;
+    }
+    let entry_count = (header_len - header_size) / 4;
 
     let mut result = SdtEntries {
         entries: [0; 32],
@@ -218,7 +227,16 @@ fn parse_xsdt(phys: u64) -> Option<SdtEntries> {
     // SAFETY: virt points to a valid XSDT in identity-mapped memory.
     let header: AcpiSdtHeader = unsafe { ptr::read_unaligned(virt as *const AcpiSdtHeader) };
     let header_size = core::mem::size_of::<AcpiSdtHeader>();
-    let entry_count = (header.length as usize - header_size) / 8;
+    let header_len = header.length as usize;
+    if header_len < header_size {
+        log::warn!(
+            "[acpi] XSDT length too small: length={} header_size={}",
+            header_len,
+            header_size
+        );
+        return None;
+    }
+    let entry_count = (header_len - header_size) / 8;
 
     let mut result = SdtEntries {
         entries: [0; 32],
@@ -252,7 +270,11 @@ pub fn find_table(signature: &[u8; 4]) -> Option<*const AcpiSdtHeader> {
     for i in 0..entries.count {
         let hdr_virt = entries.entries[i];
         // SAFETY: hdr_virt points to an identity-mapped ACPI SDT header.
-        let sig = unsafe { ptr::read_unaligned(&(*(hdr_virt as *const AcpiSdtHeader)).signature) };
+        // Use addr_of! to avoid forming a reference to a packed field (UB).
+        let sig = unsafe {
+            let sig_ptr = core::ptr::addr_of!((*(hdr_virt as *const AcpiSdtHeader)).signature);
+            ptr::read_unaligned(sig_ptr)
+        };
         if sig == *signature {
             return Some(hdr_virt as *const AcpiSdtHeader);
         }
@@ -507,7 +529,9 @@ pub fn init(rsdp_addr: Option<u64>) {
             // Log each table signature for debugging.
             for i in 0..e.count {
                 let sig = unsafe {
-                    ptr::read_unaligned(&(*(e.entries[i] as *const AcpiSdtHeader)).signature)
+                    let hdr = e.entries[i] as *const AcpiSdtHeader;
+                    let sig_ptr = core::ptr::addr_of!((*hdr).signature);
+                    ptr::read_unaligned(sig_ptr)
                 };
                 if let Ok(s) = core::str::from_utf8(&sig) {
                     log::info!("[acpi]   table {}: {}", i, s);

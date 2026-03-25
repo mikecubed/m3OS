@@ -215,6 +215,9 @@ fn ioapic_init() {
         }
 
         // --- COM1: ISA IRQ 4 → vector 36 ---
+        // Kept masked: no IDT handler for vector 36 is installed yet.
+        // Unmasking without a handler would triple-fault on UART interrupts.
+        // A future serial IRQ handler can unmask this entry when ready.
         {
             let (gsi, active_low, level_triggered) = if let Some(ovr) = crate::acpi::irq_override(4)
             {
@@ -223,13 +226,11 @@ fn ioapic_init() {
             } else {
                 (4u32, false, false)
             };
-            let low = redir_entry_low(36, active_low, level_triggered, false);
+            let low = redir_entry_low(36, active_low, level_triggered, true); // masked
             ioapic_write_redir(gsi, low, bsp_lapic_id);
             log::info!(
-                "[apic] I/O APIC: IRQ 4 → GSI {} → vector 36 (active_low={}, level={})",
+                "[apic] I/O APIC: IRQ 4 → GSI {} → vector 36 (masked, no handler yet)",
                 gsi,
-                active_low,
-                level_triggered
             );
         }
 
@@ -375,36 +376,40 @@ pub fn disable_legacy_pic() {
 /// * The LAPIC timer fires vector 32 at ~100 Hz (10 ms period).
 /// * The legacy 8259 PIC is fully masked.
 pub fn init() {
-    // 1. Enable Local APIC.
-    lapic_init();
+    // Perform the entire APIC handoff with interrupts disabled to avoid
+    // acknowledging IRQs on the wrong controller during the transition.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        // 1. Enable Local APIC.
+        lapic_init();
 
-    // 2. Program I/O APIC redirection entries.
-    ioapic_init();
+        // 2. Program I/O APIC redirection entries.
+        ioapic_init();
 
-    // 3. Calibrate LAPIC timer against PIT channel 2.
-    let tpm = calibrate_lapic_timer();
-    LAPIC_TICKS_PER_MS.call_once(|| tpm);
+        // 3. Calibrate LAPIC timer against PIT channel 2.
+        let tpm = calibrate_lapic_timer();
+        LAPIC_TICKS_PER_MS.call_once(|| tpm);
 
-    // 4. Start LAPIC timer (10 ms periodic → 100 Hz).
-    start_lapic_timer(10);
+        // 4. Start LAPIC timer (10 ms periodic → 100 Hz).
+        start_lapic_timer(10);
 
-    // 5. Switch interrupt handlers to APIC EOI path.
-    USING_APIC.store(true, core::sync::atomic::Ordering::Release);
+        // 5. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
+        unsafe {
+            let (gsi, _, _) = if let Some(ovr) = crate::acpi::irq_override(0) {
+                let (al, lt) = decode_override_flags(ovr.flags);
+                (ovr.global_system_interrupt, al, lt)
+            } else {
+                (0u32, false, false)
+            };
+            let low = redir_entry_low(32, false, false, true); // masked
+            ioapic_write_redir(gsi, low, 0);
+        }
 
-    // 6. Mask the PIT's I/O APIC entry now that the LAPIC timer is running.
-    unsafe {
-        let (gsi, _, _) = if let Some(ovr) = crate::acpi::irq_override(0) {
-            let (al, lt) = decode_override_flags(ovr.flags);
-            (ovr.global_system_interrupt, al, lt)
-        } else {
-            (0u32, false, false)
-        };
-        let low = redir_entry_low(32, false, false, true); // masked
-        ioapic_write_redir(gsi, low, 0);
-    }
+        // 6. Disable legacy PIC entirely before switching handlers to APIC EOIs.
+        disable_legacy_pic();
 
-    // 7. Disable legacy PIC entirely.
-    disable_legacy_pic();
+        // 7. Switch interrupt handlers to APIC EOI path now that the PIC is off.
+        USING_APIC.store(true, core::sync::atomic::Ordering::Release);
 
-    log::info!("[apic] APIC interrupt routing active");
+        log::info!("[apic] APIC interrupt routing active");
+    });
 }
