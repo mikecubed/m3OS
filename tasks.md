@@ -1,98 +1,127 @@
-# Phase 15 — Hardware Discovery (ACPI + PCI)
+# Phase 16 — Network Stack
 
-**Branch:** `phase-15-hardware-discovery`
-**Depends on:** Phase 3 (Interrupts) ✅, Phase 14 (Shell) ✅
-**Status:** ✅ Complete — all 49 tasks done, QEMU-validated.
-**Documentation:** [`docs/15-hardware-discovery.md`](docs/15-hardware-discovery.md)
+**Branch:** `phase-16-network-stack`
+**Depends on:** Phase 12 (POSIX Compat) ✅, Phase 15 (Hardware Discovery) ✅
+**Status:** 🚧 In progress
 
 ## Track Status
 
 | Track | Scope | Status |
 |---|---|---|
-| A | ACPI table discovery and parsing | ✅ done |
-| B | Local APIC initialization | ✅ done |
-| C | I/O APIC initialization | ✅ done |
-| D | Timer migration (PIT → LAPIC timer) | ✅ done |
-| E | PCI bus enumeration | ✅ done |
-| F | Validation + documentation | ✅ done |
+| A | virtio-net driver | 🚧 in progress |
+| B | Ethernet + ARP | ⬜ pending |
+| C | IPv4 + ICMP | ⬜ pending |
+| D | UDP | ⬜ pending |
+| E | TCP | ⬜ pending |
+| F | Socket API + net_server | ⬜ pending |
+| G | Validation + documentation | ⬜ pending |
 
 ---
 
-## Track A — ACPI Table Discovery
+## Track A — virtio-net Driver
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T001 | Read `boot_info.rsdp_addr` and store in global `Once<PhysAddr>` | ✅ |
-| P15-T002 | Define RSDP v1/v2 structures | ✅ |
-| P15-T003 | Implement `validate_rsdp()`: verify signature and checksum | ✅ |
-| P15-T004 | Define ACPI SDT header struct | ✅ |
-| P15-T005 | Implement `parse_rsdt()` / `parse_xsdt()` | ✅ |
-| P15-T006 | Implement SDT signature lookup | ✅ |
-| P15-T007 | Define MADT structures (Local APIC, I/O APIC, ISO entries) | ✅ |
-| P15-T008 | Implement `parse_madt()` | ✅ |
-| P15-T009 | Define FADT structure (minimal) | ✅ |
-| P15-T010 | Log ACPI discovery results | ✅ |
+| P16-T001 | Find virtio-net device in PCI device list | ⬜ |
+| P16-T002 | Read BARs to locate virtio configuration regions | ⬜ |
+| P16-T003 | Implement virtio device reset sequence | ⬜ |
+| P16-T004 | Implement feature negotiation | ⬜ |
+| P16-T005 | Define `Virtqueue` struct | ⬜ |
+| P16-T006 | Implement `virtqueue_init(queue_index)` | ⬜ |
+| P16-T007 | Initialize RX and TX virtqueues | ⬜ |
+| P16-T008 | Implement `virtio_net_recv()` | ⬜ |
+| P16-T009 | Implement `virtio_net_send(frame)` | ⬜ |
+| P16-T010 | Read device MAC address | ⬜ |
+| P16-T011 | Route virtio-net IRQ through I/O APIC | ⬜ |
+| P16-T012 | Implement interrupt-driven receive | ⬜ |
 
-## Track B — Local APIC Initialization
-
-| Task | Description | Status |
-|---|---|---|
-| P15-T011 | Read Local APIC base address from MADT / MSR fallback | ✅ |
-| P15-T012 | Verify LAPIC MMIO page accessible via `physical_memory_offset` | ✅ |
-| P15-T013 | Define LAPIC register offsets | ✅ |
-| P15-T014 | Implement `lapic_init()`: enable LAPIC via Spurious register | ✅ |
-| P15-T015 | Add spurious interrupt handler at vector 0xFF | ✅ |
-| P15-T016 | Implement `lapic_eoi()` | ✅ |
-
-## Track C — I/O APIC Initialization
+## Track B — Ethernet and ARP
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T017 | Read I/O APIC base address from MADT | ✅ |
-| P15-T018 | Implement I/O APIC register access (IOREGSEL/IOWIN) | ✅ |
-| P15-T019 | Read I/O APIC Version register | ✅ |
-| P15-T020 | Define redirection table entry format | ✅ |
-| P15-T021 | Program redirection for IRQ 1 (keyboard) | ✅ |
-| P15-T022 | Program redirection for IRQ 4 (COM1 serial) | ✅ |
-| P15-T023 | Mask all unused I/O APIC redirection entries | ✅ |
-| P15-T024 | Disable legacy 8259 PIC | ✅ |
-| P15-T025 | Update keyboard IRQ handler → `lapic_eoi()` | ✅ |
-| P15-T026 | Update serial IRQ handler → `lapic_eoi()` | ✅ |
+| P16-T013 | Define `EthernetFrame` struct | ⬜ |
+| P16-T014 | Implement `ethernet_parse()` | ⬜ |
+| P16-T015 | Implement `ethernet_build()` | ⬜ |
+| P16-T016 | Implement EtherType dispatch | ⬜ |
+| P16-T017 | Define ARP packet structure | ⬜ |
+| P16-T018 | Implement ARP parse/build | ⬜ |
+| P16-T019 | Implement ARP cache | ⬜ |
+| P16-T020 | Implement `arp_resolve()` | ⬜ |
+| P16-T021 | Implement ARP request path | ⬜ |
+| P16-T022 | Implement ARP reply handler | ⬜ |
+| P16-T023 | Implement ARP request responder | ⬜ |
 
-## Track D — Timer Migration (PIT → LAPIC Timer)
-
-| Task | Description | Status |
-|---|---|---|
-| P15-T027 | Calibrate LAPIC timer using PIT one-shot | ✅ |
-| P15-T028 | Store calibrated ticks-per-ms value | ✅ |
-| P15-T029 | Configure LAPIC timer in periodic mode (vector 32, ~10ms) | ✅ |
-| P15-T030 | Update timer IRQ handler → `lapic_eoi()` | ✅ |
-| P15-T031 | Verify TICK_COUNT increments and scheduler fires | ✅ |
-| P15-T032 | Stop the PIT after LAPIC timer is running | ✅ |
-
-## Track E — PCI Bus Enumeration
+## Track C — IPv4 and ICMP
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T033 | Implement `pci_config_read_u32(bus, device, function, offset)` | ✅ |
-| P15-T034 | Implement `pci_config_read_u16` and `pci_config_read_u8` helpers | ✅ |
-| P15-T035 | Define `PciDevice` struct | ✅ |
-| P15-T036 | Implement `pci_scan()`: iterate bus/device/function space | ✅ |
-| P15-T037 | Read class, subclass, BARs, interrupt line for each device | ✅ |
-| P15-T038 | Store devices in static array | ✅ |
-| P15-T039 | Expose `pci_device_list()` read-only accessor | ✅ |
-| P15-T040 | Log full PCI device list at boot | ✅ |
+| P16-T024 | Define `Ipv4Header` struct | ⬜ |
+| P16-T025 | Implement `ipv4_parse()` | ⬜ |
+| P16-T026 | Implement IPv4 header checksum | ⬜ |
+| P16-T027 | Implement `ipv4_build()` | ⬜ |
+| P16-T028 | Implement `ipv4_send()` | ⬜ |
+| P16-T029 | Configure static IP (10.0.2.15/24, gw 10.0.2.2) | ⬜ |
+| P16-T030 | Implement protocol dispatch | ⬜ |
+| P16-T031 | Define ICMP header struct | ⬜ |
+| P16-T032 | Implement ICMP echo reply | ⬜ |
+| P16-T033 | Implement `ping(target_ip)` | ⬜ |
 
-## Track F — Validation and Documentation
+## Track D — UDP
 
 | Task | Description | Status |
 |---|---|---|
-| P15-T041 | Acceptance: kernel boots using LAPIC timer | ✅ |
-| P15-T042 | Acceptance: keyboard via I/O APIC works | ✅ |
-| P15-T043 | Acceptance: legacy 8259 PIC fully masked/disabled | ✅ |
-| P15-T044 | Acceptance: boot log prints PCI device list | ✅ |
-| P15-T045 | Acceptance: ACPI logs CPU count and APIC IDs | ✅ |
-| P15-T046 | Acceptance: shell, pipes, utilities work without regression | ✅ |
-| P15-T047 | `cargo xtask check` passes | ✅ |
-| P15-T048 | QEMU boot validation — no panics | ✅ |
-| P15-T049 | Write `docs/15-hardware-discovery.md` | ✅ |
+| P16-T034 | Define `UdpHeader` struct | ⬜ |
+| P16-T035 | Implement `udp_parse()` | ⬜ |
+| P16-T036 | Implement `udp_build()` | ⬜ |
+| P16-T037 | Implement UDP port binding table | ⬜ |
+| P16-T038 | Implement `udp_send()` | ⬜ |
+| P16-T039 | Implement `udp_recv()` | ⬜ |
+
+## Track E — TCP
+
+| Task | Description | Status |
+|---|---|---|
+| P16-T040 | Define `TcpHeader` struct | ⬜ |
+| P16-T041 | Implement TCP checksum | ⬜ |
+| P16-T042 | Implement TCP parse/build | ⬜ |
+| P16-T043 | Define `TcpState` enum | ⬜ |
+| P16-T044 | Define `TcpConnection` struct | ⬜ |
+| P16-T045 | Implement active open (client connect) | ⬜ |
+| P16-T046 | Implement passive open (server listen) | ⬜ |
+| P16-T047 | Implement data send | ⬜ |
+| P16-T048 | Implement data receive | ⬜ |
+| P16-T049 | Implement connection close (active) | ⬜ |
+| P16-T050 | Implement connection close (passive) | ⬜ |
+| P16-T051 | Implement RST handling | ⬜ |
+| P16-T052 | Implement simple flow control | ⬜ |
+
+## Track F — Socket API and net_server
+
+| Task | Description | Status |
+|---|---|---|
+| P16-T053 | Create `userspace/net_server` crate | ⬜ |
+| P16-T054 | Shared-memory region for driver ↔ net_server | ⬜ |
+| P16-T055 | Implement net_server main loop | ⬜ |
+| P16-T056 | Define socket syscall numbers | ⬜ |
+| P16-T057 | Implement `sys_socket()` | ⬜ |
+| P16-T058 | Implement `sys_bind()` | ⬜ |
+| P16-T059 | Implement `sys_connect()` | ⬜ |
+| P16-T060 | Implement `sys_listen()` / `sys_accept()` | ⬜ |
+| P16-T061 | Implement `sys_send()` / `sys_recv()` | ⬜ |
+| P16-T062 | Implement `sys_sendto()` / `sys_recvfrom()` | ⬜ |
+| P16-T063 | Add `ping` shell command | ⬜ |
+| P16-T064 | Add `nc`-like utility | ⬜ |
+
+## Track G — Validation and Documentation
+
+| Task | Description | Status |
+|---|---|---|
+| P16-T065 | Acceptance: virtio-net detected and MAC logged | ⬜ |
+| P16-T066 | Acceptance: `ping 10.0.2.2` works | ⬜ |
+| P16-T067 | Acceptance: UDP echo test | ⬜ |
+| P16-T068 | Acceptance: TCP client test | ⬜ |
+| P16-T069 | Acceptance: TCP server test | ⬜ |
+| P16-T070 | Acceptance: no regressions | ⬜ |
+| P16-T071 | `cargo xtask check` passes | ⬜ |
+| P16-T072 | QEMU boot validation | ⬜ |
+| P16-T073 | Write `docs/16-network.md` | ⬜ |
