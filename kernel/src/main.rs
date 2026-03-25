@@ -699,6 +699,7 @@ fn stdin_feeder_task() -> ! {
         if ctrl && sc == 0x2E {
             let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
             if fg != 0 {
+                stdin::clear_line();
                 shell_print(my_id, console_ep, "^C\n");
                 process::send_signal_to_group(fg, process::SIGINT);
             }
@@ -709,6 +710,7 @@ fn stdin_feeder_task() -> ! {
         if ctrl && sc == 0x2C {
             let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
             if fg != 0 {
+                stdin::clear_line();
                 shell_print(my_id, console_ep, "^Z\n");
                 process::send_signal_to_group(fg, process::SIGTSTP);
             }
@@ -788,22 +790,31 @@ fn shell_task() -> ! {
                     );
                 }
 
-                // Reap finished background jobs.
+                // Reap finished background jobs. Collect reaped jobs first,
+                // then print status after releasing the process table lock
+                // to avoid holding it during IPC/allocation.
+                let mut reaped: Vec<(u32, crate::process::Pid)> = Vec::new();
                 bg_jobs.retain(|&(job, pid)| {
-                    let table = process::PROCESS_TABLE.lock();
-                    match table.find(pid) {
-                        Some(p) if p.state == process::ProcessState::Zombie => {
-                            drop(table);
-                            let mut table = process::PROCESS_TABLE.lock();
-                            table.reap(pid);
-                            let msg = alloc::format!("[{}] done  pid {}\n", job, pid);
-                            shell_print(my_id, console_ep, &msg);
-                            false
+                    let is_zombie = {
+                        let table = process::PROCESS_TABLE.lock();
+                        match table.find(pid) {
+                            Some(p) => p.state == process::ProcessState::Zombie,
+                            None => return false, // already gone
                         }
-                        None => false,
-                        _ => true,
+                    };
+                    if is_zombie {
+                        let mut table = process::PROCESS_TABLE.lock();
+                        table.reap(pid);
+                        reaped.push((job, pid));
+                        false
+                    } else {
+                        true
                     }
                 });
+                for (job, pid) in reaped {
+                    let msg = alloc::format!("[{}] done  pid {}\n", job, pid);
+                    shell_print(my_id, console_ep, &msg);
+                }
 
                 shell_print(my_id, console_ep, "> ");
             } else {
@@ -998,12 +1009,19 @@ fn shell_fork_exec(
 
     // Feed stdin from file if redirected.
     if let (Some(file), Some(pipe_id)) = (stdin_file, stdin_pipe_id) {
-        if let Some(data) = fs::ramdisk::get_file(file.trim_start_matches('/')) {
-            let mut offset = 0;
-            while offset < data.len() {
-                let chunk = (data.len() - offset).min(4096);
-                let _ = pipe::pipe_write(pipe_id, &data[offset..offset + chunk]);
-                offset += chunk;
+        let file_path = file.trim_start_matches('/');
+        match fs::ramdisk::get_file(file_path) {
+            Some(data) => {
+                let mut offset = 0;
+                while offset < data.len() {
+                    let chunk = (data.len() - offset).min(4096);
+                    let _ = pipe::pipe_write(pipe_id, &data[offset..offset + chunk]);
+                    offset += chunk;
+                }
+            }
+            None => {
+                let msg = alloc::format!("{}: No such file\n", file);
+                shell_print(my_id, console_ep, &msg);
             }
         }
         pipe::pipe_close_writer(pipe_id);
@@ -1308,11 +1326,9 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
 
 /// Resolve a command name to an ELF filename via PATH search.
 ///
-/// Searches $PATH directories for `{cmd}.elf` in the ramdisk.
-/// Returns None if the command is not found in any PATH directory.
 /// Validate a redirection target path as a writable tmpfs path.
 ///
-/// Returns the tmpfs-relative path (e.g. "/tmp/foo" → "foo"), or None
+/// Returns the tmpfs-relative path (e.g. "/tmp/foo" -> "foo"), or None
 /// if the path is outside /tmp or contains traversal segments.
 fn validate_tmpfs_path(path: &str) -> Option<String> {
     let trimmed = path.trim_start_matches('/');
@@ -1330,6 +1346,10 @@ fn validate_tmpfs_path(path: &str) -> Option<String> {
     Some(String::from(rest))
 }
 
+/// Resolve a command name to an ELF filename via PATH search.
+///
+/// Searches $PATH directories for `{cmd}.elf` in the ramdisk.
+/// Returns None if the command is not found in any PATH directory.
 fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
     // If already has .elf extension, try directly.
     if cmd.ends_with(".elf") {

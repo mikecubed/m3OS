@@ -111,6 +111,11 @@ pub fn flush_line() {
     STDIN.lock().flush_line();
 }
 
+/// Discard the current line buffer (e.g., on Ctrl-C/Ctrl-Z).
+pub fn clear_line() {
+    STDIN.lock().line.clear();
+}
+
 /// Read from stdin. Returns 0 if no data available (non-blocking check).
 pub fn read(dst: &mut [u8]) -> usize {
     STDIN.lock().read(dst)

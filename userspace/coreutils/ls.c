@@ -24,6 +24,7 @@ int main(int argc, char **argv) {
 
     char buf[1024];
     long nread;
+    int ret = 0;
     while ((nread = syscall(SYS_getdents64, fd, buf, sizeof(buf))) > 0) {
         long pos = 0;
         while (pos < nread) {
@@ -33,6 +34,11 @@ int main(int argc, char **argv) {
             pos += d->d_reclen;
         }
     }
+    if (nread < 0) {
+        const char *msg = "ls: getdents64 error\n";
+        write(2, msg, strlen(msg));
+        ret = 1;
+    }
     close(fd);
-    return 0;
+    return ret;
 }
