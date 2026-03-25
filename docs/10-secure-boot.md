@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 10 adds a host-side signing workflow so `ostest` can produce Secure Boot-friendly
+Phase 10 adds a host-side signing workflow so m³OS can produce Secure Boot-friendly
 artifacts for real UEFI hardware. The implementation has three pieces:
 
 - `scripts/gen-secure-boot-keys.sh` generates a local RSA private key and self-signed
@@ -14,10 +14,10 @@ artifacts for real UEFI hardware. The implementation has three pieces:
 
 ```mermaid
 flowchart LR
-    Keys["scripts/gen-secure-boot-keys.sh"] --> Cert["ostest.key + ostest.crt"]
+    Keys["scripts/gen-secure-boot-keys.sh"] --> Cert["m3os.key + m3os.crt"]
     Cert --> Sign["cargo xtask sign<br/>or<br/>cargo xtask image --sign"]
     Sign --> EFI["bootloader-x86_64-uefi-signed.efi"]
-    Sign --> IMG["boot-uefi-ostest-signed.img"]
+    Sign --> IMG["boot-uefi-m3os-signed.img"]
     IMG --> HW["Secure Boot hardware test"]
 ```
 
@@ -33,8 +33,8 @@ Run the helper from the repository root:
 
 By default it writes:
 
-- `./ostest.key` — 4096-bit RSA private key, mode `600`
-- `./ostest.crt` — self-signed X.509 certificate, mode `644`
+- `./m3os.key` — 4096-bit RSA private key, mode `600`
+- `./m3os.crt` — self-signed X.509 certificate, mode `644`
 
 Both files are ignored by git. `cargo xtask sign` and `cargo xtask image --sign` look
 for them in the repository root unless `--key` / `--cert` override paths are provided.
@@ -42,7 +42,7 @@ for them in the repository root unless `--key` / `--cert` override paths are pro
 The script also accepts an optional output directory for disposable local testing:
 
 ```bash
-./scripts/gen-secure-boot-keys.sh /tmp/ostest-secure-boot
+./scripts/gen-secure-boot-keys.sh /tmp/m3os-secure-boot
 ```
 
 The output directory is created with `umask 077`, so a newly created directory is not
@@ -81,8 +81,8 @@ cargo xtask image --sign
 
 This keeps the existing unsigned outputs and additionally creates:
 
-- `target/x86_64-unknown-none/release/boot-uefi-ostest-signed.img`
-- `target/x86_64-unknown-none/release/boot-uefi-ostest-signed.vhdx`
+- `target/x86_64-unknown-none/release/boot-uefi-m3os-signed.img`
+- `target/x86_64-unknown-none/release/boot-uefi-m3os-signed.vhdx`
 
 The signed image uses a signed copy of the bootloader EFI and the same kernel binary as
 the unsigned image.
@@ -122,7 +122,7 @@ UEFI Secure Boot uses a key hierarchy:
 - **dbx** — revoked signatures and certificates
 
 Firmware checks the first-stage EFI executable against the trusted keys in `db` (and any
-revocations in `dbx`). For `ostest`, the relevant requirement is: the certificate used to
+revocations in `dbx`). For m³OS, the relevant requirement is: the certificate used to
 sign the bootloader EFI must be trusted by the machine that boots it.
 
 ---
@@ -134,7 +134,7 @@ sign the bootloader EFI must be trusted by the machine that boots it.
 Use this when the target machine already boots Linux through shim and exposes `mokutil`.
 
 ```bash
-mokutil --import ostest.crt
+mokutil --import m3os.crt
 ```
 
 Then reboot, complete the MOKManager enrollment flow, and reboot again.
@@ -146,13 +146,13 @@ firmware has already trusted shim itself.
 ### Path B — direct UEFI `db` enrollment
 
 Use this when you control the firmware Secure Boot configuration directly and want the
-firmware to trust the `ostest` certificate without shim.
+firmware to trust the m³OS certificate without shim.
 
 Typical flow:
 
 1. Put the machine into Secure Boot setup mode.
 2. Enroll your own PK / KEK / db certificates using firmware setup or `efi-updatevar`.
-3. Boot the signed `ostest` image with Secure Boot enabled.
+3. Boot the signed m³OS image with Secure Boot enabled.
 
 This gives more direct control, but it also replaces or augments the OEM trust chain and
 may affect other operating systems on the same machine.
@@ -165,7 +165,7 @@ shim is a small Microsoft-signed first-stage loader used by Linux distributions.
 firmware already trusts Microsoft's UEFI CA, shim can start under Secure Boot and then use
 its own trust store (the MOK list) to validate GRUB or another EFI payload.
 
-That is different from the personal `ostest` workflow here:
+That is different from the personal m³OS workflow here:
 
 - **Personal enrollment** — you generate your own key and enroll it on machines you control.
 - **Distribution workflow** — a vendor ships a Microsoft-signed shim and maintains its own
@@ -198,9 +198,9 @@ The following local checks were run during Phase 10 implementation:
 ```bash
 cargo test -p xtask --target x86_64-unknown-linux-gnu
 cargo xtask check
-cargo xtask image --sign --key <tmp>/ostest.key --cert <tmp>/ostest.crt
-sbverify --cert <tmp>/ostest.crt <signed-bootloader-efi>
-sbverify --cert <tmp>/ostest.crt <unsigned-bootloader-efi>   # expected failure
+cargo xtask image --sign --key <tmp>/m3os.key --cert <tmp>/m3os.crt
+sbverify --cert <tmp>/m3os.crt <signed-bootloader-efi>
+sbverify --cert <tmp>/m3os.crt <unsigned-bootloader-efi>   # expected failure
 ```
 
 Observed results:

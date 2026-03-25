@@ -1,6 +1,6 @@
-# Copilot Instructions — ostest
+# Copilot Instructions — m³OS
 
-ostest is a toy bootable operating system written in **Rust**, following a **microkernel
+m³OS (technical name: m3os) is a toy bootable operating system written in **Rust**, following a **microkernel
 architecture**, targeting **x86_64** with UEFI boot. The codebase is educational but
 aims for a functional userspace shell. See `docs/` for full design documentation.
 
@@ -60,7 +60,7 @@ Ring 0 (kernel/):           Ring 3 (userspace/):
 ### Workspace Layout
 
 ```
-ostest/
+m3os/
 ├── kernel/          # the microkernel (no_std, ring 0)
 │   └── src/
 │       ├── arch/x86_64/   # GDT, IDT, paging, syscall gate

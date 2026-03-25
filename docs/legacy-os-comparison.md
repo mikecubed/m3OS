@@ -1,8 +1,8 @@
-# Legacy C Kernel vs. ostest: Comparative Analysis
+# Legacy C Kernel vs. m³OS: Comparative Analysis
 
 ## Overview
 
-This document evaluates the legacy x86 C kernel at `~/projects/oldprojects/os/kernel` against the current Rust OS (`ostest`), covering architecture, implementation progress, design decisions, and actionable recommendations.
+This document evaluates the legacy x86 C kernel at `~/projects/oldprojects/os/kernel` against the current Rust OS (m³OS), covering architecture, implementation progress, design decisions, and actionable recommendations.
 
 ---
 
@@ -83,7 +83,7 @@ graph TD
 
 ---
 
-## ostest (Rust OS) Architecture
+## m³OS (Rust OS) Architecture
 
 ```mermaid
 graph TD
@@ -143,7 +143,7 @@ graph TD
     style Boot fill:#3498db,color:#fff
 ```
 
-### ostest: What's Implemented
+### m³OS: What's Implemented
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -181,15 +181,15 @@ quadrantChart
     Legacy Keyboard Driver: [0.25, 0.80]
     Legacy Memory Mgmt: [0.20, 0.05]
     Legacy Tasking: [0.30, 0.05]
-    ostest Boot Foundation: [0.55, 0.90]
-    ostest Memory Design: [0.70, 0.10]
-    ostest Microkernel IPC: [0.95, 0.10]
-    ostest Userspace Model: [0.92, 0.08]
+    m³OS Boot Foundation: [0.55, 0.90]
+    m³OS Memory Design: [0.70, 0.10]
+    m³OS Microkernel IPC: [0.95, 0.10]
+    m³OS Userspace Model: [0.92, 0.08]
 ```
 
 ### Feature Comparison Table
 
-| Feature | Legacy C Kernel | ostest Rust | ostest Advantage |
+| Feature | Legacy C Kernel | m³OS Rust | m³OS Advantage |
 |---------|----------------|-------------|-----------------|
 | **Architecture** | x86 32-bit protected mode | x86_64 long mode | 64-bit addressing, larger memory |
 | **Boot standard** | GRUB Multiboot (BIOS) | UEFI via bootloader_api | Modern firmware, no BIOS quirks |
@@ -200,29 +200,29 @@ quadrantChart
 | **Interrupt handling** | **Fully working** | Designed (Phase 3) | Legacy wins here |
 | **VGA/serial output** | **VGA text mode working** | Serial working; VGA Phase 9 | Legacy has more display features |
 | **Keyboard input** | **Working (scancode tables)** | Designed (Phase 3/7) | Legacy wins here |
-| **System calls** | None | Designed: syscall ABI + capability system | ostest has better design |
+| **System calls** | None | Designed: syscall ABI + capability system | m³OS has better design |
 | **File system** | None | Designed: VFS + FAT32 | Same (neither implemented) |
-| **Build system** | .bat scripts (DJGPP/DOS) | Cargo xtask (cross-platform) | ostest dramatically better |
-| **Documentation** | None | 47 markdown files + Mermaid diagrams | ostest dramatically better |
-| **Testing** | None | QEMU ISA debug exit harness | ostest better |
-| **Safety** | Manual, C, undefined behavior risk | Rust ownership, bounded unsafe | ostest dramatically better |
+| **Build system** | .bat scripts (DJGPP/DOS) | Cargo xtask (cross-platform) | m³OS dramatically better |
+| **Documentation** | None | 47 markdown files + Mermaid diagrams | m³OS dramatically better |
+| **Testing** | None | QEMU ISA debug exit harness | m³OS better |
+| **Safety** | Manual, C, undefined behavior risk | Rust ownership, bounded unsafe | m³OS dramatically better |
 
 ---
 
 ## Where the Legacy Kernel is Ahead
 
-The legacy kernel has **working, runnable code** for things ostest hasn't implemented yet:
+The legacy kernel has **working, runnable code** for things m³OS hasn't implemented yet:
 
 ```mermaid
 timeline
-    title Legacy Kernel Implemented Features (ostest phases they map to)
+    title Legacy Kernel Implemented Features (m³OS phases they map to)
     section Already done in legacy
-        IDT setup          : Phase 3 target for ostest
-        8259 PIC remapping : Phase 3 target for ostest
-        ISR/IRQ stubs      : Phase 3 target for ostest
-        VGA text driver    : Phase 9 target for ostest
-        PS/2 keyboard      : Phase 3/7 target for ostest
-        Timer tick counter : Phase 3 target for ostest
+        IDT setup          : Phase 3 target for m³OS
+        8259 PIC remapping : Phase 3 target for m³OS
+        ISR/IRQ stubs      : Phase 3 target for m³OS
+        VGA text driver    : Phase 9 target for m³OS
+        PS/2 keyboard      : Phase 3/7 target for m³OS
+        Timer tick counter : Phase 3 target for m³OS
 ```
 
 Specifically, the legacy kernel is working code you can study for:
@@ -234,11 +234,11 @@ Specifically, the legacy kernel is working code you can study for:
 
 ---
 
-## Where ostest is Ahead
+## Where m³OS is Ahead
 
 ```mermaid
 graph LR
-    subgraph ostest_strengths["ostest Strengths"]
+    subgraph m3os_strengths["m³OS Strengths"]
         A["64-bit long mode<br/>vs 32-bit protected mode"]
         B["UEFI boot<br/>vs BIOS/Multiboot"]
         C["Microkernel architecture<br/>vs monolithic ring 0"]
@@ -249,13 +249,13 @@ graph LR
         H["Proper build toolchain<br/>vs .bat DJGPP scripts"]
         I["47 doc files + test harness<br/>vs zero documentation"]
     end
-    style ostest_strengths fill:#2ecc71,color:#000
+    style m3os_strengths fill:#2ecc71,color:#000
 ```
 
-Key advantages of ostest's **design** over the legacy kernel's **implementation**:
+Key advantages of m³OS's **design** over the legacy kernel's **implementation**:
 
 - **No memory management in legacy** means it can never run multiple processes, load programs, or have a heap. This is a fundamental architectural ceiling.
-- **Monolithic ring 0** in the legacy kernel means a buggy keyboard driver crashes the whole system. ostest's microkernel model isolates this.
+- **Monolithic ring 0** in the legacy kernel means a buggy keyboard driver crashes the whole system. m³OS's microkernel model isolates this.
 - **32-bit mode** caps addressable RAM at 4GB and lacks modern CPU features (NX bit properly, PCID, etc.).
 - **BIOS boot** is a dead-end for modern hardware; UEFI is the path forward.
 
@@ -269,7 +269,7 @@ Key advantages of ostest's **design** over the legacy kernel's **implementation*
 |---------|----------------|----------------|
 | **PIC remapping sequence** | `irq.c` lines 1–35 | Adopt verbatim (same hardware sequence needed in Phase 3) |
 | **ISR assembly stub pattern** | `start.asm` lines 107–301 | Understand the pattern; the `x86_64` crate automates this but knowing the mechanism matters |
-| **Function pointer IRQ dispatch table** | `irq.c` `irq_routines[16]` | Already planned in ostest (Phase 3); validates the approach |
+| **Function pointer IRQ dispatch table** | `irq.c` `irq_routines[16]` | Already planned in m³OS (Phase 3); validates the approach |
 | **Keyboard scancode lookup tables** | `kb.c` `kbdus[]` | Port to Rust in kbd_server (Phase 7) |
 | **Scroll-on-overflow VGA logic** | `scrn.c` `scroll()` | Useful if you add a VGA text fallback; the `memmove` trick is correct |
 | **EOI signaling logic** | `irq.c` `irq_handler()` | Master-only vs. master+slave EOI based on IRQ number — port this logic exactly |
@@ -281,16 +281,16 @@ Key advantages of ostest's **design** over the legacy kernel's **implementation*
 | **Flat memory model / no paging** | Entire kernel | Can never have process isolation or virtual memory |
 | **All code in ring 0** | Entire kernel | One bug anywhere crashes the system |
 | **No heap / static allocation only** | Entire kernel | Cannot load programs, cannot grow data structures |
-| **32-bit protected mode** | `start.asm`, `gdt.c` | Obsolete; 64-bit is universal; ostest is already on x86_64 |
+| **32-bit protected mode** | `start.asm`, `gdt.c` | Obsolete; 64-bit is universal; m³OS is already on x86_64 |
 | **BIOS/Multiboot boot** | `start.asm` header | Dead end; UEFI is correct path |
 | **`.bat` build scripts** | `build.bat` | Not portable; Cargo xtask is the right approach |
 | **Halt-on-all-exceptions** | `isrs.c` `fault_handler()` | Fine for early boot, but eventually should kill the offending task, not the whole OS |
 | **Hardcoded VGA address `0xB8000`** | `scrn.c` | Use framebuffer from BootInfo instead; more portable |
-| **No separation between ISR and handler** | `isrs.c` | ostest correctly plans to deliver IRQs to userspace handlers |
+| **No separation between ISR and handler** | `isrs.c` | m³OS correctly plans to deliver IRQs to userspace handlers |
 
 ---
 
-## Suggestions for ostest
+## Suggestions for m³OS
 
 Based on comparing both projects:
 
@@ -309,7 +309,7 @@ The legacy `kbdus[]` and `kbdus2[]` tables are complete and battle-tested. When 
 
 ### 3. Keep the GDT Simpler Than You Think
 
-The legacy kernel uses 3 GDT entries (null, code, data) with a flat model and it works perfectly for a monolithic kernel. ostest needs slightly more (TSS entry for ring 3, user code/data segments), but resist over-engineering the GDT — 5–6 entries is enough for the full microkernel design.
+The legacy kernel uses 3 GDT entries (null, code, data) with a flat model and it works perfectly for a monolithic kernel. m³OS needs slightly more (TSS entry for ring 3, user code/data segments), but resist over-engineering the GDT — 5–6 entries is enough for the full microkernel design.
 
 ### 4. Add a VGA Text Mode Fallback (Optional)
 
@@ -317,15 +317,15 @@ The legacy kernel's VGA driver is complete and simple. Consider adding an option
 
 ### 5. The Legacy Kernel's Tick Counter Pattern is Fine
 
-The comment "this is where we would schedule..." in `timer.c` is exactly the hook ostest needs. The pattern (IRQ0 handler increments global tick, calls a function) is correct — Phase 4's scheduler just needs to replace that function call with a real context switch. Don't overthink the timer interface.
+The comment "this is where we would schedule..." in `timer.c` is exactly the hook m³OS needs. The pattern (IRQ0 handler increments global tick, calls a function) is correct — Phase 4's scheduler just needs to replace that function call with a real context switch. Don't overthink the timer interface.
 
 ### 6. Don't Try to Match the Legacy Kernel's "Working Demo" Too Early
 
-The legacy kernel feels more functional because it has a visible keyboard + VGA demo. ostest is making a harder bet: building it right first. The serial output in Phase 1 is less visually impressive but architecturally far more sound. Stick to the plan.
+The legacy kernel feels more functional because it has a visible keyboard + VGA demo. m³OS is making a harder bet: building it right first. The serial output in Phase 1 is less visually impressive but architecturally far more sound. Stick to the plan.
 
 ### 7. Consider Adding a `debug_print` Syscall Shadow in Early Phases
 
-The legacy kernel has no way to debug userspace code. ostest's syscall design includes `sys_debug_print` (syscall 12) as a debug-only path to serial. This is the right call — don't remove it until you have a real console_server working.
+The legacy kernel has no way to debug userspace code. m³OS's syscall design includes `sys_debug_print` (syscall 12) as a debug-only path to serial. This is the right call — don't remove it until you have a real console_server working.
 
 ---
 
@@ -343,7 +343,7 @@ flowchart LR
         L6["No processes"]
     end
 
-    subgraph Transition["Gap to Fill (ostest Phases 2–9)"]
+    subgraph Transition["Gap to Fill (m³OS Phases 2–9)"]
         T1["Frame allocator + paging"]
         T2["IDT + PIC + IRQ handlers"]
         T3["Context switch + scheduler"]
@@ -352,7 +352,7 @@ flowchart LR
         T6["Core servers"]
     end
 
-    subgraph ostest["ostest (Target State)"]
+    subgraph m3os["m³OS (Target State)"]
         direction TB
         O1["Microkernel<br/>Drivers in ring 3"]
         O2["UEFI boot"]
@@ -363,11 +363,11 @@ flowchart LR
     end
 
     Legacy -->|"Port: PIC logic<br/>Port: Scancode tables<br/>Port: ISR patterns"| Transition
-    Transition --> ostest
+    Transition --> m3os
 
     style Legacy fill:#e74c3c,color:#fff
     style Transition fill:#f39c12,color:#000
-    style ostest fill:#2ecc71,color:#000
+    style m3os fill:#2ecc71,color:#000
 ```
 
 ---
@@ -391,7 +391,7 @@ gantt
     File System         :crit, 7, 8
     System Calls        :crit, 8, 9
 
-    section ostest (Rust)
+    section m³OS (Rust)
     Boot Foundation     :done, 0, 1
     Serial + Logging    :done, 1, 2
     Memory Basics       :active, 2, 3
@@ -404,7 +404,7 @@ gantt
     Shell + Framebuffer :9, 10
 ```
 
-**Key insight**: The legacy kernel got halfway through Phase 3 of ostest's roadmap and stopped. ostest has completed Phase 1 but has a much longer (and more ambitious) road ahead. The legacy kernel is a ceiling; ostest is designed to blow past it.
+**Key insight**: The legacy kernel got halfway through Phase 3 of m³OS's roadmap and stopped. m³OS has completed Phase 1 but has a much longer (and more ambitious) road ahead. The legacy kernel is a ceiling; m³OS is designed to blow past it.
 
 ---
 

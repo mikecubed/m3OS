@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 8 adds the first file-access layer to ostest. The additions are:
+Phase 8 adds the first file-access layer to m³OS. The additions are:
 
 - **File IPC protocol** — three operations (`FILE_OPEN`, `FILE_READ`, `FILE_CLOSE`) that let any
   kernel task open and read named files
@@ -230,7 +230,7 @@ The ordering guarantee matters: the fat endpoint is registered *before* `vfs_ser
 [fat] ready
 [vfs] ready, backend=EndpointId(1)
 [fs-client] opened hello.txt → fd=0
-[fs-client] read 38 bytes: "Hello from the ostest filesystem!..."
+[fs-client] read 38 bytes: "Hello from the m3os filesystem!..."
 [fs-client] Phase 8 storage demo complete
 ```
 

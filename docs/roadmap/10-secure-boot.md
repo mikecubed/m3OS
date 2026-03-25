@@ -10,7 +10,7 @@ flowchart LR
     Build["cargo xtask image --sign"] --> Sign["sign bootloader EFI"]
     Key["private key<br/>+ certificate"] --> Sign
     Sign --> EFI["bootloader-x86_64-uefi-signed.efi"]
-    Sign --> IMG["boot-uefi-ostest-signed.img"]
+    Sign --> IMG["boot-uefi-m3os-signed.img"]
     IMG --> USB["bootable USB"]
     USB --> FW["UEFI firmware<br/>Secure Boot ON"]
     Enrolled["enrolled cert<br/>(UEFI db or MOK)"] --> FW
@@ -66,7 +66,7 @@ handing off to the next stage. This does **not** add the key to the UEFI firmwar
 own signature database.
 
 ```bash
-mokutil --import ostest.crt   # run on the target machine
+mokutil --import m3os.crt   # run on the target machine
 # reboot → MOKManager prompt appears → enroll → reboot again
 ```
 
@@ -86,9 +86,9 @@ Secure Boot on dual-boot machines.
 ## Acceptance Criteria
 
 - `cargo xtask sign <unsigned-efi>` produces a verified `*-signed.efi`.
-- `cargo xtask image --sign` produces `boot-uefi-ostest-signed.img` (and `.vhdx`).
-- The signed EFI passes `sbverify --cert ostest.crt <signed-efi>`.
-- The unsigned EFI fails `sbverify --cert ostest.crt <unsigned-efi>`.
+- `cargo xtask image --sign` produces `boot-uefi-m3os-signed.img` (and `.vhdx`).
+- The signed EFI passes `sbverify --cert m3os.crt <signed-efi>`.
+- The unsigned EFI fails `sbverify --cert m3os.crt <unsigned-efi>`.
 - The kernel boots on real hardware with Secure Boot enabled after enrolling the cert.
 - Booting the unsigned or untrusted image with Secure Boot on is rejected by firmware.
 

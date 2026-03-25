@@ -15,8 +15,8 @@ flowchart LR
 ## Setup Tasks
 
 - [x] P10-T001 Write a `scripts/gen-secure-boot-keys.sh` script that runs `openssl req`
-  to generate a 4096-bit RSA key pair (`ostest.key`) and self-signed certificate
-  (`ostest.crt`) valid for 10 years, with CN=`ostest Secure Boot Key`. Add both to
+  to generate a 4096-bit RSA key pair (`m3os.key`) and self-signed certificate
+  (`m3os.crt`) valid for 10 years, with CN=`m3os Secure Boot Key`. Add both to
   `.gitignore` — the private key must never be committed.
 - [x] P10-T002 Document the expected output files and where they should be placed
   relative to the repo root so `cargo xtask sign` can find them.
@@ -25,7 +25,7 @@ flowchart LR
 
 - [x] P10-T003 Add a `sign` subcommand to `xtask/src/main.rs` (or a `--sign` flag on
   `image`) that accepts optional `--key` and `--cert` path arguments, defaulting to
-  `ostest.key` and `ostest.crt` in the repo root.
+  `m3os.key` and `m3os.crt` in the repo root.
 - [x] P10-T004 In the `sign` subcommand, run `sbsign --key <key> --cert <cert>
   --output <signed.efi> <unsigned.efi>` via `std::process::Command`. Fail with a clear
   error if `sbsign` is not found (`sbsigntool` package on Debian/Ubuntu).
@@ -36,11 +36,11 @@ flowchart LR
 
 ## Validation Tasks
 
-- [x] P10-T007 Verify `sbverify --cert ostest.crt <signed-efi>` exits 0.
+- [x] P10-T007 Verify `sbverify --cert m3os.crt <signed-efi>` exits 0.
 - [x] P10-T008 Verify the unsigned EFI fails `sbverify` against the cert (expected).
 - [ ] P10-T009 On a real machine with Secure Boot enabled: enroll the cert using one
   of the two paths documented in the milestone page — via shim's MOK (`mokutil
-  --import ostest.crt` + reboot through MOKManager) **or** via direct UEFI db
+  --import m3os.crt` + reboot through MOKManager) **or** via direct UEFI db
   enrollment (`efi-updatevar` / firmware setup). Confirm boot succeeds.
 - [ ] P10-T010 On the same machine: temporarily disable the enrolled key and confirm
   the signed binary is rejected by firmware (Secure Boot is actually enforcing).

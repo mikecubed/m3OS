@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ostest** is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Goal is a functional userspace shell. Currently at Phase 2 (memory basics complete).
+**m³OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Goal is a functional userspace shell.
 
 ## Build & Run
 

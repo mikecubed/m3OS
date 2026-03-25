@@ -31,7 +31,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     serial::init_logger();
 
-    serial_println!("[ostest] Hello from kernel!");
+    serial_println!("[m3os] Hello from kernel!");
     log::info!("Kernel initialized");
 
     // Load GDT/IDT — no IRQs yet.

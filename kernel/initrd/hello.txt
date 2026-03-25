@@ -1,2 +1,2 @@
-Hello from the ostest filesystem!
+Hello from the m³OS filesystem!
 This file lives in the kernel ramdisk.

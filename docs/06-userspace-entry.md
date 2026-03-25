@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 5 delivers the first ring-3 program running on ostest.  By the end of
+Phase 5 delivers the first ring-3 program running on m³OS.  By the end of
 this phase the kernel:
 
 - switches CPU privilege from ring 0 to ring 3 via `iretq`,
@@ -20,7 +20,7 @@ established here.
 
 ### Ring 0 vs ring 3 on x86-64
 
-x86-64 has four privilege levels (rings 0–3); ostest uses only two:
+x86-64 has four privilege levels (rings 0–3); m³OS uses only two:
 
 | Ring | Name | What runs there |
 |---|---|---|
@@ -416,7 +416,7 @@ non-trivial ways.  Phase 5 implements only `sys_exit` as a proof of concept.
   kernel to use explicit `copy_from_user` / `copy_to_user` helpers, preventing
   accidental dereferences of user pointers in kernel code.
 
-Both are enabled by default in any modern Linux kernel.  ostest will add them
+Both are enabled by default in any modern Linux kernel.  m³OS will add them
 in a later hardening phase.
 
 ---

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Phase 9 adds the first interactive layer to ostest: a pixel framebuffer text console, keyboard
+Phase 9 adds the first interactive layer to m³OS: a pixel framebuffer text console, keyboard
 IPC, and a tiny shell with built-in file commands. The additions are:
 
 - **Framebuffer text console** — `fb::init()` claims the bootloader framebuffer and provides a

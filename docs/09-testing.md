@@ -180,7 +180,7 @@ Run `cargo xtask test --display` to see QEMU's output window and use `-s -S` in
 QEMU_EXTRA_ARGS="-s -S" cargo xtask test --test my_test
 
 # In another terminal:
-gdb target/x86_64-ostest/debug/kernel \
+gdb target/x86_64-m3os/debug/kernel \
     -ex "target remote :1234" \
     -ex "break kernel_main"
 ```

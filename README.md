@@ -1,4 +1,4 @@
-# ostest
+# m³OS
 
 A toy bootable operating system written in Rust, targeting **x86_64** with a **microkernel architecture**. Built for learning OS fundamentals, with the goal of eventually running a real userspace shell.
 
