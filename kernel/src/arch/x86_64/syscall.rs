@@ -742,14 +742,15 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     };
 
-    // Copy all user-accessible pages from parent into child's page table.
+    // CoW-clone user-accessible pages: share physical frames between parent
+    // and child, clearing WRITABLE so writes trigger page faults.
     let phys_off = crate::mm::phys_offset();
     {
         // SAFETY: child_cr3 was just allocated; no other mapper over it exists.
         let mut child_mapper = unsafe { crate::mm::mapper_for_frame(child_cr3) };
-        // SAFETY: current CR3 is the parent; we iterate its lower half.
-        if let Err(e) = unsafe { copy_user_pages(phys_off, &mut child_mapper) } {
-            log::warn!("[fork] page copy failed: {:?}", e);
+        // SAFETY: current CR3 is the parent; we modify its PTEs to clear WRITABLE.
+        if let Err(e) = unsafe { cow_clone_user_pages(phys_off, &mut child_mapper) } {
+            log::warn!("[fork] CoW clone failed: {:?}", e);
             return u64::MAX;
         }
     }
@@ -1192,23 +1193,25 @@ fn has_pending_signal() -> bool {
 
 const NEG_EINTR: u64 = (-4_i64) as u64;
 
-/// Copy all user-accessible pages from the currently-active page table
-/// into `dst_mapper`'s page table.
+/// Copy-on-write clone of user-accessible pages from the parent's page table
+/// into the child's page table.
 ///
-/// Walks PML4 indices 0–255 (the user-space half).
+/// Instead of copying page contents, both parent and child share the same
+/// physical frames.  Writable pages have their WRITABLE bit cleared in both
+/// parent and child so that a write triggers a page fault which is resolved
+/// by `handle_cow_fault`.  Frame reference counts are incremented for each
+/// shared frame.
 ///
 /// # Safety
-/// The current CR3 must be valid and `dst_mapper` must reference a different,
-/// freshly-allocated PML4.
-unsafe fn copy_user_pages(
+/// The current CR3 must be the parent's page table and `dst_mapper` must
+/// reference the child's freshly-allocated PML4.
+unsafe fn cow_clone_user_pages(
     phys_off: u64,
     dst_mapper: &mut x86_64::structures::paging::OffsetPageTable<'_>,
 ) -> Result<(), crate::mm::elf::ElfError> {
     use x86_64::{
         registers::control::Cr3,
-        structures::paging::{
-            FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
-        },
+        structures::paging::{Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
         VirtAddr,
     };
 
@@ -1247,9 +1250,12 @@ unsafe fn copy_user_pages(
                     continue;
                 }
 
-                let pt: &PageTable = &*(phys_offset + p2e.addr().as_u64()).as_ptr::<PageTable>();
+                // Get a mutable reference to the parent's PT so we can clear
+                // WRITABLE on CoW pages.
+                let pt: &mut PageTable =
+                    &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
                 for p1 in 0usize..512 {
-                    let pte = &pt[p1];
+                    let pte = &mut pt[p1];
                     if !pte.flags().contains(PageTableFlags::PRESENT) {
                         continue;
                     }
@@ -1263,34 +1269,41 @@ unsafe fn copy_user_pages(
                         | ((p1 as u64) << 12);
 
                     let src_phys = pte.addr();
-                    let flags = pte.flags();
+                    let mut flags = pte.flags();
 
-                    // Allocate a new frame and copy the page content.
-                    let new_frame: PhysFrame<Size4KiB> = frame_alloc
-                        .allocate_frame()
-                        .ok_or(crate::mm::elf::ElfError::OutOfFrames)?;
+                    // For writable pages, clear WRITABLE in both parent and child
+                    // so writes trigger CoW page faults.
+                    if flags.contains(PageTableFlags::WRITABLE) {
+                        let new_parent_flags = flags & !PageTableFlags::WRITABLE;
+                        pte.set_addr(src_phys, new_parent_flags);
+                        flags = new_parent_flags;
+                    }
 
-                    let src_virt = phys_offset + src_phys.as_u64();
-                    let dst_virt = phys_offset + new_frame.start_address().as_u64();
-                    core::ptr::copy_nonoverlapping(
-                        src_virt.as_ptr::<u8>(),
-                        dst_virt.as_mut_ptr::<u8>(),
-                        4096,
-                    );
+                    // Increment refcount — the frame is now shared.
+                    crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
 
+                    // Map the same physical frame in the child with the same
+                    // flags (WRITABLE already cleared for formerly-writable pages).
                     let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)).map_err(
                         |_| crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork"),
                     )?;
+                    let frame = PhysFrame::from_start_address(src_phys)
+                        .expect("CoW: unaligned frame address");
                     dst_mapper
-                        .map_to(page, new_frame, flags, &mut frame_alloc)
+                        .map_to(page, frame, flags, &mut frame_alloc)
                         .map_err(|_| {
-                            crate::mm::elf::ElfError::MappingFailed("map_to failed in fork")
+                            crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
                         })?
                         .ignore();
                 }
             }
         }
     }
+
+    // Flush parent's TLB to ensure CPU sees the cleared WRITABLE bits.
+    // A full CR3 reload is the simplest approach.
+    let (current_cr3, cr3_flags) = Cr3::read();
+    Cr3::write(current_cr3, cr3_flags);
 
     Ok(())
 }

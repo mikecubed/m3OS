@@ -11,7 +11,7 @@
 | B | Frame reference counting | A | Done |
 | C | Process exit cleanup | A | Done |
 | D | Growable kernel heap | A | Done |
-| E | Copy-on-write fork | A, B | In Progress |
+| E | Copy-on-write fork | A, B | Done |
 | F | Validation and documentation | C, D, E | Pending |
 
 ## Track A — Free-List Frame Allocator
@@ -54,14 +54,14 @@
 
 ## Track E — Copy-on-Write Fork
 
-- [ ] P17-T027: Implement `cow_clone_user_pages()`
-- [ ] P17-T028: Handle non-writable pages (share directly)
-- [ ] P17-T029: Flush parent TLB after clearing writable bits
-- [ ] P17-T030: Replace `copy_user_pages()` with CoW in `sys_fork`
-- [ ] P17-T031: Detect CoW faults in page fault handler
-- [ ] P17-T032: Implement CoW fault resolution
-- [ ] P17-T033: Refcount-1 fast path (remap without copy)
-- [ ] P17-T034: Ensure `execve` correctness with CoW pages
+- [x] P17-T027: Implement `cow_clone_user_pages()`
+- [x] P17-T028: Handle non-writable pages (share directly via refcount_inc)
+- [x] P17-T029: Flush parent TLB after clearing writable bits (CR3 reload)
+- [x] P17-T030: Replace `copy_user_pages()` with CoW in `sys_fork`
+- [x] P17-T031: Detect CoW faults in page fault handler
+- [x] P17-T032: Implement CoW fault resolution (direct in ISR)
+- [x] P17-T033: Refcount-1 fast path (remap without copy)
+- [x] P17-T034: Ensure `execve` correctness with CoW pages (free_process_page_table handles refcounts)
 
 ## Track F — Validation
 

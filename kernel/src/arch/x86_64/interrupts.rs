@@ -28,6 +28,10 @@ pub static USING_APIC: AtomicBool = AtomicBool::new(false);
 /// interrupt). Single-CPU: no concurrent writers.
 static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
+// ---------------------------------------------------------------------------
+// CoW fault resolution (P17-T031, T032, T033)
+// ---------------------------------------------------------------------------
+
 /// Ring-0 trampoline that runs *outside* interrupt context.
 ///
 /// The exception handler redirects IRET here so that locking and
@@ -59,6 +63,132 @@ fn fault_kill_trampoline() -> ! {
     }
     // Permanently remove the kernel task — the process is dead.
     crate::task::mark_current_dead();
+}
+
+/// Resolve a copy-on-write page fault at `vaddr`.
+///
+/// Reads the current PTE, allocates a fresh frame, copies the page contents,
+/// maps the new frame as writable, and decrements the old frame's refcount.
+fn resolve_cow_fault(vaddr: u64) {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_offset = VirtAddr::new(phys_off);
+
+    let (cr3_frame, _) = Cr3::read();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+
+    // Walk the page table to find the PTE for the faulting address.
+    let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
+        let p4e = &pml4[p4_idx];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            panic!("CoW: PML4 entry not present for {:#x}", vaddr);
+        }
+
+        let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
+        let p3e = &pdpt[p3_idx];
+        if !p3e.flags().contains(PageTableFlags::PRESENT) {
+            panic!("CoW: PDPT entry not present for {:#x}", vaddr);
+        }
+
+        let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
+        let p2e = &pd[p2_idx];
+        if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            panic!("CoW: PD entry not present for {:#x}", vaddr);
+        }
+
+        let pt: &mut PageTable =
+            &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
+        let pte = &mut pt[p1_idx];
+        if !pte.flags().contains(PageTableFlags::PRESENT) {
+            panic!("CoW: PT entry not present for {:#x}", vaddr);
+        }
+
+        let old_phys = pte.addr().as_u64();
+        let old_refcount = crate::mm::frame_allocator::refcount_get(old_phys);
+
+        if old_refcount <= 1 {
+            // P17-T033: fast path — sole owner, just remap as writable.
+            let mut flags = pte.flags();
+            flags |= PageTableFlags::WRITABLE;
+            pte.set_addr(pte.addr(), flags);
+            // Flush TLB for this address.
+            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+            return;
+        }
+
+        // Allocate a fresh frame and copy the page contents.
+        let new_frame =
+            crate::mm::frame_allocator::allocate_frame().expect("CoW: out of frames for page copy");
+        let new_phys = new_frame.start_address().as_u64();
+
+        let src = (phys_off + old_phys) as *const u8;
+        let dst = (phys_off + new_phys) as *mut u8;
+        core::ptr::copy_nonoverlapping(src, dst, 4096);
+
+        // Map the new frame at the faulting address with WRITABLE restored.
+        let mut flags = pte.flags();
+        flags |= PageTableFlags::WRITABLE;
+        pte.set_addr(new_frame.start_address(), flags);
+
+        // Flush TLB for this address.
+        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
+
+        // Decrement the old frame's refcount (may free it if no other sharers).
+        crate::mm::frame_allocator::free_frame(old_phys);
+    }
+}
+
+/// Read the physical address of the page mapped at `vaddr` from the current
+/// page table.  Returns `None` if any level is not present.
+///
+/// Called from the page fault ISR (interrupts disabled, single CPU) so no
+/// locking is needed beyond what the atomic reads in the frame allocator provide.
+fn get_page_phys(vaddr: u64) -> Option<u64> {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_offset = VirtAddr::new(phys_off);
+
+    let (cr3_frame, _) = Cr3::read();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+
+    let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
+        let p4e = &pml4[p4_idx];
+        if !p4e.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
+        let p3e = &pdpt[p3_idx];
+        if !p3e.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
+        let p2e = &pd[p2_idx];
+        if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let pt: &PageTable = &*(phys_offset + p2e.addr().as_u64()).as_ptr::<PageTable>();
+        let pte = &pt[p1_idx];
+        if !pte.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        Some(pte.addr().as_u64())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -112,9 +242,30 @@ extern "x86-interrupt" fn page_fault_handler(
     let addr = x86_64::registers::control::Cr2::read();
 
     // Check if the fault came from ring 3 (user mode).
-    // If so, redirect IRET to the fault_kill_trampoline instead of calling
-    // block_current_on_recv() from interrupt context (which is forbidden).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
+        // P17-T031: detect CoW faults — a write to a present, non-writable page
+        // with a reference count > 0 is a copy-on-write fault.
+        let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
+        let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+        if is_write && is_present {
+            // Check that the page has a refcount (indicating CoW).
+            let fault_addr_u64 = match addr {
+                Ok(a) => a.as_u64(),
+                Err(_) => 0,
+            };
+            let page_phys = get_page_phys(fault_addr_u64);
+            if let Some(phys) = page_phys {
+                let refcount = crate::mm::frame_allocator::refcount_get(phys);
+                if refcount > 0 {
+                    // CoW fault — resolve directly in the ISR. Safe because
+                    // the fault is from ring 3 (no kernel locks held) and
+                    // we're on a single CPU.
+                    resolve_cow_fault(fault_addr_u64);
+                    return;
+                }
+            }
+        }
+
         let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
