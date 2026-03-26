@@ -30,7 +30,7 @@ static void fail(const char *name, const char *reason) {
 
 /* ---- Test 1: basic SIGINT handler ---- */
 
-static volatile int sigint_handled = 0;
+static volatile sig_atomic_t sigint_handled = 0;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -65,7 +65,7 @@ static void test_sigint_handler(void) {
 
 /* ---- Test 2: signal masking (block/unblock SIGUSR1) ---- */
 
-static volatile int sigusr1_handled = 0;
+static volatile sig_atomic_t sigusr1_handled = 0;
 
 static void sigusr1_handler(int sig) {
     (void)sig;
@@ -137,7 +137,7 @@ static void test_uncatchable(void) {
 
 /* ---- Test 4: auto-masking prevents re-entry ---- */
 
-static volatile int reentry_count = 0;
+static volatile sig_atomic_t reentry_count = 0;
 
 static void reentry_handler(int sig) {
     reentry_count++;

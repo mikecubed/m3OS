@@ -221,7 +221,7 @@ pub fn setup_signal_frame(
     }
 
     // uc_flags, uc_link — zero.
-    // uc_stack — zero for now (Track D will populate alt-stack info).
+    // uc_stack — zeroed here; caller writes alt-stack info via write_sigframe_uc_stack.
 
     // uc_mcontext — saved GPRs.
     let mc = OFF_MCONTEXT;
