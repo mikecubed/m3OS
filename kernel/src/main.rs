@@ -2,6 +2,9 @@
 #![no_main]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
+#![cfg_attr(test, feature(custom_test_frameworks))]
+#![cfg_attr(test, test_runner(crate::testing::test_runner))]
+#![cfg_attr(test, reexport_test_harness_main = "test_main")]
 
 extern crate alloc;
 
@@ -19,6 +22,8 @@ mod serial;
 mod signal;
 mod stdin;
 mod task;
+#[cfg(test)]
+mod testing;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
@@ -40,6 +45,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Load GDT/IDT — no IRQs yet.
     arch::init();
+
+    // When built with `cargo test`, run the generated test harness and exit.
+    #[cfg(test)]
+    test_main();
 
     // P9-T001: parse framebuffer info before mm::init consumes boot_info.
     // `mm::init` takes `&'static mut BootInfo` which borrows the whole struct
@@ -2007,17 +2016,25 @@ pub fn hlt_loop() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    if let Some(location) = info.location() {
-        serial::_panic_print(format_args!(
-            "KERNEL PANIC at {}:{}\n",
-            location.file(),
-            location.line()
-        ));
-    } else {
-        serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+    // In test builds, delegate to the test panic handler which exits QEMU
+    // with the failure code so `cargo xtask test` can detect the error.
+    #[cfg(test)]
+    testing::test_panic_handler(info);
+
+    #[cfg(not(test))]
+    {
+        if let Some(location) = info.location() {
+            serial::_panic_print(format_args!(
+                "KERNEL PANIC at {}:{}\n",
+                location.file(),
+                location.line()
+            ));
+        } else {
+            serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+        }
+        serial::_panic_print(format_args!("  {}\n", info.message()));
+        hlt_loop();
     }
-    serial::_panic_print(format_args!("  {}\n", info.message()));
-    hlt_loop();
 }
 
 #[alloc_error_handler]
