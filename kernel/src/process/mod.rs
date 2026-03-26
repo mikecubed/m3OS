@@ -88,6 +88,8 @@ pub enum FdBackend {
     PipeRead { pipe_id: usize },
     /// Write end of a kernel pipe (Phase 14).
     PipeWrite { pipe_id: usize },
+    /// Directory file descriptor (Phase 18).
+    Dir { path: String },
 }
 
 /// A single open-file entry in the per-process FD table.
@@ -296,6 +298,8 @@ pub struct Process {
     pub pending_signals: u64,
     /// Per-signal action table (Default or Ignore).
     pub signal_actions: [SignalAction; 32],
+    /// Current working directory (Phase 18). Defaults to "/".
+    pub cwd: String,
 }
 
 impl Process {
@@ -323,6 +327,7 @@ impl Process {
             fd_table: new_fd_table(),
             pending_signals: 0,
             signal_actions: [SignalAction::Default; 32],
+            cwd: String::from("/"),
         }
     }
 }
@@ -435,6 +440,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         fd_table: new_fd_table(),
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -473,6 +479,7 @@ pub fn spawn_process_with_cr3(
         fd_table: new_fd_table(),
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -515,6 +522,7 @@ pub fn spawn_process_with_cr3_and_fds(
         fd_table,
         pending_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

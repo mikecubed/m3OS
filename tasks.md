@@ -1,77 +1,76 @@
-# Phase 17 — Memory Reclamation: Implementation Progress
+# Phase 18 — Directory and VFS: Implementation Progress
 
-**Branch:** `phase-17-memory-reclamation`
-**Status:** Complete (stress test deferred to Phase 18+)
+**Branch:** `phase-18-directory-vfs`
+**Status:** In Progress
 
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |
 |-------|-------|-------------|--------|
-| A | Free-list frame allocator | — | Done |
-| B | Frame reference counting | A | Done |
-| C | Process exit cleanup | A | Done |
-| D | Growable kernel heap | A | Done |
-| E | Copy-on-write fork | A, B | Done |
-| F | Validation and documentation | C, D, E | Done |
+| A | Per-process cwd + path resolution | — | In Progress |
+| B | Directory fds + getdents64 (tmpfs) | — | In Progress |
+| C | Ramdisk directory tree | — | In Progress |
+| D | openat + root listing + ramdisk getdents64 | A, B, C | Pending |
+| E | Shell integration + validation | A, B, C, D | Pending |
 
-## Track A — Free-List Frame Allocator
+## Track A — Per-Process Working Directory and Path Resolution
 
-- [x] P17-T001: Define `FreeListAllocator` struct
-- [x] P17-T002: Implement `init(regions)` — build free list from usable regions
-- [x] P17-T003: Implement `allocate_frame()` — pop from head
-- [x] P17-T004: Implement `free_frame(phys)` — push to head
-- [x] P17-T005: Double-free detection via magic value
-- [x] P17-T006: Replace `BumpAllocator` with `FreeListAllocator`
-- [x] P17-T007: Add `free_count()` and `total_frames()` accessors
-- [x] P17-T008: Log frame allocator stats at boot
+- [ ] P18-T001: Add `cwd: String` field to `Process` struct; initialize to `"/"` in spawn functions
+- [ ] P18-T002: Copy `cwd` from parent to child in fork path
+- [ ] P18-T003: Implement `resolve_path(cwd, path) -> String` with `.`/`..` normalization
+- [ ] P18-T004: Implement `sys_chdir(path_ptr)` with directory validation
+- [ ] P18-T005: Implement `sys_getcwd(buf_ptr, size)` returning process cwd
+- [ ] P18-T006: Update `sys_open` to use `resolve_path` before routing
+- [ ] P18-T007: Update `sys_mkdir`, `sys_rmdir`, `sys_unlink`, `sys_rename`, `sys_stat` to use `resolve_path`
 
-## Track B — Frame Reference Counting
+## Track B — Directory File Descriptors and getdents64 (tmpfs)
 
-- [x] P17-T009: Determine highest physical frame number
-- [x] P17-T010: Allocate refcount table (`Vec<AtomicU16>`)
-- [x] P17-T011: Implement `refcount_inc()`
-- [x] P17-T012: Implement `refcount_dec() -> u16`
-- [x] P17-T013: Implement `refcount_get() -> u16`
-- [x] P17-T014: Hook `refcount_inc` into `allocate_frame()`
-- [x] P17-T015: Hook `refcount_dec` into `free_frame()`
+- [ ] P18-T008: Add `FdBackend::Dir { path: String }` variant
+- [ ] P18-T009: Define `O_DIRECTORY = 0o200000` constant
+- [ ] P18-T010: Implement `is_directory(resolved_path)` helper
+- [ ] P18-T011: Update `sys_open` for O_DIRECTORY and directory opens
+- [ ] P18-T012: Define `linux_dirent64` layout and DT_REG/DT_DIR constants
+- [ ] P18-T013: Implement `sys_getdents64` for tmpfs directories
+- [ ] P18-T014: Handle `sys_read` on directory fd (return EISDIR)
+- [ ] P18-T015: Handle `sys_close` on directory fd
 
-## Track C — Process Exit Cleanup
+## Track C — Ramdisk Directory Tree
 
-- [x] P17-T016: Call `free_process_page_table()` in `sys_exit`
-- [x] P17-T017: Call `free_process_page_table()` in `fault_kill_trampoline`
-- [x] P17-T018: Verify 4-level page table walk (fixed shared kernel entry detection)
-- [x] P17-T019: Update `free_process_page_table()` to use refcounting
-- [x] P17-T020: Reclaim kernel stacks in `drain_dead()` (already correct via Box drop)
-- [x] P17-T021: Verify `Task::_stack` drop behavior (confirmed correct)
+- [ ] P18-T016: Define `RamdiskNode` enum with File and Dir variants
+- [ ] P18-T017: Restructure FILES into tree with `/bin` and `/etc` directories
+- [ ] P18-T018: Implement `ramdisk_lookup(path) -> Option<&RamdiskNode>`
+- [ ] P18-T019: Implement `ramdisk_list_dir(path) -> Option<Vec<(String, bool)>>`
+- [ ] P18-T020: Update ramdisk `handle_open` to use `ramdisk_lookup`
+- [ ] P18-T021: Update ELF loader paths for `/bin/` prefix
+- [ ] P18-T022: Update or remove ramdisk FILE_LIST/name_list() endpoint
 
-## Track D — Growable Kernel Heap
+## Track D — openat, Root Listing, and Ramdisk getdents64
 
-- [x] P17-T022: Increase heap virtual reservation (64 MiB ceiling)
-- [x] P17-T023: Track current mapped extent with `AtomicUsize`
-- [x] P17-T024: Implement `grow_heap(additional_bytes)`
-- [x] P17-T025: Hook OOM path — attempt growth before panic
-- [x] P17-T026: Safety cap on max heap size
+- [ ] P18-T023: Implement `sys_getdents64` for ramdisk directories
+- [ ] P18-T024: Implement unified root directory listing (ramdisk + tmpfs)
+- [ ] P18-T025: Handle `sys_open("/")` as directory open
+- [ ] P18-T026: Update `sys_open` ramdisk routing with `ramdisk_lookup`
+- [ ] P18-T027: Define `AT_FDCWD` constant
+- [ ] P18-T028: Implement `sys_openat(dirfd, path_ptr, flags, mode)`
+- [ ] P18-T029: Ensure backward compatibility (`sys_open` delegates to `sys_openat(AT_FDCWD, ...)`)
 
-## Track E — Copy-on-Write Fork
+## Track E — Shell Integration and Validation
 
-- [x] P17-T027: Implement `cow_clone_user_pages()`
-- [x] P17-T028: Handle non-writable pages (share directly via refcount_inc)
-- [x] P17-T029: Flush parent TLB after clearing writable bits (CR3 reload)
-- [x] P17-T030: Replace `copy_user_pages()` with CoW in `sys_fork`
-- [x] P17-T031: Detect CoW faults in page fault handler
-- [x] P17-T032: Implement CoW fault resolution (direct in ISR)
-- [x] P17-T033: Refcount-1 fast path (remap without copy)
-- [x] P17-T034: Ensure `execve` correctness with CoW pages (free_process_page_table handles refcounts)
-
-## Track F — Validation
-
-- [x] P17-T035: free_frame() returns frames; free_count() increases after exit
-- [x] P17-T036: ~Fork 100 + exit reclaims frames~ (deferred — needs stress test binary; tracked for Phase 18+)
-- [x] P17-T037: CoW sharing and fault resolution works (fork-test passes)
-- [x] P17-T038: Kernel heap grows past 1 MiB (observed during refcount table alloc)
-- [x] P17-T039: Kernel stacks reclaimed after fork+exit (Box drop in drain_dead)
-- [x] P17-T040: Double-free panics with diagnostic (magic sentinel check)
-- [x] P17-T041: No regressions (shell, pipes, tmpfs, fork-test all pass)
-- [x] P17-T042: `cargo xtask check` passes
-- [x] P17-T043: QEMU boot validation — no panics
-- [x] P17-T044: Updated docs/03-memory.md with Phase 17 changes
+- [ ] P18-T030: Update kernel shell `cd` builtin to validate directory
+- [ ] P18-T031: Update `resolve_command` for `/bin/` paths
+- [ ] P18-T032: Verify musl `ls.elf` works with getdents64
+- [ ] P18-T033: Acceptance: `ls /bin` lists ELF binaries
+- [ ] P18-T034: Acceptance: `ls /tmp` lists runtime files
+- [ ] P18-T035: Acceptance: `ls /` shows bin, tmp, etc
+- [ ] P18-T036: Acceptance: `cd /bin && pwd` prints `/bin`
+- [ ] P18-T037: Acceptance: `cd nonexistent` returns error
+- [ ] P18-T038: Acceptance: `getcwd()` correct after chdir
+- [ ] P18-T039: Acceptance: directory open without O_DIRECTORY works
+- [ ] P18-T040: Acceptance: file open with O_DIRECTORY returns ENOTDIR
+- [ ] P18-T041: Acceptance: getdents64 resumes across calls
+- [ ] P18-T042: Acceptance: relative paths resolve correctly
+- [ ] P18-T043: Acceptance: openat resolves relative to dirfd
+- [ ] P18-T044: Acceptance: all existing tests pass
+- [ ] P18-T045: `cargo xtask check` passes
+- [ ] P18-T046: QEMU boot validation — no panics
+- [ ] P18-T047: Write documentation

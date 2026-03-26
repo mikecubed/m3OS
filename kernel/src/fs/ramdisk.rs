@@ -1,119 +1,400 @@
-//! Ramdisk filesystem backend — Phase 8 (`fat_server` handler logic).
+//! Ramdisk filesystem backend — Phase 8 / Phase 18.
 //!
-//! Embeds a fixed set of files at compile time and exposes a single
-//! [`handle`] function that processes one IPC message and returns the reply.
-//! No heap allocation, no mutable state — the ramdisk is purely read-only.
+//! Embeds a fixed set of files at compile time organised into a hierarchical
+//! directory tree ([`RamdiskNode`]).  Public helpers [`ramdisk_lookup`] and
+//! [`ramdisk_list_dir`] allow path-based navigation of the tree, while
+//! [`get_file`] provides backward-compatible bare-name lookup.
 //!
-//! # Phase 8 limitations
+//! The legacy IPC handler ([`handle`]) is retained for the `fat_server` task
+//! and uses a private flat file table for index-based file descriptors.
 //!
-//! File descriptors are simple indices into [`FILES`].  Because all clients
-//! are kernel tasks sharing the same address space, `FILE_OPEN` receives a
-//! raw kernel pointer to the name string and `FILE_READ` returns a raw pointer
-//! into the static content slice.  Both shortcuts are removed in Phase 9+
-//! when ring-3 clients require proper page-capability grants.
+//! No mutable state — the ramdisk is purely read-only.
 
 #![allow(dead_code)]
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::fs::protocol::{
     FILE_CLOSE, FILE_LIST, FILE_OPEN, FILE_READ, MAX_LIST_LEN, MAX_NAME_LEN, MAX_READ_LEN,
 };
 use crate::ipc::Message;
 
+// ===========================================================================
+// Directory tree
+// ===========================================================================
+
+/// A node in the ramdisk directory tree.
+pub enum RamdiskNode {
+    /// A regular file with static content embedded at compile time.
+    File { content: &'static [u8] },
+    /// A directory whose children are `(name, node)` pairs.
+    Dir {
+        children: &'static [(&'static str, RamdiskNode)],
+    },
+}
+
+impl RamdiskNode {
+    /// Returns `true` if this node is a directory.
+    pub fn is_dir(&self) -> bool {
+        matches!(self, RamdiskNode::Dir { .. })
+    }
+
+    /// Returns `true` if this node is a regular file.
+    pub fn is_file(&self) -> bool {
+        matches!(self, RamdiskNode::File { .. })
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Static file table
+// Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
 
-struct RamdiskFile {
+static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "exit0.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/exit0.elf"),
+        },
+    ),
+    (
+        "fork-test.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/fork-test.elf"),
+        },
+    ),
+    (
+        "echo-args.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/echo-args.elf"),
+        },
+    ),
+    (
+        "hello.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/hello.elf"),
+        },
+    ),
+    (
+        "tmpfs-test.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/tmpfs-test.elf"),
+        },
+    ),
+    (
+        "echo.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/echo.elf"),
+        },
+    ),
+    (
+        "true.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/true.elf"),
+        },
+    ),
+    (
+        "false.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/false.elf"),
+        },
+    ),
+    (
+        "cat.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/cat.elf"),
+        },
+    ),
+    (
+        "ls.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/ls.elf"),
+        },
+    ),
+    (
+        "pwd.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/pwd.elf"),
+        },
+    ),
+    (
+        "mkdir.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/mkdir.elf"),
+        },
+    ),
+    (
+        "rmdir.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/rmdir.elf"),
+        },
+    ),
+    (
+        "rm.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/rm.elf"),
+        },
+    ),
+    (
+        "cp.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/cp.elf"),
+        },
+    ),
+    (
+        "mv.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/mv.elf"),
+        },
+    ),
+    (
+        "env.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/env.elf"),
+        },
+    ),
+    (
+        "sleep.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/sleep.elf"),
+        },
+    ),
+    (
+        "grep.elf",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/grep.elf"),
+        },
+    ),
+];
+
+static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "hello.txt",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/hello.txt"),
+        },
+    ),
+    (
+        "readme.txt",
+        RamdiskNode::File {
+            content: include_bytes!("../../initrd/readme.txt"),
+        },
+    ),
+];
+
+static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "bin",
+        RamdiskNode::Dir {
+            children: BIN_ENTRIES,
+        },
+    ),
+    (
+        "etc",
+        RamdiskNode::Dir {
+            children: ETC_ENTRIES,
+        },
+    ),
+];
+
+/// The root of the ramdisk directory tree.
+static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
+    children: ROOT_ENTRIES,
+};
+
+// ===========================================================================
+// Tree navigation helpers
+// ===========================================================================
+
+/// Look up a node by absolute path in the ramdisk tree.
+///
+/// The path should start with `/` or be empty (returns root).
+///
+/// # Examples
+///
+/// ```ignore
+/// ramdisk_lookup("/")              // → root Dir
+/// ramdisk_lookup("/bin")           // → bin Dir
+/// ramdisk_lookup("/bin/cat.elf")   // → File
+/// ramdisk_lookup("/etc/hello.txt") // → File
+/// ```
+pub fn ramdisk_lookup(path: &str) -> Option<&'static RamdiskNode> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Some(&RAMDISK_ROOT);
+    }
+
+    let mut current = &RAMDISK_ROOT;
+    for component in trimmed.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        match current {
+            RamdiskNode::Dir { children } => {
+                match children.iter().find(|(name, _)| *name == component) {
+                    Some((_, node)) => current = node,
+                    None => return None,
+                }
+            }
+            RamdiskNode::File { .. } => return None,
+        }
+    }
+    Some(current)
+}
+
+/// List children of a ramdisk directory.
+///
+/// Returns `(name, is_dir)` pairs, or `None` if the path does not refer to a
+/// directory.
+pub fn ramdisk_list_dir(path: &str) -> Option<Vec<(String, bool)>> {
+    let node = ramdisk_lookup(path)?;
+    match node {
+        RamdiskNode::Dir { children } => {
+            let mut result = Vec::new();
+            for (name, child) in children.iter() {
+                result.push((String::from(*name), child.is_dir()));
+            }
+            Some(result)
+        }
+        RamdiskNode::File { .. } => None,
+    }
+}
+
+// ===========================================================================
+// Public file access (used by syscalls)
+// ===========================================================================
+
+/// Look up a file by path and return a reference to its static content.
+///
+/// Accepts paths with or without a leading `/`.  For backward compatibility a
+/// bare filename such as `"cat.elf"` is searched under `/bin/` and then
+/// `/etc/`.
+///
+/// Used by `sys_open`, `sys_execve`, and `resolve_command`.
+pub fn get_file(name: &str) -> Option<&'static [u8]> {
+    // Try exact path first (with leading `/` normalised).
+    let path = if name.starts_with('/') {
+        String::from(name)
+    } else {
+        alloc::format!("/{}", name)
+    };
+
+    if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&path) {
+        return Some(content);
+    }
+
+    // Backward compatibility: try under /bin/ and /etc/ for bare filenames.
+    if !name.contains('/') {
+        let bin_path = alloc::format!("/bin/{}", name);
+        if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&bin_path) {
+            return Some(content);
+        }
+        let etc_path = alloc::format!("/etc/{}", name);
+        if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&etc_path) {
+            return Some(content);
+        }
+    }
+
+    None
+}
+
+// ===========================================================================
+// Legacy flat file table (for IPC backward compatibility)
+// ===========================================================================
+
+/// Private flat entry used by the IPC `handle_open` / `handle_read` path.
+struct FlatFile {
     name: &'static str,
     content: &'static [u8],
 }
 
-const FILES: &[RamdiskFile] = &[
-    RamdiskFile {
+/// Flat file array preserving the original index-based fd scheme expected by
+/// `fs_client_task` and the VFS IPC protocol.  LLVM will deduplicate the
+/// `include_bytes!` content with the identical entries in the tree above.
+static FLAT_FILES: &[FlatFile] = &[
+    FlatFile {
         name: "hello.txt",
         content: include_bytes!("../../initrd/hello.txt"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "readme.txt",
         content: include_bytes!("../../initrd/readme.txt"),
     },
-    // Phase 11 userspace test binaries (compiled by `cargo xtask run/image`).
-    RamdiskFile {
+    FlatFile {
         name: "exit0.elf",
         content: include_bytes!("../../initrd/exit0.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "fork-test.elf",
         content: include_bytes!("../../initrd/fork-test.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "echo-args.elf",
         content: include_bytes!("../../initrd/echo-args.elf"),
     },
-    // Phase 12 musl-linked C binary (compiled by `cargo xtask run/image/check`).
-    RamdiskFile {
+    FlatFile {
         name: "hello.elf",
         content: include_bytes!("../../initrd/hello.elf"),
     },
-    // Phase 13 tmpfs test binary (compiled by `cargo xtask run/image/check`).
-    RamdiskFile {
+    FlatFile {
         name: "tmpfs-test.elf",
         content: include_bytes!("../../initrd/tmpfs-test.elf"),
     },
-    // Phase 14 core utilities (musl-linked C binaries).
-    RamdiskFile {
+    FlatFile {
         name: "echo.elf",
         content: include_bytes!("../../initrd/echo.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "true.elf",
         content: include_bytes!("../../initrd/true.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "false.elf",
         content: include_bytes!("../../initrd/false.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "cat.elf",
         content: include_bytes!("../../initrd/cat.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "ls.elf",
         content: include_bytes!("../../initrd/ls.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "pwd.elf",
         content: include_bytes!("../../initrd/pwd.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "mkdir.elf",
         content: include_bytes!("../../initrd/mkdir.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "rmdir.elf",
         content: include_bytes!("../../initrd/rmdir.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "rm.elf",
         content: include_bytes!("../../initrd/rm.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "cp.elf",
         content: include_bytes!("../../initrd/cp.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "mv.elf",
         content: include_bytes!("../../initrd/mv.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "env.elf",
         content: include_bytes!("../../initrd/env.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "sleep.elf",
         content: include_bytes!("../../initrd/sleep.elf"),
     },
-    RamdiskFile {
+    FlatFile {
         name: "grep.elf",
         content: include_bytes!("../../initrd/grep.elf"),
     },
@@ -126,8 +407,8 @@ const FILES: &[RamdiskFile] = &[
 const fn file_name_list_len() -> usize {
     let mut total = 0;
     let mut index = 0;
-    while index < FILES.len() {
-        total += FILES[index].name.len() + 1;
+    while index < FLAT_FILES.len() {
+        total += FLAT_FILES[index].name.len() + 1;
         index += 1;
     }
     total
@@ -140,8 +421,8 @@ const fn build_file_name_list() -> [u8; FILE_NAME_LIST_LEN] {
     let mut buf = [0; FILE_NAME_LIST_LEN];
     let mut out = 0;
     let mut file_index = 0;
-    while file_index < FILES.len() {
-        let name = FILES[file_index].name.as_bytes();
+    while file_index < FLAT_FILES.len() {
+        let name = FLAT_FILES[file_index].name.as_bytes();
         let mut byte_index = 0;
         while byte_index < name.len() {
             buf[out] = name[byte_index];
@@ -161,9 +442,9 @@ fn name_list() -> (*const u8, usize) {
     (FILE_NAME_LIST.as_ptr(), FILE_NAME_LIST.len())
 }
 
-// ---------------------------------------------------------------------------
-// Message handler
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// IPC message handler
+// ===========================================================================
 
 /// Handle one `fat_server` IPC message and return the reply [`Message`].
 ///
@@ -171,6 +452,7 @@ fn name_list() -> (*const u8, usize) {
 /// - [`FILE_OPEN`]  — look up a file by name; reply with its fd or `u64::MAX`.
 /// - [`FILE_READ`]  — return a pointer + length into the static content.
 /// - [`FILE_CLOSE`] — no-op; reply with an empty ack message.
+/// - [`FILE_LIST`]  — return the null-separated name list.
 /// - anything else  — reply with label `u64::MAX` (unknown operation).
 pub fn handle(msg: &Message) -> Message {
     match msg.label {
@@ -178,7 +460,6 @@ pub fn handle(msg: &Message) -> Message {
         FILE_READ => handle_read(msg),
         FILE_CLOSE => Message::new(0),
         FILE_LIST => {
-            // Return a pointer to the static null-separated name list.
             let (ptr, len) = name_list();
             let mut reply = Message::new(0);
             reply.data[0] = ptr as u64;
@@ -190,14 +471,13 @@ pub fn handle(msg: &Message) -> Message {
 }
 
 // ---------------------------------------------------------------------------
-// FILE_OPEN
+// FILE_OPEN (IPC — uses flat table for index-based fds)
 // ---------------------------------------------------------------------------
 
 fn handle_open(msg: &Message) -> Message {
     let ptr = msg.data[0];
     let len = msg.data[1] as usize;
 
-    // Null-ptr / zero-length / oversized-name guard.
     if ptr == 0 || len == 0 || len > MAX_NAME_LEN {
         return Message::with1(0, u64::MAX);
     }
@@ -214,7 +494,7 @@ fn handle_open(msg: &Message) -> Message {
         Err(_) => return Message::with1(0, u64::MAX),
     };
 
-    for (index, file) in FILES.iter().enumerate() {
+    for (index, file) in FLAT_FILES.iter().enumerate() {
         if file.name == name {
             return Message::with1(0, index as u64);
         }
@@ -224,33 +504,24 @@ fn handle_open(msg: &Message) -> Message {
 }
 
 // ---------------------------------------------------------------------------
-// FILE_READ
+// FILE_READ (IPC — uses flat table for index-based fds)
 // ---------------------------------------------------------------------------
-
-/// Look up a file by name and return a reference to its static content.
-///
-/// Used by `sys_execve` to read a binary directly without going through IPC.
-pub fn get_file(name: &str) -> Option<&'static [u8]> {
-    FILES.iter().find(|f| f.name == name).map(|f| f.content)
-}
 
 fn handle_read(msg: &Message) -> Message {
     let fd = msg.data[0];
     let offset = msg.data[1] as usize;
     let max_len = msg.data[2] as usize;
 
-    // Reject fd values that exceed usize range or the file table bounds.
     let fd_usize = match usize::try_from(fd) {
         Ok(v) => v,
         Err(_) => return Message::with2(0, 0, 0),
     };
-    if fd_usize >= FILES.len() {
+    if fd_usize >= FLAT_FILES.len() {
         return Message::with2(0, 0, 0);
     }
 
-    let file = &FILES[fd_usize];
+    let file = &FLAT_FILES[fd_usize];
 
-    // Reject offsets past the end of the file.
     if offset > file.content.len() {
         return Message::with2(0, 0, 0);
     }
@@ -258,8 +529,6 @@ fn handle_read(msg: &Message) -> Message {
     let available = file.content.len() - offset;
     let actual_len = available.min(max_len).min(MAX_READ_LEN);
 
-    // Return a pointer into the static content slice.  The slice lives for
-    // 'static so the pointer remains valid for as long as the kernel runs.
     let content_ptr = file.content[offset..].as_ptr() as u64;
 
     Message::with2(0, content_ptr, actual_len as u64)
