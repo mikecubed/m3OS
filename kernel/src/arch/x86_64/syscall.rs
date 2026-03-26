@@ -2596,7 +2596,11 @@ fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
     if crate::mm::user_mem::copy_to_user(buf_ptr, cwd_bytes).is_err() {
         return NEG_EFAULT;
     }
-    if crate::mm::user_mem::copy_to_user(buf_ptr + cwd_bytes.len() as u64, &[0u8]).is_err() {
+    let terminator_ptr = match buf_ptr.checked_add(cwd_bytes.len() as u64) {
+        Some(p) => p,
+        None => return NEG_EFAULT,
+    };
+    if crate::mm::user_mem::copy_to_user(terminator_ptr, &[0u8]).is_err() {
         return NEG_EFAULT;
     }
     // Linux getcwd returns the length of the path (including null terminator).
@@ -3056,7 +3060,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     };
 
     let offset = entry.offset;
-    let max_bytes = count as usize;
+    let max_bytes = (count as usize).min(64 * 1024);
 
     // Collect directory entries: [(".", true), ("..", true), ...children...]
     let mut entries: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();

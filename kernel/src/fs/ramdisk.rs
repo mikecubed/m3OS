@@ -215,15 +215,16 @@ pub fn ramdisk_list_dir(path: &str) -> Option<Vec<(String, bool)>> {
 ///
 /// Used by `sys_open`, `sys_execve`, and `resolve_command`.
 pub fn get_file(name: &str) -> Option<&'static [u8]> {
-    // Try exact path first (with leading `/` normalised).
-    let path = if name.starts_with('/') {
-        String::from(name)
+    // Try exact path first — avoid allocation when already absolute.
+    if name.starts_with('/') {
+        if let Some(RamdiskNode::File { content }) = ramdisk_lookup(name) {
+            return Some(content);
+        }
     } else {
-        alloc::format!("/{}", name)
-    };
-
-    if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&path) {
-        return Some(content);
+        let path = alloc::format!("/{}", name);
+        if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&path) {
+            return Some(content);
+        }
     }
 
     // Backward compatibility: try under /bin/ and /etc/ for bare filenames.
