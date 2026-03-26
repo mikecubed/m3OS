@@ -946,6 +946,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
+    // Resolve path against the process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, name);
+    let name: &str = &resolved;
+
     log::info!(
         "[p{}] execve({})",
         crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed),
