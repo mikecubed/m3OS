@@ -316,13 +316,8 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
 
     let saved_mask = read_u64(OFF_SIGMASK)?;
 
-    // Sanitize rflags: only restore safe bits (clear IOPL, IF override, TF).
-    // RFLAGS bits: IF=9, TF=8, IOPL=12-13, NT=14, RF=16, VM=17.
-    // Allow: CF(0), PF(2), AF(4), ZF(6), SF(7), DF(10), OF(11).
-    // Always set IF so userspace runs with interrupts enabled.
-    // Keep the same rflags mask as enter_userspace: 0x202 base.
-    // Actually, be permissive: just mask out IOPL and ensure IF is set.
-    // The `rflags` value is already the user's original rflags.
+    // Note: rflags sanitization (clearing IOPL, NT, VM, etc.) is done
+    // by restore_and_enter_userspace in syscall.rs before the iretq.
 
     Some((regs, saved_mask))
 }

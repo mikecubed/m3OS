@@ -516,7 +516,7 @@ fn deliver_user_signal(
     //    RIP = handler_entry, RSP = frame_rsp, RDI = signum (first arg).
     //
     //    We use a custom iretq sequence that also sets RDI.
-    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64) }
+    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64, &regs) }
 }
 
 /// Enter ring 3 at `handler` with `rsp` as the stack pointer and `rdi`
@@ -525,24 +525,20 @@ fn deliver_user_signal(
 /// # Safety
 ///
 /// Same requirements as `enter_userspace`.
-unsafe fn enter_signal_handler(handler: u64, rsp: u64, sig: u64) -> ! {
-    use core::arch::asm;
-    asm!(
-        "mov rdi, {sig}",
-        "push {ss}",
-        "push {rsp_val}",
-        "push {rflags}",
-        "push {cs}",
-        "push {rip_val}",
-        "iretq",
-        sig     = in(reg) sig,
-        ss      = in(reg) u64::from(crate::arch::x86_64::gdt::user_data_selector().0),
-        rsp_val = in(reg) rsp,
-        rflags  = const 0x202u64,
-        cs      = in(reg) u64::from(crate::arch::x86_64::gdt::user_code_selector().0),
-        rip_val = in(reg) handler,
-        options(noreturn)
-    )
+unsafe fn enter_signal_handler(
+    handler: u64,
+    rsp: u64,
+    sig: u64,
+    saved_regs: &crate::signal::SavedUserRegs,
+) -> ! {
+    // Build a modified copy of the interrupted user context: RIP→handler,
+    // RSP→sigframe, RDI→signal number. All other GPRs retain the
+    // interrupted values so no kernel register state leaks to ring 3.
+    let mut regs = *saved_regs;
+    regs.rip = handler;
+    regs.rsp = rsp;
+    regs.rdi = sig;
+    restore_and_enter_userspace(&regs)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,9 +760,12 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     // then load all registers from the struct.
     let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
     let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
-    // Sanitize rflags: always set IF (bit 9), clear IOPL (bits 12-13).
-    // Sanitize: clear IOPL (bits 12-13), force IF (bit 9) and reserved bit 1.
-    let rflags = (regs.rflags & !0x3000) | 0x202;
+    // Sanitize rflags: clear all privileged/reserved bits that could cause
+    // #GP during iretq, then force IF (bit 9) and reserved bit 1.
+    // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
+    const PRIV_MASK: u64 =
+        (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+    let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
 
     asm!(
         // Build the iretq frame on the kernel stack.
@@ -1009,7 +1008,6 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     if ss_ptr != 0 {
         // Cannot change alt stack while executing on it.
         if proc.alt_stack_flags & crate::process::SS_ONSTACK != 0 {
-            const NEG_EPERM: u64 = (-1_i64) as u64;
             return NEG_EPERM;
         }
 
