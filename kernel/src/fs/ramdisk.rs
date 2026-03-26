@@ -149,9 +149,10 @@ static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
 // Tree navigation helpers
 // ===========================================================================
 
-/// Look up a node by absolute path in the ramdisk tree.
+/// Look up a node by path in the ramdisk tree.
 ///
-/// The path should start with `/` or be empty (returns root).
+/// Accepts both absolute (`/bin/cat.elf`) and relative (`bin/cat.elf`) paths;
+/// leading slashes are stripped before traversal. An empty path returns root.
 ///
 /// # Examples
 ///

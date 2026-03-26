@@ -1154,9 +1154,8 @@ fn shell_fork_exec(
                 match pipe::pipe_read(pipe_id, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                            shell_print(my_id, console_ep, s);
-                        }
+                        let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
+                        shell_print(my_id, console_ep, &s);
                     }
                     Err(_) => {
                         task::yield_now();
@@ -1288,9 +1287,8 @@ fn shell_pipeline(
         match pipe::pipe_read(relay_pipe, &mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-                    shell_print(my_id, console_ep, s);
-                }
+                let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
+                shell_print(my_id, console_ep, &s);
             }
             Err(_) => {
                 task::yield_now();

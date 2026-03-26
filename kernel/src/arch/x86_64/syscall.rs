@@ -962,14 +962,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Err(()) => return NEG_EFAULT,
     };
 
-    // Strip leading "/" or path prefix to get the ramdisk filename.
-    let file_name = name.trim_start_matches('/');
-
-    // Read the binary from the ramdisk.
-    let data = match crate::fs::ramdisk::get_file(file_name) {
+    // Read the binary from the ramdisk (get_file handles both absolute and bare names).
+    let data = match crate::fs::ramdisk::get_file(name) {
         Some(d) => d,
         None => {
-            log::warn!("[execve] file not found: {}", file_name);
+            log::warn!("[execve] file not found: {}", name);
             return NEG_ENOENT;
         }
     };
@@ -1849,11 +1846,8 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                     return NEG_ENOTDIR;
                 }
             }
-        } else {
-            let file_name = name.trim_start_matches('/');
-            if crate::fs::ramdisk::get_file(file_name).is_some() {
-                return NEG_ENOTDIR;
-            }
+        } else if crate::fs::ramdisk::get_file(name).is_some() {
+            return NEG_ENOTDIR;
         }
         // Path doesn't exist — fall through to normal open which will return ENOENT.
     }
@@ -1936,12 +1930,11 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
-    if writable {
+    if writable || create {
         return NEG_EROFS;
     }
 
-    let file_name = name.trim_start_matches('/');
-    let content = match crate::fs::ramdisk::get_file(file_name) {
+    let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => {
             log::warn!("[open] file not found: {}", name);
@@ -2026,7 +2019,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                     return NEG_ENOTDIR;
                 }
             }
-        } else if crate::fs::ramdisk::get_file(name.trim_start_matches('/')).is_some() {
+        } else if crate::fs::ramdisk::get_file(name).is_some() {
             return NEG_ENOTDIR;
         }
     }
@@ -2085,11 +2078,11 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         };
     }
 
-    // Ramdisk fallback.
-    if writable {
+    // Ramdisk fallback — read-only.
+    if writable || create {
         return NEG_EROFS;
     }
-    let content = match crate::fs::ramdisk::get_file(name.trim_start_matches('/')) {
+    let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => return NEG_ENOENT,
     };
