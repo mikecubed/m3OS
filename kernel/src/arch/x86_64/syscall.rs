@@ -121,7 +121,7 @@ use super::gdt;
 
 /// Scratch space to save the user RSP during a syscall.
 #[no_mangle]
-static mut SYSCALL_USER_RSP: u64 = 0;
+pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
 
 /// Saved value of R10 at SYSCALL entry.
 ///
@@ -268,9 +268,10 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
-    // Divergent syscalls (exit) never return — handle them first.
+    // Divergent syscalls (exit, sigreturn) never return — handle them first.
     match number {
         6 => sys_exit_legacy(arg0),
+        15 => sys_sigreturn(user_rsp),
         60 | 231 => sys_exit(arg0 as i32),
         _ => {}
     }
@@ -289,7 +290,7 @@ pub extern "C" fn syscall_handler(
         12 => sys_linux_brk(arg0),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
         13 => sys_rt_sigaction(arg0, arg1, arg2),
-        14 => sys_rt_sigprocmask(),
+        14 => sys_rt_sigprocmask(arg0, arg1, arg2),
         // Linux misc (Phase 12, T023–T026)
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
@@ -323,8 +324,14 @@ pub extern "C" fn syscall_handler(
         109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
         121 => sys_getpgid(arg0),
+        // Phase 19: sigaltstack
+        131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
+        // Phase 19: gettid — returns PID (no threads, tid=pid)
+        186 => sys_getpid(),
+        // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
+        200 => sys_kill(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
@@ -336,8 +343,9 @@ pub extern "C" fn syscall_handler(
         _ => NEG_ENOSYS,
     };
 
-    // Phase 14 (P14-T031): check pending signals before returning to userspace.
-    check_pending_signals();
+    // Phase 14/19: check pending signals before returning to userspace.
+    // If a user handler is delivered, this diverges and never returns.
+    check_pending_signals(result);
 
     result
 }
@@ -345,12 +353,12 @@ pub extern "C" fn syscall_handler(
 /// Check and deliver pending signals for the current process.
 ///
 /// Called after every syscall (except exit/execve which diverge).
-/// For now, only default actions are supported:
-///   - Terminate: kill the process
-///   - Stop: mark as Stopped and yield
-///   - Continue: already handled in send_signal
-///   - Ignore: do nothing
-fn check_pending_signals() {
+/// `syscall_result` is the return value that would be placed in RAX.
+///
+/// If a user handler is found, this function **diverges**: it builds a
+/// sigframe on the user stack and enters ring 3 at the handler address.
+/// The normal syscall return path is never reached in that case.
+fn check_pending_signals(syscall_result: u64) {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     if pid == 0 {
         return; // kernel task, no signals
@@ -365,7 +373,6 @@ fn check_pending_signals() {
                 match disposition {
                     SignalDisposition::Terminate => {
                         log::info!("[p{}] killed by signal {}", pid, signum);
-                        // Use negative exit code to indicate signal death.
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
@@ -379,7 +386,6 @@ fn check_pending_signals() {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
-                        // Yield until SIGCONT resumes us.
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -392,13 +398,147 @@ fn check_pending_signals() {
                                 .store(pid, core::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    SignalDisposition::Continue | SignalDisposition::Ignore => {
-                        // Nothing to do.
+                    SignalDisposition::Continue | SignalDisposition::Ignore => {}
+                    SignalDisposition::UserHandler {
+                        entry,
+                        mask,
+                        flags,
+                        restorer,
+                    } => {
+                        deliver_user_signal(
+                            pid,
+                            signum,
+                            syscall_result,
+                            entry,
+                            mask,
+                            flags,
+                            restorer,
+                        );
+                        // deliver_user_signal diverges — never reaches here.
                     }
                 }
             }
         }
     }
+}
+
+/// Build a sigframe on the user stack and enter the signal handler.
+///
+/// This function **never returns** — it diverges into ring 3 at the
+/// handler address via `iretq`.
+#[allow(clippy::too_many_arguments)]
+fn deliver_user_signal(
+    pid: crate::process::Pid,
+    signum: u32,
+    syscall_result: u64,
+    handler_entry: u64,
+    sa_mask: u64,
+    sa_flags: u64,
+    restorer: u64,
+) -> ! {
+    // 1. Read the interrupted user register state from the kernel stack.
+    let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
+
+    // 2. Read and update the process's blocked_signals; check alt stack.
+    let (old_blocked, alt_stack_rsp) = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => {
+                log::warn!("[signal] deliver: pid {} gone", pid);
+                sys_exit(-11); // SIGSEGV
+            }
+        };
+        let old = proc.blocked_signals;
+        // Block the delivered signal + sa_mask during handler execution.
+        proc.blocked_signals |= sa_mask | (1u64 << signum);
+        // SIGKILL and SIGSTOP can never be blocked.
+        proc.blocked_signals &= !UNBLOCKABLE_MASK;
+
+        // Check if we should use the alternate signal stack.
+        let alt_rsp = if sa_flags & SA_ONSTACK != 0
+            && proc.alt_stack_base != 0
+            && proc.alt_stack_flags & crate::process::SS_DISABLE == 0
+            && proc.alt_stack_flags & crate::process::SS_ONSTACK == 0
+        {
+            // Mark the alt stack as in use; compute top with overflow check.
+            proc.alt_stack_flags |= crate::process::SS_ONSTACK;
+            proc.alt_stack_base.checked_add(proc.alt_stack_size)
+        } else {
+            None
+        };
+        (old, alt_rsp)
+    };
+
+    // 3. Build the sigframe on the user stack (or alt stack).
+    let frame_rsp = match crate::signal::setup_signal_frame(
+        &regs,
+        old_blocked,
+        signum,
+        restorer,
+        alt_stack_rsp,
+    ) {
+        Some(rsp) => rsp,
+        None => {
+            log::warn!(
+                "[p{}] signal {}: cannot build sigframe (bad user stack {:#x})",
+                pid,
+                signum,
+                regs.rsp,
+            );
+            sys_exit(-11); // SIGSEGV default
+        }
+    };
+
+    // Write the uc_stack into the sigframe if using alt stack (so sigreturn
+    // can clear SS_ONSTACK).
+    if alt_stack_rsp.is_some() {
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid) {
+            crate::signal::write_sigframe_uc_stack(
+                frame_rsp,
+                proc.alt_stack_base,
+                proc.alt_stack_flags,
+                proc.alt_stack_size,
+            );
+        }
+    }
+
+    log::info!(
+        "[p{}] delivering signal {} → handler {:#x}, frame_rsp={:#x}",
+        pid,
+        signum,
+        handler_entry,
+        frame_rsp,
+    );
+
+    // 4. Enter ring 3 at the handler address.
+    //    RIP = handler_entry, RSP = frame_rsp, RDI = signum (first arg).
+    //
+    //    We use a custom iretq sequence that also sets RDI.
+    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64, &regs) }
+}
+
+/// Enter ring 3 at `handler` with `rsp` as the stack pointer and `rdi`
+/// set to the signal number (first argument to the handler).
+///
+/// # Safety
+///
+/// Same requirements as `enter_userspace`.
+unsafe fn enter_signal_handler(
+    handler: u64,
+    rsp: u64,
+    sig: u64,
+    saved_regs: &crate::signal::SavedUserRegs,
+) -> ! {
+    // Build a modified copy of the interrupted user context: RIP→handler,
+    // RSP→sigframe, RDI→signal number. All other GPRs retain the
+    // interrupted values so no kernel register state leaks to ring 3.
+    let mut regs = *saved_regs;
+    regs.rip = handler;
+    regs.rsp = rsp;
+    regs.rdi = sig;
+    restore_and_enter_userspace(&regs)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,9 +684,126 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
     }
 }
 
-/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
+/// `rt_sigreturn()` — restore interrupted register state from sigframe (syscall 15).
 ///
-/// We only support Default and Ignore (no user signal handlers yet).
+/// This is a divergent syscall: it reads the sigframe from the user stack,
+/// restores all saved registers and the signal mask, and enters ring 3 at
+/// the interrupted instruction.  It never returns through the normal path.
+fn sys_sigreturn(user_rsp: u64) -> ! {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Restore registers and signal mask from the sigframe.
+    let (regs, saved_mask) = match crate::signal::restore_sigframe(user_rsp) {
+        Some(r) => r,
+        None => {
+            log::warn!(
+                "[p{}] sigreturn: invalid sigframe at rsp {:#x}",
+                pid,
+                user_rsp
+            );
+            sys_exit(-11); // SIGSEGV
+        }
+    };
+
+    // Restore the signal mask and clear SS_ONSTACK based on kernel state
+    // (not user-provided uc_stack flags, which userspace could corrupt).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.blocked_signals = saved_mask & !UNBLOCKABLE_MASK;
+            if proc.alt_stack_flags & crate::process::SS_ONSTACK != 0 {
+                proc.alt_stack_flags &= !crate::process::SS_ONSTACK;
+            }
+        }
+    }
+
+    // Validate restored RIP and RSP are canonical userspace addresses.
+    // A corrupt sigframe could cause iretq to fault in ring 0.
+    const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if regs.rip >= USER_ADDR_LIMIT || regs.rsp >= USER_ADDR_LIMIT {
+        log::warn!(
+            "[p{}] sigreturn: non-canonical rip={:#x} or rsp={:#x}",
+            pid,
+            regs.rip,
+            regs.rsp,
+        );
+        sys_exit(-11); // SIGSEGV
+    }
+
+    log::debug!(
+        "[p{}] sigreturn → rip={:#x} rsp={:#x}",
+        pid,
+        regs.rip,
+        regs.rsp,
+    );
+
+    // Restore all registers and enter ring 3 at the interrupted instruction.
+    // We use iretq with a full register restore to return to the exact
+    // pre-signal state.
+    unsafe { restore_and_enter_userspace(&regs) }
+}
+
+/// Enter ring 3 with a full set of restored registers from a sigframe.
+///
+/// Restores all GPRs then uses `iretq` to return to the interrupted
+/// instruction with the correct RSP and RFLAGS.
+///
+/// # Safety
+///
+/// `regs` must contain valid userspace addresses for RIP and RSP.
+unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! {
+    use core::arch::asm;
+    // We need to restore all GPRs.  The simplest approach: push the iretq
+    // frame first, then load all GPRs from the struct, then iretq.
+    //
+    // We save the struct pointer in a register, set up the iretq frame,
+    // then load all registers from the struct.
+    let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
+    let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
+    // Sanitize rflags: clear all privileged/reserved bits that could cause
+    // #GP during iretq, then force IF (bit 9) and reserved bit 1.
+    // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
+    const PRIV_MASK: u64 =
+        (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+    let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
+
+    asm!(
+        // Build the iretq frame on the kernel stack.
+        "push {ss}",
+        "push {user_rsp}",
+        "push {rflags}",
+        "push {cs}",
+        "push {user_rip}",
+        // Now restore all GPRs from the SavedUserRegs struct.
+        // r14 holds the pointer to the struct (chosen because we restore it last-ish).
+        "mov r15, [r14 + 120]",  // r15 offset
+        "mov r13, [r14 + 104]",  // r13
+        "mov r12, [r14 + 96]",   // r12
+        "mov r11, [r14 + 88]",   // r11
+        "mov r10, [r14 + 80]",   // r10
+        "mov r9, [r14 + 72]",    // r9
+        "mov r8, [r14 + 64]",    // r8
+        "mov rbp, [r14 + 48]",   // rbp
+        "mov rbx, [r14 + 8]",    // rbx
+        "mov rdx, [r14 + 24]",   // rdx
+        "mov rsi, [r14 + 32]",   // rsi
+        "mov rdi, [r14 + 40]",   // rdi
+        "mov rcx, [r14 + 16]",   // rcx
+        "mov rax, [r14 + 0]",    // rax
+        // Restore r14 last (it was our pointer register).
+        "mov r14, [r14 + 112]",  // r14
+        "iretq",
+        ss       = in(reg) ss,
+        user_rsp = in(reg) regs.rsp,
+        rflags   = in(reg) rflags,
+        cs       = in(reg) cs,
+        user_rip = in(reg) regs.rip,
+        in("r14") regs as *const crate::signal::SavedUserRegs as u64,
+        options(noreturn)
+    )
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
     if sig == 0 || sig >= 32 {
@@ -565,14 +822,29 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     };
 
     // Write old action if requested.
-    // struct sigaction: sa_handler (8 bytes) + sa_flags (8 bytes) + sa_restorer (8 bytes) + sa_mask (8 bytes) = 32 bytes min
+    // Linux struct sigaction layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes
     if oldact_ptr != 0 {
         let mut old_sa = [0u8; 32];
-        let handler: u64 = match proc.signal_actions[sig as usize] {
-            crate::process::SignalAction::Default => 0, // SIG_DFL
-            crate::process::SignalAction::Ignore => 1,  // SIG_IGN
-        };
-        old_sa[0..8].copy_from_slice(&handler.to_ne_bytes());
+        match proc.signal_actions[sig as usize] {
+            crate::process::SignalAction::Default => {
+                old_sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
+            }
+            crate::process::SignalAction::Ignore => {
+                old_sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
+            }
+            crate::process::SignalAction::Handler {
+                entry,
+                mask,
+                flags,
+                restorer,
+            } => {
+                old_sa[0..8].copy_from_slice(&entry.to_ne_bytes());
+                old_sa[8..16].copy_from_slice(&flags.to_ne_bytes());
+                old_sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
+                // Convert kernel mask back to userspace (0-indexed).
+                old_sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
+            }
+        }
         if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
             return NEG_EFAULT;
         }
@@ -584,21 +856,199 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         if crate::mm::user_mem::copy_from_user(&mut sa, act_ptr).is_err() {
             return NEG_EFAULT;
         }
-        let handler = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
-        proc.signal_actions[sig as usize] = match handler {
+        let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
+        let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
+        let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
+
+        // Reject handler or restorer pointing into kernel space.
+        // Values 0 (SIG_DFL) and 1 (SIG_IGN) are handled by the match below.
+        const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+        if handler_addr >= USER_LIMIT {
+            return NEG_EINVAL;
+        }
+        if sa_restorer != 0 && sa_restorer >= USER_LIMIT {
+            return NEG_EINVAL;
+        }
+        // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
+        let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
+
+        proc.signal_actions[sig as usize] = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
-            _ => crate::process::SignalAction::Default, // user handlers → treat as default for now
+            _ => {
+                // Warn if SA_RESTORER is missing — musl always sets it.
+                // Without a restorer, the handler cannot return to sigreturn.
+                let effective_restorer = if sa_flags & SA_RESTORER != 0 {
+                    sa_restorer
+                } else {
+                    log::warn!(
+                        "[p{}] rt_sigaction: sig={} handler {:#x} missing SA_RESTORER",
+                        pid,
+                        sig,
+                        handler_addr,
+                    );
+                    0 // will fault on handler return, making the bug visible
+                };
+                crate::process::SignalAction::Handler {
+                    entry: handler_addr,
+                    mask: sa_mask,
+                    flags: sa_flags,
+                    restorer: effective_restorer,
+                }
+            }
         };
     }
 
     0
 }
 
-/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — stub (syscall 14).
+/// Signal mask operation constants (Linux).
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+
+/// Bits that must never be set in blocked_signals (SIGKILL=9, SIGSTOP=19).
+const UNBLOCKABLE_MASK: u64 = (1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP);
+
+/// Signal action flags (from Linux uapi).
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+#[allow(dead_code)]
+const SA_SIGINFO: u64 = 0x0000_0004;
+#[allow(dead_code)]
+const SA_NODEFER: u64 = 0x4000_0000;
+#[allow(dead_code)]
+const SA_RESETHAND: u64 = 0x8000_0000;
+
+/// `rt_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize)` — syscall 14.
 ///
-/// Signal masking is not implemented; always returns success.
-fn sys_rt_sigprocmask() -> u64 {
+/// Reads/modifies the calling process's blocked-signal mask.
+fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write old mask to userspace if requested.
+    // Userspace (musl) uses 0-indexed bits: bit N represents signal N+1.
+    // Kernel uses signal-number-indexed bits: bit N represents signal N.
+    // Convert kernel→userspace by shifting right 1.
+    if oldset_ptr != 0 {
+        let old_user = proc.blocked_signals >> 1;
+        let old_bytes = old_user.to_ne_bytes();
+        if crate::mm::user_mem::copy_to_user(oldset_ptr, &old_bytes).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Apply new mask if set_ptr is non-null.
+    if set_ptr != 0 {
+        let mut set_bytes = [0u8; 8];
+        if crate::mm::user_mem::copy_from_user(&mut set_bytes, set_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        // Convert userspace→kernel by shifting left 1.
+        let set = u64::from_ne_bytes(set_bytes) << 1;
+
+        match how {
+            SIG_BLOCK => proc.blocked_signals |= set,
+            SIG_UNBLOCK => proc.blocked_signals &= !set,
+            SIG_SETMASK => proc.blocked_signals = set,
+            _ => return NEG_EINVAL,
+        }
+
+        // SIGKILL and SIGSTOP can never be blocked.
+        proc.blocked_signals &= !UNBLOCKABLE_MASK;
+    }
+
+    // Drop the lock before checking pending signals so we don't deadlock.
+    // Check pending signals after any operation that could unblock signals.
+    let needs_check = set_ptr != 0 && (how == SIG_UNBLOCK || how == SIG_SETMASK);
+    drop(table);
+
+    // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.
+    // Pass 0 as the syscall result since rt_sigprocmask succeeds.
+    if needs_check {
+        check_pending_signals(0);
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19: sigaltstack (P19-T020, T021)
+// ---------------------------------------------------------------------------
+
+/// `sigaltstack(ss, old_ss)` — register/query alternate signal stack (syscall 131).
+fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write current alt stack to old_ss_ptr if requested.
+    if old_ss_ptr != 0 {
+        // struct stack_t: ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8) = 24 bytes
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&proc.alt_stack_base.to_ne_bytes());
+        buf[8..12].copy_from_slice(&proc.alt_stack_flags.to_ne_bytes());
+        buf[16..24].copy_from_slice(&proc.alt_stack_size.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(old_ss_ptr, &buf).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Read and set new alt stack if provided.
+    if ss_ptr != 0 {
+        // Cannot change alt stack while executing on it.
+        if proc.alt_stack_flags & crate::process::SS_ONSTACK != 0 {
+            return NEG_EPERM;
+        }
+
+        let mut buf = [0u8; 24];
+        if crate::mm::user_mem::copy_from_user(&mut buf, ss_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let ss_sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let ss_flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let ss_size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+
+        if ss_flags & crate::process::SS_DISABLE != 0 {
+            // Disable the alt stack.
+            proc.alt_stack_base = 0;
+            proc.alt_stack_size = 0;
+            proc.alt_stack_flags = crate::process::SS_DISABLE;
+        } else {
+            // Only SS_DISABLE is accepted from userspace; SS_ONSTACK is a
+            // read-only status flag maintained by the kernel.
+            if ss_flags & !crate::process::SS_DISABLE != 0 {
+                return NEG_EINVAL;
+            }
+            // Validate minimum size.
+            if ss_size < crate::process::MINSIGSTKSZ {
+                return NEG_EINVAL;
+            }
+            // Validate range is within canonical userspace (above null page).
+            const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+            if !(0x1000..USER_LIMIT).contains(&ss_sp)
+                || ss_sp
+                    .checked_add(ss_size)
+                    .is_none_or(|top| top > USER_LIMIT)
+            {
+                return NEG_EINVAL;
+            }
+            proc.alt_stack_base = ss_sp;
+            proc.alt_stack_size = ss_size;
+            proc.alt_stack_flags = 0;
+        }
+    }
+
     0
 }
 
@@ -821,7 +1271,16 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
     // and file descriptors are consistent with the copied address space.
-    let (parent_brk, parent_mmap, parent_fds, parent_pgid, parent_cwd) = {
+    let (
+        parent_brk,
+        parent_mmap,
+        parent_fds,
+        parent_pgid,
+        parent_cwd,
+        parent_blocked_signals,
+        parent_signal_actions,
+        parent_alt_stack,
+    ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
             Some(p) => (
@@ -830,6 +1289,9 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.fd_table.clone(),
                 p.pgid,
                 p.cwd.clone(),
+                p.blocked_signals,
+                p.signal_actions,
+                (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
             ),
             None => (
                 0,
@@ -840,6 +1302,9 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 },
                 0,
                 alloc::string::String::from("/"),
+                0,
+                [crate::process::SignalAction::Default; 32],
+                (0u64, 0u64, 0u32),
             ),
         }
     };
@@ -860,11 +1325,16 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_pgid,
     );
 
-    // Inherit parent's cwd in the child (Phase 18).
+    // Inherit parent's cwd, signal mask, and signal actions in the child.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(child) = table.find_mut(child_pid) {
             child.cwd = parent_cwd;
+            child.blocked_signals = parent_blocked_signals;
+            child.signal_actions = parent_signal_actions;
+            child.alt_stack_base = parent_alt_stack.0;
+            child.alt_stack_size = parent_alt_stack.1;
+            child.alt_stack_flags = parent_alt_stack.2;
         }
     }
 
@@ -1247,9 +1717,13 @@ fn has_pending_signal() -> bool {
     if proc.pending_signals == 0 {
         return false;
     }
-    // Check if any pending signal has a non-Ignore disposition.
+    // Check if any pending, unblocked signal has a non-Ignore disposition.
+    let deliverable = proc.pending_signals & !proc.blocked_signals;
+    if deliverable == 0 {
+        return false;
+    }
     for sig in 0..64u32 {
-        if proc.pending_signals & (1u64 << sig) != 0 {
+        if deliverable & (1u64 << sig) != 0 {
             let action = if sig < 32 {
                 proc.signal_actions[sig as usize]
             } else {
@@ -1263,6 +1737,7 @@ fn has_pending_signal() -> bool {
                     crate::process::SignalDisposition::Ignore
                 }
                 crate::process::SignalAction::Default => crate::process::default_signal_action(sig),
+                crate::process::SignalAction::Handler { .. } => return true,
             };
             if disposition != crate::process::SignalDisposition::Ignore {
                 return true;

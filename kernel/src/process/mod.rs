@@ -192,12 +192,26 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
 /// Signal numbers (Linux x86_64).
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGSEGV: u32 = 11;
+pub const SIGUSR2: u32 = 12;
+pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+
+/// sigaltstack flag: currently executing on the alt stack.
+pub const SS_ONSTACK: u32 = 1;
+/// sigaltstack flag: alt stack is disabled.
+pub const SS_DISABLE: u32 = 2;
+/// Minimum signal stack size (bytes).
+pub const MINSIGSTKSZ: u64 = 2048;
 
 /// What to do when a signal is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +220,17 @@ pub enum SignalAction {
     Default,
     /// Ignore the signal.
     Ignore,
+    /// Run a user-space signal handler.
+    Handler {
+        /// Userspace handler function address.
+        entry: u64,
+        /// Additional signals to block during handler execution.
+        mask: u64,
+        /// `sa_flags` from `rt_sigaction` (SA_RESTORER, SA_ONSTACK, etc.).
+        flags: u64,
+        /// Address of the `__restore_rt` trampoline stub (from `sa_restorer`).
+        restorer: u64,
+    },
 }
 
 /// Default action table: terminate or ignore.
@@ -214,7 +239,8 @@ pub fn default_signal_action(sig: u32) -> SignalDisposition {
         SIGCHLD => SignalDisposition::Ignore,
         SIGCONT => SignalDisposition::Continue,
         SIGSTOP | SIGTSTP => SignalDisposition::Stop,
-        SIGKILL | SIGINT | SIGTERM | SIGHUP => SignalDisposition::Terminate,
+        SIGKILL | SIGINT | SIGTERM | SIGHUP | SIGBUS | SIGFPE | SIGSEGV | SIGPIPE | SIGALRM
+        | SIGUSR1 | SIGUSR2 => SignalDisposition::Terminate,
         _ => SignalDisposition::Terminate,
     }
 }
@@ -226,6 +252,13 @@ pub enum SignalDisposition {
     Stop,
     Continue,
     Ignore,
+    /// Deliver to a user-space handler via sigframe.
+    UserHandler {
+        entry: u64,
+        mask: u64,
+        flags: u64,
+        restorer: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +329,17 @@ pub struct Process {
     pub fd_table: [Option<FdEntry>; MAX_FDS],
     /// Bitfield of pending signals (bit N = signal N is pending).
     pub pending_signals: u64,
+    /// Bitfield of blocked signals (bit N = signal N is blocked from delivery).
+    /// SIGKILL (9) and SIGSTOP (19) can never be blocked.
+    pub blocked_signals: u64,
     /// Per-signal action table (Default or Ignore).
     pub signal_actions: [SignalAction; 32],
+    /// Alternate signal stack base address (0 = disabled).
+    pub alt_stack_base: u64,
+    /// Alternate signal stack size in bytes.
+    pub alt_stack_size: u64,
+    /// Alternate signal stack flags (SS_DISABLE, SS_ONSTACK).
+    pub alt_stack_flags: u32,
     /// Current working directory (Phase 18). Defaults to "/".
     pub cwd: String,
 }
@@ -326,7 +368,11 @@ impl Process {
             pgid: pid,
             fd_table: new_fd_table(),
             pending_signals: 0,
+            blocked_signals: 0,
             signal_actions: [SignalAction::Default; 32],
+            alt_stack_base: 0,
+            alt_stack_size: 0,
+            alt_stack_flags: 0,
             cwd: String::from("/"),
         }
     }
@@ -439,7 +485,11 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
@@ -478,7 +528,11 @@ pub fn spawn_process_with_cr3(
         pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
@@ -521,7 +575,11 @@ pub fn spawn_process_with_cr3_and_fds(
         pgid,
         fd_table,
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
@@ -596,8 +654,12 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
         return None;
     }
 
-    // Find the lowest-numbered pending signal.
-    let sig = proc.pending_signals.trailing_zeros();
+    // Find the lowest-numbered pending signal that is not blocked.
+    let deliverable = proc.pending_signals & !proc.blocked_signals;
+    if deliverable == 0 {
+        return None;
+    }
+    let sig = deliverable.trailing_zeros();
     if sig >= 64 {
         return None;
     }
@@ -620,6 +682,24 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
             }
         }
         SignalAction::Default => default_signal_action(sig),
+        SignalAction::Handler {
+            entry,
+            mask,
+            flags,
+            restorer,
+        } => {
+            // SIGKILL and SIGSTOP always use default action regardless.
+            if sig == SIGKILL || sig == SIGSTOP {
+                default_signal_action(sig)
+            } else {
+                SignalDisposition::UserHandler {
+                    entry,
+                    mask,
+                    flags,
+                    restorer,
+                }
+            }
+        }
     };
 
     Some((sig, disposition))
