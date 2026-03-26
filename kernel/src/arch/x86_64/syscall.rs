@@ -328,6 +328,10 @@ pub extern "C" fn syscall_handler(
         131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
+        // Phase 19: gettid — returns PID (no threads, tid=pid)
+        186 => sys_getpid(),
+        // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
+        200 => sys_kill(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
@@ -830,7 +834,8 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
                 old_sa[0..8].copy_from_slice(&entry.to_ne_bytes());
                 old_sa[8..16].copy_from_slice(&flags.to_ne_bytes());
                 old_sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
-                old_sa[24..32].copy_from_slice(&mask.to_ne_bytes());
+                // Convert kernel mask back to userspace (0-indexed).
+                old_sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
             }
         }
         if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
@@ -847,7 +852,8 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
         let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
         let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
-        let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap());
+        // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
+        let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
         proc.signal_actions[sig as usize] = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
@@ -910,8 +916,12 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     };
 
     // Write old mask to userspace if requested.
+    // Userspace (musl) uses 0-indexed bits: bit N represents signal N+1.
+    // Kernel uses signal-number-indexed bits: bit N represents signal N.
+    // Convert kernel→userspace by shifting right 1.
     if oldset_ptr != 0 {
-        let old_bytes = proc.blocked_signals.to_ne_bytes();
+        let old_user = proc.blocked_signals >> 1;
+        let old_bytes = old_user.to_ne_bytes();
         if crate::mm::user_mem::copy_to_user(oldset_ptr, &old_bytes).is_err() {
             return NEG_EFAULT;
         }
@@ -923,7 +933,8 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
         if crate::mm::user_mem::copy_from_user(&mut set_bytes, set_ptr).is_err() {
             return NEG_EFAULT;
         }
-        let set = u64::from_ne_bytes(set_bytes);
+        // Convert userspace→kernel by shifting left 1.
+        let set = u64::from_ne_bytes(set_bytes) << 1;
 
         match how {
             SIG_BLOCK => proc.blocked_signals |= set,
@@ -937,7 +948,8 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     }
 
     // Drop the lock before checking pending signals so we don't deadlock.
-    let needs_check = set_ptr != 0 && how == SIG_UNBLOCK;
+    // Check pending signals after any operation that could unblock signals.
+    let needs_check = set_ptr != 0 && (how == SIG_UNBLOCK || how == SIG_SETMASK);
     drop(table);
 
     // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.

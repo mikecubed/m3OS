@@ -1641,6 +1641,12 @@ fn p11_launcher_task() -> ! {
     run_elf_and_report("tmpfs-test.elf");
     log::info!("[p13] tmpfs-test.elf launch complete");
 
+    // Phase 19: signal handler validation
+    // -----------------------------------------------------------------------
+    log::info!("[p13] running signal-test.elf (signal handler validation)");
+    run_elf_and_report("signal-test.elf");
+    log::info!("[p13] signal-test.elf launch complete");
+
     loop {
         task::yield_now();
     }

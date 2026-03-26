@@ -147,6 +147,8 @@ fn build_musl_bins() {
     let bins: &[(&str, &str)] = &[
         ("userspace/hello-c/hello.c", "hello"),
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
+        // Phase 19 signal handler test
+        ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 14 core utilities
         ("userspace/coreutils/echo.c", "echo"),
         ("userspace/coreutils/true.c", "true"),

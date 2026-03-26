@@ -171,8 +171,9 @@ const MC_RFLAGS: usize = 136;
 const OFF_SIGMASK: usize = OFF_MCONTEXT + SIGCONTEXT_SIZE; // 48 + 256 = 304
 const OFF_SIGINFO: usize = OFF_SIGMASK + SIGMASK_SIZE; // 304 + 128 = 432
 
-/// Kernel address space starts at this address — user pointers must be below.
-const KERNEL_BASE: u64 = 0x1000_0000_0000;
+/// User-space addresses on x86_64 must be in the lower canonical half
+/// (bit 47 clear).  The highest valid user address is 0x0000_7FFF_FFFF_FFFF.
+const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// Write the signal frame to the user stack and return the new user RSP.
 ///
@@ -196,7 +197,7 @@ pub fn setup_signal_frame(
     let frame_rsp = ((base_rsp - SIGFRAME_SIZE as u64) & !15) - 8;
 
     // Validate: frame must be in user space.
-    if !(0x1000..KERNEL_BASE).contains(&frame_rsp) {
+    if !(0x1000..USER_ADDR_LIMIT).contains(&frame_rsp) {
         return None;
     }
 
@@ -277,7 +278,7 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
     // the handler popped pretcode, advancing RSP by 8).
     let frame_rsp = user_rsp.wrapping_sub(8);
 
-    if !(0x1000..KERNEL_BASE).contains(&frame_rsp) {
+    if !(0x1000..USER_ADDR_LIMIT).contains(&frame_rsp) {
         return None;
     }
 
@@ -328,7 +329,7 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
 /// Returns `(ss_sp, ss_flags, ss_size)`.
 pub fn read_sigframe_uc_stack(user_rsp: u64) -> Option<(u64, u32, u64)> {
     let frame_rsp = user_rsp.wrapping_sub(8);
-    if !(0x1000..KERNEL_BASE).contains(&frame_rsp) {
+    if !(0x1000..USER_ADDR_LIMIT).contains(&frame_rsp) {
         return None;
     }
     let mut buf = [0u8; 24];
