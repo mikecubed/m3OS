@@ -1,4 +1,4 @@
-# Phase 25 - Compiler Bootstrap
+# Phase 26 - Compiler Bootstrap
 
 ## Milestone Goal
 
@@ -85,7 +85,7 @@ This phase depends on all of the following being complete:
 
 ## Companion Task List
 
-- [Phase 25 Task List](./tasks/25-compiler-bootstrap-tasks.md)
+- [Phase 26 Task List](./tasks/26-compiler-bootstrap-tasks.md)
 
 ## Documentation Deliverables
 

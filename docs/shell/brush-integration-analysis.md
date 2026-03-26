@@ -81,8 +81,8 @@ near term. Everything above it is blocked by OS features m3OS does not yet have.
 |---|---|---|---|
 | Rust `std` / musl libc | `brush-parser`, everything | ❌ designed, not built | Phase 12 |
 | `sigaction` user handlers | `brush-core` (trap builtin) | ❌ stub only | Phase 19 |
-| `termios` (`tcgetattr`/`tcsetattr`) | `crossterm`, `nix::term` | ❌ ioctl stub only | Phase 21 |
-| PTY / raw TTY | `reedline`, line editing | ❌ not started | Phase 21 |
+| `termios` (`tcgetattr`/`tcsetattr`) | `crossterm`, `nix::term` | ❌ ioctl stub only | Phase 22 |
+| PTY / raw TTY | `reedline`, line editing | ❌ not started | Phase 22 |
 | `clone(CLONE_VM)` — threads | tokio `rt-multi-thread` | 🔴 no phase exists | — |
 | `epoll_create` / `epoll_ctl` / `epoll_wait` | tokio I/O driver | 🔴 no phase exists | — |
 | `eventfd` | tokio wakeup | 🔴 no phase exists | — |
@@ -90,7 +90,7 @@ near term. Everything above it is blocked by OS features m3OS does not yet have.
 | `getrlimit` / `setrlimit` | `nix::resource` | ❌ not implemented | — |
 | `/etc/passwd`, `getuid` | `uzers` | ❌ not implemented | — |
 | Terminal database on filesystem | `terminfo` | ❌ not implemented | — |
-| Socket syscalls | `tokio::net` | ❌ not started | Phase 22 |
+| Socket syscalls | `tokio::net` | ❌ not started | Phase 23 |
 
 ### The Hard Wall: Tokio Threads
 
@@ -152,9 +152,9 @@ flowchart TD
     p18["Phase 18\nDirectory & VFS\n(getdents64, real cwd, opendir)"]
     p19["Phase 19\nSignal Handlers\n(sigaction, trampolines, sigreturn)"]
     p20["Phase 20\nUserspace Init & Shell\n(ring-3 init + minimal shell)"]
-    p21["Phase 21\nTTY & Terminal Control\n(termios, PTY, cooked/raw mode)"]
-    p22["Phase 22\nSocket API\n(TCP/UDP to userspace)"]
-    p23["Phase 23\nPersistent Storage\n(virtio-blk, FAT32 r/w)"]
+    p21["Phase 22\nTTY & Terminal Control\n(termios, PTY, cooked/raw mode)"]
+    p22["Phase 23\nSocket API\n(TCP/UDP to userspace)"]
+    p23["Phase 24\nPersistent Storage\n(virtio-blk, FAT32 r/w)"]
 
     p17 --> p18 --> p19 --> p20 --> p21
 
@@ -198,7 +198,7 @@ byte-by-byte line reader, whitespace tokenizer, `fork`/`execve`/`waitpid`, pipe,
 
 ### Option B — `brush-parser` in a Custom Shell (Best mid-term path)
 
-After Phase 12 (musl) and Phase 21 (TTY), compile `userspace/shell` as a
+After Phase 12 (musl) and Phase 22 (TTY), compile `userspace/shell` as a
 `x86_64-unknown-linux-musl` Rust binary (switching from `no_std` to `std`). Add
 `brush-parser` as a dependency. Write your own execution engine without tokio — just
 `fork`/`execve`/`waitpid` plus your signal and pipe machinery.
@@ -261,7 +261,7 @@ timeline
                  : fork + execve + waitpid
                  : pipe and redirection
                  : cd and exit builtins
-    section After Phase 21
+    section After Phase 22
         Phase 20+ : Switch shell to x86_64-unknown-linux-musl
                   : Add brush-parser as dependency
                   : Replace hand-rolled tokenizer
@@ -276,7 +276,7 @@ timeline
 1. **Implement Phase 20's minimal shell as designed.** It is the correct educational
    foundation and the only feasible path right now.
 
-2. **After Phase 21 (TTY):** Update `userspace/shell` to compile as
+2. **After Phase 22 (TTY):** Update `userspace/shell` to compile as
    `x86_64-unknown-linux-musl` (add `brush-parser` to `Cargo.toml`, delete the
    hand-rolled tokenizer, keep your execution engine). This is the sweet spot of
    effort vs. correctness.
@@ -327,6 +327,6 @@ already provides: `fork`, `execve`, `waitpid`, `pipe`, `dup2`, `open`, `close`.
 - [brush repository](https://github.com/reubeno/brush)
 - [brush-parser crate](https://github.com/reubeno/brush/tree/main/brush-parser)
 - [docs/roadmap/20-userspace-init-shell.md](../roadmap/20-userspace-init-shell.md)
-- [docs/roadmap/21-tty-pty.md](../roadmap/21-tty-pty.md)
+- [docs/roadmap/22-tty-pty.md](../roadmap/22-tty-pty.md)
 - [docs/12-posix-compatibility-layer.md](../12-posix-compatibility-layer.md)
 - [docs/14-shell-and-tools.md](../14-shell-and-tools.md)

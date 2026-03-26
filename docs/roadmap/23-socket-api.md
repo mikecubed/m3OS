@@ -1,4 +1,4 @@
-# Phase 22 — Socket API
+# Phase 23 — Socket API
 
 ## Milestone Goal
 
@@ -116,7 +116,7 @@ flowchart TD
 
 ## Companion Task List
 
-- [Phase 22 Task List](./tasks/22-socket-api-tasks.md)
+- [Phase 23 Task List](./tasks/23-socket-api-tasks.md)
 
 ## Documentation Deliverables
 

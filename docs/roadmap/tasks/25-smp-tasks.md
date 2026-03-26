@@ -1,4 +1,4 @@
-# Phase 24 — Symmetric Multiprocessing: Task List
+# Phase 25 — Symmetric Multiprocessing: Task List
 
 **Depends on:** Phase 4 (Tasking) ✅, Phase 15 (Hardware Discovery) ✅
 **Goal:** Boot all Application Processors, give each core its own GDT/TSS/kernel
@@ -161,7 +161,7 @@ access from multiple cores.
 
 ## Deferred Until Later
 
-These items are explicitly out of scope for Phase 24:
+These items are explicitly out of scope for Phase 25:
 
 - NUMA-aware memory allocation
 - CPU affinity (`sched_setaffinity`)
