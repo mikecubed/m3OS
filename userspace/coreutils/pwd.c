@@ -5,7 +5,7 @@
 int main(void) {
     char buf[256];
     if (getcwd(buf, sizeof(buf))) {
-        write(1, buf, strlen(buf));
+        write(1, buf, strlen(buf)); /* DevSkim: ignore DS140021 — getcwd null-terminates */
         write(1, "\n", 1);
     }
     return 0;

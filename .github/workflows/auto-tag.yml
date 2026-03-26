@@ -49,4 +49,10 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           git tag "$TAG"
           git push origin "$TAG"
-          echo "Tagged $TAG — release workflow will run"
+          echo "Tagged $TAG"
+
+      - name: Trigger release workflow
+        if: steps.version.outputs.changed == 'true' && steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --field tag="${{ steps.version.outputs.tag }}"

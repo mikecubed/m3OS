@@ -20,12 +20,12 @@ static int tests_passed = 0;
 static int tests_failed = 0;
 
 static void pass(const char *name) {
-    printf("  PASS: %s\n", name);
+    printf("  PASS: %s\n", name); /* DevSkim: ignore DS154189 — format string is a literal */
     tests_passed++;
 }
 
 static void fail(const char *name, const char *reason) {
-    printf("  FAIL: %s — %s\n", name, reason);
+    printf("  FAIL: %s — %s\n", name, reason); /* DevSkim: ignore DS154189 — format string is a literal */
     tests_failed++;
 }
 
@@ -33,7 +33,7 @@ static void fail(const char *name, const char *reason) {
 static void test_write_read_roundtrip(void) {
     const char *path = "/tmp/test.txt";
     const char *msg = "Hello from tmpfs!";
-    size_t msg_len = strlen(msg);
+    size_t msg_len = strlen(msg); /* DevSkim: ignore DS140021 — string literal */
 
     /* Create and write */
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -210,7 +210,7 @@ static void cleanup(void) {
 }
 
 int main(void) {
-    printf("[tmpfs-test] starting Phase 13 validation\n");
+    printf("[tmpfs-test] starting Phase 13 validation\n"); /* DevSkim: ignore DS154189 — format string is a literal */
 
     test_write_read_roundtrip();
     test_mkdir_rmdir();
@@ -219,7 +219,7 @@ int main(void) {
     test_sequential_write();
     cleanup();
 
-    printf("[tmpfs-test] results: %d passed, %d failed\n",
+    printf("[tmpfs-test] results: %d passed, %d failed\n", /* DevSkim: ignore DS154189 — format string is a literal */
            tests_passed, tests_failed);
 
     return tests_failed > 0 ? 1 : 0;
