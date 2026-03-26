@@ -1,4 +1,4 @@
-# Phase 18 - Compiler Bootstrap
+# Phase 25 - Compiler Bootstrap
 
 ## Milestone Goal
 
@@ -9,7 +9,7 @@ self-hosting: the compiler compiles itself.
 ```mermaid
 flowchart TD
     subgraph Host["host machine (cross-compile, one time)"]
-        TCC_src["TCC source\n(tcc.c)"] -->|"host gcc"| TCC_bin["tcc binary\n(x86-64, musl-linked)"]
+        TCC_src["TCC source<br/>(tcc.c)"] -->|"host gcc"| TCC_bin["tcc binary<br/>(x86-64, musl-linked)"]
         musl_src["musl libc source"] -->|"host gcc"| musl_lib["libc.a + headers"]
         TCC_bin --> Image["disk image"]
         musl_lib --> Image
@@ -22,7 +22,7 @@ flowchart TD
         Shell -->|"./hello"| Hello
         Hello -->|"prints"| Console["console"]
 
-        Shell -->|"tcc tcc.c -o tcc2"| SelfHost["tcc2\n(self-compiled TCC)"]
+        Shell -->|"tcc tcc.c -o tcc2"| SelfHost["tcc2<br/>(self-compiled TCC)"]
     end
 ```
 
@@ -85,7 +85,7 @@ This phase depends on all of the following being complete:
 
 ## Companion Task List
 
-- [Phase 18 Task List](./tasks/18-compiler-bootstrap-tasks.md)
+- [Phase 25 Task List](./tasks/25-compiler-bootstrap-tasks.md)
 
 ## Documentation Deliverables
 

@@ -1,4 +1,4 @@
-# Phase 17 - Symmetric Multiprocessing
+# Phase 24 - Symmetric Multiprocessing
 
 ## Milestone Goal
 
@@ -8,14 +8,14 @@ truly in parallel.
 
 ```mermaid
 flowchart TD
-    BSP["Bootstrap Processor\n(BSP, core 0)"] -->|"SIPI"| AP1["AP core 1"]
+    BSP["Bootstrap Processor<br/>(BSP, core 0)"] -->|"SIPI"| AP1["AP core 1"]
     BSP -->|"SIPI"| AP2["AP core 2"]
     BSP -->|"SIPI"| APn["AP core N"]
 
     subgraph PerCore["per-core state (×N)"]
-        LAPIC["Local APIC\n(timer + IPI)"]
-        GS["GS base\n(per-core data)"]
-        TSS["TSS\n(kernel stack)"]
+        LAPIC["Local APIC<br/>(timer + IPI)"]
+        GS["GS base<br/>(per-core data)"]
+        TSS["TSS<br/>(kernel stack)"]
         RunQ["run queue"]
     end
 
@@ -74,7 +74,7 @@ flowchart TD
 
 ## Companion Task List
 
-- [Phase 17 Task List](./tasks/17-smp-tasks.md)
+- [Phase 24 Task List](./tasks/24-smp-tasks.md)
 
 ## Documentation Deliverables
 

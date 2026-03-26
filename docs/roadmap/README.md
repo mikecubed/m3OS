@@ -45,7 +45,6 @@ flowchart TD
     P6 --> P7
     P7 --> P8
     P7 --> P9
-    P3 --> P9
     P8 --> P9
     P9 -.->|optional| P10["Phase 10<br/>Secure Boot"]
     P9 --> P11["Phase 11<br/>Process Model"]
@@ -57,16 +56,26 @@ flowchart TD
     P3 --> P15["Phase 15<br/>Hardware Discovery"]
     P12 --> P16["Phase 16<br/>Network"]
     P15 --> P16
-    P15 --> P17["Phase 17<br/>SMP"]
-    P4 --> P17
-    P12 --> P18["Phase 18<br/>Compiler Bootstrap"]
+    P14 --> P17["Phase 17<br/>Memory Reclamation"]
+    P11 --> P17
+    P17 --> P18["Phase 18<br/>Directory and VFS"]
     P13 --> P18
-    P14 --> P18
+    P18 --> P19["Phase 19<br/>Signal Handlers"]
+    P19 --> P20["Phase 20<br/>Userspace Init and Shell"]
+    P20 --> P21["Phase 21<br/>TTY and Terminal Control"]
+    P16 --> P22["Phase 22<br/>Socket API"]
+    P21 --> P22
+    P18 --> P23["Phase 23<br/>Persistent Storage"]
+    P15 --> P23
+    P17 --> P24["Phase 24<br/>SMP"]
+    P4 --> P24
+    P20 --> P25["Phase 25<br/>Compiler Bootstrap"]
+    P23 --> P25
 ```
 
 ## Milestone Summary
 
-### Original Phases (complete)
+### Foundation Phases (complete)
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
@@ -81,7 +90,7 @@ flowchart TD
 | 9 | Framebuffer and Shell | Text UI and tiny shell become usable | [Phase 9](./09-framebuffer-and-shell.md) | [Tasks](./tasks/09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot | Kernel boots on real hardware with Secure Boot on | [Phase 10](./10-secure-boot.md) | [Tasks](./tasks/10-secure-boot-tasks.md) |
 
-### Extended Phases
+### POSIX and Userspace Phases
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
@@ -91,8 +100,25 @@ flowchart TD
 | 14 | Shell and Tools | Pipes, redirection, job control, and core utilities | [Phase 14](./14-shell-and-tools.md) | [Tasks](./tasks/14-shell-and-tools-tasks.md) |
 | 15 | Hardware Discovery | ACPI + PCI enumeration; APIC replaces legacy PIC | [Phase 15](./15-hardware-discovery.md) | [Tasks](./tasks/15-hardware-discovery-tasks.md) |
 | 16 | Network | virtio-net driver and minimal TCP/IP stack | [Phase 16](./16-network.md) | [Tasks](./tasks/16-network-tasks.md) |
-| 17 | SMP | All CPU cores run the scheduler simultaneously | [Phase 17](./17-smp.md) | [Tasks](./tasks/17-smp-tasks.md) |
-| 18 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 18](./18-compiler-bootstrap.md) | [Tasks](./tasks/18-compiler-bootstrap-tasks.md) |
+
+### Usability Phases
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 17 | Memory Reclamation | Free-list allocator, CoW fork, heap growth, stack cleanup | [Phase 17](./17-memory-reclamation.md) | [Tasks](./tasks/17-memory-reclamation-tasks.md) |
+| 18 | Directory and VFS | `getdents64`, directory fds, real cwd, ramdisk layout | [Phase 18](./18-directory-vfs.md) | [Tasks](./tasks/18-directory-vfs-tasks.md) |
+| 19 | Signal Handlers | User signal handlers, trampolines, `sigreturn` | [Phase 19](./19-signal-handlers.md) | [Tasks](./tasks/19-signal-handlers-tasks.md) |
+| 20 | Userspace Init and Shell | Ring-3 PID 1 init, remove kernel shell | [Phase 20](./20-userspace-init-shell.md) | [Tasks](./tasks/20-userspace-init-shell-tasks.md) |
+| 21 | TTY and Terminal Control | termios, cooked/raw mode, PTY pairs | [Phase 21](./21-tty-pty.md) | [Tasks](./tasks/21-tty-pty-tasks.md) |
+| 22 | Socket API | BSD socket syscalls over TCP/UDP stack | [Phase 22](./22-socket-api.md) | [Tasks](./tasks/22-socket-api-tasks.md) |
+| 23 | Persistent Storage | virtio-blk driver, FAT32 read/write | [Phase 23](./23-persistent-storage.md) | [Tasks](./tasks/23-persistent-storage-tasks.md) |
+
+### Advanced Phases (deferred)
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 24 | SMP | All CPU cores run the scheduler simultaneously | [Phase 24](./24-smp.md) | [Tasks](./tasks/24-smp-tasks.md) |
+| 25 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 25](./25-compiler-bootstrap.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
@@ -117,21 +143,28 @@ gantt
     Storage and VFS      :done, p8, after p7, 1
     Framebuffer + Shell  :done, p9, after p8, 1
 
-    section Process and Compatibility
-    Process Model        :p11, after p9, 1
-    POSIX Compat         :p12, after p11, 1
-    Writable FS          :p13, after p8, 1
+    section Process and Compatibility (complete)
+    Process Model        :done, p11, after p9, 1
+    POSIX Compat         :done, p12, after p11, 1
+    Writable FS          :done, p13, after p8, 1
+    Shell and Tools      :done, p14, after p12, 1
 
-    section Usable System
-    Shell and Tools      :p14, after p12, 1
+    section Hardware (in progress)
+    Hardware Discovery   :active, p15, after p3, 1
+    Network              :active, p16, after p15, 1
 
-    section Hardware
-    Hardware Discovery   :p15, after p3, 1
-    Network              :p16, after p15, 1
-    SMP                  :p17, after p15, 1
+    section Usability
+    Memory Reclamation   :p17, after p14, 1
+    Directory and VFS    :p18, after p17, 1
+    Signal Handlers      :p19, after p18, 1
+    Userspace Init       :p20, after p19, 1
+    TTY and Terminal     :p21, after p20, 1
+    Socket API           :p22, after p16, 1
+    Persistent Storage   :p23, after p18, 1
 
-    section Compiler
-    Compiler Bootstrap   :p18, after p14, 1
+    section Advanced
+    SMP                  :p24, after p17, 1
+    Compiler Bootstrap   :p25, after p23, 1
 ```
 
 ## Required Documentation for Every Phase
@@ -149,19 +182,6 @@ Each phase must include:
 - which parts are intentionally simplified vs. a production OS
 - a "how real OSes differ" section explaining what was deferred and why the toy
   design is still useful for learning
-
-## What to Defer Beyond Phase 18
-
-These topics remain out of scope:
-
-- dynamic linking and shared libraries
-- POSIX signal semantics beyond the basics
-- copy-on-write fork
-- journaling filesystems
-- TCP congestion control and retransmit timers
-- NUMA-aware memory allocation
-- GCC or Clang as the native compiler
-- package manager or ports tree
 
 ## Related Documents
 
