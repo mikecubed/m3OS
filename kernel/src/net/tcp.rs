@@ -7,11 +7,8 @@ use spin::Mutex;
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
 
-#[allow(unused_imports)]
-pub use kernel_core::net::tcp::{
-    build, parse, tcp_checksum, TcpBuildParams, TcpHeader, MAX_TCP_SEGMENT, TCP_ACK, TCP_FIN,
-    TCP_PSH, TCP_RST, TCP_SYN,
-};
+use kernel_core::net::tcp::{build, parse, TcpBuildParams};
+pub use kernel_core::net::tcp::{TcpHeader, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
 
 // ===========================================================================
 // TCP State

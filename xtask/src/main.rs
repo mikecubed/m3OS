@@ -415,7 +415,7 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    println!("check passed: clippy clean, formatting correct, 63+ host tests pass");
+    println!("check passed: clippy clean, formatting correct, host tests pass");
 }
 
 fn cmd_fmt(fix: bool) {

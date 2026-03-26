@@ -28,7 +28,17 @@ pub struct TcpHeader {
 pub const MAX_TCP_SEGMENT: usize = 65515;
 
 /// Compute TCP checksum with pseudo-header.
+///
+/// # Panics
+///
+/// Panics if `tcp_data.len()` exceeds `u16::MAX` (65535 bytes).
 pub fn tcp_checksum(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, tcp_data: &[u8]) -> u16 {
+    assert!(
+        tcp_data.len() <= u16::MAX as usize,
+        "tcp_checksum: tcp_data too long ({} bytes, max {})",
+        tcp_data.len(),
+        u16::MAX
+    );
     let tcp_len = tcp_data.len() as u16;
     let mut pseudo = Vec::with_capacity(12 + tcp_data.len());
     pseudo.extend_from_slice(&src_ip);
