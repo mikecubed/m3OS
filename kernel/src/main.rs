@@ -46,10 +46,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Load GDT/IDT — no IRQs yet.
     arch::init();
 
-    // When built with `cargo test`, run the generated test harness and exit.
-    #[cfg(test)]
-    test_main();
-
     // P9-T001: parse framebuffer info before mm::init consumes boot_info.
     // `mm::init` takes `&'static mut BootInfo` which borrows the whole struct
     // for 'static, so we must extract the raw pointer + layout first.
@@ -68,6 +64,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let rsdp_addr: Option<u64> = boot_info.rsdp_addr.into_option();
 
     mm::init(boot_info);
+
+    // When built with `cargo test`, run the generated test harness and exit.
+    // Placed after mm::init so that tests can use heap allocations.
+    #[cfg(test)]
+    test_main();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, info)) = fb_parts {

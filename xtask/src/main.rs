@@ -13,6 +13,12 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 
+/// QEMU process exit codes produced by the ISA debug-exit device.
+/// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
+/// and kernel writing 0x11 → exit 0x23.
+const QEMU_EXIT_SUCCESS: i32 = 0x21;
+const QEMU_EXIT_FAILURE: i32 = 0x23;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -642,10 +648,10 @@ fn cmd_test(test_args: &TestArgs) {
         };
 
         match exit_code {
-            Some(0x21) => {
+            Some(QEMU_EXIT_SUCCESS) => {
                 println!("Test {name}: PASSED");
             }
-            Some(0x23) => {
+            Some(QEMU_EXIT_FAILURE) => {
                 eprintln!("Test {name}: FAILED (test panicked)");
                 all_passed = false;
             }

@@ -95,8 +95,8 @@ The flow for every test run:
 # Run all in-QEMU kernel tests
 cargo xtask test
 
-# Run a single test binary
-cargo xtask test --test basic_boot
+# Run a single test binary (when integration tests exist in kernel/tests/)
+cargo xtask test --test heap_allocation
 
 # Run with visible QEMU window (useful for debugging hangs)
 cargo xtask test --display
