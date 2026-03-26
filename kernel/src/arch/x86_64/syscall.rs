@@ -324,6 +324,8 @@ pub extern "C" fn syscall_handler(
         109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
         121 => sys_getpgid(arg0),
+        // Phase 19: sigaltstack
+        131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
@@ -427,14 +429,15 @@ fn deliver_user_signal(
     syscall_result: u64,
     handler_entry: u64,
     sa_mask: u64,
-    _sa_flags: u64,
+    sa_flags: u64,
     restorer: u64,
 ) -> ! {
     // 1. Read the interrupted user register state from the kernel stack.
     let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
 
-    // 2. Read and update the process's blocked_signals.
-    let old_blocked = {
+    // 2. Read and update the process's blocked_signals; check alt stack.
+    const SA_ONSTACK: u64 = 0x0800_0000;
+    let (old_blocked, alt_stack_rsp) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
@@ -448,16 +451,29 @@ fn deliver_user_signal(
         proc.blocked_signals |= sa_mask | (1u64 << signum);
         // SIGKILL and SIGSTOP can never be blocked.
         proc.blocked_signals &= !UNBLOCKABLE_MASK;
-        old
+
+        // Check if we should use the alternate signal stack.
+        let alt_rsp = if sa_flags & SA_ONSTACK != 0
+            && proc.alt_stack_base != 0
+            && proc.alt_stack_flags & crate::process::SS_DISABLE == 0
+            && proc.alt_stack_flags & crate::process::SS_ONSTACK == 0
+        {
+            // Mark the alt stack as in use.
+            proc.alt_stack_flags |= crate::process::SS_ONSTACK;
+            Some(proc.alt_stack_base + proc.alt_stack_size)
+        } else {
+            None
+        };
+        (old, alt_rsp)
     };
 
-    // 3. Build the sigframe on the user stack.
+    // 3. Build the sigframe on the user stack (or alt stack).
     let frame_rsp = match crate::signal::setup_signal_frame(
         &regs,
         old_blocked,
         signum,
         restorer,
-        None, // alt-stack support added in Track D
+        alt_stack_rsp,
     ) {
         Some(rsp) => rsp,
         None => {
@@ -470,6 +486,20 @@ fn deliver_user_signal(
             sys_exit(-11); // SIGSEGV default
         }
     };
+
+    // Write the uc_stack into the sigframe if using alt stack (so sigreturn
+    // can clear SS_ONSTACK).
+    if alt_stack_rsp.is_some() {
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid) {
+            crate::signal::write_sigframe_uc_stack(
+                frame_rsp,
+                proc.alt_stack_base,
+                proc.alt_stack_flags,
+                proc.alt_stack_size,
+            );
+        }
+    }
 
     log::info!(
         "[p{}] delivering signal {} → handler {:#x}, frame_rsp={:#x}",
@@ -676,6 +706,16 @@ fn sys_sigreturn(user_rsp: u64) -> ! {
         }
     };
 
+    // Check if the sigframe was delivered on the alt stack; clear SS_ONSTACK.
+    if let Some((_sp, flags, _size)) = crate::signal::read_sigframe_uc_stack(user_rsp) {
+        if flags & crate::process::SS_ONSTACK != 0 {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.alt_stack_flags &= !crate::process::SS_ONSTACK;
+            }
+        }
+    }
+
     // Restore the signal mask (saved before handler execution).
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -880,6 +920,67 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     // Pass 0 as the syscall result since rt_sigprocmask succeeds.
     if needs_check {
         check_pending_signals(0);
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 19: sigaltstack (P19-T020, T021)
+// ---------------------------------------------------------------------------
+
+/// `sigaltstack(ss, old_ss)` — register/query alternate signal stack (syscall 131).
+fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write current alt stack to old_ss_ptr if requested.
+    if old_ss_ptr != 0 {
+        // struct stack_t: ss_sp(8) + ss_flags(4) + pad(4) + ss_size(8) = 24 bytes
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&proc.alt_stack_base.to_ne_bytes());
+        buf[8..12].copy_from_slice(&proc.alt_stack_flags.to_ne_bytes());
+        buf[16..24].copy_from_slice(&proc.alt_stack_size.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(old_ss_ptr, &buf).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Read and set new alt stack if provided.
+    if ss_ptr != 0 {
+        // Cannot change alt stack while executing on it.
+        if proc.alt_stack_flags & crate::process::SS_ONSTACK != 0 {
+            const NEG_EPERM: u64 = (-1_i64) as u64;
+            return NEG_EPERM;
+        }
+
+        let mut buf = [0u8; 24];
+        if crate::mm::user_mem::copy_from_user(&mut buf, ss_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let ss_sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let ss_flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let ss_size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+
+        if ss_flags & crate::process::SS_DISABLE != 0 {
+            // Disable the alt stack.
+            proc.alt_stack_base = 0;
+            proc.alt_stack_size = 0;
+            proc.alt_stack_flags = crate::process::SS_DISABLE;
+        } else {
+            // Validate minimum size.
+            if ss_size < crate::process::MINSIGSTKSZ {
+                return NEG_EINVAL;
+            }
+            proc.alt_stack_base = ss_sp;
+            proc.alt_stack_size = ss_size;
+            proc.alt_stack_flags = 0;
+        }
     }
 
     0

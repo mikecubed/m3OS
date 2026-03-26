@@ -206,6 +206,13 @@ pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
 
+/// sigaltstack flag: currently executing on the alt stack.
+pub const SS_ONSTACK: u32 = 1;
+/// sigaltstack flag: alt stack is disabled.
+pub const SS_DISABLE: u32 = 2;
+/// Minimum signal stack size (bytes).
+pub const MINSIGSTKSZ: u64 = 2048;
+
 /// What to do when a signal is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalAction {
@@ -327,6 +334,12 @@ pub struct Process {
     pub blocked_signals: u64,
     /// Per-signal action table (Default or Ignore).
     pub signal_actions: [SignalAction; 32],
+    /// Alternate signal stack base address (0 = disabled).
+    pub alt_stack_base: u64,
+    /// Alternate signal stack size in bytes.
+    pub alt_stack_size: u64,
+    /// Alternate signal stack flags (SS_DISABLE, SS_ONSTACK).
+    pub alt_stack_flags: u32,
     /// Current working directory (Phase 18). Defaults to "/".
     pub cwd: String,
 }
@@ -357,6 +370,9 @@ impl Process {
             pending_signals: 0,
             blocked_signals: 0,
             signal_actions: [SignalAction::Default; 32],
+            alt_stack_base: 0,
+            alt_stack_size: 0,
+            alt_stack_flags: 0,
             cwd: String::from("/"),
         }
     }
@@ -471,6 +487,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         pending_signals: 0,
         blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
@@ -511,6 +530,9 @@ pub fn spawn_process_with_cr3(
         pending_signals: 0,
         blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
@@ -555,6 +577,9 @@ pub fn spawn_process_with_cr3_and_fds(
         pending_signals: 0,
         blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
         cwd: String::from("/"),
     };
     PROCESS_TABLE.lock().insert(proc);
