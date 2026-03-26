@@ -1454,7 +1454,6 @@ fn expand_vars(s: &str, env: &[(String, String)]) -> String {
     result
 }
 
-/// Set or update an environment variable.
 /// Resolve a path relative to a working directory (shell-level).
 /// Same algorithm as the kernel's resolve_path.
 fn shell_resolve_path(cwd: &str, path: &str) -> String {
@@ -1513,6 +1512,7 @@ fn shell_is_directory(path: &str) -> bool {
     }
 }
 
+/// Set or update an environment variable in the shell's env list.
 fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
     for (k, v) in env.iter_mut() {
         if k == key {
@@ -1571,7 +1571,7 @@ fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
         for dir in path_val.split(':') {
             let full = alloc::format!("{}/{}", dir.trim_end_matches('/'), elf_name);
             if fs::ramdisk::get_file(&full).is_some() {
-                return Some(elf_name);
+                return Some(full);
             }
         }
     }

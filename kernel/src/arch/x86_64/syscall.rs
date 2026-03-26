@@ -327,7 +327,7 @@ pub extern "C" fn syscall_handler(
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
-        // Phase 18: openat(dirfd, path, flags, mode)
+        // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
         257 => sys_linux_openat(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
@@ -1859,6 +1859,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     }
 
     if path_is_dir {
+        // Directories cannot be opened for writing, creation, or truncation.
+        if writable || create || truncate {
+            return NEG_EISDIR;
+        }
         let entry = FdEntry {
             backend: FdBackend::Dir {
                 path: alloc::string::String::from(name),
@@ -2028,6 +2032,9 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     }
 
     if path_is_dir {
+        if writable || create || truncate {
+            return NEG_EISDIR;
+        }
         let entry = FdEntry {
             backend: FdBackend::Dir {
                 path: alloc::string::String::from(name),
