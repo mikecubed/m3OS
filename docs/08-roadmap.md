@@ -84,13 +84,13 @@ flowchart TD
 | 14 | Pipes, redirection, job control, core utilities | [Shell and Tools](./roadmap/14-shell-and-tools.md) |
 | 15 | ACPI parsing, PCI enumeration, APIC replaces PIC | [Hardware Discovery](./roadmap/15-hardware-discovery.md) |
 | 16 | virtio-net driver, Ethernet/ARP/IP/UDP/TCP | [Network](./roadmap/16-network.md) |
+| 17 | Frame reclaim, heap growth, CoW fork, kernel stack cleanup | [Memory Reclamation](./roadmap/17-memory-reclamation.md) |
+| 18 | `getdents64`, directory fds, real cwd, ramdisk layout | [Directory and VFS](./roadmap/18-directory-vfs.md) |
 
 ### Usability Phases (planned)
 
 | Phase | Focus | Link |
 |---|---|---|
-| 17 | Frame reclaim, heap growth, CoW fork, kernel stack cleanup | [Memory Reclamation](./roadmap/17-memory-reclamation.md) |
-| 18 | `getdents64`, directory fds, real cwd, ramdisk layout | [Directory and VFS](./roadmap/18-directory-vfs.md) |
 | 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
 | 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
 | 21 | termios, cooked/raw mode, PTY pairs, window size | [TTY and Terminal Control](./roadmap/21-tty-pty.md) |
