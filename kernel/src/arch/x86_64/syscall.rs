@@ -2591,7 +2591,8 @@ fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
     if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
         return NEG_EFAULT;
     }
-    buf_ptr
+    // Linux getcwd returns the length of the path (including null terminator).
+    out.len() as u64
 }
 
 // ---------------------------------------------------------------------------

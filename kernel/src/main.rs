@@ -924,6 +924,13 @@ fn shell_execute(
                 // Validate the target is an existing directory.
                 if shell_is_directory(&resolved) {
                     set_env(env, "PWD", &resolved);
+                    // Also update the kernel process's cwd so child processes
+                    // inherit the correct working directory.
+                    let pid = process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                    let mut table = process::PROCESS_TABLE.lock();
+                    if let Some(proc) = table.find_mut(pid) {
+                        proc.cwd = resolved.clone();
+                    }
                 } else {
                     let msg = alloc::format!("cd: {}: No such directory\n", args_str);
                     shell_print(my_id, console_ep, &msg);
