@@ -13,6 +13,12 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 
+/// QEMU process exit codes produced by the ISA debug-exit device.
+/// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
+/// and kernel writing 0x11 → exit 0x23.
+const QEMU_EXIT_SUCCESS: i32 = 0x21;
+const QEMU_EXIT_FAILURE: i32 = 0x23;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QemuDisplayMode {
     Headless,
@@ -39,6 +45,14 @@ fn main() {
         Some("fmt") => {
             let fix = args.iter().any(|a| a == "--fix");
             cmd_fmt(fix);
+        }
+        Some("test") => {
+            let test_args = parse_test_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_test(&test_args);
         }
         Some("runner") => {
             let kernel_binary = args
@@ -68,7 +82,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -443,6 +457,221 @@ fn cmd_check() {
     }
 
     println!("check passed: clippy clean, formatting correct, host tests pass");
+}
+
+#[derive(Debug, Clone)]
+struct TestArgs {
+    test_name: Option<String>,
+    timeout_secs: u64,
+    display: bool,
+}
+
+fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
+    let mut test_name = None;
+    let mut timeout_secs = 60u64;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--test" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `--test`".to_string())?;
+                test_name = Some(value.clone());
+            }
+            "--timeout" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for `--timeout`".to_string())?;
+                timeout_secs = value
+                    .parse()
+                    .map_err(|_| format!("invalid timeout value: {value}"))?;
+            }
+            "--display" => {
+                display = true;
+            }
+            _ if let Some(value) = arg.strip_prefix("--test=") => {
+                test_name = Some(value.to_string());
+            }
+            _ if let Some(value) = arg.strip_prefix("--timeout=") => {
+                timeout_secs = value
+                    .parse()
+                    .map_err(|_| format!("invalid timeout value: {value}"))?;
+            }
+            _ => {
+                return Err(format!("unknown test flag `{arg}`"));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(TestArgs {
+        test_name,
+        timeout_secs,
+        display,
+    })
+}
+
+/// Build kernel test binaries and return their paths.
+///
+/// Uses `cargo build --tests --message-format=json` to discover the compiled
+/// test binary paths without running them.
+fn build_test_binaries(test_name: Option<&str>) -> Vec<PathBuf> {
+    let root = workspace_root();
+    build_userspace_bins();
+    build_musl_bins();
+
+    let mut build_args = vec![
+        "build",
+        "--tests",
+        "--package",
+        "kernel",
+        "--target",
+        "x86_64-unknown-none",
+        "-Zbuild-std=core,compiler_builtins,alloc",
+        "-Zbuild-std-features=compiler-builtins-mem",
+        "--message-format=json",
+    ];
+
+    // If a specific test name is requested, pass it via --test.
+    let test_flag;
+    if let Some(name) = test_name {
+        test_flag = name.to_string();
+        build_args.push("--test");
+        build_args.push(&test_flag);
+    }
+
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(&build_args)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("failed to run cargo build --tests");
+
+    if !output.status.success() {
+        eprintln!("Kernel test build failed");
+        std::process::exit(1);
+    }
+
+    // Parse JSON lines to find test executable paths.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut binaries = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            if json.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact") {
+                if let Some(executable) = json.get("executable").and_then(|v| v.as_str()) {
+                    // Only include test binaries (those with test = true in profile).
+                    if json
+                        .get("profile")
+                        .and_then(|p| p.get("test"))
+                        .and_then(|t| t.as_bool())
+                        == Some(true)
+                    {
+                        binaries.push(PathBuf::from(executable));
+                    }
+                }
+            }
+        }
+    }
+
+    if binaries.is_empty() {
+        eprintln!("No test binaries found");
+        std::process::exit(1);
+    }
+
+    binaries
+}
+
+/// QEMU arguments for running a test kernel: headless, with ISA debug exit device.
+fn qemu_test_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    // Add ISA debug exit device so the test kernel can signal pass/fail.
+    args.extend([
+        "-device".to_string(),
+        "isa-debug-exit,iobase=0xf4,iosize=0x04".to_string(),
+    ]);
+    args
+}
+
+fn cmd_test(test_args: &TestArgs) {
+    let binaries = build_test_binaries(test_args.test_name.as_deref());
+    let ovmf = find_ovmf();
+    let mut all_passed = true;
+
+    for binary in &binaries {
+        let name = binary
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("\n--- Running test: {name} ---");
+
+        let uefi_image = create_uefi_image(binary);
+        let args = qemu_test_args(&uefi_image, &ovmf, test_args.display);
+
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(&args)
+            .spawn()
+            .expect("failed to launch QEMU");
+
+        let timeout = std::time::Duration::from_secs(test_args.timeout_secs);
+        let start = std::time::Instant::now();
+
+        let exit_code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => {
+                    if start.elapsed() > timeout {
+                        eprintln!(
+                            "Test {name} timed out after {}s — killing QEMU",
+                            test_args.timeout_secs
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    eprintln!("Error waiting for QEMU: {e}");
+                    break None;
+                }
+            }
+        };
+
+        match exit_code {
+            Some(QEMU_EXIT_SUCCESS) => {
+                println!("Test {name}: PASSED");
+            }
+            Some(QEMU_EXIT_FAILURE) => {
+                eprintln!("Test {name}: FAILED (test panicked)");
+                all_passed = false;
+            }
+            Some(code) => {
+                eprintln!("Test {name}: FAILED (unexpected QEMU exit code: 0x{code:x})");
+                all_passed = false;
+            }
+            None => {
+                eprintln!("Test {name}: FAILED (timeout or signal)");
+                all_passed = false;
+            }
+        }
+    }
+
+    if all_passed {
+        println!("\nAll {} test(s) passed", binaries.len());
+    } else {
+        eprintln!("\nSome tests failed");
+        std::process::exit(1);
+    }
 }
 
 fn cmd_fmt(fix: bool) {

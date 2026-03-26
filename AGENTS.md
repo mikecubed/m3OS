@@ -15,8 +15,10 @@ cargo xtask run          # build + launch in QEMU (primary dev workflow)
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask check        # clippy (-D warnings) + rustfmt + kernel-core host tests
 cargo xtask fmt --fix    # auto-format all workspace source
-cargo xtask test         # run all kernel tests in QEMU (Phase 4+, not yet implemented)
-cargo xtask test --test <name>  # run a single test (Phase 4+, not yet implemented)
+cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
+cargo xtask test --test <name>  # run a single QEMU test binary
+cargo xtask test --timeout 120  # custom timeout (default 60s)
+cargo xtask test --display      # show QEMU window for debugging
 cargo test -p kernel-core       # run kernel-core host-side unit tests directly
 ```
 

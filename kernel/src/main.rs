@@ -2,6 +2,9 @@
 #![no_main]
 #![feature(alloc_error_handler)]
 #![feature(abi_x86_interrupt)]
+#![cfg_attr(test, feature(custom_test_frameworks))]
+#![cfg_attr(test, test_runner(crate::testing::test_runner))]
+#![cfg_attr(test, reexport_test_harness_main = "test_main")]
 
 extern crate alloc;
 
@@ -19,6 +22,8 @@ mod serial;
 mod signal;
 mod stdin;
 mod task;
+#[cfg(test)]
+mod testing;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
@@ -59,6 +64,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let rsdp_addr: Option<u64> = boot_info.rsdp_addr.into_option();
 
     mm::init(boot_info);
+
+    // When built with `cargo test`, run the generated test harness and exit.
+    // Placed after mm::init so that tests can use heap allocations.
+    #[cfg(test)]
+    test_main();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, info)) = fb_parts {
@@ -2007,17 +2017,25 @@ pub fn hlt_loop() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    if let Some(location) = info.location() {
-        serial::_panic_print(format_args!(
-            "KERNEL PANIC at {}:{}\n",
-            location.file(),
-            location.line()
-        ));
-    } else {
-        serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+    // In test builds, delegate to the test panic handler which exits QEMU
+    // with the failure code so `cargo xtask test` can detect the error.
+    #[cfg(test)]
+    testing::test_panic_handler(info);
+
+    #[cfg(not(test))]
+    {
+        if let Some(location) = info.location() {
+            serial::_panic_print(format_args!(
+                "KERNEL PANIC at {}:{}\n",
+                location.file(),
+                location.line()
+            ));
+        } else {
+            serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
+        }
+        serial::_panic_print(format_args!("  {}\n", info.message()));
+        hlt_loop();
     }
-    serial::_panic_print(format_args!("  {}\n", info.message()));
-    hlt_loop();
 }
 
 #[alloc_error_handler]
@@ -2032,4 +2050,23 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
         );
     }
     panic!("allocation error: {:?} (heap growth failed)", layout)
+}
+
+// ---------------------------------------------------------------------------
+// In-QEMU unit tests (run via `cargo xtask test`)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::serial_println;
+
+    #[test_case]
+    fn trivial_assertion() {
+        assert_eq!(1 + 1, 2);
+    }
+
+    #[test_case]
+    fn serial_output_works() {
+        serial_println!("serial output from test");
+    }
 }

@@ -104,22 +104,22 @@ Each task moves the pure-logic code to kernel-core AND updates the kernel file t
 
 ### 4a: Kernel Test Harness Module
 
-- [ ] T042 [US2] Create `kernel/src/testing.rs` with `QemuExitCode`, `exit_qemu()`, `Testable` trait, `test_runner()`, `test_panic_handler()`
-- [ ] T043 [US2] Update `kernel/src/main.rs` with conditional `#![cfg_attr(test, ...)]` attributes for `custom_test_frameworks` and `test_runner`
-- [ ] T044 [US2] Add conditional `#[cfg(test)]` test panic handler in `kernel/src/main.rs` that calls `testing::test_panic_handler()`
+- [x] T042 [US2] Create `kernel/src/testing.rs` with `QemuExitCode`, `exit_qemu()`, `Testable` trait, `test_runner()`, `test_panic_handler()`
+- [x] T043 [US2] Update `kernel/src/main.rs` with conditional `#![cfg_attr(test, ...)]` attributes for `custom_test_frameworks` and `test_runner`
+- [x] T044 [US2] Add conditional `#[cfg(test)]` test panic handler in `kernel/src/main.rs` that calls `testing::test_panic_handler()`
 
 ### 4b: Xtask Test Subcommand
 
-- [ ] T045 [US2] Add `test` subcommand to `xtask/src/main.rs` — build kernel with `--tests`, launch QEMU with ISA debug exit device, read exit code
-- [ ] T046 [US2] Add `--test <name>` flag to run a single integration test binary
-- [ ] T047 [US2] Add `--timeout <seconds>` flag (default 60s) — kill QEMU if it exceeds the timeout
-- [ ] T048 [US2] Update `usage()` in `xtask/src/main.rs` to document the `test` subcommand
+- [x] T045 [US2] Add `test` subcommand to `xtask/src/main.rs` — build kernel with `--tests`, launch QEMU with ISA debug exit device, read exit code
+- [x] T046 [US2] Add `--test <name>` flag to run a single integration test binary
+- [x] T047 [US2] Add `--timeout <seconds>` flag (default 60s) — kill QEMU if it exceeds the timeout
+- [x] T048 [US2] Update `usage()` in `xtask/src/main.rs` to document the `test` subcommand
 
 ### 4c: Sample Integration Test
 
-- [ ] T049 [US2] Write a basic boot integration test as a `#[test_case]` in `kernel/src/main.rs` (or `kernel/tests/basic_boot.rs`) that verifies serial output works and exits successfully
-- [ ] T050 [US2] Verify `cargo xtask test` runs the sample test and QEMU exits with success code (0x21)
-- [ ] T051 [US2] Verify a panicking test causes QEMU to exit with failure code (0x23) and prints the panic message
+- [x] T049 [US2] Write a basic boot integration test as a `#[test_case]` in `kernel/src/main.rs` (or `kernel/tests/basic_boot.rs`) that verifies serial output works and exits successfully
+- [x] T050 [US2] Verify `cargo xtask test` runs the sample test and QEMU exits with success code (0x21)
+- [x] T051 [US2] Verify a panicking test causes QEMU to exit with failure code (0x23) and prints the panic message
 
 **Checkpoint**: US2 complete — `cargo xtask test` works with at least one integration test
 
@@ -129,9 +129,9 @@ Each task moves the pure-logic code to kernel-core AND updates the kernel file t
 
 **Goal**: Document the testing patterns so future developers can add tests without guidance
 
-- [ ] T052 [P] [US3] Update `docs/09-testing.md` to document both host-side (`cargo test -p kernel-core`) and QEMU testing workflows with concrete examples
-- [ ] T053 [P] [US3] Update `CLAUDE.md` / `AGENTS.md` build commands section to include `cargo xtask test` and host test commands
-- [ ] T054 [US3] Update workspace `Cargo.toml` comments if needed to reflect new `kernel-core` member
+- [x] T052 [P] [US3] Update `docs/09-testing.md` to document both host-side (`cargo test -p kernel-core`) and QEMU testing workflows with concrete examples
+- [x] T053 [P] [US3] Update `CLAUDE.md` / `AGENTS.md` build commands section to include `cargo xtask test` and host test commands
+- [x] T054 [US3] Update workspace `Cargo.toml` comments if needed to reflect new `kernel-core` member
 
 **Checkpoint**: US3 complete — documentation matches implementation
 
@@ -139,9 +139,9 @@ Each task moves the pure-logic code to kernel-core AND updates the kernel file t
 
 ## Phase 6: Polish & Validation
 
-- [ ] T055 Run full validation: `cargo xtask check` (includes host tests), `cargo xtask test` (QEMU tests), `cargo xtask run` (normal boot)
-- [ ] T056 Verify SC-001: count host-side tests (must be >= 30)
-- [ ] T057 Verify SC-002: measure host test execution time (must be < 10 seconds)
+- [x] T055 Run full validation: `cargo xtask check` (includes host tests), `cargo xtask test` (QEMU tests), `cargo xtask run` (normal boot)
+- [x] T056 Verify SC-001: count host-side tests (must be >= 30) — **63 tests**
+- [x] T057 Verify SC-002: measure host test execution time (must be < 10 seconds) — **0.063s**
 
 ---
 
