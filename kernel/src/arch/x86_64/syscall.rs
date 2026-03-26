@@ -1025,17 +1025,18 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
             proc.alt_stack_size = 0;
             proc.alt_stack_flags = crate::process::SS_DISABLE;
         } else {
-            // Reject unknown flags (only SS_DISABLE and SS_ONSTACK are valid).
-            if ss_flags & !(crate::process::SS_DISABLE | crate::process::SS_ONSTACK) != 0 {
+            // Only SS_DISABLE is accepted from userspace; SS_ONSTACK is a
+            // read-only status flag maintained by the kernel.
+            if ss_flags & !crate::process::SS_DISABLE != 0 {
                 return NEG_EINVAL;
             }
             // Validate minimum size.
             if ss_size < crate::process::MINSIGSTKSZ {
                 return NEG_EINVAL;
             }
-            // Validate range is within canonical userspace.
+            // Validate range is within canonical userspace (above null page).
             const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
-            if ss_sp >= USER_LIMIT
+            if !(0x1000..USER_LIMIT).contains(&ss_sp)
                 || ss_sp
                     .checked_add(ss_size)
                     .is_none_or(|top| top > USER_LIMIT)
@@ -1278,6 +1279,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_cwd,
         parent_blocked_signals,
         parent_signal_actions,
+        parent_alt_stack,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1289,6 +1291,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.cwd.clone(),
                 p.blocked_signals,
                 p.signal_actions,
+                (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
             ),
             None => (
                 0,
@@ -1301,6 +1304,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 alloc::string::String::from("/"),
                 0,
                 [crate::process::SignalAction::Default; 32],
+                (0u64, 0u64, 0u32),
             ),
         }
     };
@@ -1328,6 +1332,9 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.cwd = parent_cwd;
             child.blocked_signals = parent_blocked_signals;
             child.signal_actions = parent_signal_actions;
+            child.alt_stack_base = parent_alt_stack.0;
+            child.alt_stack_size = parent_alt_stack.1;
+            child.alt_stack_flags = parent_alt_stack.2;
         }
     }
 
