@@ -436,7 +436,6 @@ fn deliver_user_signal(
     let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
 
     // 2. Read and update the process's blocked_signals; check alt stack.
-    const SA_ONSTACK: u64 = 0x0800_0000;
     let (old_blocked, alt_stack_rsp) = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -853,12 +852,27 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         proc.signal_actions[sig as usize] = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
-            _ => crate::process::SignalAction::Handler {
-                entry: handler_addr,
-                mask: sa_mask,
-                flags: sa_flags,
-                restorer: sa_restorer,
-            },
+            _ => {
+                // Warn if SA_RESTORER is missing — musl always sets it.
+                // Without a restorer, the handler cannot return to sigreturn.
+                let effective_restorer = if sa_flags & SA_RESTORER != 0 {
+                    sa_restorer
+                } else {
+                    log::warn!(
+                        "[p{}] rt_sigaction: sig={} handler {:#x} missing SA_RESTORER",
+                        pid,
+                        sig,
+                        handler_addr,
+                    );
+                    0 // will fault on handler return, making the bug visible
+                };
+                crate::process::SignalAction::Handler {
+                    entry: handler_addr,
+                    mask: sa_mask,
+                    flags: sa_flags,
+                    restorer: effective_restorer,
+                }
+            }
         };
     }
 
@@ -872,6 +886,16 @@ const SIG_SETMASK: u64 = 2;
 
 /// Bits that must never be set in blocked_signals (SIGKILL=9, SIGSTOP=19).
 const UNBLOCKABLE_MASK: u64 = (1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP);
+
+/// Signal action flags (from Linux uapi).
+const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+#[allow(dead_code)]
+const SA_SIGINFO: u64 = 0x0000_0004;
+#[allow(dead_code)]
+const SA_NODEFER: u64 = 0x4000_0000;
+#[allow(dead_code)]
+const SA_RESETHAND: u64 = 0x8000_0000;
 
 /// `rt_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize)` — syscall 14.
 ///
