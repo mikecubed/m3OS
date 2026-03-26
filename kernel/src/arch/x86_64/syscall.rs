@@ -1816,13 +1816,22 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
-        None => return NEG_EFAULT,
+        None => {
+            log::warn!("[open] read_user_cstr failed for ptr={:#x}", path_ptr);
+            return NEG_EFAULT;
+        }
     };
 
     // Resolve path against current process's working directory.
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+    log::info!(
+        "[open] raw='{}' cwd='{}' resolved='{}'",
+        raw_name,
+        cwd,
+        name
+    );
 
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
