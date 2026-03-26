@@ -118,7 +118,7 @@ flowchart TD
 | Phase | Focus | Task List |
 |---|---|---|
 | 25 | SMP (AP startup, per-core scheduler, TLB shootdown) | [Phase 25 Tasks](./25-smp-tasks.md) |
-| 25 | Compiler bootstrap (TCC self-hosting) | *not yet created* |
+| 26 | Compiler bootstrap (TCC self-hosting) | [Phase 26 Tasks](./26-compiler-bootstrap-tasks.md) |
 
 ## Suggested Usage
 
