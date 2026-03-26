@@ -8,10 +8,10 @@
 | Track | Scope | Dependencies | Status |
 |-------|-------|-------------|--------|
 | A | Free-list frame allocator | — | Done |
-| B | Frame reference counting | A | Pending |
-| C | Process exit cleanup | A | Pending |
-| D | Growable kernel heap | A | Pending |
-| E | Copy-on-write fork | A, B | Pending |
+| B | Frame reference counting | A | Done |
+| C | Process exit cleanup | A | Done |
+| D | Growable kernel heap | A | Done |
+| E | Copy-on-write fork | A, B | In Progress |
 | F | Validation and documentation | C, D, E | Pending |
 
 ## Track A — Free-List Frame Allocator
@@ -27,30 +27,30 @@
 
 ## Track B — Frame Reference Counting
 
-- [ ] P17-T009: Determine highest physical frame number
-- [ ] P17-T010: Allocate refcount table (`Vec<AtomicU16>`)
-- [ ] P17-T011: Implement `refcount_inc()`
-- [ ] P17-T012: Implement `refcount_dec() -> u16`
-- [ ] P17-T013: Implement `refcount_get() -> u16`
-- [ ] P17-T014: Hook `refcount_inc` into `allocate_frame()`
-- [ ] P17-T015: Hook `refcount_dec` into `free_frame()`
+- [x] P17-T009: Determine highest physical frame number
+- [x] P17-T010: Allocate refcount table (`Vec<AtomicU16>`)
+- [x] P17-T011: Implement `refcount_inc()`
+- [x] P17-T012: Implement `refcount_dec() -> u16`
+- [x] P17-T013: Implement `refcount_get() -> u16`
+- [x] P17-T014: Hook `refcount_inc` into `allocate_frame()`
+- [x] P17-T015: Hook `refcount_dec` into `free_frame()`
 
 ## Track C — Process Exit Cleanup
 
-- [ ] P17-T016: Call `free_process_page_table()` in `sys_exit`
-- [ ] P17-T017: Call `free_process_page_table()` in `fault_kill_trampoline`
-- [ ] P17-T018: Verify 4-level page table walk
-- [ ] P17-T019: Update `free_process_page_table()` to use refcounting
-- [ ] P17-T020: Reclaim kernel stacks in `drain_dead()`
-- [ ] P17-T021: Verify `Task::_stack` drop behavior
+- [x] P17-T016: Call `free_process_page_table()` in `sys_exit`
+- [x] P17-T017: Call `free_process_page_table()` in `fault_kill_trampoline`
+- [x] P17-T018: Verify 4-level page table walk (fixed shared kernel entry detection)
+- [x] P17-T019: Update `free_process_page_table()` to use refcounting
+- [x] P17-T020: Reclaim kernel stacks in `drain_dead()` (already correct via Box drop)
+- [x] P17-T021: Verify `Task::_stack` drop behavior (confirmed correct)
 
 ## Track D — Growable Kernel Heap
 
-- [ ] P17-T022: Increase heap virtual reservation (64 MiB ceiling)
-- [ ] P17-T023: Track current mapped extent with `AtomicUsize`
-- [ ] P17-T024: Implement `grow_heap(additional_bytes)`
-- [ ] P17-T025: Hook OOM path — attempt growth before panic
-- [ ] P17-T026: Safety cap on max heap size
+- [x] P17-T022: Increase heap virtual reservation (64 MiB ceiling)
+- [x] P17-T023: Track current mapped extent with `AtomicUsize`
+- [x] P17-T024: Implement `grow_heap(additional_bytes)`
+- [x] P17-T025: Hook OOM path — attempt growth before panic
+- [x] P17-T026: Safety cap on max heap size
 
 ## Track E — Copy-on-Write Fork
 

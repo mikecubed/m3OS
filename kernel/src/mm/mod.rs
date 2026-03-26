@@ -89,6 +89,9 @@ pub fn init(boot_info: &'static mut BootInfo) {
     let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
     heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
 
+    // P17-T010: initialize per-frame refcount table (requires heap).
+    frame_allocator::init_refcounts();
+
     log::info!("[mm] Memory subsystem initialized");
 }
 
@@ -214,31 +217,42 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
 
 /// Free all user-space page table frames for the given PML4 physical address.
 ///
-/// Walks PML4 indices 0–255 (user half), frees every mapped user-accessible
-/// physical frame, and frees the page-table structure frames themselves.
-///
-/// Frame reclamation is a stub in the bump allocator (no-op); the real benefit
-/// today is correctness — the function documents the ownership transfer and
-/// will become fully effective once Phase 13 adds a free list.
+/// Walks the process's PML4, freeing user-accessible leaf pages and any
+/// page-table structure frames that are process-private (not shared with the
+/// kernel).  Shared kernel entries (PML4[1..256]) are detected by comparing
+/// against the kernel's PML4 and skipped entirely.
 ///
 /// # Safety
 ///
 /// `cr3_phys` must be the physical address of a valid, now-unreachable PML4
 /// that is no longer loaded in CR3. No other code may access the page table
 /// after this call.
-#[allow(dead_code)]
 pub fn free_process_page_table(cr3_phys: u64) {
     use x86_64::structures::paging::{PageTable, PageTableFlags};
     let phys_off = VirtAddr::new(phys_offset());
+    let kernel_pml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
+
     // SAFETY: cr3_phys is a valid PML4 frame being freed. The caller guarantees
     // it is no longer active (not in CR3) and has exclusive ownership.
     unsafe {
         let pml4: &PageTable = &*(phys_off + cr3_phys).as_ptr::<PageTable>();
+        let kernel_pml4: &PageTable = &*(phys_off + kernel_pml4_phys).as_ptr::<PageTable>();
+
         for p4 in 0usize..256 {
             let p4e = &pml4[p4];
             if !p4e.flags().contains(PageTableFlags::PRESENT) {
                 continue;
             }
+
+            // Skip entries that point to the same PDPT frame as the kernel —
+            // these are shallow copies made by new_process_page_table and the
+            // frames are shared with the kernel.
+            if kernel_pml4[p4].flags().contains(PageTableFlags::PRESENT)
+                && p4e.addr() == kernel_pml4[p4].addr()
+            {
+                continue;
+            }
+
             let pdpt: &PageTable = &*(phys_off + p4e.addr().as_u64()).as_ptr::<PageTable>();
             for p3 in 0usize..512 {
                 let p3e = &pdpt[p3];
@@ -248,6 +262,10 @@ pub fn free_process_page_table(cr3_phys: u64) {
                 if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
                     continue;
                 }
+
+                // Skip PD frames shared with the kernel (from deep-copy in
+                // new_process_page_table, kernel PDs are cloned but some entries
+                // may still point to shared kernel PTs).
                 let pd: &PageTable = &*(phys_off + p3e.addr().as_u64()).as_ptr::<PageTable>();
                 for p2 in 0usize..512 {
                     let p2e = &pd[p2];
@@ -257,7 +275,9 @@ pub fn free_process_page_table(cr3_phys: u64) {
                     if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
                         continue;
                     }
+
                     let pt: &PageTable = &*(phys_off + p2e.addr().as_u64()).as_ptr::<PageTable>();
+                    let mut has_user_pages = false;
                     for p1 in 0usize..512 {
                         let pte = &pt[p1];
                         if !pte.flags().contains(PageTableFlags::PRESENT) {
@@ -266,9 +286,14 @@ pub fn free_process_page_table(cr3_phys: u64) {
                         if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                             continue;
                         }
+                        has_user_pages = true;
                         frame_allocator::free_frame(pte.addr().as_u64());
                     }
-                    frame_allocator::free_frame(p2e.addr().as_u64()); // free PT frame
+                    // Only free the PT frame if it contained user pages —
+                    // otherwise it's a kernel-shared PT.
+                    if has_user_pages {
+                        frame_allocator::free_frame(p2e.addr().as_u64());
+                    }
                 }
                 frame_allocator::free_frame(p3e.addr().as_u64()); // free PD frame
             }

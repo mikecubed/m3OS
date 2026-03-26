@@ -412,9 +412,19 @@ fn sys_exit(code: i32) -> ! {
         // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
         crate::process::send_sigchld_to_parent(pid);
     }
+    // Read the dying process's CR3 before we switch away from it.
+    let cr3_phys = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.page_table_root)
+    };
     // Restore kernel page table before yielding so the next scheduled task
     // does not inherit this process's CR3.
     crate::mm::restore_kernel_cr3();
+    // Free the process's user-space page table frames now that we are back
+    // on the kernel CR3 and no longer using the process's address space.
+    if let Some(phys) = cr3_phys {
+        crate::mm::free_process_page_table(phys.as_u64());
+    }
     // Mark the kernel task as dead so the scheduler reclaims it.
     crate::task::mark_current_dead();
 }

@@ -1,5 +1,8 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
@@ -32,6 +35,8 @@ struct FreeListAllocator {
     total_frames: usize,
     /// Virtual base of the physical-memory offset mapping.
     phys_offset: u64,
+    /// Highest physical frame number from the memory map (P17-T009).
+    max_frame_number: u64,
 }
 
 impl FreeListAllocator {
@@ -41,6 +46,7 @@ impl FreeListAllocator {
             free_count: 0,
             total_frames: 0,
             phys_offset: 0,
+            max_frame_number: 0,
         }
     }
 
@@ -52,6 +58,21 @@ impl FreeListAllocator {
         self.head = 0;
         self.free_count = 0;
         self.total_frames = 0;
+
+        // P17-T009: determine highest physical frame number from usable regions.
+        // Only Usable regions produce allocatable frames; reserved/MMIO regions
+        // at high addresses (e.g., PCI hole at 4 GiB) must not inflate the table.
+        let max_phys_addr = regions
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .map(|r| r.end)
+            .max()
+            .unwrap_or(0);
+        self.max_frame_number = if max_phys_addr > 0 {
+            (max_phys_addr - 1) / PAGE_SIZE
+        } else {
+            0
+        };
 
         for region in regions {
             if region.kind != MemoryRegionKind::Usable {
@@ -73,8 +94,9 @@ impl FreeListAllocator {
         }
 
         log::info!(
-            "[mm] frame allocator: {} usable 4KiB frames on free list (>= 1 MiB)",
-            self.total_frames
+            "[mm] frame allocator: {} usable 4KiB frames on free list (>= 1 MiB), max frame #{}",
+            self.total_frames,
+            self.max_frame_number
         );
     }
 
@@ -125,10 +147,10 @@ impl FreeListAllocator {
         Some(PhysFrame::containing_address(addr))
     }
 
-    /// Return a frame to the free list.
+    /// Push a frame back onto the free list (unconditionally).
     ///
     /// Panics if the frame is already on the free list (double-free).
-    fn free(&mut self, phys: u64) {
+    fn free_to_list(&mut self, phys: u64) {
         debug_assert!(
             phys >= ALLOC_MIN_ADDR,
             "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
@@ -172,14 +194,36 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
 }
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    FRAME_ALLOCATOR.0.lock().allocate()
+    let frame = FRAME_ALLOCATOR.0.lock().allocate()?;
+    // P17-T014: set refcount to 1 for freshly allocated frames.
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        refcount_inc(frame.start_address().as_u64());
+    }
+    Some(frame)
 }
 
 /// Return a frame to the allocator.
 ///
+/// If refcounting is initialized, decrements the reference count first.
+/// The frame is only pushed onto the free list when the count reaches zero.
+/// Frames allocated before refcounting was enabled (refcount == 0) are freed
+/// directly without decrementing.
 /// Panics on double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
-    FRAME_ALLOCATOR.0.lock().free(phys);
+    // P17-T015: use refcounting when available.
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        let current = refcount_get(phys);
+        if current == 0 {
+            // Frame was allocated before refcounting was enabled — free directly.
+        } else {
+            let new_count = refcount_dec(phys);
+            if new_count > 0 {
+                // Frame is still shared — do not reclaim.
+                return;
+            }
+        }
+    }
+    FRAME_ALLOCATOR.0.lock().free_to_list(phys);
 }
 
 /// Returns the number of frames currently on the free list.
@@ -190,6 +234,84 @@ pub fn free_count() -> usize {
 /// Returns the total number of usable frames discovered at boot.
 pub fn total_frames() -> usize {
     FRAME_ALLOCATOR.0.lock().total_frames
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame reference counting (P17-T009 through P17-T015)
+// ---------------------------------------------------------------------------
+
+/// True once `init_refcounts()` has completed.
+static REFCOUNT_INIT: AtomicBool = AtomicBool::new(false);
+
+/// The refcount table. Each entry corresponds to a physical frame number
+/// (phys_addr / 4096). Allocated on the heap after `heap::init_heap`.
+static REFCOUNT_TABLE: spin::Once<Vec<AtomicU16>> = spin::Once::new();
+
+/// Initialize the per-frame refcount table.
+///
+/// Must be called **after** `heap::init_heap` (since it allocates a `Vec`) and
+/// **after** `frame_allocator::init` (since it reads `max_frame_number`).
+pub fn init_refcounts() {
+    let max_frame = FRAME_ALLOCATOR.0.lock().max_frame_number;
+    let count = (max_frame + 1) as usize;
+
+    REFCOUNT_TABLE.call_once(|| {
+        let mut table = Vec::with_capacity(count);
+        for _ in 0..count {
+            table.push(AtomicU16::new(0));
+        }
+        table
+    });
+
+    REFCOUNT_INIT.store(true, Ordering::Release);
+
+    log::info!(
+        "[mm] refcount table: {} entries for frames 0..={}",
+        count,
+        max_frame
+    );
+}
+
+/// Atomically increment the reference count for the frame at `phys`.
+///
+/// Panics on overflow (count would exceed `u16::MAX`).
+pub fn refcount_inc(phys: u64) {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_inc: frame index out of range");
+    let prev = table[idx].fetch_add(1, Ordering::SeqCst);
+    assert!(
+        prev < u16::MAX,
+        "refcount_inc: overflow for frame {:#x}",
+        phys
+    );
+}
+
+/// Atomically decrement the reference count for the frame at `phys`.
+///
+/// Returns the **new** count. Panics on underflow (decrement below 0).
+pub fn refcount_dec(phys: u64) -> u16 {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_dec: frame index out of range");
+    let prev = table[idx].fetch_sub(1, Ordering::SeqCst);
+    assert!(prev > 0, "refcount_dec: underflow for frame {:#x}", phys);
+    prev - 1
+}
+
+/// Read the current reference count for the frame at `phys`.
+#[allow(dead_code)]
+pub fn refcount_get(phys: u64) -> u16 {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_get: frame index out of range");
+    table[idx].load(Ordering::SeqCst)
 }
 
 #[inline]
