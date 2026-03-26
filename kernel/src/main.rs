@@ -909,11 +909,24 @@ fn shell_execute(
                 return;
             }
             "cd" => {
-                // The shell is a kernel task, so there's no user-space chdir to call.
-                // chdir syscall (80) is a no-op in our OS (single global cwd).
-                // Update $PWD so child processes see the new directory.
-                if !args_str.is_empty() {
-                    set_env(env, "PWD", args_str);
+                if args_str.is_empty() {
+                    // cd with no args: go to /
+                    set_env(env, "PWD", "/");
+                    return;
+                }
+                // Resolve the target relative to current $PWD.
+                let current_pwd = env
+                    .iter()
+                    .find(|(k, _)| k == "PWD")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("/");
+                let resolved = shell_resolve_path(current_pwd, args_str);
+                // Validate the target is an existing directory.
+                if shell_is_directory(&resolved) {
+                    set_env(env, "PWD", &resolved);
+                } else {
+                    let msg = alloc::format!("cd: {}: No such directory\n", args_str);
+                    shell_print(my_id, console_ep, &msg);
                 }
                 return;
             }
@@ -1364,6 +1377,64 @@ fn expand_vars(s: &str, env: &[(String, String)]) -> String {
 }
 
 /// Set or update an environment variable.
+/// Resolve a path relative to a working directory (shell-level).
+/// Same algorithm as the kernel's resolve_path.
+fn shell_resolve_path(cwd: &str, path: &str) -> String {
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if path.is_empty() || path == "." {
+        String::from(cwd)
+    } else {
+        alloc::format!("{}/{}", cwd.trim_end_matches('/'), path)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for component in combined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for part in &parts {
+            result.push('/');
+            result.push_str(part);
+        }
+        result
+    }
+}
+
+/// Check if a resolved absolute path is an existing directory (shell-level).
+fn shell_is_directory(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    // Check tmpfs.
+    let trimmed = path.trim_start_matches('/');
+    if trimmed == "tmp" || trimmed.starts_with("tmp/") {
+        let rel = if trimmed == "tmp" {
+            ""
+        } else {
+            &trimmed[4..] // skip "tmp/"
+        };
+        if rel.is_empty() {
+            return true;
+        }
+        let tmpfs = fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
+    }
+    // Check ramdisk tree.
+    match fs::ramdisk::ramdisk_lookup(path) {
+        Some(node) => node.is_dir(),
+        None => false,
+    }
+}
+
 fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
     for (k, v) in env.iter_mut() {
         if k == key {
@@ -1412,19 +1483,16 @@ fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
 
     let elf_name = alloc::format!("{}.elf", cmd);
 
-    // Try direct lookup first (flat ramdisk).
+    // Try direct lookup first (get_file has backward compat: bare name → /bin/).
     if fs::ramdisk::get_file(&elf_name).is_some() {
         return Some(elf_name);
     }
 
-    // Search PATH directories. Our ramdisk is flat, so path components
-    // are stripped — we just retry the base name.
+    // Search PATH directories against the ramdisk tree.
     if let Some((_, path_val)) = env.iter().find(|(k, _)| k == "PATH") {
-        for _dir in path_val.split(':') {
-            // Ramdisk is flat; all binaries are at root level.
-            // The PATH search is primarily for compatibility — the actual
-            // lookup just checks if {cmd}.elf exists.
-            if fs::ramdisk::get_file(&elf_name).is_some() {
+        for dir in path_val.split(':') {
+            let full = alloc::format!("{}/{}", dir.trim_end_matches('/'), elf_name);
+            if fs::ramdisk::get_file(&full).is_some() {
                 return Some(elf_name);
             }
         }

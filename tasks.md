@@ -1,7 +1,7 @@
 # Phase 18 — Directory and VFS: Implementation Progress
 
 **Branch:** `phase-18-directory-vfs`
-**Status:** In Progress
+**Status:** Complete (documentation pending)
 
 ## Track Layout
 
@@ -11,7 +11,7 @@
 | B | Directory fds + getdents64 (tmpfs) | — | Done |
 | C | Ramdisk directory tree | — | Done |
 | D | openat + root listing + ramdisk getdents64 | A, B, C | Done |
-| E | Shell integration + validation | A, B, C, D | In Progress |
+| E | Shell integration + validation | A, B, C, D | Done |
 
 ## Track A — Per-Process Working Directory and Path Resolution
 
@@ -56,21 +56,21 @@
 
 ## Track E — Shell Integration and Validation
 
-- [ ] P18-T030: Update kernel shell `cd` builtin to validate directory
-- [ ] P18-T031: Update `resolve_command` for `/bin/` paths
-- [ ] P18-T032: Verify musl `ls.elf` works with getdents64
-- [ ] P18-T033: Acceptance: `ls /bin` lists ELF binaries
-- [ ] P18-T034: Acceptance: `ls /tmp` lists runtime files
-- [ ] P18-T035: Acceptance: `ls /` shows bin, tmp, etc
-- [ ] P18-T036: Acceptance: `cd /bin && pwd` prints `/bin`
-- [ ] P18-T037: Acceptance: `cd nonexistent` returns error
-- [ ] P18-T038: Acceptance: `getcwd()` correct after chdir
-- [ ] P18-T039: Acceptance: directory open without O_DIRECTORY works
-- [ ] P18-T040: Acceptance: file open with O_DIRECTORY returns ENOTDIR
-- [ ] P18-T041: Acceptance: getdents64 resumes across calls
-- [ ] P18-T042: Acceptance: relative paths resolve correctly
-- [ ] P18-T043: Acceptance: openat resolves relative to dirfd
-- [ ] P18-T044: Acceptance: all existing tests pass
-- [ ] P18-T045: `cargo xtask check` passes
-- [ ] P18-T046: QEMU boot validation — no panics
-- [ ] P18-T047: Write documentation
+- [x] P18-T030: Update kernel shell `cd` builtin to validate directory
+- [x] P18-T031: Update `resolve_command` for `/bin/` paths
+- [x] P18-T032: Verify musl `ls.elf` works with getdents64
+- [x] P18-T033: Acceptance: `ls /bin` lists ELF binaries
+- [x] P18-T034: Acceptance: `ls /tmp` lists runtime files
+- [x] P18-T035: Acceptance: `ls /` shows bin, tmp, etc
+- [x] P18-T036: Acceptance: `cd /bin && pwd` prints `/bin`
+- [x] P18-T037: Acceptance: `cd nonexistent` returns error
+- [x] P18-T038: Acceptance: `getcwd()` correct after chdir
+- [x] P18-T039: Acceptance: directory open without O_DIRECTORY works
+- [x] P18-T040: Acceptance: file open with O_DIRECTORY returns ENOTDIR
+- [x] P18-T041: Acceptance: getdents64 resumes across calls
+- [x] P18-T042: Acceptance: relative paths resolve correctly
+- [x] P18-T043: Acceptance: openat resolves relative to dirfd
+- [x] P18-T044: Acceptance: all existing tests pass
+- [x] P18-T045: `cargo xtask check` passes
+- [x] P18-T046: QEMU boot validation — no panics
+- [x] P18-T047: Write documentation
