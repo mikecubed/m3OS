@@ -2680,8 +2680,8 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
     };
     fill(&mut utsname[0..65], b"m3os"); // sysname
     fill(&mut utsname[65..130], b"m3os"); // nodename
-    fill(&mut utsname[130..195], b"0.14.0"); // release
-    fill(&mut utsname[195..260], b"phase-14"); // version
+    fill(&mut utsname[130..195], env!("CARGO_PKG_VERSION").as_bytes()); // release
+    fill(&mut utsname[195..260], env!("CARGO_PKG_VERSION").as_bytes()); // version
     fill(&mut utsname[260..325], b"x86_64"); // machine
                                              // domainname left as zero
     if crate::mm::user_mem::copy_to_user(buf_ptr, &utsname).is_err() {
