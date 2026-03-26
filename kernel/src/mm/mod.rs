@@ -81,7 +81,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
     PHYS_OFFSET.call_once(|| phys_offset);
 
     memory_map::init(static_regions);
-    frame_allocator::init(static_regions);
+    frame_allocator::init(static_regions, phys_offset);
 
     // Log reserved regions below 1 MiB to confirm allocator skips them (P2-T008)
     debug::log_reserved_below_1mib();
