@@ -1152,12 +1152,8 @@ fn shell_fork_exec(
             loop {
                 let mut buf = [0u8; 4096];
                 match pipe::pipe_read(pipe_id, &mut buf) {
-                    Ok(0) => {
-                        log::info!("[shell-relay] EOF on pipe {}", pipe_id);
-                        break;
-                    }
+                    Ok(0) => break,
                     Ok(n) => {
-                        log::info!("[shell-relay] read {} bytes from pipe {}", n, pipe_id);
                         if let Ok(s) = core::str::from_utf8(&buf[..n]) {
                             shell_print(my_id, console_ep, s);
                         }
