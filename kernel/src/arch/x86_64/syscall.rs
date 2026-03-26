@@ -2581,29 +2581,30 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// T024: getcwd(buf, size) — always returns "/"
+// T024: getcwd(buf, size) — return per-process working directory
 // ---------------------------------------------------------------------------
 
 fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
     let cwd = current_cwd();
     let cwd_bytes = cwd.as_bytes();
-    // Need space for the string plus null terminator.
-    if (size as usize) < cwd_bytes.len() + 1 {
+    let total_len = cwd_bytes.len() + 1; // include null terminator
+    if (size as usize) < total_len {
         const NEG_ERANGE: u64 = (-34_i64) as u64;
         return NEG_ERANGE;
     }
-    let mut out = alloc::vec![0u8; cwd_bytes.len() + 1];
-    out[..cwd_bytes.len()].copy_from_slice(cwd_bytes);
-    // out[last] is already 0 (null terminator)
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+    // Copy path, then write a single null terminator — no heap allocation.
+    if crate::mm::user_mem::copy_to_user(buf_ptr, cwd_bytes).is_err() {
+        return NEG_EFAULT;
+    }
+    if crate::mm::user_mem::copy_to_user(buf_ptr + cwd_bytes.len() as u64, &[0u8]).is_err() {
         return NEG_EFAULT;
     }
     // Linux getcwd returns the length of the path (including null terminator).
-    out.len() as u64
+    total_len as u64
 }
 
 // ---------------------------------------------------------------------------
-// T024: chdir — stub (always succeeds)
+// T024: chdir(path) — resolve path, validate directory, update process cwd
 // ---------------------------------------------------------------------------
 
 fn sys_linux_chdir(path_ptr: u64) -> u64 {
@@ -3064,10 +3065,13 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     if let Some(rel) = tmpfs_relative_path(&dir_path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(children) = tmpfs.list_dir(rel) {
-            for (name, is_dir) in children {
-                entries.push((name, is_dir));
+        match tmpfs.list_dir(rel) {
+            Ok(children) => {
+                for (name, is_dir) in children {
+                    entries.push((name, is_dir));
+                }
             }
+            Err(_) => return NEG_ENOENT,
         }
     } else if dir_path == "/" {
         // Unified root listing: ramdisk top-level dirs + tmpfs "tmp".

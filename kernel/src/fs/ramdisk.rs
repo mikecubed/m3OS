@@ -49,137 +49,78 @@ impl RamdiskNode {
 }
 
 // ---------------------------------------------------------------------------
+// File payloads — each include_bytes! appears exactly once.
+// ---------------------------------------------------------------------------
+
+static HELLO_TXT: &[u8] = include_bytes!("../../initrd/hello.txt");
+static README_TXT: &[u8] = include_bytes!("../../initrd/readme.txt");
+static EXIT0_ELF: &[u8] = include_bytes!("../../initrd/exit0.elf");
+static FORK_TEST_ELF: &[u8] = include_bytes!("../../initrd/fork-test.elf");
+static ECHO_ARGS_ELF: &[u8] = include_bytes!("../../initrd/echo-args.elf");
+static HELLO_ELF: &[u8] = include_bytes!("../../initrd/hello.elf");
+static TMPFS_TEST_ELF: &[u8] = include_bytes!("../../initrd/tmpfs-test.elf");
+static ECHO_ELF: &[u8] = include_bytes!("../../initrd/echo.elf");
+static TRUE_ELF: &[u8] = include_bytes!("../../initrd/true.elf");
+static FALSE_ELF: &[u8] = include_bytes!("../../initrd/false.elf");
+static CAT_ELF: &[u8] = include_bytes!("../../initrd/cat.elf");
+static LS_ELF: &[u8] = include_bytes!("../../initrd/ls.elf");
+static PWD_ELF: &[u8] = include_bytes!("../../initrd/pwd.elf");
+static MKDIR_ELF: &[u8] = include_bytes!("../../initrd/mkdir.elf");
+static RMDIR_ELF: &[u8] = include_bytes!("../../initrd/rmdir.elf");
+static RM_ELF: &[u8] = include_bytes!("../../initrd/rm.elf");
+static CP_ELF: &[u8] = include_bytes!("../../initrd/cp.elf");
+static MV_ELF: &[u8] = include_bytes!("../../initrd/mv.elf");
+static ENV_ELF: &[u8] = include_bytes!("../../initrd/env.elf");
+static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep.elf");
+static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep.elf");
+
+// ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
 
 static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
-    (
-        "exit0.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/exit0.elf"),
-        },
-    ),
+    ("exit0.elf", RamdiskNode::File { content: EXIT0_ELF }),
     (
         "fork-test.elf",
         RamdiskNode::File {
-            content: include_bytes!("../../initrd/fork-test.elf"),
+            content: FORK_TEST_ELF,
         },
     ),
     (
         "echo-args.elf",
         RamdiskNode::File {
-            content: include_bytes!("../../initrd/echo-args.elf"),
+            content: ECHO_ARGS_ELF,
         },
     ),
-    (
-        "hello.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/hello.elf"),
-        },
-    ),
+    ("hello.elf", RamdiskNode::File { content: HELLO_ELF }),
     (
         "tmpfs-test.elf",
         RamdiskNode::File {
-            content: include_bytes!("../../initrd/tmpfs-test.elf"),
+            content: TMPFS_TEST_ELF,
         },
     ),
-    (
-        "echo.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/echo.elf"),
-        },
-    ),
-    (
-        "true.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/true.elf"),
-        },
-    ),
-    (
-        "false.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/false.elf"),
-        },
-    ),
-    (
-        "cat.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/cat.elf"),
-        },
-    ),
-    (
-        "ls.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/ls.elf"),
-        },
-    ),
-    (
-        "pwd.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/pwd.elf"),
-        },
-    ),
-    (
-        "mkdir.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/mkdir.elf"),
-        },
-    ),
-    (
-        "rmdir.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/rmdir.elf"),
-        },
-    ),
-    (
-        "rm.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/rm.elf"),
-        },
-    ),
-    (
-        "cp.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/cp.elf"),
-        },
-    ),
-    (
-        "mv.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/mv.elf"),
-        },
-    ),
-    (
-        "env.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/env.elf"),
-        },
-    ),
-    (
-        "sleep.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/sleep.elf"),
-        },
-    ),
-    (
-        "grep.elf",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/grep.elf"),
-        },
-    ),
+    ("echo.elf", RamdiskNode::File { content: ECHO_ELF }),
+    ("true.elf", RamdiskNode::File { content: TRUE_ELF }),
+    ("false.elf", RamdiskNode::File { content: FALSE_ELF }),
+    ("cat.elf", RamdiskNode::File { content: CAT_ELF }),
+    ("ls.elf", RamdiskNode::File { content: LS_ELF }),
+    ("pwd.elf", RamdiskNode::File { content: PWD_ELF }),
+    ("mkdir.elf", RamdiskNode::File { content: MKDIR_ELF }),
+    ("rmdir.elf", RamdiskNode::File { content: RMDIR_ELF }),
+    ("rm.elf", RamdiskNode::File { content: RM_ELF }),
+    ("cp.elf", RamdiskNode::File { content: CP_ELF }),
+    ("mv.elf", RamdiskNode::File { content: MV_ELF }),
+    ("env.elf", RamdiskNode::File { content: ENV_ELF }),
+    ("sleep.elf", RamdiskNode::File { content: SLEEP_ELF }),
+    ("grep.elf", RamdiskNode::File { content: GREP_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
-    (
-        "hello.txt",
-        RamdiskNode::File {
-            content: include_bytes!("../../initrd/hello.txt"),
-        },
-    ),
+    ("hello.txt", RamdiskNode::File { content: HELLO_TXT }),
     (
         "readme.txt",
         RamdiskNode::File {
-            content: include_bytes!("../../initrd/readme.txt"),
+            content: README_TXT,
         },
     ),
 ];
@@ -311,92 +252,92 @@ struct FlatFile {
 }
 
 /// Flat file array preserving the original index-based fd scheme expected by
-/// `fs_client_task` and the VFS IPC protocol.  LLVM will deduplicate the
-/// `include_bytes!` content with the identical entries in the tree above.
+/// `fs_client_task` and the VFS IPC protocol.  References the same named
+/// statics as the directory tree — no duplicate `include_bytes!`.
 static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "hello.txt",
-        content: include_bytes!("../../initrd/hello.txt"),
+        content: HELLO_TXT,
     },
     FlatFile {
         name: "readme.txt",
-        content: include_bytes!("../../initrd/readme.txt"),
+        content: README_TXT,
     },
     FlatFile {
         name: "exit0.elf",
-        content: include_bytes!("../../initrd/exit0.elf"),
+        content: EXIT0_ELF,
     },
     FlatFile {
         name: "fork-test.elf",
-        content: include_bytes!("../../initrd/fork-test.elf"),
+        content: FORK_TEST_ELF,
     },
     FlatFile {
         name: "echo-args.elf",
-        content: include_bytes!("../../initrd/echo-args.elf"),
+        content: ECHO_ARGS_ELF,
     },
     FlatFile {
         name: "hello.elf",
-        content: include_bytes!("../../initrd/hello.elf"),
+        content: HELLO_ELF,
     },
     FlatFile {
         name: "tmpfs-test.elf",
-        content: include_bytes!("../../initrd/tmpfs-test.elf"),
+        content: TMPFS_TEST_ELF,
     },
     FlatFile {
         name: "echo.elf",
-        content: include_bytes!("../../initrd/echo.elf"),
+        content: ECHO_ELF,
     },
     FlatFile {
         name: "true.elf",
-        content: include_bytes!("../../initrd/true.elf"),
+        content: TRUE_ELF,
     },
     FlatFile {
         name: "false.elf",
-        content: include_bytes!("../../initrd/false.elf"),
+        content: FALSE_ELF,
     },
     FlatFile {
         name: "cat.elf",
-        content: include_bytes!("../../initrd/cat.elf"),
+        content: CAT_ELF,
     },
     FlatFile {
         name: "ls.elf",
-        content: include_bytes!("../../initrd/ls.elf"),
+        content: LS_ELF,
     },
     FlatFile {
         name: "pwd.elf",
-        content: include_bytes!("../../initrd/pwd.elf"),
+        content: PWD_ELF,
     },
     FlatFile {
         name: "mkdir.elf",
-        content: include_bytes!("../../initrd/mkdir.elf"),
+        content: MKDIR_ELF,
     },
     FlatFile {
         name: "rmdir.elf",
-        content: include_bytes!("../../initrd/rmdir.elf"),
+        content: RMDIR_ELF,
     },
     FlatFile {
         name: "rm.elf",
-        content: include_bytes!("../../initrd/rm.elf"),
+        content: RM_ELF,
     },
     FlatFile {
         name: "cp.elf",
-        content: include_bytes!("../../initrd/cp.elf"),
+        content: CP_ELF,
     },
     FlatFile {
         name: "mv.elf",
-        content: include_bytes!("../../initrd/mv.elf"),
+        content: MV_ELF,
     },
     FlatFile {
         name: "env.elf",
-        content: include_bytes!("../../initrd/env.elf"),
+        content: ENV_ELF,
     },
     FlatFile {
         name: "sleep.elf",
-        content: include_bytes!("../../initrd/sleep.elf"),
+        content: SLEEP_ELF,
     },
     FlatFile {
         name: "grep.elf",
-        content: include_bytes!("../../initrd/grep.elf"),
+        content: GREP_ELF,
     },
 ];
 
