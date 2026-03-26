@@ -1055,9 +1055,12 @@ fn shell_fork_exec(
         }
     };
 
-    // Build the child process, with optional I/O redirection via pipes.
+    // Build the child process with pipes for I/O.
+    // Always create a stdout pipe so the shell can relay child output
+    // to the framebuffer console. For file redirects, the pipe is
+    // drained to the file instead.
     let stdin_pipe_id = stdin_file.map(|_| pipe::create_pipe());
-    let stdout_pipe_id = stdout_file.map(|_| pipe::create_pipe());
+    let stdout_pipe_id = Some(pipe::create_pipe());
 
     let child_pid =
         match spawn_user_process_with_pipe(&elf_name, &parts, env, stdin_pipe_id, stdout_pipe_id) {
@@ -1098,44 +1101,62 @@ fn shell_fork_exec(
         pipe::pipe_close_reader(pipe_id);
     }
 
-    // Capture stdout to file if redirected.
-    if let (Some(file), Some(pipe_id)) = (stdout_file, stdout_pipe_id) {
+    // Drain child stdout pipe.
+    if let Some(pipe_id) = stdout_pipe_id {
         pipe::pipe_close_writer(pipe_id);
-        // Validate and extract tmpfs-relative path.
-        let tmpfs_rel = match validate_tmpfs_path(file) {
-            Some(r) => r,
-            None => {
-                let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
-                shell_print(my_id, console_ep, &msg);
-                pipe::pipe_close_reader(pipe_id);
-                return;
-            }
-        };
-        {
-            let mut tmpfs = fs::tmpfs::TMPFS.lock();
-            let _ = tmpfs.open_or_create(&tmpfs_rel, true);
-            if !stdout_append {
-                let _ = tmpfs.truncate(&tmpfs_rel, 0);
-            }
-        }
-        let mut file_offset = if stdout_append {
-            let tmpfs = fs::tmpfs::TMPFS.lock();
-            tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
-        } else {
-            0
-        };
-        // Drain pipe into file in a background-ish loop.
-        loop {
-            let mut buf = [0u8; 4096];
-            match pipe::pipe_read(pipe_id, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut tmpfs = fs::tmpfs::TMPFS.lock();
-                    let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
-                    file_offset += n;
+
+        if let Some(file) = stdout_file {
+            // Redirect to file.
+            let tmpfs_rel = match validate_tmpfs_path(file) {
+                Some(r) => r,
+                None => {
+                    let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
+                    shell_print(my_id, console_ep, &msg);
+                    pipe::pipe_close_reader(pipe_id);
+                    return;
                 }
-                Err(_) => {
-                    task::yield_now();
+            };
+            {
+                let mut tmpfs = fs::tmpfs::TMPFS.lock();
+                let _ = tmpfs.open_or_create(&tmpfs_rel, true);
+                if !stdout_append {
+                    let _ = tmpfs.truncate(&tmpfs_rel, 0);
+                }
+            }
+            let mut file_offset = if stdout_append {
+                let tmpfs = fs::tmpfs::TMPFS.lock();
+                tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
+            } else {
+                0
+            };
+            loop {
+                let mut buf = [0u8; 4096];
+                match pipe::pipe_read(pipe_id, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut tmpfs = fs::tmpfs::TMPFS.lock();
+                        let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
+                        file_offset += n;
+                    }
+                    Err(_) => {
+                        task::yield_now();
+                    }
+                }
+            }
+        } else {
+            // No file redirect — relay child stdout to framebuffer console.
+            loop {
+                let mut buf = [0u8; 4096];
+                match pipe::pipe_read(pipe_id, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                            shell_print(my_id, console_ep, s);
+                        }
+                    }
+                    Err(_) => {
+                        task::yield_now();
+                    }
                 }
             }
         }
