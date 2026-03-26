@@ -709,22 +709,29 @@ fn sys_sigreturn(user_rsp: u64) -> ! {
         }
     };
 
-    // Check if the sigframe was delivered on the alt stack; clear SS_ONSTACK.
-    if let Some((_sp, flags, _size)) = crate::signal::read_sigframe_uc_stack(user_rsp) {
-        if flags & crate::process::SS_ONSTACK != 0 {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
+    // Restore the signal mask and clear SS_ONSTACK based on kernel state
+    // (not user-provided uc_stack flags, which userspace could corrupt).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.blocked_signals = saved_mask & !UNBLOCKABLE_MASK;
+            if proc.alt_stack_flags & crate::process::SS_ONSTACK != 0 {
                 proc.alt_stack_flags &= !crate::process::SS_ONSTACK;
             }
         }
     }
 
-    // Restore the signal mask (saved before handler execution).
-    {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.blocked_signals = saved_mask & !UNBLOCKABLE_MASK;
-        }
+    // Validate restored RIP and RSP are canonical userspace addresses.
+    // A corrupt sigframe could cause iretq to fault in ring 0.
+    const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if regs.rip >= USER_ADDR_LIMIT || regs.rsp >= USER_ADDR_LIMIT {
+        log::warn!(
+            "[p{}] sigreturn: non-canonical rip={:#x} or rsp={:#x}",
+            pid,
+            regs.rip,
+            regs.rsp,
+        );
+        sys_exit(-11); // SIGSEGV
     }
 
     log::debug!(

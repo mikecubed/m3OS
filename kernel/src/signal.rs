@@ -140,7 +140,9 @@ pub const SIGFRAME_SIZE: usize = 8 + 8 + 8 + 24 + SIGCONTEXT_SIZE + SIGMASK_SIZE
 
 // Offsets within the sigframe (from the frame base).
 const OFF_PRETCODE: usize = 0;
+#[allow(dead_code)] // layout constant for SA_SIGINFO support
 const OFF_UC_FLAGS: usize = 8;
+#[allow(dead_code)] // layout constant for nested ucontext
 const OFF_UC_LINK: usize = 16;
 const OFF_UC_STACK: usize = 24;
 // uc_stack: ss_sp(8) + ss_flags(4) + _pad(4) + ss_size(8) = 24 bytes
@@ -194,7 +196,8 @@ pub fn setup_signal_frame(
     // for the call-convention "return address slot" alignment (the CPU
     // expects RSP % 16 == 8 at a CALL instruction, so RSP % 16 == 0
     // at function entry after the CALL pushes the return address).
-    let frame_rsp = ((base_rsp - SIGFRAME_SIZE as u64) & !15) - 8;
+    let frame_rsp = base_rsp.checked_sub(SIGFRAME_SIZE as u64)? & !15u64;
+    let frame_rsp = frame_rsp.checked_sub(8)?;
 
     // Validate: frame must be in user space.
     if !(0x1000..USER_ADDR_LIMIT).contains(&frame_rsp) {
@@ -322,22 +325,6 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
     // The `rflags` value is already the user's original rflags.
 
     Some((regs, saved_mask))
-}
-
-/// Read the `uc_stack` (stack_t) from a sigframe for sigaltstack SS_ONSTACK tracking.
-///
-/// Returns `(ss_sp, ss_flags, ss_size)`.
-pub fn read_sigframe_uc_stack(user_rsp: u64) -> Option<(u64, u32, u64)> {
-    let frame_rsp = user_rsp.wrapping_sub(8);
-    if !(0x1000..USER_ADDR_LIMIT).contains(&frame_rsp) {
-        return None;
-    }
-    let mut buf = [0u8; 24];
-    crate::mm::user_mem::copy_from_user(&mut buf, frame_rsp + OFF_UC_STACK as u64).ok()?;
-    let ss_sp = u64::from_ne_bytes(buf[0..8].try_into().ok()?);
-    let ss_flags = u32::from_ne_bytes(buf[8..12].try_into().ok()?);
-    let ss_size = u64::from_ne_bytes(buf[16..24].try_into().ok()?);
-    Some((ss_sp, ss_flags, ss_size))
 }
 
 /// Write the `uc_stack` (stack_t) into a sigframe at the given frame_rsp.
