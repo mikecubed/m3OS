@@ -213,6 +213,17 @@ pub enum SignalAction {
     Default,
     /// Ignore the signal.
     Ignore,
+    /// Run a user-space signal handler.
+    Handler {
+        /// Userspace handler function address.
+        entry: u64,
+        /// Additional signals to block during handler execution.
+        mask: u64,
+        /// `sa_flags` from `rt_sigaction` (SA_RESTORER, SA_ONSTACK, etc.).
+        flags: u64,
+        /// Address of the `__restore_rt` trampoline stub (from `sa_restorer`).
+        restorer: u64,
+    },
 }
 
 /// Default action table: terminate or ignore.
@@ -234,6 +245,13 @@ pub enum SignalDisposition {
     Stop,
     Continue,
     Ignore,
+    /// Deliver to a user-space handler via sigframe.
+    UserHandler {
+        entry: u64,
+        mask: u64,
+        flags: u64,
+        restorer: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +657,24 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
             }
         }
         SignalAction::Default => default_signal_action(sig),
+        SignalAction::Handler {
+            entry,
+            mask,
+            flags,
+            restorer,
+        } => {
+            // SIGKILL and SIGSTOP always use default action regardless.
+            if sig == SIGKILL || sig == SIGSTOP {
+                default_signal_action(sig)
+            } else {
+                SignalDisposition::UserHandler {
+                    entry,
+                    mask,
+                    flags,
+                    restorer,
+                }
+            }
+        }
     };
 
     Some((sig, disposition))

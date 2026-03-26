@@ -121,7 +121,7 @@ use super::gdt;
 
 /// Scratch space to save the user RSP during a syscall.
 #[no_mangle]
-static mut SYSCALL_USER_RSP: u64 = 0;
+pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
 
 /// Saved value of R10 at SYSCALL entry.
 ///
@@ -336,8 +336,9 @@ pub extern "C" fn syscall_handler(
         _ => NEG_ENOSYS,
     };
 
-    // Phase 14 (P14-T031): check pending signals before returning to userspace.
-    check_pending_signals();
+    // Phase 14/19: check pending signals before returning to userspace.
+    // If a user handler is delivered, this diverges and never returns.
+    check_pending_signals(result);
 
     result
 }
@@ -345,12 +346,12 @@ pub extern "C" fn syscall_handler(
 /// Check and deliver pending signals for the current process.
 ///
 /// Called after every syscall (except exit/execve which diverge).
-/// For now, only default actions are supported:
-///   - Terminate: kill the process
-///   - Stop: mark as Stopped and yield
-///   - Continue: already handled in send_signal
-///   - Ignore: do nothing
-fn check_pending_signals() {
+/// `syscall_result` is the return value that would be placed in RAX.
+///
+/// If a user handler is found, this function **diverges**: it builds a
+/// sigframe on the user stack and enters ring 3 at the handler address.
+/// The normal syscall return path is never reached in that case.
+fn check_pending_signals(syscall_result: u64) {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     if pid == 0 {
         return; // kernel task, no signals
@@ -365,7 +366,6 @@ fn check_pending_signals() {
                 match disposition {
                     SignalDisposition::Terminate => {
                         log::info!("[p{}] killed by signal {}", pid, signum);
-                        // Use negative exit code to indicate signal death.
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
@@ -379,7 +379,6 @@ fn check_pending_signals() {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
-                        // Yield until SIGCONT resumes us.
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -392,13 +391,124 @@ fn check_pending_signals() {
                                 .store(pid, core::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    SignalDisposition::Continue | SignalDisposition::Ignore => {
-                        // Nothing to do.
+                    SignalDisposition::Continue | SignalDisposition::Ignore => {}
+                    SignalDisposition::UserHandler {
+                        entry,
+                        mask,
+                        flags,
+                        restorer,
+                    } => {
+                        deliver_user_signal(
+                            pid,
+                            signum,
+                            syscall_result,
+                            entry,
+                            mask,
+                            flags,
+                            restorer,
+                        );
+                        // deliver_user_signal diverges — never reaches here.
                     }
                 }
             }
         }
     }
+}
+
+/// Build a sigframe on the user stack and enter the signal handler.
+///
+/// This function **never returns** — it diverges into ring 3 at the
+/// handler address via `iretq`.
+#[allow(clippy::too_many_arguments)]
+fn deliver_user_signal(
+    pid: crate::process::Pid,
+    signum: u32,
+    syscall_result: u64,
+    handler_entry: u64,
+    sa_mask: u64,
+    _sa_flags: u64,
+    restorer: u64,
+) -> ! {
+    // 1. Read the interrupted user register state from the kernel stack.
+    let regs = unsafe { crate::signal::read_saved_user_regs(syscall_result) };
+
+    // 2. Read and update the process's blocked_signals.
+    let old_blocked = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => {
+                log::warn!("[signal] deliver: pid {} gone", pid);
+                sys_exit(-11); // SIGSEGV
+            }
+        };
+        let old = proc.blocked_signals;
+        // Block the delivered signal + sa_mask during handler execution.
+        proc.blocked_signals |= sa_mask | (1u64 << signum);
+        // SIGKILL and SIGSTOP can never be blocked.
+        proc.blocked_signals &= !UNBLOCKABLE_MASK;
+        old
+    };
+
+    // 3. Build the sigframe on the user stack.
+    let frame_rsp = match crate::signal::setup_signal_frame(
+        &regs,
+        old_blocked,
+        signum,
+        restorer,
+        None, // alt-stack support added in Track D
+    ) {
+        Some(rsp) => rsp,
+        None => {
+            log::warn!(
+                "[p{}] signal {}: cannot build sigframe (bad user stack {:#x})",
+                pid,
+                signum,
+                regs.rsp,
+            );
+            sys_exit(-11); // SIGSEGV default
+        }
+    };
+
+    log::info!(
+        "[p{}] delivering signal {} → handler {:#x}, frame_rsp={:#x}",
+        pid,
+        signum,
+        handler_entry,
+        frame_rsp,
+    );
+
+    // 4. Enter ring 3 at the handler address.
+    //    RIP = handler_entry, RSP = frame_rsp, RDI = signum (first arg).
+    //
+    //    We use a custom iretq sequence that also sets RDI.
+    unsafe { enter_signal_handler(handler_entry, frame_rsp, signum as u64) }
+}
+
+/// Enter ring 3 at `handler` with `rsp` as the stack pointer and `rdi`
+/// set to the signal number (first argument to the handler).
+///
+/// # Safety
+///
+/// Same requirements as `enter_userspace`.
+unsafe fn enter_signal_handler(handler: u64, rsp: u64, sig: u64) -> ! {
+    use core::arch::asm;
+    asm!(
+        "mov rdi, {sig}",
+        "push {ss}",
+        "push {rsp_val}",
+        "push {rflags}",
+        "push {cs}",
+        "push {rip_val}",
+        "iretq",
+        sig     = in(reg) sig,
+        ss      = in(reg) u64::from(crate::arch::x86_64::gdt::user_data_selector().0),
+        rsp_val = in(reg) rsp,
+        rflags  = const 0x202u64,
+        cs      = in(reg) u64::from(crate::arch::x86_64::gdt::user_code_selector().0),
+        rip_val = in(reg) handler,
+        options(noreturn)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -565,14 +675,28 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     };
 
     // Write old action if requested.
-    // struct sigaction: sa_handler (8 bytes) + sa_flags (8 bytes) + sa_restorer (8 bytes) + sa_mask (8 bytes) = 32 bytes min
+    // Linux struct sigaction layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes
     if oldact_ptr != 0 {
         let mut old_sa = [0u8; 32];
-        let handler: u64 = match proc.signal_actions[sig as usize] {
-            crate::process::SignalAction::Default => 0, // SIG_DFL
-            crate::process::SignalAction::Ignore => 1,  // SIG_IGN
-        };
-        old_sa[0..8].copy_from_slice(&handler.to_ne_bytes());
+        match proc.signal_actions[sig as usize] {
+            crate::process::SignalAction::Default => {
+                old_sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
+            }
+            crate::process::SignalAction::Ignore => {
+                old_sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
+            }
+            crate::process::SignalAction::Handler {
+                entry,
+                mask,
+                flags,
+                restorer,
+            } => {
+                old_sa[0..8].copy_from_slice(&entry.to_ne_bytes());
+                old_sa[8..16].copy_from_slice(&flags.to_ne_bytes());
+                old_sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
+                old_sa[24..32].copy_from_slice(&mask.to_ne_bytes());
+            }
+        }
         if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
             return NEG_EFAULT;
         }
@@ -584,11 +708,20 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         if crate::mm::user_mem::copy_from_user(&mut sa, act_ptr).is_err() {
             return NEG_EFAULT;
         }
-        let handler = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
-        proc.signal_actions[sig as usize] = match handler {
+        let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
+        let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
+        let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
+        let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap());
+
+        proc.signal_actions[sig as usize] = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
-            _ => crate::process::SignalAction::Default, // user handlers → treat as default for now
+            _ => crate::process::SignalAction::Handler {
+                entry: handler_addr,
+                mask: sa_mask,
+                flags: sa_flags,
+                restorer: sa_restorer,
+            },
         };
     }
 
@@ -647,8 +780,9 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     drop(table);
 
     // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.
+    // Pass 0 as the syscall result since rt_sigprocmask succeeds.
     if needs_check {
-        check_pending_signals();
+        check_pending_signals(0);
     }
 
     0
@@ -1333,6 +1467,7 @@ fn has_pending_signal() -> bool {
                     crate::process::SignalDisposition::Ignore
                 }
                 crate::process::SignalAction::Default => crate::process::default_signal_action(sig),
+                crate::process::SignalAction::Handler { .. } => return true,
             };
             if disposition != crate::process::SignalDisposition::Ignore {
                 return true;

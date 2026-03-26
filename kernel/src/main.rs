@@ -16,6 +16,8 @@ mod pci;
 mod pipe;
 mod process;
 mod serial;
+#[allow(dead_code)]
+mod signal;
 mod stdin;
 mod task;
 
