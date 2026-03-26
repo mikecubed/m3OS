@@ -2050,3 +2050,22 @@ fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
     }
     panic!("allocation error: {:?} (heap growth failed)", layout)
 }
+
+// ---------------------------------------------------------------------------
+// In-QEMU unit tests (run via `cargo xtask test`)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::serial_println;
+
+    #[test_case]
+    fn trivial_assertion() {
+        assert_eq!(1 + 1, 2);
+    }
+
+    #[test_case]
+    fn serial_output_works() {
+        serial_println!("serial output from test");
+    }
+}
