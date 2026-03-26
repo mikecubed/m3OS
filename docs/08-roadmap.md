@@ -46,15 +46,16 @@ flowchart TD
     P13 --> P18
     P18 --> P19["19. Signal Handlers"]
     P19 --> P20["20. Userspace Init and Shell"]
-    P20 --> P21["21. TTY and Terminal Control"]
-    P16 --> P22["22. Socket API"]
-    P21 --> P22
-    P18 --> P23["23. Persistent Storage"]
-    P15 --> P23
-    P17 --> P24["24. SMP"]
-    P4 --> P24
-    P20 --> P25["25. Compiler Bootstrap"]
-    P23 --> P25
+    P20 --> P21["21. Ion Shell Integration"]
+    P21 --> P22["22. TTY and Terminal Control"]
+    P16 --> P23["23. Socket API"]
+    P22 --> P23
+    P18 --> P24["24. Persistent Storage"]
+    P15 --> P24
+    P17 --> P25["25. SMP"]
+    P4 --> P25
+    P20 --> P26["26. Compiler Bootstrap"]
+    P24 --> P26
 ```
 
 ## Detailed Phase Pages
@@ -93,16 +94,17 @@ flowchart TD
 |---|---|---|
 | 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
 | 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
-| 21 | termios, cooked/raw mode, PTY pairs, window size | [TTY and Terminal Control](./roadmap/21-tty-pty.md) |
-| 22 | Socket syscalls, expose TCP/UDP stack to userspace | [Socket API](./roadmap/22-socket-api.md) |
-| 23 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/23-persistent-storage.md) |
+| 21 | ion shell (Redox OS) replaces minimal custom shell | [Ion Shell Integration](./roadmap/21-ion-shell.md) |
+| 22 | termios, cooked/raw mode, PTY pairs, window size | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
+| 23 | Socket syscalls, expose TCP/UDP stack to userspace | [Socket API](./roadmap/23-socket-api.md) |
+| 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
 
 ### Advanced Phases (deferred)
 
 | Phase | Focus | Link |
 |---|---|---|
-| 24 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/24-smp.md) |
-| 25 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/25-compiler-bootstrap.md) |
+| 25 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/25-smp.md) |
+| 26 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/26-compiler-bootstrap.md) |
 
 ## Documentation Expectation Per Phase
 

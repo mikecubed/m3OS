@@ -1,4 +1,4 @@
-# Phase 21 — TTY and Terminal Control
+# Phase 22 — TTY and Terminal Control
 
 ## Milestone Goal
 
@@ -113,7 +113,7 @@ flowchart TD
 
 ## Companion Task List
 
-- [Phase 21 Task List](./tasks/21-tty-pty-tasks.md)
+- [Phase 22 Task List](./tasks/22-tty-pty-tasks.md)
 
 ## Documentation Deliverables
 

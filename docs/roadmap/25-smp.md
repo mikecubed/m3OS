@@ -1,4 +1,4 @@
-# Phase 24 - Symmetric Multiprocessing
+# Phase 25 - Symmetric Multiprocessing
 
 ## Milestone Goal
 
@@ -74,7 +74,7 @@ flowchart TD
 
 ## Companion Task List
 
-- [Phase 24 Task List](./tasks/24-smp-tasks.md)
+- [Phase 25 Task List](./tasks/25-smp-tasks.md)
 
 ## Documentation Deliverables
 

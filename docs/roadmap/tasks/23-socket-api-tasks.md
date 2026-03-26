@@ -1,7 +1,7 @@
-# Phase 22 — Socket Api: Task List
+# Phase 23 — Socket Api: Task List
 
-**Depends on:** Phase 21 ✅
-**Goal:** See [Phase 22 roadmap doc](../22-socket-api.md) for full details.
+**Depends on:** Phase 22 ✅
+**Goal:** See [Phase 23 roadmap doc](../23-socket-api.md) for full details.
 
 > Task breakdown for this phase is pending. It will be expanded before implementation begins,
 > following the same track layout used in previous phases (independent tracks A, B, C…
@@ -15,8 +15,8 @@
 | B | Syscall integration | A |
 | C | Validation and tests | A, B |
 
-_Expand this file into detailed tasks (P22-T001…) before starting implementation._
+_Expand this file into detailed tasks (P23-T001…) before starting implementation._
 
 ## Related
 
-- [Phase 22 Design Doc](../22-socket-api.md)
+- [Phase 23 Design Doc](../23-socket-api.md)

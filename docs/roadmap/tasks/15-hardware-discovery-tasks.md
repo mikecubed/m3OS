@@ -141,7 +141,7 @@ These items are explicitly out of scope for Phase 15:
 - PCI device power management (D-states)
 - ACPI S-states (sleep, hibernate)
 - PCIe hotplug
-- Application Processor (AP) startup (Phase 24: SMP)
+- Application Processor (AP) startup (Phase 25: SMP)
 - IOMMU / DMA remapping
 - HPET as timer source
 - PCI BAR MMIO mapping for specific device drivers (Phase 16: Network)

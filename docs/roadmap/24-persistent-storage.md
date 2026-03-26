@@ -1,4 +1,4 @@
-# Phase 23 - Persistent Storage
+# Phase 24 - Persistent Storage
 
 ## Milestone Goal
 
@@ -106,7 +106,7 @@ flowchart TD
 
 ## Companion Task List
 
-- [Phase 23 Task List](./tasks/23-persistent-storage-tasks.md)
+- [Phase 24 Task List](./tasks/24-persistent-storage-tasks.md)
 
 ## Documentation Deliverables
 

@@ -61,14 +61,15 @@ flowchart TD
     P18 --> P19["Phase 19 Tasks"]
     P19 --> P20["Phase 20 Tasks"]
     P20 --> P21["Phase 21 Tasks"]
-    P16 --> P22["Phase 22 Tasks"]
-    P21 --> P22
-    P18 --> P23["Phase 23 Tasks"]
-    P15 --> P23
-    P17 --> P24["Phase 24 Tasks"]
-    P4 --> P24
-    P20 --> P25["Phase 25 Tasks"]
-    P23 --> P25
+    P21 --> P22["Phase 22 Tasks"]
+    P16 --> P23["Phase 23 Tasks"]
+    P22 --> P23
+    P18 --> P24["Phase 24 Tasks"]
+    P15 --> P24
+    P17 --> P25["Phase 25 Tasks"]
+    P4 --> P25
+    P20 --> P26["Phase 26 Tasks"]
+    P24 --> P26
 ```
 
 ## Task Documents
@@ -107,15 +108,16 @@ flowchart TD
 | 18 | Directory and VFS (`getdents64`, real cwd) | [Phase 18 Tasks](./18-directory-vfs-tasks.md) |
 | 19 | Signal handlers (trampolines, `sigreturn`) | [Phase 19 Tasks](./19-signal-handlers-tasks.md) |
 | 20 | Userspace init and shell (ring-3 PID 1) | [Phase 20 Tasks](./20-userspace-init-shell-tasks.md) |
-| 21 | TTY and terminal control (termios, PTY) | [Phase 21 Tasks](./21-tty-pty-tasks.md) |
-| 22 | Socket API (BSD sockets over TCP/UDP stack) | [Phase 22 Tasks](./22-socket-api-tasks.md) |
-| 23 | Persistent storage (virtio-blk, FAT32 r/w) | [Phase 23 Tasks](./23-persistent-storage-tasks.md) |
+| 21 | Ion shell integration (ion replaces custom shell) | [Phase 21 Tasks](./21-ion-shell-tasks.md) |
+| 22 | TTY and terminal control (termios, PTY) | [Phase 22 Tasks](./22-tty-pty-tasks.md) |
+| 23 | Socket API (BSD sockets over TCP/UDP stack) | [Phase 23 Tasks](./23-socket-api-tasks.md) |
+| 24 | Persistent storage (virtio-blk, FAT32 r/w) | [Phase 24 Tasks](./24-persistent-storage-tasks.md) |
 
 ### Advanced Phases
 
 | Phase | Focus | Task List |
 |---|---|---|
-| 24 | SMP (AP startup, per-core scheduler, TLB shootdown) | [Phase 24 Tasks](./24-smp-tasks.md) |
+| 25 | SMP (AP startup, per-core scheduler, TLB shootdown) | [Phase 25 Tasks](./25-smp-tasks.md) |
 | 25 | Compiler bootstrap (TCC self-hosting) | *not yet created* |
 
 ## Suggested Usage

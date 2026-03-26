@@ -62,15 +62,16 @@ flowchart TD
     P13 --> P18
     P18 --> P19["Phase 19<br/>Signal Handlers"]
     P19 --> P20["Phase 20<br/>Userspace Init and Shell"]
-    P20 --> P21["Phase 21<br/>TTY and Terminal Control"]
-    P16 --> P22["Phase 22<br/>Socket API"]
-    P21 --> P22
-    P18 --> P23["Phase 23<br/>Persistent Storage"]
-    P15 --> P23
-    P17 --> P24["Phase 24<br/>SMP"]
-    P4 --> P24
-    P20 --> P25["Phase 25<br/>Compiler Bootstrap"]
-    P23 --> P25
+    P20 --> P21["Phase 21<br/>Ion Shell Integration"]
+    P21 --> P22["Phase 22<br/>TTY and Terminal Control"]
+    P16 --> P23["Phase 23<br/>Socket API"]
+    P22 --> P23
+    P18 --> P24["Phase 24<br/>Persistent Storage"]
+    P15 --> P24
+    P17 --> P25["Phase 25<br/>SMP"]
+    P4 --> P25
+    P20 --> P26["Phase 26<br/>Compiler Bootstrap"]
+    P24 --> P26
 ```
 
 ## Milestone Summary
@@ -109,16 +110,17 @@ flowchart TD
 | 18 | Directory and VFS | `getdents64`, directory fds, real cwd, ramdisk layout | [Phase 18](./18-directory-vfs.md) | [Tasks](./tasks/18-directory-vfs-tasks.md) |
 | 19 | Signal Handlers | User signal handlers, trampolines, `sigreturn` | [Phase 19](./19-signal-handlers.md) | [Tasks](./tasks/19-signal-handlers-tasks.md) |
 | 20 | Userspace Init and Shell | Ring-3 PID 1 init, remove kernel shell | [Phase 20](./20-userspace-init-shell.md) | [Tasks](./tasks/20-userspace-init-shell-tasks.md) |
-| 21 | TTY and Terminal Control | termios, cooked/raw mode, PTY pairs | [Phase 21](./21-tty-pty.md) | [Tasks](./tasks/21-tty-pty-tasks.md) |
-| 22 | Socket API | BSD socket syscalls over TCP/UDP stack | [Phase 22](./22-socket-api.md) | [Tasks](./tasks/22-socket-api-tasks.md) |
-| 23 | Persistent Storage | virtio-blk driver, FAT32 read/write | [Phase 23](./23-persistent-storage.md) | [Tasks](./tasks/23-persistent-storage-tasks.md) |
+| 21 | Ion Shell Integration | ion (Redox OS shell) replaces the minimal custom shell | [Phase 21](./21-ion-shell.md) | [Tasks](./tasks/21-ion-shell-tasks.md) |
+| 22 | TTY and Terminal Control | termios, cooked/raw mode, PTY pairs | [Phase 22](./22-tty-pty.md) | [Tasks](./tasks/22-tty-pty-tasks.md) |
+| 23 | Socket API | BSD socket syscalls over TCP/UDP stack | [Phase 23](./23-socket-api.md) | [Tasks](./tasks/23-socket-api-tasks.md) |
+| 24 | Persistent Storage | virtio-blk driver, FAT32 read/write | [Phase 24](./24-persistent-storage.md) | [Tasks](./tasks/24-persistent-storage-tasks.md) |
 
 ### Advanced Phases (deferred)
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
-| 24 | SMP | All CPU cores run the scheduler simultaneously | [Phase 24](./24-smp.md) | [Tasks](./tasks/24-smp-tasks.md) |
-| 25 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 25](./25-compiler-bootstrap.md) | *not yet created* |
+| 25 | SMP | All CPU cores run the scheduler simultaneously | [Phase 25](./25-smp.md) | [Tasks](./tasks/25-smp-tasks.md) |
+| 26 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 26](./26-compiler-bootstrap.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
