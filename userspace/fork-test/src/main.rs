@@ -19,13 +19,7 @@ pub extern "C" fn _start() -> ! {
     } else {
         // Parent path: wait for child.
         let mut wstatus: i32 = -1;
-        let waited = unsafe {
-            syscall2(
-                SYS_WAITPID,
-                child_pid,
-                &mut wstatus as *mut i32 as u64,
-            )
-        };
+        let waited = unsafe { syscall2(SYS_WAITPID, child_pid, &mut wstatus as *mut i32 as u64) };
         if waited == u64::MAX {
             serial_print("fork-test: waitpid failed\n");
             exit(2)
