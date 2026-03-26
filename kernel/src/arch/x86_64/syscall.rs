@@ -461,9 +461,9 @@ fn deliver_user_signal(
             && proc.alt_stack_flags & crate::process::SS_DISABLE == 0
             && proc.alt_stack_flags & crate::process::SS_ONSTACK == 0
         {
-            // Mark the alt stack as in use.
+            // Mark the alt stack as in use; compute top with overflow check.
             proc.alt_stack_flags |= crate::process::SS_ONSTACK;
-            Some(proc.alt_stack_base + proc.alt_stack_size)
+            proc.alt_stack_base.checked_add(proc.alt_stack_size)
         } else {
             None
         };
@@ -765,7 +765,8 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
     let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
     // Sanitize rflags: always set IF (bit 9), clear IOPL (bits 12-13).
-    let rflags = (regs.rflags & !0x3000) | 0x200;
+    // Sanitize: clear IOPL (bits 12-13), force IF (bit 9) and reserved bit 1.
+    let rflags = (regs.rflags & !0x3000) | 0x202;
 
     asm!(
         // Build the iretq frame on the kernel stack.
@@ -859,6 +860,16 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
         let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
         let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
+
+        // Reject handler or restorer pointing into kernel space.
+        // Values 0 (SIG_DFL) and 1 (SIG_IGN) are handled by the match below.
+        const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+        if handler_addr >= USER_LIMIT {
+            return NEG_EINVAL;
+        }
+        if sa_restorer != 0 && sa_restorer >= USER_LIMIT {
+            return NEG_EINVAL;
+        }
         // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
         let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
@@ -1016,8 +1027,21 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
             proc.alt_stack_size = 0;
             proc.alt_stack_flags = crate::process::SS_DISABLE;
         } else {
+            // Reject unknown flags (only SS_DISABLE and SS_ONSTACK are valid).
+            if ss_flags & !(crate::process::SS_DISABLE | crate::process::SS_ONSTACK) != 0 {
+                return NEG_EINVAL;
+            }
             // Validate minimum size.
             if ss_size < crate::process::MINSIGSTKSZ {
+                return NEG_EINVAL;
+            }
+            // Validate range is within canonical userspace.
+            const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+            if ss_sp >= USER_LIMIT
+                || ss_sp
+                    .checked_add(ss_size)
+                    .is_none_or(|top| top > USER_LIMIT)
+            {
                 return NEG_EINVAL;
             }
             proc.alt_stack_base = ss_sp;

@@ -77,7 +77,10 @@ static void test_signal_masking(void) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigusr1_handler;
     sa.sa_flags = SA_RESTORER;
-    sigaction(SIGUSR1, &sa, NULL);
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) {
+        fail("signal_masking", "sigaction failed");
+        return;
+    }
 
     sigusr1_handled = 0;
 
@@ -85,7 +88,10 @@ static void test_signal_masking(void) {
     sigset_t block_set, old_set;
     sigemptyset(&block_set);
     sigaddset(&block_set, SIGUSR1);
-    sigprocmask(SIG_BLOCK, &block_set, &old_set);
+    if (sigprocmask(SIG_BLOCK, &block_set, &old_set) != 0) {
+        fail("signal_masking", "sigprocmask SIG_BLOCK failed");
+        return;
+    }
 
     /* Send SIGUSR1 to self -- should be held pending. */
     raise(SIGUSR1);
@@ -96,7 +102,10 @@ static void test_signal_masking(void) {
     }
 
     /* Unblock -- should deliver immediately. */
-    sigprocmask(SIG_UNBLOCK, &block_set, NULL);
+    if (sigprocmask(SIG_UNBLOCK, &block_set, NULL) != 0) {
+        fail("signal_masking", "sigprocmask SIG_UNBLOCK failed");
+        return;
+    }
 
     if (sigusr1_handled)
         pass("signal_masking");
@@ -143,7 +152,10 @@ static void test_auto_masking(void) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = reentry_handler;
     sa.sa_flags = SA_RESTORER;
-    sigaction(SIGUSR2, &sa, NULL);
+    if (sigaction(SIGUSR2, &sa, NULL) != 0) {
+        fail("auto_masking", "sigaction failed");
+        return;
+    }
 
     reentry_count = 0;
     raise(SIGUSR2);
