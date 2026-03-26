@@ -473,10 +473,7 @@ mod tests {
 
         // Write to directory
         fs.mkdir("/d").unwrap();
-        assert_eq!(
-            fs.write_file("/d", 0, b"x"),
-            Err(TmpfsError::WrongType)
-        );
+        assert_eq!(fs.write_file("/d", 0, b"x"), Err(TmpfsError::WrongType));
 
         // Read from directory
         assert_eq!(fs.read_file("/d", 0, 100), Err(TmpfsError::WrongType));

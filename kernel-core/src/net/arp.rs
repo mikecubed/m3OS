@@ -31,8 +31,7 @@ pub fn parse(payload: &[u8]) -> Option<ArpPacket> {
     let hw_len = payload[4];
     let proto_len = payload[5];
 
-    if hw_type != ARP_HW_ETHERNET || proto_type != ARP_PROTO_IPV4 || hw_len != 6 || proto_len != 4
-    {
+    if hw_type != ARP_HW_ETHERNET || proto_type != ARP_PROTO_IPV4 || hw_len != 6 || proto_len != 4 {
         return None;
     }
 

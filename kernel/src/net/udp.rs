@@ -5,8 +5,9 @@ use spin::Mutex;
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
 
+use kernel_core::net::udp::{build, parse, UdpBindings};
 #[allow(unused_imports)]
-pub use kernel_core::net::udp::{build, parse, UdpBindings, UdpDatagram, UdpHeader};
+pub use kernel_core::net::udp::{UdpDatagram, UdpHeader};
 
 static UDP_BINDINGS: Mutex<UdpBindings> = Mutex::new(UdpBindings::new());
 
