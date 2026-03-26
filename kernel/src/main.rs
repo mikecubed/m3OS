@@ -924,13 +924,6 @@ fn shell_execute(
                 // Validate the target is an existing directory.
                 if shell_is_directory(&resolved) {
                     set_env(env, "PWD", &resolved);
-                    // Also update the kernel process's cwd so child processes
-                    // inherit the correct working directory.
-                    let pid = process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-                    let mut table = process::PROCESS_TABLE.lock();
-                    if let Some(proc) = table.find_mut(pid) {
-                        proc.cwd = resolved.clone();
-                    }
                 } else {
                     let msg = alloc::format!("cd: {}: No such directory\n", args_str);
                     shell_print(my_id, console_ep, &msg);
@@ -1062,23 +1055,34 @@ fn shell_fork_exec(
     let stdin_pipe_id = stdin_file.map(|_| pipe::create_pipe());
     let stdout_pipe_id = Some(pipe::create_pipe());
 
-    let child_pid =
-        match spawn_user_process_with_pipe(&elf_name, &parts, env, stdin_pipe_id, stdout_pipe_id) {
-            Some(pid) => pid,
-            None => {
-                // Clean up any pipes created for redirection.
-                if let Some(id) = stdin_pipe_id {
-                    pipe::pipe_close_reader(id);
-                    pipe::pipe_close_writer(id);
-                }
-                if let Some(id) = stdout_pipe_id {
-                    pipe::pipe_close_reader(id);
-                    pipe::pipe_close_writer(id);
-                }
-                shell_print(my_id, console_ep, "fork: failed\n");
-                return;
+    let shell_cwd = env
+        .iter()
+        .find(|(k, _)| k == "PWD")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("/");
+    let child_pid = match spawn_user_process_with_pipe(
+        &elf_name,
+        &parts,
+        env,
+        stdin_pipe_id,
+        stdout_pipe_id,
+        shell_cwd,
+    ) {
+        Some(pid) => pid,
+        None => {
+            // Clean up any pipes created for redirection.
+            if let Some(id) = stdin_pipe_id {
+                pipe::pipe_close_reader(id);
+                pipe::pipe_close_writer(id);
             }
-        };
+            if let Some(id) = stdout_pipe_id {
+                pipe::pipe_close_reader(id);
+                pipe::pipe_close_writer(id);
+            }
+            shell_print(my_id, console_ep, "fork: failed\n");
+            return;
+        }
+    };
 
     // Feed stdin from file if redirected.
     if let (Some(file), Some(pipe_id)) = (stdin_file, stdin_pipe_id) {
@@ -1223,26 +1227,33 @@ fn shell_pipeline(
 
     // Create a pipe.
     let pipe_id = pipe::create_pipe();
+    let shell_cwd = env
+        .iter()
+        .find(|(k, _)| k == "PWD")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("/");
 
     // Spawn first child (stdout → pipe write end).
-    let pid0 = match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id)) {
-        Some(pid) => pid,
-        None => {
-            pipe::pipe_close_reader(pipe_id);
-            pipe::pipe_close_writer(pipe_id);
-            return;
-        }
-    };
+    let pid0 =
+        match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id), shell_cwd) {
+            Some(pid) => pid,
+            None => {
+                pipe::pipe_close_reader(pipe_id);
+                pipe::pipe_close_writer(pipe_id);
+                return;
+            }
+        };
 
     // Spawn second child (stdin ← pipe read end).
-    let pid1 = match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None) {
-        Some(pid) => pid,
-        None => {
-            pipe::pipe_close_reader(pipe_id);
-            pipe::pipe_close_writer(pipe_id);
-            return;
-        }
-    };
+    let pid1 =
+        match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None, shell_cwd) {
+            Some(pid) => pid,
+            None => {
+                pipe::pipe_close_reader(pipe_id);
+                pipe::pipe_close_writer(pipe_id);
+                return;
+            }
+        };
 
     // Close our copies of the pipe ends so EOF propagates.
     pipe::pipe_close_writer(pipe_id);
@@ -1275,6 +1286,7 @@ fn spawn_user_process_with_pipe(
     env: &[(String, String)],
     stdin_pipe: Option<usize>,
     stdout_pipe: Option<usize>,
+    cwd: &str,
 ) -> Option<crate::process::Pid> {
     use crate::mm::elf::load_elf_into;
 
@@ -1346,6 +1358,14 @@ fn spawn_user_process_with_pipe(
         fd_table,
         0, // pgid=0 → use own pid
     );
+
+    // Set the child's working directory from the shell's cwd.
+    {
+        let mut table = process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.cwd = String::from(cwd);
+        }
+    }
 
     process::push_fork_ctx(pid, loaded.entry, user_rsp);
     task::spawn(process::fork_child_trampoline, "shell-child");
