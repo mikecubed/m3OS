@@ -246,7 +246,7 @@ pub fn free_process_page_table(cr3_phys: u64) {
         count: usize,
         filter: fn(PageTableFlags) -> bool,
     ) -> Vec<u64> {
-        let mut addrs = Vec::new();
+        let mut addrs = Vec::with_capacity(count);
         let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
         for i in 0..count {
             let entry = &pt[i];
