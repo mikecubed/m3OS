@@ -1244,20 +1244,33 @@ fn shell_pipeline(
             }
         };
 
-    // Spawn second child (stdin ← pipe read end).
-    let pid1 =
-        match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None, shell_cwd) {
-            Some(pid) => pid,
-            None => {
-                pipe::pipe_close_reader(pipe_id);
-                pipe::pipe_close_writer(pipe_id);
-                return;
-            }
-        };
+    // Create a stdout relay pipe for the second child so its output
+    // goes to the framebuffer console instead of serial.
+    let relay_pipe = pipe::create_pipe();
+
+    // Spawn second child (stdin ← inter-process pipe, stdout → relay pipe).
+    let pid1 = match spawn_user_process_with_pipe(
+        &elf1,
+        &parts1,
+        env,
+        Some(pipe_id),
+        Some(relay_pipe),
+        shell_cwd,
+    ) {
+        Some(pid) => pid,
+        None => {
+            pipe::pipe_close_reader(pipe_id);
+            pipe::pipe_close_writer(pipe_id);
+            pipe::pipe_close_reader(relay_pipe);
+            pipe::pipe_close_writer(relay_pipe);
+            return;
+        }
+    };
 
     // Close our copies of the pipe ends so EOF propagates.
     pipe::pipe_close_writer(pipe_id);
     pipe::pipe_close_reader(pipe_id);
+    pipe::pipe_close_writer(relay_pipe);
 
     // Put both children in the same process group so Ctrl-C/Ctrl-Z
     // signals both stages of the pipeline.
@@ -1268,6 +1281,23 @@ fn shell_pipeline(
         }
     }
     process::FG_PGID.store(pid0, core::sync::atomic::Ordering::Relaxed);
+
+    // Drain the relay pipe to the framebuffer console.
+    loop {
+        let mut buf = [0u8; 4096];
+        match pipe::pipe_read(relay_pipe, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+                    shell_print(my_id, console_ep, s);
+                }
+            }
+            Err(_) => {
+                task::yield_now();
+            }
+        }
+    }
+    pipe::pipe_close_reader(relay_pipe);
 
     // Wait for both children.
     wait_for_child(pid0);
