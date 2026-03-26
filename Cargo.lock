@@ -315,6 +315,7 @@ name = "kernel"
 version = "0.19.0"
 dependencies = [
  "bootloader_api",
+ "kernel-core",
  "linked_list_allocator",
  "log",
  "pic8259",
@@ -322,6 +323,10 @@ dependencies = [
  "uart_16550",
  "x86_64",
 ]
+
+[[package]]
+name = "kernel-core"
+version = "0.1.0"
 
 [[package]]
 name = "leb128fmt"

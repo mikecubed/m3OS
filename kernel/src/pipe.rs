@@ -13,76 +13,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-/// Size of each pipe's ring buffer.
-const PIPE_BUF_SIZE: usize = 4096;
-
-/// A kernel pipe: ring buffer with ref-counted reader/writer ends.
-pub struct Pipe {
-    buf: [u8; PIPE_BUF_SIZE],
-    /// Read position in the ring buffer.
-    read_pos: usize,
-    /// Number of valid bytes in the buffer (0 = empty, PIPE_BUF_SIZE = full).
-    count: usize,
-    /// Number of open read-end references (FDs pointing to PipeRead for this pipe).
-    pub reader_count: u32,
-    /// Number of open write-end references (FDs pointing to PipeWrite for this pipe).
-    pub writer_count: u32,
-}
-
-impl Pipe {
-    fn new() -> Self {
-        Pipe {
-            buf: [0u8; PIPE_BUF_SIZE],
-            read_pos: 0,
-            count: 0,
-            reader_count: 1,
-            writer_count: 1,
-        }
-    }
-
-    /// Read up to `dst.len()` bytes from the pipe. Returns number of bytes read.
-    pub fn read(&mut self, dst: &mut [u8]) -> usize {
-        let to_read = dst.len().min(self.count);
-        for (i, byte) in dst.iter_mut().enumerate().take(to_read) {
-            *byte = self.buf[(self.read_pos + i) % PIPE_BUF_SIZE];
-        }
-        self.read_pos = (self.read_pos + to_read) % PIPE_BUF_SIZE;
-        self.count -= to_read;
-        to_read
-    }
-
-    /// Write up to `src.len()` bytes into the pipe. Returns number of bytes written.
-    pub fn write(&mut self, src: &[u8]) -> usize {
-        let space = PIPE_BUF_SIZE - self.count;
-        let to_write = src.len().min(space);
-        let write_pos = (self.read_pos + self.count) % PIPE_BUF_SIZE;
-        for (i, &byte) in src.iter().enumerate().take(to_write) {
-            self.buf[(write_pos + i) % PIPE_BUF_SIZE] = byte;
-        }
-        self.count += to_write;
-        to_write
-    }
-
-    /// Returns true if the buffer is empty.
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Returns true if the buffer is full.
-    pub fn is_full(&self) -> bool {
-        self.count == PIPE_BUF_SIZE
-    }
-
-    /// Check if any writer is still open.
-    pub fn has_writer(&self) -> bool {
-        self.writer_count > 0
-    }
-
-    /// Check if any reader is still open.
-    pub fn has_reader(&self) -> bool {
-        self.reader_count > 0
-    }
-}
+pub use kernel_core::pipe::Pipe;
 
 /// Global pipe table.
 static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());

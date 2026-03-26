@@ -91,7 +91,10 @@ fn build_userspace_bins() {
 
     // Ensure the initrd directory exists before copying.
     fs::create_dir_all(&initrd).unwrap_or_else(|e| {
-        panic!("failed to create initrd directory {}: {e}", initrd.display());
+        panic!(
+            "failed to create initrd directory {}: {e}",
+            initrd.display()
+        );
     });
 
     let bins: &[(&str, &str)] = &[
@@ -140,7 +143,10 @@ fn build_musl_bins() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
     fs::create_dir_all(&initrd).unwrap_or_else(|e| {
-        panic!("failed to create initrd directory {}: {e}", initrd.display());
+        panic!(
+            "failed to create initrd directory {}: {e}",
+            initrd.display()
+        );
     });
 
     // (source path relative to workspace root, output name)
@@ -386,9 +392,48 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Clippy + tests for kernel-core (host target).
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
-        .args(["fmt", "--package", "kernel", "--", "--check"])
+        .args([
+            "clippy",
+            "--package",
+            "kernel-core",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run kernel-core clippy");
+
+    if !status.success() {
+        eprintln!("kernel-core clippy reported errors");
+        std::process::exit(1);
+    }
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "kernel-core",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+        ])
+        .status()
+        .expect("failed to run kernel-core tests");
+
+    if !status.success() {
+        eprintln!("kernel-core host tests failed");
+        std::process::exit(1);
+    }
+
+    // Format check for both kernel and kernel-core.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(["fmt", "--all", "--", "--check"])
         .status()
         .expect("failed to run cargo fmt");
 
@@ -397,12 +442,12 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    println!("check passed: clippy clean, formatting correct");
+    println!("check passed: clippy clean, formatting correct, host tests pass");
 }
 
 fn cmd_fmt(fix: bool) {
     let root = workspace_root();
-    let mut args = vec!["fmt", "--package", "kernel"];
+    let mut args = vec!["fmt", "--all"];
     if !fix {
         args.extend(["--", "--check"]);
     }
@@ -461,8 +506,9 @@ impl FileDataSource {
         match self {
             FileDataSource::File(path) => {
                 io::copy(
-                    &mut File::open(path)
-                        .with_context(|| format!("failed to open `{}` for copying", path.display()))?,
+                    &mut File::open(path).with_context(|| {
+                        format!("failed to open `{}` for copying", path.display())
+                    })?,
                     target,
                 )
                 .with_context(|| format!("failed to copy `{}`", path.display()))?;
@@ -618,11 +664,12 @@ fn cmd_image(image_args: &ImageArgs) {
     };
     let signed_bootloader = sign_efi(&sign_args);
     let signed_image = signed_path(&uefi_image);
-    create_signed_uefi_image(&kernel_binary, &signed_bootloader, &signed_image)
-        .unwrap_or_else(|err| {
+    create_signed_uefi_image(&kernel_binary, &signed_bootloader, &signed_image).unwrap_or_else(
+        |err| {
             eprintln!("Error: failed to assemble signed UEFI image: {err:#}");
             std::process::exit(1);
-        });
+        },
+    );
     println!("Signed EFI: {}", signed_bootloader.display());
     println!("Signed UEFI image: {}", signed_image.display());
     convert_to_vhdx(&signed_image);
@@ -762,15 +809,12 @@ fn find_uefi_bootloader_in(build_dir: &Path) -> Result<PathBuf, String> {
     }
 
     candidates.sort_by_key(|(modified, _)| *modified);
-    candidates
-        .pop()
-        .map(|(_, path)| path)
-        .ok_or_else(|| {
-            format!(
-                "could not locate bootloader-x86_64-uefi.efi under `{}`; rebuild xtask first",
-                build_dir.display()
-            )
-        })
+    candidates.pop().map(|(_, path)| path).ok_or_else(|| {
+        format!(
+            "could not locate bootloader-x86_64-uefi.efi under `{}`; rebuild xtask first",
+            build_dir.display()
+        )
+    })
 }
 
 fn create_signed_uefi_image(
@@ -795,21 +839,24 @@ fn create_signed_uefi_image(
             .reopen()
             .context("failed to reopen temporary FAT image for formatting")?,
     )
-        .context("failed to create signed FAT filesystem")?;
+    .context("failed to create signed FAT filesystem")?;
     create_gpt_disk(
         fat_partition
             .reopen()
             .context("failed to reopen temporary FAT image for GPT packaging")?,
         image_path,
     )
-        .context("failed to create signed GPT disk image")?;
+    .context("failed to create signed GPT disk image")?;
     fat_partition
         .close()
         .context("failed to delete temporary FAT image after disk image creation")?;
     Ok(())
 }
 
-fn create_fat_filesystem(files: &BTreeMap<&str, FileDataSource>, fat_file: File) -> anyhow::Result<()> {
+fn create_fat_filesystem(
+    files: &BTreeMap<&str, FileDataSource>,
+    fat_file: File,
+) -> anyhow::Result<()> {
     const MB: u64 = 1024 * 1024;
 
     let mut needed_size = 0;
@@ -885,7 +932,10 @@ fn add_files_to_image<T: fatfs::ReadWriteSeek>(
 fn fat_parent_dirs(target_path_raw: &str) -> Vec<String> {
     let mut dirs = Vec::new();
     let mut parts = Vec::new();
-    for component in target_path_raw.split('/').filter(|component| !component.is_empty()) {
+    for component in target_path_raw
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
         parts.push(component);
     }
 
@@ -986,7 +1036,10 @@ mod tests {
     fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
 
-        assert_eq!(signed_path(&unsigned), PathBuf::from("target/bootx64-signed.efi"));
+        assert_eq!(
+            signed_path(&unsigned),
+            PathBuf::from("target/bootx64-signed.efi")
+        );
     }
 
     #[test]
@@ -1010,11 +1063,12 @@ mod tests {
         );
 
         assert!(args.windows(2).any(|window| window == ["-display", "sdl"]));
-        assert!(args.windows(2).any(|window| window == ["-audiodev", "none,id=noaudio"]));
-        assert!(
-            args.windows(2)
-                .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-audiodev", "none,id=noaudio"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"]));
     }
 
     #[test]
@@ -1049,7 +1103,8 @@ mod tests {
     #[test]
     fn parse_sign_args_uses_repo_root_defaults() {
         let workspace_root = PathBuf::from("/workspace/m3os");
-        let parsed = parse_sign_args(&string_args(&["build/bootx64.efi"]), &workspace_root).unwrap();
+        let parsed =
+            parse_sign_args(&string_args(&["build/bootx64.efi"]), &workspace_root).unwrap();
 
         assert_eq!(parsed.unsigned_efi, PathBuf::from("build/bootx64.efi"));
         assert_eq!(parsed.signed_efi, PathBuf::from("build/bootx64-signed.efi"));
@@ -1124,8 +1179,8 @@ mod tests {
         let fat_image = NamedTempFile::new().unwrap();
         create_fat_filesystem(&files, fat_image.reopen().unwrap()).unwrap();
 
-        let filesystem = fatfs::FileSystem::new(fat_image.reopen().unwrap(), fatfs::FsOptions::new())
-            .unwrap();
+        let filesystem =
+            fatfs::FileSystem::new(fat_image.reopen().unwrap(), fatfs::FsOptions::new()).unwrap();
         let root_dir = filesystem.root_dir();
 
         let mut bootloader = root_dir.open_file(UEFI_BOOT_FILENAME).unwrap();

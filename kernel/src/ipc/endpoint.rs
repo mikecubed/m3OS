@@ -34,13 +34,7 @@ use spin::Mutex;
 use super::{Capability, Message};
 use crate::task::{scheduler, TaskId};
 
-// ---------------------------------------------------------------------------
-// EndpointId
-// ---------------------------------------------------------------------------
-
-/// Index into the global endpoint registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EndpointId(pub u8);
+pub use kernel_core::types::EndpointId;
 
 // ---------------------------------------------------------------------------
 // Global endpoint registry

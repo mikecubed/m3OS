@@ -1,65 +1,12 @@
-//! ICMP echo request/reply (P16-T031 through P16-T033).
+//! ICMP echo request/reply — pure logic re-exported from kernel-core.
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use super::ipv4::{self, Ipv4Header};
 
-// ===========================================================================
-// ICMP types
-// ===========================================================================
-
-const ICMP_ECHO_REPLY: u8 = 0;
-const ICMP_ECHO_REQUEST: u8 = 8;
-
-// ===========================================================================
-// ICMP header (P16-T031)
-// ===========================================================================
-
-/// Parsed ICMP header.
-#[derive(Debug, Clone, Copy)]
-pub struct IcmpHeader {
-    pub icmp_type: u8,
-    pub code: u8,
-    pub checksum: u16,
-    pub rest: [u8; 4], // identifier (2) + sequence (2) for echo
-}
-
-/// Parse an ICMP packet.
-fn parse(data: &[u8]) -> Option<(IcmpHeader, &[u8])> {
-    if data.len() < 8 {
-        return None;
-    }
-    let header = IcmpHeader {
-        icmp_type: data[0],
-        code: data[1],
-        checksum: u16::from_be_bytes([data[2], data[3]]),
-        rest: [data[4], data[5], data[6], data[7]],
-    };
-    Some((header, &data[8..]))
-}
-
-/// Build an ICMP packet with auto-computed checksum.
-fn build(icmp_type: u8, code: u8, rest: [u8; 4], payload: &[u8]) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(8 + payload.len());
-    pkt.push(icmp_type);
-    pkt.push(code);
-    // Checksum placeholder
-    pkt.extend_from_slice(&0u16.to_be_bytes());
-    pkt.extend_from_slice(&rest);
-    pkt.extend_from_slice(payload);
-
-    // Compute checksum over entire ICMP message.
-    let cksum = ipv4::checksum(&pkt);
-    pkt[2] = (cksum >> 8) as u8;
-    pkt[3] = cksum as u8;
-
-    pkt
-}
-
-// ===========================================================================
-// ICMP echo reply (P16-T032)
-// ===========================================================================
+use kernel_core::net::icmp::{build, parse};
+#[allow(unused_imports)]
+pub use kernel_core::net::icmp::{IcmpHeader, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST};
 
 /// Handle an incoming ICMP packet.
 pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
@@ -70,7 +17,6 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
 
     match icmp_hdr.icmp_type {
         ICMP_ECHO_REQUEST => {
-            // Send echo reply with the same identifier, sequence, and data.
             let reply = build(ICMP_ECHO_REPLY, 0, icmp_hdr.rest, icmp_data);
             ipv4::send(ip_header.src, ipv4::PROTO_ICMP, &reply);
             log::debug!(
@@ -85,8 +31,6 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
             let id = u16::from_be_bytes([icmp_hdr.rest[0], icmp_hdr.rest[1]]);
             let seq = u16::from_be_bytes([icmp_hdr.rest[2], icmp_hdr.rest[3]]);
 
-            // Only accept replies matching the outstanding request's
-            // identifier and sequence number to avoid stale/mismatched replies.
             let expected_id = PING_EXPECTED_ID.load(Ordering::Acquire);
             let expected_seq = PING_EXPECTED_SEQ.load(Ordering::Acquire);
             if id != expected_id || seq != expected_seq {
@@ -116,34 +60,18 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
     }
 }
 
-// ===========================================================================
-// Ping (P16-T033)
-// ===========================================================================
-
-/// Tracks whether a ping reply has been received.
 pub static PING_REPLY_RECEIVED: AtomicBool = AtomicBool::new(false);
-/// Tick count when the ping reply was received.
 pub static PING_REPLY_TICK: AtomicU64 = AtomicU64::new(0);
-/// Expected ICMP identifier for the outstanding ping request.
 static PING_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
-/// Expected ICMP sequence number for the outstanding ping request.
 static PING_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
 
 /// Send an ICMP echo request to the given IP address.
-///
-/// Returns the tick count at which the request was sent, for RTT calculation.
 pub fn ping(target_ip: super::arp::Ipv4Addr, seq: u16) -> u64 {
     PING_REPLY_RECEIVED.store(false, Ordering::Release);
-    PING_EXPECTED_ID.store(1, Ordering::Release); // identifier = 0x0001
+    PING_EXPECTED_ID.store(1, Ordering::Release);
     PING_EXPECTED_SEQ.store(seq, Ordering::Release);
 
-    let rest = [
-        0x00,
-        0x01, // identifier
-        (seq >> 8) as u8,
-        seq as u8, // sequence number
-    ];
-    // 32 bytes of payload data.
+    let rest = [0x00, 0x01, (seq >> 8) as u8, seq as u8];
     let payload = [0xABu8; 32];
 
     let icmp_pkt = build(ICMP_ECHO_REQUEST, 0, rest, &payload);

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "kernel",
+    "kernel-core",
     "xtask",
     # Phase 11 userspace test binaries
     "userspace/syscall-lib",

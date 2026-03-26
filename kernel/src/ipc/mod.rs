@@ -39,6 +39,7 @@ pub mod registry;
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
+#[allow(unused_imports)]
 pub use notification::NotifId;
 #[allow(unused_imports)]
 pub use registry::RegistryError;

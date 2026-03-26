@@ -13,13 +13,24 @@ Uses the `xtask` pattern — always build through `cargo xtask`, never `cargo bu
 ```bash
 cargo xtask run          # build + launch in QEMU (primary dev workflow)
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
-cargo xtask check        # clippy (-D warnings) + rustfmt check
-cargo xtask fmt --fix    # auto-format all kernel source
-cargo xtask test         # run all kernel tests in QEMU (Phase 3+, not yet implemented)
-cargo xtask test --test <name>  # run a single test (Phase 3+, not yet implemented)
+cargo xtask check        # clippy (-D warnings) + rustfmt + kernel-core host tests
+cargo xtask fmt --fix    # auto-format all workspace source
+cargo xtask test         # run all kernel tests in QEMU (Phase 4+, not yet implemented)
+cargo xtask test --test <name>  # run a single test (Phase 4+, not yet implemented)
+cargo test -p kernel-core       # run kernel-core host-side unit tests directly
 ```
 
-Tests cannot use `cargo test` — the kernel is `no_std` and tests run inside QEMU via the xtask harness.
+Tests cannot use `cargo test` on the kernel — it is `no_std` and tests run inside QEMU via the xtask harness. Pure-logic code lives in `kernel-core` and is testable on the host via `cargo test -p kernel-core`.
+
+## First-Time Setup
+
+After cloning, install the git hooks so quality gates run before commits and pushes:
+
+```bash
+./setup.sh
+```
+
+This sets `core.hooksPath` to `.githooks/`, which contains pre-commit and pre-push hooks that run `cargo xtask check`.
 
 ## Architecture
 

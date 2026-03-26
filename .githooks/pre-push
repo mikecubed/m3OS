@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-push hook: run full quality gates before pushing to remote.
+# To bypass in an emergency: git push --no-verify
+
+set -e
+
+# Locate cargo — try PATH first, then ~/.cargo/env
+if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$HOME/.cargo/env" ]; then
+        . "$HOME/.cargo/env"
+    else
+        echo "pre-push: cargo not found, skipping check"
+        exit 0
+    fi
+fi
+
+echo "pre-push: running cargo xtask check..."
+cargo xtask check
