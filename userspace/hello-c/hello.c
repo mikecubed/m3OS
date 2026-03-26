@@ -17,7 +17,7 @@ int main(void) {
     const char *msg = "malloc works\n";
     char *buf = malloc(64); /* DevSkim: ignore DS161085 — constant literal, no integer math */
     if (buf) {
-        memcpy(buf, msg, strlen(msg) + 1); /* DevSkim: ignore DS154189,DS140021 — bounded copy of string literal into 64-byte buffer */
+        memcpy(buf, msg, strlen(msg) + 1); /* DevSkim: ignore DS154189,DS140021,DS121708 — bounded copy of string literal into 64-byte buffer */
         fputs(buf, stdout);
         free(buf);
     }
