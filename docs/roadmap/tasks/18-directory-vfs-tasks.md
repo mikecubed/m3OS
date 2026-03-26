@@ -1,6 +1,8 @@
 # Phase 18 — Directory and VFS: Task List
 
 **Depends on:** Phase 17 (Memory Reclamation) ✅
+**Branch:** `phase-18-directory-vfs`
+**Status:** Complete
 **Goal:** Make the filesystem navigable with per-process working directories,
 directory file descriptors, `getdents64`, hierarchical ramdisk, path resolution,
 and `openat`.
@@ -36,13 +38,13 @@ Already implemented (no new work needed):
 
 ## Track Layout
 
-| Track | Scope | Dependencies |
-|---|---|---|
-| A | Per-process cwd + path resolution | — |
-| B | Directory file descriptors + getdents64 (tmpfs) | — |
-| C | Ramdisk directory tree | — |
-| D | openat + cross-fs root listing + ramdisk getdents64 | A, B, C |
-| E | Shell integration + validation | A, B, C, D |
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Per-process cwd + path resolution | — | Done |
+| B | Directory file descriptors + getdents64 (tmpfs) | — | Done |
+| C | Ramdisk directory tree | — | Done |
+| D | openat + cross-fs root listing + ramdisk getdents64 | A, B, C | Done |
+| E | Shell integration + validation | A, B, C, D | Done |
 
 ---
 
