@@ -63,14 +63,15 @@ The frame allocator works in *physical* space. The page mapper works across the 
 
 `sys_fork` uses CoW instead of eagerly copying all user pages:
 
-1. `cow_clone_user_pages`: walks parent's PTEs, clears WRITABLE on writable pages in both
-   parent and child, increments refcount for each shared frame, maps same physical frame
-   in child's page table
+1. `cow_clone_user_pages`: walks parent's PTEs; for writable pages, clears WRITABLE and
+   sets BIT_9 (CoW marker) in both parent and child; increments refcount for each shared
+   frame; maps same physical frame in child's page table. Read-only pages (.text/.rodata)
+   are shared without BIT_9 so writes to them remain genuine protection violations.
 2. Flushes parent TLB via CR3 reload
 3. On write to a CoW page, a page fault fires:
-   - Detection: ring-3 write fault, page present but not writable, refcount > 0
-   - Resolution (in ISR): allocate fresh frame, copy 4 KiB, remap writable, decrement
-     old frame's refcount
+   - Detection: ring-3 write fault, page present but not writable, PTE BIT_9 set
+   - Resolution (in ISR): allocate fresh frame, copy 4 KiB, remap writable, clear BIT_9,
+     decrement old frame's refcount. On OOM, falls through to kill the process.
    - Fast path: if refcount == 1 (sole owner), just remap writable without copying
 
 ### Future allocator evolution

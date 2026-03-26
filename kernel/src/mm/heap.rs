@@ -67,11 +67,12 @@ pub fn init_heap(
     );
 }
 
-/// Grow the kernel heap by `additional_bytes`, mapping new pages and extending
-/// the allocator.
+/// Grow the kernel heap by up to `additional_bytes`, mapping new pages and
+/// extending the allocator.
 ///
-/// Returns `Ok(())` on success, `Err(())` if growth would exceed
-/// `HEAP_MAX_SIZE` or frame allocation fails.
+/// Growth may be partial if frame allocation fails mid-way. Returns `Ok(())`
+/// if at least one new page was mapped; returns `Err(())` if growth would
+/// exceed `HEAP_MAX_SIZE` or no pages could be mapped at all.
 pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     use super::paging::{get_mapper, GlobalFrameAlloc};
 

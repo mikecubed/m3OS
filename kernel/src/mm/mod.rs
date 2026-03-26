@@ -233,79 +233,87 @@ pub fn new_process_page_table() -> Option<PhysFrame<Size4KiB>> {
 /// that is no longer loaded in CR3. No other code may access the page table
 /// after this call.
 pub fn free_process_page_table(cr3_phys: u64) {
+    use alloc::vec::Vec;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
     let phys_off = VirtAddr::new(phys_offset());
     let kernel_pml4_phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
 
+    // Helper: read present, non-huge child table addresses from a page table,
+    // scoping the &PageTable reference so it drops before any free_frame calls.
+    unsafe fn collect_children(
+        phys_off: VirtAddr,
+        table_phys: u64,
+        count: usize,
+        filter: fn(PageTableFlags) -> bool,
+    ) -> Vec<u64> {
+        let mut addrs = Vec::new();
+        let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
+        for i in 0..count {
+            let entry = &pt[i];
+            let flags = entry.flags();
+            if !flags.contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            if !filter(flags) {
+                continue;
+            }
+            addrs.push(entry.addr().as_u64());
+        }
+        addrs
+    }
+
+    fn not_huge(flags: PageTableFlags) -> bool {
+        !flags.contains(PageTableFlags::HUGE_PAGE)
+    }
+    fn user_leaf(flags: PageTableFlags) -> bool {
+        flags.contains(PageTableFlags::USER_ACCESSIBLE)
+    }
+
     // SAFETY: cr3_phys is a valid PML4 frame being freed. The caller guarantees
     // it is no longer active (not in CR3) and has exclusive ownership.
+    // All &PageTable references are scoped within collect_children so they
+    // drop before free_frame writes allocator metadata into the frame.
     unsafe {
         let pml4: &PageTable = &*(phys_off + cr3_phys).as_ptr::<PageTable>();
         let kernel_pml4: &PageTable = &*(phys_off + kernel_pml4_phys).as_ptr::<PageTable>();
 
+        // Collect PDPT addresses for non-kernel PML4 entries.
+        let mut pdpt_addrs = Vec::new();
         for p4 in 0usize..256 {
             let p4e = &pml4[p4];
             if !p4e.flags().contains(PageTableFlags::PRESENT) {
                 continue;
             }
-
-            // Skip entries that point to the same PDPT frame as the kernel —
-            // these are shallow copies made by new_process_page_table and the
-            // frames are shared with the kernel.
             if kernel_pml4[p4].flags().contains(PageTableFlags::PRESENT)
                 && p4e.addr() == kernel_pml4[p4].addr()
             {
                 continue;
             }
-
-            let pdpt: &PageTable = &*(phys_off + p4e.addr().as_u64()).as_ptr::<PageTable>();
-            for p3 in 0usize..512 {
-                let p3e = &pdpt[p3];
-                if !p3e.flags().contains(PageTableFlags::PRESENT) {
-                    continue;
-                }
-                if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    continue;
-                }
-
-                // Walk PD frames for this process. PD frames under PML4[0]
-                // are process-private (deep-copied by new_process_page_table),
-                // but some PT entries may point at shared kernel PTs — those
-                // are detected below via the has_user_pages check.
-                let pd: &PageTable = &*(phys_off + p3e.addr().as_u64()).as_ptr::<PageTable>();
-                for p2 in 0usize..512 {
-                    let p2e = &pd[p2];
-                    if !p2e.flags().contains(PageTableFlags::PRESENT) {
-                        continue;
-                    }
-                    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
-                        continue;
-                    }
-
-                    let pt: &PageTable = &*(phys_off + p2e.addr().as_u64()).as_ptr::<PageTable>();
-                    let mut has_user_pages = false;
-                    for p1 in 0usize..512 {
-                        let pte = &pt[p1];
-                        if !pte.flags().contains(PageTableFlags::PRESENT) {
-                            continue;
-                        }
-                        if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-                            continue;
-                        }
-                        has_user_pages = true;
-                        frame_allocator::free_frame(pte.addr().as_u64());
-                    }
-                    // Only free the PT frame if it contained user pages —
-                    // otherwise it's a kernel-shared PT.
-                    if has_user_pages {
-                        frame_allocator::free_frame(p2e.addr().as_u64());
-                    }
-                }
-                frame_allocator::free_frame(p3e.addr().as_u64()); // free PD frame
-            }
-            frame_allocator::free_frame(p4e.addr().as_u64()); // free PDPT frame
+            pdpt_addrs.push(p4e.addr().as_u64());
         }
-        frame_allocator::free_frame(cr3_phys); // free PML4 frame
+        // PML4/kernel_pml4 references are fine — those frames aren't freed yet.
+
+        for pdpt_phys in &pdpt_addrs {
+            let pd_addrs = collect_children(phys_off, *pdpt_phys, 512, not_huge);
+
+            for pd_phys in &pd_addrs {
+                let pt_addrs = collect_children(phys_off, *pd_phys, 512, not_huge);
+
+                for pt_phys in &pt_addrs {
+                    let leaf_addrs = collect_children(phys_off, *pt_phys, 512, user_leaf);
+                    let has_user = !leaf_addrs.is_empty();
+                    for leaf in &leaf_addrs {
+                        frame_allocator::free_frame(*leaf);
+                    }
+                    if has_user {
+                        frame_allocator::free_frame(*pt_phys);
+                    }
+                }
+                frame_allocator::free_frame(*pd_phys);
+            }
+            frame_allocator::free_frame(*pdpt_phys);
+        }
+        frame_allocator::free_frame(cr3_phys);
     }
 }
 

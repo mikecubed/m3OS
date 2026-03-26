@@ -82,9 +82,9 @@ pub fn log_frame_stats() {
         }
     }
 
-    let total_mib = (total_frames * PAGE_SIZE) / (1024 * 1024);
     let free = super::frame_allocator::free_count();
     let total = super::frame_allocator::total_frames();
+    let total_mib = (total as u64 * PAGE_SIZE) / (1024 * 1024);
 
     log::info!(
         "[mm/debug] frame stats: {}/{} frames free ({} MiB total usable)",
