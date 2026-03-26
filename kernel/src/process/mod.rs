@@ -192,7 +192,14 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
 /// Signal numbers (Linux x86_64).
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGSEGV: u32 = 11;
+pub const SIGUSR2: u32 = 12;
+pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
@@ -214,7 +221,8 @@ pub fn default_signal_action(sig: u32) -> SignalDisposition {
         SIGCHLD => SignalDisposition::Ignore,
         SIGCONT => SignalDisposition::Continue,
         SIGSTOP | SIGTSTP => SignalDisposition::Stop,
-        SIGKILL | SIGINT | SIGTERM | SIGHUP => SignalDisposition::Terminate,
+        SIGKILL | SIGINT | SIGTERM | SIGHUP | SIGBUS | SIGFPE | SIGSEGV | SIGPIPE | SIGALRM
+        | SIGUSR1 | SIGUSR2 => SignalDisposition::Terminate,
         _ => SignalDisposition::Terminate,
     }
 }
@@ -296,6 +304,9 @@ pub struct Process {
     pub fd_table: [Option<FdEntry>; MAX_FDS],
     /// Bitfield of pending signals (bit N = signal N is pending).
     pub pending_signals: u64,
+    /// Bitfield of blocked signals (bit N = signal N is blocked from delivery).
+    /// SIGKILL (9) and SIGSTOP (19) can never be blocked.
+    pub blocked_signals: u64,
     /// Per-signal action table (Default or Ignore).
     pub signal_actions: [SignalAction; 32],
     /// Current working directory (Phase 18). Defaults to "/".
@@ -326,6 +337,7 @@ impl Process {
             pgid: pid,
             fd_table: new_fd_table(),
             pending_signals: 0,
+            blocked_signals: 0,
             signal_actions: [SignalAction::Default; 32],
             cwd: String::from("/"),
         }
@@ -439,6 +451,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
         cwd: String::from("/"),
     };
@@ -478,6 +491,7 @@ pub fn spawn_process_with_cr3(
         pgid: pid,
         fd_table: new_fd_table(),
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
         cwd: String::from("/"),
     };
@@ -521,6 +535,7 @@ pub fn spawn_process_with_cr3_and_fds(
         pgid,
         fd_table,
         pending_signals: 0,
+        blocked_signals: 0,
         signal_actions: [SignalAction::Default; 32],
         cwd: String::from("/"),
     };
@@ -596,8 +611,12 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
         return None;
     }
 
-    // Find the lowest-numbered pending signal.
-    let sig = proc.pending_signals.trailing_zeros();
+    // Find the lowest-numbered pending signal that is not blocked.
+    let deliverable = proc.pending_signals & !proc.blocked_signals;
+    if deliverable == 0 {
+        return None;
+    }
+    let sig = deliverable.trailing_zeros();
     if sig >= 64 {
         return None;
     }

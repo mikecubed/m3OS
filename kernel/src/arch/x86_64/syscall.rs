@@ -289,7 +289,7 @@ pub extern "C" fn syscall_handler(
         12 => sys_linux_brk(arg0),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
         13 => sys_rt_sigaction(arg0, arg1, arg2),
-        14 => sys_rt_sigprocmask(),
+        14 => sys_rt_sigprocmask(arg0, arg1, arg2),
         // Linux misc (Phase 12, T023–T026)
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
@@ -595,10 +595,62 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     0
 }
 
-/// `rt_sigprocmask(how, set, oldset, sigsetsize)` — stub (syscall 14).
+/// Signal mask operation constants (Linux).
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+
+/// Bits that must never be set in blocked_signals (SIGKILL=9, SIGSTOP=19).
+const UNBLOCKABLE_MASK: u64 = (1u64 << crate::process::SIGKILL) | (1u64 << crate::process::SIGSTOP);
+
+/// `rt_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize)` — syscall 14.
 ///
-/// Signal masking is not implemented; always returns success.
-fn sys_rt_sigprocmask() -> u64 {
+/// Reads/modifies the calling process's blocked-signal mask.
+fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EINVAL,
+    };
+
+    // Write old mask to userspace if requested.
+    if oldset_ptr != 0 {
+        let old_bytes = proc.blocked_signals.to_ne_bytes();
+        if crate::mm::user_mem::copy_to_user(oldset_ptr, &old_bytes).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Apply new mask if set_ptr is non-null.
+    if set_ptr != 0 {
+        let mut set_bytes = [0u8; 8];
+        if crate::mm::user_mem::copy_from_user(&mut set_bytes, set_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let set = u64::from_ne_bytes(set_bytes);
+
+        match how {
+            SIG_BLOCK => proc.blocked_signals |= set,
+            SIG_UNBLOCK => proc.blocked_signals &= !set,
+            SIG_SETMASK => proc.blocked_signals = set,
+            _ => return NEG_EINVAL,
+        }
+
+        // SIGKILL and SIGSTOP can never be blocked.
+        proc.blocked_signals &= !UNBLOCKABLE_MASK;
+    }
+
+    // Drop the lock before checking pending signals so we don't deadlock.
+    let needs_check = set_ptr != 0 && how == SIG_UNBLOCK;
+    drop(table);
+
+    // After SIG_UNBLOCK, deliver any newly-unblocked pending signals immediately.
+    if needs_check {
+        check_pending_signals();
+    }
+
     0
 }
 
@@ -821,7 +873,15 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
     // and file descriptors are consistent with the copied address space.
-    let (parent_brk, parent_mmap, parent_fds, parent_pgid, parent_cwd) = {
+    let (
+        parent_brk,
+        parent_mmap,
+        parent_fds,
+        parent_pgid,
+        parent_cwd,
+        parent_blocked_signals,
+        parent_signal_actions,
+    ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
             Some(p) => (
@@ -830,6 +890,8 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.fd_table.clone(),
                 p.pgid,
                 p.cwd.clone(),
+                p.blocked_signals,
+                p.signal_actions,
             ),
             None => (
                 0,
@@ -840,6 +902,8 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 },
                 0,
                 alloc::string::String::from("/"),
+                0,
+                [crate::process::SignalAction::Default; 32],
             ),
         }
     };
@@ -860,11 +924,13 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_pgid,
     );
 
-    // Inherit parent's cwd in the child (Phase 18).
+    // Inherit parent's cwd, signal mask, and signal actions in the child.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(child) = table.find_mut(child_pid) {
             child.cwd = parent_cwd;
+            child.blocked_signals = parent_blocked_signals;
+            child.signal_actions = parent_signal_actions;
         }
     }
 
@@ -1247,9 +1313,13 @@ fn has_pending_signal() -> bool {
     if proc.pending_signals == 0 {
         return false;
     }
-    // Check if any pending signal has a non-Ignore disposition.
+    // Check if any pending, unblocked signal has a non-Ignore disposition.
+    let deliverable = proc.pending_signals & !proc.blocked_signals;
+    if deliverable == 0 {
+        return false;
+    }
     for sig in 0..64u32 {
-        if proc.pending_signals & (1u64 << sig) != 0 {
+        if deliverable & (1u64 << sig) != 0 {
             let action = if sig < 32 {
                 proc.signal_actions[sig as usize]
             } else {
