@@ -1,0 +1,60 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy, rust-src
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Lint (clippy + fmt)
+        run: cargo xtask check
+
+      - name: Build disk images
+        run: cargo xtask image
+
+      - name: Boot smoke test
+        run: |
+          timeout 30 cargo xtask run 2>&1 | tee boot.log || true
+          grep -q '\[shell\] ready' boot.log
+          ! grep -q 'panicked at' boot.log
+
+      - name: Userspace test binaries
+        run: |
+          # Verify all embedded test binaries ran and passed
+          grep -q 'exit0.elf.*exited with code 0' boot.log
+          grep -q 'fork-test: PASS' boot.log
+          grep -q 'tmpfs-test.*results:.*passed, 0' boot.log
+          grep -q 'signal-test.*results:.*passed, 0' boot.log
+
+      - name: Upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: boot.log
+          retention-days: 7
