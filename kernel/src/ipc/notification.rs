@@ -52,13 +52,7 @@ use spin::Mutex;
 
 use crate::task::{scheduler, TaskId};
 
-// ---------------------------------------------------------------------------
-// NotifId
-// ---------------------------------------------------------------------------
-
-/// Index into the global notification registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotifId(pub u8);
+pub use kernel_core::types::NotifId;
 
 // ---------------------------------------------------------------------------
 // Lock-free state (safe for ISR access)

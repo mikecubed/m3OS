@@ -393,8 +393,7 @@ impl Virtqueue {
 // Global driver state
 // ===========================================================================
 
-/// MAC address type.
-pub type MacAddr = [u8; 6];
+pub use kernel_core::types::MacAddr;
 
 #[allow(dead_code)]
 struct VirtioNetDriver {

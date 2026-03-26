@@ -47,6 +47,8 @@ use alloc::boxed::Box;
 
 use crate::ipc::{CapabilityTable, Message};
 
+pub use kernel_core::types::TaskId;
+
 pub mod scheduler;
 
 #[allow(unused_imports)]
@@ -67,14 +69,7 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 4; // 16 KiB
 // Task ID
 // ---------------------------------------------------------------------------
 
-/// Unique identifier for a kernel task.
-///
-/// Not yet consumed outside this module; the allow silences the dead-code
-/// lint for the inner field so the identifier is available for future use
-/// (e.g. IPC, logging, wait-queues).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaskId(pub u64);
+// TaskId is re-exported from kernel_core::types above.
 
 // ---------------------------------------------------------------------------
 // Task state

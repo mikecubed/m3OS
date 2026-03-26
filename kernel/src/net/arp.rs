@@ -6,12 +6,7 @@ use spin::Mutex;
 use super::ethernet::{self, MAC_BROADCAST};
 use super::virtio_net::{self, MacAddr};
 
-// ===========================================================================
-// Types
-// ===========================================================================
-
-/// IPv4 address as 4 bytes.
-pub type Ipv4Addr = [u8; 4];
+pub use kernel_core::types::Ipv4Addr;
 
 // ===========================================================================
 // ARP packet structure (P16-T017)
