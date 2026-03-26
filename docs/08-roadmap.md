@@ -40,16 +40,26 @@ flowchart TD
     P3 --> P15["15. Hardware Discovery"]
     P12 --> P16["16. Network"]
     P15 --> P16
-    P15 --> P17["17. SMP"]
-    P4 --> P17
-    P12 --> P18["18. Compiler Bootstrap"]
+    P14 --> P17["17. Memory Reclamation"]
+    P11 --> P17
+    P17 --> P18["18. Directory and VFS"]
     P13 --> P18
-    P14 --> P18
+    P18 --> P19["19. Signal Handlers"]
+    P19 --> P20["20. Userspace Init and Shell"]
+    P20 --> P21["21. TTY and Terminal Control"]
+    P16 --> P22["22. Socket API"]
+    P21 --> P22
+    P18 --> P23["23. Persistent Storage"]
+    P15 --> P23
+    P17 --> P24["24. SMP"]
+    P4 --> P24
+    P20 --> P25["25. Compiler Bootstrap"]
+    P23 --> P25
 ```
 
 ## Detailed Phase Pages
 
-### Original Phases (complete)
+### Foundation Phases (complete)
 
 | Phase | Focus | Link |
 |---|---|---|
@@ -64,18 +74,35 @@ flowchart TD
 | 9 | Screen output and shell | [Framebuffer and Shell](./roadmap/09-framebuffer-and-shell.md) |
 | 10 *(optional)* | Secure Boot signing for real hardware | [Secure Boot](./roadmap/10-secure-boot.md) |
 
-### Extended Phases
+### POSIX and Userspace Phases (complete)
 
 | Phase | Focus | Link |
 |---|---|---|
 | 11 | ELF loader; fork, exec, wait | [Process Model](./roadmap/11-process-model.md) |
 | 12 | Linux syscall ABI; musl libc; C programs run unmodified | [POSIX Compat](./roadmap/12-posix-compat.md) |
-| 13 | tmpfs and FAT32 write path | [Writable FS](./roadmap/13-writable-fs.md) |
+| 13 | tmpfs writable filesystem | [Writable FS](./roadmap/13-writable-fs.md) |
 | 14 | Pipes, redirection, job control, core utilities | [Shell and Tools](./roadmap/14-shell-and-tools.md) |
 | 15 | ACPI parsing, PCI enumeration, APIC replaces PIC | [Hardware Discovery](./roadmap/15-hardware-discovery.md) |
 | 16 | virtio-net driver, Ethernet/ARP/IP/UDP/TCP | [Network](./roadmap/16-network.md) |
-| 17 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/17-smp.md) |
-| 18 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/18-compiler-bootstrap.md) |
+
+### Usability Phases (planned)
+
+| Phase | Focus | Link |
+|---|---|---|
+| 17 | Frame reclaim, heap growth, CoW fork, kernel stack cleanup | [Memory Reclamation](./roadmap/17-memory-reclamation.md) |
+| 18 | `getdents64`, directory fds, real cwd, ramdisk layout | [Directory and VFS](./roadmap/18-directory-vfs.md) |
+| 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
+| 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
+| 21 | termios, cooked/raw mode, PTY pairs, window size | [TTY and Terminal Control](./roadmap/21-tty-pty.md) |
+| 22 | Socket syscalls, expose TCP/UDP stack to userspace | [Socket API](./roadmap/22-socket-api.md) |
+| 23 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/23-persistent-storage.md) |
+
+### Advanced Phases (deferred)
+
+| Phase | Focus | Link |
+|---|---|---|
+| 24 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/24-smp.md) |
+| 25 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/25-compiler-bootstrap.md) |
 
 ## Documentation Expectation Per Phase
 
@@ -94,3 +121,4 @@ Each phase should produce documentation that explains:
 - [IPC](./06-ipc.md)
 - [Userspace & Syscalls](./07-userspace.md)
 - [Testing](./09-testing.md)
+- [OS State Analysis](./17-os-state-analysis.md)
