@@ -115,11 +115,10 @@ fn resolve_cow_fault(vaddr: u64) {
         let old_refcount = crate::mm::frame_allocator::refcount_get(old_phys);
 
         if old_refcount <= 1 {
-            // P17-T033: fast path — sole owner, just remap as writable.
-            let mut flags = pte.flags();
-            flags |= PageTableFlags::WRITABLE;
+            // P17-T033: fast path — sole owner, just remap as writable
+            // and clear the CoW marker bit.
+            let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
             pte.set_addr(pte.addr(), flags);
-            // Flush TLB for this address.
             x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
             return;
         }
@@ -133,9 +132,8 @@ fn resolve_cow_fault(vaddr: u64) {
         let dst = (phys_off + new_phys) as *mut u8;
         core::ptr::copy_nonoverlapping(src, dst, 4096);
 
-        // Map the new frame at the faulting address with WRITABLE restored.
-        let mut flags = pte.flags();
-        flags |= PageTableFlags::WRITABLE;
+        // Map the new frame writable, clear the CoW marker.
+        let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
         pte.set_addr(new_frame.start_address(), flags);
 
         // Flush TLB for this address.
@@ -146,12 +144,10 @@ fn resolve_cow_fault(vaddr: u64) {
     }
 }
 
-/// Read the physical address of the page mapped at `vaddr` from the current
-/// page table.  Returns `None` if any level is not present.
+/// Check whether the PTE for `vaddr` has the CoW marker bit (BIT_9) set.
 ///
-/// Called from the page fault ISR (interrupts disabled, single CPU) so no
-/// locking is needed beyond what the atomic reads in the frame allocator provide.
-fn get_page_phys(vaddr: u64) -> Option<u64> {
+/// Called from the page fault ISR (interrupts disabled, single CPU).
+fn has_cow_marker(vaddr: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -170,24 +166,21 @@ fn get_page_phys(vaddr: u64) -> Option<u64> {
         let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
         let p4e = &pml4[p4_idx];
         if !p4e.flags().contains(PageTableFlags::PRESENT) {
-            return None;
+            return false;
         }
         let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
         let p3e = &pdpt[p3_idx];
         if !p3e.flags().contains(PageTableFlags::PRESENT) {
-            return None;
+            return false;
         }
         let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
         let p2e = &pd[p2_idx];
         if !p2e.flags().contains(PageTableFlags::PRESENT) {
-            return None;
+            return false;
         }
         let pt: &PageTable = &*(phys_offset + p2e.addr().as_u64()).as_ptr::<PageTable>();
         let pte = &pt[p1_idx];
-        if !pte.flags().contains(PageTableFlags::PRESENT) {
-            return None;
-        }
-        Some(pte.addr().as_u64())
+        pte.flags().contains(PageTableFlags::BIT_9)
     }
 }
 
@@ -243,23 +236,14 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // Check if the fault came from ring 3 (user mode).
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        // P17-T031: detect CoW faults — a write to a present, non-writable page
-        // with a reference count > 0 is a copy-on-write fault.
+        // P17-T031: detect CoW faults — a write to a present, non-writable
+        // page marked with BIT_9 (the CoW marker set by cow_clone_user_pages).
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
         if is_write && is_present {
-            // CoW detection: a shared page (refcount > 1) that was made
-            // read-only by cow_clone_user_pages.  Refcount == 1 means the
-            // page is exclusively owned — a write to it is a genuine
-            // protection violation (e.g., write to .text), not CoW.
-            let fault_addr_u64 = match addr {
-                Ok(a) => a.as_u64(),
-                Err(_) => 0,
-            };
-            let page_phys = get_page_phys(fault_addr_u64);
-            if let Some(phys) = page_phys {
-                let refcount = crate::mm::frame_allocator::refcount_get(phys);
-                if refcount > 1 {
+            if let Ok(fault_vaddr) = addr {
+                let fault_addr_u64 = fault_vaddr.as_u64();
+                if has_cow_marker(fault_addr_u64) {
                     // CoW fault — resolve directly in the ISR. Safe because
                     // the fault is from ring 3 (no kernel locks held) and
                     // we're on a single CPU.

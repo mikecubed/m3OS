@@ -120,6 +120,8 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
             Ok(flush) => flush.flush(),
             Err(e) => {
                 log::error!("[mm] heap growth failed: map_to error: {:?}", e);
+                // Return the just-allocated frame to avoid leaking it.
+                super::frame_allocator::free_frame(frame.start_address().as_u64());
                 break;
             }
         }

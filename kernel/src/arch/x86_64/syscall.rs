@@ -1272,10 +1272,13 @@ unsafe fn cow_clone_user_pages(
                     let src_phys = pte.addr();
                     let mut flags = pte.flags();
 
-                    // For writable pages, clear WRITABLE in both parent and child
-                    // so writes trigger CoW page faults.
+                    // For writable pages, clear WRITABLE and set BIT_9 (CoW
+                    // marker) in both parent and child so the page fault
+                    // handler can distinguish CoW pages from genuinely
+                    // read-only shared pages (e.g. .text/.rodata).
                     if flags.contains(PageTableFlags::WRITABLE) {
-                        let new_parent_flags = flags & !PageTableFlags::WRITABLE;
+                        let new_parent_flags =
+                            (flags & !PageTableFlags::WRITABLE) | PageTableFlags::BIT_9;
                         pte.set_addr(src_phys, new_parent_flags);
                         flags = new_parent_flags;
                     }
