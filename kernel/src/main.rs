@@ -909,11 +909,24 @@ fn shell_execute(
                 return;
             }
             "cd" => {
-                // The shell is a kernel task, so there's no user-space chdir to call.
-                // chdir syscall (80) is a no-op in our OS (single global cwd).
-                // Update $PWD so child processes see the new directory.
-                if !args_str.is_empty() {
-                    set_env(env, "PWD", args_str);
+                if args_str.is_empty() {
+                    // cd with no args: go to /
+                    set_env(env, "PWD", "/");
+                    return;
+                }
+                // Resolve the target relative to current $PWD.
+                let current_pwd = env
+                    .iter()
+                    .find(|(k, _)| k == "PWD")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("/");
+                let resolved = shell_resolve_path(current_pwd, args_str);
+                // Validate the target is an existing directory.
+                if shell_is_directory(&resolved) {
+                    set_env(env, "PWD", &resolved);
+                } else {
+                    let msg = alloc::format!("cd: {}: No such directory\n", args_str);
+                    shell_print(my_id, console_ep, &msg);
                 }
                 return;
             }
@@ -1035,27 +1048,41 @@ fn shell_fork_exec(
         }
     };
 
-    // Build the child process, with optional I/O redirection via pipes.
+    // Build the child process with pipes for I/O.
+    // Always create a stdout pipe so the shell can relay child output
+    // to the framebuffer console. For file redirects, the pipe is
+    // drained to the file instead.
     let stdin_pipe_id = stdin_file.map(|_| pipe::create_pipe());
-    let stdout_pipe_id = stdout_file.map(|_| pipe::create_pipe());
+    let stdout_pipe_id = Some(pipe::create_pipe());
 
-    let child_pid =
-        match spawn_user_process_with_pipe(&elf_name, &parts, env, stdin_pipe_id, stdout_pipe_id) {
-            Some(pid) => pid,
-            None => {
-                // Clean up any pipes created for redirection.
-                if let Some(id) = stdin_pipe_id {
-                    pipe::pipe_close_reader(id);
-                    pipe::pipe_close_writer(id);
-                }
-                if let Some(id) = stdout_pipe_id {
-                    pipe::pipe_close_reader(id);
-                    pipe::pipe_close_writer(id);
-                }
-                shell_print(my_id, console_ep, "fork: failed\n");
-                return;
+    let shell_cwd = env
+        .iter()
+        .find(|(k, _)| k == "PWD")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("/");
+    let child_pid = match spawn_user_process_with_pipe(
+        &elf_name,
+        &parts,
+        env,
+        stdin_pipe_id,
+        stdout_pipe_id,
+        shell_cwd,
+    ) {
+        Some(pid) => pid,
+        None => {
+            // Clean up any pipes created for redirection.
+            if let Some(id) = stdin_pipe_id {
+                pipe::pipe_close_reader(id);
+                pipe::pipe_close_writer(id);
             }
-        };
+            if let Some(id) = stdout_pipe_id {
+                pipe::pipe_close_reader(id);
+                pipe::pipe_close_writer(id);
+            }
+            shell_print(my_id, console_ep, "fork: failed\n");
+            return;
+        }
+    };
 
     // Feed stdin from file if redirected.
     if let (Some(file), Some(pipe_id)) = (stdin_file, stdin_pipe_id) {
@@ -1078,44 +1105,61 @@ fn shell_fork_exec(
         pipe::pipe_close_reader(pipe_id);
     }
 
-    // Capture stdout to file if redirected.
-    if let (Some(file), Some(pipe_id)) = (stdout_file, stdout_pipe_id) {
+    // Drain child stdout pipe.
+    if let Some(pipe_id) = stdout_pipe_id {
         pipe::pipe_close_writer(pipe_id);
-        // Validate and extract tmpfs-relative path.
-        let tmpfs_rel = match validate_tmpfs_path(file) {
-            Some(r) => r,
-            None => {
-                let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
-                shell_print(my_id, console_ep, &msg);
-                pipe::pipe_close_reader(pipe_id);
-                return;
-            }
-        };
-        {
-            let mut tmpfs = fs::tmpfs::TMPFS.lock();
-            let _ = tmpfs.open_or_create(&tmpfs_rel, true);
-            if !stdout_append {
-                let _ = tmpfs.truncate(&tmpfs_rel, 0);
-            }
-        }
-        let mut file_offset = if stdout_append {
-            let tmpfs = fs::tmpfs::TMPFS.lock();
-            tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
-        } else {
-            0
-        };
-        // Drain pipe into file in a background-ish loop.
-        loop {
-            let mut buf = [0u8; 4096];
-            match pipe::pipe_read(pipe_id, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut tmpfs = fs::tmpfs::TMPFS.lock();
-                    let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
-                    file_offset += n;
+
+        if let Some(file) = stdout_file {
+            // Redirect to file.
+            let tmpfs_rel = match validate_tmpfs_path(file) {
+                Some(r) => r,
+                None => {
+                    let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
+                    shell_print(my_id, console_ep, &msg);
+                    pipe::pipe_close_reader(pipe_id);
+                    return;
                 }
-                Err(_) => {
-                    task::yield_now();
+            };
+            {
+                let mut tmpfs = fs::tmpfs::TMPFS.lock();
+                let _ = tmpfs.open_or_create(&tmpfs_rel, true);
+                if !stdout_append {
+                    let _ = tmpfs.truncate(&tmpfs_rel, 0);
+                }
+            }
+            let mut file_offset = if stdout_append {
+                let tmpfs = fs::tmpfs::TMPFS.lock();
+                tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
+            } else {
+                0
+            };
+            loop {
+                let mut buf = [0u8; 4096];
+                match pipe::pipe_read(pipe_id, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut tmpfs = fs::tmpfs::TMPFS.lock();
+                        let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
+                        file_offset += n;
+                    }
+                    Err(_) => {
+                        task::yield_now();
+                    }
+                }
+            }
+        } else {
+            // No file redirect — relay child stdout to framebuffer console.
+            loop {
+                let mut buf = [0u8; 4096];
+                match pipe::pipe_read(pipe_id, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
+                        shell_print(my_id, console_ep, &s);
+                    }
+                    Err(_) => {
+                        task::yield_now();
+                    }
                 }
             }
         }
@@ -1182,23 +1226,42 @@ fn shell_pipeline(
 
     // Create a pipe.
     let pipe_id = pipe::create_pipe();
+    let shell_cwd = env
+        .iter()
+        .find(|(k, _)| k == "PWD")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("/");
 
     // Spawn first child (stdout → pipe write end).
-    let pid0 = match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id)) {
-        Some(pid) => pid,
-        None => {
-            pipe::pipe_close_reader(pipe_id);
-            pipe::pipe_close_writer(pipe_id);
-            return;
-        }
-    };
+    let pid0 =
+        match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id), shell_cwd) {
+            Some(pid) => pid,
+            None => {
+                pipe::pipe_close_reader(pipe_id);
+                pipe::pipe_close_writer(pipe_id);
+                return;
+            }
+        };
 
-    // Spawn second child (stdin ← pipe read end).
-    let pid1 = match spawn_user_process_with_pipe(&elf1, &parts1, env, Some(pipe_id), None) {
+    // Create a stdout relay pipe for the second child so its output
+    // goes to the framebuffer console instead of serial.
+    let relay_pipe = pipe::create_pipe();
+
+    // Spawn second child (stdin ← inter-process pipe, stdout → relay pipe).
+    let pid1 = match spawn_user_process_with_pipe(
+        &elf1,
+        &parts1,
+        env,
+        Some(pipe_id),
+        Some(relay_pipe),
+        shell_cwd,
+    ) {
         Some(pid) => pid,
         None => {
             pipe::pipe_close_reader(pipe_id);
             pipe::pipe_close_writer(pipe_id);
+            pipe::pipe_close_reader(relay_pipe);
+            pipe::pipe_close_writer(relay_pipe);
             return;
         }
     };
@@ -1206,6 +1269,7 @@ fn shell_pipeline(
     // Close our copies of the pipe ends so EOF propagates.
     pipe::pipe_close_writer(pipe_id);
     pipe::pipe_close_reader(pipe_id);
+    pipe::pipe_close_writer(relay_pipe);
 
     // Put both children in the same process group so Ctrl-C/Ctrl-Z
     // signals both stages of the pipeline.
@@ -1216,6 +1280,22 @@ fn shell_pipeline(
         }
     }
     process::FG_PGID.store(pid0, core::sync::atomic::Ordering::Relaxed);
+
+    // Drain the relay pipe to the framebuffer console.
+    loop {
+        let mut buf = [0u8; 4096];
+        match pipe::pipe_read(relay_pipe, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
+                shell_print(my_id, console_ep, &s);
+            }
+            Err(_) => {
+                task::yield_now();
+            }
+        }
+    }
+    pipe::pipe_close_reader(relay_pipe);
 
     // Wait for both children.
     wait_for_child(pid0);
@@ -1234,6 +1314,7 @@ fn spawn_user_process_with_pipe(
     env: &[(String, String)],
     stdin_pipe: Option<usize>,
     stdout_pipe: Option<usize>,
+    cwd: &str,
 ) -> Option<crate::process::Pid> {
     use crate::mm::elf::load_elf_into;
 
@@ -1306,6 +1387,14 @@ fn spawn_user_process_with_pipe(
         0, // pgid=0 → use own pid
     );
 
+    // Set the child's working directory from the shell's cwd.
+    {
+        let mut table = process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.cwd = String::from(cwd);
+        }
+    }
+
     process::push_fork_ctx(pid, loaded.entry, user_rsp);
     task::spawn(process::fork_child_trampoline, "shell-child");
 
@@ -1363,7 +1452,65 @@ fn expand_vars(s: &str, env: &[(String, String)]) -> String {
     result
 }
 
-/// Set or update an environment variable.
+/// Resolve a path relative to a working directory (shell-level).
+/// Same algorithm as the kernel's resolve_path.
+fn shell_resolve_path(cwd: &str, path: &str) -> String {
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if path.is_empty() || path == "." {
+        String::from(cwd)
+    } else {
+        alloc::format!("{}/{}", cwd.trim_end_matches('/'), path)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for component in combined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for part in &parts {
+            result.push('/');
+            result.push_str(part);
+        }
+        result
+    }
+}
+
+/// Check if a resolved absolute path is an existing directory (shell-level).
+fn shell_is_directory(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    // Check tmpfs.
+    let trimmed = path.trim_start_matches('/');
+    if trimmed == "tmp" || trimmed.starts_with("tmp/") {
+        let rel = if trimmed == "tmp" {
+            ""
+        } else {
+            &trimmed[4..] // skip "tmp/"
+        };
+        if rel.is_empty() {
+            return true;
+        }
+        let tmpfs = fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
+    }
+    // Check ramdisk tree.
+    match fs::ramdisk::ramdisk_lookup(path) {
+        Some(node) => node.is_dir(),
+        None => false,
+    }
+}
+
+/// Set or update an environment variable in the shell's env list.
 fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
     for (k, v) in env.iter_mut() {
         if k == key {
@@ -1412,20 +1559,17 @@ fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
 
     let elf_name = alloc::format!("{}.elf", cmd);
 
-    // Try direct lookup first (flat ramdisk).
+    // Try direct lookup first (get_file has backward compat: bare name → /bin/).
     if fs::ramdisk::get_file(&elf_name).is_some() {
         return Some(elf_name);
     }
 
-    // Search PATH directories. Our ramdisk is flat, so path components
-    // are stripped — we just retry the base name.
+    // Search PATH directories against the ramdisk tree.
     if let Some((_, path_val)) = env.iter().find(|(k, _)| k == "PATH") {
-        for _dir in path_val.split(':') {
-            // Ramdisk is flat; all binaries are at root level.
-            // The PATH search is primarily for compatibility — the actual
-            // lookup just checks if {cmd}.elf exists.
-            if fs::ramdisk::get_file(&elf_name).is_some() {
-                return Some(elf_name);
+        for dir in path_val.split(':') {
+            let full = alloc::format!("{}/{}", dir.trim_end_matches('/'), elf_name);
+            if fs::ramdisk::get_file(&full).is_some() {
+                return Some(full);
             }
         }
     }

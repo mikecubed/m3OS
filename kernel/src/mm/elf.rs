@@ -497,6 +497,21 @@ pub unsafe fn setup_abi_stack_with_envp(
 
     // Now build the pointer table growing downward:
     // aux vector, envp NULL, argv NULLs + pointers, argc
+    //
+    // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
+    // Calculate the total size of the pointer table so we can align
+    // BEFORE writing it, keeping argc/argv/envp contiguous.
+    let auxv_slots = 5 * 2; // 5 entries × 2 (key + value)
+    let envp_slots = env_ptrs.len() + 1; // pointers + NULL
+    let argv_slots = arg_ptrs.len() + 1; // pointers + NULL
+    let argc_slot = 1;
+    let total_slots = auxv_slots + envp_slots + argv_slots + argc_slot;
+    let table_bytes = total_slots * 8;
+    // After subtracting table_bytes, cursor must be 8 mod 16.
+    let target = cursor - table_bytes as u64;
+    if target % 16 != 8 {
+        cursor -= 8; // alignment pad goes ABOVE the auxv
+    }
 
     // Auxiliary vector (key, value pairs, terminated by AT_NULL).
     const AT_PHDR: u64 = 3;
@@ -540,13 +555,6 @@ pub unsafe fn setup_abi_stack_with_envp(
         cursor -= 8;
         let kptr = virt_to_kptr(cursor)?;
         (kptr as *mut u64).write(ptr);
-    }
-
-    // SysV AMD64 ABI: RSP at `_start` must be 8 mod 16.
-    // After placing argc (–8 bytes), cursor must satisfy `cursor % 16 == 8`.
-    // So before the argc write, cursor must be `0 mod 16`.
-    if !cursor.is_multiple_of(16) {
-        cursor -= 8; // add one 8-byte alignment pad (already zeroed by map_user_stack)
     }
 
     // argc.

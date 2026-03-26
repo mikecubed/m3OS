@@ -1,6 +1,8 @@
 # Phase 17 — Memory Reclamation: Task List
 
 **Depends on:** Phase 11 (Process Model) ✅, Phase 14 (Shell and Tools) ✅
+**Branch:** `phase-17-memory-reclamation`
+**Status:** Complete (stress test deferred to Phase 18+)
 **Goal:** Replace the bump frame allocator with a free-list allocator, add frame
 reference counting, make the kernel heap growable, free kernel stacks on process
 exit, and switch `fork` from eager full-copy to copy-on-write.
@@ -38,14 +40,14 @@ Already implemented (no new work needed):
 
 ## Track Layout
 
-| Track | Scope | Dependencies |
-|---|---|---|
-| A | Free-list frame allocator | — |
-| B | Frame reference counting | A |
-| C | Process exit cleanup (page table + kernel stack) | A |
-| D | Growable kernel heap | A |
-| E | Copy-on-write fork | A, B |
-| F | Validation and documentation | C, D, E |
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Free-list frame allocator | — | Done |
+| B | Frame reference counting | A | Done |
+| C | Process exit cleanup (page table + kernel stack) | A | Done |
+| D | Growable kernel heap | A | Done |
+| E | Copy-on-write fork | A, B | Done |
+| F | Validation and documentation | C, D, E | Done |
 
 ---
 

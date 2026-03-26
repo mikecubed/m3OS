@@ -39,8 +39,69 @@ const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
 const NEG_EROFS: u64 = (-30_i64) as u64;
+const NEG_ENOTDIR: u64 = (-20_i64) as u64;
+const NEG_EISDIR: u64 = (-21_i64) as u64;
 const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
+
+/// linux_dirent64 type constants.
+#[allow(dead_code)]
+const DT_DIR: u8 = 4;
+#[allow(dead_code)]
+const DT_REG: u8 = 8;
+
+// ---------------------------------------------------------------------------
+// Path resolution helpers (Phase 18)
+// ---------------------------------------------------------------------------
+
+/// Resolve a path relative to the given working directory.
+/// Absolute paths (starting with '/') are used as-is.
+/// Relative paths are joined with cwd.
+/// Normalizes `.` and `..` components.
+fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    let combined = if path.starts_with('/') {
+        String::from(path)
+    } else if path.is_empty() || path == "." {
+        String::from(cwd)
+    } else {
+        alloc::format!("{}/{}", cwd.trim_end_matches('/'), path)
+    };
+
+    let mut parts: Vec<&str> = Vec::new();
+    for component in combined.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+
+    if parts.is_empty() {
+        String::from("/")
+    } else {
+        let mut result = String::new();
+        for part in &parts {
+            result.push('/');
+            result.push_str(part);
+        }
+        result
+    }
+}
+
+/// Get the current process's working directory.
+fn current_cwd() -> alloc::string::String {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => p.cwd.clone(),
+        None => alloc::string::String::from("/"),
+    }
+}
 
 use core::arch::global_asm;
 
@@ -266,8 +327,8 @@ pub extern "C" fn syscall_handler(
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
-        // openat: ignore dirfd, treat as open(path, flags)
-        257 => sys_linux_open(arg1, arg2),
+        // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
+        257 => sys_linux_openat(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Custom kernel debug print (moved from 12, Phase 12 T010)
@@ -760,10 +821,16 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
     // and file descriptors are consistent with the copied address space.
-    let (parent_brk, parent_mmap, parent_fds, parent_pgid) = {
+    let (parent_brk, parent_mmap, parent_fds, parent_pgid, parent_cwd) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
-            Some(p) => (p.brk_current, p.mmap_next, p.fd_table.clone(), p.pgid),
+            Some(p) => (
+                p.brk_current,
+                p.mmap_next,
+                p.fd_table.clone(),
+                p.pgid,
+                p.cwd.clone(),
+            ),
             None => (
                 0,
                 0,
@@ -772,6 +839,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                     [NONE; crate::process::MAX_FDS]
                 },
                 0,
+                alloc::string::String::from("/"),
             ),
         }
     };
@@ -791,6 +859,14 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_fds,
         parent_pgid,
     );
+
+    // Inherit parent's cwd in the child (Phase 18).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(child) = table.find_mut(child_pid) {
+            child.cwd = parent_cwd;
+        }
+    }
 
     // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
     crate::process::push_fork_ctx(child_pid, user_rip, user_rsp);
@@ -870,6 +946,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
+    // Resolve path against the process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, name);
+    let name: &str = &resolved;
+
     log::info!(
         "[p{}] execve({})",
         crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed),
@@ -886,14 +967,11 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Err(()) => return NEG_EFAULT,
     };
 
-    // Strip leading "/" or path prefix to get the ramdisk filename.
-    let file_name = name.trim_start_matches('/');
-
-    // Read the binary from the ramdisk.
-    let data = match crate::fs::ramdisk::get_file(file_name) {
+    // Read the binary from the ramdisk (get_file handles both absolute and bare names).
+    let data = match crate::fs::ramdisk::get_file(name) {
         Some(d) => d,
         None => {
-            log::warn!("[execve] file not found: {}", file_name);
+            log::warn!("[execve] file not found: {}", name);
             return NEG_ENOENT;
         }
     };
@@ -1529,6 +1607,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::PipeWrite { .. } => NEG_EBADF,
+        FdBackend::Dir { .. } => NEG_EISDIR,
     }
 }
 
@@ -1643,6 +1722,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::PipeRead { .. } => NEG_EBADF,
+        FdBackend::Dir { .. } => NEG_EBADF,
     }
 }
 
@@ -1685,6 +1765,29 @@ fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
+const O_DIRECTORY: u64 = 0o200000;
+
+/// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
+const AT_FDCWD: u64 = (-100_i64) as u64;
+
+/// Check if a resolved absolute path is a directory across all filesystems.
+fn is_directory(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if let Some(rel) = tmpfs_relative_path(path) {
+        if rel.is_empty() {
+            return true; // /tmp itself
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
+    }
+    // Check ramdisk directory tree.
+    match crate::fs::ramdisk::ramdisk_lookup(path) {
+        Some(node) => node.is_dir(),
+        None => false,
+    }
+}
 
 /// Check if a path targets the tmpfs mount at `/tmp`.
 ///
@@ -1713,10 +1816,15 @@ fn tmpfs_relative_path(path: &str) -> Option<&str> {
 
 fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
@@ -1729,11 +1837,52 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
 
+    // Handle directory opens (Phase 18).
+    let o_directory = flags & O_DIRECTORY != 0;
+    let path_is_dir = is_directory(name);
+
+    if o_directory && !path_is_dir {
+        // O_DIRECTORY set on a non-directory (or non-existent path).
+        // Check if the path exists as a file — if so, ENOTDIR.
+        if let Some(rel) = tmpfs_relative_path(name) {
+            if !rel.is_empty() {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                if tmpfs.stat(rel).is_ok() {
+                    return NEG_ENOTDIR;
+                }
+            }
+        } else if crate::fs::ramdisk::get_file(name).is_some() {
+            return NEG_ENOTDIR;
+        }
+        // Path doesn't exist — fall through to normal open which will return ENOENT.
+    }
+
+    if path_is_dir {
+        // Directories cannot be opened for writing, creation, or truncation.
+        if writable || create || truncate {
+            return NEG_EISDIR;
+        }
+        let entry = FdEntry {
+            backend: FdBackend::Dir {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => {
+                log::info!("[open] {} → fd {} (dir)", name, i);
+                i as u64
+            }
+            None => NEG_EMFILE,
+        };
+    }
+
     // Check if this is a tmpfs path.
     if let Some(rel) = tmpfs_relative_path(name) {
         if rel.is_empty() {
-            // Opening /tmp itself — it's a directory, not a regular file.
-            const NEG_EISDIR: u64 = (-21_i64) as u64;
+            // /tmp itself handled as directory above; shouldn't reach here.
             return NEG_EISDIR;
         }
 
@@ -1744,11 +1893,9 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             Ok(_created) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
-                const NEG_EISDIR: u64 = (-21_i64) as u64;
                 return NEG_EISDIR;
             }
             Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-                const NEG_ENOTDIR: u64 = (-20_i64) as u64;
                 return NEG_ENOTDIR;
             }
             Err(_) => return NEG_EINVAL,
@@ -1788,12 +1935,11 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
-    if writable {
+    if writable || create {
         return NEG_EROFS;
     }
 
-    let file_name = name.trim_start_matches('/');
-    let content = match crate::fs::ramdisk::get_file(file_name) {
+    let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => {
             log::warn!("[open] file not found: {}", name);
@@ -1819,6 +1965,144 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             log::warn!("[open] fd table full");
             NEG_EMFILE
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18: openat(dirfd, path, flags, mode) — syscall 257
+// ---------------------------------------------------------------------------
+
+fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    if dirfd == AT_FDCWD {
+        // Resolve relative to process cwd — same as sys_linux_open.
+        return sys_linux_open(path_ptr, flags);
+    }
+
+    // dirfd is a directory fd — resolve path relative to it.
+    let dirfd_idx = dirfd as usize;
+    if dirfd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let dir_entry = match current_fd_entry(dirfd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let base_path = match &dir_entry.backend {
+        FdBackend::Dir { path } => path.clone(),
+        _ => return NEG_ENOTDIR,
+    };
+
+    // Read the relative path from userspace.
+    let mut buf = [0u8; 512];
+    let rel_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    // Resolve relative to the directory fd's path.
+    let resolved = resolve_path(&base_path, rel_name);
+    let name: &str = &resolved;
+
+    // Decode flags and delegate to the same open logic.
+    let (readable, writable) = match flags & 0o3 {
+        0 => (true, false),
+        1 => (false, true),
+        2 => (true, true),
+        _ => return NEG_EINVAL,
+    };
+    let create = flags & O_CREAT != 0;
+    let truncate = flags & O_TRUNC != 0;
+    let append = flags & O_APPEND != 0;
+    let o_directory = flags & O_DIRECTORY != 0;
+    let path_is_dir = is_directory(name);
+
+    if o_directory && !path_is_dir {
+        if let Some(rel) = tmpfs_relative_path(name) {
+            if !rel.is_empty() {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                if tmpfs.stat(rel).is_ok() {
+                    return NEG_ENOTDIR;
+                }
+            }
+        } else if crate::fs::ramdisk::get_file(name).is_some() {
+            return NEG_ENOTDIR;
+        }
+    }
+
+    if path_is_dir {
+        if writable || create || truncate {
+            return NEG_EISDIR;
+        }
+        let entry = FdEntry {
+            backend: FdBackend::Dir {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Tmpfs file open.
+    if let Some(rel) = tmpfs_relative_path(name) {
+        if rel.is_empty() {
+            return NEG_EISDIR;
+        }
+        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        match tmpfs.open_or_create(rel, create) {
+            Ok(_) => {}
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => return NEG_ENOTDIR,
+            Err(_) => return NEG_EINVAL,
+        }
+        if truncate && writable {
+            let _ = tmpfs.truncate(rel, 0);
+        }
+        let initial_offset = if append {
+            tmpfs.file_size(rel).unwrap_or(0)
+        } else {
+            0
+        };
+        drop(tmpfs);
+        let entry = FdEntry {
+            backend: FdBackend::Tmpfs {
+                path: alloc::string::String::from(rel),
+            },
+            offset: initial_offset,
+            readable,
+            writable,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Ramdisk fallback — read-only.
+    if writable || create {
+        return NEG_EROFS;
+    }
+    let content = match crate::fs::ramdisk::get_file(name) {
+        Some(c) => c,
+        None => return NEG_ENOENT,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::Ramdisk {
+            content_addr: content.as_ptr() as usize,
+            content_len: content.len(),
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
     }
 }
 
@@ -1874,6 +2158,19 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
+    // Handle directory fds separately — they get S_IFDIR mode.
+    if matches!(&entry.backend, FdBackend::Dir { .. }) {
+        let mut stat = [0u8; 144];
+        let mode: u32 = 0x4000 | 0o755; // S_IFDIR | rwxr-xr-x
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        let blksize: u64 = 4096;
+        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let size = match &entry.backend {
         FdBackend::Stdout
         | FdBackend::Stdin
@@ -1887,6 +2184,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
+        FdBackend::Dir { .. } => unreachable!(), // handled above
     };
 
     // x86_64 stat struct (144 bytes, all little-endian).
@@ -1929,7 +2227,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Stdout
         | FdBackend::Stdin
         | FdBackend::PipeRead { .. }
-        | FdBackend::PipeWrite { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::PipeWrite { .. }
+        | FdBackend::Dir { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -2280,25 +2579,67 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// T024: getcwd(buf, size) — always returns "/"
+// T024: getcwd(buf, size) — return per-process working directory
 // ---------------------------------------------------------------------------
 
 fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
-    if size < 2 {
-        return NEG_EINVAL;
+    let cwd = current_cwd();
+    let cwd_bytes = cwd.as_bytes();
+    let total_len = cwd_bytes.len() + 1; // include null terminator
+    if (size as usize) < total_len {
+        const NEG_ERANGE: u64 = (-34_i64) as u64;
+        return NEG_ERANGE;
     }
-    let cwd = b"/\0";
-    if crate::mm::user_mem::copy_to_user(buf_ptr, cwd).is_err() {
+    // Copy path, then write a single null terminator — no heap allocation.
+    if crate::mm::user_mem::copy_to_user(buf_ptr, cwd_bytes).is_err() {
         return NEG_EFAULT;
     }
-    buf_ptr // Linux getcwd returns the buffer pointer on success
+    let terminator_ptr = match buf_ptr.checked_add(cwd_bytes.len() as u64) {
+        Some(p) => p,
+        None => return NEG_EFAULT,
+    };
+    if crate::mm::user_mem::copy_to_user(terminator_ptr, &[0u8]).is_err() {
+        return NEG_EFAULT;
+    }
+    // Linux getcwd returns the length of the path (including null terminator).
+    total_len as u64
 }
 
 // ---------------------------------------------------------------------------
-// T024: chdir — stub (always succeeds)
+// T024: chdir(path) — resolve path, validate directory, update process cwd
 // ---------------------------------------------------------------------------
 
-fn sys_linux_chdir(_path_ptr: u64) -> u64 {
+fn sys_linux_chdir(path_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, name);
+
+    // Verify the resolved path exists and is a directory.
+    if !is_directory(&resolved) {
+        // Path is not a directory — check if it exists at all to choose error.
+        if let Some(rel) = tmpfs_relative_path(&resolved) {
+            if !rel.is_empty() {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                if tmpfs.stat(rel).is_ok() {
+                    return NEG_ENOTDIR;
+                }
+            }
+        } else if crate::fs::ramdisk::ramdisk_lookup(&resolved).is_some() {
+            return NEG_ENOTDIR;
+        }
+        return NEG_ENOENT;
+    }
+
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    if let Some(proc) = table.find_mut(pid) {
+        proc.cwd = resolved;
+    }
     0
 }
 
@@ -2355,10 +2696,15 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
 
 fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     // Check tmpfs first.
     if let Some(rel) = tmpfs_relative_path(name) {
@@ -2367,7 +2713,6 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             Ok(s) => s,
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-                const NEG_ENOTDIR: u64 = (-20_i64) as u64;
                 return NEG_ENOTDIR;
             }
             Err(_) => return NEG_EINVAL,
@@ -2390,23 +2735,48 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
-    let file_name = name.trim_start_matches('/');
-    let size = match crate::fs::ramdisk::get_file(file_name) {
-        Some(c) => c.len() as u64,
-        None => return NEG_ENOENT,
-    };
-
-    let mut stat = [0u8; 144];
-    let mode: u32 = 0x8000 | 0o644;
-    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-    stat[48..56].copy_from_slice(&size.to_ne_bytes());
-    let blksize: u64 = 4096;
-    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-
-    if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-        return NEG_EFAULT;
+    // Check ramdisk tree (supports directories and hierarchical paths).
+    match crate::fs::ramdisk::ramdisk_lookup(name) {
+        Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
+            let mut stat = [0u8; 144];
+            let mode: u32 = 0x8000 | 0o644; // S_IFREG
+            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+            let size = content.len() as u64;
+            stat[48..56].copy_from_slice(&size.to_ne_bytes());
+            let blksize: u64 = 4096;
+            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        Some(crate::fs::ramdisk::RamdiskNode::Dir { .. }) => {
+            let mut stat = [0u8; 144];
+            let mode: u32 = 0x4000 | 0o755; // S_IFDIR
+            stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+            let blksize: u64 = 4096;
+            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        None => {
+            // Also handle "/" specially.
+            if name == "/" {
+                let mut stat = [0u8; 144];
+                let mode: u32 = 0x4000 | 0o755;
+                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                let blksize: u64 = 4096;
+                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                    return NEG_EFAULT;
+                }
+                return 0;
+            }
+            NEG_ENOENT
+        }
     }
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -2415,10 +2785,15 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
 
 fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
@@ -2436,10 +2811,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
         }
         Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
-        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
-            NEG_ENOTDIR
-        }
+        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => NEG_ENOTDIR,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -2450,10 +2822,15 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
 
 fn sys_linux_rmdir(path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
@@ -2473,10 +2850,7 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
         Err(
             crate::fs::tmpfs::TmpfsError::WrongType | crate::fs::tmpfs::TmpfsError::NotADirectory,
-        ) => {
-            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
-            NEG_ENOTDIR
-        }
+        ) => NEG_ENOTDIR,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -2487,10 +2861,15 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
 
 fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
@@ -2507,14 +2886,8 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
-        Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
-            const NEG_EISDIR: u64 = (-21_i64) as u64;
-            NEG_EISDIR
-        }
-        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => {
-            const NEG_ENOTDIR: u64 = (-20_i64) as u64;
-            NEG_ENOTDIR
-        }
+        Err(crate::fs::tmpfs::TmpfsError::WrongType) => NEG_EISDIR,
+        Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => NEG_ENOTDIR,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -2525,27 +2898,32 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
 
 fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let mut buf1 = [0u8; 512];
-    let old_name = match read_user_cstr(old_ptr, &mut buf1) {
+    let old_raw = match read_user_cstr(old_ptr, &mut buf1) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    // Copy old_name to owned string since we need buf for new_name too.
+    // Copy old_raw to owned string since we need buf for new_raw too.
     let mut old_owned = [0u8; 512];
-    let old_len = old_name.len();
-    old_owned[..old_len].copy_from_slice(old_name.as_bytes());
+    let old_len = old_raw.len();
+    old_owned[..old_len].copy_from_slice(old_raw.as_bytes());
 
     let mut buf2 = [0u8; 512];
-    let new_name = match read_user_cstr(new_ptr, &mut buf2) {
+    let new_raw = match read_user_cstr(new_ptr, &mut buf2) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    let old_str = core::str::from_utf8(&old_owned[..old_len]).unwrap();
-    let old_rel = match tmpfs_relative_path(old_str) {
+    // Resolve both paths against current process's working directory.
+    let cwd = current_cwd();
+    let old_str_raw = core::str::from_utf8(&old_owned[..old_len]).unwrap();
+    let old_resolved = resolve_path(&cwd, old_str_raw);
+    let new_resolved = resolve_path(&cwd, new_raw);
+
+    let old_rel = match tmpfs_relative_path(&old_resolved) {
         Some(r) => r,
         None => return NEG_EROFS,
     };
-    let new_rel = match tmpfs_relative_path(new_name) {
+    let new_rel = match tmpfs_relative_path(&new_resolved) {
         Some(r) => r,
         None => return NEG_EROFS,
     };
@@ -2553,7 +2931,7 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
     match tmpfs.rename(old_rel, new_rel) {
         Ok(()) => {
-            log::info!("[rename] {} → {}", old_str, new_name);
+            log::info!("[rename] {} → {}", old_resolved, new_resolved);
             0
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
@@ -2573,17 +2951,21 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
     }
 
     let mut buf = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut buf) {
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
+
+    // Resolve path against current process's working directory.
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
         None => return NEG_EROFS,
     };
     if rel.is_empty() {
-        const NEG_EISDIR: u64 = (-21_i64) as u64;
         return NEG_EISDIR;
     }
 
@@ -2592,10 +2974,7 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
         Ok(()) => 0,
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
         Err(crate::fs::tmpfs::TmpfsError::NoSpace) => NEG_ENOSPC,
-        Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
-            const NEG_EISDIR: u64 = (-21_i64) as u64;
-            NEG_EISDIR
-        }
+        Err(crate::fs::tmpfs::TmpfsError::WrongType) => NEG_EISDIR,
         Err(_) => NEG_EINVAL,
     }
 }
@@ -2629,7 +3008,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         FdBackend::Stdout
         | FdBackend::Stdin
         | FdBackend::PipeRead { .. }
-        | FdBackend::PipeWrite { .. } => NEG_EINVAL,
+        | FdBackend::PipeWrite { .. }
+        | FdBackend::Dir { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -2662,10 +3042,112 @@ fn sys_linux_fsync(fd: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
-    // Not implemented — returns ENOSYS so callers know to fall back.
-    // Directory listing via getdents64 is deferred to a future phase.
-    let _ = (fd, buf_ptr, count);
-    NEG_ENOSYS
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    let dir_path = match &entry.backend {
+        FdBackend::Dir { path } => path.clone(),
+        _ => return NEG_ENOTDIR,
+    };
+
+    let offset = entry.offset;
+    let max_bytes = (count as usize).min(64 * 1024);
+
+    // Collect directory entries: [(".", true), ("..", true), ...children...]
+    let mut entries: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
+    entries.push((alloc::string::String::from("."), true));
+    entries.push((alloc::string::String::from(".."), true));
+
+    if let Some(rel) = tmpfs_relative_path(&dir_path) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        match tmpfs.list_dir(rel) {
+            Ok(children) => {
+                for (name, is_dir) in children {
+                    entries.push((name, is_dir));
+                }
+            }
+            Err(_) => return NEG_ENOENT,
+        }
+    } else if dir_path == "/" {
+        // Unified root listing: ramdisk top-level dirs + tmpfs "tmp".
+        if let Some(ramdisk_children) = crate::fs::ramdisk::ramdisk_list_dir("/") {
+            for (name, is_dir) in ramdisk_children {
+                entries.push((name, is_dir));
+            }
+        }
+        // Add "tmp" for the tmpfs mount point.
+        entries.push((alloc::string::String::from("tmp"), true));
+    } else {
+        // Ramdisk directory listing.
+        if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
+            for (name, is_dir) in children {
+                entries.push((name, is_dir));
+            }
+        }
+    }
+
+    if offset >= entries.len() {
+        return 0; // end of directory
+    }
+
+    // Serialize into a kernel buffer, then copy to userspace.
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut idx = offset;
+
+    while idx < entries.len() {
+        let (ref name, is_dir) = entries[idx];
+        let name_bytes = name.as_bytes();
+        // reclen = 19 (fixed fields) + name_len + 1 (null), rounded up to 8
+        let reclen = (19 + name_bytes.len() + 1 + 7) & !7;
+
+        if out.len() + reclen > max_bytes {
+            if out.is_empty() {
+                // Even one entry doesn't fit — EINVAL.
+                return NEG_EINVAL;
+            }
+            break;
+        }
+
+        let start = out.len();
+        out.resize(start + reclen, 0); // zero-pad
+
+        let d_ino: u64 = (idx + 1) as u64;
+        let d_off: i64 = (idx + 1) as i64;
+        let d_type: u8 = if is_dir { DT_DIR } else { DT_REG };
+
+        out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
+        out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
+        out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        out[start + 18] = d_type;
+        out[start + 19..start + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+        // null terminator and padding are already zero from resize
+
+        idx += 1;
+    }
+
+    if out.is_empty() {
+        return 0;
+    }
+
+    if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+        return NEG_EFAULT;
+    }
+
+    // Update the fd offset so the next call resumes.
+    with_current_fd_mut(fd_idx, |slot| {
+        if let Some(ref mut e) = slot {
+            e.offset = idx;
+        }
+    });
+
+    out.len() as u64
 }
 
 // ---------------------------------------------------------------------------
