@@ -268,9 +268,10 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
-    // Divergent syscalls (exit) never return — handle them first.
+    // Divergent syscalls (exit, sigreturn) never return — handle them first.
     match number {
         6 => sys_exit_legacy(arg0),
+        15 => sys_sigreturn(user_rsp),
         60 | 231 => sys_exit(arg0 as i32),
         _ => {}
     }
@@ -654,9 +655,105 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
     }
 }
 
-/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
+/// `rt_sigreturn()` — restore interrupted register state from sigframe (syscall 15).
 ///
-/// We only support Default and Ignore (no user signal handlers yet).
+/// This is a divergent syscall: it reads the sigframe from the user stack,
+/// restores all saved registers and the signal mask, and enters ring 3 at
+/// the interrupted instruction.  It never returns through the normal path.
+fn sys_sigreturn(user_rsp: u64) -> ! {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+
+    // Restore registers and signal mask from the sigframe.
+    let (regs, saved_mask) = match crate::signal::restore_sigframe(user_rsp) {
+        Some(r) => r,
+        None => {
+            log::warn!(
+                "[p{}] sigreturn: invalid sigframe at rsp {:#x}",
+                pid,
+                user_rsp
+            );
+            sys_exit(-11); // SIGSEGV
+        }
+    };
+
+    // Restore the signal mask (saved before handler execution).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.blocked_signals = saved_mask & !UNBLOCKABLE_MASK;
+        }
+    }
+
+    log::debug!(
+        "[p{}] sigreturn → rip={:#x} rsp={:#x}",
+        pid,
+        regs.rip,
+        regs.rsp,
+    );
+
+    // Restore all registers and enter ring 3 at the interrupted instruction.
+    // We use iretq with a full register restore to return to the exact
+    // pre-signal state.
+    unsafe { restore_and_enter_userspace(&regs) }
+}
+
+/// Enter ring 3 with a full set of restored registers from a sigframe.
+///
+/// Restores all GPRs then uses `iretq` to return to the interrupted
+/// instruction with the correct RSP and RFLAGS.
+///
+/// # Safety
+///
+/// `regs` must contain valid userspace addresses for RIP and RSP.
+unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! {
+    use core::arch::asm;
+    // We need to restore all GPRs.  The simplest approach: push the iretq
+    // frame first, then load all GPRs from the struct, then iretq.
+    //
+    // We save the struct pointer in a register, set up the iretq frame,
+    // then load all registers from the struct.
+    let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
+    let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
+    // Sanitize rflags: always set IF (bit 9), clear IOPL (bits 12-13).
+    let rflags = (regs.rflags & !0x3000) | 0x200;
+
+    asm!(
+        // Build the iretq frame on the kernel stack.
+        "push {ss}",
+        "push {user_rsp}",
+        "push {rflags}",
+        "push {cs}",
+        "push {user_rip}",
+        // Now restore all GPRs from the SavedUserRegs struct.
+        // r14 holds the pointer to the struct (chosen because we restore it last-ish).
+        "mov r15, [r14 + 120]",  // r15 offset
+        "mov r13, [r14 + 104]",  // r13
+        "mov r12, [r14 + 96]",   // r12
+        "mov r11, [r14 + 88]",   // r11
+        "mov r10, [r14 + 80]",   // r10
+        "mov r9, [r14 + 72]",    // r9
+        "mov r8, [r14 + 64]",    // r8
+        "mov rbp, [r14 + 48]",   // rbp
+        "mov rbx, [r14 + 8]",    // rbx
+        "mov rdx, [r14 + 24]",   // rdx
+        "mov rsi, [r14 + 32]",   // rsi
+        "mov rdi, [r14 + 40]",   // rdi
+        "mov rcx, [r14 + 16]",   // rcx
+        "mov rax, [r14 + 0]",    // rax
+        // Restore r14 last (it was our pointer register).
+        "mov r14, [r14 + 112]",  // r14
+        "iretq",
+        ss       = in(reg) ss,
+        user_rsp = in(reg) regs.rsp,
+        rflags   = in(reg) rflags,
+        cs       = in(reg) cs,
+        user_rip = in(reg) regs.rip,
+        in("r14") regs as *const crate::signal::SavedUserRegs as u64,
+        options(noreturn)
+    )
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
     if sig == 0 || sig >= 32 {

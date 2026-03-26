@@ -25,7 +25,11 @@
 //! ```
 
 /// Saved user-space register state, read from the kernel syscall stack.
+///
+/// **Must be `#[repr(C)]`** — the `restore_and_enter_userspace` asm stub
+/// in `syscall.rs` accesses fields by fixed byte offsets.
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub struct SavedUserRegs {
     pub rax: u64,
     pub rbx: u64,
