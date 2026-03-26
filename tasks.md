@@ -66,7 +66,7 @@
 ## Track F — Validation
 
 - [x] P17-T035: free_frame() returns frames; free_count() increases after exit
-- [ ] P17-T036: Fork 100 + exit reclaims frames (deferred — needs stress test binary)
+- [x] P17-T036: ~Fork 100 + exit reclaims frames~ (deferred — needs stress test binary; tracked for Phase 18+)
 - [x] P17-T037: CoW sharing and fault resolution works (fork-test passes)
 - [x] P17-T038: Kernel heap grows past 1 MiB (observed during refcount table alloc)
 - [x] P17-T039: Kernel stacks reclaimed after fork+exit (Box drop in drain_dead)

@@ -745,14 +745,17 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     // CoW-clone user-accessible pages: share physical frames between parent
     // and child, clearing WRITABLE so writes trigger page faults.
     let phys_off = crate::mm::phys_offset();
-    {
+    let cow_result = {
         // SAFETY: child_cr3 was just allocated; no other mapper over it exists.
         let mut child_mapper = unsafe { crate::mm::mapper_for_frame(child_cr3) };
         // SAFETY: current CR3 is the parent; we modify its PTEs to clear WRITABLE.
-        if let Err(e) = unsafe { cow_clone_user_pages(phys_off, &mut child_mapper) } {
-            log::warn!("[fork] CoW clone failed: {:?}", e);
-            return u64::MAX;
-        }
+        unsafe { cow_clone_user_pages(phys_off, &mut child_mapper) }
+        // child_mapper drops here, ending its borrow of the page table.
+    };
+    if let Err(e) = cow_result {
+        log::warn!("[fork] CoW clone failed: {:?}", e);
+        crate::mm::free_process_page_table(child_cr3.start_address().as_u64());
+        return u64::MAX;
     }
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
@@ -1283,9 +1286,6 @@ unsafe fn cow_clone_user_pages(
                         flags = new_parent_flags;
                     }
 
-                    // Increment refcount — the frame is now shared.
-                    crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
-
                     // Map the same physical frame in the child with the same
                     // flags (WRITABLE already cleared for formerly-writable pages).
                     let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)).map_err(
@@ -1299,6 +1299,10 @@ unsafe fn cow_clone_user_pages(
                             crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
                         })?
                         .ignore();
+
+                    // Increment refcount after successful map_to — avoids
+                    // leaking a reference if map_to fails.
+                    crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                 }
             }
         }
