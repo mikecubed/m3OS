@@ -8,13 +8,14 @@ members = [
     "userspace/exit0",
     "userspace/fork-test",
     "userspace/echo-args",
-    # Future userspace servers (Phase 12+):
-    # "userspace/init",
+    # Phase 20 userspace init and shell
+    "userspace/init",
+    "userspace/shell",
+    # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",
     # "userspace/fat_server",
     # "userspace/kbd_server",
-    # "userspace/shell",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
