@@ -13,7 +13,7 @@ struct linux_dirent64 {
 };
 
 int main(int argc, char **argv) {
-    const char *path = (argc > 1) ? argv[1] : "/tmp";
+    const char *path = (argc > 1) ? argv[1] : ".";
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         /* Failed to open directory: report error and exit. */
