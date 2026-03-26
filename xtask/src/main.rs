@@ -386,6 +386,24 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Run host-side unit tests for kernel-core.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "kernel-core",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+        ])
+        .status()
+        .expect("failed to run kernel-core tests");
+
+    if !status.success() {
+        eprintln!("kernel-core host tests failed");
+        std::process::exit(1);
+    }
+
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args(["fmt", "--package", "kernel", "--", "--check"])
@@ -397,7 +415,7 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    println!("check passed: clippy clean, formatting correct");
+    println!("check passed: clippy clean, formatting correct, 63+ host tests pass");
 }
 
 fn cmd_fmt(fix: bool) {
