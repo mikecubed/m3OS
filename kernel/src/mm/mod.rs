@@ -86,8 +86,13 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // Log reserved regions below 1 MiB to confirm allocator skips them (P2-T008)
     debug::log_reserved_below_1mib();
 
-    let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
-    heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
+    // Scope the mapper so it is dropped before any heap allocations that
+    // might trigger grow_heap (which calls get_mapper). Holding both would
+    // alias &mut PageTable = UB.
+    {
+        let mut mapper = unsafe { paging::init(x86_64::VirtAddr::new(phys_offset)) };
+        heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
+    }
 
     // P17-T010: initialize per-frame refcount table (requires heap).
     frame_allocator::init_refcounts();
@@ -263,9 +268,10 @@ pub fn free_process_page_table(cr3_phys: u64) {
                     continue;
                 }
 
-                // Skip PD frames shared with the kernel (from deep-copy in
-                // new_process_page_table, kernel PDs are cloned but some entries
-                // may still point to shared kernel PTs).
+                // Walk PD frames for this process. PD frames under PML4[0]
+                // are process-private (deep-copied by new_process_page_table),
+                // but some PT entries may point at shared kernel PTs — those
+                // are detected below via the has_user_pages check.
                 let pd: &PageTable = &*(phys_off + p3e.addr().as_u64()).as_ptr::<PageTable>();
                 for p2 in 0usize..512 {
                     let p2e = &pd[p2];

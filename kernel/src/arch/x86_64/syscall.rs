@@ -1273,35 +1273,36 @@ unsafe fn cow_clone_user_pages(
                         | ((p1 as u64) << 12);
 
                     let src_phys = pte.addr();
-                    let mut flags = pte.flags();
+                    let flags = pte.flags();
+                    let was_writable = flags.contains(PageTableFlags::WRITABLE);
 
-                    // For writable pages, clear WRITABLE and set BIT_9 (CoW
-                    // marker) in both parent and child so the page fault
-                    // handler can distinguish CoW pages from genuinely
-                    // read-only shared pages (e.g. .text/.rodata).
-                    if flags.contains(PageTableFlags::WRITABLE) {
-                        let new_parent_flags =
-                            (flags & !PageTableFlags::WRITABLE) | PageTableFlags::BIT_9;
-                        pte.set_addr(src_phys, new_parent_flags);
-                        flags = new_parent_flags;
-                    }
+                    // Compute child flags: if the page was writable, clear
+                    // WRITABLE and set BIT_9 (CoW marker) in the child.
+                    // Don't mutate parent PTE yet — defer until map_to succeeds.
+                    let child_flags = if was_writable {
+                        (flags & !PageTableFlags::WRITABLE) | PageTableFlags::BIT_9
+                    } else {
+                        flags
+                    };
 
-                    // Map the same physical frame in the child with the same
-                    // flags (WRITABLE already cleared for formerly-writable pages).
+                    // Map the same physical frame in the child.
                     let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)).map_err(
                         |_| crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork"),
                     )?;
                     let frame = PhysFrame::from_start_address(src_phys)
                         .expect("CoW: unaligned frame address");
                     dst_mapper
-                        .map_to(page, frame, flags, &mut frame_alloc)
+                        .map_to(page, frame, child_flags, &mut frame_alloc)
                         .map_err(|_| {
                             crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
                         })?
                         .ignore();
 
-                    // Increment refcount after successful map_to — avoids
-                    // leaking a reference if map_to fails.
+                    // Child mapping succeeded — now mutate the parent PTE to
+                    // match (clear WRITABLE, set BIT_9) and bump refcount.
+                    if was_writable {
+                        pte.set_addr(src_phys, child_flags);
+                    }
                     crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                 }
             }

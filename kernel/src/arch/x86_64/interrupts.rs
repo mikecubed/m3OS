@@ -69,7 +69,9 @@ fn fault_kill_trampoline() -> ! {
 ///
 /// Reads the current PTE, allocates a fresh frame, copies the page contents,
 /// maps the new frame as writable, and decrements the old frame's refcount.
-fn resolve_cow_fault(vaddr: u64) {
+///
+/// Returns `true` on success, `false` if frame allocation fails (OOM).
+fn resolve_cow_fault(vaddr: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -120,12 +122,16 @@ fn resolve_cow_fault(vaddr: u64) {
             let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
             pte.set_addr(pte.addr(), flags);
             x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
-            return;
+            return true;
         }
 
-        // Allocate a fresh frame and copy the page contents.
-        let new_frame =
-            crate::mm::frame_allocator::allocate_frame().expect("CoW: out of frames for page copy");
+        // Allocate a fresh frame. If out of memory, return false so the
+        // page fault handler falls through to the kill path instead of
+        // panicking the kernel (user-triggerable OOM must not be a DoS).
+        let new_frame = match crate::mm::frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => return false,
+        };
         let new_phys = new_frame.start_address().as_u64();
 
         let src = (phys_off + old_phys) as *const u8;
@@ -142,6 +148,7 @@ fn resolve_cow_fault(vaddr: u64) {
         // Decrement the old frame's refcount (may free it if no other sharers).
         crate::mm::frame_allocator::free_frame(old_phys);
     }
+    true
 }
 
 /// Check whether the PTE for `vaddr` has the CoW marker bit (BIT_9) set.
@@ -246,9 +253,11 @@ extern "x86-interrupt" fn page_fault_handler(
                 if has_cow_marker(fault_addr_u64) {
                     // CoW fault — resolve directly in the ISR. Safe because
                     // the fault is from ring 3 (no kernel locks held) and
-                    // we're on a single CPU.
-                    resolve_cow_fault(fault_addr_u64);
-                    return;
+                    // we're on a single CPU. On OOM, fall through to kill.
+                    if resolve_cow_fault(fault_addr_u64) {
+                        return;
+                    }
+                    // OOM during CoW — fall through to kill the process.
                 }
             }
         }

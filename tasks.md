@@ -1,7 +1,7 @@
 # Phase 17 — Memory Reclamation: Implementation Progress
 
 **Branch:** `phase-17-memory-reclamation`
-**Status:** Complete
+**Status:** Complete (stress test deferred to Phase 18+)
 
 ## Track Layout
 
