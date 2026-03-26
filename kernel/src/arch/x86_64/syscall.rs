@@ -327,8 +327,8 @@ pub extern "C" fn syscall_handler(
         158 => sys_linux_arch_prctl(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
-        // openat: ignore dirfd, treat as open(path, flags)
-        257 => sys_linux_open(arg1, arg2),
+        // Phase 18: openat(dirfd, path, flags, mode)
+        257 => sys_linux_openat(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Custom kernel debug print (moved from 12, Phase 12 T010)
@@ -1765,6 +1765,9 @@ const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
 
+/// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
+const AT_FDCWD: u64 = (-100_i64) as u64;
+
 /// Check if a resolved absolute path is a directory across all filesystems.
 fn is_directory(path: &str) -> bool {
     if path == "/" {
@@ -1960,6 +1963,141 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             log::warn!("[open] fd table full");
             NEG_EMFILE
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18: openat(dirfd, path, flags, mode) — syscall 257
+// ---------------------------------------------------------------------------
+
+fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    if dirfd == AT_FDCWD {
+        // Resolve relative to process cwd — same as sys_linux_open.
+        return sys_linux_open(path_ptr, flags);
+    }
+
+    // dirfd is a directory fd — resolve path relative to it.
+    let dirfd_idx = dirfd as usize;
+    if dirfd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let dir_entry = match current_fd_entry(dirfd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let base_path = match &dir_entry.backend {
+        FdBackend::Dir { path } => path.clone(),
+        _ => return NEG_ENOTDIR,
+    };
+
+    // Read the relative path from userspace.
+    let mut buf = [0u8; 512];
+    let rel_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    // Resolve relative to the directory fd's path.
+    let resolved = resolve_path(&base_path, rel_name);
+    let name: &str = &resolved;
+
+    // Decode flags and delegate to the same open logic.
+    let (readable, writable) = match flags & 0o3 {
+        0 => (true, false),
+        1 => (false, true),
+        2 => (true, true),
+        _ => return NEG_EINVAL,
+    };
+    let create = flags & O_CREAT != 0;
+    let truncate = flags & O_TRUNC != 0;
+    let append = flags & O_APPEND != 0;
+    let o_directory = flags & O_DIRECTORY != 0;
+    let path_is_dir = is_directory(name);
+
+    if o_directory && !path_is_dir {
+        if let Some(rel) = tmpfs_relative_path(name) {
+            if !rel.is_empty() {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                if tmpfs.stat(rel).is_ok() {
+                    return NEG_ENOTDIR;
+                }
+            }
+        } else if crate::fs::ramdisk::get_file(name.trim_start_matches('/')).is_some() {
+            return NEG_ENOTDIR;
+        }
+    }
+
+    if path_is_dir {
+        let entry = FdEntry {
+            backend: FdBackend::Dir {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Tmpfs file open.
+    if let Some(rel) = tmpfs_relative_path(name) {
+        if rel.is_empty() {
+            return NEG_EISDIR;
+        }
+        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        match tmpfs.open_or_create(rel, create) {
+            Ok(_) => {}
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
+            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => return NEG_ENOTDIR,
+            Err(_) => return NEG_EINVAL,
+        }
+        if truncate && writable {
+            let _ = tmpfs.truncate(rel, 0);
+        }
+        let initial_offset = if append {
+            tmpfs.file_size(rel).unwrap_or(0)
+        } else {
+            0
+        };
+        drop(tmpfs);
+        let entry = FdEntry {
+            backend: FdBackend::Tmpfs {
+                path: alloc::string::String::from(rel),
+            },
+            offset: initial_offset,
+            readable,
+            writable,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Ramdisk fallback.
+    if writable {
+        return NEG_EROFS;
+    }
+    let content = match crate::fs::ramdisk::get_file(name.trim_start_matches('/')) {
+        Some(c) => c,
+        None => return NEG_ENOENT,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::Ramdisk {
+            content_addr: content.as_ptr() as usize,
+            content_len: content.len(),
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
     }
 }
 
@@ -2924,10 +3062,21 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
     } else if dir_path == "/" {
-        // Root: unified listing deferred to Track D.
-        // For now, just return . and ..
+        // Unified root listing: ramdisk top-level dirs + tmpfs "tmp".
+        if let Some(ramdisk_children) = crate::fs::ramdisk::ramdisk_list_dir("/") {
+            for (name, is_dir) in ramdisk_children {
+                entries.push((name, is_dir));
+            }
+        }
+        // Add "tmp" for the tmpfs mount point.
+        entries.push((alloc::string::String::from("tmp"), true));
     } else {
-        // Ramdisk dir: deferred to Track D.
+        // Ramdisk directory listing.
+        if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
+            for (name, is_dir) in children {
+                entries.push((name, is_dir));
+            }
+        }
     }
 
     if offset >= entries.len() {
