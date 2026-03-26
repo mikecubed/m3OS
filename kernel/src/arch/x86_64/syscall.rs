@@ -2107,14 +2107,15 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     match &entry.backend {
         FdBackend::Stdout => {
-            // stdout/stderr go to serial.
+            // stdout/stderr go to serial + framebuffer console.
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
                 return NEG_EFAULT;
             }
             if let Ok(s) = core::str::from_utf8(&buf[..len]) {
-                log::info!("[userspace] {}", s.trim_end_matches('\n'));
+                crate::serial::_print(format_args!("{}", s));
+                crate::fb::write_str(s);
             }
             len as u64
         }

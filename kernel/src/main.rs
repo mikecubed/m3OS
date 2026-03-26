@@ -836,16 +836,13 @@ fn stdin_feeder_task() -> ! {
 
         // Enter (0x1C): flush line buffer to stdin.
         if sc == 0x1C {
-            shell_print(my_id, console_ep, "\n");
             stdin::flush_line();
             continue;
         }
 
         // Backspace (0x0E): remove last character.
         if sc == 0x0E {
-            if stdin::backspace() {
-                shell_print(my_id, console_ep, "\x08 \x08");
-            }
+            stdin::backspace();
             continue;
         }
 
@@ -854,8 +851,6 @@ fn stdin_feeder_task() -> ! {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             stdin::push_char(s.as_bytes()[0]);
-            // Echo to console.
-            shell_print(my_id, console_ep, s);
         }
     }
 }
