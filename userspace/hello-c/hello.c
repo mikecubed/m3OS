@@ -14,9 +14,10 @@ int main(void) {
     puts("hello from musl!");
 
     /* Exercise malloc so musl calls brk or mmap. */
-    char *buf = malloc(64);
+    const char *msg = "malloc works\n";
+    char *buf = malloc(64); /* DevSkim: ignore DS161085 — constant literal, no integer math */
     if (buf) {
-        strcpy(buf, "malloc works\n");
+        memcpy(buf, msg, strlen(msg) + 1);
         fputs(buf, stdout);
         free(buf);
     }

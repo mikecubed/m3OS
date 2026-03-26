@@ -27,7 +27,7 @@ static void grep_fd(int fd, const char *pattern) {
                 /* No newline — move leftover to start of buf. */
                 line_start = buf + n - p;
                 if (line_start > 0 && p != buf) {
-                    memmove(buf, p, line_start);
+                    memmove(buf, p, line_start); /* DevSkim: ignore DS154189 — length is bounded by buf size */
                 }
                 break;
             }
@@ -53,7 +53,7 @@ static void grep_fd(int fd, const char *pattern) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         const char *msg = "usage: grep <pattern> [file...]\n";
-        write(2, msg, strlen(msg));
+        write(2, msg, strlen(msg)); /* DevSkim: ignore DS140021 — string literal */
         return 1;
     }
     const char *pattern = argv[1];

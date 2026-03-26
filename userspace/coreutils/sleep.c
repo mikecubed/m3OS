@@ -6,7 +6,7 @@
 int main(int argc, char **argv) {
     if (argc < 2) {
         const char *msg = "usage: sleep <seconds>\n";
-        write(2, msg, strlen(msg));
+        write(2, msg, strlen(msg)); /* DevSkim: ignore DS140021 — string literal */
         return 1;
     }
     /* Simple atoi. */

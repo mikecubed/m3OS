@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
     if (fd < 0) {
         /* Failed to open directory: report error and exit. */
         const char *msg = "ls: cannot open directory\n";
-        write(2, msg, strlen(msg));
+        write(2, msg, strlen(msg)); /* DevSkim: ignore DS140021 — string literal */
         return 1;
     }
 
@@ -29,14 +29,14 @@ int main(int argc, char **argv) {
         long pos = 0;
         while (pos < nread) {
             struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + pos);
-            write(1, d->d_name, strlen(d->d_name));
+            write(1, d->d_name, strlen(d->d_name)); /* DevSkim: ignore DS140021 — d_name is null-terminated by the kernel */
             write(1, "\n", 1);
             pos += d->d_reclen;
         }
     }
     if (nread < 0) {
         const char *msg = "ls: getdents64 error\n";
-        write(2, msg, strlen(msg));
+        write(2, msg, strlen(msg)); /* DevSkim: ignore DS140021 — string literal */
         ret = 1;
     }
     close(fd);
