@@ -44,7 +44,6 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ///
 /// Aliasing `&mut PageTable` is UB.  Call only when no other `OffsetPageTable`
 /// is alive (e.g. after `mm::init` has returned and dropped its local mapper).
-#[allow(dead_code)] // used by userspace setup (Phase 5 / Phase 7+), not Phase 6
 pub unsafe fn get_mapper() -> OffsetPageTable<'static> {
     let phys_offset = x86_64::VirtAddr::new(super::phys_offset());
     let level_4_table = active_level_4_table(phys_offset);

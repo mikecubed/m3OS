@@ -1,5 +1,8 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
@@ -12,142 +15,303 @@ const PAGE_SIZE: u64 = 4096;
 /// code paths that run before ExitBootServices completes.
 pub(crate) const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
 
-struct BumpAllocator {
-    regions: Option<&'static [MemoryRegion]>,
-    region_index: usize,
-    next_addr: u64,
-    frames_allocated: usize,
+/// Magic value written to bytes 8..16 of each free frame for double-free detection.
+const FREE_MAGIC: u64 = 0xDEAD_F4EE_F4EE_DEAD;
+
+/// Free-list frame allocator.
+///
+/// Each free 4 KiB frame stores:
+///   - bytes 0..8: physical address of the next free frame (0 = end of list)
+///   - bytes 8..16: `FREE_MAGIC` sentinel for double-free detection
+///
+/// The allocator accesses frame memory through the bootloader's physical-memory
+/// offset mapping (physical address P is at virtual address `phys_offset + P`).
+struct FreeListAllocator {
+    /// Physical address of the first free frame, or 0 if the list is empty.
+    head: u64,
+    /// Number of frames currently on the free list.
+    free_count: usize,
+    /// Total number of usable frames discovered at init (>= 1 MiB).
+    total_frames: usize,
+    /// Virtual base of the physical-memory offset mapping.
+    phys_offset: u64,
+    /// Highest physical frame number from the memory map (P17-T009).
+    max_frame_number: u64,
 }
 
-impl BumpAllocator {
+impl FreeListAllocator {
     const fn new() -> Self {
         Self {
-            regions: None,
-            region_index: 0,
-            next_addr: 0,
-            frames_allocated: 0,
+            head: 0,
+            free_count: 0,
+            total_frames: 0,
+            phys_offset: 0,
+            max_frame_number: 0,
         }
     }
 
-    fn init(&mut self, regions: &'static [MemoryRegion]) {
-        self.regions = Some(regions);
-        self.region_index = 0;
-        self.next_addr = 0;
-        self.frames_allocated = 0;
+    /// Build the free list from bootloader memory regions.
+    ///
+    /// Pushes every usable frame (>= 1 MiB) onto the intrusive linked list.
+    fn init(&mut self, regions: &'static [MemoryRegion], phys_offset: u64) {
+        self.phys_offset = phys_offset;
+        self.head = 0;
+        self.free_count = 0;
+        self.total_frames = 0;
 
-        // Advance to the first allocatable region
-        self.advance_to_usable();
-
-        // Count and log total allocatable frames (excluding sub-1MiB)
-        let total_frames: u64 = regions
+        // P17-T009: determine highest physical frame number from usable regions.
+        // Only Usable regions produce allocatable frames; reserved/MMIO regions
+        // at high addresses (e.g., PCI hole at 4 GiB) must not inflate the table.
+        let max_phys_addr = regions
             .iter()
             .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| {
-                let start = align_up(r.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
-                let end = align_down(r.end, PAGE_SIZE);
-                if end > start {
-                    (end - start) / PAGE_SIZE
-                } else {
-                    0
-                }
-            })
-            .sum();
+            .map(|r| r.end)
+            .max()
+            .unwrap_or(0);
+        self.max_frame_number = if max_phys_addr > 0 {
+            (max_phys_addr - 1) / PAGE_SIZE
+        } else {
+            0
+        };
+
+        for region in regions {
+            if region.kind != MemoryRegionKind::Usable {
+                continue;
+            }
+
+            let start = align_up(region.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
+            let end = align_down(region.end, PAGE_SIZE);
+            if end <= start {
+                continue;
+            }
+
+            let mut addr = start;
+            while addr + PAGE_SIZE <= end {
+                self.push_frame(addr);
+                self.total_frames += 1;
+                addr += PAGE_SIZE;
+            }
+        }
 
         log::info!(
-            "[mm] frame allocator: {} usable 4KiB frames available (>= 1 MiB)",
-            total_frames
+            "[mm] frame allocator: {} usable 4KiB frames on free list (>= 1 MiB), max frame #{}",
+            self.total_frames,
+            self.max_frame_number
         );
     }
 
-    fn advance_to_usable(&mut self) {
-        let regions = match self.regions {
-            Some(r) => r,
-            None => return,
-        };
-
-        while self.region_index < regions.len() {
-            let region = &regions[self.region_index];
-            if region.kind == MemoryRegionKind::Usable {
-                // Clamp start to 1 MiB to skip low-memory frames
-                let start = align_up(region.start.max(ALLOC_MIN_ADDR), PAGE_SIZE);
-                if start < region.end {
-                    self.next_addr = start;
-                    return;
-                }
-            }
-            self.region_index += 1;
+    /// Push a frame onto the head of the free list.
+    ///
+    /// Writes the current head pointer and magic sentinel into the frame's
+    /// first 16 bytes via the physical-memory offset mapping.
+    fn push_frame(&mut self, phys: u64) {
+        let virt = (self.phys_offset + phys) as *mut u64;
+        // SAFETY: `phys` is a valid, page-aligned physical address within a
+        // Usable memory region.  The physical-memory offset mapping guarantees
+        // `virt` is a valid kernel virtual address.  We have exclusive ownership
+        // of the frame (it is not mapped anywhere else).
+        unsafe {
+            // bytes 0..8: next pointer
+            virt.write(self.head);
+            // bytes 8..16: magic sentinel
+            virt.add(1).write(FREE_MAGIC);
         }
+        self.head = phys;
+        self.free_count += 1;
     }
 
-    fn allocate(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let regions = self.regions?;
-
-        loop {
-            if self.region_index >= regions.len() {
-                return None;
-            }
-
-            let region = &regions[self.region_index];
-
-            // Only allocate from usable regions
-            if region.kind != MemoryRegionKind::Usable {
-                self.region_index += 1;
-                self.advance_to_usable();
-                continue;
-            }
-
-            let frame_start = self.next_addr;
-            let frame_end = frame_start + PAGE_SIZE;
-
-            if frame_end > region.end {
-                // Current region exhausted, move to next
-                self.region_index += 1;
-                self.advance_to_usable();
-                continue;
-            }
-
-            self.next_addr = frame_end;
-            self.frames_allocated += 1;
-
-            let addr = PhysAddr::new(frame_start);
-            return Some(PhysFrame::containing_address(addr));
+    /// Pop a frame from the head of the free list.
+    fn pop_frame(&mut self) -> Option<u64> {
+        if self.head == 0 {
+            return None;
         }
+
+        let phys = self.head;
+        let virt = (self.phys_offset + phys) as *mut u64;
+        // SAFETY: `phys` is a frame on our free list; the physical-memory offset
+        // mapping makes `virt` a valid kernel virtual address.
+        unsafe {
+            // Read next pointer and advance head.
+            self.head = virt.read();
+            // Clear the magic sentinel so double-free detection works.
+            virt.add(1).write(0);
+        }
+        self.free_count -= 1;
+        Some(phys)
+    }
+
+    /// Allocate a single 4 KiB frame.
+    fn allocate(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let phys = self.pop_frame()?;
+        let addr = PhysAddr::new(phys);
+        Some(PhysFrame::containing_address(addr))
+    }
+
+    /// Push a frame back onto the free list (unconditionally).
+    ///
+    /// Panics if the frame is already on the free list (double-free).
+    fn free_to_list(&mut self, phys: u64) {
+        debug_assert!(
+            phys >= ALLOC_MIN_ADDR,
+            "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
+            phys
+        );
+        debug_assert!(
+            phys.is_multiple_of(PAGE_SIZE),
+            "free_frame: address {:#x} is not page-aligned",
+            phys
+        );
+
+        // Double-free detection: check if the magic sentinel is present.
+        let virt = (self.phys_offset + phys) as *const u64;
+        // SAFETY: phys is a page-aligned address that was previously allocated;
+        // the offset mapping makes virt valid.
+        let magic = unsafe { virt.add(1).read() };
+        if magic == FREE_MAGIC {
+            panic!(
+                "double-free detected: frame {:#x} is already on the free list",
+                phys
+            );
+        }
+
+        self.push_frame(phys);
     }
 }
 
-struct LockedFrameAllocator(Mutex<BumpAllocator>);
+struct LockedFrameAllocator(Mutex<FreeListAllocator>);
 
 static FRAME_ALLOCATOR: LockedFrameAllocator =
-    LockedFrameAllocator(Mutex::new(BumpAllocator::new()));
+    LockedFrameAllocator(Mutex::new(FreeListAllocator::new()));
 
 static FRAME_ALLOC_INIT: AtomicBool = AtomicBool::new(false);
 
-pub fn init(regions: &'static [MemoryRegion]) {
+pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     assert!(
         !FRAME_ALLOC_INIT.swap(true, Ordering::AcqRel),
         "frame_allocator::init called more than once"
     );
-    FRAME_ALLOCATOR.0.lock().init(regions);
+    FRAME_ALLOCATOR.0.lock().init(regions, phys_offset);
 }
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    FRAME_ALLOCATOR.0.lock().allocate()
-}
-
-/// Returns how many frames have been handed out since init.
-pub fn allocated_count() -> usize {
-    FRAME_ALLOCATOR.0.lock().frames_allocated
+    let frame = FRAME_ALLOCATOR.0.lock().allocate()?;
+    // P17-T014: set refcount to 1 for freshly allocated frames.
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        refcount_inc(frame.start_address().as_u64());
+    }
+    Some(frame)
 }
 
 /// Return a frame to the allocator.
 ///
-/// Currently a no-op because the frame allocator is a bump allocator that
-/// cannot reclaim frames. The stub is required so that `free_process_page_table`
-/// compiles. Proper frame reclamation with a free-list is planned for Phase 13.
-#[allow(unused_variables)]
-pub fn free_frame(_phys: u64) {
-    // Bump allocator: frames are not reclaimed.
-    // Phase 13+ will add a free list.
+/// If refcounting is initialized, decrements the reference count first.
+/// The frame is only pushed onto the free list when the count reaches zero.
+/// Frames allocated before refcounting was enabled (refcount == 0) are freed
+/// directly without decrementing.
+/// Panics on double-free (frame already on the free list).
+pub fn free_frame(phys: u64) {
+    // P17-T015: use refcounting when available.
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        let current = refcount_get(phys);
+        if current == 0 {
+            // Frame was allocated before refcounting was enabled — free directly.
+        } else {
+            let new_count = refcount_dec(phys);
+            if new_count > 0 {
+                // Frame is still shared — do not reclaim.
+                return;
+            }
+        }
+    }
+    FRAME_ALLOCATOR.0.lock().free_to_list(phys);
+}
+
+/// Returns the number of frames currently on the free list.
+pub fn free_count() -> usize {
+    FRAME_ALLOCATOR.0.lock().free_count
+}
+
+/// Returns the total number of usable frames discovered at boot.
+pub fn total_frames() -> usize {
+    FRAME_ALLOCATOR.0.lock().total_frames
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame reference counting (P17-T009 through P17-T015)
+// ---------------------------------------------------------------------------
+
+/// True once `init_refcounts()` has completed.
+static REFCOUNT_INIT: AtomicBool = AtomicBool::new(false);
+
+/// The refcount table. Each entry corresponds to a physical frame number
+/// (phys_addr / 4096). Allocated on the heap after `heap::init_heap`.
+static REFCOUNT_TABLE: spin::Once<Vec<AtomicU16>> = spin::Once::new();
+
+/// Initialize the per-frame refcount table.
+///
+/// Must be called **after** `heap::init_heap` (since it allocates a `Vec`) and
+/// **after** `frame_allocator::init` (since it reads `max_frame_number`).
+pub fn init_refcounts() {
+    let max_frame = FRAME_ALLOCATOR.0.lock().max_frame_number;
+    let count = (max_frame + 1) as usize;
+
+    REFCOUNT_TABLE.call_once(|| {
+        let mut table = Vec::with_capacity(count);
+        for _ in 0..count {
+            table.push(AtomicU16::new(0));
+        }
+        table
+    });
+
+    REFCOUNT_INIT.store(true, Ordering::Release);
+
+    log::info!(
+        "[mm] refcount table: {} entries for frames 0..={}",
+        count,
+        max_frame
+    );
+}
+
+/// Atomically increment the reference count for the frame at `phys`.
+///
+/// Panics on overflow (count would exceed `u16::MAX`).
+pub fn refcount_inc(phys: u64) {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_inc: frame index out of range");
+    let prev = table[idx].fetch_add(1, Ordering::SeqCst);
+    assert!(
+        prev < u16::MAX,
+        "refcount_inc: overflow for frame {:#x}",
+        phys
+    );
+}
+
+/// Atomically decrement the reference count for the frame at `phys`.
+///
+/// Returns the **new** count. Panics on underflow (decrement below 0).
+pub fn refcount_dec(phys: u64) -> u16 {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_dec: frame index out of range");
+    let prev = table[idx].fetch_sub(1, Ordering::SeqCst);
+    assert!(prev > 0, "refcount_dec: underflow for frame {:#x}", phys);
+    prev - 1
+}
+
+/// Read the current reference count for the frame at `phys`.
+#[allow(dead_code)]
+pub fn refcount_get(phys: u64) -> u16 {
+    let idx = (phys / PAGE_SIZE) as usize;
+    let table = REFCOUNT_TABLE
+        .get()
+        .expect("refcount table not initialized");
+    assert!(idx < table.len(), "refcount_get: frame index out of range");
+    table[idx].load(Ordering::SeqCst)
 }
 
 #[inline]

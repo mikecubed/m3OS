@@ -1,15 +1,21 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8000_0000_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+/// Initial heap size mapped at boot (1 MiB).
+pub const HEAP_INITIAL_SIZE: usize = 1024 * 1024; // 1 MiB
+/// Maximum heap size the kernel may grow to (64 MiB).
+pub const HEAP_MAX_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 static HEAP_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Tracks the current number of bytes mapped into the heap region.
+static HEAP_MAPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// Map the kernel heap region and initialise the global allocator.
 ///
@@ -26,7 +32,7 @@ pub fn init_heap(
 
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
-        let heap_end = heap_start + HEAP_SIZE as u64 - 1u64;
+        let heap_end = heap_start + HEAP_INITIAL_SIZE as u64 - 1u64;
         let heap_start_page = Page::containing_address(heap_start);
         let heap_end_page = Page::containing_address(heap_end);
         Page::range_inclusive(heap_start_page, heap_end_page)
@@ -46,12 +52,108 @@ pub fn init_heap(
     }
 
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        ALLOCATOR
+            .lock()
+            .init(HEAP_START as *mut u8, HEAP_INITIAL_SIZE);
     }
 
+    HEAP_MAPPED.store(HEAP_INITIAL_SIZE, Ordering::Release);
+
     log::info!(
-        "[mm] heap initialized at {:#x}, size={}KiB",
+        "[mm] heap initialized at {:#x}, size={}KiB, max={}MiB",
         HEAP_START,
-        HEAP_SIZE / 1024
+        HEAP_INITIAL_SIZE / 1024,
+        HEAP_MAX_SIZE / (1024 * 1024),
     );
+}
+
+/// Grow the kernel heap by up to `additional_bytes`, mapping new pages and
+/// extending the allocator.
+///
+/// Growth may be partial if frame allocation fails mid-way. Returns `Ok(())`
+/// if at least one new page was mapped; returns `Err(())` if growth would
+/// exceed `HEAP_MAX_SIZE` or no pages could be mapped at all.
+pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
+    use super::paging::{get_mapper, GlobalFrameAlloc};
+
+    // Round up to page boundary.
+    let page_size: usize = 4096;
+    let additional_bytes = (additional_bytes + page_size - 1) & !(page_size - 1);
+
+    let current_mapped = HEAP_MAPPED.load(Ordering::Acquire);
+    let new_mapped = current_mapped.checked_add(additional_bytes).ok_or(())?;
+
+    // P17-T026: safety cap — refuse to exceed HEAP_MAX_SIZE.
+    if new_mapped > HEAP_MAX_SIZE {
+        log::error!(
+            "[mm] heap growth refused: requested total {}KiB exceeds max {}MiB",
+            new_mapped / 1024,
+            HEAP_MAX_SIZE / (1024 * 1024),
+        );
+        return Err(());
+    }
+
+    let mut mapper = unsafe { get_mapper() };
+    let mut frame_alloc = GlobalFrameAlloc;
+
+    let start_addr = VirtAddr::new((HEAP_START + current_mapped) as u64);
+    let end_addr = VirtAddr::new((HEAP_START + new_mapped - 1) as u64);
+    let start_page: Page<Size4KiB> = Page::containing_address(start_addr);
+    let end_page: Page<Size4KiB> = Page::containing_address(end_addr);
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    let mut pages_mapped: usize = 0;
+    for page in Page::range_inclusive(start_page, end_page) {
+        let frame = match super::frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => {
+                log::error!(
+                    "[mm] heap growth failed: frame allocation failed after {} pages",
+                    pages_mapped,
+                );
+                break;
+            }
+        };
+
+        let map_result = unsafe { mapper.map_to(page, frame, flags, &mut frame_alloc) };
+        match map_result {
+            Ok(flush) => flush.flush(),
+            Err(e) => {
+                log::error!("[mm] heap growth failed: map_to error: {:?}", e);
+                // Return the just-allocated frame to avoid leaking it.
+                super::frame_allocator::free_frame(frame.start_address().as_u64());
+                break;
+            }
+        }
+        pages_mapped += 1;
+    }
+
+    if pages_mapped == 0 {
+        return Err(());
+    }
+
+    // Extend the allocator for however many pages were actually mapped.
+    let bytes_mapped = pages_mapped * 4096;
+    unsafe {
+        ALLOCATOR.lock().extend(bytes_mapped);
+    }
+
+    HEAP_MAPPED.store(current_mapped + bytes_mapped, Ordering::Release);
+
+    log::info!(
+        "[mm] heap grown by {}KiB → total {}KiB",
+        bytes_mapped / 1024,
+        (current_mapped + bytes_mapped) / 1024,
+    );
+
+    Ok(())
+}
+
+/// Attempt to grow the heap on OOM. Called from the alloc error handler.
+///
+/// Returns `true` if growth succeeded and the caller should retry.
+pub fn try_grow_on_oom() -> bool {
+    // Try to grow by 1 MiB.
+    grow_heap(1024 * 1024).is_ok()
 }

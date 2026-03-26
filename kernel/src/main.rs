@@ -1871,5 +1871,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    panic!("allocation error: {:?}", layout)
+    // Attempt to grow the heap so that *future* allocations have a better
+    // chance of succeeding. This handler must diverge (-> !) and cannot retry
+    // the allocation that triggered OOM.
+    if mm::heap::try_grow_on_oom() {
+        panic!(
+            "allocation error for {:?} — heap was grown, but alloc_error_handler cannot retry",
+            layout
+        );
+    }
+    panic!("allocation error: {:?} (heap growth failed)", layout)
 }

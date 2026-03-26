@@ -30,27 +30,24 @@ graph TD
 
 ## Physical Frame Allocator
 
-### Phase 2 implementation: bump allocator
+### Phase 17 implementation: free-list allocator with reference counting
 
-The Phase 2 frame allocator is a **bump allocator** — allocate-only, no free:
+The frame allocator is an **intrusive free-list** — each free 4 KiB frame stores a
+next pointer (bytes 0..8) and a magic sentinel (bytes 8..16) in its own memory, accessed
+through the bootloader's physical-memory offset mapping.
 
-- Iterates `BootInfo::memory_regions` in order, skipping non-`Usable` regions
-- Skips all frames below 1 MiB (`ALLOC_MIN_ADDR = 0x0010_0000`) — some UEFI/QEMU
-  memory maps mark conventional low memory as `Usable`, but those frames may hold
-  BIOS data area remnants or be in use by firmware code still running at boot
-- Hands out 4 KiB-aligned frames one at a time by advancing a pointer
-- Never returns a frame once allocated (no deallocation)
+- `allocate_frame()` pops from the head of the free list
+- `free_frame(phys)` pushes back to the head; panics on double-free (magic check)
+- `free_count()` / `total_frames()` for diagnostics
+- Frames below 1 MiB are never allocated (`ALLOC_MIN_ADDR = 0x0010_0000`)
 
-```rust
-pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    FRAME_ALLOCATOR.0.lock().allocate()
-}
-```
-
-**Limitations:**
-- Cannot reclaim frames — memory consumed during init is gone forever
-- Not suitable for process termination or page-out (Phase 4+)
-- A single freed frame from the middle of a usable region is unrecoverable
+**Per-frame reference counting** is layered on top:
+- A `Vec<AtomicU16>` table indexed by frame number (phys_addr / 4096)
+- Initialized after heap init; frames allocated before refcounting starts are tracked
+  with refcount 0 and freed directly
+- `allocate_frame()` sets refcount to 1
+- `free_frame()` decrements refcount; only pushes to free list when count reaches 0
+- `refcount_inc(phys)` / `refcount_dec(phys)` / `refcount_get(phys)` for CoW support
 
 ### Concepts: physical frames vs virtual pages vs kernel heap
 
@@ -62,16 +59,29 @@ pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
 
 The frame allocator works in *physical* space. The page mapper works across the *physical↔virtual* boundary. The heap allocator works entirely in *virtual* space, carving up the already-mapped heap region.
 
+### Copy-on-write fork (Phase 17)
+
+`sys_fork` uses CoW instead of eagerly copying all user pages:
+
+1. `cow_clone_user_pages`: walks parent's PTEs; for writable pages, clears WRITABLE and
+   sets BIT_9 (CoW marker) in both parent and child; increments refcount for each shared
+   frame; maps same physical frame in child's page table. Read-only pages (.text/.rodata)
+   are shared without BIT_9 so writes to them remain genuine protection violations.
+2. Flushes parent TLB via CR3 reload
+3. On write to a CoW page, a page fault fires:
+   - Detection: ring-3 write fault, page present but not writable, PTE BIT_9 set
+   - Resolution (in ISR): allocate fresh frame, copy 4 KiB, remap writable, clear BIT_9,
+     decrement old frame's refcount. On OOM, falls through to kill the process.
+   - Fast path: if refcount == 1 (sole owner), just remap writable without copying
+
 ### Future allocator evolution
 
-Mature kernels replace the bump allocator in stages:
+Mature kernels add further refinements:
 
-1. **Buddy allocator** — splits/merges power-of-two frame blocks; O(log n) alloc/free; easy to reclaim
-2. **SLAB/SLUB allocator** — small-object caching on top of buddy; amortizes `kmalloc` overhead
-3. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries, better throughput for large buffers
-4. **Demand paging / copy-on-write** — don't map physical frames until first access; enables fork() efficiency
-
-For m³OS, the bump allocator is sufficient through Phase 5 (userspace entry). Phase 6+ IPC page grants will require a proper frame reclaim path.
+1. **Buddy allocator** — splits/merges power-of-two frame blocks; O(log n) alloc/free
+2. **SLAB/SLUB allocator** — small-object caching on top of buddy
+3. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries
+4. **Demand paging** — don't map physical frames until first access
 
 ```
 Physical Memory
@@ -156,25 +166,20 @@ let page_table = unsafe { &mut *(virt_addr.as_mut_ptr::<PageTable>()) };
 
 ## Kernel Heap
 
-Once paging is set up, the kernel allocates a heap region (e.g., 1 MiB at a fixed
-virtual address) and initializes `linked_list_allocator` with it:
+The kernel heap starts at `HEAP_START = 0xFFFF_8000_0000_0000` with an initial size of
+1 MiB. It uses `linked_list_allocator::LockedHeap` as the `#[global_allocator]`.
 
-```rust
-use linked_list_allocator::LockedHeap;
+**Growable heap (Phase 17):** The heap can grow up to `HEAP_MAX_SIZE = 64 MiB`.
+`grow_heap(bytes)` maps fresh frames and calls `ALLOCATOR.lock().extend()`. On partial
+failure (mid-growth OOM), only successfully mapped pages are extended — no leaked frames.
 
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+The `#[alloc_error_handler]` attempts `try_grow_on_oom()` before panicking, but because
+the handler's signature is `-> !` it cannot retry the failed allocation. In practice,
+`extend()` adds the new memory to the free list so the *next* allocation succeeds; the
+current allocation still panics. A custom allocator wrapper could retry transparently
+but is deferred.
 
-pub fn init_heap(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
-    // Map HEAP_START..HEAP_START+HEAP_SIZE to physical frames
-    // Then:
-    unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
-    }
-}
-```
-
-After this, `alloc` types (`Vec`, `Box`, `Arc`, `String`, etc.) work in the kernel.
+After `init_heap`, `alloc` types (`Vec`, `Box`, `Arc`, `String`, etc.) work in the kernel.
 
 ---
 
@@ -216,8 +221,19 @@ graph LR
 
 ---
 
+## Process Exit Cleanup (Phase 17)
+
+When a process exits (`sys_exit` or fault kill):
+1. Read the process's CR3 from the process table
+2. `restore_kernel_cr3()` — switch to the kernel's page table
+3. `free_process_page_table(cr3_phys)` — walk PML4[0..256], skip entries shared with
+   the kernel (detected by matching PDPT frame addresses), free user-accessible leaf
+   pages and private page table structure frames via `free_frame()` (refcount-aware)
+4. `mark_current_dead()` — scheduler removes the task; `Task::_stack` `Box<[u8]>` drops,
+   freeing the kernel stack back to the heap
+
 ## Open Questions
 
-- **Bitmap vs free-list** for the frame allocator — bitmap is simpler; free-list is faster at runtime
-- **Heap size** — fixed 1–4 MiB initially; growable heap needed eventually
-- **Copy-on-write fork** — not needed until we have process spawning from userspace; skip for now
+- **Buddy allocator** — would give O(log n) allocation and coalescing for large allocations
+- **Kernel stack guard pages** — unmapped page below each stack to catch overflow
+- **Per-process memory limits** — tracking and capping process RSS
