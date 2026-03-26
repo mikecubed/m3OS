@@ -102,35 +102,46 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-    for (pages_mapped, page) in Page::range_inclusive(start_page, end_page).enumerate() {
-        let frame = super::frame_allocator::allocate_frame().ok_or_else(|| {
-            log::error!(
-                "[mm] heap growth failed: frame allocation failed after {} pages",
-                pages_mapped,
-            );
-        })?;
+    let mut pages_mapped: usize = 0;
+    for page in Page::range_inclusive(start_page, end_page) {
+        let frame = match super::frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => {
+                log::error!(
+                    "[mm] heap growth failed: frame allocation failed after {} pages",
+                    pages_mapped,
+                );
+                break;
+            }
+        };
 
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, &mut frame_alloc)
-                .map_err(|e| {
-                    log::error!("[mm] heap growth failed: map_to error: {:?}", e);
-                })?
-                .flush();
+        let map_result = unsafe { mapper.map_to(page, frame, flags, &mut frame_alloc) };
+        match map_result {
+            Ok(flush) => flush.flush(),
+            Err(e) => {
+                log::error!("[mm] heap growth failed: map_to error: {:?}", e);
+                break;
+            }
         }
+        pages_mapped += 1;
     }
 
-    // Tell the linked-list allocator about the new memory.
+    if pages_mapped == 0 {
+        return Err(());
+    }
+
+    // Extend the allocator for however many pages were actually mapped.
+    let bytes_mapped = pages_mapped * 4096;
     unsafe {
-        ALLOCATOR.lock().extend(additional_bytes);
+        ALLOCATOR.lock().extend(bytes_mapped);
     }
 
-    HEAP_MAPPED.store(new_mapped, Ordering::Release);
+    HEAP_MAPPED.store(current_mapped + bytes_mapped, Ordering::Release);
 
     log::info!(
         "[mm] heap grown by {}KiB → total {}KiB",
-        additional_bytes / 1024,
-        new_mapped / 1024,
+        bytes_mapped / 1024,
+        (current_mapped + bytes_mapped) / 1024,
     );
 
     Ok(())

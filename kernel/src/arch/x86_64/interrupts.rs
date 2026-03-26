@@ -248,7 +248,10 @@ extern "x86-interrupt" fn page_fault_handler(
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
         if is_write && is_present {
-            // Check that the page has a refcount (indicating CoW).
+            // CoW detection: a shared page (refcount > 1) that was made
+            // read-only by cow_clone_user_pages.  Refcount == 1 means the
+            // page is exclusively owned — a write to it is a genuine
+            // protection violation (e.g., write to .text), not CoW.
             let fault_addr_u64 = match addr {
                 Ok(a) => a.as_u64(),
                 Err(_) => 0,
@@ -256,7 +259,7 @@ extern "x86-interrupt" fn page_fault_handler(
             let page_phys = get_page_phys(fault_addr_u64);
             if let Some(phys) = page_phys {
                 let refcount = crate::mm::frame_allocator::refcount_get(phys);
-                if refcount > 0 {
+                if refcount > 1 {
                     // CoW fault — resolve directly in the ISR. Safe because
                     // the fault is from ring 3 (no kernel locks held) and
                     // we're on a single CPU.

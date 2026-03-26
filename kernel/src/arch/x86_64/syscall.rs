@@ -1199,7 +1199,8 @@ const NEG_EINTR: u64 = (-4_i64) as u64;
 /// Instead of copying page contents, both parent and child share the same
 /// physical frames.  Writable pages have their WRITABLE bit cleared in both
 /// parent and child so that a write triggers a page fault which is resolved
-/// by `handle_cow_fault`.  Frame reference counts are incremented for each
+/// by `resolve_cow_fault` in the page fault handler.  Frame reference counts
+/// are incremented for each
 /// shared frame.
 ///
 /// # Safety

@@ -168,12 +168,15 @@ let page_table = unsafe { &mut *(virt_addr.as_mut_ptr::<PageTable>()) };
 The kernel heap starts at `HEAP_START = 0xFFFF_8000_0000_0000` with an initial size of
 1 MiB. It uses `linked_list_allocator::LockedHeap` as the `#[global_allocator]`.
 
-**Growable heap (Phase 17):** The heap can grow up to `HEAP_MAX_SIZE = 64 MiB`. When an
-allocation fails:
-1. The `#[alloc_error_handler]` calls `try_grow_on_oom()`
-2. `grow_heap(1 MiB)` maps fresh frames into the next unmapped portion of the heap region
-3. Calls `ALLOCATOR.lock().extend(bytes)` to tell the linked-list allocator about new memory
-4. Growth is capped at `HEAP_MAX_SIZE` to prevent runaway allocation
+**Growable heap (Phase 17):** The heap can grow up to `HEAP_MAX_SIZE = 64 MiB`.
+`grow_heap(bytes)` maps fresh frames and calls `ALLOCATOR.lock().extend()`. On partial
+failure (mid-growth OOM), only successfully mapped pages are extended — no leaked frames.
+
+The `#[alloc_error_handler]` attempts `try_grow_on_oom()` before panicking, but because
+the handler's signature is `-> !` it cannot retry the failed allocation. In practice,
+`extend()` adds the new memory to the free list so the *next* allocation succeeds; the
+current allocation still panics. A custom allocator wrapper could retry transparently
+but is deferred.
 
 After `init_heap`, `alloc` types (`Vec`, `Box`, `Arc`, `String`, etc.) work in the kernel.
 
