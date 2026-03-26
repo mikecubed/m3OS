@@ -554,6 +554,24 @@ pub unsafe fn setup_abi_stack_with_envp(
     let kptr = virt_to_kptr(cursor)?;
     (kptr as *mut u64).write(argv.len() as u64);
 
+    // Debug: verify the stack layout.
+    let argc_val = (virt_to_kptr(cursor)? as *const u64).read();
+    // Read the actual argv[0] and argv[1] pointers from the stack.
+    let argv0_slot = (virt_to_kptr(cursor + 8)? as *const u64).read();
+    let argv1_slot = if argv.len() > 1 {
+        (virt_to_kptr(cursor + 16)? as *const u64).read()
+    } else {
+        0
+    };
+    log::debug!(
+        "[abi-stack] rsp={:#x} argc={} argv[0]@{:#x} argv[1]@{:#x} ptrs={:?}",
+        cursor,
+        argc_val,
+        argv0_slot,
+        argv1_slot,
+        &arg_ptrs,
+    );
+
     // Return rsp pointing at argc.
     Ok(cursor)
 }
