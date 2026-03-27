@@ -2006,8 +2006,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     match &entry.backend {
         FdBackend::Stdin => {
-            // Read from kernel stdin buffer (Phase 14, Track E).
-            // Yield-loop until data is available (line-buffered).
+            // Read from kernel stdin buffer (raw byte-at-a-time, Phase 20).
+            // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
             let saved_user_rsp = unsafe { SYSCALL_USER_RSP };

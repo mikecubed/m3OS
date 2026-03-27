@@ -194,9 +194,14 @@ fn execute_pipeline(left: &[u8], right: &[u8]) {
         close(read_fd);
         dup2(write_fd, STDOUT_FILENO as i32);
         close(write_fd);
-        // Tokenize and exec left command.
         exec_simple_command(left);
         exit(127);
+    }
+    if left_pid < 0 {
+        write_str(STDERR_FILENO, "sh: fork failed\n");
+        close(read_fd);
+        close(write_fd);
+        return;
     }
 
     // Fork right child.
@@ -206,19 +211,16 @@ fn execute_pipeline(left: &[u8], right: &[u8]) {
         close(write_fd);
         dup2(read_fd, STDIN_FILENO as i32);
         close(read_fd);
-        // Tokenize and exec right command.
         exec_simple_command(right);
         exit(127);
     }
 
-    // Parent: close both pipe ends and wait for both children.
+    // Parent: close both pipe ends and wait for children.
     close(read_fd);
     close(write_fd);
 
     let mut status: i32 = 0;
-    if left_pid > 0 {
-        waitpid(left_pid as i32, &mut status, 0);
-    }
+    waitpid(left_pid as i32, &mut status, 0);
     if right_pid > 0 {
         waitpid(right_pid as i32, &mut status, 0);
     }
