@@ -67,10 +67,12 @@ fn spawn_shell() -> isize {
 
         // Ion interactive mode now works. Use it as primary shell.
         let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        execve(ION_PATH, &ion_argv, &envp);
+        let ion_ret = execve(ION_PATH, &ion_argv, &envp);
 
-        // Ion not available — fall back to sh0.
-        write_str(STDOUT_FILENO, "init: ion not available, trying sh0\n");
+        // Ion execve failed — fall back to sh0.
+        write_str(STDOUT_FILENO, "init: ion execve failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-ion_ret) as u64);
+        write_str(STDOUT_FILENO, "), trying sh0\n");
         let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
         let ret = execve(SH0_PATH, &sh0_argv, &envp);
 

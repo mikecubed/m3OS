@@ -423,7 +423,7 @@ pub extern "C" fn syscall_handler(
         186 => sys_getpid(),
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
         200 => sys_kill(arg0, arg1),
-        // Phase 21: futex stub — single-threaded OS, yield and return
+        // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
         202 => sys_futex(arg0, arg1, arg2),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
@@ -4389,7 +4389,9 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
             // Force-clear the futex word to 0 so the caller's next
             // lock-acquire CAS (compare_exchange(0, tid)) succeeds.
             let zero = 0u32.to_ne_bytes();
-            let _ = crate::mm::user_mem::copy_to_user(uaddr, &zero);
+            if crate::mm::user_mem::copy_to_user(uaddr, &zero).is_err() {
+                return NEG_EFAULT;
+            }
             0 // pretend we were woken
         }
         FUTEX_WAKE => 1, // pretend one waiter woke up

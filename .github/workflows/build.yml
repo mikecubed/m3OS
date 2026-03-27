@@ -47,7 +47,7 @@ jobs:
           timeout 30 cargo xtask run 2>&1 | tee boot.log || true
           # Phase 20: verify userspace init banner and shell prompt
           grep -q 'm3OS init (PID 1)' boot.log
-          grep -q '\$ ' boot.log
+          grep -qE '(\$ |ion# )' boot.log
           # Verify no kernel panics
           ! grep -q 'panicked at' boot.log
 

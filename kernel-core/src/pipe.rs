@@ -171,4 +171,13 @@ mod tests {
         let read = pipe.read(&mut empty);
         assert_eq!(read, 0);
     }
+
+    #[test]
+    fn refcounts_start_at_zero() {
+        let pipe = Pipe::new();
+        assert_eq!(pipe.reader_count, 0);
+        assert_eq!(pipe.writer_count, 0);
+        assert!(!pipe.has_reader());
+        assert!(!pipe.has_writer());
+    }
 }
