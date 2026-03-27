@@ -330,6 +330,20 @@ pub extern "C" fn syscall_handler(
         _ => {}
     }
 
+    // DEBUG: trace all syscalls from Ion (pid 12) to find where it blocks.
+    {
+        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        if pid == 12 {
+            log::debug!(
+                "[p12 syscall] nr={} args=({:#x}, {:#x}, {:#x})",
+                number,
+                arg0,
+                arg1,
+                arg2
+            );
+        }
+    }
+
     let result = match number {
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
