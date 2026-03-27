@@ -27,63 +27,52 @@
 5. **fault_kill_trampoline missing cleanup** — added `close_all_fds_for` and `send_sigchld_to_parent`
 6. **free_process_page_table safety** — added bounds validation for physical addresses
 
-## Remaining Blockers (2 issues)
+## Resolved Blockers
 
-### Blocker 1: Musl child processes crash writing above stack top
+### Blocker 1: RESOLVED — Fork child caller-saved register corruption
 
-**Symptom:** Every musl C binary exec'd from sh0 (echo, ls, pwd, etc.) page faults at `ELF_STACK_TOP + N*4096` in `__libc_malloc_impl` (rip=0x403003).
+**Original symptom:** Every musl C binary exec'd from sh0 crashed in `memcpy`
+(`rep movsq` at rip=0x403003) with the fault address tracking the exact boundary
+of mapped pages above ELF_STACK_TOP.
 
-**Root cause:** Musl's `__init_tls` allocates the TLS/TCB block at an address ABOVE the initial stack pointer. On Linux, the kernel maps a much larger stack region (8 MB default) and the area above RSP is valid. Our kernel only maps `STACK_PAGES` (64) pages below `ELF_STACK_TOP`. Musl writes above our mapped region.
+**Actual root cause (corrected):** The original diagnosis of "musl TLS writing
+above stack" was wrong. The crash was in sh0's own `memcpy`, called in the
+**forked child before execve**. The Linux syscall ABI preserves all registers
+except RAX/RCX/R11, but our fork child trampoline only restored callee-saved
+registers (RBX/RBP/R12-R15). Caller-saved registers (RDI/RSI/RDX/R8/R9/R10)
+contained garbage kernel values, so the forked child's `memcpy` used a bogus
+destination pointer from kernel-mode RDI.
 
-**Key evidence:**
-- Crash address is always exactly `ELF_STACK_TOP + (extra_pages * 4096)` — the first unmapped page
-- rip=0x403003 is `__libc_malloc_impl` — musl's internal allocator
-- Disassembly shows no TLS prefix (not `fs:` access) — it's a regular memory write through a pointer
-- Adding extra pages above shifts the fault address proportionally
+**Fix (commit b6af358):**
+1. Save RDI/RSI/RDX/R8/R9/R10 at `syscall_entry` to new global statics
+2. Pass them through `ForkChildCtx` and `ForkEntryCtx`
+3. Restore them in `fork_enter_userspace` assembly before IRETQ
+4. Also added demand paging for stack region (8 MiB above ELF_STACK_TOP)
+   as defense-in-depth for musl's actual TLS allocation needs
 
-**Recommended fix approach:**
-1. **Read musl's `__init_tls` source** (`src/env/__init_tls.c` in musl) to understand exactly how it calculates the TLS block address and size
-2. The TLS block is likely allocated via `__syscall(SYS_mmap, ...)` at a specific address, OR musl's `_start` sets up the thread-control block above the stack
-3. **Most likely fix:** Our `ELF_STACK_TOP` should not be the literal top of mapped memory. Instead, map a generous region ABOVE the stack (e.g., 1 MB) for musl's TLS/TCB, OR handle the page fault by dynamically mapping pages when the access is within a reasonable range above the stack (demand paging)
-4. **Quick-and-dirty fix:** Map 256 extra pages (1 MB) above `ELF_STACK_TOP` — this should cover musl's TLS needs. The current 16 pages isn't enough.
+### Blocker 2: Deferred to Phase 22 — Ion interactive/script mode
 
-**Files to investigate:**
-- `kernel/src/mm/elf.rs:365` — `map_user_stack` function
-- `kernel/src/mm/elf.rs:44` — `ELF_STACK_TOP` constant (currently `0x7FFF_FF00_0000`)
-- musl source: `src/env/__init_tls.c`, `src/internal/pthread_impl.h`
+Ion's `-c` mode exits with code 1 because `set_unique_pid` calls `tcsetpgrp`
+which returns ENOTTY, causing ion to abort before processing the `-c` command.
+This is fundamentally a termios issue (Phase 22).
 
-### Blocker 2: Ion interactive mode panics (SIGABRT)
-
-**Symptom:** Ion starts, prints warnings (ENOTTY, config/history errors), forks child for PROMPT command, child runs `/bin/PROMPT` which outputs "ion# " and exits(0), then ion panics with SIGABRT.
-
-**Root cause:** Ion's `liner` line-editing library or ion's command pipeline reading fails in non-TTY mode. The panic isn't in `prompt.rs` (that was patched) — it's deeper in ion's runtime, likely in `readln.rs:9` (`fcntl(...).unwrap()`) or in liner's stdin handling.
-
-**Recommended fix approach:**
-1. This is fundamentally a **Phase 22 (Termios) issue** — ion's liner library expects a real TTY
-2. For Phase 21, the pragmatic approach is: **sh0 is the interactive shell, ion is script-only**
-3. To make `ion -c "echo hello"` work, the script-mode code path needs to not trigger liner at all. Currently the `-c` flag doesn't produce output — needs investigation of whether our argv passing to execve is correct for ion's argument parsing
-4. Consider testing with `echo "echo hello" | /bin/ion` from sh0 to pipe a script into ion's stdin
-
-**Files:**
-- `userspace/init/src/main.rs:69-81` — shell spawn logic (currently sh0 primary, ion fallback)
-- `/tmp/ion-build/ion/src/binary/readln.rs` — liner's non-TTY handling
-- `/tmp/ion-build/ion/src/binary/prompt.rs` — patched to not panic on non-subprocess errors
-
-## Remaining Tasks
+## Completed Tasks
 
 ### Must-fix for PR merge
-- [ ] **Fix musl stack-top crash** (Blocker 1) — without this, no musl binary can run from the shell
-- [ ] Verify `echo hello` works from sh0 prompt after fix
-- [ ] Verify all Phase 20 acceptance criteria still pass with sh0
+- [x] **Fix musl stack-top crash** (Blocker 1) — fork child register corruption fixed
+- [x] Verify `echo hello` works from sh0 prompt — confirmed
+- [x] Verify all Phase 20 acceptance criteria still pass with sh0 — confirmed
+  (echo, pwd, ls, cd, cat, output redirection, pipelines all work)
 
 ### Should-do for Phase 21 completeness
-- [ ] Get `ion -c "echo hello"` working (script mode)
-- [ ] Update task list with final status
-- [ ] Write `docs/19-ion-shell.md` (P21-T050)
-- [ ] Update CI assertions (P21-T023)
+- [x] ~~Get `ion -c "echo hello"` working~~ — investigated; deferred to Phase 22
+- [x] Update task list with final status
+- [x] Write `docs/19-ion-shell.md` (P21-T050)
+- [x] Update CI assertions (P21-T023)
 
 ### Deferred to Phase 22 (Termios)
 - Ion interactive mode (raw-mode line editing, history, tab completion)
+- Ion script mode (`ion -c`) — needs `tcsetpgrp` to succeed
 - `isatty()` returning true for console fd
 - Ion's liner library TTY handling
 - All interactive acceptance tests (P21-T028, T030-T034, T038-T044)
