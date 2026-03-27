@@ -309,6 +309,8 @@ pub extern "C" fn syscall_handler(
         4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
+        // Phase 21: socketpair — return ENOSYS (no sockets yet)
+        53 => NEG_ENOSYS,
         // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
         56 => sys_clone(arg0, user_rip, user_rsp),
         57 => sys_fork(user_rip, user_rsp),
@@ -350,6 +352,8 @@ pub extern "C" fn syscall_handler(
         186 => sys_getpid(),
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
         200 => sys_kill(arg0, arg1),
+        // Phase 21: futex stub — single-threaded OS, yield and return
+        202 => sys_futex(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
@@ -3941,4 +3945,28 @@ fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
         return NEG_EFAULT;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// futex(uaddr, op, val, ...) — syscall 202
+// ---------------------------------------------------------------------------
+
+/// Minimal futex stub for single-threaded OS.
+/// FUTEX_WAIT: yield CPU then return 0 (pretend wakeup occurred).
+/// FUTEX_WAKE: return 1 (pretend one waiter was woken).
+fn sys_futex(_uaddr: u64, op: u64) -> u64 {
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const FUTEX_PRIVATE: u64 = 128;
+
+    let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
+    match cmd {
+        FUTEX_WAIT => {
+            // Yield once to let other tasks run, then pretend we were woken.
+            crate::task::yield_now();
+            0
+        }
+        FUTEX_WAKE => 1, // pretend one waiter woke up
+        _ => 0,          // unknown ops succeed silently
+    }
 }
