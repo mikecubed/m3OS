@@ -324,7 +324,7 @@ pub fn nanosleep(seconds: u64) -> isize {
     // The kernel's nanosleep reads a timespec struct from a user pointer:
     //   bytes 0..8: tv_sec (i64)
     //   bytes 8..16: tv_nsec (i64)
-    let ts: [u64; 2] = [seconds, 0];
+    let ts: [i64; 2] = [seconds as i64, 0];
     unsafe { syscall2(SYS_NANOSLEEP, ts.as_ptr() as u64, 0) as isize }
 }
 

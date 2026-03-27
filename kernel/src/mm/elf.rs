@@ -725,8 +725,14 @@ fn apply_rela_relocations(
     let mut rela_size: u64 = 0;
     let mut i = 0;
     while i + 16 <= dyn_sz {
-        let off = dyn_off + i;
-        if off + 16 > data.len() {
+        let off = match dyn_off.checked_add(i) {
+            Some(o) => o,
+            None => break,
+        };
+        if match off.checked_add(16) {
+            Some(end) => end > data.len(),
+            None => true,
+        } {
             break;
         }
         let d_tag = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
@@ -757,8 +763,14 @@ fn apply_rela_relocations(
     // Each Elf64_Rela entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
     let mut j = 0;
     while j + 24 <= rela_sz {
-        let off = rela_off + j;
-        if off + 24 > data.len() {
+        let off = match rela_off.checked_add(j) {
+            Some(o) => o,
+            None => break,
+        };
+        if match off.checked_add(24) {
+            Some(end) => end > data.len(),
+            None => true,
+        } {
             break;
         }
         let r_offset = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());

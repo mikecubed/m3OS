@@ -1,84 +1,41 @@
-//! Kernel stdin buffer (Phase 14, Track E).
+//! Kernel stdin buffer (Phase 20).
 //!
-//! Provides a line-buffered stdin for userspace processes.  Characters are
-//! accumulated in a line buffer; on Enter the completed line (including '\n')
-//! is flushed to the read buffer where `read(0, ...)` can consume it.
-//!
-//! The stdin feeder task reads scancodes from the keyboard IRQ ring buffer,
-//! decodes them to characters, echoes them to the console, handles backspace,
-//! and flushes on Enter.
+//! Provides a raw (character-at-a-time) stdin for userspace processes.
+//! Each byte pushed via `push_byte` is immediately available to
+//! `read(0, ...)` — there is no kernel-side line buffering.  The
+//! userspace shell handles its own echo, backspace, and line editing.
 
-extern crate alloc;
-
-use alloc::vec::Vec;
 use spin::Mutex;
 
 /// Maximum size of the read-ready buffer.
 const STDIN_BUF_SIZE: usize = 4096;
 
-/// The global stdin state.
+/// The global stdin state — a simple circular byte buffer.
 struct StdinState {
-    /// Line buffer: characters typed but not yet committed (Enter not pressed).
-    line: Vec<u8>,
-    /// Read-ready buffer: completed lines available for `read(0, ...)`.
     buf: [u8; STDIN_BUF_SIZE],
-    /// Read position in buf.
     read_pos: usize,
-    /// Number of valid bytes in buf.
     count: usize,
 }
 
 impl StdinState {
     const fn new() -> Self {
         StdinState {
-            line: Vec::new(),
             buf: [0u8; STDIN_BUF_SIZE],
             read_pos: 0,
             count: 0,
         }
     }
 
-    /// Append a character to the line buffer.
-    fn push_char(&mut self, c: u8) {
-        if self.line.len() < 1024 {
-            self.line.push(c);
-        }
-    }
-
-    /// Remove the last character from the line buffer (backspace).
-    fn backspace(&mut self) -> bool {
-        self.line.pop().is_some()
-    }
-
-    /// Flush the line buffer + '\n' into the read-ready buffer.
-    ///
-    /// If the buffer is full, retains unflushed bytes in the line buffer
-    /// so they can be retried later (prevents silent data loss).
-    fn flush_line(&mut self) {
-        let mut flushed = 0;
-        for &b in &self.line {
-            if self.count >= STDIN_BUF_SIZE {
-                break;
-            }
-            let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
-            self.buf[write_pos] = b;
-            self.count += 1;
-            flushed += 1;
-        }
-        // Add newline if there's space.
+    /// Push a single byte into the read-ready buffer (immediately readable).
+    fn push_byte(&mut self, c: u8) {
         if self.count < STDIN_BUF_SIZE {
             let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
-            self.buf[write_pos] = b'\n';
+            self.buf[write_pos] = c;
             self.count += 1;
-            // Newline was appended; the line is complete, so discard the buffer.
-            self.line.clear();
-        } else {
-            // Couldn't even fit the newline; retain unflushed portion so it can be retried.
-            self.line.drain(..flushed);
         }
     }
 
-    /// Read up to `n` bytes from the read-ready buffer.
+    /// Read up to `dst.len()` bytes from the buffer.
     fn read(&mut self, dst: &mut [u8]) -> usize {
         let to_read = dst.len().min(self.count);
         for (i, byte) in dst.iter_mut().enumerate().take(to_read) {
@@ -96,27 +53,15 @@ impl StdinState {
 
 static STDIN: Mutex<StdinState> = Mutex::new(StdinState::new());
 
-/// Push a decoded character into the stdin line buffer.
+/// Push a byte into stdin (immediately readable by userspace).
 pub fn push_char(c: u8) {
-    STDIN.lock().push_char(c);
+    STDIN.lock().push_byte(c);
 }
 
-/// Handle backspace in the line buffer.
-pub fn backspace() -> bool {
-    STDIN.lock().backspace()
-}
+/// Clear line — no-op in raw mode (retained for Ctrl-C/Z handler compat).
+pub fn clear_line() {}
 
-/// Flush the current line (on Enter).
-pub fn flush_line() {
-    STDIN.lock().flush_line();
-}
-
-/// Discard the current line buffer (e.g., on Ctrl-C/Ctrl-Z).
-pub fn clear_line() {
-    STDIN.lock().line.clear();
-}
-
-/// Read from stdin. Returns 0 if no data available (non-blocking check).
+/// Read from stdin. Returns 0 if no data available.
 pub fn read(dst: &mut [u8]) -> usize {
     STDIN.lock().read(dst)
 }

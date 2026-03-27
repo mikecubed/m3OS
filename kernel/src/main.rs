@@ -840,15 +840,15 @@ fn stdin_feeder_task() -> ! {
             continue;
         }
 
-        // Enter (0x1C): flush line buffer to stdin.
+        // Enter (0x1C): push newline byte.
         if sc == 0x1C {
-            stdin::flush_line();
+            stdin::push_char(b'\n');
             continue;
         }
 
-        // Backspace (0x0E): remove last character.
+        // Backspace (0x0E): push backspace byte for userspace to handle.
         if sc == 0x0E {
-            stdin::backspace();
+            stdin::push_char(0x7f);
             continue;
         }
 
