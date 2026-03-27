@@ -66,17 +66,16 @@ fn spawn_shell() -> isize {
             core::ptr::null(),
         ];
 
-        // Try /bin/ion (Phase 21 shell).
-        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        execve(ION_PATH, &ion_argv, &envp);
+        // Phase 21: ion is available at /bin/ion for script mode (ion -c 'cmd').
+        // Interactive mode requires Phase 22 (termios) for liner's TTY handling.
+        // Use sh0 as the interactive shell for now.
+        let sh0_argv_primary: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
+        execve(SH0_PATH, &sh0_argv_primary, &envp);
 
-        // execve returned — ion not available, fall back to /bin/sh0.
-        write_str(
-            STDOUT_FILENO,
-            "init: ion not available, falling back to sh0\n",
-        );
-        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
-        let ret = execve(SH0_PATH, &sh0_argv, &envp);
+        // sh0 not available — try ion as fallback (interactive requires Phase 22).
+        write_str(STDOUT_FILENO, "init: sh0 not available, trying ion\n");
+        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(ION_PATH, &ion_argv, &envp);
 
         // Both failed.
         write_str(STDOUT_FILENO, "init: execve failed (");
