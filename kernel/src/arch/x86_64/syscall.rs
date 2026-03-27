@@ -164,6 +164,8 @@ pub(crate) static mut SYSCALL_USER_R8: u64 = 0;
 pub(crate) static mut SYSCALL_USER_R9: u64 = 0;
 #[no_mangle]
 pub(crate) static mut SYSCALL_USER_R10: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RFLAGS: u64 = 0;
 
 /// Virtual address of the top of the kernel syscall stack.
 ///
@@ -206,6 +208,8 @@ global_asm!(
     "mov [rip + SYSCALL_USER_R8], r8",
     "mov [rip + SYSCALL_USER_R9], r9",
     "mov [rip + SYSCALL_USER_R10], r10",
+    // Save user RFLAGS (in R11) so fork child can inherit it.
+    "mov [rip + SYSCALL_USER_RFLAGS], r11",
     // --- Save return address and user flags ---
     "push rcx", // user RIP  (restored before SYSRETQ)  [rsp+56 after all pushes]
     "push r11", // user RFLAGS
@@ -3931,21 +3935,34 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             // Find the next free fd >= arg, duplicate oldfd into it.
             let oldfd = fd as usize;
             let min_fd = arg as usize;
-            if oldfd >= MAX_FDS || min_fd >= MAX_FDS {
+            if oldfd >= MAX_FDS {
                 return NEG_EBADF;
+            }
+            if min_fd >= MAX_FDS {
+                return NEG_EINVAL;
             }
             let entry = match current_fd_entry(oldfd) {
                 Some(e) => e,
                 None => return NEG_EBADF,
             };
-            // Increment pipe ref-count for the duplicated FD.
-            match &entry.backend {
-                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
-                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
-                _ => {}
-            }
+            // Remember pipe info so we only bump refcount on successful alloc.
+            let pipe_info = match &entry.backend {
+                FdBackend::PipeRead { pipe_id } => Some((true, *pipe_id)),
+                FdBackend::PipeWrite { pipe_id } => Some((false, *pipe_id)),
+                _ => None,
+            };
             match alloc_fd(min_fd, entry) {
-                Some(new_fd) => new_fd as u64,
+                Some(new_fd) => {
+                    // Increment pipe ref-count only after successful allocation.
+                    if let Some((is_read, pipe_id)) = pipe_info {
+                        if is_read {
+                            crate::pipe::pipe_add_reader(pipe_id);
+                        } else {
+                            crate::pipe::pipe_add_writer(pipe_id);
+                        }
+                    }
+                    new_fd as u64
+                }
                 None => NEG_EMFILE,
             }
         }

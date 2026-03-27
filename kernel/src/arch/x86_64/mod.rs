@@ -107,12 +107,13 @@ pub struct ForkEntryCtx {
     pub ss: u64,  // offset 64
     pub cs: u64,  // offset 72
     // Caller-saved registers (syscall-preserved).
-    pub rdi: u64, // offset 80
-    pub rsi: u64, // offset 88
-    pub rdx: u64, // offset 96
-    pub r8: u64,  // offset 104
-    pub r9: u64,  // offset 112
-    pub r10: u64, // offset 120
+    pub rdi: u64,    // offset 80
+    pub rsi: u64,    // offset 88
+    pub rdx: u64,    // offset 96
+    pub r8: u64,     // offset 104
+    pub r9: u64,     // offset 112
+    pub r10: u64,    // offset 120
+    pub rflags: u64, // offset 128
 }
 
 /// Static storage for the fork child entry context.
@@ -135,6 +136,7 @@ pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
     r8: 0,
     r9: 0,
     r10: 0,
+    rflags: 0,
 };
 
 // Assembly trampoline: reads ForkEntryCtx, restores ALL registers, IRETs to ring 3.
@@ -161,8 +163,11 @@ global_asm!(
     "mov rcx, [rax + 64]", // ss
     "push rcx",
     "push [rax + 8]", // user RSP
-    "mov rcx, 0x202",
-    "push rcx",            // RFLAGS (IF set)
+    // Use saved user RFLAGS (sanitized: ensure IF is set, clear IOPL/VM/RF).
+    "mov rcx, [rax + 128]", // user RFLAGS
+    "or  rcx, 0x200",       // ensure IF (interrupt enable) is set
+    "and ecx, 0x000ED7FF",  // clear IOPL, VM, RF, reserved bits
+    "push rcx",
     "mov rcx, [rax + 72]", // cs
     "push rcx",
     "push [rax]", // user RIP
@@ -198,6 +203,7 @@ pub unsafe fn enter_userspace_fork(
     r8: u64,
     r9: u64,
     r10: u64,
+    rflags: u64,
 ) -> ! {
     FORK_ENTRY_CTX = ForkEntryCtx {
         rip,
@@ -216,6 +222,7 @@ pub unsafe fn enter_userspace_fork(
         r8,
         r9,
         r10,
+        rflags,
     };
     fork_enter_userspace()
 }

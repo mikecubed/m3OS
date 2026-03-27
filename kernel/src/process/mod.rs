@@ -750,6 +750,9 @@ struct ForkChildCtx {
     user_r8: u64,
     user_r9: u64,
     user_r10: u64,
+    // User RFLAGS from R11 at syscall entry — the fork child should
+    // inherit the parent's flags (e.g. direction flag, arithmetic flags).
+    user_rflags: u64,
 }
 
 /// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
@@ -767,7 +770,7 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
     // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
     // so the fork child must restore all of them.
     // SAFETY: single-CPU; written at every syscall entry before this call.
-    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10) = unsafe {
+    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10, rflags) = unsafe {
         use crate::arch::x86_64::syscall::*;
         (
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
@@ -782,6 +785,7 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)),
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)),
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R10)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RFLAGS)),
         )
     };
     FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
@@ -800,6 +804,7 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r8: r8,
         user_r9: r9,
         user_r10: r10,
+        user_rflags: rflags,
     });
 }
 
@@ -824,6 +829,7 @@ pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r8: 0,
         user_r9: 0,
         user_r10: 0,
+        user_rflags: 0x202, // IF set, reserved bit set — safe default
     });
 }
 
@@ -899,6 +905,7 @@ pub fn fork_child_trampoline() -> ! {
             ctx.user_r8,
             ctx.user_r9,
             ctx.user_r10,
+            ctx.user_rflags,
         )
     }
 }
