@@ -466,6 +466,7 @@ fn cmd_check() {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    build_ion();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
