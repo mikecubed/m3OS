@@ -41,7 +41,7 @@ const PF_W: u32 = 0x2; // Write
 
 /// Virtual address of the top of the user stack.
 /// Set well below the canonical boundary (0x0000_8000_0000_0000) to leave
-/// room for stack frames that grow above the initial RSP during startup.
+/// room for musl's TLS/TCB allocation above the initial RSP during startup.
 pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FF00_0000;
 /// Number of pages to allocate for the user stack (256 KiB — ion/musl needs more than 32 KiB).
 pub const STACK_PAGES: u64 = 64;

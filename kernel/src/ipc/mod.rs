@@ -23,7 +23,8 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers 1–5, 7–8).
+//! - Userspace IPC via the syscall gate (syscall numbers 4 and 7 only;
+//!   syscall 10 was remapped to `mprotect` in Phase 21).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
 //!

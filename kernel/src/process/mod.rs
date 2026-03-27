@@ -803,6 +803,30 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
     });
 }
 
+/// Like [`push_fork_ctx`], but zeros all caller-saved registers.
+///
+/// Use this for kernel-spawned processes (not from `sys_fork`) where the
+/// `SYSCALL_USER_*` statics contain stale values from a previous syscall.
+pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
+    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+        pid,
+        user_rip,
+        user_rsp,
+        user_rbx: 0,
+        user_rbp: 0,
+        user_r12: 0,
+        user_r13: 0,
+        user_r14: 0,
+        user_r15: 0,
+        user_rdi: 0,
+        user_rsi: 0,
+        user_rdx: 0,
+        user_r8: 0,
+        user_r9: 0,
+        user_r10: 0,
+    });
+}
+
 /// Kernel-task entry point for a fork child.
 ///
 /// Pops the next fork context from `FORK_CHILD_QUEUE`, switches the process's
@@ -832,14 +856,11 @@ pub fn fork_child_trampoline() -> ! {
     }
 
     // Restore FS.base (TLS pointer) for the child process.
+    // Always write, even when 0, to avoid inheriting stale TLS from a previous task.
     {
         let table = PROCESS_TABLE.lock();
         if let Some(proc) = table.find(ctx.pid) {
-            if proc.fs_base != 0 {
-                x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(
-                    proc.fs_base,
-                ));
-            }
+            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(proc.fs_base));
         }
     }
 

@@ -2,8 +2,8 @@
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/ion` as the interactive shell (Phase 21)
-//! - Fall back to `/bin/sh0` if ion is unavailable (Phase 20 shell)
+//! - Fork+exec `/bin/sh0` as the interactive shell
+//! - Ion available at `/bin/ion` for script mode (Phase 22 for interactive)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)

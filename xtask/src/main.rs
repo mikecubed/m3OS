@@ -273,7 +273,7 @@ fn build_ion() {
     }
 
     println!("ion: building for x86_64-unknown-linux-musl (static, non-PIE)...");
-    let status = Command::new("cargo")
+    let status = Command::new(env!("CARGO"))
         .current_dir(&ion_src)
         .env(
             "RUSTFLAGS",

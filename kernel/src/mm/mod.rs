@@ -314,22 +314,15 @@ pub fn free_process_page_table(cr3_phys: u64) {
                     for leaf in &leaf_addrs {
                         frame_allocator::free_frame(*leaf);
                     }
-                    // Only free the PT frame if it's not shared (refcount check).
-                    if has_user && frame_allocator::refcount_get(*pt_phys) <= 1 {
+                    if has_user {
                         frame_allocator::free_frame(*pt_phys);
                     }
                 }
-                if frame_allocator::refcount_get(*pd_phys) <= 1 {
-                    frame_allocator::free_frame(*pd_phys);
-                }
+                frame_allocator::free_frame(*pd_phys);
             }
-            if frame_allocator::refcount_get(*pdpt_phys) <= 1 {
-                frame_allocator::free_frame(*pdpt_phys);
-            }
+            frame_allocator::free_frame(*pdpt_phys);
         }
-        if frame_allocator::refcount_get(cr3_phys) <= 1 {
-            frame_allocator::free_frame(cr3_phys);
-        }
+        frame_allocator::free_frame(cr3_phys);
     }
 }
 

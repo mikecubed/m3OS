@@ -290,7 +290,7 @@ fn spawn_userspace_init() {
     );
     log::info!("[init] /sbin/init registered as pid {}", pid);
 
-    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
     task::spawn(process::fork_child_trampoline, "userspace-init");
 }
 
@@ -1143,7 +1143,7 @@ fn run_elf_and_report(name: &'static str) {
     // fork_child_trampoline sets CURRENT_PID when it runs — the launcher
     // must not set it here because the launcher kernel task is not the
     // new userspace process.
-    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
 
     // Spawn the kernel task; it will run fork_child_trampoline which
     // sets CURRENT_PID, switches CR3, and enters ring 3.

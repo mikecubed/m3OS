@@ -1341,21 +1341,6 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     let parent_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] fork()", parent_pid);
 
-    // Debug: log saved callee-saved registers for fork child restore.
-    if parent_pid == 3 {
-        unsafe {
-            log::debug!(
-                "[fork:3] saved regs: rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBP)),
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R12)),
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
-                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
-            );
-        }
-    }
-
     // Allocate a new page table for the child, copying kernel entries.
     let child_cr3 = match crate::mm::new_process_page_table() {
         Some(f) => f,
@@ -1822,9 +1807,8 @@ fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64)
             gdt::set_kernel_stack(kstack_top);
         }
         // Restore FS.base (TLS pointer) for this process.
-        if fs_base != 0 {
-            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
-        }
+        // Always write, even when 0, to avoid inheriting stale TLS from a previous task.
+        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
     }
 }
 
@@ -2642,6 +2626,20 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Resolve relative to the directory fd's path.
     let resolved = resolve_path(&base_path, rel_name);
     let name: &str = &resolved;
+
+    // /dev/null special file — reads return EOF, writes are discarded.
+    if name == "/dev/null" {
+        let entry = FdEntry {
+            backend: FdBackend::DevNull,
+            offset: 0,
+            readable: true,
+            writable: true,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
 
     // Decode flags and delegate to the same open logic.
     let (readable, writable) = match flags & 0o3 {
