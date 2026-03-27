@@ -3418,7 +3418,6 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 
 fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     use kernel_core::tty::{TERMIOS_SIZE, WINSIZE_SIZE};
-
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
