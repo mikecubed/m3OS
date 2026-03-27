@@ -119,7 +119,8 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
             // Check for CoW page: present + user-accessible + BIT_9 marker.
             if is_cow_page(&mapper, VirtAddr::new(page_base)) {
                 if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
-                    return Err(()); // OOM during CoW resolution
+                    log::warn!("[copy_to_user] OOM resolving CoW at {:#x}", page_base);
+                    return Err(()); // OOM — callers return EFAULT (no ENOMEM path yet)
                 }
                 // Page is now writable — re-translate after CoW resolution.
                 let mapper = unsafe { crate::mm::paging::get_mapper() };
