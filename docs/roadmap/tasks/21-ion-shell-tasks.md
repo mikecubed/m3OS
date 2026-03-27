@@ -60,48 +60,49 @@ Ion's runtime (via musl libc and the `nix` crate) calls syscalls that our
 kernel doesn't yet handle. Most can be stubbed with harmless return values;
 a few need minimal implementation.
 
-| Task | Description |
-|---|---|
-| P21-T001 | Add `fcntl` (72) stub: handle `F_DUPFD` (0) by finding the next free fd >= arg, `F_GETFD` (1) returns 0, `F_SETFD` (2) returns 0 (ignore close-on-exec flag), `F_GETFL` (3) returns 0, `F_SETFL` (4) returns 0; all other commands return `-EINVAL` |
-| P21-T002 | Add `getuid` (102), `geteuid` (107), `getgid` (104), `getegid` (108) stubs: all return 0 (root). Single-user OS, no user/group management. |
-| P21-T003 | Add `getpgrp` (111) stub: return the current process's pgid from the process table (equivalent to `getpgid(0)`) |
-| P21-T004 | Add `access` (21) stub: check if the path exists in ramdisk or tmpfs; return 0 if found, `-ENOENT` if not. Ignore the mode argument (no permission model). |
-| P21-T005 | Add `mprotect` (10) stub: return 0 (no-op). musl uses this for stack guard pages; our ELF loader already sets up guard pages. |
-| P21-T006 | Add `set_robust_list` (273) stub: return 0 (no-op). musl's thread initialization calls this. |
-| P21-T007 | Add `prlimit64` (302) stub: return `-ENOSYS`. musl queries resource limits but handles the error. |
-| P21-T008 | Add `getrandom` (318) stub: fill the user buffer with bytes from a simple PRNG seeded from the TSC (or return `-ENOSYS` and let musl fall back to `/dev/urandom` which will fail gracefully via the `rand` crate's fallback). |
-| P21-T009 | Add `ioctl` handling for `TCGETS` (0x5401) and `TCSETS` (0x5402): return `-ENOTTY` so ion detects it's not a real terminal and falls back to cooked mode instead of crashing. Currently ioctl returns `-EINVAL` for unknown requests which may confuse callers expecting `-ENOTTY`. |
-| P21-T010 | Add `clone` (56) stub: if flags indicate a plain fork (flags=`SIGCHLD`), delegate to `sys_fork`. Otherwise return `-ENOSYS`. musl sometimes uses clone instead of fork. |
-| P21-T011 | Add `pipe2` (293) stub: delegate to the existing `sys_pipe` implementation, ignoring the flags argument (O_CLOEXEC, O_NONBLOCK not needed). musl prefers pipe2 over pipe. |
-| P21-T012 | Add `dup3` (292) stub: delegate to the existing `sys_dup2` implementation, ignoring the flags argument. musl prefers dup3 over dup2. |
-| P21-T013 | Verify `cargo xtask check` passes after all stubs are added |
+| Task | Description | Status |
+|---|---|---|
+| P21-T001 | Add `fcntl` (72) stub: F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD/SETFD, F_GETFL/SETFL | ✅ Done |
+| P21-T002 | Add `getuid` (102), `geteuid` (107), `getgid` (104), `getegid` (108) stubs: all return 0 (root) | ✅ Done |
+| P21-T003 | Add `getpgrp` (111) stub: delegates to `getpgid(0)` | ✅ Done |
+| P21-T004 | Add `access` (21) stub: check ramdisk/tmpfs/dev paths | ✅ Done |
+| P21-T005 | Add `mprotect` (10) stub: no-op | ✅ Done |
+| P21-T006 | Add `set_robust_list` (273) stub: no-op | ✅ Done |
+| P21-T007 | Add `prlimit64` (302) stub: returns `-ENOSYS` | ✅ Done |
+| P21-T008 | Add `getrandom` (318) stub: TSC-seeded xorshift64* PRNG | ✅ Done |
+| P21-T009 | Add `ioctl` TCGETS/TCSETS/TIOCGPGRP/TIOCSPGRP → `-ENOTTY` | ✅ Done |
+| P21-T010 | Add `clone` (56) stub: delegate SIGCHLD to sys_fork | ✅ Done |
+| P21-T011 | Add `pipe2` (293) stub: delegates to sys_pipe | ✅ Done |
+| P21-T012 | Add `dup3` (292) stub: delegates to sys_dup2 | ✅ Done |
+| P21-T013 | Verify `cargo xtask check` passes | ✅ Done |
+| — | **Bonus:** futex (202), clock_gettime (228), gettimeofday (96), socketpair (53), /dev/null | ✅ Done |
 
 ## Track B — Build Pipeline
 
 Cross-compile ion for musl and embed it in the ramdisk alongside existing
 binaries. Ion is ~3.7 MB so this significantly increases the kernel image size.
 
-| Task | Description |
-|---|---|
-| P21-T014 | Add `rustup target add x86_64-unknown-linux-musl` to CI setup (if not already present) and to the setup.sh script |
-| P21-T015 | Add a `build_ion()` function in `xtask/src/main.rs`: clone ion from `https://github.com/redox-os/ion` (or use a vendored copy at `xtask/vendor/ion/`), build with `cargo build --release --target x86_64-unknown-linux-musl`, copy the resulting binary to `kernel/initrd/ion.elf` |
-| P21-T016 | Alternative to P21-T015: add a `xtask/vendor/` directory with a pre-built ion binary checked into git (avoids 26s build + git clone during `cargo xtask image`). Document how to rebuild it. Trade-off: larger repo but faster/more reproducible builds. |
-| P21-T017 | Update `kernel/src/fs/ramdisk.rs`: add `static ION_ELF: &[u8] = include_bytes!("../../initrd/ion.elf");` and register it at `/bin/ion` and `/bin/ion.elf` in the BIN_ENTRIES table |
-| P21-T018 | Verify `cargo xtask image` builds successfully with ion embedded. Check that the kernel binary size is acceptable (expect ~5-6 MB total with ion's 3.7 MB). |
-| P21-T019 | Verify `readelf -l kernel/initrd/ion.elf` shows no `PT_INTERP` segment (statically linked) and all relocations are `R_X86_64_RELATIVE` |
+| Task | Description | Status |
+|---|---|---|
+| P21-T014 | musl target already present in CI | ✅ Done |
+| P21-T015 | `build_ion()` in xtask: clone, build with `-C relocation-model=static`, strip, cache | ✅ Done |
+| P21-T016 | Vendoring deferred — build_ion() caches ion.elf between builds | ⏭ Skipped |
+| P21-T017 | Ramdisk: `/bin/ion` and `/bin/ion.elf` entries added | ✅ Done |
+| P21-T018 | `cargo xtask image` builds successfully with ion (3.1 MB stripped) | ✅ Done |
+| P21-T019 | Ion is ET_EXEC (non-PIE), no relocations, no PT_INTERP | ✅ Done |
 
 ## Track C — Init and Shell Rename
 
 Rename the Phase 20 minimal shell to `/bin/sh0` and update init to launch
 ion with a fallback to sh0.
 
-| Task | Description |
-|---|---|
-| P21-T020 | Rename the shell binary: in `userspace/shell/Cargo.toml`, change `name = "sh"` to `name = "sh0"` (the `[[bin]]` name). Update xtask to copy it as `sh0.elf` instead of `sh.elf`. |
-| P21-T021 | Update `kernel/src/fs/ramdisk.rs`: rename `SH_ELF` entries from `"sh"` / `"sh.elf"` to `"sh0"` / `"sh0.elf"`. Keep the `include_bytes!` pointing at `sh0.elf`. |
-| P21-T022 | Update `userspace/init/src/main.rs`: change `SHELL_PATH` from `/bin/sh` to `/bin/ion`. Add a fallback: if `execve("/bin/ion", ...)` returns (failure), try `execve("/bin/sh0", ...)` before giving up. |
-| P21-T023 | Update CI boot smoke test assertions: check for ion's prompt or banner instead of (or in addition to) `$ `. The ion prompt may be `ion> ` or `> ` depending on `$PROMPT`. |
-| P21-T024 | Verify `cargo xtask check` and `cargo xtask image` pass with the rename |
+| Task | Description | Status |
+|---|---|---|
+| P21-T020 | Shell binary renamed to `sh0` in Cargo.toml + xtask | ✅ Done |
+| P21-T021 | Ramdisk: `/bin/sh0` and `/bin/sh0.elf` entries | ✅ Done |
+| P21-T022 | Init: exec `/bin/ion` first, fall back to `/bin/sh0` | ✅ Done |
+| P21-T023 | CI boot assertions — deferred to Track E | ⏳ |
+| P21-T024 | `cargo xtask check` + `cargo xtask image` pass | ✅ Done |
 
 ## Track D — Runtime Debugging
 
@@ -109,20 +110,21 @@ Boot ion in QEMU and iteratively fix kernel-side issues. This track is
 inherently iterative — each boot attempt may reveal new missing syscalls
 or unexpected behavior.
 
-| Task | Description |
-|---|---|
-| P21-T025 | First boot attempt: `cargo xtask run`, capture serial output, identify the first crash or unhandled syscall. Fix and repeat. |
-| P21-T026 | Add a catch-all syscall log: for any unhandled syscall number, log the number and arguments before returning `-ENOSYS`. This helps identify what ion/musl needs without crashing. |
-| P21-T027 | Verify musl's `__libc_start_main` runs successfully: `arch_prctl(ARCH_SET_FS)` for TLS, `set_tid_address`, stack guard via `mprotect` |
-| P21-T028 | Verify `ion -c 'echo hello'` (script mode): have init exec ion with `-c` flag first. If this works, the basic ion runtime is functional. |
-| P21-T029 | Verify `ion` interactive mode: boot to the ion prompt, confirm it reads stdin and prints output. If `tcgetpgrp`/`tcsetpgrp` fail, confirm ion prints a warning but continues. |
-| P21-T030 | Test pipeline execution: `echo hello | cat` via ion. Verify ion's internal fork+pipe+exec matches our kernel's implementation. |
-| P21-T031 | Test variable assignment and expansion: `let x = world; echo $x` should print `world`. This exercises ion's variable engine (no kernel changes needed). |
-| P21-T032 | Test loop syntax: `for i in a b c { echo $i }` should print three lines. |
-| P21-T033 | Test `cd /bin && pwd` — verify ion uses the `chdir` syscall and our kernel handles it correctly for ion's working directory. |
-| P21-T034 | Test signal handling: `Ctrl-C` during a long-running child (e.g., `sleep 10`) should kill the child and return to the ion prompt. Verify `SIGINT` is delivered to the foreground process group, not to ion. |
-| P21-T035 | Verify sh0 fallback: temporarily remove ion from the ramdisk and confirm init falls back to `/bin/sh0` and the Phase 20 shell works. |
-| P21-T036 | If `getrandom` (318) is needed: implement a minimal PRNG using RDTSC as entropy source, or return `-ENOSYS` and verify ion/rand handles the fallback. |
+| Task | Description | Status |
+|---|---|---|
+| P21-T025 | First boot: PIE crash → switched to non-PIE (ET_EXEC) build | ✅ Done |
+| P21-T026 | Catch-all syscall logger added (log::warn for unhandled syscalls) | ✅ Done |
+| P21-T027 | musl __libc_start_main verified: arch_prctl, set_tid_address, mprotect all work | ✅ Done |
+| P21-T028 | Ion script mode — deferred (interactive mode works, testing with keyboard input needed) | ⏳ |
+| P21-T029 | Ion interactive: starts, detects non-TTY, prints errors gracefully, enters loop | ✅ Done |
+| P21-T030 | Pipeline testing — requires keyboard input, deferred | ⏳ |
+| P21-T031 | Variable testing — requires keyboard input, deferred | ⏳ |
+| P21-T032 | Loop testing — requires keyboard input, deferred | ⏳ |
+| P21-T033 | cd testing — requires keyboard input, deferred | ⏳ |
+| P21-T034 | Signal handling — requires keyboard input, deferred | ⏳ |
+| P21-T035 | sh0 fallback verified: works when ion not available | ✅ Done |
+| P21-T036 | getrandom implemented with TSC-seeded xorshift64* PRNG | ✅ Done |
+| — | **Bonus:** Fixed critical futex context restore bug (init CR3 corruption) | ✅ Done |
 
 ## Track E — Validation and Documentation
 
