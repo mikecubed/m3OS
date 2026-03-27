@@ -272,10 +272,23 @@ pub fn get_file(name: &str) -> Option<&'static [u8]> {
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(name) {
             return Some(content);
         }
+        // Try with .elf suffix (ramdisk binaries use this extension).
+        if !name.ends_with(".elf") {
+            let elf_path = alloc::format!("{}.elf", name);
+            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&elf_path) {
+                return Some(content);
+            }
+        }
     } else {
         let path = alloc::format!("/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&path) {
             return Some(content);
+        }
+        if !name.ends_with(".elf") {
+            let elf_path = alloc::format!("/{}.elf", name);
+            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&elf_path) {
+                return Some(content);
+            }
         }
     }
 
@@ -284,6 +297,12 @@ pub fn get_file(name: &str) -> Option<&'static [u8]> {
         let bin_path = alloc::format!("/bin/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&bin_path) {
             return Some(content);
+        }
+        if !name.ends_with(".elf") {
+            let bin_elf = alloc::format!("/bin/{}.elf", name);
+            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&bin_elf) {
+                return Some(content);
+            }
         }
         let etc_path = alloc::format!("/etc/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&etc_path) {

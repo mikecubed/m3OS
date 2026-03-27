@@ -2,8 +2,7 @@
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/sh0` as the interactive shell
-//! - Ion available at `/bin/ion` (interactive mode deferred — needs posix_spawn fixes)
+//! - Fork+exec `/bin/ion` as the interactive shell (sh0 as fallback)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)
@@ -58,7 +57,7 @@ pub extern "C" fn _start() -> ! {
 fn spawn_shell() -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: exec sh0 as primary interactive shell, fall back to ion.
+        // Child: exec ion as primary interactive shell, fall back to sh0.
         let envp: [*const u8; 4] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -66,16 +65,16 @@ fn spawn_shell() -> isize {
             core::ptr::null(),
         ];
 
-        // Phase 22: TTY infrastructure ready. Use sh0 as primary interactive
-        // shell — it works with the cooked-mode line discipline. Ion interactive
-        // mode requires additional posix_spawn/CLOEXEC work (deferred).
-        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
-        execve(SH0_PATH, &sh0_argv, &envp);
-
-        // sh0 not available — try ion as fallback.
-        write_str(STDOUT_FILENO, "init: sh0 not available, trying ion\n");
+        // Ion interactive mode now works. Use it as primary shell.
         let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        let ret = execve(ION_PATH, &ion_argv, &envp);
+        let ion_ret = execve(ION_PATH, &ion_argv, &envp);
+
+        // Ion execve failed — fall back to sh0.
+        write_str(STDOUT_FILENO, "init: ion execve failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-ion_ret) as u64);
+        write_str(STDOUT_FILENO, "), trying sh0\n");
+        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SH0_PATH, &sh0_argv, &envp);
 
         // Both failed.
         write_str(STDOUT_FILENO, "init: execve failed (");

@@ -85,7 +85,9 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 /// Copy `src` bytes into userspace virtual address `dst_vaddr`.
 ///
 /// Same validation rules as `copy_from_user`; additionally requires pages to
-/// be `WRITABLE`.
+/// be `WRITABLE`. If a page is a CoW (copy-on-write) page (present, user-
+/// accessible, BIT_9 set, but not writable), the CoW fault is resolved
+/// in-place before copying.
 pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     let len = src.len();
     if len == 0 {
@@ -100,7 +102,6 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     }
 
     let phys_off = crate::mm::phys_offset();
-    let mapper = unsafe { crate::mm::paging::get_mapper() };
 
     let mut copied = 0usize;
     let mut vaddr = dst_vaddr;
@@ -110,12 +111,36 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+        // Re-acquire mapper each iteration because CoW resolution
+        // modifies the page tables (invalidating the mapper's view).
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
 
         if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
+            // Check for CoW page: present + user-accessible + BIT_9 marker.
+            if is_cow_page(&mapper, VirtAddr::new(page_base)) {
+                if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
+                    log::warn!("[copy_to_user] OOM resolving CoW at {:#x}", page_base);
+                    return Err(()); // OOM — callers return EFAULT (no ENOMEM path yet)
+                }
+                // Page is now writable — re-translate after CoW resolution.
+                let mapper = unsafe { crate::mm::paging::get_mapper() };
+                let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+                let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src[copied..].as_ptr(),
+                        frame_virt as *mut u8,
+                        avail,
+                    );
+                }
+                copied += avail;
+                vaddr += avail as u64;
+                continue;
+            }
             return Err(());
         }
 
+        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
         let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
         // SAFETY: frame_virt is a kernel virtual address for a mapped writable frame.
         unsafe {
@@ -127,6 +152,19 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Check whether the page at `vaddr` is a CoW page (present, user-accessible,
+/// BIT_9 marker set, but not writable).
+fn is_cow_page(mapper: &x86_64::structures::paging::OffsetPageTable<'_>, vaddr: VirtAddr) -> bool {
+    match mapper.translate(vaddr) {
+        TranslateResult::Mapped { flags, .. } => {
+            flags.contains(
+                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::BIT_9,
+            ) && !flags.contains(PageTableFlags::WRITABLE)
+        }
+        _ => false,
+    }
 }
 
 /// Check whether the page at `vaddr` is mapped USER_ACCESSIBLE.

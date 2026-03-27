@@ -423,8 +423,8 @@ pub extern "C" fn syscall_handler(
         186 => sys_getpid(),
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
         200 => sys_kill(arg0, arg1),
-        // Phase 21: futex stub — single-threaded OS, yield and return
-        202 => sys_futex(arg0, arg1),
+        // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
+        202 => sys_futex(arg0, arg1, arg2),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
@@ -1173,6 +1173,8 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
 fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
+    // Pipe starts with reader_count=0, writer_count=0.
+    // We bump refcounts explicitly after each successful FD allocation.
     let pipe_id = crate::pipe::create_pipe();
 
     let read_entry = FdEntry {
@@ -1193,28 +1195,31 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     let read_fd = match alloc_fd(3, read_entry) {
         Some(fd) => fd,
         None => {
-            crate::pipe::pipe_close_reader(pipe_id);
-            crate::pipe::pipe_close_writer(pipe_id);
+            // No FDs reference this pipe yet — free the slot directly.
+            crate::pipe::free_pipe(pipe_id);
             return NEG_EMFILE;
         }
     };
+    crate::pipe::pipe_add_reader(pipe_id); // reader_count: 0 → 1
+
     let write_fd = match alloc_fd(3, write_entry) {
         Some(fd) => fd,
         None => {
-            // Clean up the read fd we just allocated.
+            // Only the read FD exists — close it properly.
             with_current_fd_mut(read_fd, |slot| *slot = None);
-            crate::pipe::pipe_close_reader(pipe_id);
-            crate::pipe::pipe_close_writer(pipe_id);
+            crate::pipe::pipe_close_reader(pipe_id); // reader_count: 1 → 0
+                                                     // writer_count is still 0, so pipe slot is now freed.
             return NEG_EMFILE;
         }
     };
+    crate::pipe::pipe_add_writer(pipe_id); // writer_count: 0 → 1
 
     // Write [read_fd, write_fd] as two i32s to user memory.
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
     bytes[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
     if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
-        // Clean up on failure.
+        // Both FDs exist — close them properly via refcounts.
         with_current_fd_mut(read_fd, |slot| *slot = None);
         with_current_fd_mut(write_fd, |slot| *slot = None);
         crate::pipe::pipe_close_reader(pipe_id);
@@ -4358,9 +4363,12 @@ fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Minimal futex stub for single-threaded OS.
-/// FUTEX_WAIT: yield CPU then return 0 (pretend wakeup occurred).
-/// FUTEX_WAKE: return 1 (pretend one waiter was woken).
-fn sys_futex(_uaddr: u64, op: u64) -> u64 {
+///
+/// In a single-threaded/cooperative OS, no other thread can change
+/// the futex word or wake a waiter. If FUTEX_WAIT sees *uaddr == val,
+/// the lock is deadlocked — we clear the word to 0 so the caller's
+/// next compare-and-swap succeeds and acquires the lock.
+fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
     const FUTEX_PRIVATE: u64 = 128;
@@ -4368,14 +4376,23 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
     let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
     match cmd {
         FUTEX_WAIT => {
-            // Yield once to let other tasks run, then pretend we were woken.
-            // Must restore caller context after yield (CR3, stack, PID) to
-            // avoid using another process's page table.
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
-            crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
-            0
+            // Check *uaddr == val per the futex contract.
+            let mut cur = [0u8; 4];
+            if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                return NEG_EFAULT;
+            }
+            let current_val = u32::from_ne_bytes(cur) as u64;
+            if current_val != val {
+                return NEG_EAGAIN;
+            }
+            // Single-threaded deadlock: no other thread can wake us.
+            // Force-clear the futex word to 0 so the caller's next
+            // lock-acquire CAS (compare_exchange(0, tid)) succeeds.
+            let zero = 0u32.to_ne_bytes();
+            if crate::mm::user_mem::copy_to_user(uaddr, &zero).is_err() {
+                return NEG_EFAULT;
+            }
+            0 // pretend we were woken
         }
         FUTEX_WAKE => 1, // pretend one waiter woke up
         _ => 0,          // unknown ops succeed silently

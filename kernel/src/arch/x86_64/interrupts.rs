@@ -75,7 +75,7 @@ fn fault_kill_trampoline() -> ! {
 /// maps the new frame as writable, and decrements the old frame's refcount.
 ///
 /// Returns `true` on success, `false` if frame allocation fails (OOM).
-fn resolve_cow_fault(vaddr: u64) -> bool {
+pub fn resolve_cow_fault(vaddr: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 

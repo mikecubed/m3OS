@@ -19,6 +19,10 @@ pub use kernel_core::pipe::Pipe;
 static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());
 
 /// Allocate a new pipe and return its ID.
+///
+/// The pipe is created with `reader_count=0, writer_count=0`.
+/// Callers must explicitly call `pipe_add_reader`/`pipe_add_writer`
+/// for each FD they create that references the pipe.
 pub fn create_pipe() -> usize {
     let mut table = PIPE_TABLE.lock();
     // Reuse a freed slot if available.
@@ -31,6 +35,15 @@ pub fn create_pipe() -> usize {
     let id = table.len();
     table.push(Some(Pipe::new()));
     id
+}
+
+/// Free a pipe slot directly, without adjusting refcounts.
+/// Used when pipe creation fails before any FDs reference it.
+pub fn free_pipe(pipe_id: usize) {
+    let mut table = PIPE_TABLE.lock();
+    if pipe_id < table.len() {
+        table[pipe_id] = None;
+    }
 }
 
 /// Increment the reader ref-count (called by fork/dup2 when cloning a PipeRead FD).

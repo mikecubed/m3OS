@@ -20,8 +20,8 @@ impl Pipe {
             buf: [0u8; PIPE_BUF_SIZE],
             read_pos: 0,
             count: 0,
-            reader_count: 1,
-            writer_count: 1,
+            reader_count: 0,
+            writer_count: 0,
         }
     }
 
@@ -170,5 +170,14 @@ mod tests {
         let mut empty = [0u8; 0];
         let read = pipe.read(&mut empty);
         assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn refcounts_start_at_zero() {
+        let pipe = Pipe::new();
+        assert_eq!(pipe.reader_count, 0);
+        assert_eq!(pipe.writer_count, 0);
+        assert!(!pipe.has_reader());
+        assert!(!pipe.has_writer());
     }
 }
