@@ -50,8 +50,8 @@ fn read_line(buf: &mut [u8; MAX_LINE]) -> usize {
             if pos > 0 {
                 return pos;
             }
-            // Yield briefly and retry on empty read.
-            syscall_lib::nanosleep(0);
+            // Yield CPU briefly (~10ms) and retry.
+            syscall_lib::nanosleep(1);
             continue;
         }
 
@@ -215,13 +215,16 @@ fn execute_pipeline(left: &[u8], right: &[u8]) {
         exit(127);
     }
 
-    // Parent: close both pipe ends and wait for children.
+    // Parent: close both pipe ends.
     close(read_fd);
     close(write_fd);
 
+    // Wait for children. If right fork failed, still reap the left child.
     let mut status: i32 = 0;
     waitpid(left_pid as i32, &mut status, 0);
-    if right_pid > 0 {
+    if right_pid < 0 {
+        write_str(STDERR_FILENO, "sh: fork failed (right pipeline stage)\n");
+    } else {
         waitpid(right_pid as i32, &mut status, 0);
     }
 }
