@@ -360,9 +360,12 @@ pub extern "C" fn syscall_handler(
         35 => sys_nanosleep(arg0),
         // Phase 21: sendto → write for pipe-based socketpair
         44 => sys_linux_write(arg0, arg1, arg2),
-        // Phase 21: recvfrom — non-blocking read for pipe-based socketpair.
-        // Ion uses MSG_DONTWAIT on the signal self-pipe; must not block.
-        45 => sys_recvfrom(arg0, arg1, arg2),
+        // Phase 21/22: recvfrom — read for pipe-based socketpair.
+        // Supports MSG_DONTWAIT (non-blocking) and blocking mode.
+        45 => {
+            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            sys_recvfrom(arg0, arg1, arg2, flags)
+        }
         // IPC syscalls (Phase 6) — kernel-task only.
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
         4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
@@ -4328,9 +4331,13 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
 // recvfrom(fd, buf, len, flags, ...) — syscall 45
 // ---------------------------------------------------------------------------
 
-/// Non-blocking read for pipe-based socketpair.
-/// Always behaves as if MSG_DONTWAIT is set — returns -EAGAIN if no data.
-fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+/// Read for pipe-based socketpair (recvfrom syscall).
+/// If MSG_DONTWAIT (0x40) is set in flags, returns -EAGAIN when no data.
+/// Otherwise blocks until data or EOF, like read().
+fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
+    const MSG_DONTWAIT: u64 = 0x40;
+    let nonblock = flags & MSG_DONTWAIT != 0;
+
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -4343,16 +4350,43 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
             let len = (count as usize).min(4096);
-            let mut tmp = [0u8; 4096];
-            match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
-                Ok(n) if n > 0 => {
-                    if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
-                        return NEG_EFAULT;
+
+            if nonblock {
+                // Non-blocking: single attempt.
+                let mut tmp = [0u8; 4096];
+                match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
+                    Ok(n) if n > 0 => {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        n as u64
                     }
-                    n as u64
+                    Ok(_) => 0,           // EOF
+                    Err(_) => NEG_EAGAIN, // would block
                 }
-                Ok(_) => 0,           // EOF: writer closed, no more data
-                Err(_) => NEG_EAGAIN, // would block or transient pipe error
+            } else {
+                // Blocking: yield-loop until data or EOF.
+                let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                loop {
+                    let mut tmp = [0u8; 4096];
+                    match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
+                        Ok(0) => return 0, // EOF
+                        Ok(n) => {
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                return NEG_EFAULT;
+                            }
+                            return n as u64;
+                        }
+                        Err(_) => {
+                            if has_pending_signal() {
+                                return NEG_EINTR;
+                            }
+                            crate::task::yield_now();
+                            restore_caller_context(pid, saved_user_rsp);
+                        }
+                    }
+                }
             }
         }
         _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds
