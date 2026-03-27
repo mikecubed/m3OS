@@ -337,6 +337,9 @@ pub extern "C" fn syscall_handler(
         2 => sys_linux_open(arg0, arg1),
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
+        // Phase 22: poll stub — report all requested fds as ready.
+        // Ion uses poll() to multiplex between signal pipe and stdin.
+        7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 21: mprotect stub (musl stack guard)
         10 => 0, // no-op — our ELF loader already sets up guard pages
@@ -367,8 +370,9 @@ pub extern "C" fn syscall_handler(
             sys_recvfrom(arg0, arg1, arg2, flags)
         }
         // IPC syscalls (Phase 6) — kernel-task only.
+        // Note: syscall 7 was IPC but is now poll (Phase 22).
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
-        4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
+        4 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
         // Phase 21: socketpair — implement as pipe pair (sufficient for signal self-pipe)
@@ -4390,5 +4394,93 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
             }
         }
         _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 22: poll(fds, nfds, timeout) — syscall 7
+// ---------------------------------------------------------------------------
+
+/// poll(fds, nfds, timeout) — check fd readiness.
+///
+/// For pipe-read fds: report POLLIN if data available or writer closed (EOF).
+/// For TTY fds: report POLLIN if stdin has data.
+/// Other fds: report requested events (optimistic).
+/// If no fds are ready and timeout != 0, yield once and re-check.
+fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
+    const POLLIN: i16 = 0x001;
+
+    let nfds = nfds as usize;
+    if nfds > 256 {
+        return NEG_EINVAL;
+    }
+    let timeout_i = timeout as i64;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+
+    loop {
+        let mut ready_count = 0u64;
+
+        for i in 0..nfds {
+            let base = match fds_ptr.checked_add((i * 8) as u64) {
+                Some(a) => a,
+                None => return NEG_EFAULT,
+            };
+            let mut pfd = [0u8; 8];
+            if crate::mm::user_mem::copy_from_user(&mut pfd, base).is_err() {
+                return NEG_EFAULT;
+            }
+            let fd = i32::from_ne_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
+            let events = i16::from_ne_bytes([pfd[4], pfd[5]]);
+            let mut revents: i16 = 0;
+
+            if fd >= 0 && (fd as usize) < MAX_FDS {
+                if let Some(entry) = current_fd_entry(fd as usize) {
+                    match &entry.backend {
+                        FdBackend::PipeRead { pipe_id } => {
+                            // Check if pipe has data or is EOF.
+                            let mut tmp = [0u8; 0];
+                            match crate::pipe::pipe_read(*pipe_id, &mut tmp) {
+                                Ok(_) => revents = events & POLLIN,      // EOF (data ready)
+                                Err(true) => {}                          // would block (not ready)
+                                Err(false) => revents = events & POLLIN, // impossible for read
+                            }
+                        }
+                        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
+                            if crate::stdin::has_data() {
+                                revents = events & POLLIN;
+                            }
+                        }
+                        _ => {
+                            // Optimistic: report writable fds as ready.
+                            revents = events;
+                        }
+                    }
+                } else {
+                    revents = 0x020; // POLLNVAL
+                }
+            } else if fd >= 0 {
+                revents = 0x020; // POLLNVAL
+            }
+
+            if revents != 0 {
+                ready_count += 1;
+            }
+            pfd[6..8].copy_from_slice(&revents.to_ne_bytes());
+            if crate::mm::user_mem::copy_to_user(base, &pfd).is_err() {
+                return NEG_EFAULT;
+            }
+        }
+
+        if ready_count > 0 || timeout_i == 0 {
+            return ready_count;
+        }
+
+        // No fds ready and timeout != 0: yield and retry.
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        crate::task::yield_now();
+        restore_caller_context(pid, saved_user_rsp);
     }
 }
