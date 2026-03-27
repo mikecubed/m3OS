@@ -1,3 +1,5 @@
+use core::arch::global_asm;
+
 pub mod apic;
 pub mod gdt;
 pub mod interrupts;
@@ -85,4 +87,142 @@ pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
         rax_val = in(reg) rax,
         options(noreturn)
     )
+}
+
+/// Context for entering ring 3 from a fork child, stored in a static so
+/// assembly can load register values without running out of register operands.
+///
+/// Includes ALL registers preserved by the Linux syscall ABI (everything
+/// except RAX/RCX/R11) plus the IRET frame fields.
+#[repr(C)]
+pub struct ForkEntryCtx {
+    pub rip: u64, // offset 0
+    pub rsp: u64, // offset 8
+    pub rbx: u64, // offset 16
+    pub rbp: u64, // offset 24
+    pub r12: u64, // offset 32
+    pub r13: u64, // offset 40
+    pub r14: u64, // offset 48
+    pub r15: u64, // offset 56
+    pub ss: u64,  // offset 64
+    pub cs: u64,  // offset 72
+    // Caller-saved registers (syscall-preserved).
+    pub rdi: u64,    // offset 80
+    pub rsi: u64,    // offset 88
+    pub rdx: u64,    // offset 96
+    pub r8: u64,     // offset 104
+    pub r9: u64,     // offset 112
+    pub r10: u64,    // offset 120
+    pub rflags: u64, // offset 128
+}
+
+/// Static storage for the fork child entry context.
+/// Single-CPU: only one fork child enters userspace at a time.
+#[no_mangle]
+pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
+    rip: 0,
+    rsp: 0,
+    rbx: 0,
+    rbp: 0,
+    r12: 0,
+    r13: 0,
+    r14: 0,
+    r15: 0,
+    ss: 0,
+    cs: 0,
+    rdi: 0,
+    rsi: 0,
+    rdx: 0,
+    r8: 0,
+    r9: 0,
+    r10: 0,
+    rflags: 0,
+};
+
+// Assembly trampoline: reads ForkEntryCtx, restores ALL registers, IRETs to ring 3.
+global_asm!(
+    ".global fork_enter_userspace",
+    "fork_enter_userspace:",
+    // On entry: FORK_ENTRY_CTX is populated.
+    // Use rax as the base pointer (will be zeroed before IRETQ).
+    "lea rax, [rip + FORK_ENTRY_CTX]",
+    // Restore callee-saved registers.
+    "mov rbx, [rax + 16]",
+    "mov rbp, [rax + 24]",
+    "mov r12, [rax + 32]",
+    "mov r13, [rax + 40]",
+    "mov r14, [rax + 48]",
+    "mov r15, [rax + 56]",
+    // Restore caller-saved registers (syscall-preserved).
+    "mov rsi, [rax + 88]",
+    "mov rdx, [rax + 96]",
+    "mov r8,  [rax + 104]",
+    "mov r9,  [rax + 112]",
+    "mov r10, [rax + 120]",
+    // Build IRET frame: SS, RSP, RFLAGS, CS, RIP
+    "mov rcx, [rax + 64]", // ss
+    "push rcx",
+    "push [rax + 8]", // user RSP
+    // Use saved user RFLAGS (sanitized: ensure IF is set, clear IOPL/VM/RF).
+    "mov rcx, [rax + 128]", // user RFLAGS
+    "or  rcx, 0x200",       // ensure IF (interrupt enable) is set
+    "and ecx, 0x000ED7FF",  // clear IOPL, VM, RF, reserved bits
+    "push rcx",
+    "mov rcx, [rax + 72]", // cs
+    "push rcx",
+    "push [rax]", // user RIP
+    // Restore rdi AFTER we're done using rax as base (rdi is offset 80).
+    "mov rdi, [rax + 80]",
+    // RAX = 0 (fork child return value).
+    "xor eax, eax",
+    "iretq",
+);
+
+extern "C" {
+    fn fork_enter_userspace() -> !;
+}
+
+/// Enter ring 3 for a fork child with full register restore.
+///
+/// Restores ALL registers preserved by the Linux syscall ABI so the child
+/// resumes with the exact same register state as the parent had at the
+/// `syscall` instruction.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn enter_userspace_fork(
+    rip: u64,
+    rsp: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    rflags: u64,
+) -> ! {
+    FORK_ENTRY_CTX = ForkEntryCtx {
+        rip,
+        rsp,
+        rbx,
+        rbp,
+        r12,
+        r13,
+        r14,
+        r15,
+        ss: u64::from(gdt::user_data_selector().0),
+        cs: u64::from(gdt::user_code_selector().0),
+        rdi,
+        rsi,
+        rdx,
+        r8,
+        r9,
+        r10,
+        rflags,
+    };
+    fork_enter_userspace()
 }

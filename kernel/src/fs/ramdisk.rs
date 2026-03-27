@@ -74,8 +74,11 @@ static ENV_ELF: &[u8] = include_bytes!("../../initrd/env.elf");
 static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep.elf");
 static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep.elf");
 static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test.elf");
+static PROMPT_ELF: &[u8] = include_bytes!("../../initrd/PROMPT.elf");
+static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test.elf");
 static INIT_ELF: &[u8] = include_bytes!("../../initrd/init.elf");
-static SH_ELF: &[u8] = include_bytes!("../../initrd/sh.elf");
+static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0.elf");
+static ION_ELF: &[u8] = include_bytes!("../../initrd/ion.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -122,8 +125,34 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: SIGNAL_TEST_ELF,
         },
     ),
-    ("sh", RamdiskNode::File { content: SH_ELF }),
-    ("sh.elf", RamdiskNode::File { content: SH_ELF }),
+    (
+        "PROMPT",
+        RamdiskNode::File {
+            content: PROMPT_ELF,
+        },
+    ),
+    (
+        "PROMPT.elf",
+        RamdiskNode::File {
+            content: PROMPT_ELF,
+        },
+    ),
+    (
+        "stdin-test",
+        RamdiskNode::File {
+            content: STDIN_TEST_ELF,
+        },
+    ),
+    (
+        "stdin-test.elf",
+        RamdiskNode::File {
+            content: STDIN_TEST_ELF,
+        },
+    ),
+    ("sh0", RamdiskNode::File { content: SH0_ELF }),
+    ("sh0.elf", RamdiskNode::File { content: SH0_ELF }),
+    ("ion", RamdiskNode::File { content: ION_ELF }),
+    ("ion.elf", RamdiskNode::File { content: ION_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[

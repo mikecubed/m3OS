@@ -90,6 +90,8 @@ pub enum FdBackend {
     PipeWrite { pipe_id: usize },
     /// Directory file descriptor (Phase 18).
     Dir { path: String },
+    /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
+    DevNull,
 }
 
 /// A single open-file entry in the per-process FD table.
@@ -342,6 +344,9 @@ pub struct Process {
     pub alt_stack_flags: u32,
     /// Current working directory (Phase 18). Defaults to "/".
     pub cwd: String,
+    /// FS.base MSR value (TLS pointer, set by arch_prctl ARCH_SET_FS).
+    /// Saved on syscall entry, restored on context switch (Phase 21).
+    pub fs_base: u64,
 }
 
 impl Process {
@@ -374,6 +379,7 @@ impl Process {
             alt_stack_size: 0,
             alt_stack_flags: 0,
             cwd: String::from("/"),
+            fs_base: 0,
         }
     }
 }
@@ -491,6 +497,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -534,6 +541,7 @@ pub fn spawn_process_with_cr3(
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -581,6 +589,7 @@ pub fn spawn_process_with_cr3_and_fds(
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -725,6 +734,25 @@ struct ForkChildCtx {
     pid: Pid,
     user_rip: u64,
     user_rsp: u64,
+    // Callee-saved registers from the parent at syscall entry.
+    user_rbx: u64,
+    user_rbp: u64,
+    user_r12: u64,
+    user_r13: u64,
+    user_r14: u64,
+    user_r15: u64,
+    // Caller-saved registers — the Linux syscall ABI preserves all registers
+    // except RAX/RCX/R11. Without restoring these, the fork child starts
+    // with garbage in RDI/RSI/RDX/R8/R9/R10.
+    user_rdi: u64,
+    user_rsi: u64,
+    user_rdx: u64,
+    user_r8: u64,
+    user_r9: u64,
+    user_r10: u64,
+    // User RFLAGS from R11 at syscall entry — the fork child should
+    // inherit the parent's flags (e.g. direction flag, arithmetic flags).
+    user_rflags: u64,
 }
 
 /// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
@@ -733,11 +761,75 @@ struct ForkChildCtx {
 static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::new());
 
 /// Push a fork-child context so `fork_child_trampoline` can consume it.
+///
+/// For fork() calls, the registers are read from the statics saved at
+/// syscall entry. For kernel-spawned processes (p11 launcher), they're
+/// zeroed.
 pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
+    // Read ALL saved user registers (callee-saved + caller-saved).
+    // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
+    // so the fork child must restore all of them.
+    // SAFETY: single-CPU; written at every syscall entry before this call.
+    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10, rflags) = unsafe {
+        use crate::arch::x86_64::syscall::*;
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBP)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R12)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDI)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSI)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDX)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R10)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RFLAGS)),
+        )
+    };
     FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
+        user_rbx: rbx,
+        user_rbp: rbp,
+        user_r12: r12,
+        user_r13: r13,
+        user_r14: r14,
+        user_r15: r15,
+        user_rdi: rdi,
+        user_rsi: rsi,
+        user_rdx: rdx,
+        user_r8: r8,
+        user_r9: r9,
+        user_r10: r10,
+        user_rflags: rflags,
+    });
+}
+
+/// Like [`push_fork_ctx`], but zeros all caller-saved registers.
+///
+/// Use this for kernel-spawned processes (not from `sys_fork`) where the
+/// `SYSCALL_USER_*` statics contain stale values from a previous syscall.
+pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
+    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+        pid,
+        user_rip,
+        user_rsp,
+        user_rbx: 0,
+        user_rbp: 0,
+        user_r12: 0,
+        user_r13: 0,
+        user_r14: 0,
+        user_r15: 0,
+        user_rdi: 0,
+        user_rsi: 0,
+        user_rdx: 0,
+        user_r8: 0,
+        user_r9: 0,
+        user_r10: 0,
+        user_rflags: 0x202, // IF set, reserved bit set — safe default
     });
 }
 
@@ -769,6 +861,15 @@ pub fn fork_child_trampoline() -> ! {
         *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) = kstack_top;
     }
 
+    // Restore FS.base (TLS pointer) for the child process.
+    // Always write, even when 0, to avoid inheriting stale TLS from a previous task.
+    {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(ctx.pid) {
+            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(proc.fs_base));
+        }
+    }
+
     // If the child has its own page table, switch CR3.
     if let Some(cr3) = cr3_phys {
         unsafe {
@@ -782,8 +883,31 @@ pub fn fork_child_trampoline() -> ! {
             Cr3::write(frame, Cr3Flags::empty());
         }
     }
-    // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value).
-    unsafe { crate::arch::enter_userspace_with_retval(ctx.user_rip, ctx.user_rsp, 0) }
+    // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value)
+    // and the parent's callee-saved registers restored.
+    //
+    // For kernel-spawned processes (init, p11 tests), the callee-saved
+    // registers are zeroed which is safe — execve replaces them immediately.
+    // For fork() children, these are the parent's actual register values.
+    unsafe {
+        crate::arch::enter_userspace_fork(
+            ctx.user_rip,
+            ctx.user_rsp,
+            ctx.user_rbx,
+            ctx.user_rbp,
+            ctx.user_r12,
+            ctx.user_r13,
+            ctx.user_r14,
+            ctx.user_r15,
+            ctx.user_rdi,
+            ctx.user_rsi,
+            ctx.user_rdx,
+            ctx.user_r8,
+            ctx.user_r9,
+            ctx.user_r10,
+            ctx.user_rflags,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

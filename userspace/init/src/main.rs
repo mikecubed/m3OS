@@ -1,8 +1,9 @@
-//! m3OS init — PID 1 userspace process (Phase 20).
+//! m3OS init — PID 1 userspace process (Phase 20/21).
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/sh` as the interactive shell
+//! - Fork+exec `/bin/sh0` as the interactive shell
+//! - Ion available at `/bin/ion` for script mode (Phase 22 for interactive)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)
@@ -11,8 +12,10 @@
 
 use syscall_lib::{execve, exit, fork, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG};
 
-const SHELL_PATH: &[u8] = b"/bin/sh\0";
-const SHELL_ARGV0: &[u8] = b"/bin/sh\0";
+const ION_PATH: &[u8] = b"/bin/ion\0";
+const ION_ARGV0: &[u8] = b"/bin/ion\0";
+const SH0_PATH: &[u8] = b"/bin/sh0\0";
+const SH0_ARGV0: &[u8] = b"/bin/sh0\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -55,17 +58,27 @@ pub extern "C" fn _start() -> ! {
 fn spawn_shell() -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: exec the shell.
-        let argv: [*const u8; 2] = [SHELL_ARGV0.as_ptr(), core::ptr::null()];
+        // Child: exec sh0 as primary interactive shell, fall back to ion.
         let envp: [*const u8; 4] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
             ENV_TERM.as_ptr(),
             core::ptr::null(),
         ];
-        let ret = execve(SHELL_PATH, &argv, &envp);
-        // execve only returns on failure.
-        write_str(STDOUT_FILENO, "init: execve /bin/sh failed (");
+
+        // Phase 21: ion is available at /bin/ion for script mode (ion -c 'cmd').
+        // Interactive mode requires Phase 22 (termios) for liner's TTY handling.
+        // Use sh0 as the interactive shell for now.
+        let sh0_argv_primary: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
+        execve(SH0_PATH, &sh0_argv_primary, &envp);
+
+        // sh0 not available — try ion as fallback (interactive requires Phase 22).
+        write_str(STDOUT_FILENO, "init: sh0 not available, trying ion\n");
+        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(ION_PATH, &ion_argv, &envp);
+
+        // Both failed.
+        write_str(STDOUT_FILENO, "init: execve failed (");
         syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
         write_str(STDOUT_FILENO, ")\n");
         exit(1);

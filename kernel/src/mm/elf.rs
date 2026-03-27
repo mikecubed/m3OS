@@ -39,10 +39,16 @@ const PF_X: u32 = 0x1; // Execute
 const PF_W: u32 = 0x2; // Write
                        // PF_R (0x4) is always assumed present.
 
-/// Virtual address of the top of the user stack (just below 128 TiB).
-pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-/// Number of pages to allocate for the user stack (32 KiB).
-pub const STACK_PAGES: u64 = 8;
+/// Virtual address of the top of the user stack.
+/// Set well below the canonical boundary (0x0000_8000_0000_0000) to leave
+/// room for musl's TLS/TCB allocation above the initial RSP during startup.
+pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FF00_0000;
+/// Number of pages to allocate for the user stack (256 KiB — ion/musl needs more than 32 KiB).
+pub const STACK_PAGES: u64 = 64;
+/// Extra pages pre-mapped above ELF_STACK_TOP for the ABI stack layout.
+/// Additional pages above this are demand-paged by the page fault handler
+/// when musl's TLS/TCB allocation writes above the initial RSP.
+const ABOVE_STACK_PAGES: u64 = 16;
 /// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
 const USER_VADDR_MIN: u64 = 0x0040_0000;
 /// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).
@@ -362,7 +368,11 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>, phys_off: u64) -> Res
 
     let mut frame_alloc = GlobalFrameAlloc;
 
-    for i in 0..STACK_PAGES {
+    // Map STACK_PAGES pages below ELF_STACK_TOP for the stack, plus
+    // ABOVE_STACK_PAGES pages above it for the ABI stack layout.
+    // Additional pages above this are demand-paged by the page fault handler
+    // when musl's TLS/TCB allocation writes above the initial RSP.
+    for i in 0..STACK_PAGES + ABOVE_STACK_PAGES {
         let vaddr = VirtAddr::new(ELF_STACK_TOP - STACK_PAGES * 4096 + i * 4096);
         let page: Page<Size4KiB> = Page::containing_address(vaddr);
 

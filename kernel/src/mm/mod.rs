@@ -246,6 +246,10 @@ pub fn free_process_page_table(cr3_phys: u64) {
         count: usize,
         filter: fn(PageTableFlags) -> bool,
     ) -> Vec<u64> {
+        // Validate the table physical address before dereferencing.
+        if table_phys == 0 || table_phys & 0xFFF != 0 {
+            return Vec::new();
+        }
         let mut addrs = Vec::with_capacity(count);
         let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
         for i in 0..count {
@@ -257,7 +261,12 @@ pub fn free_process_page_table(cr3_phys: u64) {
             if !filter(flags) {
                 continue;
             }
-            addrs.push(entry.addr().as_u64());
+            let addr = entry.addr().as_u64();
+            // Skip entries with invalid physical addresses.
+            if addr == 0 || addr & 0xFFF != 0 {
+                continue;
+            }
+            addrs.push(addr);
         }
         addrs
     }

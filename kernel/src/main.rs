@@ -218,6 +218,10 @@ fn init_task() -> ! {
     // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
     task::spawn(stdin_feeder_task, "stdin-feeder");
 
+    // Phase 21: serial stdin feeder — reads bytes from COM1, feeds stdin buffer.
+    // Allows testing ion interactively via `cargo xtask run` with piped input.
+    task::spawn(serial_stdin_feeder_task, "serial-stdin");
+
     // Phase 20: re-enable p11 launcher now that restore_caller_context
     // preserves per-process syscall state across yields.
     task::spawn(p11_launcher_task, "p11-launcher");
@@ -286,7 +290,7 @@ fn spawn_userspace_init() {
     );
     log::info!("[init] /sbin/init registered as pid {}", pid);
 
-    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
     task::spawn(process::fork_child_trampoline, "userspace-init");
 }
 
@@ -869,6 +873,29 @@ fn idle_task() -> ! {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 21 — serial stdin feeder
+// ---------------------------------------------------------------------------
+
+/// Poll the serial port (COM1) for incoming bytes and feed them into the
+/// kernel stdin buffer. This allows testing ion interactively via piped
+/// input to QEMU's `-serial stdio`.
+fn serial_stdin_feeder_task() -> ! {
+    loop {
+        // Read from COM1 data port (0x3F8) if data is available.
+        // Line Status Register (0x3FD) bit 0 = data ready.
+        let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FD).read() };
+        if lsr & 1 != 0 {
+            let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8).read() };
+            // Map \r to \n for terminals that send \r on Enter.
+            let ch = if byte == b'\r' { b'\n' } else { byte };
+            stdin::push_char(ch);
+        } else {
+            task::yield_now();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 11 — userspace launcher (P11-T017 / P11-T018)
 // ---------------------------------------------------------------------------
 
@@ -1116,7 +1143,7 @@ fn run_elf_and_report(name: &'static str) {
     // fork_child_trampoline sets CURRENT_PID when it runs — the launcher
     // must not set it here because the launcher kernel task is not the
     // new userspace process.
-    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
 
     // Spawn the kernel task; it will run fork_child_trampoline which
     // sets CURRENT_PID, switches CR3, and enters ring 3.
