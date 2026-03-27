@@ -87,15 +87,15 @@ flowchart TD
 | 16 | virtio-net driver, Ethernet/ARP/IP/UDP/TCP | [Network](./roadmap/16-network.md) |
 | 17 | Frame reclaim, heap growth, CoW fork, kernel stack cleanup | [Memory Reclamation](./roadmap/17-memory-reclamation.md) |
 | 18 | `getdents64`, directory fds, real cwd, ramdisk layout | [Directory and VFS](./roadmap/18-directory-vfs.md) |
+| 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
+| 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
+| 21 | ion shell (Redox OS) replaces minimal custom shell | [Ion Shell Integration](./roadmap/21-ion-shell.md) |
+| 22 | termios, cooked/raw mode, PTY stubs, window size, ion default shell | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
 
 ### Usability Phases (planned)
 
 | Phase | Focus | Link |
 |---|---|---|
-| 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
-| 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
-| 21 | ion shell (Redox OS) replaces minimal custom shell | [Ion Shell Integration](./roadmap/21-ion-shell.md) |
-| 22 | termios, cooked/raw mode, PTY pairs, window size | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
 | 23 | Socket syscalls, expose TCP/UDP stack to userspace | [Socket API](./roadmap/23-socket-api.md) |
 | 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
 
