@@ -174,7 +174,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 // Phase 7 service tasks
 // ---------------------------------------------------------------------------
 
-/// init task: creates service endpoints, registers them, spawns servers.
+/// init task: creates service endpoints, registers them, spawns servers,
+/// then loads the userspace `/sbin/init` as PID 1.
 fn init_task() -> ! {
     // Phase 7: console service endpoint.
     let console_ep = ipc::endpoint::ENDPOINTS.lock().create();
@@ -200,7 +201,6 @@ fn init_task() -> ! {
     log::info!("[init] service registry: vfs={:?}", vfs_ep);
 
     // Spawn Phase 7 service tasks.
-    // kbd_server_task creates its own notification internally.
     task::spawn(console_server_task, "console");
     task::spawn(kbd_server_task, "kbd");
     task::spawn(console_client_task, "console-client");
@@ -215,19 +215,79 @@ fn init_task() -> ! {
         task::spawn(net_task, "net");
     }
 
-    // Spawn Phase 9 shell task.
-    task::spawn(shell_task, "shell");
-
     // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
     task::spawn(stdin_feeder_task, "stdin-feeder");
 
-    // Phase 11: spawn userspace process launcher task (P11-T017).
+    // Phase 20: re-enable p11 launcher now that restore_caller_context
+    // preserves per-process syscall state across yields.
     task::spawn(p11_launcher_task, "p11-launcher");
+
+    // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
+    spawn_userspace_init();
 
     log::info!("[init] service set started — yielding");
     loop {
         task::yield_now();
     }
+}
+
+/// Load `/sbin/init` from the ramdisk and launch it as userspace PID 1.
+fn spawn_userspace_init() {
+    use mm::elf::load_elf_into;
+
+    let data = fs::ramdisk::get_file("sbin/init")
+        .or_else(|| fs::ramdisk::get_file("sbin/init.elf"))
+        .expect("[init] /sbin/init (or /sbin/init.elf) not found in ramdisk");
+
+    if data.is_empty() {
+        panic!("[init] /sbin/init (or .elf) is empty — not built?");
+    }
+
+    log::info!("[init] loading /sbin/init: {} bytes", data.len());
+
+    let new_cr3 = mm::new_process_page_table().expect("[init] out of frames for /sbin/init");
+    let phys_off = mm::phys_offset();
+
+    let argv: &[&[u8]] = &[b"/sbin/init"];
+    let envp: &[&[u8]] = &[b"PATH=/bin:/sbin:/usr/bin", b"HOME=/", b"TERM=m3os"];
+
+    let (loaded, user_rsp) = {
+        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
+        let loaded = unsafe { load_elf_into(&mut mapper, phys_off, data) }
+            .expect("[init] ELF load failed for /sbin/init");
+        let user_rsp = unsafe {
+            mm::elf::setup_abi_stack_with_envp(
+                loaded.stack_top,
+                &mapper,
+                phys_off,
+                argv,
+                envp,
+                loaded.phdr_vaddr,
+                loaded.phnum,
+            )
+        }
+        .expect("[init] ABI stack setup failed for /sbin/init");
+        (loaded, user_rsp)
+    };
+
+    log::info!(
+        "[init] /sbin/init loaded: entry={:#x} rsp={:#x}",
+        loaded.entry,
+        user_rsp,
+    );
+
+    let pid = process::spawn_process_with_cr3(
+        0,
+        loaded.entry,
+        user_rsp,
+        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+        0,
+        0,
+    );
+    log::info!("[init] /sbin/init registered as pid {}", pid);
+
+    process::push_fork_ctx(pid, loaded.entry, user_rsp);
+    task::spawn(process::fork_child_trampoline, "userspace-init");
 }
 
 /// Console server: receives IPC write requests, logs to serial, replies with ack.
@@ -759,6 +819,9 @@ fn stdin_feeder_task() -> ! {
                 stdin::clear_line();
                 shell_print(my_id, console_ep, "^C\n");
                 process::send_signal_to_group(fg, process::SIGINT);
+            } else {
+                // No foreground group — push raw Ctrl-C byte for userspace shell.
+                stdin::push_char(0x03);
             }
             continue;
         }
@@ -770,22 +833,22 @@ fn stdin_feeder_task() -> ! {
                 stdin::clear_line();
                 shell_print(my_id, console_ep, "^Z\n");
                 process::send_signal_to_group(fg, process::SIGTSTP);
+            } else {
+                // No foreground group — push raw Ctrl-Z byte for userspace shell.
+                stdin::push_char(0x1A);
             }
             continue;
         }
 
-        // Enter (0x1C): flush line buffer to stdin.
+        // Enter (0x1C): push newline byte.
         if sc == 0x1C {
-            shell_print(my_id, console_ep, "\n");
-            stdin::flush_line();
+            stdin::push_char(b'\n');
             continue;
         }
 
-        // Backspace (0x0E): remove last character.
+        // Backspace (0x0E): push backspace byte for userspace to handle.
         if sc == 0x0E {
-            if stdin::backspace() {
-                shell_print(my_id, console_ep, "\x08 \x08");
-            }
+            stdin::push_char(0x7f);
             continue;
         }
 
@@ -794,798 +857,8 @@ fn stdin_feeder_task() -> ! {
             let mut buf = [0u8; 4];
             let s = c.encode_utf8(&mut buf);
             stdin::push_char(s.as_bytes()[0]);
-            // Echo to console.
-            shell_print(my_id, console_ep, s);
         }
     }
-}
-
-/// Shell task: fork+exec interactive command interpreter (Phase 14, Track H).
-///
-/// Reads lines from the kernel stdin buffer, parses commands with pipes
-/// and redirection, and uses fork+exec to launch external ELF binaries.
-fn shell_task() -> ! {
-    let my_id = task::current_task_id().expect("[shell] no task id");
-    let console_ep = ipc::registry::lookup("console").expect("[shell] console not found");
-
-    shell_print(my_id, console_ep, "[shell] ready — type 'help'\n");
-    shell_print(my_id, console_ep, "> ");
-
-    let mut line_buf: Vec<u8> = Vec::new();
-
-    // Environment variables.
-    let mut env: Vec<(String, String)> = Vec::new();
-    env.push((String::from("PATH"), String::from("/bin")));
-
-    // Job list for background processes.
-    let mut bg_jobs: Vec<(u32, crate::process::Pid)> = Vec::new(); // (job_num, pid)
-    let mut next_job: u32 = 1;
-
-    loop {
-        // Read from stdin buffer.
-        let mut tmp = [0u8; 256];
-        let n = stdin::read(&mut tmp);
-        if n == 0 {
-            task::yield_now();
-            continue;
-        }
-
-        // Accumulate into line buffer.
-        for &b in &tmp[..n] {
-            if b == b'\n' {
-                let line_str = String::from(core::str::from_utf8(&line_buf).unwrap_or("").trim());
-                line_buf.clear();
-
-                if !line_str.is_empty() {
-                    shell_execute(
-                        my_id,
-                        console_ep,
-                        &line_str,
-                        &mut env,
-                        &mut bg_jobs,
-                        &mut next_job,
-                    );
-                }
-
-                // Reap finished background jobs. Collect reaped jobs first,
-                // then print status after releasing the process table lock
-                // to avoid holding it during IPC/allocation.
-                let mut reaped: Vec<(u32, crate::process::Pid)> = Vec::new();
-                bg_jobs.retain(|&(job, pid)| {
-                    let is_zombie = {
-                        let table = process::PROCESS_TABLE.lock();
-                        match table.find(pid) {
-                            Some(p) => p.state == process::ProcessState::Zombie,
-                            None => return false, // already gone
-                        }
-                    };
-                    if is_zombie {
-                        let mut table = process::PROCESS_TABLE.lock();
-                        table.reap(pid);
-                        reaped.push((job, pid));
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for (job, pid) in reaped {
-                    let msg = alloc::format!("[{}] done  pid {}\n", job, pid);
-                    shell_print(my_id, console_ep, &msg);
-                }
-
-                shell_print(my_id, console_ep, "> ");
-            } else {
-                line_buf.push(b);
-            }
-        }
-    }
-}
-
-/// Execute a shell command line (may contain pipes and redirection).
-fn shell_execute(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    line: &str,
-    env: &mut Vec<(String, String)>,
-    bg_jobs: &mut Vec<(u32, crate::process::Pid)>,
-    next_job: &mut u32,
-) {
-    // Expand $VAR references.
-    let expanded = expand_vars(line, env);
-    let line = expanded.trim();
-    if line.is_empty() {
-        return;
-    }
-
-    // Check for background `&`.
-    let (line, background) = if line.ends_with('&') {
-        (line.trim_end_matches('&').trim(), true)
-    } else {
-        (line, false)
-    };
-
-    // Split on `|` for pipeline.
-    let stages: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-
-    if stages.len() == 1 {
-        // Single command — check builtins first.
-        let parts: Vec<&str> = stages[0].splitn(2, ' ').collect();
-        let cmd = parts[0];
-        let args_str = if parts.len() > 1 { parts[1].trim() } else { "" };
-
-        match cmd {
-            "help" => {
-                shell_print(my_id, console_ep,
-                    "builtins: help cd exit export unset env fg bg ping\nexternal: echo cat ls pwd mkdir rmdir rm cp mv sleep grep true false\n");
-                return;
-            }
-            "cd" => {
-                if args_str.is_empty() {
-                    // cd with no args: go to /
-                    set_env(env, "PWD", "/");
-                    return;
-                }
-                // Resolve the target relative to current $PWD.
-                let current_pwd = env
-                    .iter()
-                    .find(|(k, _)| k == "PWD")
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or("/");
-                let resolved = shell_resolve_path(current_pwd, args_str);
-                // Validate the target is an existing directory.
-                if shell_is_directory(&resolved) {
-                    set_env(env, "PWD", &resolved);
-                } else {
-                    let msg = alloc::format!("cd: {}: No such directory\n", args_str);
-                    shell_print(my_id, console_ep, &msg);
-                }
-                return;
-            }
-            "exit" => {
-                shell_print(my_id, console_ep, "exit\n");
-                loop {
-                    task::yield_now();
-                }
-            }
-            "export" => {
-                if let Some(eq) = args_str.find('=') {
-                    let key = &args_str[..eq];
-                    let val = &args_str[eq + 1..];
-                    set_env(env, key, val);
-                }
-                return;
-            }
-            "unset" => {
-                env.retain(|(k, _)| k != args_str);
-                return;
-            }
-            "env" => {
-                for (k, v) in env.iter() {
-                    let line = alloc::format!("{}={}\n", k, v);
-                    shell_print(my_id, console_ep, &line);
-                }
-                return;
-            }
-            "fg" => {
-                if let Some(&(job, pid)) = bg_jobs.last() {
-                    let msg = alloc::format!("[{}] fg  pid {}\n", job, pid);
-                    shell_print(my_id, console_ep, &msg);
-                    // Set foreground group and send SIGCONT.
-                    process::FG_PGID.store(pid, core::sync::atomic::Ordering::Relaxed);
-                    process::send_signal(pid, process::SIGCONT);
-                    // Wait for the process (may stop again via Ctrl-Z).
-                    let exited = wait_for_child(pid);
-                    process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
-                    if exited {
-                        bg_jobs.retain(|&(_, p)| p != pid);
-                    }
-                    // If stopped, leave in bg_jobs so fg can resume again.
-                }
-                return;
-            }
-            "bg" => {
-                if let Some(&(_job, pid)) = bg_jobs.last() {
-                    process::send_signal(pid, process::SIGCONT);
-                }
-                return;
-            }
-            "ping" => {
-                shell_ping(my_id, console_ep, args_str);
-                return;
-            }
-            _ => {} // fall through to fork+exec
-        }
-
-        // Fork+exec for external command.
-        shell_fork_exec(
-            my_id, console_ep, stages[0], env, background, bg_jobs, next_job,
-        );
-    } else {
-        // Pipeline: fork two children connected by a pipe.
-        shell_pipeline(my_id, console_ep, &stages, env);
-    }
-}
-
-/// Fork and exec a single command (with optional redirection).
-fn shell_fork_exec(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    cmd_line: &str,
-    env: &[(String, String)],
-    background: bool,
-    bg_jobs: &mut Vec<(u32, crate::process::Pid)>,
-    next_job: &mut u32,
-) {
-    // Parse redirection: > file, >> file, < file.
-    let mut parts: Vec<&str> = Vec::new();
-    let mut stdout_file: Option<&str> = None;
-    let mut stdout_append = false;
-    let mut stdin_file: Option<&str> = None;
-    let mut iter = cmd_line.split_whitespace();
-    while let Some(tok) = iter.next() {
-        if tok == ">>" {
-            stdout_file = iter.next();
-            stdout_append = true;
-        } else if let Some(rest) = tok.strip_prefix(">>") {
-            stdout_file = Some(rest);
-            stdout_append = true;
-        } else if tok == ">" {
-            stdout_file = iter.next();
-            stdout_append = false;
-        } else if let Some(rest) = tok.strip_prefix('>') {
-            stdout_file = Some(rest);
-            stdout_append = false;
-        } else if tok == "<" {
-            stdin_file = iter.next();
-        } else if let Some(rest) = tok.strip_prefix('<') {
-            stdin_file = Some(rest);
-        } else {
-            parts.push(tok);
-        }
-    }
-
-    if parts.is_empty() {
-        return;
-    }
-
-    let cmd_name = parts[0];
-    // Resolve command via PATH search.
-    let elf_name = match resolve_command(cmd_name, env) {
-        Some(name) => name,
-        None => {
-            let msg = alloc::format!("{}: command not found\n", cmd_name);
-            shell_print(my_id, console_ep, &msg);
-            return;
-        }
-    };
-
-    // Build the child process with pipes for I/O.
-    // Always create a stdout pipe so the shell can relay child output
-    // to the framebuffer console. For file redirects, the pipe is
-    // drained to the file instead.
-    let stdin_pipe_id = stdin_file.map(|_| pipe::create_pipe());
-    let stdout_pipe_id = Some(pipe::create_pipe());
-
-    let shell_cwd = env
-        .iter()
-        .find(|(k, _)| k == "PWD")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("/");
-    let child_pid = match spawn_user_process_with_pipe(
-        &elf_name,
-        &parts,
-        env,
-        stdin_pipe_id,
-        stdout_pipe_id,
-        shell_cwd,
-    ) {
-        Some(pid) => pid,
-        None => {
-            // Clean up any pipes created for redirection.
-            if let Some(id) = stdin_pipe_id {
-                pipe::pipe_close_reader(id);
-                pipe::pipe_close_writer(id);
-            }
-            if let Some(id) = stdout_pipe_id {
-                pipe::pipe_close_reader(id);
-                pipe::pipe_close_writer(id);
-            }
-            shell_print(my_id, console_ep, "fork: failed\n");
-            return;
-        }
-    };
-
-    // Feed stdin from file if redirected.
-    if let (Some(file), Some(pipe_id)) = (stdin_file, stdin_pipe_id) {
-        let file_path = file.trim_start_matches('/');
-        match fs::ramdisk::get_file(file_path) {
-            Some(data) => {
-                let mut offset = 0;
-                while offset < data.len() {
-                    let chunk = (data.len() - offset).min(4096);
-                    let _ = pipe::pipe_write(pipe_id, &data[offset..offset + chunk]);
-                    offset += chunk;
-                }
-            }
-            None => {
-                let msg = alloc::format!("{}: No such file\n", file);
-                shell_print(my_id, console_ep, &msg);
-            }
-        }
-        pipe::pipe_close_writer(pipe_id);
-        pipe::pipe_close_reader(pipe_id);
-    }
-
-    // Drain child stdout pipe.
-    if let Some(pipe_id) = stdout_pipe_id {
-        pipe::pipe_close_writer(pipe_id);
-
-        if let Some(file) = stdout_file {
-            // Redirect to file.
-            let tmpfs_rel = match validate_tmpfs_path(file) {
-                Some(r) => r,
-                None => {
-                    let msg = alloc::format!("{}: not a writable path (use /tmp/...)\n", file);
-                    shell_print(my_id, console_ep, &msg);
-                    pipe::pipe_close_reader(pipe_id);
-                    return;
-                }
-            };
-            {
-                let mut tmpfs = fs::tmpfs::TMPFS.lock();
-                let _ = tmpfs.open_or_create(&tmpfs_rel, true);
-                if !stdout_append {
-                    let _ = tmpfs.truncate(&tmpfs_rel, 0);
-                }
-            }
-            let mut file_offset = if stdout_append {
-                let tmpfs = fs::tmpfs::TMPFS.lock();
-                tmpfs.file_size(&tmpfs_rel).unwrap_or(0)
-            } else {
-                0
-            };
-            loop {
-                let mut buf = [0u8; 4096];
-                match pipe::pipe_read(pipe_id, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut tmpfs = fs::tmpfs::TMPFS.lock();
-                        let _ = tmpfs.write_file(&tmpfs_rel, file_offset, &buf[..n]);
-                        file_offset += n;
-                    }
-                    Err(_) => {
-                        task::yield_now();
-                    }
-                }
-            }
-        } else {
-            // No file redirect — relay child stdout to framebuffer console.
-            loop {
-                let mut buf = [0u8; 4096];
-                match pipe::pipe_read(pipe_id, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
-                        shell_print(my_id, console_ep, &s);
-                    }
-                    Err(_) => {
-                        task::yield_now();
-                    }
-                }
-            }
-        }
-        pipe::pipe_close_reader(pipe_id);
-    }
-
-    if background {
-        let job = *next_job;
-        *next_job += 1;
-        bg_jobs.push((job, child_pid));
-        let msg = alloc::format!("[{}] {}\n", job, child_pid);
-        shell_print(my_id, console_ep, &msg);
-    } else {
-        // Set foreground process group.
-        process::FG_PGID.store(child_pid, core::sync::atomic::Ordering::Relaxed);
-        let exited = wait_for_child(child_pid);
-        process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
-        if !exited {
-            // Child was stopped (Ctrl-Z) — add to background jobs.
-            let job = *next_job;
-            *next_job += 1;
-            bg_jobs.push((job, child_pid));
-            let msg = alloc::format!("[{}] stopped  pid {}\n", job, child_pid);
-            shell_print(my_id, console_ep, &msg);
-        }
-    }
-}
-
-/// Pipeline: connect two commands with a pipe.
-fn shell_pipeline(
-    my_id: task::TaskId,
-    console_ep: ipc::endpoint::EndpointId,
-    stages: &[&str],
-    env: &[(String, String)],
-) {
-    if stages.len() != 2 {
-        shell_print(my_id, console_ep, "only two-stage pipelines supported\n");
-        return;
-    }
-
-    // Parse each stage.
-    let parts0: Vec<&str> = stages[0].split_whitespace().collect();
-    let parts1: Vec<&str> = stages[1].split_whitespace().collect();
-    if parts0.is_empty() || parts1.is_empty() {
-        return;
-    }
-
-    let elf0 = match resolve_command(parts0[0], env) {
-        Some(name) => name,
-        None => {
-            let msg = alloc::format!("{}: command not found\n", parts0[0]);
-            shell_print(my_id, console_ep, &msg);
-            return;
-        }
-    };
-    let elf1 = match resolve_command(parts1[0], env) {
-        Some(name) => name,
-        None => {
-            let msg = alloc::format!("{}: command not found\n", parts1[0]);
-            shell_print(my_id, console_ep, &msg);
-            return;
-        }
-    };
-
-    // Create a pipe.
-    let pipe_id = pipe::create_pipe();
-    let shell_cwd = env
-        .iter()
-        .find(|(k, _)| k == "PWD")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("/");
-
-    // Spawn first child (stdout → pipe write end).
-    let pid0 =
-        match spawn_user_process_with_pipe(&elf0, &parts0, env, None, Some(pipe_id), shell_cwd) {
-            Some(pid) => pid,
-            None => {
-                pipe::pipe_close_reader(pipe_id);
-                pipe::pipe_close_writer(pipe_id);
-                return;
-            }
-        };
-
-    // Create a stdout relay pipe for the second child so its output
-    // goes to the framebuffer console instead of serial.
-    let relay_pipe = pipe::create_pipe();
-
-    // Spawn second child (stdin ← inter-process pipe, stdout → relay pipe).
-    let pid1 = match spawn_user_process_with_pipe(
-        &elf1,
-        &parts1,
-        env,
-        Some(pipe_id),
-        Some(relay_pipe),
-        shell_cwd,
-    ) {
-        Some(pid) => pid,
-        None => {
-            pipe::pipe_close_reader(pipe_id);
-            pipe::pipe_close_writer(pipe_id);
-            pipe::pipe_close_reader(relay_pipe);
-            pipe::pipe_close_writer(relay_pipe);
-            return;
-        }
-    };
-
-    // Close our copies of the pipe ends so EOF propagates.
-    pipe::pipe_close_writer(pipe_id);
-    pipe::pipe_close_reader(pipe_id);
-    pipe::pipe_close_writer(relay_pipe);
-
-    // Put both children in the same process group so Ctrl-C/Ctrl-Z
-    // signals both stages of the pipeline.
-    {
-        let mut table = process::PROCESS_TABLE.lock();
-        if let Some(p) = table.find_mut(pid1) {
-            p.pgid = pid0;
-        }
-    }
-    process::FG_PGID.store(pid0, core::sync::atomic::Ordering::Relaxed);
-
-    // Drain the relay pipe to the framebuffer console.
-    loop {
-        let mut buf = [0u8; 4096];
-        match pipe::pipe_read(relay_pipe, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let s = alloc::string::String::from_utf8_lossy(&buf[..n]);
-                shell_print(my_id, console_ep, &s);
-            }
-            Err(_) => {
-                task::yield_now();
-            }
-        }
-    }
-    pipe::pipe_close_reader(relay_pipe);
-
-    // Wait for both children.
-    wait_for_child(pid0);
-    wait_for_child(pid1);
-
-    process::FG_PGID.store(0, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Spawn a userspace ELF process with optional pipe redirection.
-///
-/// `stdin_pipe`: if Some, FD 0 reads from this pipe.
-/// `stdout_pipe`: if Some, FD 1 writes to this pipe.
-fn spawn_user_process_with_pipe(
-    elf_name: &str,
-    argv: &[&str],
-    env: &[(String, String)],
-    stdin_pipe: Option<usize>,
-    stdout_pipe: Option<usize>,
-    cwd: &str,
-) -> Option<crate::process::Pid> {
-    use crate::mm::elf::load_elf_into;
-
-    let data = fs::ramdisk::get_file(elf_name)?;
-    if data.is_empty() {
-        return None;
-    }
-
-    let new_cr3 = mm::new_process_page_table()?;
-    let phys_off = mm::phys_offset();
-
-    let argv_bytes: Vec<Vec<u8>> = argv.iter().map(|s| Vec::from(s.as_bytes())).collect();
-    let argv_refs: Vec<&[u8]> = argv_bytes.iter().map(|v| v.as_slice()).collect();
-
-    let envp_strs: Vec<String> = env
-        .iter()
-        .map(|(k, v)| alloc::format!("{}={}", k, v))
-        .collect();
-    let envp_refs: Vec<&[u8]> = envp_strs.iter().map(|s| s.as_bytes()).collect();
-
-    let (loaded, user_rsp) = {
-        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
-        let loaded = unsafe { load_elf_into(&mut mapper, phys_off, data) }.ok()?;
-        let user_rsp = unsafe {
-            mm::elf::setup_abi_stack_with_envp(
-                loaded.stack_top,
-                &mapper,
-                phys_off,
-                &argv_refs,
-                &envp_refs,
-                loaded.phdr_vaddr,
-                loaded.phnum,
-            )
-        }
-        .ok()?;
-        (loaded, user_rsp)
-    };
-
-    let mut fd_table = process::new_fd_table_pub();
-
-    // Wire pipe FDs if requested. Increment ref-counts since the pipe was
-    // created with 1 reader + 1 writer, and these are additional references.
-    if let Some(pipe_id) = stdin_pipe {
-        pipe::pipe_add_reader(pipe_id);
-        fd_table[0] = Some(process::FdEntry {
-            backend: process::FdBackend::PipeRead { pipe_id },
-            offset: 0,
-            readable: true,
-            writable: false,
-        });
-    }
-    if let Some(pipe_id) = stdout_pipe {
-        pipe::pipe_add_writer(pipe_id);
-        fd_table[1] = Some(process::FdEntry {
-            backend: process::FdBackend::PipeWrite { pipe_id },
-            offset: 0,
-            readable: false,
-            writable: true,
-        });
-    }
-
-    let pid = process::spawn_process_with_cr3_and_fds(
-        0,
-        loaded.entry,
-        user_rsp,
-        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
-        0,
-        0,
-        fd_table,
-        0, // pgid=0 → use own pid
-    );
-
-    // Set the child's working directory from the shell's cwd.
-    {
-        let mut table = process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.cwd = String::from(cwd);
-        }
-    }
-
-    process::push_fork_ctx(pid, loaded.entry, user_rsp);
-    task::spawn(process::fork_child_trampoline, "shell-child");
-
-    Some(pid)
-}
-
-/// Wait for a child process to exit (spin-yield).
-/// Returns `true` if the child exited (reaped), `false` if it was stopped
-/// (Ctrl-Z). A stopped child is not reaped — it can be resumed with `fg`.
-fn wait_for_child(pid: crate::process::Pid) -> bool {
-    loop {
-        let state = {
-            let table = process::PROCESS_TABLE.lock();
-            table.find(pid).map(|p| p.state)
-        };
-        match state {
-            Some(process::ProcessState::Zombie) => {
-                let mut table = process::PROCESS_TABLE.lock();
-                table.reap(pid);
-                return true;
-            }
-            Some(process::ProcessState::Stopped) => {
-                return false; // stopped by signal — return to shell
-            }
-            None => return true,
-            _ => {
-                task::yield_now();
-            }
-        }
-    }
-}
-
-/// Expand $VAR references in a string.
-fn expand_vars(s: &str, env: &[(String, String)]) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            let mut var = String::new();
-            while let Some(&nc) = chars.peek() {
-                if nc.is_alphanumeric() || nc == '_' {
-                    var.push(nc);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if let Some((_, v)) = env.iter().find(|(k, _)| k == &var) {
-                result.push_str(v);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Resolve a path relative to a working directory (shell-level).
-/// Same algorithm as the kernel's resolve_path.
-fn shell_resolve_path(cwd: &str, path: &str) -> String {
-    let combined = if path.starts_with('/') {
-        String::from(path)
-    } else if path.is_empty() || path == "." {
-        String::from(cwd)
-    } else {
-        alloc::format!("{}/{}", cwd.trim_end_matches('/'), path)
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    for component in combined.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    if parts.is_empty() {
-        String::from("/")
-    } else {
-        let mut result = String::new();
-        for part in &parts {
-            result.push('/');
-            result.push_str(part);
-        }
-        result
-    }
-}
-
-/// Check if a resolved absolute path is an existing directory (shell-level).
-fn shell_is_directory(path: &str) -> bool {
-    if path == "/" {
-        return true;
-    }
-    // Check tmpfs.
-    let trimmed = path.trim_start_matches('/');
-    if trimmed == "tmp" || trimmed.starts_with("tmp/") {
-        let rel = if trimmed == "tmp" {
-            ""
-        } else {
-            &trimmed[4..] // skip "tmp/"
-        };
-        if rel.is_empty() {
-            return true;
-        }
-        let tmpfs = fs::tmpfs::TMPFS.lock();
-        return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
-    }
-    // Check ramdisk tree.
-    match fs::ramdisk::ramdisk_lookup(path) {
-        Some(node) => node.is_dir(),
-        None => false,
-    }
-}
-
-/// Set or update an environment variable in the shell's env list.
-fn set_env(env: &mut Vec<(String, String)>, key: &str, val: &str) {
-    for (k, v) in env.iter_mut() {
-        if k == key {
-            *v = String::from(val);
-            return;
-        }
-    }
-    env.push((String::from(key), String::from(val)));
-}
-
-/// Resolve a command name to an ELF filename via PATH search.
-///
-/// Validate a redirection target path as a writable tmpfs path.
-///
-/// Returns the tmpfs-relative path (e.g. "/tmp/foo" -> "foo"), or None
-/// if the path is outside /tmp or contains traversal segments.
-fn validate_tmpfs_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_start_matches('/');
-    let rest = if trimmed == "tmp" {
-        return None; // /tmp itself is a directory
-    } else {
-        trimmed.strip_prefix("tmp/")?
-    };
-    // Reject `.`, `..`, and empty segments.
-    for segment in rest.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return None;
-        }
-    }
-    Some(String::from(rest))
-}
-
-/// Resolve a command name to an ELF filename via PATH search.
-///
-/// Searches $PATH directories for `{cmd}.elf` in the ramdisk.
-/// Returns None if the command is not found in any PATH directory.
-fn resolve_command(cmd: &str, env: &[(String, String)]) -> Option<String> {
-    // If already has .elf extension, try directly.
-    if cmd.ends_with(".elf") {
-        return if fs::ramdisk::get_file(cmd).is_some() {
-            Some(String::from(cmd))
-        } else {
-            None
-        };
-    }
-
-    let elf_name = alloc::format!("{}.elf", cmd);
-
-    // Try direct lookup first (get_file has backward compat: bare name → /bin/).
-    if fs::ramdisk::get_file(&elf_name).is_some() {
-        return Some(elf_name);
-    }
-
-    // Search PATH directories against the ramdisk tree.
-    if let Some((_, path_val)) = env.iter().find(|(k, _)| k == "PATH") {
-        for dir in path_val.split(':') {
-            let full = alloc::format!("{}/{}", dir.trim_end_matches('/'), elf_name);
-            if fs::ramdisk::get_file(&full).is_some() {
-                return Some(full);
-            }
-        }
-    }
-
-    None
 }
 
 /// Idle task: halts the CPU between timer ticks.
@@ -1924,83 +1197,6 @@ fn net_task() -> ! {
                 last_poll_tick = now;
             }
             task::yield_now();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shell `ping` command (P16-T063)
-// ---------------------------------------------------------------------------
-
-/// Parse a dotted-decimal IPv4 address string.
-fn parse_ipv4(s: &str) -> Option<net::arp::Ipv4Addr> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let mut addr = [0u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        addr[i] = part.parse::<u8>().ok()?;
-    }
-    Some(addr)
-}
-
-/// `ping <ip>` — send ICMP echo requests and wait for replies.
-fn shell_ping(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, args: &str) {
-    let target = match parse_ipv4(args.trim()) {
-        Some(ip) => ip,
-        None => {
-            shell_print(my_id, console_ep, "usage: ping <ip>\n");
-            return;
-        }
-    };
-
-    if !net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
-        shell_print(my_id, console_ep, "ping: network not available\n");
-        return;
-    }
-
-    let msg = alloc::format!(
-        "PING {}.{}.{}.{}\n",
-        target[0],
-        target[1],
-        target[2],
-        target[3]
-    );
-    shell_print(my_id, console_ep, &msg);
-
-    for seq in 0..4u16 {
-        let send_tick = net::icmp::ping(target, seq);
-
-        // Wait up to ~2 seconds for a reply (200 ticks at ~100 Hz).
-        let mut got_reply = false;
-        for _ in 0..200u32 {
-            // Process incoming frames to handle the reply.
-            net::dispatch::process_rx();
-
-            if net::icmp::PING_REPLY_RECEIVED.load(core::sync::atomic::Ordering::Acquire) {
-                let recv_tick =
-                    net::icmp::PING_REPLY_TICK.load(core::sync::atomic::Ordering::Acquire);
-                let rtt_ticks = recv_tick.wrapping_sub(send_tick);
-                let rtt_ms = rtt_ticks * 10; // ~10ms per tick at 100 Hz
-                let reply_msg = alloc::format!(
-                    "reply from {}.{}.{}.{}: seq={} time={}ms\n",
-                    target[0],
-                    target[1],
-                    target[2],
-                    target[3],
-                    seq,
-                    rtt_ms
-                );
-                shell_print(my_id, console_ep, &reply_msg);
-                got_reply = true;
-                break;
-            }
-            task::yield_now();
-        }
-        if !got_reply {
-            let timeout_msg = alloc::format!("request timeout for seq {}\n", seq);
-            shell_print(my_id, console_ep, &timeout_msg);
         }
     }
 }

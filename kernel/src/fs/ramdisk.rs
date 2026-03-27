@@ -74,6 +74,8 @@ static ENV_ELF: &[u8] = include_bytes!("../../initrd/env.elf");
 static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep.elf");
 static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep.elf");
 static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test.elf");
+static INIT_ELF: &[u8] = include_bytes!("../../initrd/init.elf");
+static SH_ELF: &[u8] = include_bytes!("../../initrd/sh.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -120,6 +122,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: SIGNAL_TEST_ELF,
         },
     ),
+    ("sh", RamdiskNode::File { content: SH_ELF }),
+    ("sh.elf", RamdiskNode::File { content: SH_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
@@ -132,11 +136,22 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
 ];
 
+static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[
+    ("init", RamdiskNode::File { content: INIT_ELF }),
+    ("init.elf", RamdiskNode::File { content: INIT_ELF }),
+];
+
 static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
     (
         "bin",
         RamdiskNode::Dir {
             children: BIN_ENTRIES,
+        },
+    ),
+    (
+        "sbin",
+        RamdiskNode::Dir {
+            children: SBIN_ENTRIES,
         },
     ),
     (

@@ -32,6 +32,7 @@ const ET_DYN: u16 = 3; // position-independent executable (PIE)
 const EM_X86_64: u16 = 0x3E;
 
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
 
 // ELF segment flags
 const PF_X: u32 = 0x1; // Execute
@@ -620,6 +621,9 @@ pub unsafe fn load_elf_into(
         return Err(ElfError::MappingFailed("unsupported ELF type"));
     };
 
+    // Track the PT_DYNAMIC segment for relocation processing.
+    let mut dyn_offset: Option<(u64, u64)> = None; // (p_offset, p_filesz)
+
     for i in 0..phnum {
         let base = phoff
             .checked_add(
@@ -631,6 +635,18 @@ pub unsafe fn load_elf_into(
         let phdr = parse_phdr(data, base, phentsize)?;
         if phdr.p_type == PT_LOAD {
             map_load_segment(mapper, phys_off, data, &phdr, load_bias)?;
+        }
+        if phdr.p_type == PT_DYNAMIC {
+            dyn_offset = Some((phdr.p_offset, phdr.p_filesz));
+        }
+    }
+
+    // Apply R_X86_64_RELATIVE relocations for PIE binaries.
+    if load_bias != 0 {
+        if let Some((dyn_off, dyn_sz)) = dyn_offset {
+            apply_rela_relocations(
+                mapper, phys_off, data, dyn_off, dyn_sz, load_bias, min_vaddr,
+            );
         }
     }
 
@@ -669,4 +685,121 @@ pub unsafe fn load_elf(data: &[u8]) -> Result<LoadedElf, ElfError> {
     let phys_off = super::phys_offset();
     let mut mapper = super::paging::get_mapper();
     load_elf_into(&mut mapper, phys_off, data)
+}
+
+// ---------------------------------------------------------------------------
+// R_X86_64_RELATIVE relocation support for PIE binaries
+// ---------------------------------------------------------------------------
+
+// Dynamic section tag values
+const DT_NULL: u64 = 0;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+
+// Relocation type
+const R_X86_64_RELATIVE: u32 = 8;
+
+/// Parse the PT_DYNAMIC segment to find DT_RELA/DT_RELASZ entries, then
+/// apply R_X86_64_RELATIVE relocations by writing `load_bias + addend`
+/// at each relocation target address.
+///
+/// `min_vaddr` is the minimum p_vaddr across all PT_LOAD segments.  It is
+/// used to convert the DT_RELA value (which is a virtual address, not a
+/// file offset) into a file offset:  `file_offset = vaddr - min_vaddr`.
+/// For our PIE binaries linked at vaddr 0 this delta is 0, but the
+/// conversion is required for correctness with arbitrary link bases.
+fn apply_rela_relocations(
+    mapper: &mut OffsetPageTable<'_>,
+    phys_off: u64,
+    data: &[u8],
+    dyn_offset: u64,
+    dyn_size: u64,
+    load_bias: u64,
+    min_vaddr: u64,
+) {
+    let dyn_off = dyn_offset as usize;
+    let dyn_sz = dyn_size as usize;
+
+    // Parse dynamic section entries (each is 16 bytes: d_tag + d_val).
+    let mut rela_vaddr: u64 = 0;
+    let mut rela_size: u64 = 0;
+    let mut i = 0;
+    while i + 16 <= dyn_sz {
+        let off = match dyn_off.checked_add(i) {
+            Some(o) => o,
+            None => break,
+        };
+        if match off.checked_add(16) {
+            Some(end) => end > data.len(),
+            None => true,
+        } {
+            break;
+        }
+        let d_tag = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let d_val = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        match d_tag {
+            DT_NULL => break,
+            DT_RELA => rela_vaddr = d_val,
+            DT_RELASZ => rela_size = d_val,
+            _ => {}
+        }
+        i += 16;
+    }
+
+    if rela_vaddr == 0 || rela_size == 0 {
+        return; // No relocations.
+    }
+
+    // DT_RELA is a *virtual address* in the ELF spec, not a file offset.
+    // Convert it to a file offset by subtracting the base vaddr of the
+    // first LOAD segment (min_vaddr). Guard against malformed ELFs where
+    // DT_RELA points below the first LOAD segment.
+    let rela_off = match rela_vaddr.checked_sub(min_vaddr) {
+        Some(off) => off as usize,
+        None => return, // malformed: DT_RELA below min_vaddr
+    };
+    let rela_sz = rela_size as usize;
+
+    // Each Elf64_Rela entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
+    let mut j = 0;
+    while j + 24 <= rela_sz {
+        let off = match rela_off.checked_add(j) {
+            Some(o) => o,
+            None => break,
+        };
+        if match off.checked_add(24) {
+            Some(end) => end > data.len(),
+            None => true,
+        } {
+            break;
+        }
+        let r_offset = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let r_info = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        let r_addend = i64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+
+        let r_type = (r_info & 0xFFFF_FFFF) as u32;
+
+        if r_type == R_X86_64_RELATIVE {
+            // Write load_bias + addend at (load_bias + r_offset).
+            let target_vaddr = load_bias + r_offset;
+            let value = (load_bias as i64 + r_addend) as u64;
+
+            // Translate the target virtual address to a physical address
+            // so we can write through the physical-memory offset mapping.
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(target_vaddr));
+            if let Ok(phys_addr) = mapper.translate_page(page) {
+                let page_offset = target_vaddr & 0xFFF;
+                let dest =
+                    (phys_off + phys_addr.start_address().as_u64() + page_offset) as *mut u64;
+                // SAFETY: the page was just mapped by map_load_segment and the
+                // target is within a loaded segment. Use write_unaligned to
+                // avoid UB if a malformed ELF specifies an unaligned r_offset.
+                unsafe {
+                    core::ptr::write_unaligned(dest, value);
+                }
+            }
+        }
+
+        j += 24;
+    }
 }

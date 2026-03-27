@@ -94,11 +94,12 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(path.trim()).parent().unwrap().to_path_buf()
 }
 
-/// Compile Phase 11 userspace test binaries and copy them into kernel/initrd/.
+/// Compile userspace Rust binaries and copy them into kernel/initrd/.
 ///
-/// Each binary is compiled for `x86_64-unknown-none` (statically linked,
-/// no libc) in release mode.  The resulting ELF files are copied directly
-/// into `kernel/initrd/` and embedded in the kernel's ramdisk via `include_bytes!`.
+/// Includes Phase 11 test binaries (exit0, fork-test, echo-args) and
+/// Phase 20 init + shell. Each is compiled for `x86_64-unknown-none`
+/// (statically linked, no libc) in release mode. The resulting ELF files
+/// are embedded in the kernel's ramdisk via `include_bytes!`.
 fn build_userspace_bins() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
@@ -115,6 +116,8 @@ fn build_userspace_bins() {
         ("exit0", "exit0"),
         ("fork-test", "fork-test"),
         ("echo-args", "echo-args"),
+        ("init", "init"),
+        ("shell", "sh"),
     ];
 
     for (pkg, bin) in bins {
