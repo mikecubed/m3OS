@@ -183,6 +183,39 @@ terminal multiplexer and SSH work (Phase 23+).
 
 ---
 
+## Phase 20/21 Deferred Items Resolved by This Phase
+
+The following items were explicitly deferred to Phase 22 by earlier phases:
+
+**From Phase 20 (Userspace Init and Shell):**
+- PTY / TTY line discipline (`/dev/pts`, `termios`, raw mode, kernel-side echo) → Tracks A–D
+- Tab completion and readline-style line editing → Track F (ion's reedline handles this once termios works)
+
+**From Phase 21 (Ion Shell Integration) — specific deferred tasks:**
+
+| P21 Task | Description | Resolved by |
+|---|---|---|
+| P21-T028 | Ion script mode `ion -c` exits 1 due to ENOTTY in startup | P22-T050 |
+| P21-T031 | Variable testing — requires ion interactive mode | P22-T051 |
+| P21-T032 | Loop testing — requires ion interactive mode | P22-T052 |
+| P21-T034 | Signal handling — requires ion interactive mode | P22-T054, P22-T055 |
+| P21-T038 | Booting in QEMU presents the ion prompt | P22-T046 |
+| P21-T040 | `let x = world; echo $x` prints `world` | P22-T051 |
+| P21-T042 | `for i in a b c { echo $i }` prints three lines | P22-T052 |
+| P21-T044 | `Ctrl-C` during `sleep 10` kills the child | P22-T054 |
+
+**From Phase 21 — deferred feature list:**
+
+| Feature | Resolved by |
+|---|---|
+| Ion's interactive raw-mode line editor (arrow keys, history recall) | P22-T048 |
+| `SIGWINCH` / window size change notifications | P22-T040–T043 |
+| Proper `isatty()` that returns true for the console fd | P22-T038 |
+| History persistence (`~/.local/share/ion/history`) | Deferred again (requires writable home dir) |
+| Tab completion with reedline-style highlighting | Deferred again (depends on ion's reedline integration) |
+
+---
+
 ## Deferred Until Later Phases
 
 These items require infrastructure beyond Phase 22 scope:
