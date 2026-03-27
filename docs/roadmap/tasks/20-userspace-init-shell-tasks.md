@@ -17,7 +17,7 @@ kernel is no longer responsible for parsing commands or managing the interactive
 | E — kernel cleanup | ✅ Done | ~870 lines of ring-0 shell removed |
 | F — stdin bridge | ✅ Done | stdout→framebuffer, echo in userspace |
 | Bug fixes | ✅ Done | CoW fork parent flags, ELF relocations, syscall concurrency |
-| G — validation | 🔲 In progress | Boot + prompt confirmed, interactive testing needed |
+| G — validation/docs | ✅ Done | Boot validated, docs/18-userspace-init.md written |
 
 ## Prerequisite Analysis
 
