@@ -284,6 +284,8 @@ pub extern "C" fn syscall_handler(
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
         8 => sys_linux_lseek(arg0, arg1, arg2),
+        // Phase 21: mprotect stub (musl stack guard)
+        10 => 0, // no-op — our ELF loader already sets up guard pages
         // Linux-compatible memory (Phase 12, T018–T020)
         9 => sys_linux_mmap(arg0, arg1),
         11 => sys_linux_munmap(arg0, arg1),
@@ -295,21 +297,28 @@ pub extern "C" fn syscall_handler(
         16 => sys_linux_ioctl(arg0, arg1, arg2),
         19 => sys_linux_readv(arg0, arg1, arg2),
         20 => sys_linux_writev(arg0, arg1, arg2),
+        // Phase 21: access stub (PATH search — check existence only)
+        21 => sys_access(arg0),
         // Phase 14: pipe and dup2
         22 => sys_pipe(arg0),
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
         // IPC syscalls (Phase 6) — kernel-task only.
-        4 | 7 | 10 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
+        // Note: syscall 10 was IPC but is now mprotect (Phase 21).
+        4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
+        // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
+        56 => sys_clone(arg0, user_rip, user_rsp),
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
         61 => sys_waitpid(arg0, arg1, arg2),
         // Phase 14: signal syscalls
         62 => sys_kill(arg0, arg1),
         63 => sys_linux_uname(arg0),
+        // Phase 21: fcntl stub
+        72 => sys_fcntl(arg0, arg1, arg2),
         // Phase 13: filesystem mutation syscalls
         74 => sys_linux_fsync(arg0),
         76 => sys_linux_truncate(arg0, arg1),
@@ -320,9 +329,16 @@ pub extern "C" fn syscall_handler(
         83 => sys_linux_mkdir(arg0, arg1),
         84 => sys_linux_rmdir(arg0),
         87 => sys_linux_unlink(arg0),
+        // Phase 21: user/group ID stubs — single-user OS, always root (0)
+        102 => 0, // getuid
+        104 => 0, // getgid
+        107 => 0, // geteuid
+        108 => 0, // getegid
         // Phase 14: process group syscalls
         109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
+        // Phase 21: getpgrp — equivalent to getpgid(0)
+        111 => sys_getpgid(0),
         121 => sys_getpgid(arg0),
         // Phase 19: sigaltstack
         131 => sys_sigaltstack(arg0, arg1),
@@ -336,11 +352,25 @@ pub extern "C" fn syscall_handler(
         218 => sys_linux_set_tid_address(),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
         257 => sys_linux_openat(arg0, arg1, arg2),
+        // Phase 21: set_robust_list stub — musl thread init, no-op
+        273 => 0,
+        // Phase 21: dup3 — delegate to dup2 (ignore flags)
+        292 => sys_dup2(arg0, arg1),
+        // Phase 21: pipe2 — delegate to pipe (ignore flags)
+        293 => sys_pipe(arg0),
+        // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
+        302 => NEG_ENOSYS,
+        // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
+        318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
-        _ => NEG_ENOSYS,
+        _ => {
+            // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
+            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            NEG_ENOSYS
+        }
     };
 
     // Phase 14/19: check pending signals before returning to userspace.
@@ -3166,6 +3196,20 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         }
         return 0;
     }
+    // Phase 21: TCGETS/TCSETS → -ENOTTY so ion detects non-TTY and uses cooked mode.
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
+    const NEG_ENOTTY: u64 = (-25_i64) as u64;
+    if matches!(
+        req,
+        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGPGRP | TIOCSPGRP
+    ) {
+        return NEG_ENOTTY;
+    }
     // All other ioctl requests return EINVAL.
     let _ = fd;
     NEG_EINVAL
@@ -3684,4 +3728,132 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 /// the `clear_child_tid` pointer; we can safely ignore the pointer.
 fn sys_linux_set_tid_address() -> u64 {
     crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed) as u64
+}
+
+// ===========================================================================
+// Phase 21 — Ion Shell: syscall stubs for musl/nix runtime
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// access(path, mode) — syscall 21
+// ---------------------------------------------------------------------------
+
+/// Check if a path exists. Ignores the mode argument (no permission model).
+fn sys_access(path_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, name);
+
+    // Check ramdisk.
+    if crate::fs::ramdisk::ramdisk_lookup(&resolved).is_some() {
+        return 0;
+    }
+    // Check tmpfs.
+    if let Some(rel) = tmpfs_relative_path(&resolved) {
+        if rel.is_empty() {
+            return 0; // /tmp itself
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        if tmpfs.stat(rel).is_ok() {
+            return 0;
+        }
+    }
+    NEG_ENOENT
+}
+
+// ---------------------------------------------------------------------------
+// clone(flags, ...) — syscall 56
+// ---------------------------------------------------------------------------
+
+/// Minimal clone stub: if flags indicate a plain fork (flags == SIGCHLD or 0),
+/// delegate to sys_fork. Otherwise return -ENOSYS.
+fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
+    const SIGCHLD: u64 = 17;
+    // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
+    // Accept flags == SIGCHLD or flags == 0 (bare fork semantics).
+    let base_flags = flags & 0xFF; // low byte is the exit signal
+    if base_flags == SIGCHLD || base_flags == 0 {
+        sys_fork(user_rip, user_rsp)
+    } else {
+        NEG_ENOSYS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fcntl(fd, cmd, arg) — syscall 72
+// ---------------------------------------------------------------------------
+
+/// Minimal fcntl: F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL.
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            // Find the next free fd >= arg, duplicate oldfd into it.
+            let oldfd = fd as usize;
+            let min_fd = arg as usize;
+            if oldfd >= MAX_FDS || min_fd >= MAX_FDS {
+                return NEG_EBADF;
+            }
+            let entry = match current_fd_entry(oldfd) {
+                Some(e) => e,
+                None => return NEG_EBADF,
+            };
+            // Increment pipe ref-count for the duplicated FD.
+            match &entry.backend {
+                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+                _ => {}
+            }
+            match alloc_fd(min_fd, entry) {
+                Some(new_fd) => new_fd as u64,
+                None => NEG_EMFILE,
+            }
+        }
+        F_GETFD | F_GETFL => 0,
+        F_SETFD | F_SETFL => 0,
+        _ => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getrandom(buf, buflen, flags) — syscall 318
+// ---------------------------------------------------------------------------
+
+/// Fill user buffer with pseudo-random bytes seeded from the TSC.
+fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
+    let len = buflen as usize;
+    if len == 0 {
+        return 0;
+    }
+    // Cap at 256 bytes per call to avoid large kernel allocations.
+    let actual = len.min(256);
+    let mut out = [0u8; 256];
+
+    // Simple xorshift64* PRNG seeded from TSC.
+    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
+    if state == 0 {
+        state = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    for byte in out[..actual].iter_mut() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+    }
+
+    if crate::mm::user_mem::copy_to_user(buf_ptr, &out[..actual]).is_err() {
+        return NEG_EFAULT;
+    }
+    actual as u64
 }
