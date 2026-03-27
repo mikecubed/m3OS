@@ -2,8 +2,8 @@
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/ion` as the interactive shell (Phase 22: termios ready)
-//! - Fallback to `/bin/sh0` if ion is not available
+//! - Fork+exec `/bin/sh0` as the interactive shell
+//! - Ion available at `/bin/ion` (interactive mode deferred — needs posix_spawn fixes)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)
@@ -66,14 +66,16 @@ fn spawn_shell() -> isize {
             core::ptr::null(),
         ];
 
-        // Phase 22: termios is ready — use ion as primary interactive shell.
-        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        execve(ION_PATH, &ion_argv, &envp);
-
-        // Ion not available — fall back to sh0.
-        write_str(STDOUT_FILENO, "init: ion not available, trying sh0\n");
+        // Phase 22: TTY infrastructure ready. Use sh0 as primary interactive
+        // shell — it works with the cooked-mode line discipline. Ion interactive
+        // mode requires additional posix_spawn/CLOEXEC work (deferred).
         let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
-        let ret = execve(SH0_PATH, &sh0_argv, &envp);
+        execve(SH0_PATH, &sh0_argv, &envp);
+
+        // sh0 not available — try ion as fallback.
+        write_str(STDOUT_FILENO, "init: sh0 not available, trying ion\n");
+        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(ION_PATH, &ion_argv, &envp);
 
         // Both failed.
         write_str(STDOUT_FILENO, "init: execve failed (");
