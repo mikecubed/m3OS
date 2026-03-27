@@ -218,7 +218,8 @@ fn init_task() -> ! {
     // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
     task::spawn(stdin_feeder_task, "stdin-feeder");
 
-    // Phase 11: spawn userspace process launcher task (P11-T017).
+    // Phase 20: re-enable p11 launcher now that restore_caller_context
+    // preserves per-process syscall state across yields.
     task::spawn(p11_launcher_task, "p11-launcher");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.

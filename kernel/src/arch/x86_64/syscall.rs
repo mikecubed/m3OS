@@ -386,6 +386,7 @@ fn check_pending_signals(syscall_result: u64) {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
+                        let sig_saved_rsp = unsafe { SYSCALL_USER_RSP };
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -394,8 +395,7 @@ fn check_pending_signals(syscall_result: u64) {
                                 .unwrap_or(false)
                         } {
                             crate::task::yield_now();
-                            crate::process::CURRENT_PID
-                                .store(pid, core::sync::atomic::Ordering::Relaxed);
+                            restore_caller_context(pid, sig_saved_rsp);
                         }
                     }
                     SignalDisposition::Continue | SignalDisposition::Ignore => {}
@@ -1223,9 +1223,10 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     let ticks = (secs as u64).saturating_mul(100) + (nsecs as u64) / 10_000_000;
     let start = crate::arch::x86_64::interrupts::tick_count();
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
     while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
         crate::task::yield_now();
-        crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+        restore_caller_context(pid, saved_user_rsp);
         if has_pending_signal() {
             return NEG_EINTR;
         }
@@ -1546,6 +1547,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
     let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
     const WUNTRACED: u64 = 0x2;
     let report_stopped = options & WUNTRACED != 0;
 
@@ -1632,7 +1634,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 
         if let Some((child_pid, code_opt, stopped)) = result {
             // Restore caller context.
-            waitpid_restore_caller(calling_pid);
+            restore_caller_context(calling_pid, saved_user_rsp);
 
             // Write wstatus.
             if status_ptr != 0 {
@@ -1661,12 +1663,17 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 
         // No matching child ready; yield and try again.
         crate::task::yield_now();
-        crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+        restore_caller_context(calling_pid, saved_user_rsp);
     }
 }
 
-/// Restore the caller's CR3 and kernel stack after waitpid.
-fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
+/// Restore the caller's CR3, kernel stack, and user RSP after a yield.
+///
+/// When a syscall handler calls `yield_now()` to block, another task may
+/// enter the kernel via syscall and overwrite the global `SYSCALL_USER_RSP`
+/// and `SYSCALL_STACK_TOP`. This function restores all per-process state
+/// so that the `sysretq` return path uses the correct values.
+fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
     let (caller_cr3_phys, kstack_top) = {
         let table = crate::process::PROCESS_TABLE.lock();
         let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
@@ -1687,11 +1694,11 @@ fn waitpid_restore_caller(calling_pid: crate::process::Pid) {
         }
     }
     crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
-    if kstack_top != 0 {
-        unsafe {
-            crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
-            *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) =
-                kstack_top;
+    unsafe {
+        SYSCALL_USER_RSP = saved_user_rsp;
+        if kstack_top != 0 {
+            SYSCALL_STACK_TOP = kstack_top;
+            gdt::set_kernel_stack(kstack_top);
         }
     }
 }
@@ -1843,12 +1850,27 @@ unsafe fn cow_clone_user_pages(
                     )?;
                     let frame = PhysFrame::from_start_address(src_phys)
                         .expect("CoW: unaligned frame address");
-                    dst_mapper
-                        .map_to(page, frame, child_flags, &mut frame_alloc)
-                        .map_err(|_| {
-                            crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
-                        })?
-                        .ignore();
+                    // Intermediate page table entries (PD, PDPT, PML4) must always
+                    // have WRITABLE set so that after CoW resolution makes the PTE
+                    // writable, writes can actually succeed. The leaf PTE is the
+                    // only level that controls CoW (no WRITABLE + BIT_9).
+                    let parent_flags = PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE;
+                    unsafe {
+                        dst_mapper
+                            .map_to_with_table_flags(
+                                page,
+                                frame,
+                                child_flags,
+                                parent_flags,
+                                &mut frame_alloc,
+                            )
+                            .map_err(|_| {
+                                crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
+                            })?
+                            .ignore();
+                    }
 
                     // Child mapping succeeded — now mutate the parent PTE to
                     // match (clear WRITABLE, set BIT_9) and bump refcount.
@@ -1983,6 +2005,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Yield-loop until data is available (line-buffered).
             let capped = (count as usize).min(4096);
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
             loop {
                 if crate::stdin::has_data() {
                     let mut tmp = [0u8; 4096];
@@ -1999,7 +2022,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                crate::process::CURRENT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::Stdout => NEG_EBADF,
@@ -2059,6 +2082,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let pipe_id = *pipe_id;
             let capped = (count as usize).min(4096);
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
             // Yield-loop until data is available or writer closes.
             loop {
                 let mut tmp = [0u8; 4096];
@@ -2075,8 +2099,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        crate::process::CURRENT_PID
-                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -2176,6 +2199,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return NEG_EFAULT;
             }
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
             // Yield-loop until space is available or reader closes.
             loop {
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
@@ -2191,8 +2215,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        crate::process::CURRENT_PID
-                            .store(pid, core::sync::atomic::Ordering::Relaxed);
+                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
