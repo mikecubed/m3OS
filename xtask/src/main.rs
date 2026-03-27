@@ -117,7 +117,7 @@ fn build_userspace_bins() {
         ("fork-test", "fork-test"),
         ("echo-args", "echo-args"),
         ("init", "init"),
-        ("shell", "sh"),
+        ("shell", "sh0"),
     ];
 
     for (pkg, bin) in bins {

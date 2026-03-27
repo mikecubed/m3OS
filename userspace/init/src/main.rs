@@ -1,8 +1,9 @@
-//! m3OS init — PID 1 userspace process (Phase 20).
+//! m3OS init — PID 1 userspace process (Phase 20/21).
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/sh` as the interactive shell
+//! - Fork+exec `/bin/ion` as the interactive shell (Phase 21)
+//! - Fall back to `/bin/sh0` if ion is unavailable (Phase 20 shell)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)
@@ -11,8 +12,10 @@
 
 use syscall_lib::{execve, exit, fork, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG};
 
-const SHELL_PATH: &[u8] = b"/bin/sh\0";
-const SHELL_ARGV0: &[u8] = b"/bin/sh\0";
+const ION_PATH: &[u8] = b"/bin/ion\0";
+const ION_ARGV0: &[u8] = b"/bin/ion\0";
+const SH0_PATH: &[u8] = b"/bin/sh0\0";
+const SH0_ARGV0: &[u8] = b"/bin/sh0\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -55,17 +58,28 @@ pub extern "C" fn _start() -> ! {
 fn spawn_shell() -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: exec the shell.
-        let argv: [*const u8; 2] = [SHELL_ARGV0.as_ptr(), core::ptr::null()];
+        // Child: try ion first, fall back to sh0.
         let envp: [*const u8; 4] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
             ENV_TERM.as_ptr(),
             core::ptr::null(),
         ];
-        let ret = execve(SHELL_PATH, &argv, &envp);
-        // execve only returns on failure.
-        write_str(STDOUT_FILENO, "init: execve /bin/sh failed (");
+
+        // Try /bin/ion (Phase 21 shell).
+        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
+        execve(ION_PATH, &ion_argv, &envp);
+
+        // execve returned — ion not available, fall back to /bin/sh0.
+        write_str(
+            STDOUT_FILENO,
+            "init: ion not available, falling back to sh0\n",
+        );
+        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SH0_PATH, &sh0_argv, &envp);
+
+        // Both failed.
+        write_str(STDOUT_FILENO, "init: execve failed (");
         syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
         write_str(STDOUT_FILENO, ")\n");
         exit(1);
