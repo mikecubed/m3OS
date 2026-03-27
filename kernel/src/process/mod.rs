@@ -344,6 +344,9 @@ pub struct Process {
     pub alt_stack_flags: u32,
     /// Current working directory (Phase 18). Defaults to "/".
     pub cwd: String,
+    /// FS.base MSR value (TLS pointer, set by arch_prctl ARCH_SET_FS).
+    /// Saved on syscall entry, restored on context switch (Phase 21).
+    pub fs_base: u64,
 }
 
 impl Process {
@@ -376,6 +379,7 @@ impl Process {
             alt_stack_size: 0,
             alt_stack_flags: 0,
             cwd: String::from("/"),
+            fs_base: 0,
         }
     }
 }
@@ -493,6 +497,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -536,6 +541,7 @@ pub fn spawn_process_with_cr3(
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -583,6 +589,7 @@ pub fn spawn_process_with_cr3_and_fds(
         alt_stack_size: 0,
         alt_stack_flags: 0,
         cwd: String::from("/"),
+        fs_base: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -802,6 +809,18 @@ pub fn fork_child_trampoline() -> ! {
         *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) = kstack_top;
     }
 
+    // Restore FS.base (TLS pointer) for the child process.
+    {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(ctx.pid) {
+            if proc.fs_base != 0 {
+                x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(
+                    proc.fs_base,
+                ));
+            }
+        }
+    }
+
     // If the child has its own page table, switch CR3.
     if let Some(cr3) = cr3_phys {
         unsafe {
@@ -817,6 +836,10 @@ pub fn fork_child_trampoline() -> ! {
     }
     // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value)
     // and the parent's callee-saved registers restored.
+    //
+    // For kernel-spawned processes (init, p11 tests), the callee-saved
+    // registers are zeroed which is safe — execve replaces them immediately.
+    // For fork() children, these are the parent's actual register values.
     unsafe {
         crate::arch::enter_userspace_fork(
             ctx.user_rip,

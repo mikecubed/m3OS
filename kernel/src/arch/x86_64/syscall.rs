@@ -1315,6 +1315,21 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     let parent_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     log::info!("[p{}] fork()", parent_pid);
 
+    // Debug: log saved callee-saved registers for fork child restore.
+    if parent_pid == 3 {
+        unsafe {
+            log::debug!(
+                "[fork:3] saved regs: rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBP)),
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R12)),
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
+                core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
+            );
+        }
+    }
+
     // Allocate a new page table for the child, copying kernel entries.
     let child_cr3 = match crate::mm::new_process_page_table() {
         Some(f) => f,
@@ -1351,6 +1366,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_blocked_signals,
         parent_signal_actions,
         parent_alt_stack,
+        parent_fs_base,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1363,6 +1379,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.blocked_signals,
                 p.signal_actions,
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
+                p.fs_base,
             ),
             None => (
                 0,
@@ -1376,6 +1393,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 0,
                 [crate::process::SignalAction::Default; 32],
                 (0u64, 0u64, 0u32),
+                0,
             ),
         }
     };
@@ -1406,6 +1424,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.alt_stack_base = parent_alt_stack.0;
             child.alt_stack_size = parent_alt_stack.1;
             child.alt_stack_flags = parent_alt_stack.2;
+            child.fs_base = parent_fs_base;
         }
     }
 
@@ -1749,14 +1768,15 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 /// and `SYSCALL_STACK_TOP`. This function restores all per-process state
 /// so that the `sysretq` return path uses the correct values.
 fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
-    let (caller_cr3_phys, kstack_top) = {
+    let (caller_cr3_phys, kstack_top, fs_base) = {
         let table = crate::process::PROCESS_TABLE.lock();
         let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
         let kst = table
             .find(calling_pid)
             .map(|p| p.kernel_stack_top)
             .unwrap_or(0);
-        (cr3, kst)
+        let fsb = table.find(calling_pid).map(|p| p.fs_base).unwrap_or(0);
+        (cr3, kst, fsb)
     };
     if let Some(phys) = caller_cr3_phys {
         unsafe {
@@ -1774,6 +1794,10 @@ fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64)
         if kstack_top != 0 {
             SYSCALL_STACK_TOP = kstack_top;
             gdt::set_kernel_stack(kstack_top);
+        }
+        // Restore FS.base (TLS pointer) for this process.
+        if fs_base != 0 {
+            x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
         }
     }
 }
@@ -3782,6 +3806,12 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
                 Err(_) => return NEG_EINVAL,
             };
             x86_64::registers::model_specific::FsBase::write(vaddr);
+            // Save FS.base to process table for context-switch restore.
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.fs_base = addr;
+            }
             0
         }
         _ => NEG_EINVAL,
