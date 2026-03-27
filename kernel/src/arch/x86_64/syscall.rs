@@ -3963,7 +3963,12 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
     match cmd {
         FUTEX_WAIT => {
             // Yield once to let other tasks run, then pretend we were woken.
+            // Must restore caller context after yield (CR3, stack, PID) to
+            // avoid using another process's page table.
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
             crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
             0
         }
         FUTEX_WAKE => 1, // pretend one waiter woke up
