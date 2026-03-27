@@ -4398,15 +4398,14 @@ fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
 
 /// Minimal futex stub for single-threaded OS.
 ///
-/// In a single-threaded/cooperative OS, no other thread can wake a futex
-/// waiter. FUTEX_WAIT must never truly block — if *uaddr != val, return
-/// -EAGAIN (standard); if *uaddr == val, return -ETIMEDOUT immediately
-/// to prevent deadlock (the caller will take its timeout/retry path).
+/// In a single-threaded/cooperative OS, no other thread can change
+/// the futex word or wake a waiter. If FUTEX_WAIT sees *uaddr == val,
+/// the lock is deadlocked — we clear the word to 0 so the caller's
+/// next compare-and-swap succeeds and acquires the lock.
 fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
     const FUTEX_PRIVATE: u64 = 128;
-    const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 
     let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
     match cmd {
@@ -4420,10 +4419,12 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
             if current_val != val {
                 return NEG_EAGAIN;
             }
-            // Single-threaded: no one can change the value or wake us.
-            // Return -ETIMEDOUT so the caller falls through to its
-            // retry/error path instead of spinning forever.
-            NEG_ETIMEDOUT
+            // Single-threaded deadlock: no other thread can wake us.
+            // Force-clear the futex word to 0 so the caller's next
+            // lock-acquire CAS (compare_exchange(0, tid)) succeeds.
+            let zero = 0u32.to_ne_bytes();
+            let _ = crate::mm::user_mem::copy_to_user(uaddr, &zero);
+            0 // pretend we were woken
         }
         FUTEX_WAKE => 1, // pretend one waiter woke up
         _ => 0,          // unknown ops succeed silently
