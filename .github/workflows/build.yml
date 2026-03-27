@@ -44,8 +44,8 @@ jobs:
       - name: Boot smoke test
         run: |
           timeout 30 cargo xtask run 2>&1 | tee boot.log || true
-          # Verify kernel reached the shell prompt (end of boot sequence)
-          grep -q '\[shell\] ready' boot.log
+          # Phase 20: userspace init prints banner, shell prints prompt
+          grep -q 'm3OS init (PID 1)' boot.log
           # Verify no kernel panics
           ! grep -q 'panicked at' boot.log
 

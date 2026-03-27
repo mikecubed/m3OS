@@ -235,9 +235,8 @@ fn init_task() -> ! {
 fn spawn_userspace_init() {
     use mm::elf::load_elf_into;
 
-    let init_path = "sbin/init";
-    let data = fs::ramdisk::get_file(init_path)
-        .or_else(|| fs::ramdisk::get_file("init.elf"))
+    let data = fs::ramdisk::get_file("sbin/init")
+        .or_else(|| fs::ramdisk::get_file("sbin/init.elf"))
         .expect("[init] /sbin/init not found in ramdisk");
 
     if data.is_empty() {
