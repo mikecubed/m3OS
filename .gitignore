@@ -20,6 +20,7 @@
 *.qcow2
 *.fd
 OVMF*.fd
+boot*.log
 
 # Editor and IDE files
 *.swp
