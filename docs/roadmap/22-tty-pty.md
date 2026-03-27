@@ -141,12 +141,39 @@ VT100/ANSI escape sequences. This phase implements only the subset needed for an
 interactive shell: termios cooked/raw switching, window size, and skeleton PTY
 allocation. A full escape-sequence processor and devpts filesystem are deferred.
 
+## Phase 22 Follow-up: Ion Interactive Mode (Complete)
+
+The Ion shell interactive mode was blocked by several kernel bugs discovered
+during investigation. All were fixed in the `fix/pipe-refcount-init` branch:
+
+| Fix | Problem | Root Cause |
+|-----|---------|------------|
+| Pipe refcount init=0 | Pipe slot reuse corruption during fork+exec | `Pipe::new()` started reader/writer counts at 1 instead of 0; syscalls relied on the implicit initial count rather than explicitly incrementing |
+| Futex force-clear | musl lock deadlock spinning on `futex(WAIT)` | Single-threaded OS has no other thread to release locks; `FUTEX_WAIT` now clears the lock word to 0 when `*uaddr == val` |
+| CoW in copy_to_user | `EFAULT` on post-fork writes from syscall handlers | `copy_to_user` rejected CoW pages (read-only + BIT_9) instead of resolving the fault; ring-0 writes never trigger page faults |
+| .elf suffix fallback | External commands not found by Ion | musl's `execvp` tried `/bin/ls` but ramdisk stores `/bin/ls.elf`; `get_file` now tries appending `.elf` |
+
+Ion is now the default boot shell. sh0 remains available as fallback.
+
+## Next: VT100 / ANSI Escape Sequence Processing
+
+Ion's `liner` library redraws the prompt on every keystroke using ANSI escape
+sequences (`\x1b[K` clear-to-end, `\x1b[nG` cursor column, `\r` carriage
+return). The framebuffer console currently ignores these, causing each redraw
+to append rather than overwrite in place. Minimum viable subset needed:
+
+- `\r` (CR) — move cursor to column 0 (may already work)
+- `\x1b[K` (EL) — erase from cursor to end of line
+- `\x1b[nG` (CHA) — move cursor to column n
+- `\x1b[?25l` / `\x1b[?25h` — hide/show cursor
+- `\x1b[m` / `\x1b[0m` — reset attributes (SGR, can be a no-op initially)
+- `\x1b[nA` / `\x1b[nB` / `\x1b[nC` / `\x1b[nD` — cursor up/down/forward/back
+
 ## Deferred Until Later
 
 - Full PTY data path between master and slave (needed for terminal multiplexers,
   SSH, `script`)
 - `/dev/pts` devpts filesystem (dynamic slave device nodes)
-- VT100 / ANSI escape sequence processing in the line discipline
 - `VSTART` / `VSTOP` (XON/XOFF) software flow control
 - Modem control lines (DTR, RTS, CTS) and `TIOCMGET` / `TIOCMSET`
 - Session leaders and controlling terminals (`TIOCSCTTY`, `setsid`)
