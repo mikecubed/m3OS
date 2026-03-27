@@ -24,6 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
+          targets: x86_64-unknown-linux-musl
           components: rustfmt, clippy, rust-src
 
       - name: Install system dependencies
