@@ -187,6 +187,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/env.c", "env"),
         ("userspace/coreutils/sleep.c", "sleep"),
         ("userspace/coreutils/grep.c", "grep"),
+        // Phase 21 debugging
+        ("userspace/stdin-test/stdin-test.c", "stdin-test"),
     ];
 
     for (src_rel, name) in bins {

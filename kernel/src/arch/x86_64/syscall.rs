@@ -304,13 +304,21 @@ pub extern "C" fn syscall_handler(
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
+        // Phase 21: sendto → write for pipe-based socketpair
+        44 => sys_linux_write(arg0, arg1, arg2),
+        // Phase 21: recvfrom — non-blocking read for pipe-based socketpair.
+        // Ion uses MSG_DONTWAIT on the signal self-pipe; must not block.
+        45 => sys_recvfrom(arg0, arg1, arg2),
         // IPC syscalls (Phase 6) — kernel-task only.
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
         4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
-        // Phase 21: socketpair — return ENOSYS (no sockets yet)
-        53 => NEG_ENOSYS,
+        // Phase 21: socketpair — implement as pipe pair (sufficient for signal self-pipe)
+        53 => {
+            let sv_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            sys_pipe(sv_ptr)
+        }
         // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
         56 => sys_clone(arg0, user_rip, user_rsp),
         57 => sys_fork(user_rip, user_rsp),
@@ -3973,5 +3981,39 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
         }
         FUTEX_WAKE => 1, // pretend one waiter woke up
         _ => 0,          // unknown ops succeed silently
+    }
+}
+
+// ---------------------------------------------------------------------------
+// recvfrom(fd, buf, len, flags, ...) — syscall 45
+// ---------------------------------------------------------------------------
+
+/// Non-blocking read for pipe-based socketpair.
+/// Always behaves as if MSG_DONTWAIT is set — returns -EAGAIN if no data.
+fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } => {
+            let pipe_id = *pipe_id;
+            let len = (count as usize).min(4096);
+            let mut tmp = [0u8; 4096];
+            match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
+                Ok(n) if n > 0 => {
+                    if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    n as u64
+                }
+                _ => NEG_EAGAIN, // no data available or writer closed
+            }
+        }
+        _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds
     }
 }
