@@ -337,6 +337,9 @@ pub extern "C" fn syscall_handler(
         2 => sys_linux_open(arg0, arg1),
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
+        // Phase 22: poll stub — report all requested fds as ready.
+        // Ion uses poll() to multiplex between signal pipe and stdin.
+        7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 21: mprotect stub (musl stack guard)
         10 => 0, // no-op — our ELF loader already sets up guard pages
@@ -354,24 +357,30 @@ pub extern "C" fn syscall_handler(
         // Phase 21: access stub (PATH search — check existence only)
         21 => sys_access(arg0),
         // Phase 14: pipe and dup2
-        22 => sys_pipe(arg0),
+        22 => sys_pipe_with_flags(arg0, false),
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
         // Phase 21: sendto → write for pipe-based socketpair
         44 => sys_linux_write(arg0, arg1, arg2),
-        // Phase 21: recvfrom — non-blocking read for pipe-based socketpair.
-        // Ion uses MSG_DONTWAIT on the signal self-pipe; must not block.
-        45 => sys_recvfrom(arg0, arg1, arg2),
+        // Phase 21/22: recvfrom — read for pipe-based socketpair.
+        // Supports MSG_DONTWAIT (non-blocking) and blocking mode.
+        45 => {
+            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            sys_recvfrom(arg0, arg1, arg2, flags)
+        }
         // IPC syscalls (Phase 6) — kernel-task only.
+        // Note: syscall 7 was IPC but is now poll (Phase 22).
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
-        4 | 7 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
+        4 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
-        // Phase 21: socketpair — implement as pipe pair (sufficient for signal self-pipe)
+        // Phase 21/22: socketpair — implement as pipe pair.
+        // arg1 has type|flags (SOCK_CLOEXEC=0x80000).
         53 => {
             let sv_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            sys_pipe(sv_ptr)
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(sv_ptr, cloexec)
         }
         // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
         56 => sys_clone(arg0, user_rip, user_rsp),
@@ -427,7 +436,11 @@ pub extern "C" fn syscall_handler(
         // Phase 21: dup3 — delegate to dup2 (ignore flags)
         292 => sys_dup2(arg0, arg1),
         // Phase 21: pipe2 — delegate to pipe (ignore flags)
-        293 => sys_pipe(arg0),
+        293 => {
+            // pipe2(fds, flags) — O_CLOEXEC = 0x80000
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(arg0, cloexec)
+        }
         // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
         302 => NEG_ENOSYS,
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
@@ -1159,7 +1172,7 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// `pipe(pipefd_ptr)` — create a pipe (syscall 22).
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
-fn sys_pipe(pipefd_ptr: u64) -> u64 {
+fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     let pipe_id = crate::pipe::create_pipe();
 
     let read_entry = FdEntry {
@@ -1167,12 +1180,14 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec,
     };
     let write_entry = FdEntry {
         backend: FdBackend::PipeWrite { pipe_id },
         offset: 0,
         readable: false,
         writable: true,
+        cloexec,
     };
 
     let read_fd = match alloc_fd(3, read_entry) {
@@ -1252,8 +1267,11 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     }
 
     // Copy the FD entry to the new slot.
+    // POSIX: dup2 always clears FD_CLOEXEC on the new descriptor.
+    let mut entry_copy = entry;
+    entry_copy.cloexec = false;
     with_current_fd_mut(newfd, |slot| {
-        *slot = Some(entry);
+        *slot = Some(entry_copy);
     });
 
     newfd as u64
@@ -1599,9 +1617,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         (loaded, user_rsp)
     };
 
+    // Close file descriptors with FD_CLOEXEC set.
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    crate::process::close_cloexec_fds(pid);
+
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
@@ -2113,8 +2134,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Stdin => {
-            // Read from kernel stdin buffer (raw byte-at-a-time, Phase 20).
+        FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
+            // Read from kernel stdin buffer.
             // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -2220,6 +2241,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
+        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
+            log::trace!("[pty] read: PTY data path not yet implemented");
+            const NEG_ENOSYS: u64 = (-38_i64) as u64;
+            NEG_ENOSYS
+        }
     }
 }
 
@@ -2243,8 +2269,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Stdout => {
-            // stdout/stderr go to serial + framebuffer console.
+        FdBackend::Stdout | FdBackend::DeviceTTY { .. } => {
+            // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
@@ -2337,6 +2363,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
         FdBackend::DevNull => count, // silently discard
+        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
+            log::trace!("[pty] write: PTY data path not yet implemented");
+            const NEG_ENOSYS: u64 = (-38_i64) as u64;
+            NEG_ENOSYS
+        }
     }
 }
 
@@ -2455,11 +2486,47 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
             None => NEG_EMFILE,
         };
+    }
+
+    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    if name == "/dev/ptmx" {
+        let pty_id = crate::tty::alloc_pty();
+        log::info!("[pty] allocated PTY pair {}", pty_id);
+        let entry = FdEntry {
+            backend: FdBackend::PtyMaster { pty_id },
+            offset: 0,
+            readable: true,
+            writable: true,
+            cloexec: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
+        if let Ok(pty_id) = suffix.parse::<u32>() {
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: false,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => NEG_EMFILE,
+            };
+        }
+        return NEG_ENOENT;
     }
 
     let create = flags & O_CREAT != 0;
@@ -2498,6 +2565,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -2550,6 +2618,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
+            cloexec: false,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -2584,6 +2653,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -2647,11 +2717,47 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
             None => NEG_EMFILE,
         };
+    }
+
+    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    if name == "/dev/ptmx" {
+        let pty_id = crate::tty::alloc_pty();
+        log::info!("[pty] allocated PTY pair {}", pty_id);
+        let entry = FdEntry {
+            backend: FdBackend::PtyMaster { pty_id },
+            offset: 0,
+            readable: true,
+            writable: true,
+            cloexec: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
+        if let Ok(pty_id) = suffix.parse::<u32>() {
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: false,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => NEG_EMFILE,
+            };
+        }
+        return NEG_ENOENT;
     }
 
     let create = flags & O_CREAT != 0;
@@ -2684,6 +2790,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2720,6 +2827,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2743,6 +2851,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -2826,6 +2935,27 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
+    // DeviceTTY / PTY gets S_IFCHR mode with appropriate rdev encoding.
+    if matches!(
+        &entry.backend,
+        FdBackend::DeviceTTY { .. } | FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. }
+    ) {
+        let mut stat = [0u8; 144];
+        let mode: u32 = 0x2000 | 0o620; // S_IFCHR | rw--w----
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        let rdev: u64 = match &entry.backend {
+            FdBackend::DeviceTTY { tty_id } => ((5u64) << 8) | (*tty_id as u64),
+            FdBackend::PtyMaster { pty_id } => ((5u64) << 8) | (2 + *pty_id as u64),
+            FdBackend::PtySlave { pty_id } => ((136u64) << 8) | (*pty_id as u64),
+            _ => 0,
+        };
+        stat[32..40].copy_from_slice(&rdev.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let size = match &entry.backend {
         FdBackend::Stdout
         | FdBackend::Stdin
@@ -2839,7 +2969,13 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
-        FdBackend::Dir { .. } | FdBackend::DevNull => unreachable!(), // handled above
+        FdBackend::Dir { .. }
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => {
+            unreachable!() // handled above
+        }
     };
 
     // x86_64 stat struct (144 bytes, all little-endian).
@@ -2884,7 +3020,10 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
-        | FdBackend::DevNull => return NEG_EINVAL, // not seekable
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3304,37 +3443,158 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    const TIOCGWINSZ: u64 = 0x5413;
-    if req == TIOCGWINSZ {
-        // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } — each u16
-        let winsize: [u8; 8] = {
-            let mut w = [0u8; 8];
-            w[0..2].copy_from_slice(&24u16.to_ne_bytes()); // rows
-            w[2..4].copy_from_slice(&80u16.to_ne_bytes()); // cols
-            w
-        };
-        if crate::mm::user_mem::copy_to_user(arg, &winsize).is_err() {
-            return NEG_EFAULT;
-        }
-        return 0;
-    }
-    // Phase 21: TCGETS/TCSETS → -ENOTTY so ion detects non-TTY and uses cooked mode.
+    use kernel_core::tty::{TERMIOS_SIZE, WINSIZE_SIZE};
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
     const TCSETSF: u64 = 0x5404;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
     const NEG_ENOTTY: u64 = (-25_i64) as u64;
-    if matches!(
-        req,
-        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGPGRP | TIOCSPGRP
-    ) {
+
+    const TIOCGPTN: u64 = 0x80045430; // _IOR('T', 0x30, unsigned int)
+
+    // Check if the fd is a TTY or PTY; non-TTY fds return ENOTTY.
+    let fd_idx = fd as usize;
+    let backend = if fd_idx < MAX_FDS {
+        current_fd_entry(fd_idx).map(|e| e.backend.clone())
+    } else {
+        None
+    };
+    let is_tty = matches!(
+        &backend,
+        Some(FdBackend::DeviceTTY { .. })
+            | Some(FdBackend::PtyMaster { .. })
+            | Some(FdBackend::PtySlave { .. })
+    );
+
+    if !is_tty {
         return NEG_ENOTTY;
     }
-    // All other ioctl requests return EINVAL.
-    let _ = fd;
-    NEG_EINVAL
+
+    // TIOCGPTN: return PTY number for master fds.
+    if req == TIOCGPTN {
+        if let Some(FdBackend::PtyMaster { pty_id }) = &backend {
+            let bytes = (*pty_id).to_ne_bytes();
+            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                return NEG_EFAULT;
+            }
+            return 0;
+        }
+        return NEG_EINVAL;
+    }
+
+    match req {
+        TCGETS => {
+            // Copy TTY0.termios (36 bytes) to userspace.
+            let tty = crate::tty::TTY0.lock();
+            let src = unsafe {
+                core::slice::from_raw_parts(&tty.termios as *const _ as *const u8, TERMIOS_SIZE)
+            };
+            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TCSETS => {
+            // TCSANOW: apply immediately.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            crate::tty::TTY0.lock().termios = new_termios;
+            0
+        }
+        TCSETSW => {
+            // TCSADRAIN: drain output then apply. Output is synchronous, so
+            // this is equivalent to TCSANOW.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            crate::tty::TTY0.lock().termios = new_termios;
+            0
+        }
+        TCSETSF => {
+            // TCSAFLUSH: flush input, then apply new termios.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            // Flush stdin buffer and edit buffer.
+            crate::stdin::flush();
+            let mut tty = crate::tty::TTY0.lock();
+            tty.edit_buf.clear();
+            tty.termios = new_termios;
+            0
+        }
+        TIOCGPGRP => {
+            // Return foreground process group.
+            let tty = crate::tty::TTY0.lock();
+            let pgid = tty.fg_pgid;
+            let bytes = (pgid as i32).to_ne_bytes();
+            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TIOCSPGRP => {
+            // Set foreground process group.
+            let mut bytes = [0u8; 4];
+            if crate::mm::user_mem::copy_from_user(&mut bytes, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let pgid = i32::from_ne_bytes(bytes) as u32;
+            crate::tty::TTY0.lock().fg_pgid = pgid;
+            crate::process::FG_PGID.store(pgid, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        TIOCGWINSZ => {
+            // Copy TTY0.winsize (8 bytes) to userspace.
+            let tty = crate::tty::TTY0.lock();
+            let src = unsafe {
+                core::slice::from_raw_parts(&tty.winsize as *const _ as *const u8, WINSIZE_SIZE)
+            };
+            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TIOCSWINSZ => {
+            // Set window size and send SIGWINCH to foreground group.
+            let mut buf = [0u8; WINSIZE_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_ws = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Winsize)
+            };
+            let mut tty = crate::tty::TTY0.lock();
+            let changed =
+                tty.winsize.ws_row != new_ws.ws_row || tty.winsize.ws_col != new_ws.ws_col;
+            tty.winsize = new_ws;
+            let fg = tty.fg_pgid;
+            drop(tty);
+            if changed && fg != 0 {
+                crate::process::send_signal_to_group(fg, crate::process::SIGWINCH);
+            }
+            0
+        }
+        // TIOCSPTLCK (unlockpt) and TIOCGRANTPT (grantpt) — no-ops for PTY stubs.
+        0x40045431 | 0x5417 => 0,
+        _ => NEG_EINVAL,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3432,6 +3692,16 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             0
         }
         None => {
+            // Device special files.
+            if name == "/dev/null" || name == "/dev/ptmx" || name.starts_with("/dev/pts/") {
+                let mut stat = [0u8; 144];
+                let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
+                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                    return NEG_EFAULT;
+                }
+                return 0;
+            }
             // Also handle "/" specially.
             if name == "/" {
                 let mut stat = [0u8; 144];
@@ -3680,7 +3950,10 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
-        | FdBackend::DevNull => NEG_EINVAL,
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3879,7 +4152,8 @@ fn sys_access(path_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, name);
 
     // Phase 21: /dev/null always exists.
-    if resolved == "/dev/null" {
+    // Phase 22: /dev/ptmx and /dev/pts/* always exist.
+    if resolved == "/dev/null" || resolved == "/dev/ptmx" || resolved.starts_with("/dev/pts/") {
         return 0;
     }
 
@@ -3935,6 +4209,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Find the next free fd >= arg, duplicate oldfd into it.
+            let set_cloexec = cmd == F_DUPFD_CLOEXEC;
             let oldfd = fd as usize;
             let min_fd = arg as usize;
             if oldfd >= MAX_FDS {
@@ -3943,10 +4218,13 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             if min_fd >= MAX_FDS {
                 return NEG_EINVAL;
             }
-            let entry = match current_fd_entry(oldfd) {
+            let mut entry = match current_fd_entry(oldfd) {
                 Some(e) => e,
                 None => return NEG_EBADF,
             };
+            if set_cloexec {
+                entry.cloexec = true;
+            }
             // Remember pipe info so we only bump refcount on successful alloc.
             let pipe_info = match &entry.backend {
                 FdBackend::PipeRead { pipe_id } => Some((true, *pipe_id)),
@@ -3968,8 +4246,30 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 None => NEG_EMFILE,
             }
         }
-        F_GETFD | F_GETFL => 0,
-        F_SETFD | F_SETFL => 0,
+        F_GETFD => {
+            // Return FD_CLOEXEC (1) if cloexec is set.
+            match current_fd_entry(fd as usize) {
+                Some(e) => {
+                    if e.cloexec {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => NEG_EBADF,
+            }
+        }
+        F_SETFD => {
+            // arg & 1 = FD_CLOEXEC
+            let cloexec = arg & 1 != 0;
+            with_current_fd_mut(fd as usize, |slot| {
+                if let Some(e) = slot {
+                    e.cloexec = cloexec;
+                }
+            });
+            0
+        }
+        F_GETFL | F_SETFL => 0,
         _ => NEG_EINVAL,
     }
 }
@@ -4086,9 +4386,13 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
 // recvfrom(fd, buf, len, flags, ...) — syscall 45
 // ---------------------------------------------------------------------------
 
-/// Non-blocking read for pipe-based socketpair.
-/// Always behaves as if MSG_DONTWAIT is set — returns -EAGAIN if no data.
-fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+/// Read for pipe-based socketpair (recvfrom syscall).
+/// If MSG_DONTWAIT (0x40) is set in flags, returns -EAGAIN when no data.
+/// Otherwise blocks until data or EOF, like read().
+fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
+    const MSG_DONTWAIT: u64 = 0x40;
+    let nonblock = flags & MSG_DONTWAIT != 0;
+
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -4101,18 +4405,132 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
             let len = (count as usize).min(4096);
-            let mut tmp = [0u8; 4096];
-            match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
-                Ok(n) if n > 0 => {
-                    if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
-                        return NEG_EFAULT;
+
+            if nonblock {
+                // Non-blocking: single attempt.
+                let mut tmp = [0u8; 4096];
+                match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
+                    Ok(n) if n > 0 => {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        n as u64
                     }
-                    n as u64
+                    Ok(_) => 0,           // EOF
+                    Err(_) => NEG_EAGAIN, // would block
                 }
-                Ok(_) => 0,           // EOF: writer closed, no more data
-                Err(_) => NEG_EAGAIN, // would block or transient pipe error
+            } else {
+                // Blocking: yield-loop until data or EOF.
+                let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                loop {
+                    let mut tmp = [0u8; 4096];
+                    match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
+                        Ok(0) => return 0, // EOF
+                        Ok(n) => {
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                return NEG_EFAULT;
+                            }
+                            return n as u64;
+                        }
+                        Err(_) => {
+                            if has_pending_signal() {
+                                return NEG_EINTR;
+                            }
+                            crate::task::yield_now();
+                            restore_caller_context(pid, saved_user_rsp);
+                        }
+                    }
+                }
             }
         }
         _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 22: poll(fds, nfds, timeout) — syscall 7
+// ---------------------------------------------------------------------------
+
+/// poll(fds, nfds, timeout) — check fd readiness.
+///
+/// For pipe-read fds: report POLLIN if data available or writer closed (EOF).
+/// For TTY fds: report POLLIN if stdin has data.
+/// Other fds: report requested events (optimistic).
+/// If no fds are ready and timeout != 0, yield once and re-check.
+fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
+    const POLLIN: i16 = 0x001;
+    let nfds = nfds as usize;
+    if nfds > 256 {
+        return NEG_EINVAL;
+    }
+    let timeout_i = timeout as i64;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+
+    loop {
+        let mut ready_count = 0u64;
+
+        for i in 0..nfds {
+            let base = match fds_ptr.checked_add((i * 8) as u64) {
+                Some(a) => a,
+                None => return NEG_EFAULT,
+            };
+            let mut pfd = [0u8; 8];
+            if crate::mm::user_mem::copy_from_user(&mut pfd, base).is_err() {
+                return NEG_EFAULT;
+            }
+            let fd = i32::from_ne_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
+            let events = i16::from_ne_bytes([pfd[4], pfd[5]]);
+            let mut revents: i16 = 0;
+
+            if fd >= 0 && (fd as usize) < MAX_FDS {
+                if let Some(entry) = current_fd_entry(fd as usize) {
+                    match &entry.backend {
+                        FdBackend::PipeRead { pipe_id } => {
+                            // Check if pipe has data or is EOF.
+                            let mut tmp = [0u8; 0];
+                            match crate::pipe::pipe_read(*pipe_id, &mut tmp) {
+                                Ok(_) => revents = events & POLLIN,      // EOF (data ready)
+                                Err(true) => {}                          // would block (not ready)
+                                Err(false) => revents = events & POLLIN, // impossible for read
+                            }
+                        }
+                        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
+                            if crate::stdin::has_data() {
+                                revents = events & POLLIN;
+                            }
+                        }
+                        _ => {
+                            // Optimistic: report writable fds as ready.
+                            revents = events;
+                        }
+                    }
+                } else {
+                    revents = 0x020; // POLLNVAL
+                }
+            } else if fd >= 0 {
+                revents = 0x020; // POLLNVAL
+            }
+
+            if revents != 0 {
+                ready_count += 1;
+            }
+            pfd[6..8].copy_from_slice(&revents.to_ne_bytes());
+            if crate::mm::user_mem::copy_to_user(base, &pfd).is_err() {
+                return NEG_EFAULT;
+            }
+        }
+
+        if ready_count > 0 || timeout_i == 0 {
+            return ready_count;
+        }
+
+        // No fds ready and timeout != 0: yield and retry.
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        crate::task::yield_now();
+        restore_caller_context(pid, saved_user_rsp);
     }
 }

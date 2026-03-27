@@ -6,4 +6,5 @@ pub mod fs;
 pub mod ipc;
 pub mod net;
 pub mod pipe;
+pub mod tty;
 pub mod types;
