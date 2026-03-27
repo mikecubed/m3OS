@@ -2440,20 +2440,6 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
-    // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
-    if name == "/dev/null" {
-        let entry = FdEntry {
-            backend: FdBackend::DevNull,
-            offset: 0,
-            readable: true,
-            writable: true,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),     // O_RDONLY
@@ -2461,6 +2447,21 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         2 => (true, true),      // O_RDWR
         _ => return NEG_EINVAL, // invalid combination
     };
+    // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
+    // Placed after flags decode so O_RDONLY/O_WRONLY are respected.
+    if name == "/dev/null" {
+        let entry = FdEntry {
+            backend: FdBackend::DevNull,
+            offset: 0,
+            readable,
+            writable,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
@@ -2631,20 +2632,6 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     let resolved = resolve_path(&base_path, rel_name);
     let name: &str = &resolved;
 
-    // /dev/null special file — reads return EOF, writes are discarded.
-    if name == "/dev/null" {
-        let entry = FdEntry {
-            backend: FdBackend::DevNull,
-            offset: 0,
-            readable: true,
-            writable: true,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
     // Decode flags and delegate to the same open logic.
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),
@@ -2652,6 +2639,21 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         2 => (true, true),
         _ => return NEG_EINVAL,
     };
+
+    // /dev/null special file — placed after flags decode to respect O_RDONLY/O_WRONLY.
+    if name == "/dev/null" {
+        let entry = FdEntry {
+            backend: FdBackend::DevNull,
+            offset: 0,
+            readable,
+            writable,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;

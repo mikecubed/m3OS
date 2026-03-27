@@ -58,7 +58,7 @@ pub extern "C" fn _start() -> ! {
 fn spawn_shell() -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: try ion first, fall back to sh0.
+        // Child: exec sh0 as primary interactive shell, fall back to ion.
         let envp: [*const u8; 4] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),

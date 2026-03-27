@@ -138,6 +138,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     (
+        "stdin-test",
+        RamdiskNode::File {
+            content: STDIN_TEST_ELF,
+        },
+    ),
+    (
         "stdin-test.elf",
         RamdiskNode::File {
             content: STDIN_TEST_ELF,
