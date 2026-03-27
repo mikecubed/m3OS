@@ -17,7 +17,7 @@ const ION_ARGV0: &[u8] = b"/bin/ion\0";
 const SH0_PATH: &[u8] = b"/bin/sh0\0";
 const SH0_ARGV0: &[u8] = b"/bin/sh0\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-const ENV_HOME: &[u8] = b"HOME=/\0";
+const ENV_HOME: &[u8] = b"HOME=/tmp\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 
 #[no_mangle]
