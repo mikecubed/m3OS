@@ -41,8 +41,8 @@ const PF_W: u32 = 0x2; // Write
 
 /// Virtual address of the top of the user stack (just below 128 TiB).
 pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
-/// Number of pages to allocate for the user stack (32 KiB).
-pub const STACK_PAGES: u64 = 8;
+/// Number of pages to allocate for the user stack (2 MiB — ion/musl needs significant stack).
+pub const STACK_PAGES: u64 = 512;
 /// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
 const USER_VADDR_MIN: u64 = 0x0040_0000;
 /// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).

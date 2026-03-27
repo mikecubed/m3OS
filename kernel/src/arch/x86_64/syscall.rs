@@ -321,6 +321,8 @@ pub extern "C" fn syscall_handler(
         72 => sys_fcntl(arg0, arg1, arg2),
         // Phase 13: filesystem mutation syscalls
         74 => sys_linux_fsync(arg0),
+        // Phase 21: gettimeofday stub — return approximate time from LAPIC tick count
+        96 => sys_gettimeofday(arg0),
         76 => sys_linux_truncate(arg0, arg1),
         77 => sys_linux_ftruncate(arg0, arg1),
         79 => sys_linux_getcwd(arg0, arg1),
@@ -350,6 +352,8 @@ pub extern "C" fn syscall_handler(
         200 => sys_kill(arg0, arg1),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
+        // Phase 21: clock_gettime — return approximate time from LAPIC ticks
+        228 => sys_clock_gettime(arg0, arg1),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
         257 => sys_linux_openat(arg0, arg1, arg2),
         // Phase 21: set_robust_list stub — musl thread init, no-op
@@ -2141,6 +2145,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
+        FdBackend::DevNull => 0, // EOF
     }
 }
 
@@ -2257,6 +2262,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
+        FdBackend::DevNull => count, // silently discard
     }
 }
 
@@ -2359,6 +2365,20 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+
+    // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
+    if name == "/dev/null" {
+        let entry = FdEntry {
+            backend: FdBackend::DevNull,
+            offset: 0,
+            readable: true,
+            writable: true,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
 
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
@@ -2705,6 +2725,17 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
+    // DevNull gets S_IFCHR mode.
+    if matches!(&entry.backend, FdBackend::DevNull) {
+        let mut stat = [0u8; 144];
+        let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let size = match &entry.backend {
         FdBackend::Stdout
         | FdBackend::Stdin
@@ -2718,7 +2749,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
-        FdBackend::Dir { .. } => unreachable!(), // handled above
+        FdBackend::Dir { .. } | FdBackend::DevNull => unreachable!(), // handled above
     };
 
     // x86_64 stat struct (144 bytes, all little-endian).
@@ -2762,7 +2793,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::Stdin
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
-        | FdBackend::Dir { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::Dir { .. }
+        | FdBackend::DevNull => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3557,7 +3589,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::Stdin
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
-        | FdBackend::Dir { .. } => NEG_EINVAL,
+        | FdBackend::Dir { .. }
+        | FdBackend::DevNull => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3749,6 +3782,11 @@ fn sys_access(path_ptr: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, name);
 
+    // Phase 21: /dev/null always exists.
+    if resolved == "/dev/null" {
+        return 0;
+    }
+
     // Check ramdisk.
     if crate::fs::ramdisk::ramdisk_lookup(&resolved).is_some() {
         return 0;
@@ -3856,4 +3894,51 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
         return NEG_EFAULT;
     }
     actual as u64
+}
+
+// ---------------------------------------------------------------------------
+// gettimeofday(tv, tz) — syscall 96
+// ---------------------------------------------------------------------------
+
+/// Return an approximate time based on the LAPIC timer tick count.
+/// Since we don't have a real RTC, we return a monotonically increasing
+/// value derived from the kernel's tick counter.
+fn sys_gettimeofday(tv_ptr: u64) -> u64 {
+    if tv_ptr == 0 {
+        return 0;
+    }
+    let ticks = crate::arch::x86_64::interrupts::tick_count();
+    // Assume ~100 ticks/second (10ms per tick from LAPIC timer).
+    let secs = ticks / 100;
+    let usecs = (ticks % 100) * 10_000;
+    // struct timeval: tv_sec (i64) + tv_usec (i64) = 16 bytes
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&(secs as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(usecs as i64).to_ne_bytes());
+    if crate::mm::user_mem::copy_to_user(tv_ptr, &buf).is_err() {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// clock_gettime(clk_id, tp) — syscall 228
+// ---------------------------------------------------------------------------
+
+/// Return monotonic time based on the LAPIC tick counter.
+fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
+    if tp_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    let ticks = crate::arch::x86_64::interrupts::tick_count();
+    let secs = ticks / 100;
+    let nsecs = (ticks % 100) * 10_000_000;
+    // struct timespec: tv_sec (i64) + tv_nsec (i64) = 16 bytes
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&(secs as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(nsecs as i64).to_ne_bytes());
+    if crate::mm::user_mem::copy_to_user(tp_ptr, &buf).is_err() {
+        return NEG_EFAULT;
+    }
+    0
 }

@@ -90,6 +90,8 @@ pub enum FdBackend {
     PipeWrite { pipe_id: usize },
     /// Directory file descriptor (Phase 18).
     Dir { path: String },
+    /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
+    DevNull,
 }
 
 /// A single open-file entry in the per-process FD table.
