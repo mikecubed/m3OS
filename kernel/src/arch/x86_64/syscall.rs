@@ -1267,8 +1267,11 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     }
 
     // Copy the FD entry to the new slot.
+    // POSIX: dup2 always clears FD_CLOEXEC on the new descriptor.
+    let mut entry_copy = entry;
+    entry_copy.cloexec = false;
     with_current_fd_mut(newfd, |slot| {
-        *slot = Some(entry);
+        *slot = Some(entry_copy);
     });
 
     newfd as u64
@@ -4206,6 +4209,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             // Find the next free fd >= arg, duplicate oldfd into it.
+            let set_cloexec = cmd == F_DUPFD_CLOEXEC;
             let oldfd = fd as usize;
             let min_fd = arg as usize;
             if oldfd >= MAX_FDS {
@@ -4214,10 +4218,13 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             if min_fd >= MAX_FDS {
                 return NEG_EINVAL;
             }
-            let entry = match current_fd_entry(oldfd) {
+            let mut entry = match current_fd_entry(oldfd) {
                 Some(e) => e,
                 None => return NEG_EBADF,
             };
+            if set_cloexec {
+                entry.cloexec = true;
+            }
             // Remember pipe info so we only bump refcount on successful alloc.
             let pipe_info = match &entry.backend {
                 FdBackend::PipeRead { pipe_id } => Some((true, *pipe_id)),
