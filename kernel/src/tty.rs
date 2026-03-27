@@ -27,3 +27,17 @@ impl TtyState {
 
 /// The single console TTY instance.
 pub static TTY0: Mutex<TtyState> = Mutex::new(TtyState::new());
+
+// ---------------------------------------------------------------------------
+// PTY skeleton (Phase 22 — data path deferred to Phase 23+)
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Next PTY pair ID (monotonically increasing).
+static NEXT_PTY_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a new PTY pair, returning the pty_id.
+pub fn alloc_pty() -> u32 {
+    NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed)
+}

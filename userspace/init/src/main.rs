@@ -1,9 +1,9 @@
-//! m3OS init — PID 1 userspace process (Phase 20/21).
+//! m3OS init — PID 1 userspace process (Phase 20–22).
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/sh0` as the interactive shell
-//! - Ion available at `/bin/ion` for script mode (Phase 22 for interactive)
+//! - Fork+exec `/bin/ion` as the interactive shell (Phase 22: termios ready)
+//! - Fallback to `/bin/sh0` if ion is not available
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn the shell if it exits
 //! - Never exit (kernel panics if PID 1 dies)
@@ -66,16 +66,14 @@ fn spawn_shell() -> isize {
             core::ptr::null(),
         ];
 
-        // Phase 21: ion is available at /bin/ion for script mode (ion -c 'cmd').
-        // Interactive mode requires Phase 22 (termios) for liner's TTY handling.
-        // Use sh0 as the interactive shell for now.
-        let sh0_argv_primary: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
-        execve(SH0_PATH, &sh0_argv_primary, &envp);
-
-        // sh0 not available — try ion as fallback (interactive requires Phase 22).
-        write_str(STDOUT_FILENO, "init: sh0 not available, trying ion\n");
+        // Phase 22: termios is ready — use ion as primary interactive shell.
         let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        let ret = execve(ION_PATH, &ion_argv, &envp);
+        execve(ION_PATH, &ion_argv, &envp);
+
+        // Ion not available — fall back to sh0.
+        write_str(STDOUT_FILENO, "init: ion not available, trying sh0\n");
+        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SH0_PATH, &sh0_argv, &envp);
 
         // Both failed.
         write_str(STDOUT_FILENO, "init: execve failed (");

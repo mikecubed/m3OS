@@ -94,6 +94,10 @@ pub enum FdBackend {
     DevNull,
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
+    /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).
+    PtyMaster { pty_id: u32 },
+    /// PTY slave — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).
+    PtySlave { pty_id: u32 },
 }
 
 /// A single open-file entry in the per-process FD table.

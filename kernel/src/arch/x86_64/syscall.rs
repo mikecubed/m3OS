@@ -2220,6 +2220,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
+        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
+            log::trace!("[pty] read: PTY data path not yet implemented");
+            const NEG_ENOSYS: u64 = (-38_i64) as u64;
+            NEG_ENOSYS
+        }
     }
 }
 
@@ -2337,6 +2342,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
         FdBackend::DevNull => count, // silently discard
+        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
+            log::trace!("[pty] write: PTY data path not yet implemented");
+            const NEG_ENOSYS: u64 = (-38_i64) as u64;
+            NEG_ENOSYS
+        }
     }
 }
 
@@ -2460,6 +2470,39 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             Some(i) => i as u64,
             None => NEG_EMFILE,
         };
+    }
+
+    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    if name == "/dev/ptmx" {
+        let pty_id = crate::tty::alloc_pty();
+        log::info!("[pty] allocated PTY pair {}", pty_id);
+        let entry = FdEntry {
+            backend: FdBackend::PtyMaster { pty_id },
+            offset: 0,
+            readable: true,
+            writable: true,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
+        if let Ok(pty_id) = suffix.parse::<u32>() {
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => NEG_EMFILE,
+            };
+        }
+        return NEG_ENOENT;
     }
 
     let create = flags & O_CREAT != 0;
@@ -2654,6 +2697,39 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         };
     }
 
+    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    if name == "/dev/ptmx" {
+        let pty_id = crate::tty::alloc_pty();
+        log::info!("[pty] allocated PTY pair {}", pty_id);
+        let entry = FdEntry {
+            backend: FdBackend::PtyMaster { pty_id },
+            offset: 0,
+            readable: true,
+            writable: true,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
+    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
+        if let Ok(pty_id) = suffix.parse::<u32>() {
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => NEG_EMFILE,
+            };
+        }
+        return NEG_ENOENT;
+    }
+
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
@@ -2826,13 +2902,20 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
-    // DeviceTTY gets S_IFCHR | 0620, st_rdev encodes tty major/minor.
-    if let FdBackend::DeviceTTY { tty_id } = &entry.backend {
+    // DeviceTTY / PTY gets S_IFCHR mode with appropriate rdev encoding.
+    if matches!(
+        &entry.backend,
+        FdBackend::DeviceTTY { .. } | FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. }
+    ) {
         let mut stat = [0u8; 144];
         let mode: u32 = 0x2000 | 0o620; // S_IFCHR | rw--w----
         stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        // st_rdev at offset 32: encode major=136, minor=tty_id (Linux PTY convention)
-        let rdev: u64 = ((136u64) << 8) | (*tty_id as u64);
+        let rdev: u64 = match &entry.backend {
+            FdBackend::DeviceTTY { tty_id } => ((5u64) << 8) | (*tty_id as u64),
+            FdBackend::PtyMaster { pty_id } => ((5u64) << 8) | (2 + *pty_id as u64),
+            FdBackend::PtySlave { pty_id } => ((136u64) << 8) | (*pty_id as u64),
+            _ => 0,
+        };
         stat[32..40].copy_from_slice(&rdev.to_ne_bytes());
         if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
             return NEG_EFAULT;
@@ -2853,7 +2936,11 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
-        FdBackend::Dir { .. } | FdBackend::DevNull | FdBackend::DeviceTTY { .. } => {
+        FdBackend::Dir { .. }
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => {
             unreachable!() // handled above
         }
     };
@@ -2901,7 +2988,9 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
-        | FdBackend::DeviceTTY { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3333,19 +3422,36 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     const TIOCSWINSZ: u64 = 0x5414;
     const NEG_ENOTTY: u64 = (-25_i64) as u64;
 
-    // Check if the fd is a TTY; non-TTY fds return ENOTTY for termios ioctls.
+    const TIOCGPTN: u64 = 0x80045430; // _IOR('T', 0x30, unsigned int)
+
+    // Check if the fd is a TTY or PTY; non-TTY fds return ENOTTY.
     let fd_idx = fd as usize;
-    let is_tty = if fd_idx < MAX_FDS {
-        match current_fd_entry(fd_idx) {
-            Some(e) => matches!(e.backend, FdBackend::DeviceTTY { .. }),
-            None => false,
-        }
+    let backend = if fd_idx < MAX_FDS {
+        current_fd_entry(fd_idx).map(|e| e.backend.clone())
     } else {
-        false
+        None
     };
+    let is_tty = matches!(
+        &backend,
+        Some(FdBackend::DeviceTTY { .. })
+            | Some(FdBackend::PtyMaster { .. })
+            | Some(FdBackend::PtySlave { .. })
+    );
 
     if !is_tty {
         return NEG_ENOTTY;
+    }
+
+    // TIOCGPTN: return PTY number for master fds.
+    if req == TIOCGPTN {
+        if let Some(FdBackend::PtyMaster { pty_id }) = &backend {
+            let bytes = (*pty_id).to_ne_bytes();
+            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                return NEG_EFAULT;
+            }
+            return 0;
+        }
+        return NEG_EINVAL;
     }
 
     match req {
@@ -3453,6 +3559,8 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
+        // TIOCSPTLCK (unlockpt) and TIOCGRANTPT (grantpt) — no-ops for PTY stubs.
+        0x40045431 | 0x5417 => 0,
         _ => NEG_EINVAL,
     }
 }
@@ -3552,6 +3660,16 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             0
         }
         None => {
+            // Device special files.
+            if name == "/dev/null" || name == "/dev/ptmx" || name.starts_with("/dev/pts/") {
+                let mut stat = [0u8; 144];
+                let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
+                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                    return NEG_EFAULT;
+                }
+                return 0;
+            }
             // Also handle "/" specially.
             if name == "/" {
                 let mut stat = [0u8; 144];
@@ -3801,7 +3919,9 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
-        | FdBackend::DeviceTTY { .. } => NEG_EINVAL,
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -4000,7 +4120,8 @@ fn sys_access(path_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, name);
 
     // Phase 21: /dev/null always exists.
-    if resolved == "/dev/null" {
+    // Phase 22: /dev/ptmx and /dev/pts/* always exist.
+    if resolved == "/dev/null" || resolved == "/dev/ptmx" || resolved.starts_with("/dev/pts/") {
         return 0;
     }
 
