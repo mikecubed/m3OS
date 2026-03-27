@@ -727,6 +727,13 @@ struct ForkChildCtx {
     pid: Pid,
     user_rip: u64,
     user_rsp: u64,
+    // Callee-saved registers from the parent at syscall entry.
+    user_rbx: u64,
+    user_rbp: u64,
+    user_r12: u64,
+    user_r13: u64,
+    user_r14: u64,
+    user_r15: u64,
 }
 
 /// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
@@ -735,11 +742,35 @@ struct ForkChildCtx {
 static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::new());
 
 /// Push a fork-child context so `fork_child_trampoline` can consume it.
+///
+/// For fork() calls, the callee-saved registers are read from the statics
+/// saved at syscall entry. For kernel-spawned processes (p11 launcher),
+/// they're zeroed.
 pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
+    // Read the saved user callee-saved registers.
+    // SAFETY: single-CPU; these are written at every syscall entry before
+    // push_fork_ctx can be called.
+    let (rbx, rbp, r12, r13, r14, r15) = unsafe {
+        use crate::arch::x86_64::syscall::*;
+        (
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBP)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R12)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
+        )
+    };
     FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
+        user_rbx: rbx,
+        user_rbp: rbp,
+        user_r12: r12,
+        user_r13: r13,
+        user_r14: r14,
+        user_r15: r15,
     });
 }
 
@@ -784,8 +815,20 @@ pub fn fork_child_trampoline() -> ! {
             Cr3::write(frame, Cr3Flags::empty());
         }
     }
-    // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value).
-    unsafe { crate::arch::enter_userspace_with_retval(ctx.user_rip, ctx.user_rsp, 0) }
+    // Enter ring 3 at the parent's post-fork RIP with rax=0 (child return value)
+    // and the parent's callee-saved registers restored.
+    unsafe {
+        crate::arch::enter_userspace_fork(
+            ctx.user_rip,
+            ctx.user_rsp,
+            ctx.user_rbx,
+            ctx.user_rbp,
+            ctx.user_r12,
+            ctx.user_r13,
+            ctx.user_r14,
+            ctx.user_r15,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

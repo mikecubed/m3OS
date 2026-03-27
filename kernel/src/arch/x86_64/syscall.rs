@@ -131,6 +131,23 @@ pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
 #[no_mangle]
 static mut SYSCALL_ARG3: u64 = 0;
 
+/// Saved user callee-saved registers at syscall entry (for fork child restore).
+/// These are the registers that the SYSCALL instruction does NOT clobber,
+/// so they carry the user's values into the kernel. The fork child trampoline
+/// reads these to enter userspace with the correct register state.
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RBX: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RBP: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R12: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R13: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R14: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R15: u64 = 0;
+
 /// Virtual address of the top of the kernel syscall stack.
 ///
 /// Updated by the fork-child trampoline when switching to a per-process
@@ -156,6 +173,13 @@ global_asm!(
     "mov [rip + SYSCALL_USER_RSP], rsp",
     "mov rsp, [rip + SYSCALL_STACK_TOP]",
     "cld",
+    // --- Save user callee-saved registers for fork child restore ---
+    "mov [rip + SYSCALL_USER_RBX], rbx",
+    "mov [rip + SYSCALL_USER_RBP], rbp",
+    "mov [rip + SYSCALL_USER_R12], r12",
+    "mov [rip + SYSCALL_USER_R13], r13",
+    "mov [rip + SYSCALL_USER_R14], r14",
+    "mov [rip + SYSCALL_USER_R15], r15",
     // --- Save return address and user flags ---
     "push rcx", // user RIP  (restored before SYSRETQ)  [rsp+56 after all pushes]
     "push r11", // user RFLAGS

@@ -246,6 +246,10 @@ pub fn free_process_page_table(cr3_phys: u64) {
         count: usize,
         filter: fn(PageTableFlags) -> bool,
     ) -> Vec<u64> {
+        // Validate the table physical address before dereferencing.
+        if table_phys == 0 || table_phys & 0xFFF != 0 {
+            return Vec::new();
+        }
         let mut addrs = Vec::with_capacity(count);
         let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
         for i in 0..count {
@@ -257,7 +261,12 @@ pub fn free_process_page_table(cr3_phys: u64) {
             if !filter(flags) {
                 continue;
             }
-            addrs.push(entry.addr().as_u64());
+            let addr = entry.addr().as_u64();
+            // Skip entries with invalid physical addresses.
+            if addr == 0 || addr & 0xFFF != 0 {
+                continue;
+            }
+            addrs.push(addr);
         }
         addrs
     }
@@ -305,15 +314,22 @@ pub fn free_process_page_table(cr3_phys: u64) {
                     for leaf in &leaf_addrs {
                         frame_allocator::free_frame(*leaf);
                     }
-                    if has_user {
+                    // Only free the PT frame if it's not shared (refcount check).
+                    if has_user && frame_allocator::refcount_get(*pt_phys) <= 1 {
                         frame_allocator::free_frame(*pt_phys);
                     }
                 }
-                frame_allocator::free_frame(*pd_phys);
+                if frame_allocator::refcount_get(*pd_phys) <= 1 {
+                    frame_allocator::free_frame(*pd_phys);
+                }
             }
-            frame_allocator::free_frame(*pdpt_phys);
+            if frame_allocator::refcount_get(*pdpt_phys) <= 1 {
+                frame_allocator::free_frame(*pdpt_phys);
+            }
         }
-        frame_allocator::free_frame(cr3_phys);
+        if frame_allocator::refcount_get(cr3_phys) <= 1 {
+            frame_allocator::free_frame(cr3_phys);
+        }
     }
 }
 

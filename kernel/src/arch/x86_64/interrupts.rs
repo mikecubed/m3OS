@@ -42,6 +42,8 @@ fn fault_kill_trampoline() -> ! {
     x86_64::instructions::interrupts::disable();
     let pid = FAULT_KILL_PID.load(Ordering::Relaxed);
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
+    // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+    crate::process::close_all_fds_for(pid);
     // Mark the process zombie with SIGSEGV exit code.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -50,6 +52,8 @@ fn fault_kill_trampoline() -> ! {
             proc.exit_code = Some(-11);
         }
     }
+    // Deliver SIGCHLD to parent so waitpid unblocks.
+    crate::process::send_sigchld_to_parent(pid);
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
@@ -277,11 +281,20 @@ extern "x86-interrupt" fn page_fault_handler(
         // runs in ring 0 outside interrupt context where locking is safe.
         // SAFETY: we modify the interrupt return frame while interrupts are
         // disabled. The trampoline is a valid kernel function pointer.
+        // We must also set RSP to the current kernel stack (not the user RSP
+        // that was saved in the frame), otherwise IRET would pop the user RSP
+        // and the trampoline would run with an unmapped stack → GPF.
+        let kernel_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
+        }
         unsafe {
             stack_frame.as_mut().update(|f| {
                 f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
                 f.code_segment = gdt::kernel_code_selector();
                 f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+                f.stack_pointer = VirtAddr::new(kernel_rsp);
+                f.stack_segment = gdt::kernel_data_selector();
             });
         }
         return;
@@ -310,11 +323,17 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         // page_fault_handler — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
         // SAFETY: same as page_fault_handler above.
+        let kernel_rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
+        }
         unsafe {
             stack_frame.as_mut().update(|f| {
                 f.instruction_pointer = VirtAddr::new(fault_kill_trampoline as *const () as u64);
                 f.code_segment = gdt::kernel_code_selector();
                 f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+                f.stack_pointer = VirtAddr::new(kernel_rsp);
+                f.stack_segment = gdt::kernel_data_selector();
             });
         }
         return;

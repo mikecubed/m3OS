@@ -74,6 +74,7 @@ static ENV_ELF: &[u8] = include_bytes!("../../initrd/env.elf");
 static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep.elf");
 static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep.elf");
 static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test.elf");
+static PROMPT_ELF: &[u8] = include_bytes!("../../initrd/PROMPT.elf");
 static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test.elf");
 static INIT_ELF: &[u8] = include_bytes!("../../initrd/init.elf");
 static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0.elf");
@@ -122,6 +123,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "signal-test.elf",
         RamdiskNode::File {
             content: SIGNAL_TEST_ELF,
+        },
+    ),
+    (
+        "PROMPT",
+        RamdiskNode::File {
+            content: PROMPT_ELF,
+        },
+    ),
+    (
+        "PROMPT.elf",
+        RamdiskNode::File {
+            content: PROMPT_ELF,
         },
     ),
     (

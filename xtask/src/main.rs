@@ -187,7 +187,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/env.c", "env"),
         ("userspace/coreutils/sleep.c", "sleep"),
         ("userspace/coreutils/grep.c", "grep"),
-        // Phase 21 debugging
+        // Phase 21: ion prompt command + stdin test
+        ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
     ];
 
