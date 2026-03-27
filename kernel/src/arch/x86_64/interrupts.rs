@@ -195,6 +195,94 @@ fn has_cow_marker(vaddr: u64) -> bool {
     }
 }
 
+/// Demand-page a single 4 KiB user-accessible frame at the page containing
+/// `vaddr`. Used to grow the stack region on first write (musl's TLS/TCB
+/// allocation writes above the initial RSP — Linux maps 8 MiB so this is
+/// always valid there; we grow on demand).
+///
+/// Called from the page fault ISR (interrupts disabled, single CPU).
+/// Returns `true` on success, `false` on OOM.
+fn demand_map_user_page(vaddr: u64) -> bool {
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_offset_va = VirtAddr::new(phys_off);
+
+    let (cr3_frame, _) = Cr3::read();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+
+    let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let user_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    unsafe {
+        let pml4: &mut PageTable = &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
+        if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+            // Allocate a PDPT page.
+            let frame = match crate::mm::frame_allocator::allocate_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            let frame_phys = frame.start_address().as_u64();
+            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
+            pml4[p4_idx].set_addr(frame.start_address(), user_flags);
+        }
+
+        let pdpt: &mut PageTable =
+            &mut *(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+        if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+            let frame = match crate::mm::frame_allocator::allocate_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            let frame_phys = frame.start_address().as_u64();
+            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
+            pdpt[p3_idx].set_addr(frame.start_address(), user_flags);
+        }
+
+        let pd: &mut PageTable =
+            &mut *(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+        if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+            let frame = match crate::mm::frame_allocator::allocate_frame() {
+                Some(f) => f,
+                None => return false,
+            };
+            let frame_phys = frame.start_address().as_u64();
+            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
+            pd[p2_idx].set_addr(frame.start_address(), user_flags);
+        }
+
+        let pt: &mut PageTable =
+            &mut *(phys_offset_va + pd[p2_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+        if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+            // Already mapped — this shouldn't happen for demand paging.
+            return false;
+        }
+
+        // Allocate a fresh zeroed frame for the data page.
+        let frame = match crate::mm::frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => return false,
+        };
+        let frame_phys = frame.start_address().as_u64();
+        core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
+
+        let data_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+        pt[p1_idx].set_addr(frame.start_address(), data_flags);
+
+        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr & !0xFFF));
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // IDT
 // ---------------------------------------------------------------------------
@@ -262,6 +350,26 @@ extern "x86-interrupt" fn page_fault_handler(
                         return;
                     }
                     // OOM during CoW — fall through to kill the process.
+                }
+            }
+        }
+
+        // Demand-paging for the stack region: musl's __init_tls and malloc
+        // write above ELF_STACK_TOP (Linux maps an 8 MB region so this is
+        // always valid there). When the fault is a write to an unmapped page
+        // within 8 MiB above ELF_STACK_TOP, allocate a fresh frame and map it.
+        if is_write && !is_present {
+            if let Ok(fault_vaddr) = addr {
+                let fault_addr_u64 = fault_vaddr.as_u64();
+                let stack_top = crate::mm::elf::ELF_STACK_TOP;
+                let stack_bottom = stack_top - crate::mm::elf::STACK_PAGES * 4096;
+                // Allow demand-paging 8 MiB above ELF_STACK_TOP and down to guard page.
+                const DEMAND_LIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
+                if fault_addr_u64 >= stack_bottom
+                    && fault_addr_u64 < stack_top + DEMAND_LIMIT
+                    && demand_map_user_page(fault_addr_u64)
+                {
+                    return;
                 }
             }
         }

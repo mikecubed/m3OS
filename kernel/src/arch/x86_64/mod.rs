@@ -91,6 +91,9 @@ pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
 
 /// Context for entering ring 3 from a fork child, stored in a static so
 /// assembly can load register values without running out of register operands.
+///
+/// Includes ALL registers preserved by the Linux syscall ABI (everything
+/// except RAX/RCX/R11) plus the IRET frame fields.
 #[repr(C)]
 pub struct ForkEntryCtx {
     pub rip: u64, // offset 0
@@ -103,6 +106,13 @@ pub struct ForkEntryCtx {
     pub r15: u64, // offset 56
     pub ss: u64,  // offset 64
     pub cs: u64,  // offset 72
+    // Caller-saved registers (syscall-preserved).
+    pub rdi: u64, // offset 80
+    pub rsi: u64, // offset 88
+    pub rdx: u64, // offset 96
+    pub r8: u64,  // offset 104
+    pub r9: u64,  // offset 112
+    pub r10: u64, // offset 120
 }
 
 /// Static storage for the fork child entry context.
@@ -119,31 +129,47 @@ pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
     r15: 0,
     ss: 0,
     cs: 0,
+    rdi: 0,
+    rsi: 0,
+    rdx: 0,
+    r8: 0,
+    r9: 0,
+    r10: 0,
 };
 
-// Assembly trampoline: reads ForkEntryCtx, restores registers, IRETs to ring 3.
+// Assembly trampoline: reads ForkEntryCtx, restores ALL registers, IRETs to ring 3.
 global_asm!(
     ".global fork_enter_userspace",
     "fork_enter_userspace:",
     // On entry: FORK_ENTRY_CTX is populated.
-    // Load callee-saved registers.
-    "lea rdi, [rip + FORK_ENTRY_CTX]",
-    "mov rbx, [rdi + 16]",
-    "mov rbp, [rdi + 24]",
-    "mov r12, [rdi + 32]",
-    "mov r13, [rdi + 40]",
-    "mov r14, [rdi + 48]",
-    "mov r15, [rdi + 56]",
-    // Load ss selector value into rax temporarily.
-    "mov rax, [rdi + 64]", // ss
-    "push rax",
-    "push [rdi + 8]", // user RSP
-    "mov rax, 0x202",
-    "push rax",            // RFLAGS
-    "mov rax, [rdi + 72]", // cs
-    "push rax",
-    "push [rdi]",   // user RIP
-    "xor eax, eax", // rax = 0 (fork child return)
+    // Use rax as the base pointer (will be zeroed before IRETQ).
+    "lea rax, [rip + FORK_ENTRY_CTX]",
+    // Restore callee-saved registers.
+    "mov rbx, [rax + 16]",
+    "mov rbp, [rax + 24]",
+    "mov r12, [rax + 32]",
+    "mov r13, [rax + 40]",
+    "mov r14, [rax + 48]",
+    "mov r15, [rax + 56]",
+    // Restore caller-saved registers (syscall-preserved).
+    "mov rsi, [rax + 88]",
+    "mov rdx, [rax + 96]",
+    "mov r8,  [rax + 104]",
+    "mov r9,  [rax + 112]",
+    "mov r10, [rax + 120]",
+    // Build IRET frame: SS, RSP, RFLAGS, CS, RIP
+    "mov rcx, [rax + 64]", // ss
+    "push rcx",
+    "push [rax + 8]", // user RSP
+    "mov rcx, 0x202",
+    "push rcx",            // RFLAGS (IF set)
+    "mov rcx, [rax + 72]", // cs
+    "push rcx",
+    "push [rax]", // user RIP
+    // Restore rdi AFTER we're done using rax as base (rdi is offset 80).
+    "mov rdi, [rax + 80]",
+    // RAX = 0 (fork child return value).
+    "xor eax, eax",
     "iretq",
 );
 
@@ -151,7 +177,11 @@ extern "C" {
     fn fork_enter_userspace() -> !;
 }
 
-/// Enter ring 3 for a fork child with full callee-saved register restore.
+/// Enter ring 3 for a fork child with full register restore.
+///
+/// Restores ALL registers preserved by the Linux syscall ABI so the child
+/// resumes with the exact same register state as the parent had at the
+/// `syscall` instruction.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn enter_userspace_fork(
     rip: u64,
@@ -162,6 +192,12 @@ pub unsafe fn enter_userspace_fork(
     r13: u64,
     r14: u64,
     r15: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
 ) -> ! {
     FORK_ENTRY_CTX = ForkEntryCtx {
         rip,
@@ -174,6 +210,12 @@ pub unsafe fn enter_userspace_fork(
         r15,
         ss: u64::from(gdt::user_data_selector().0),
         cs: u64::from(gdt::user_code_selector().0),
+        rdi,
+        rsi,
+        rdx,
+        r8,
+        r9,
+        r10,
     };
     fork_enter_userspace()
 }

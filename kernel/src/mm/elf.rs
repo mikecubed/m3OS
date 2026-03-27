@@ -45,6 +45,10 @@ const PF_W: u32 = 0x2; // Write
 pub const ELF_STACK_TOP: u64 = 0x0000_7FFF_FF00_0000;
 /// Number of pages to allocate for the user stack (256 KiB — ion/musl needs more than 32 KiB).
 pub const STACK_PAGES: u64 = 64;
+/// Extra pages pre-mapped above ELF_STACK_TOP for the ABI stack layout.
+/// Additional pages above this are demand-paged by the page fault handler
+/// when musl's TLS/TCB allocation writes above the initial RSP.
+const ABOVE_STACK_PAGES: u64 = 16;
 /// Lower bound for valid userspace virtual addresses (4 MiB, matching Linux).
 const USER_VADDR_MIN: u64 = 0x0040_0000;
 /// Upper bound (exclusive) for valid userspace virtual addresses (128 TiB canonical boundary).
@@ -364,10 +368,11 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>, phys_off: u64) -> Res
 
     let mut frame_alloc = GlobalFrameAlloc;
 
-    // Map STACK_PAGES pages for the stack, plus 16 extra pages above ELF_STACK_TOP.
-    // musl's malloc and environment handling write to memory near the argv/envp
-    // strings which are packed at the top of the stack region.
-    for i in 0..STACK_PAGES + 16 {
+    // Map STACK_PAGES pages below ELF_STACK_TOP for the stack, plus
+    // ABOVE_STACK_PAGES pages above it. musl's __init_tls allocates the
+    // TLS/TCB block above the initial RSP (Linux maps an 8 MB region so
+    // this is always valid there). 256 pages (1 MiB) covers musl's needs.
+    for i in 0..STACK_PAGES + ABOVE_STACK_PAGES {
         let vaddr = VirtAddr::new(ELF_STACK_TOP - STACK_PAGES * 4096 + i * 4096);
         let page: Page<Size4KiB> = Page::containing_address(vaddr);
 

@@ -148,6 +148,23 @@ pub(crate) static mut SYSCALL_USER_R14: u64 = 0;
 #[no_mangle]
 pub(crate) static mut SYSCALL_USER_R15: u64 = 0;
 
+/// Saved user caller-saved registers at syscall entry (for fork child restore).
+/// The Linux syscall ABI preserves ALL registers except RAX (return value),
+/// RCX (return address), and R11 (RFLAGS). The fork child must restore these
+/// so the child resumes with the same register state as the parent.
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RDI: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RSI: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_RDX: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R8: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R9: u64 = 0;
+#[no_mangle]
+pub(crate) static mut SYSCALL_USER_R10: u64 = 0;
+
 /// Virtual address of the top of the kernel syscall stack.
 ///
 /// Updated by the fork-child trampoline when switching to a per-process
@@ -180,6 +197,15 @@ global_asm!(
     "mov [rip + SYSCALL_USER_R13], r13",
     "mov [rip + SYSCALL_USER_R14], r14",
     "mov [rip + SYSCALL_USER_R15], r15",
+    // --- Save user caller-saved registers for fork child restore ---
+    // The Linux syscall ABI preserves all registers except RAX/RCX/R11.
+    // The fork child must restore these so the child resumes correctly.
+    "mov [rip + SYSCALL_USER_RDI], rdi",
+    "mov [rip + SYSCALL_USER_RSI], rsi",
+    "mov [rip + SYSCALL_USER_RDX], rdx",
+    "mov [rip + SYSCALL_USER_R8], r8",
+    "mov [rip + SYSCALL_USER_R9], r9",
+    "mov [rip + SYSCALL_USER_R10], r10",
     // --- Save return address and user flags ---
     "push rcx", // user RIP  (restored before SYSRETQ)  [rsp+56 after all pushes]
     "push r11", // user RFLAGS

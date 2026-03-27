@@ -741,6 +741,15 @@ struct ForkChildCtx {
     user_r13: u64,
     user_r14: u64,
     user_r15: u64,
+    // Caller-saved registers — the Linux syscall ABI preserves all registers
+    // except RAX/RCX/R11. Without restoring these, the fork child starts
+    // with garbage in RDI/RSI/RDX/R8/R9/R10.
+    user_rdi: u64,
+    user_rsi: u64,
+    user_rdx: u64,
+    user_r8: u64,
+    user_r9: u64,
+    user_r10: u64,
 }
 
 /// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
@@ -750,14 +759,15 @@ static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::ne
 
 /// Push a fork-child context so `fork_child_trampoline` can consume it.
 ///
-/// For fork() calls, the callee-saved registers are read from the statics
-/// saved at syscall entry. For kernel-spawned processes (p11 launcher),
-/// they're zeroed.
+/// For fork() calls, the registers are read from the statics saved at
+/// syscall entry. For kernel-spawned processes (p11 launcher), they're
+/// zeroed.
 pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
-    // Read the saved user callee-saved registers.
-    // SAFETY: single-CPU; these are written at every syscall entry before
-    // push_fork_ctx can be called.
-    let (rbx, rbp, r12, r13, r14, r15) = unsafe {
+    // Read ALL saved user registers (callee-saved + caller-saved).
+    // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
+    // so the fork child must restore all of them.
+    // SAFETY: single-CPU; written at every syscall entry before this call.
+    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10) = unsafe {
         use crate::arch::x86_64::syscall::*;
         (
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
@@ -766,6 +776,12 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
             core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDI)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSI)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDX)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)),
+            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R10)),
         )
     };
     FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
@@ -778,6 +794,12 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r13: r13,
         user_r14: r14,
         user_r15: r15,
+        user_rdi: rdi,
+        user_rsi: rsi,
+        user_rdx: rdx,
+        user_r8: r8,
+        user_r9: r9,
+        user_r10: r10,
     });
 }
 
@@ -850,6 +872,12 @@ pub fn fork_child_trampoline() -> ! {
             ctx.user_r13,
             ctx.user_r14,
             ctx.user_r15,
+            ctx.user_rdi,
+            ctx.user_rsi,
+            ctx.user_rdx,
+            ctx.user_r8,
+            ctx.user_r9,
+            ctx.user_r10,
         )
     }
 }
