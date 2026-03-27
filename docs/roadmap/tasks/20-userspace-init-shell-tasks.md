@@ -6,6 +6,19 @@ with real ring-3 userspace processes. PID 1 becomes a `no_std` Rust binary loade
 from the ramdisk; the interactive shell is a userspace ELF that init spawns. The
 kernel is no longer responsible for parsing commands or managing the interactive session.
 
+## Implementation Progress
+
+| Track | Status | Notes |
+|---|---|---|
+| A — syscall-lib | ✅ Done | syscall3-6, all wrappers, constants, write_str/write_u64 |
+| B — init binary | ✅ Done | PID 1 with reap loop, shell respawn |
+| C — shell binary | ✅ Done | Line editor, tokenizer, cd/exit, pipes, redirection, PATH |
+| D — ramdisk/xtask | ✅ Done | /sbin/init and /bin/sh in ramdisk |
+| E — kernel cleanup | ✅ Done | ~870 lines of ring-0 shell removed |
+| F — stdin bridge | ✅ Done | stdout→framebuffer, echo in userspace |
+| Bug fixes | ✅ Done | CoW fork parent flags, ELF relocations, syscall concurrency |
+| G — validation | 🔲 In progress | Boot + prompt confirmed, interactive testing needed |
+
 ## Prerequisite Analysis
 
 Current state (post-Phase 19):
