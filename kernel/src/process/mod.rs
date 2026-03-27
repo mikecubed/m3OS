@@ -109,6 +109,8 @@ pub struct FdEntry {
     pub readable: bool,
     /// True if the file was opened for writing.
     pub writable: bool,
+    /// Close-on-exec flag (FD_CLOEXEC).
+    pub cloexec: bool,
 }
 
 /// Const sentinel for empty FD slots (used in array init).
@@ -131,6 +133,37 @@ pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
             _ => {}
         }
+    }
+}
+
+/// Close all FDs with the CLOEXEC flag set. Called by execve.
+pub fn close_cloexec_fds(pid: Pid) {
+    let mut readers = alloc::vec::Vec::new();
+    let mut writers = alloc::vec::Vec::new();
+    {
+        let mut table = PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return,
+        };
+        for slot in proc.fd_table.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.cloexec {
+                    match &entry.backend {
+                        FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
+                        FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                        _ => {}
+                    }
+                    *slot = None;
+                }
+            }
+        }
+    }
+    for id in readers {
+        crate::pipe::pipe_close_reader(id);
+    }
+    for id in writers {
+        crate::pipe::pipe_close_writer(id);
     }
 }
 
@@ -177,18 +210,21 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec: false,
     });
     table[1] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
         readable: false,
         writable: true,
+        cloexec: false,
     });
     table[2] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
         readable: false,
         writable: true,
+        cloexec: false,
     });
     table
 }

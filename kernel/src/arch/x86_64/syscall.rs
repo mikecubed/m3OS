@@ -357,7 +357,7 @@ pub extern "C" fn syscall_handler(
         // Phase 21: access stub (PATH search — check existence only)
         21 => sys_access(arg0),
         // Phase 14: pipe and dup2
-        22 => sys_pipe(arg0),
+        22 => sys_pipe_with_flags(arg0, false),
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
@@ -375,10 +375,12 @@ pub extern "C" fn syscall_handler(
         4 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
-        // Phase 21: socketpair — implement as pipe pair (sufficient for signal self-pipe)
+        // Phase 21/22: socketpair — implement as pipe pair.
+        // arg1 has type|flags (SOCK_CLOEXEC=0x80000).
         53 => {
             let sv_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            sys_pipe(sv_ptr)
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(sv_ptr, cloexec)
         }
         // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
         56 => sys_clone(arg0, user_rip, user_rsp),
@@ -434,7 +436,11 @@ pub extern "C" fn syscall_handler(
         // Phase 21: dup3 — delegate to dup2 (ignore flags)
         292 => sys_dup2(arg0, arg1),
         // Phase 21: pipe2 — delegate to pipe (ignore flags)
-        293 => sys_pipe(arg0),
+        293 => {
+            // pipe2(fds, flags) — O_CLOEXEC = 0x80000
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(arg0, cloexec)
+        }
         // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
         302 => NEG_ENOSYS,
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
@@ -1166,7 +1172,7 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// `pipe(pipefd_ptr)` — create a pipe (syscall 22).
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
-fn sys_pipe(pipefd_ptr: u64) -> u64 {
+fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     let pipe_id = crate::pipe::create_pipe();
 
     let read_entry = FdEntry {
@@ -1174,12 +1180,14 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec,
     };
     let write_entry = FdEntry {
         backend: FdBackend::PipeWrite { pipe_id },
         offset: 0,
         readable: false,
         writable: true,
+        cloexec,
     };
 
     let read_fd = match alloc_fd(3, read_entry) {
@@ -1606,9 +1614,12 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         (loaded, user_rsp)
     };
 
+    // Close file descriptors with FD_CLOEXEC set.
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    crate::process::close_cloexec_fds(pid);
+
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
@@ -2472,6 +2483,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2488,6 +2500,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: true,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2503,6 +2516,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                 offset: 0,
                 readable: true,
                 writable: true,
+                cloexec: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -2548,6 +2562,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -2600,6 +2615,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
+            cloexec: false,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -2634,6 +2650,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -2697,6 +2714,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2713,6 +2731,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: true,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2728,6 +2747,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 offset: 0,
                 readable: true,
                 writable: true,
+                cloexec: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -2767,6 +2787,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: 0,
             readable: true,
             writable: false,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2803,6 +2824,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             offset: initial_offset,
             readable,
             writable,
+            cloexec: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -2826,6 +2848,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: false,
+        cloexec: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -4216,8 +4239,30 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                 None => NEG_EMFILE,
             }
         }
-        F_GETFD | F_GETFL => 0,
-        F_SETFD | F_SETFL => 0,
+        F_GETFD => {
+            // Return FD_CLOEXEC (1) if cloexec is set.
+            match current_fd_entry(fd as usize) {
+                Some(e) => {
+                    if e.cloexec {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                None => NEG_EBADF,
+            }
+        }
+        F_SETFD => {
+            // arg & 1 = FD_CLOEXEC
+            let cloexec = arg & 1 != 0;
+            with_current_fd_mut(fd as usize, |slot| {
+                if let Some(e) = slot {
+                    e.cloexec = cloexec;
+                }
+            });
+            0
+        }
+        F_GETFL | F_SETFL => 0,
         _ => NEG_EINVAL,
     }
 }
@@ -4408,7 +4453,6 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
 /// If no fds are ready and timeout != 0, yield once and re-check.
 fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     const POLLIN: i16 = 0x001;
-
     let nfds = nfds as usize;
     if nfds > 256 {
         return NEG_EINVAL;
