@@ -332,7 +332,7 @@ pub extern "C" fn syscall_handler(
 
     // DEBUG: trace all syscalls from Ion (pid 12) to find where it blocks.
     let _trace_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-    if _trace_pid == 12 {
+    if _trace_pid >= 12 {
         if number == 202 {
             // Futex: also log the value at uaddr
             let mut cur = [0u8; 4];
