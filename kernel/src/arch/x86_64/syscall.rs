@@ -3903,9 +3903,10 @@ fn sys_access(path_ptr: u64) -> u64 {
 fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
     const SIGCHLD: u64 = 17;
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
-    // Accept flags == SIGCHLD or flags == 0 (bare fork semantics).
-    let base_flags = flags & 0xFF; // low byte is the exit signal
-    if base_flags == SIGCHLD || base_flags == 0 {
+    // Accept only flags == SIGCHLD or flags == 0 (bare fork semantics).
+    // Reject any additional CLONE_* bits to avoid silently mis-handling
+    // real thread creation requests.
+    if flags == SIGCHLD || flags == 0 {
         sys_fork(user_rip, user_rsp)
     } else {
         NEG_ENOSYS
@@ -4089,7 +4090,8 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     n as u64
                 }
-                _ => NEG_EAGAIN, // no data available or writer closed
+                Ok(_) => 0,           // EOF: writer closed, no more data
+                Err(_) => NEG_EAGAIN, // would block or transient pipe error
             }
         }
         _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds

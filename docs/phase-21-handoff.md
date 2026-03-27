@@ -142,4 +142,4 @@ cargo xtask run             # launch QEMU (headless, serial stdio)
 ```
 
 ### Ion build location
-Ion source is cloned to `target/ion-src/` on first build. The binary is cached at `kernel/initrd/ion.elf`. Delete it to force rebuild. Ion's `prompt.rs` was patched to remove a panic — the patch is in the cloned source only (not committed).
+Ion source is cloned to `target/ion-src/` on first build. The binary is cached at `kernel/initrd/ion.elf`. Delete it to force rebuild.

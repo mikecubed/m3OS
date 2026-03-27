@@ -1,10 +1,12 @@
 # Phase 21 — Ion Shell Integration: Task List
 
 **Depends on:** Phase 20 (Userspace Init and Shell) ✅
-**Goal:** Replace the minimal `no_std` shell from Phase 20 with
-[ion](https://github.com/redox-os/ion) — the shell built for Redox OS. After
-this phase `/bin/ion` is the interactive shell that userspace init spawns. The
-Phase 20 shell is renamed to `/bin/sh0` and kept as a regression harness.
+**Goal:** Integrate
+[ion](https://github.com/redox-os/ion) — the shell built for Redox OS — into the
+system as a non-interactive/script-mode shell at `/bin/ion`, while keeping the
+Phase 20 shell as the interactive shell that userspace init spawns (`/bin/sh0`)
+and continuing to use it as a regression harness. Ion becomes the interactive
+login shell in Phase 22 (Termios).
 
 ## Prerequisite Analysis
 
@@ -25,9 +27,9 @@ Current state (post-Phase 20):
   SIGINT, SIGCHLD, SIGTSTP, SIGCONT)
 
 Feasibility findings (from ion cross-compilation test):
-- **Ion compiles** for `x86_64-unknown-linux-musl` in ~26s, producing a 3.7 MB
-  statically linked PIE binary with no `PT_INTERP`
-- **All 3,955 relocations** are `R_X86_64_RELATIVE` — supported by our ELF loader
+- **Ion compiles** for `x86_64-unknown-linux-musl` in ~26s; `xtask build_ion()`
+  produces a ~3.1 MB statically linked non-PIE `ET_EXEC` binary with no `PT_INTERP`
+- **No runtime relocations** are required — the ELF loader maps fixed-address segments directly
 - **Ion's `set_unique_pid()`** calls `tcgetpgrp`/`tcsetpgrp` (ioctl-based) but
   handles the error gracefully (`if let Err(err) = ...`)
 - **`atty::is()`** calls `isatty()` → `ioctl(TIOCGWINSZ)` — already stubbed
@@ -100,7 +102,7 @@ ion with a fallback to sh0.
 |---|---|---|
 | P21-T020 | Shell binary renamed to `sh0` in Cargo.toml + xtask | ✅ Done |
 | P21-T021 | Ramdisk: `/bin/sh0` and `/bin/sh0.elf` entries | ✅ Done |
-| P21-T022 | Init: exec `/bin/ion` first, fall back to `/bin/sh0` | ✅ Done |
+| P21-T022 | Init: exec `/bin/sh0` first, fall back to `/bin/ion` | ✅ Done |
 | P21-T023 | CI boot assertions — sh0 commands verified via piped QEMU test | ✅ Done |
 | P21-T024 | `cargo xtask check` + `cargo xtask image` pass | ✅ Done |
 
