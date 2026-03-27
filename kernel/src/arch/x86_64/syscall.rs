@@ -331,9 +331,24 @@ pub extern "C" fn syscall_handler(
     }
 
     // DEBUG: trace all syscalls from Ion (pid 12) to find where it blocks.
-    {
-        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-        if pid == 12 {
+    let _trace_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if _trace_pid == 12 {
+        if number == 202 {
+            // Futex: also log the value at uaddr
+            let mut cur = [0u8; 4];
+            let uval = if crate::mm::user_mem::copy_from_user(&mut cur, arg0).is_ok() {
+                u32::from_ne_bytes(cur)
+            } else {
+                0xDEAD
+            };
+            log::debug!(
+                "[p12 syscall] nr=202 uaddr={:#x} *uaddr={} op={:#x} val={}",
+                arg0,
+                uval,
+                arg1,
+                arg2
+            );
+        } else {
             log::debug!(
                 "[p12 syscall] nr={} args=({:#x}, {:#x}, {:#x})",
                 number,
@@ -469,6 +484,11 @@ pub extern "C" fn syscall_handler(
             NEG_ENOSYS
         }
     };
+
+    // DEBUG: log return values for pid 12
+    if _trace_pid == 12 && number != 202 {
+        log::debug!("[p12 syscall] nr={} → {:#x}", number, result);
+    }
 
     // Phase 14/19: check pending signals before returning to userspace.
     // If a user handler is delivered, this diverges and never returns.
