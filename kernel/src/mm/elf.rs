@@ -622,7 +622,7 @@ pub unsafe fn load_elf_into(
     };
 
     // Track the PT_DYNAMIC segment for relocation processing.
-    let mut dyn_offset: Option<(u64, u64)> = None; // (vaddr, filesz)
+    let mut dyn_offset: Option<(u64, u64)> = None; // (p_offset, p_filesz)
 
     for i in 0..phnum {
         let base = phoff
@@ -644,7 +644,9 @@ pub unsafe fn load_elf_into(
     // Apply R_X86_64_RELATIVE relocations for PIE binaries.
     if load_bias != 0 {
         if let Some((dyn_off, dyn_sz)) = dyn_offset {
-            apply_rela_relocations(mapper, phys_off, data, dyn_off, dyn_sz, load_bias);
+            apply_rela_relocations(
+                mapper, phys_off, data, dyn_off, dyn_sz, load_bias, min_vaddr,
+            );
         }
     }
 
@@ -700,6 +702,12 @@ const R_X86_64_RELATIVE: u32 = 8;
 /// Parse the PT_DYNAMIC segment to find DT_RELA/DT_RELASZ entries, then
 /// apply R_X86_64_RELATIVE relocations by writing `load_bias + addend`
 /// at each relocation target address.
+///
+/// `min_vaddr` is the minimum p_vaddr across all PT_LOAD segments.  It is
+/// used to convert the DT_RELA value (which is a virtual address, not a
+/// file offset) into a file offset:  `file_offset = vaddr - min_vaddr`.
+/// For our PIE binaries linked at vaddr 0 this delta is 0, but the
+/// conversion is required for correctness with arbitrary link bases.
 fn apply_rela_relocations(
     mapper: &mut OffsetPageTable<'_>,
     phys_off: u64,
@@ -707,6 +715,7 @@ fn apply_rela_relocations(
     dyn_offset: u64,
     dyn_size: u64,
     load_bias: u64,
+    min_vaddr: u64,
 ) {
     let dyn_off = dyn_offset as usize;
     let dyn_sz = dyn_size as usize;
@@ -735,11 +744,12 @@ fn apply_rela_relocations(
         return; // No relocations.
     }
 
-    // DT_RELA gives the *file offset* of the .rela.dyn section for ET_DYN
-    // binaries linked at vaddr 0. Convert to file offset.
-    // For our PIE binaries linked at vaddr 0, the vaddr IS the file offset
-    // (the first LOAD segment starts at offset=0, vaddr=0).
-    let rela_off = rela_vaddr as usize;
+    // DT_RELA is a *virtual address* in the ELF spec, not a file offset.
+    // Convert it to a file offset by subtracting the base vaddr of the
+    // first LOAD segment (min_vaddr).  For our PIE binaries linked at
+    // vaddr 0, min_vaddr is 0 so this is a no-op, but the conversion is
+    // necessary for correctness with arbitrary link bases.
+    let rela_off = (rela_vaddr - min_vaddr) as usize;
     let rela_sz = rela_size as usize;
 
     // Each Elf64_Rela entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).

@@ -237,10 +237,10 @@ fn spawn_userspace_init() {
 
     let data = fs::ramdisk::get_file("sbin/init")
         .or_else(|| fs::ramdisk::get_file("sbin/init.elf"))
-        .expect("[init] /sbin/init not found in ramdisk");
+        .expect("[init] /sbin/init (or /sbin/init.elf) not found in ramdisk");
 
     if data.is_empty() {
-        panic!("[init] /sbin/init is empty — not built?");
+        panic!("[init] /sbin/init (or .elf) is empty — not built?");
     }
 
     log::info!("[init] loading /sbin/init: {} bytes", data.len());
@@ -819,6 +819,9 @@ fn stdin_feeder_task() -> ! {
                 stdin::clear_line();
                 shell_print(my_id, console_ep, "^C\n");
                 process::send_signal_to_group(fg, process::SIGINT);
+            } else {
+                // No foreground group — push raw Ctrl-C byte for userspace shell.
+                stdin::push_char(0x03);
             }
             continue;
         }
@@ -830,6 +833,9 @@ fn stdin_feeder_task() -> ! {
                 stdin::clear_line();
                 shell_print(my_id, console_ep, "^Z\n");
                 process::send_signal_to_group(fg, process::SIGTSTP);
+            } else {
+                // No foreground group — push raw Ctrl-Z byte for userspace shell.
+                stdin::push_char(0x1A);
             }
             continue;
         }

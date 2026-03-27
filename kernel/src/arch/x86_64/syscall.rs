@@ -1548,6 +1548,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
     let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    const WNOHANG: u64 = 0x1;
     const WUNTRACED: u64 = 0x2;
     let report_stopped = options & WUNTRACED != 0;
 
@@ -1661,7 +1662,11 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
             return child_pid as u64;
         }
 
-        // No matching child ready; yield and try again.
+        // No matching child ready.
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        // Yield and try again.
         crate::task::yield_now();
         restore_caller_context(calling_pid, saved_user_rsp);
     }
