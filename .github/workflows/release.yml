@@ -50,8 +50,9 @@ jobs:
       - name: Boot smoke test
         run: |
           timeout 30 cargo xtask run 2>&1 | tee boot.log || true
-          # Phase 20: userspace init prints banner, shell prints prompt
+          # Phase 20: verify userspace init banner and shell prompt
           grep -q 'm3OS init (PID 1)' boot.log
+          grep -q '\$ ' boot.log
           ! grep -q 'panicked at' boot.log
 
       - name: Prepare release artifacts

@@ -746,10 +746,12 @@ fn apply_rela_relocations(
 
     // DT_RELA is a *virtual address* in the ELF spec, not a file offset.
     // Convert it to a file offset by subtracting the base vaddr of the
-    // first LOAD segment (min_vaddr).  For our PIE binaries linked at
-    // vaddr 0, min_vaddr is 0 so this is a no-op, but the conversion is
-    // necessary for correctness with arbitrary link bases.
-    let rela_off = (rela_vaddr - min_vaddr) as usize;
+    // first LOAD segment (min_vaddr). Guard against malformed ELFs where
+    // DT_RELA points below the first LOAD segment.
+    let rela_off = match rela_vaddr.checked_sub(min_vaddr) {
+        Some(off) => off as usize,
+        None => return, // malformed: DT_RELA below min_vaddr
+    };
     let rela_sz = rela_size as usize;
 
     // Each Elf64_Rela entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
@@ -778,9 +780,10 @@ fn apply_rela_relocations(
                 let dest =
                     (phys_off + phys_addr.start_address().as_u64() + page_offset) as *mut u64;
                 // SAFETY: the page was just mapped by map_load_segment and the
-                // target is within a loaded segment.
+                // target is within a loaded segment. Use write_unaligned to
+                // avoid UB if a malformed ELF specifies an unaligned r_offset.
                 unsafe {
-                    core::ptr::write(dest, value);
+                    core::ptr::write_unaligned(dest, value);
                 }
             }
         }

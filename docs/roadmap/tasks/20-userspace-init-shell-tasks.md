@@ -188,7 +188,7 @@ Ensure keyboard input reaches the userspace shell's stdin fd. The current
 | P20-T056 | Acceptance: `kernel/src/main.rs` no longer contains `shell_task` or `init_task` functions |
 | P20-T057 | `cargo xtask check` passes (clippy + fmt) |
 | P20-T058 | QEMU boot validation — no panics, no regressions |
-| P20-T059 | Write `docs/16-userspace-init.md`: PID 1 contract (why init must never exit, orphan reaping), `_start` → `main` entry sequence for `no_std` Rust userspace, syscall wrapper pattern, shell fork-exec-wait loop, pipe fd plumbing diagram (parent/left-child/right-child fd state), which kernel-task servers remain in ring-0 and why |
+| P20-T059 | Write `docs/18-userspace-init.md`: PID 1 contract (why init must never exit, orphan reaping), `_start` → `main` entry sequence for `no_std` Rust userspace, syscall wrapper pattern, shell fork-exec-wait loop, pipe fd plumbing diagram (parent/left-child/right-child fd state), which kernel-task servers remain in ring-0 and why |
 
 ---
 
