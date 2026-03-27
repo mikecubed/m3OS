@@ -20,8 +20,8 @@ impl Pipe {
             buf: [0u8; PIPE_BUF_SIZE],
             read_pos: 0,
             count: 0,
-            reader_count: 1,
-            writer_count: 1,
+            reader_count: 0,
+            writer_count: 0,
         }
     }
 

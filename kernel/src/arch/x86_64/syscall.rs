@@ -1173,6 +1173,8 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
 fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
+    // Pipe starts with reader_count=0, writer_count=0.
+    // We bump refcounts explicitly after each successful FD allocation.
     let pipe_id = crate::pipe::create_pipe();
 
     let read_entry = FdEntry {
@@ -1193,28 +1195,31 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     let read_fd = match alloc_fd(3, read_entry) {
         Some(fd) => fd,
         None => {
-            crate::pipe::pipe_close_reader(pipe_id);
-            crate::pipe::pipe_close_writer(pipe_id);
+            // No FDs reference this pipe yet — free the slot directly.
+            crate::pipe::free_pipe(pipe_id);
             return NEG_EMFILE;
         }
     };
+    crate::pipe::pipe_add_reader(pipe_id); // reader_count: 0 → 1
+
     let write_fd = match alloc_fd(3, write_entry) {
         Some(fd) => fd,
         None => {
-            // Clean up the read fd we just allocated.
+            // Only the read FD exists — close it properly.
             with_current_fd_mut(read_fd, |slot| *slot = None);
-            crate::pipe::pipe_close_reader(pipe_id);
-            crate::pipe::pipe_close_writer(pipe_id);
+            crate::pipe::pipe_close_reader(pipe_id); // reader_count: 1 → 0
+                                                     // writer_count is still 0, so pipe slot is now freed.
             return NEG_EMFILE;
         }
     };
+    crate::pipe::pipe_add_writer(pipe_id); // writer_count: 0 → 1
 
     // Write [read_fd, write_fd] as two i32s to user memory.
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
     bytes[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
     if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
-        // Clean up on failure.
+        // Both FDs exist — close them properly via refcounts.
         with_current_fd_mut(read_fd, |slot| *slot = None);
         with_current_fd_mut(write_fd, |slot| *slot = None);
         crate::pipe::pipe_close_reader(pipe_id);
