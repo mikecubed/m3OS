@@ -229,10 +229,83 @@ fn build_musl_bins() {
     }
 }
 
+/// Cross-compile ion shell for musl and place it in kernel/initrd/.
+///
+/// Strategy: clone ion from GitHub (or use cached clone in target/ion-src/),
+/// build with `cargo build --release --target x86_64-unknown-linux-musl`,
+/// strip, and copy to kernel/initrd/ion.elf.
+///
+/// If the ion.elf binary already exists and is newer than ion's Cargo.toml,
+/// the build is skipped (cache hit).
+fn build_ion() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    let ion_elf = initrd.join("ion.elf");
+
+    // If a pre-built ion.elf exists, skip the build.
+    if ion_elf.exists() && ion_elf.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("ion: using cached {}", ion_elf.display());
+        return;
+    }
+
+    fs::create_dir_all(&initrd).unwrap();
+
+    let ion_src = root.join("target/ion-src");
+    if !ion_src.join("Cargo.toml").exists() {
+        println!("ion: cloning ion shell from GitHub...");
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/redox-os/ion.git",
+                ion_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for ion");
+        if !status.success() {
+            eprintln!("Failed to clone ion repository");
+            std::process::exit(1);
+        }
+    }
+
+    println!("ion: building for x86_64-unknown-linux-musl...");
+    let status = Command::new("cargo")
+        .current_dir(&ion_src)
+        .args([
+            "build",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-musl",
+        ])
+        .status()
+        .expect("failed to build ion");
+    if !status.success() {
+        eprintln!("ion build failed");
+        std::process::exit(1);
+    }
+
+    let built = ion_src.join("target/x86_64-unknown-linux-musl/release/ion");
+
+    // Strip debug symbols to reduce binary size (~3.7M → ~3.2M).
+    let strip_status = Command::new("strip")
+        .args(["-o", ion_elf.to_str().unwrap(), built.to_str().unwrap()])
+        .status();
+    match strip_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            // Fallback: copy without stripping.
+            fs::copy(&built, &ion_elf).expect("failed to copy ion binary to initrd");
+        }
+    }
+    println!("ion: {} → kernel/initrd/ion.elf", built.display());
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    build_ion();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
