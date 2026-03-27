@@ -92,6 +92,8 @@ pub enum FdBackend {
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
     DevNull,
+    /// TTY device — reads from stdin buffer, writes to console (Phase 22).
+    DeviceTTY { tty_id: u32 },
 }
 
 /// A single open-file entry in the per-process FD table.
@@ -167,19 +169,19 @@ pub fn close_all_fds_for(pid: Pid) {
 fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
     let mut table = [NONE_FD; MAX_FDS];
     table[0] = Some(FdEntry {
-        backend: FdBackend::Stdin,
+        backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
         readable: true,
         writable: false,
     });
     table[1] = Some(FdEntry {
-        backend: FdBackend::Stdout,
+        backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
         readable: false,
         writable: true,
     });
     table[2] = Some(FdEntry {
-        backend: FdBackend::Stdout,
+        backend: FdBackend::DeviceTTY { tty_id: 0 },
         offset: 0,
         readable: false,
         writable: true,
@@ -194,6 +196,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
 /// Signal numbers (Linux x86_64).
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
 pub const SIGBUS: u32 = 7;
 pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
@@ -207,6 +210,7 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+pub const SIGWINCH: u32 = 28;
 
 /// sigaltstack flag: currently executing on the alt stack.
 pub const SS_ONSTACK: u32 = 1;
@@ -238,7 +242,7 @@ pub enum SignalAction {
 /// Default action table: terminate or ignore.
 pub fn default_signal_action(sig: u32) -> SignalDisposition {
     match sig {
-        SIGCHLD => SignalDisposition::Ignore,
+        SIGCHLD | SIGWINCH => SignalDisposition::Ignore,
         SIGCONT => SignalDisposition::Continue,
         SIGSTOP | SIGTSTP => SignalDisposition::Stop,
         SIGKILL | SIGINT | SIGTERM | SIGHUP | SIGBUS | SIGFPE | SIGSEGV | SIGPIPE | SIGALRM

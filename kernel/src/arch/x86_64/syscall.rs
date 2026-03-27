@@ -2113,8 +2113,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Stdin => {
-            // Read from kernel stdin buffer (raw byte-at-a-time, Phase 20).
+        FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
+            // Read from kernel stdin buffer.
             // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -2243,8 +2243,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     }
 
     match &entry.backend {
-        FdBackend::Stdout => {
-            // stdout/stderr go to serial + framebuffer console.
+        FdBackend::Stdout | FdBackend::DeviceTTY { .. } => {
+            // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
@@ -2826,6 +2826,20 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
+    // DeviceTTY gets S_IFCHR | 0620, st_rdev encodes tty major/minor.
+    if let FdBackend::DeviceTTY { tty_id } = &entry.backend {
+        let mut stat = [0u8; 144];
+        let mode: u32 = 0x2000 | 0o620; // S_IFCHR | rw--w----
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        // st_rdev at offset 32: encode major=136, minor=tty_id (Linux PTY convention)
+        let rdev: u64 = ((136u64) << 8) | (*tty_id as u64);
+        stat[32..40].copy_from_slice(&rdev.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let size = match &entry.backend {
         FdBackend::Stdout
         | FdBackend::Stdin
@@ -2839,7 +2853,9 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
-        FdBackend::Dir { .. } | FdBackend::DevNull => unreachable!(), // handled above
+        FdBackend::Dir { .. } | FdBackend::DevNull | FdBackend::DeviceTTY { .. } => {
+            unreachable!() // handled above
+        }
     };
 
     // x86_64 stat struct (144 bytes, all little-endian).
@@ -2884,7 +2900,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
-        | FdBackend::DevNull => return NEG_EINVAL, // not seekable
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3304,37 +3321,140 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    const TIOCGWINSZ: u64 = 0x5413;
-    if req == TIOCGWINSZ {
-        // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } — each u16
-        let winsize: [u8; 8] = {
-            let mut w = [0u8; 8];
-            w[0..2].copy_from_slice(&24u16.to_ne_bytes()); // rows
-            w[2..4].copy_from_slice(&80u16.to_ne_bytes()); // cols
-            w
-        };
-        if crate::mm::user_mem::copy_to_user(arg, &winsize).is_err() {
-            return NEG_EFAULT;
-        }
-        return 0;
-    }
-    // Phase 21: TCGETS/TCSETS → -ENOTTY so ion detects non-TTY and uses cooked mode.
+    use kernel_core::tty::{TERMIOS_SIZE, WINSIZE_SIZE};
+
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
     const TCSETSW: u64 = 0x5403;
     const TCSETSF: u64 = 0x5404;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCSWINSZ: u64 = 0x5414;
     const NEG_ENOTTY: u64 = (-25_i64) as u64;
-    if matches!(
-        req,
-        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGPGRP | TIOCSPGRP
-    ) {
+
+    // Check if the fd is a TTY; non-TTY fds return ENOTTY for termios ioctls.
+    let fd_idx = fd as usize;
+    let is_tty = if fd_idx < MAX_FDS {
+        match current_fd_entry(fd_idx) {
+            Some(e) => matches!(e.backend, FdBackend::DeviceTTY { .. }),
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    if !is_tty {
         return NEG_ENOTTY;
     }
-    // All other ioctl requests return EINVAL.
-    let _ = fd;
-    NEG_EINVAL
+
+    match req {
+        TCGETS => {
+            // Copy TTY0.termios (36 bytes) to userspace.
+            let tty = crate::tty::TTY0.lock();
+            let src = unsafe {
+                core::slice::from_raw_parts(&tty.termios as *const _ as *const u8, TERMIOS_SIZE)
+            };
+            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TCSETS => {
+            // TCSANOW: apply immediately.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            crate::tty::TTY0.lock().termios = new_termios;
+            0
+        }
+        TCSETSW => {
+            // TCSADRAIN: drain output then apply. Output is synchronous, so
+            // this is equivalent to TCSANOW.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            crate::tty::TTY0.lock().termios = new_termios;
+            0
+        }
+        TCSETSF => {
+            // TCSAFLUSH: flush input, then apply new termios.
+            let mut buf = [0u8; TERMIOS_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_termios = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
+            };
+            // Flush stdin buffer and edit buffer.
+            crate::stdin::flush();
+            let mut tty = crate::tty::TTY0.lock();
+            tty.edit_buf.clear();
+            tty.termios = new_termios;
+            0
+        }
+        TIOCGPGRP => {
+            // Return foreground process group.
+            let tty = crate::tty::TTY0.lock();
+            let pgid = tty.fg_pgid;
+            let bytes = (pgid as i32).to_ne_bytes();
+            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TIOCSPGRP => {
+            // Set foreground process group.
+            let mut bytes = [0u8; 4];
+            if crate::mm::user_mem::copy_from_user(&mut bytes, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let pgid = i32::from_ne_bytes(bytes) as u32;
+            crate::tty::TTY0.lock().fg_pgid = pgid;
+            crate::process::FG_PGID.store(pgid, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        TIOCGWINSZ => {
+            // Copy TTY0.winsize (8 bytes) to userspace.
+            let tty = crate::tty::TTY0.lock();
+            let src = unsafe {
+                core::slice::from_raw_parts(&tty.winsize as *const _ as *const u8, WINSIZE_SIZE)
+            };
+            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        TIOCSWINSZ => {
+            // Set window size and send SIGWINCH to foreground group.
+            let mut buf = [0u8; WINSIZE_SIZE];
+            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let new_ws = unsafe {
+                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Winsize)
+            };
+            let mut tty = crate::tty::TTY0.lock();
+            let changed =
+                tty.winsize.ws_row != new_ws.ws_row || tty.winsize.ws_col != new_ws.ws_col;
+            tty.winsize = new_ws;
+            let fg = tty.fg_pgid;
+            drop(tty);
+            if changed && fg != 0 {
+                crate::process::send_signal_to_group(fg, crate::process::SIGWINCH);
+            }
+            0
+        }
+        _ => NEG_EINVAL,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3680,7 +3800,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PipeRead { .. }
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
-        | FdBackend::DevNull => NEG_EINVAL,
+        | FdBackend::DevNull
+        | FdBackend::DeviceTTY { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();

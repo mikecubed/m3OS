@@ -1,10 +1,10 @@
-//! Kernel stdin buffer (Phase 20).
+//! Kernel stdin buffer (Phase 20, updated Phase 22).
 //!
-//! Provides a raw (character-at-a-time) stdin for userspace processes.
-//! Each byte pushed via `push_byte` is immediately available to
-//! `read(0, ...)` — there is no kernel-side line buffering.  The
-//! userspace shell handles its own echo, backspace, and line editing.
+//! Circular byte buffer backing `read(0, ...)` for userspace.
+//! The line discipline in `stdin_feeder_task` decides when bytes
+//! are delivered here (immediately in raw mode, on newline in cooked).
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// Maximum size of the read-ready buffer.
@@ -26,7 +26,6 @@ impl StdinState {
         }
     }
 
-    /// Push a single byte into the read-ready buffer (immediately readable).
     fn push_byte(&mut self, c: u8) {
         if self.count < STDIN_BUF_SIZE {
             let write_pos = (self.read_pos + self.count) % STDIN_BUF_SIZE;
@@ -35,7 +34,6 @@ impl StdinState {
         }
     }
 
-    /// Read up to `dst.len()` bytes from the buffer.
     fn read(&mut self, dst: &mut [u8]) -> usize {
         let to_read = dst.len().min(self.count);
         for (i, byte) in dst.iter_mut().enumerate().take(to_read) {
@@ -53,20 +51,43 @@ impl StdinState {
 
 static STDIN: Mutex<StdinState> = Mutex::new(StdinState::new());
 
+/// EOF flag: when set, has_data() returns true but read() returns 0.
+static EOF_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// Push a byte into stdin (immediately readable by userspace).
 pub fn push_char(c: u8) {
     STDIN.lock().push_byte(c);
 }
 
-/// Clear line — no-op in raw mode (retained for Ctrl-C/Z handler compat).
-pub fn clear_line() {}
-
-/// Read from stdin. Returns 0 if no data available.
+/// Read from stdin. Returns 0 if no data available (or EOF).
 pub fn read(dst: &mut [u8]) -> usize {
+    // Check EOF flag first: if set, consume it and return 0.
+    if EOF_PENDING
+        .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        return 0;
+    }
     STDIN.lock().read(dst)
 }
 
-/// Check if stdin has data ready to read.
+/// Check if stdin has data ready to read (or EOF is pending).
 pub fn has_data() -> bool {
+    if EOF_PENDING.load(Ordering::Relaxed) {
+        return true;
+    }
     !STDIN.lock().is_empty()
+}
+
+/// Signal EOF: next read() will return 0.
+pub fn signal_eof() {
+    EOF_PENDING.store(true, Ordering::Release);
+}
+
+/// Flush (discard) all pending stdin data.
+pub fn flush() {
+    let mut s = STDIN.lock();
+    s.read_pos = 0;
+    s.count = 0;
+    EOF_PENDING.store(false, Ordering::Release);
 }

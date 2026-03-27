@@ -24,6 +24,7 @@ mod stdin;
 mod task;
 #[cfg(test)]
 mod testing;
+mod tty;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
@@ -772,12 +773,14 @@ fn shell_print(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, s: &s
 /// echoes to the console, handles line buffering and backspace, and feeds
 /// completed lines into the kernel stdin buffer for `read(0, ...)`.
 fn stdin_feeder_task() -> ! {
+    use kernel_core::tty::*;
+
     let my_id = task::current_task_id().expect("[stdin] no task id");
 
     let console_ep = ipc::registry::lookup("console").expect("[stdin] console not found");
     let kbd_ep = ipc::registry::lookup("kbd").expect("[stdin] kbd not found");
 
-    log::info!("[stdin] feeder ready");
+    log::info!("[stdin] feeder ready (Phase 22 line discipline)");
 
     let mut shift = false;
     let mut ctrl = false;
@@ -804,63 +807,189 @@ fn stdin_feeder_task() -> ! {
             continue;
         }
 
-        // Ctrl make code (left Ctrl = 0x1D).
+        // Modifier make codes.
         if sc == 0x1D {
             ctrl = true;
             continue;
         }
-
-        // Shift make codes.
         if sc == 0x2A || sc == 0x36 {
             shift = true;
             continue;
         }
 
-        // Ctrl-C (scancode 0x2E = 'C'): send SIGINT to foreground group.
-        if ctrl && sc == 0x2E {
-            let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
-            if fg != 0 {
-                stdin::clear_line();
-                shell_print(my_id, console_ep, "^C\n");
-                process::send_signal_to_group(fg, process::SIGINT);
-            } else {
-                // No foreground group — push raw Ctrl-C byte for userspace shell.
-                stdin::push_char(0x03);
+        // Convert scancode to a byte value.
+        let byte = if sc == 0x1C {
+            b'\n'
+        } else if sc == 0x0E {
+            0x7F // DEL / backspace
+        } else if ctrl {
+            // Ctrl + letter → control character (0x01–0x1A).
+            match scancode_to_char(sc, false) {
+                Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as u8) - b'A' + 1,
+                _ => continue,
             }
-            continue;
-        }
-
-        // Ctrl-Z (scancode 0x2C = 'Z'): send SIGTSTP to foreground group.
-        if ctrl && sc == 0x2C {
-            let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
-            if fg != 0 {
-                stdin::clear_line();
-                shell_print(my_id, console_ep, "^Z\n");
-                process::send_signal_to_group(fg, process::SIGTSTP);
-            } else {
-                // No foreground group — push raw Ctrl-Z byte for userspace shell.
-                stdin::push_char(0x1A);
+        } else {
+            match scancode_to_char(sc, shift) {
+                Some(c) => {
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    s.as_bytes()[0]
+                }
+                None => continue,
             }
-            continue;
+        };
+
+        // Read termios flags under lock.
+        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = {
+            let t = tty::TTY0.lock();
+            (
+                t.termios.c_lflag,
+                t.termios.c_iflag,
+                t.termios.c_oflag,
+                t.termios.c_cc,
+            )
+        };
+
+        let canonical = c_lflag & ICANON != 0;
+        let echo_on = c_lflag & ECHO != 0;
+        let isig = c_lflag & ISIG != 0;
+
+        // ICRNL: translate CR to NL on input.
+        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
+            b'\n'
+        } else {
+            byte
+        };
+
+        // ISIG: check signal characters from c_cc (not hardcoded).
+        if isig {
+            let signal = if byte == c_cc_arr[VINTR] {
+                Some((process::SIGINT, "^C"))
+            } else if byte == c_cc_arr[VSUSP] {
+                Some((process::SIGTSTP, "^Z"))
+            } else if byte == c_cc_arr[VQUIT] {
+                Some((process::SIGQUIT, "^\\"))
+            } else {
+                None
+            };
+
+            if let Some((sig, name)) = signal {
+                let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+                if fg != 0 {
+                    // Clear edit buffer in canonical mode.
+                    if canonical {
+                        tty::TTY0.lock().edit_buf.clear();
+                    }
+                    shell_print(my_id, console_ep, name);
+                    shell_print(my_id, console_ep, "\n");
+                    process::send_signal_to_group(fg, sig);
+                } else {
+                    // No foreground group — push raw byte.
+                    stdin::push_char(byte);
+                }
+                continue;
+            }
         }
 
-        // Enter (0x1C): push newline byte.
-        if sc == 0x1C {
-            stdin::push_char(b'\n');
-            continue;
-        }
+        if canonical {
+            // Cooked mode: buffer in edit_buf, deliver on newline or EOF.
 
-        // Backspace (0x0E): push backspace byte for userspace to handle.
-        if sc == 0x0E {
-            stdin::push_char(0x7f);
-            continue;
-        }
+            // VERASE (backspace/DEL)
+            if byte == c_cc_arr[VERASE] || byte == 0x7F {
+                let erased = tty::TTY0.lock().edit_buf.erase_char();
+                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
+                    shell_print(my_id, console_ep, "\x08 \x08");
+                }
+                continue;
+            }
 
-        // Printable character.
-        if let Some(c) = scancode_to_char(sc, shift) {
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            stdin::push_char(s.as_bytes()[0]);
+            // VKILL (^U)
+            if byte == c_cc_arr[VKILL] {
+                let n = tty::TTY0.lock().edit_buf.kill_line();
+                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
+                    // Erase the line visually.
+                    for _ in 0..n {
+                        shell_print(my_id, console_ep, "\x08 \x08");
+                    }
+                }
+                continue;
+            }
+
+            // VWERASE (^W)
+            if byte == c_cc_arr[VWERASE] {
+                let n = tty::TTY0.lock().edit_buf.word_erase();
+                if n > 0 && echo_on {
+                    for _ in 0..n {
+                        shell_print(my_id, console_ep, "\x08 \x08");
+                    }
+                }
+                continue;
+            }
+
+            // VEOF (^D)
+            if byte == c_cc_arr[VEOF] {
+                let mut t = tty::TTY0.lock();
+                if t.edit_buf.is_empty() {
+                    drop(t);
+                    stdin::signal_eof();
+                } else {
+                    // Non-empty: flush buffer without appending newline.
+                    let len = t.edit_buf.len;
+                    // Push directly while holding the lock (stdin uses a
+                    // separate lock so this is safe from deadlock).
+                    for i in 0..len {
+                        stdin::push_char(t.edit_buf.buf[i]);
+                    }
+                    t.edit_buf.clear();
+                }
+                continue;
+            }
+
+            // Newline: deliver line.
+            if byte == b'\n' {
+                let mut t = tty::TTY0.lock();
+                let len = t.edit_buf.len;
+                for i in 0..len {
+                    stdin::push_char(t.edit_buf.buf[i]);
+                }
+                t.edit_buf.clear();
+                drop(t);
+                stdin::push_char(b'\n');
+
+                // Echo newline.
+                if echo_on || (c_lflag & ECHONL != 0) {
+                    if c_oflag & ONLCR != 0 {
+                        shell_print(my_id, console_ep, "\r\n");
+                    } else {
+                        shell_print(my_id, console_ep, "\n");
+                    }
+                }
+                continue;
+            }
+
+            // Regular character: buffer it.
+            tty::TTY0.lock().edit_buf.push(byte);
+
+            if echo_on {
+                let echo_buf = [byte];
+                if let Ok(s) = core::str::from_utf8(&echo_buf) {
+                    shell_print(my_id, console_ep, s);
+                }
+            }
+        } else {
+            // Raw / cbreak mode: push byte immediately.
+            stdin::push_char(byte);
+
+            if echo_on {
+                let echo_buf = [byte];
+                if let Ok(s) = core::str::from_utf8(&echo_buf) {
+                    if c_oflag & ONLCR != 0 && byte == b'\n' {
+                        shell_print(my_id, console_ep, "\r\n");
+                    } else {
+                        shell_print(my_id, console_ep, s);
+                    }
+                }
+            }
         }
     }
 }
