@@ -169,6 +169,9 @@ to append rather than overwrite in place. Minimum viable subset needed:
 - `\x1b[m` / `\x1b[0m` — reset attributes (SGR, can be a no-op initially)
 - `\x1b[nA` / `\x1b[nB` / `\x1b[nC` / `\x1b[nD` — cursor up/down/forward/back
 
+See [Phase 22b Task List](./tasks/22b-ansi-escape-tasks.md) for the full
+implementation plan.
+
 ## Deferred Until Later
 
 - Full PTY data path between master and slave (needed for terminal multiplexers,
