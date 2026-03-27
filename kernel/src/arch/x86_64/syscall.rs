@@ -438,7 +438,7 @@ pub extern "C" fn syscall_handler(
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
         200 => sys_kill(arg0, arg1),
         // Phase 21: futex stub — single-threaded OS, yield and return
-        202 => sys_futex(arg0, arg1),
+        202 => sys_futex(arg0, arg1, arg2),
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
@@ -4377,9 +4377,9 @@ fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Minimal futex stub for single-threaded OS.
-/// FUTEX_WAIT: yield CPU then return 0 (pretend wakeup occurred).
+/// FUTEX_WAIT: check *uaddr == val, if not return -EAGAIN; else yield and return 0.
 /// FUTEX_WAKE: return 1 (pretend one waiter was woken).
-fn sys_futex(_uaddr: u64, op: u64) -> u64 {
+fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
     const FUTEX_PRIVATE: u64 = 128;
@@ -4387,9 +4387,17 @@ fn sys_futex(_uaddr: u64, op: u64) -> u64 {
     let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
     match cmd {
         FUTEX_WAIT => {
-            // Yield once to let other tasks run, then pretend we were woken.
-            // Must restore caller context after yield (CR3, stack, PID) to
-            // avoid using another process's page table.
+            // POSIX futex contract: atomically check that *uaddr == val.
+            // If not, return -EAGAIN so the caller re-evaluates the condition.
+            let mut cur = [0u8; 4];
+            if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                return NEG_EFAULT;
+            }
+            let current_val = u32::from_ne_bytes(cur) as u64;
+            if current_val != val {
+                return NEG_EAGAIN;
+            }
+            // Value matches — yield once then pretend we were woken.
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
             let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
             crate::task::yield_now();
