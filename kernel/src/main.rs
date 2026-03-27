@@ -218,6 +218,10 @@ fn init_task() -> ! {
     // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
     task::spawn(stdin_feeder_task, "stdin-feeder");
 
+    // Phase 21: serial stdin feeder — reads bytes from COM1, feeds stdin buffer.
+    // Allows testing ion interactively via `cargo xtask run` with piped input.
+    task::spawn(serial_stdin_feeder_task, "serial-stdin");
+
     // Phase 20: re-enable p11 launcher now that restore_caller_context
     // preserves per-process syscall state across yields.
     task::spawn(p11_launcher_task, "p11-launcher");
@@ -865,6 +869,29 @@ fn stdin_feeder_task() -> ! {
 fn idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 21 — serial stdin feeder
+// ---------------------------------------------------------------------------
+
+/// Poll the serial port (COM1) for incoming bytes and feed them into the
+/// kernel stdin buffer. This allows testing ion interactively via piped
+/// input to QEMU's `-serial stdio`.
+fn serial_stdin_feeder_task() -> ! {
+    loop {
+        // Read from COM1 data port (0x3F8) if data is available.
+        // Line Status Register (0x3FD) bit 0 = data ready.
+        let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FD).read() };
+        if lsr & 1 != 0 {
+            let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8).read() };
+            // Map \r to \n for terminals that send \r on Enter.
+            let ch = if byte == b'\r' { b'\n' } else { byte };
+            stdin::push_char(ch);
+        } else {
+            task::yield_now();
+        }
     }
 }
 
