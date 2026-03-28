@@ -207,6 +207,10 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
+            // Free the allocated queue frames to avoid leaking them.
+            for i in 0..pages_needed {
+                frame_allocator::free_frame(phys_base + (i as u64) * 4096);
+            }
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -672,6 +676,8 @@ pub fn init() {
         Some(f) => f,
         None => {
             log::error!("[virtio-blk] failed to allocate DMA frame");
+            // Free the scratch frame we already allocated.
+            frame_allocator::free_frame(scratch_phys);
             return;
         }
     };
@@ -709,7 +715,16 @@ fn alloc_contiguous_frames(count: usize) -> Option<u64> {
     let base = first.start_address().as_u64();
 
     for i in 1..count {
-        let frame = frame_allocator::allocate_frame()?;
+        let frame = match frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => {
+                // Out of frames: free the contiguous frames allocated so far.
+                for j in 0..i {
+                    frame_allocator::free_frame(base + (j as u64) * 4096);
+                }
+                return None;
+            }
+        };
         let expected = base + (i as u64) * 4096;
         if frame.start_address().as_u64() != expected {
             log::error!(

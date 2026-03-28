@@ -1026,7 +1026,9 @@ impl io::Write for PartitionSlice {
 impl io::Seek for PartitionSlice {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let new_partition_pos = match pos {
-            io::SeekFrom::Start(n) => n as i64,
+            io::SeekFrom::Start(n) => i64::try_from(n).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
+            })?,
             io::SeekFrom::End(n) => self.size as i64 + n,
             io::SeekFrom::Current(n) => self.partition_pos()? as i64 + n,
         };

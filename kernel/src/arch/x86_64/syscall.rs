@@ -2427,7 +2427,12 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 let chunk = (len - copied).min(4096);
                 let user_ptr = match buf_ptr.checked_add(copied as u64) {
                     Some(p) => p,
-                    None => break,
+                    None => {
+                        if copied == 0 {
+                            return NEG_EFAULT;
+                        }
+                        break;
+                    }
                 };
                 let mut tmp = [0u8; 4096];
                 if crate::mm::user_mem::copy_from_user(&mut tmp[..chunk], user_ptr).is_err() {
@@ -2823,8 +2828,8 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         }
 
         if crate::fs::fat32::is_mounted() {
-            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-            if let Some(vol) = vol.as_ref() {
+            let mut vol_guard = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol_guard.as_mut() {
                 match vol.lookup(rel) {
                     Ok(entry) => {
                         if entry.is_dir() {
@@ -2892,48 +2897,44 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                         };
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::NotFound) if create => {
-                        // Create a new file.
-
-                        let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
-                        if let Some(vol) = vol.as_mut() {
-                            let parts: alloc::vec::Vec<&str> =
-                                rel.split('/').filter(|s| !s.is_empty()).collect();
-                            let (parent_cluster, file_name) = if parts.len() <= 1 {
-                                (vol.bpb.root_cluster, rel)
-                            } else {
-                                let parent_path = parts[..parts.len() - 1].join("/");
-                                let parent_cluster = match vol.lookup(&parent_path) {
-                                    Ok(pe) if pe.is_dir() => pe.start_cluster(),
-                                    _ => return NEG_ENOENT,
-                                };
-                                (parent_cluster, parts[parts.len() - 1])
+                        // Create a new file (same lock guard, no deadlock).
+                        let parts: alloc::vec::Vec<&str> =
+                            rel.split('/').filter(|s| !s.is_empty()).collect();
+                        let (parent_cluster, file_name) = if parts.len() <= 1 {
+                            (vol.bpb.root_cluster, rel)
+                        } else {
+                            let parent_path = parts[..parts.len() - 1].join("/");
+                            let parent_cluster = match vol.lookup(&parent_path) {
+                                Ok(pe) if pe.is_dir() => pe.start_cluster(),
+                                _ => return NEG_ENOENT,
                             };
+                            (parent_cluster, parts[parts.len() - 1])
+                        };
 
-                            match vol.create_file(parent_cluster, file_name) {
-                                Ok(_entry) => {
-                                    let fd_entry = FdEntry {
-                                        backend: FdBackend::Fat32Disk {
-                                            path: alloc::string::String::from(rel),
-                                            start_cluster: 0,
-                                            file_size: 0,
-                                            dir_cluster: parent_cluster,
-                                        },
-                                        offset: 0,
-                                        readable,
-                                        writable,
-                                        cloexec: false,
-                                    };
+                        match vol.create_file(parent_cluster, file_name) {
+                            Ok(_entry) => {
+                                let fd_entry = FdEntry {
+                                    backend: FdBackend::Fat32Disk {
+                                        path: alloc::string::String::from(rel),
+                                        start_cluster: 0,
+                                        file_size: 0,
+                                        dir_cluster: parent_cluster,
+                                    },
+                                    offset: 0,
+                                    readable,
+                                    writable,
+                                    cloexec: false,
+                                };
 
-                                    return match alloc_fd(3, fd_entry) {
-                                        Some(i) => {
-                                            log::info!("[open] {} → fd {} (fat32 new)", name, i);
-                                            i as u64
-                                        }
-                                        None => NEG_EMFILE,
-                                    };
-                                }
-                                Err(_) => return NEG_EIO,
+                                return match alloc_fd(3, fd_entry) {
+                                    Some(i) => {
+                                        log::info!("[open] {} → fd {} (fat32 new)", name, i);
+                                        i as u64
+                                    }
+                                    None => NEG_EMFILE,
+                                };
                             }
+                            Err(_) => return NEG_EIO,
                         }
                     }
                     Err(_) => return NEG_ENOENT,
