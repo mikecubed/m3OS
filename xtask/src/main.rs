@@ -1046,8 +1046,13 @@ impl io::Seek for PartitionSlice {
 
 /// Create a 64 MB raw data disk image with an MBR partition table and a
 /// FAT32-formatted partition. The image is placed at `output_dir/disk.img`.
+/// Skips creation if the image already exists to preserve persisted data.
 fn create_data_disk(output_dir: &Path) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
+    if disk_path.exists() {
+        println!("Data disk: {} (existing, preserved)", disk_path.display());
+        return disk_path;
+    }
     const DISK_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
