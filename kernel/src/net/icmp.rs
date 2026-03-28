@@ -62,8 +62,8 @@ pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {
 
 pub static PING_REPLY_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub static PING_REPLY_TICK: AtomicU64 = AtomicU64::new(0);
-static PING_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
-static PING_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
+pub static PING_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
+pub static PING_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
 
 /// Send an ICMP echo request to the given IP address.
 pub fn ping(target_ip: super::arp::Ipv4Addr, seq: u16) -> u64 {

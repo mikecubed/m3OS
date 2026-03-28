@@ -361,13 +361,41 @@ pub extern "C" fn syscall_handler(
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
-        // Phase 21: sendto → write for pipe-based socketpair
-        44 => sys_linux_write(arg0, arg1, arg2),
-        // Phase 21/22: recvfrom — read for pipe-based socketpair.
-        // Supports MSG_DONTWAIT (non-blocking) and blocking mode.
+        // Phase 23: socket syscalls
+        41 => sys_socket(arg0, arg1, arg2),
+        42 => sys_connect(arg0, arg1, arg2),
+        43 => sys_accept(arg0, arg1, arg2),
+        44 => {
+            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            let addr_ptr =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            let addr_len =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)) };
+            sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
+        }
         45 => {
             let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            sys_recvfrom(arg0, arg1, arg2, flags)
+            let addr_ptr =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            let addr_len_ptr =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)) };
+            sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
+        }
+        48 => sys_shutdown_sock(arg0, arg1),
+        49 => sys_bind(arg0, arg1, arg2),
+        50 => sys_listen(arg0, arg1),
+        51 => sys_getsockname(arg0, arg1, arg2),
+        52 => sys_getpeername(arg0, arg1, arg2),
+        54 => {
+            let optval_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            let optlen = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
+        }
+        55 => {
+            let optval_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            let optlen_ptr =
+                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
         }
         // IPC syscalls (Phase 6) — kernel-task only.
         // Note: syscall 7 was IPC but is now poll (Phase 22).
@@ -2251,7 +2279,10 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             const NEG_ENOSYS: u64 = (-38_i64) as u64;
             NEG_ENOSYS
         }
-        FdBackend::Socket { .. } => NEG_ENOSYS, // placeholder, wired up in Track D
+        FdBackend::Socket { .. } => {
+            // Delegate to recvfrom with no addr
+            sys_recvfrom_socket(fd as u64, buf_ptr, count, 0, 0, 0)
+        }
     }
 }
 
@@ -2374,7 +2405,10 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             const NEG_ENOSYS: u64 = (-38_i64) as u64;
             NEG_ENOSYS
         }
-        FdBackend::Socket { .. } => NEG_ENOSYS, // placeholder, wired up in Track D
+        FdBackend::Socket { .. } => {
+            // Delegate to sendto with no addr
+            sys_sendto(fd, buf_ptr, count, 0, 0, 0)
+        }
     }
 }
 
@@ -4417,13 +4451,493 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// recvfrom(fd, buf, len, flags, ...) — syscall 45
+// Phase 23: Socket syscalls
 // ---------------------------------------------------------------------------
 
-/// Read for pipe-based socketpair (recvfrom syscall).
-/// If MSG_DONTWAIT (0x40) is set in flags, returns -EAGAIN when no data.
-/// Otherwise blocks until data or EOF, like read().
-fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
+/// Helper: read a SockaddrIn from userspace and return (ip, port).
+fn sockaddr_from_user(addr_ptr: u64) -> Result<([u8; 4], u16), u64> {
+    let mut buf = [0u8; 16]; // sizeof(sockaddr_in)
+    if crate::mm::user_mem::copy_from_user(&mut buf, addr_ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    if family != 2 {
+        // AF_INET
+        return Err(NEG_EINVAL);
+    }
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    let ip = [buf[4], buf[5], buf[6], buf[7]];
+    Ok((ip, port))
+}
+
+/// Helper: write a SockaddrIn to userspace.
+fn sockaddr_to_user(addr_ptr: u64, ip: [u8; 4], port: u16) -> Result<(), u64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 16];
+    buf[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
+    buf[2..4].copy_from_slice(&port.to_be_bytes());
+    buf[4..8].copy_from_slice(&ip);
+    if crate::mm::user_mem::copy_to_user(addr_ptr, &buf).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    Ok(())
+}
+
+/// Helper: look up socket handle from fd. Returns (handle, socket_kind, protocol).
+fn socket_handle_from_fd(
+    fd: u64,
+) -> Result<
+    (
+        crate::net::SocketHandle,
+        crate::net::SocketKind,
+        crate::net::SocketProtocol,
+    ),
+    u64,
+> {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return Err(NEG_EBADF);
+    }
+    let entry = current_fd_entry(fd_idx).ok_or(NEG_EBADF)?;
+    match &entry.backend {
+        FdBackend::Socket { handle } => {
+            let h = *handle;
+            let info = crate::net::with_socket(h, |s| (s.kind, s.protocol));
+            match info {
+                Some((kind, proto)) => Ok((h, kind, proto)),
+                None => Err(NEG_EBADF),
+            }
+        }
+        _ => Err(NEG_ENOTSOCK),
+    }
+}
+
+const NEG_ENOTSOCK: u64 = (-88_i64) as u64;
+const NEG_EADDRINUSE: u64 = (-98_i64) as u64;
+const NEG_ENOTCONN: u64 = (-107_i64) as u64;
+const NEG_ECONNREFUSED: u64 = (-111_i64) as u64;
+const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
+const NEG_EOPNOTSUPP: u64 = (-95_i64) as u64;
+const NEG_ENOPROTOOPT: u64 = (-92_i64) as u64;
+const NEG_EAFNOSUPPORT: u64 = (-97_i64) as u64;
+
+/// socket(domain, type, protocol) — syscall 41
+fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
+    use crate::net::{SocketKind, SocketProtocol};
+    // Only AF_INET (2) supported
+    if domain != 2 {
+        return NEG_EAFNOSUPPORT;
+    }
+    let (kind, proto) = match socktype {
+        1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
+        2 => {
+            // SOCK_DGRAM — protocol determines UDP vs ICMP
+            if protocol == 1 {
+                (SocketKind::Dgram, SocketProtocol::Icmp) // IPPROTO_ICMP
+            } else {
+                (SocketKind::Dgram, SocketProtocol::Udp) // default to UDP
+            }
+        }
+        _ => return NEG_EINVAL,
+    };
+    let handle = match crate::net::alloc_socket(kind, proto) {
+        Some(h) => h,
+        None => return NEG_EMFILE,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::Socket { handle },
+        offset: 0,
+        readable: true,
+        writable: true,
+        cloexec: false,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            crate::net::free_socket(handle);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// bind(fd, addr, addrlen) — syscall 49
+fn sys_bind(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+    let (handle, kind, proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (ip, port) = match sockaddr_from_user(addr_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let local_ip = if ip == [0, 0, 0, 0] {
+        crate::net::config::our_ip()
+    } else {
+        ip
+    };
+
+    match proto {
+        crate::net::SocketProtocol::Udp => {
+            if !crate::net::udp::bind(port) {
+                return NEG_EADDRINUSE;
+            }
+            crate::net::with_socket_mut(handle, |s| {
+                s.local_addr = local_ip;
+                s.local_port = port;
+                s.udp_bound = true;
+                s.state = crate::net::SocketState::Bound;
+            });
+        }
+        crate::net::SocketProtocol::Tcp => {
+            crate::net::with_socket_mut(handle, |s| {
+                s.local_addr = local_ip;
+                s.local_port = port;
+                s.state = crate::net::SocketState::Bound;
+            });
+        }
+        crate::net::SocketProtocol::Icmp => {
+            crate::net::with_socket_mut(handle, |s| {
+                s.local_addr = local_ip;
+                s.state = crate::net::SocketState::Bound;
+            });
+        }
+    }
+    let _ = kind;
+    0
+}
+
+/// connect(fd, addr, addrlen) — syscall 42
+fn sys_connect(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+    let (handle, _kind, proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (ip, port) = match sockaddr_from_user(addr_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match proto {
+        crate::net::SocketProtocol::Tcp => {
+            // Allocate a TCP connection slot
+            let local_port = crate::net::with_socket(handle, |s| {
+                if s.local_port == 0 {
+                    // Auto-assign ephemeral port
+                    crate::arch::x86_64::interrupts::tick_count() as u16 | 0x8000
+                } else {
+                    s.local_port
+                }
+            })
+            .unwrap_or(0x8000);
+
+            let tcp_idx = match crate::net::tcp::create(local_port) {
+                Some(idx) => idx,
+                None => return NEG_EAGAIN, // no TCP slots
+            };
+            crate::net::tcp::connect(tcp_idx, ip, port);
+            crate::net::with_socket_mut(handle, |s| {
+                s.tcp_slot = Some(tcp_idx);
+                s.remote_addr = ip;
+                s.remote_port = port;
+                s.local_port = local_port;
+                s.local_addr = crate::net::config::our_ip();
+            });
+
+            // Block until connected or error
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let mut tries = 0u32;
+            loop {
+                let state = crate::net::tcp::state(tcp_idx);
+                match state {
+                    crate::net::tcp::TcpState::Established => {
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.state = crate::net::SocketState::Connected;
+                        });
+                        return 0;
+                    }
+                    crate::net::tcp::TcpState::Closed => {
+                        crate::net::tcp::destroy(tcp_idx);
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.tcp_slot = None;
+                            s.state = crate::net::SocketState::Closed;
+                        });
+                        return NEG_ECONNREFUSED;
+                    }
+                    _ => {
+                        tries += 1;
+                        if tries > 3000 {
+                            // ~30 seconds timeout
+                            crate::net::tcp::destroy(tcp_idx);
+                            crate::net::with_socket_mut(handle, |s| {
+                                s.tcp_slot = None;
+                                s.state = crate::net::SocketState::Closed;
+                            });
+                            return NEG_ETIMEDOUT;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        restore_caller_context(pid, saved_user_rsp);
+                    }
+                }
+            }
+        }
+        crate::net::SocketProtocol::Udp => {
+            // UDP "connect" just sets the remote address
+            crate::net::with_socket_mut(handle, |s| {
+                s.remote_addr = ip;
+                s.remote_port = port;
+                s.state = crate::net::SocketState::Connected;
+            });
+            0
+        }
+        crate::net::SocketProtocol::Icmp => {
+            crate::net::with_socket_mut(handle, |s| {
+                s.remote_addr = ip;
+                s.state = crate::net::SocketState::Connected;
+            });
+            0
+        }
+    }
+}
+
+/// listen(fd, backlog) — syscall 50
+fn sys_listen(fd: u64, _backlog: u64) -> u64 {
+    let (handle, _kind, proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if !matches!(proto, crate::net::SocketProtocol::Tcp) {
+        return NEG_EOPNOTSUPP;
+    }
+    let local_port = crate::net::with_socket(handle, |s| s.local_port).unwrap_or(0);
+    if local_port == 0 {
+        return NEG_EINVAL; // must bind first
+    }
+    // Allocate a TCP slot for listening
+    let tcp_idx = match crate::net::tcp::create(local_port) {
+        Some(idx) => idx,
+        None => return NEG_EAGAIN,
+    };
+    crate::net::tcp::listen(tcp_idx);
+    crate::net::with_socket_mut(handle, |s| {
+        s.tcp_slot = Some(tcp_idx);
+        s.state = crate::net::SocketState::Listening;
+    });
+    0
+}
+
+/// accept(fd, addr, addrlen) — syscall 43
+fn sys_accept(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let tcp_idx = match crate::net::with_socket(handle, |s| s.tcp_slot) {
+        Some(Some(idx)) => idx,
+        _ => return NEG_EINVAL,
+    };
+
+    // Block until an incoming connection is established
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    loop {
+        let state = crate::net::tcp::state(tcp_idx);
+        match state {
+            crate::net::tcp::TcpState::Established | crate::net::tcp::TcpState::CloseWait => {
+                // Connection accepted — the listen slot has been consumed.
+                // Transfer it to a new socket.
+                let new_handle = match crate::net::alloc_socket(
+                    crate::net::SocketKind::Stream,
+                    crate::net::SocketProtocol::Tcp,
+                ) {
+                    Some(h) => h,
+                    None => return NEG_EMFILE,
+                };
+
+                // Get peer info from the TCP connection
+                let (remote_ip, remote_port, local_port) =
+                    crate::net::tcp::peer_info(tcp_idx).unwrap_or(([0; 4], 0, 0));
+
+                crate::net::with_socket_mut(new_handle, |s| {
+                    s.tcp_slot = Some(tcp_idx);
+                    s.remote_addr = remote_ip;
+                    s.remote_port = remote_port;
+                    s.local_port = local_port;
+                    s.local_addr = crate::net::config::our_ip();
+                    s.state = crate::net::SocketState::Connected;
+                });
+
+                // Create a new listen slot on the original socket
+                let listen_port = crate::net::with_socket(handle, |s| s.local_port).unwrap_or(0);
+                if let Some(new_tcp) = crate::net::tcp::create(listen_port) {
+                    crate::net::tcp::listen(new_tcp);
+                    crate::net::with_socket_mut(handle, |s| {
+                        s.tcp_slot = Some(new_tcp);
+                    });
+                }
+
+                // Write peer address to userspace
+                if addr_ptr != 0 {
+                    if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
+                        crate::net::free_socket(new_handle);
+                        return e;
+                    }
+                }
+
+                // Allocate fd for the new socket
+                let entry = FdEntry {
+                    backend: FdBackend::Socket { handle: new_handle },
+                    offset: 0,
+                    readable: true,
+                    writable: true,
+                    cloexec: false,
+                };
+                match alloc_fd(0, entry) {
+                    Some(new_fd) => return new_fd as u64,
+                    None => {
+                        crate::net::free_socket(new_handle);
+                        return NEG_EMFILE;
+                    }
+                }
+            }
+            _ => {
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+                restore_caller_context(pid, saved_user_rsp);
+            }
+        }
+    }
+}
+
+/// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
+fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    match &entry.backend {
+        FdBackend::Socket { handle } => {
+            let handle = *handle;
+            let info = match crate::net::with_socket(handle, |s| {
+                (
+                    s.protocol,
+                    s.tcp_slot,
+                    s.remote_addr,
+                    s.remote_port,
+                    s.local_port,
+                    s.shut_wr,
+                )
+            }) {
+                Some(v) => v,
+                None => return NEG_EBADF,
+            };
+            let (proto, tcp_slot, remote_addr, remote_port, local_port, shut_wr) = info;
+            if shut_wr {
+                const NEG_EPIPE: u64 = (-32_i64) as u64;
+                return NEG_EPIPE;
+            }
+
+            let capped = (len as usize).min(4096);
+            let mut tmp = [0u8; 4096];
+            if crate::mm::user_mem::copy_from_user(&mut tmp[..capped], buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+
+            match proto {
+                crate::net::SocketProtocol::Tcp => {
+                    if let Some(tcp_idx) = tcp_slot {
+                        crate::net::tcp::send(tcp_idx, &tmp[..capped]);
+                        capped as u64
+                    } else {
+                        NEG_ENOTCONN
+                    }
+                }
+                crate::net::SocketProtocol::Udp => {
+                    // Use provided addr or connected peer
+                    let (dst_ip, dst_port) = if addr_ptr != 0 {
+                        match sockaddr_from_user(addr_ptr) {
+                            Ok(v) => v,
+                            Err(e) => return e,
+                        }
+                    } else {
+                        (remote_addr, remote_port)
+                    };
+                    if dst_port == 0 {
+                        return NEG_ENOTCONN;
+                    }
+                    crate::net::udp::send(dst_ip, dst_port, local_port, &tmp[..capped]);
+                    capped as u64
+                }
+                crate::net::SocketProtocol::Icmp => {
+                    // Build and send ICMP echo request
+                    let dst_ip = if addr_ptr != 0 {
+                        match sockaddr_from_user(addr_ptr) {
+                            Ok((ip, _)) => ip,
+                            Err(e) => return e,
+                        }
+                    } else {
+                        remote_addr
+                    };
+                    // The payload IS the ICMP packet body (type/code/checksum/rest + data
+                    // are built by the caller for raw ICMP, but for DGRAM ICMP sockets
+                    // we build the echo request).
+                    // Extract id and seq from the first 4 bytes if present
+                    let (id, seq) = if capped >= 4 {
+                        let id = u16::from_be_bytes([tmp[0], tmp[1]]);
+                        let seq = u16::from_be_bytes([tmp[2], tmp[3]]);
+                        (id, seq)
+                    } else {
+                        (1u16, 0u16)
+                    };
+                    let rest = [(id >> 8) as u8, id as u8, (seq >> 8) as u8, seq as u8];
+                    let payload = if capped > 4 {
+                        &tmp[4..capped]
+                    } else {
+                        &[0xABu8; 32] as &[u8]
+                    };
+                    use crate::net::icmp::{
+                        ICMP_ECHO_REQUEST, PING_EXPECTED_ID, PING_EXPECTED_SEQ, PING_REPLY_RECEIVED,
+                    };
+                    use core::sync::atomic::Ordering;
+                    PING_REPLY_RECEIVED.store(false, Ordering::Release);
+                    PING_EXPECTED_ID.store(id, Ordering::Release);
+                    PING_EXPECTED_SEQ.store(seq, Ordering::Release);
+                    let icmp_pkt =
+                        kernel_core::net::icmp::build(ICMP_ECHO_REQUEST, 0, rest, payload);
+                    crate::net::ipv4::send(dst_ip, crate::net::ipv4::PROTO_ICMP, &icmp_pkt);
+                    capped as u64
+                }
+            }
+        }
+        FdBackend::PipeWrite { .. } => {
+            // sendto on pipe-based socketpair — delegate to write
+            sys_linux_write(fd, buf_ptr, len)
+        }
+        _ => sys_linux_write(fd, buf_ptr, len),
+    }
+}
+
+/// recvfrom(fd, buf, len, flags, addr, addrlen) — syscall 45
+fn sys_recvfrom_socket(
+    fd: u64,
+    buf_ptr: u64,
+    count: u64,
+    flags: u64,
+    addr_ptr: u64,
+    _addr_len_ptr: u64,
+) -> u64 {
     const MSG_DONTWAIT: u64 = 0x40;
     let nonblock = flags & MSG_DONTWAIT != 0;
 
@@ -4435,13 +4949,137 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
+
     match &entry.backend {
+        FdBackend::Socket { handle } => {
+            let handle = *handle;
+            let info = match crate::net::with_socket(handle, |s| {
+                (
+                    s.protocol,
+                    s.tcp_slot,
+                    s.local_port,
+                    s.remote_addr,
+                    s.remote_port,
+                    s.shut_rd,
+                )
+            }) {
+                Some(v) => v,
+                None => return NEG_EBADF,
+            };
+            let (proto, tcp_slot, local_port, remote_addr, remote_port, shut_rd) = info;
+            if shut_rd {
+                return 0; // EOF
+            }
+
+            let capped = (count as usize).min(4096);
+
+            match proto {
+                crate::net::SocketProtocol::Tcp => {
+                    let tcp_idx = match tcp_slot {
+                        Some(idx) => idx,
+                        None => return NEG_ENOTCONN,
+                    };
+                    let pid =
+                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    loop {
+                        let mut tmp = [0u8; 4096];
+                        let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..capped]);
+                        if n > 0 {
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                return NEG_EFAULT;
+                            }
+                            if addr_ptr != 0 {
+                                let _ = sockaddr_to_user(addr_ptr, remote_addr, remote_port);
+                            }
+                            return n as u64;
+                        }
+                        // Check if connection is closed
+                        let state = crate::net::tcp::state(tcp_idx);
+                        if matches!(
+                            state,
+                            crate::net::tcp::TcpState::CloseWait
+                                | crate::net::tcp::TcpState::Closed
+                                | crate::net::tcp::TcpState::TimeWait
+                        ) {
+                            return 0; // EOF
+                        }
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        restore_caller_context(pid, saved_user_rsp);
+                    }
+                }
+                crate::net::SocketProtocol::Udp => {
+                    let pid =
+                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    loop {
+                        if let Some(dgram) = crate::net::udp::recv(local_port) {
+                            let n = dgram.data.len().min(capped);
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &dgram.data[..n]).is_err()
+                            {
+                                return NEG_EFAULT;
+                            }
+                            if addr_ptr != 0 {
+                                let _ = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port);
+                            }
+                            return n as u64;
+                        }
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        restore_caller_context(pid, saved_user_rsp);
+                    }
+                }
+                crate::net::SocketProtocol::Icmp => {
+                    // Wait for ICMP echo reply
+                    use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
+                    use core::sync::atomic::Ordering;
+                    let pid =
+                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    loop {
+                        if PING_REPLY_RECEIVED.load(Ordering::Acquire) {
+                            PING_REPLY_RECEIVED.store(false, Ordering::Release);
+                            let tick = PING_REPLY_TICK.load(Ordering::Acquire);
+                            // Write tick as 8-byte LE to userspace as reply data
+                            let tick_bytes = tick.to_le_bytes();
+                            let n = tick_bytes.len().min(capped);
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tick_bytes[..n]).is_err()
+                            {
+                                return NEG_EFAULT;
+                            }
+                            if addr_ptr != 0 {
+                                let _ = sockaddr_to_user(addr_ptr, remote_addr, 0);
+                            }
+                            return n as u64;
+                        }
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
+                        restore_caller_context(pid, saved_user_rsp);
+                    }
+                }
+            }
+        }
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
             let len = (count as usize).min(4096);
 
             if nonblock {
-                // Non-blocking: single attempt.
                 let mut tmp = [0u8; 4096];
                 match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
                     Ok(n) if n > 0 => {
@@ -4450,17 +5088,16 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
                         }
                         n as u64
                     }
-                    Ok(_) => 0,           // EOF
-                    Err(_) => NEG_EAGAIN, // would block
+                    Ok(_) => 0,
+                    Err(_) => NEG_EAGAIN,
                 }
             } else {
-                // Blocking: yield-loop until data or EOF.
                 let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
                 let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
                 loop {
                     let mut tmp = [0u8; 4096];
                     match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
-                        Ok(0) => return 0, // EOF
+                        Ok(0) => return 0,
                         Ok(n) => {
                             if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
                                 return NEG_EFAULT;
@@ -4478,8 +5115,168 @@ fn sys_recvfrom(fd: u64, buf_ptr: u64, count: u64, flags: u64) -> u64 {
                 }
             }
         }
-        _ => sys_linux_read(fd, buf_ptr, count), // fallback for non-pipe fds
+        _ => sys_linux_read(fd, buf_ptr, count),
     }
+}
+
+/// shutdown(fd, how) — syscall 48
+fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let tcp_slot = crate::net::with_socket(handle, |s| s.tcp_slot).flatten();
+    match how {
+        0 => {
+            // SHUT_RD
+            crate::net::with_socket_mut(handle, |s| s.shut_rd = true);
+        }
+        1 => {
+            // SHUT_WR
+            if let Some(tcp_idx) = tcp_slot {
+                crate::net::tcp::close(tcp_idx); // send FIN
+            }
+            crate::net::with_socket_mut(handle, |s| s.shut_wr = true);
+        }
+        2 => {
+            // SHUT_RDWR
+            if let Some(tcp_idx) = tcp_slot {
+                crate::net::tcp::close(tcp_idx);
+            }
+            crate::net::with_socket_mut(handle, |s| {
+                s.shut_rd = true;
+                s.shut_wr = true;
+                s.state = crate::net::SocketState::Closed;
+            });
+        }
+        _ => return NEG_EINVAL,
+    }
+    0
+}
+
+/// getsockname(fd, addr, addrlen) — syscall 51
+fn sys_getsockname(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let (ip, port) = match crate::net::with_socket(handle, |s| (s.local_addr, s.local_port)) {
+        Some(v) => v,
+        None => return NEG_EBADF,
+    };
+    match sockaddr_to_user(addr_ptr, ip, port) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// getpeername(fd, addr, addrlen) — syscall 52
+fn sys_getpeername(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let info = match crate::net::with_socket(handle, |s| (s.remote_addr, s.remote_port, s.state)) {
+        Some(v) => v,
+        None => return NEG_EBADF,
+    };
+    let (ip, port, state) = info;
+    if !matches!(state, crate::net::SocketState::Connected) {
+        return NEG_ENOTCONN;
+    }
+    match sockaddr_to_user(addr_ptr, ip, port) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// setsockopt(fd, level, optname, optval, optlen) — syscall 54
+fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // Read the option value (up to 4 bytes for int options)
+    let val = if optlen >= 4 && optval_ptr != 0 {
+        let mut buf = [0u8; 4];
+        if crate::mm::user_mem::copy_from_user(&mut buf, optval_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        i32::from_ne_bytes(buf)
+    } else {
+        0
+    };
+
+    const SOL_SOCKET: u64 = 1;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_KEEPALIVE: u64 = 9;
+    const SO_RCVBUF: u64 = 8;
+    const SO_SNDBUF: u64 = 7;
+    const IPPROTO_TCP: u64 = 6;
+    const TCP_NODELAY: u64 = 1;
+
+    match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => {
+            crate::net::with_socket_mut(handle, |s| s.options.reuse_addr = val != 0);
+        }
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            crate::net::with_socket_mut(handle, |s| s.options.keep_alive = val != 0);
+        }
+        (SOL_SOCKET, SO_RCVBUF) => {
+            crate::net::with_socket_mut(handle, |s| s.options.recv_buf_size = val as u32);
+        }
+        (SOL_SOCKET, SO_SNDBUF) => {
+            crate::net::with_socket_mut(handle, |s| s.options.send_buf_size = val as u32);
+        }
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            crate::net::with_socket_mut(handle, |s| s.options.tcp_nodelay = val != 0);
+        }
+        _ => return NEG_ENOPROTOOPT,
+    }
+    0
+}
+
+/// getsockopt(fd, level, optname, optval, optlen) — syscall 55
+fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, _optlen_ptr: u64) -> u64 {
+    let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    const SOL_SOCKET: u64 = 1;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_KEEPALIVE: u64 = 9;
+    const SO_RCVBUF: u64 = 8;
+    const SO_SNDBUF: u64 = 7;
+    const IPPROTO_TCP: u64 = 6;
+    const TCP_NODELAY: u64 = 1;
+
+    let val: i32 = match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => {
+            crate::net::with_socket(handle, |s| s.options.reuse_addr as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_KEEPALIVE) => {
+            crate::net::with_socket(handle, |s| s.options.keep_alive as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_RCVBUF) => {
+            crate::net::with_socket(handle, |s| s.options.recv_buf_size as i32).unwrap_or(0)
+        }
+        (SOL_SOCKET, SO_SNDBUF) => {
+            crate::net::with_socket(handle, |s| s.options.send_buf_size as i32).unwrap_or(0)
+        }
+        (IPPROTO_TCP, TCP_NODELAY) => {
+            crate::net::with_socket(handle, |s| s.options.tcp_nodelay as i32).unwrap_or(0)
+        }
+        _ => return NEG_ENOPROTOOPT,
+    };
+
+    if optval_ptr != 0 {
+        let buf = val.to_ne_bytes();
+        if crate::mm::user_mem::copy_to_user(optval_ptr, &buf).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
