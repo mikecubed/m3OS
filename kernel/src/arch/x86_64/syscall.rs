@@ -4515,6 +4515,7 @@ fn socket_handle_from_fd(
 }
 
 const NEG_ENOTSOCK: u64 = (-88_i64) as u64;
+const NEG_ENFILE: u64 = (-23_i64) as u64;
 const NEG_EADDRINUSE: u64 = (-98_i64) as u64;
 const NEG_ENOTCONN: u64 = (-107_i64) as u64;
 const NEG_ECONNREFUSED: u64 = (-111_i64) as u64;
@@ -4532,7 +4533,7 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     }
     let sock_flags = socktype & (0x80000 | 0x800); // SOCK_CLOEXEC | SOCK_NONBLOCK
     let socktype_raw = socktype & !(0x80000 | 0x800);
-    let _ = sock_flags; // TODO: honor SOCK_CLOEXEC/SOCK_NONBLOCK in future
+    let _ = sock_flags; // SOCK_CLOEXEC/SOCK_NONBLOCK flags stripped but not yet honored
     let (kind, proto) = match socktype_raw {
         1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
         2 => {
@@ -4547,7 +4548,7 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     };
     let handle = match crate::net::alloc_socket(kind, proto) {
         Some(h) => h,
-        None => return NEG_EMFILE,
+        None => return NEG_ENFILE,
     };
     let entry = FdEntry {
         backend: FdBackend::Socket { handle },
@@ -4697,7 +4698,18 @@ fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             }
         }
         crate::net::SocketProtocol::Udp => {
-            // UDP "connect" just sets the remote address
+            // Auto-bind an ephemeral port if not already bound
+            let needs_bind = crate::net::with_socket(handle, |s| !s.udp_bound).unwrap_or(true);
+            if needs_bind {
+                let ephemeral = crate::arch::x86_64::interrupts::tick_count() as u16 | 0xC000;
+                if crate::net::udp::bind(ephemeral) {
+                    crate::net::with_socket_mut(handle, |s| {
+                        s.local_port = ephemeral;
+                        s.local_addr = crate::net::config::our_ip();
+                        s.udp_bound = true;
+                    });
+                }
+            }
             crate::net::with_socket_mut(handle, |s| {
                 s.remote_addr = ip;
                 s.remote_port = port;
@@ -4802,17 +4814,19 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 
                 // Write peer address to userspace
                 if addr_ptr != 0 {
-                    if addr_len_ptr != 0 {
-                        let mut len_buf = [0u8; 4];
-                        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err()
-                        {
-                            crate::net::free_socket(new_handle);
-                            return NEG_EFAULT;
-                        }
-                        if u32::from_ne_bytes(len_buf) < 16 {
-                            crate::net::free_socket(new_handle);
-                            return NEG_EINVAL;
-                        }
+                    if addr_len_ptr == 0 {
+                        // Linux requires addrlen when addr is non-null
+                        crate::net::free_socket(new_handle);
+                        return NEG_EINVAL;
+                    }
+                    let mut len_buf = [0u8; 4];
+                    if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+                        crate::net::free_socket(new_handle);
+                        return NEG_EFAULT;
+                    }
+                    if u32::from_ne_bytes(len_buf) < 16 {
+                        crate::net::free_socket(new_handle);
+                        return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
                         crate::net::free_socket(new_handle);
@@ -5017,7 +5031,10 @@ fn sys_recvfrom_socket(
             }
 
             // Validate addr_len if addr_ptr is provided
-            if addr_ptr != 0 && addr_len_ptr != 0 {
+            if addr_ptr != 0 {
+                if addr_len_ptr == 0 {
+                    return NEG_EINVAL;
+                }
                 let mut len_buf = [0u8; 4];
                 if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
                     return NEG_EFAULT;
@@ -5406,11 +5423,12 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr
         }
     }
 
-    if optval_ptr != 0 {
-        let buf = val.to_ne_bytes();
-        if crate::mm::user_mem::copy_to_user(optval_ptr, &buf).is_err() {
-            return NEG_EFAULT;
-        }
+    if optval_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    let buf = val.to_ne_bytes();
+    if crate::mm::user_mem::copy_to_user(optval_ptr, &buf).is_err() {
+        return NEG_EFAULT;
     }
     if optlen_ptr != 0 {
         let len_buf = 4u32.to_ne_bytes();
