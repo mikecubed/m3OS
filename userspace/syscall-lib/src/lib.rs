@@ -165,6 +165,24 @@ pub const SYS_GETPGID: u64 = 121;
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 
 // ===========================================================================
+// Socket syscall numbers (Phase 23)
+// ===========================================================================
+
+pub const SYS_SOCKET: u64 = 41;
+pub const SYS_CONNECT: u64 = 42;
+pub const SYS_ACCEPT: u64 = 43;
+pub const SYS_SENDTO: u64 = 44;
+pub const SYS_RECVFROM: u64 = 45;
+pub const SYS_SHUTDOWN: u64 = 48;
+pub const SYS_BIND: u64 = 49;
+pub const SYS_LISTEN: u64 = 50;
+pub const SYS_GETSOCKNAME: u64 = 51;
+pub const SYS_GETPEERNAME: u64 = 52;
+pub const SYS_SETSOCKOPT: u64 = 54;
+pub const SYS_GETSOCKOPT: u64 = 55;
+pub const SYS_CLOCK_GETTIME: u64 = 228;
+
+// ===========================================================================
 // File flags and constants
 // ===========================================================================
 
@@ -178,6 +196,79 @@ pub const O_APPEND: u64 = 0x400;
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
+
+// ===========================================================================
+// Socket constants (Phase 23)
+// ===========================================================================
+
+pub const AF_INET: u64 = 2;
+pub const SOCK_STREAM: u64 = 1;
+pub const SOCK_DGRAM: u64 = 2;
+
+pub const IPPROTO_TCP: u64 = 6;
+pub const IPPROTO_UDP: u64 = 17;
+pub const IPPROTO_ICMP: u64 = 1;
+
+// Socket options
+pub const SOL_SOCKET: u64 = 1;
+pub const SO_REUSEADDR: u64 = 2;
+pub const SO_KEEPALIVE: u64 = 9;
+pub const SO_RCVBUF: u64 = 8;
+pub const SO_SNDBUF: u64 = 7;
+pub const TCP_NODELAY: u64 = 1;
+
+// Shutdown modes
+// Clock IDs
+pub const CLOCK_MONOTONIC: u64 = 1;
+
+pub const SHUT_RD: i32 = 0;
+pub const SHUT_WR: i32 = 1;
+pub const SHUT_RDWR: i32 = 2;
+
+// Poll events
+pub const POLLIN: i16 = 0x001;
+pub const POLLOUT: i16 = 0x004;
+pub const POLLERR: i16 = 0x008;
+pub const POLLHUP: i16 = 0x010;
+
+/// IPv4 socket address, matching Linux `struct sockaddr_in` layout.
+/// `sin_port` is stored in network byte order (big-endian).
+/// `sin_addr` is stored so that in-memory bytes match the IP octets
+/// (e.g., 10.0.2.15 → bytes [10, 0, 2, 15] at the field offset).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrIn {
+    pub sin_family: u16,
+    /// Port in **network byte order** (big-endian).
+    pub sin_port: u16,
+    /// IPv4 address — in-memory bytes are the IP octets in network order.
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
+}
+
+impl SockaddrIn {
+    /// Create a new `SockaddrIn` for the given IP and port.
+    /// `ip` is in host byte order (e.g., [10, 0, 2, 2]).
+    /// `port` is in host byte order.
+    pub fn new(ip: [u8; 4], port: u16) -> Self {
+        Self {
+            sin_family: AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes(ip),
+            sin_zero: [0; 8],
+        }
+    }
+
+    /// Return the port in host byte order.
+    pub fn port(&self) -> u16 {
+        u16::from_be(self.sin_port)
+    }
+
+    /// Return the IP address as a 4-byte array in host order.
+    pub fn ip(&self) -> [u8; 4] {
+        self.sin_addr.to_ne_bytes()
+    }
+}
 
 // ===========================================================================
 // Wait flags
@@ -326,6 +417,175 @@ pub fn nanosleep(seconds: u64) -> isize {
     //   bytes 8..16: tv_nsec (i64)
     let ts: [i64; 2] = [seconds as i64, 0];
     unsafe { syscall2(SYS_NANOSLEEP, ts.as_ptr() as u64, 0) as isize }
+}
+
+// ===========================================================================
+// High-level wrappers — Sockets (Phase 23)
+// ===========================================================================
+
+/// Create a socket. Returns fd on success, negative errno on error.
+pub fn socket(domain: i32, socktype: i32, protocol: i32) -> isize {
+    unsafe { syscall3(SYS_SOCKET, domain as u64, socktype as u64, protocol as u64) as isize }
+}
+
+/// Bind a socket to an address.
+pub fn bind(fd: i32, addr: &SockaddrIn) -> isize {
+    unsafe {
+        syscall3(
+            SYS_BIND,
+            fd as u64,
+            addr as *const SockaddrIn as u64,
+            core::mem::size_of::<SockaddrIn>() as u64,
+        ) as isize
+    }
+}
+
+/// Connect a socket to a remote address.
+pub fn connect(fd: i32, addr: &SockaddrIn) -> isize {
+    unsafe {
+        syscall3(
+            SYS_CONNECT,
+            fd as u64,
+            addr as *const SockaddrIn as u64,
+            core::mem::size_of::<SockaddrIn>() as u64,
+        ) as isize
+    }
+}
+
+/// Listen for incoming connections on a socket.
+pub fn listen(fd: i32, backlog: i32) -> isize {
+    unsafe { syscall2(SYS_LISTEN, fd as u64, backlog as u64) as isize }
+}
+
+/// Accept an incoming connection. Returns new fd on success.
+pub fn accept(fd: i32, addr: Option<&mut SockaddrIn>) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
+    let (addr_ptr, len_ptr) = match addr {
+        Some(a) => (a as *mut SockaddrIn as u64, &mut len as *mut u32 as u64),
+        None => (0u64, 0u64),
+    };
+    unsafe { syscall3(SYS_ACCEPT, fd as u64, addr_ptr, len_ptr) as isize }
+}
+
+/// Send data on a connected socket.
+pub fn send(fd: i32, buf: &[u8], flags: i32) -> isize {
+    unsafe {
+        syscall6(
+            SYS_SENDTO,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            0,
+            0,
+        ) as isize
+    }
+}
+
+/// Send data to a specific address.
+pub fn sendto(fd: i32, buf: &[u8], flags: i32, addr: &SockaddrIn) -> isize {
+    unsafe {
+        syscall6(
+            SYS_SENDTO,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *const SockaddrIn as u64,
+            core::mem::size_of::<SockaddrIn>() as u64,
+        ) as isize
+    }
+}
+
+/// Receive data from a connected socket.
+pub fn recv(fd: i32, buf: &mut [u8], flags: i32) -> isize {
+    unsafe {
+        syscall6(
+            SYS_RECVFROM,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            0,
+            0,
+        ) as isize
+    }
+}
+
+/// Receive data and sender address.
+pub fn recvfrom(fd: i32, buf: &mut [u8], flags: i32, addr: &mut SockaddrIn) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
+    unsafe {
+        syscall6(
+            SYS_RECVFROM,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *mut SockaddrIn as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
+}
+
+/// Shut down part of a full-duplex connection.
+pub fn shutdown(fd: i32, how: i32) -> isize {
+    unsafe { syscall2(SYS_SHUTDOWN, fd as u64, how as u64) as isize }
+}
+
+/// Get the local address of a socket.
+pub fn getsockname(fd: i32, addr: &mut SockaddrIn) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
+    unsafe {
+        syscall3(
+            SYS_GETSOCKNAME,
+            fd as u64,
+            addr as *mut SockaddrIn as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
+}
+
+/// Get the remote address of a connected socket.
+pub fn getpeername(fd: i32, addr: &mut SockaddrIn) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
+    unsafe {
+        syscall3(
+            SYS_GETPEERNAME,
+            fd as u64,
+            addr as *mut SockaddrIn as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
+}
+
+/// Set a socket option.
+pub fn setsockopt(fd: i32, level: i32, optname: i32, optval: &[u8]) -> isize {
+    unsafe {
+        syscall5(
+            SYS_SETSOCKOPT,
+            fd as u64,
+            level as u64,
+            optname as u64,
+            optval.as_ptr() as u64,
+            optval.len() as u64,
+        ) as isize
+    }
+}
+
+/// Get a socket option.
+pub fn getsockopt(fd: i32, level: i32, optname: i32, optval: &mut [u8]) -> isize {
+    let mut len: u32 = optval.len() as u32;
+    unsafe {
+        syscall5(
+            SYS_GETSOCKOPT,
+            fd as u64,
+            level as u64,
+            optname as u64,
+            optval.as_mut_ptr() as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
 }
 
 // ===========================================================================

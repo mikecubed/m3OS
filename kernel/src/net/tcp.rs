@@ -44,6 +44,7 @@ pub struct TcpConnection {
     pub rcv_nxt: u32,
     pub rcv_wnd: u16,
     pub recv_buf: VecDeque<u8>,
+    #[allow(dead_code)]
     pub send_buf: VecDeque<u8>,
 }
 
@@ -319,6 +320,27 @@ pub fn destroy(conn_idx: usize) {
     if let Some(slot) = conns.conns.get_mut(conn_idx) {
         *slot = None;
     }
+}
+
+/// Read the peer (remote) IP, remote port, and local port for a connection.
+pub fn peer_info(conn_idx: usize) -> Option<([u8; 4], u16, u16)> {
+    let conns = TCP_CONNS.lock();
+    conns
+        .conns
+        .get(conn_idx)?
+        .as_ref()
+        .map(|c| (c.remote_ip, c.remote_port, c.local_port))
+}
+
+/// Check if the TCP connection's recv buffer has data.
+pub fn has_recv_data(conn_idx: usize) -> bool {
+    let conns = TCP_CONNS.lock();
+    conns
+        .conns
+        .get(conn_idx)
+        .and_then(|s| s.as_ref())
+        .map(|c| !c.recv_buf.is_empty())
+        .unwrap_or(false)
 }
 
 pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {

@@ -16,6 +16,11 @@ pub fn bind(port: u16) -> bool {
     UDP_BINDINGS.lock().bind(port)
 }
 
+/// Unbind a UDP port.
+pub fn unbind(port: u16) {
+    UDP_BINDINGS.lock().unbind(port);
+}
+
 /// Send a UDP datagram.
 pub fn send(dst_ip: Ipv4Addr, dst_port: u16, src_port: u16, data: &[u8]) {
     let udp_pkt = build(src_port, dst_port, data);
@@ -25,6 +30,11 @@ pub fn send(dst_ip: Ipv4Addr, dst_port: u16, src_port: u16, data: &[u8]) {
 /// Try to dequeue a received UDP datagram from a bound port.
 pub fn recv(port: u16) -> Option<UdpDatagram> {
     UDP_BINDINGS.lock().dequeue(port)
+}
+
+/// Check if a bound UDP port has pending datagrams.
+pub fn has_data(port: u16) -> bool {
+    UDP_BINDINGS.lock().has_data(port)
 }
 
 /// Handle an incoming UDP packet from the IPv4 layer.

@@ -11,6 +11,8 @@ members = [
     # Phase 20 userspace init and shell
     "userspace/init",
     "userspace/shell",
+    # Phase 23 userspace ping
+    "userspace/ping",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",

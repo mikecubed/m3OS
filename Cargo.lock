@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.22.2"
+version = "0.23.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -411,6 +411,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62d9a86c292b165f757e47e7fd66855def189b2564609bc4203727b27c33db22"
 dependencies = [
  "x86_64",
+]
+
+[[package]]
+name = "ping"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]
