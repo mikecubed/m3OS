@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod acpi;
 mod arch;
+mod blk;
 mod fb;
 mod fs;
 mod ipc;
@@ -100,6 +101,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: Enumerate PCI buses and log discovered devices.
     pci::init();
+
+    // Phase 24: Initialize virtio-blk driver.
+    blk::init();
 
     // Enable PIC and unmask IRQs now that all subsystems are initialized.
     unsafe { arch::enable_interrupts() };
