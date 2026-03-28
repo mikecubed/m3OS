@@ -310,12 +310,21 @@ impl Fat32Volume {
     }
 
     /// Write file data. Returns (start_cluster, new_file_size).
+    ///
+    /// `current_size` is the file's current size; the returned size is
+    /// `max(current_size, offset + data.len())` so overwrites before EOF
+    /// never shrink the file.
     pub fn write_file(
         &mut self,
         start_cluster: u32,
         offset: usize,
         data: &[u8],
+        current_size: usize,
     ) -> Result<(u32, usize), Fat32Error> {
+        if data.is_empty() {
+            let first = if start_cluster >= 2 { start_cluster } else { 0 };
+            return Ok((first, current_size));
+        }
         let cluster_size = self.bpb.sectors_per_cluster as usize * 512;
 
         // Build or extend the cluster chain as needed.
@@ -377,7 +386,7 @@ impl Fat32Volume {
             file_pos = cluster_end;
         }
 
-        Ok((first_cluster, end_offset))
+        Ok((first_cluster, end_offset.max(current_size)))
     }
 
     /// Create a new directory entry in the specified directory.
@@ -540,7 +549,7 @@ impl Fat32Volume {
                 if data[offset..offset + 11] == formatted_name {
                     let attr = data[offset + 11];
                     if attr & 0x10 != 0 {
-                        return Err(Fat32Error::NotFound); // Use rmdir for directories
+                        return Err(Fat32Error::IsDir); // Use rmdir for directories
                     }
 
                     // Free the cluster chain.

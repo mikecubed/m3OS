@@ -2411,12 +2411,13 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Fat32Disk {
             path,
             start_cluster,
+            file_size,
             dir_cluster,
-            ..
         } => {
             let len = (count as usize).min(64 * 1024);
             let path = path.clone();
             let start_cluster = *start_cluster;
+            let current_file_size = *file_size as usize;
             let dir_cluster = *dir_cluster;
             let offset = entry.offset;
 
@@ -2448,7 +2449,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
             let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
             if let Some(vol) = vol.as_mut() {
-                match vol.write_file(start_cluster, offset, data) {
+                match vol.write_file(start_cluster, offset, data, current_file_size) {
                     Ok((new_start, new_size)) => {
                         // Extract filename from path for dir entry update.
                         let file_name = path.rsplit('/').next().unwrap_or(&path);
@@ -2863,8 +2864,9 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                         } else {
                             let parent_path = parts[..parts.len() - 1].join("/");
                             match vol.lookup(&parent_path) {
-                                Ok(pe) => pe.start_cluster(),
-                                Err(_) => return NEG_EIO,
+                                Ok(pe) if pe.is_dir() => pe.start_cluster(),
+                                Ok(_) => return NEG_ENOTDIR,
+                                Err(_) => return NEG_ENOENT,
                             }
                         };
 
@@ -4198,6 +4200,7 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::NotFound) => NEG_ENOENT,
+                    Err(kernel_core::fs::fat32::Fat32Error::IsDir) => NEG_EISDIR,
                     Err(_) => NEG_EIO,
                 };
             }

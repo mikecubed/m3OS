@@ -86,6 +86,8 @@ pub enum Fat32Error {
     AlreadyExists,
     /// Attempted to delete a non-empty directory.
     DirNotEmpty,
+    /// Attempted a file operation on a directory (e.g., unlink on a dir).
+    IsDir,
     /// Chain length limit exceeded (likely corruption).
     ChainTooLong,
     /// Invalid cluster number encountered.

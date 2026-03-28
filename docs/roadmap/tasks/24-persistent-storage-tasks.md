@@ -48,9 +48,10 @@ Current state (post-Phase 23):
 
 ## Track A — xtask: Disk Image and QEMU Configuration
 
-Create a two-partition `disk.img` (MBR + ESP + FAT32 data) and pass it to QEMU as a
-virtio-blk device. The ESP partition holds the UEFI bootloader and kernel; the data
-partition is an empty FAT32 volume that the OS will mount at `/data`.
+Create a `disk.img` data disk with a single MBR FAT32 partition and pass it to QEMU
+as a virtio-blk device. The existing UEFI image (containing the ESP, bootloader, and
+kernel) remains separate; `disk.img` is an empty FAT32 volume that the OS will mount
+at `/data`.
 
 | Task | Description | Status |
 |---|---|---|
