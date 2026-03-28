@@ -233,7 +233,7 @@ static FONT: [[u8; CHAR_H]; FONT_GLYPHS] = [
 // ---------------------------------------------------------------------------
 
 /// Pixel colour representation (r, g, b).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Colour {
     r: u8,
     g: u8,
@@ -338,22 +338,6 @@ const VGA_BRIGHT_COLORS: [Colour; 8] = [
         b: 0xFF,
     }, // 7: Bright White
 ];
-
-/// Brighten a colour (for SGR bold attribute).
-fn brighten(c: Colour) -> Colour {
-    // Find matching standard color and return its bright variant.
-    for (i, &std_c) in VGA_COLORS.iter().enumerate() {
-        if c.r == std_c.r && c.g == std_c.g && c.b == std_c.b {
-            return VGA_BRIGHT_COLORS[i];
-        }
-    }
-    // Already bright or custom — saturating add.
-    Colour {
-        r: c.r.saturating_add(0x55),
-        g: c.g.saturating_add(0x55),
-        b: c.b.saturating_add(0x55),
-    }
-}
 
 /// Internal framebuffer console state.
 struct FbConsole {
@@ -499,11 +483,8 @@ impl FbConsole {
         let row_bytes = self.stride * self.bytes_per_pixel * CHAR_H;
         let total = self.stride * self.bytes_per_pixel * self.height;
         if row_bytes == 0 || total == 0 || row_bytes >= total {
-            // No full text row fits in the framebuffer. Clear what we have and
-            // avoid underflowing `total - row_bytes`.
-            unsafe {
-                core::ptr::write_bytes(self.buf, 0x00, total);
-            }
+            // No full text row fits in the framebuffer. Clear what we have.
+            self.clear_region(0, 0, self.cols(), self.rows());
             return;
         }
         // SAFETY: `self.buf` points to the framebuffer with `total` bytes. We
@@ -514,8 +495,11 @@ impl FbConsole {
         unsafe {
             // Shift buffer up by one text row.
             core::ptr::copy(self.buf.add(row_bytes), self.buf, total - row_bytes);
-            // Zero the last row (background colour = black = 0x00).
-            core::ptr::write_bytes(self.buf.add(total - row_bytes), 0x00, row_bytes);
+        }
+        // Clear the last row using the current background color.
+        let rows = self.rows();
+        if rows > 0 {
+            self.clear_region(0, rows - 1, self.cols(), rows);
         }
     }
 
@@ -710,8 +694,13 @@ impl FbConsole {
                     self.bg_color = BG;
                 }
                 1 => {
-                    // Bold/bright — brighten foreground.
-                    self.fg_color = brighten(self.fg_color);
+                    // Bold/bright — map standard foreground colors to their
+                    // bright variants. This is idempotent: if the current
+                    // foreground is already a bright color (or a non-palette
+                    // color), we leave it unchanged.
+                    if let Some(idx) = VGA_COLORS.iter().position(|&col| col == self.fg_color) {
+                        self.fg_color = VGA_BRIGHT_COLORS[idx];
+                    }
                 }
                 // Standard foreground colors 30–37.
                 n @ 30..=37 => {
