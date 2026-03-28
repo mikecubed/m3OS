@@ -1115,10 +1115,12 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     let mut partition = PartitionSlice::new(partition_file, partition_offset, partition_size);
     partition.seek(io::SeekFrom::Start(0)).unwrap();
 
+    // Use 512 bytes/cluster (1 sector/cluster) to ensure enough clusters
+    // for FAT32 (needs >= 65525). With 63 MB / 512 B = ~129000 clusters.
     let format_options = fatfs::FormatVolumeOptions::new()
         .volume_label(*b"M3OS_DATA  ")
         .fat_type(fatfs::FatType::Fat32)
-        .bytes_per_cluster(4096);
+        .bytes_per_cluster(512);
     fatfs::format_volume(&mut partition, format_options).unwrap_or_else(|e| {
         eprintln!("Error: failed to format data disk partition as FAT32: {e}");
         std::process::exit(1);
