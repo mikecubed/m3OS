@@ -2823,12 +2823,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 
     // Phase 24: check if this is a FAT32 /data path.
     if let Some(rel) = fat32_relative_path(name) {
-        if rel.is_empty() {
-            // /data itself — handled as directory above; shouldn't reach here.
-            return NEG_EISDIR;
-        }
-
         if crate::fs::fat32::is_mounted() {
+            if rel.is_empty() {
+                return NEG_EISDIR;
+            }
             let mut vol_guard = crate::fs::fat32::FAT32_VOLUME.lock();
             if let Some(vol) = vol_guard.as_mut() {
                 match vol.lookup(rel) {
@@ -2942,8 +2940,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                     Err(_) => return NEG_ENOENT,
                 }
             }
+        } else {
+            // FAT32 not mounted — /data doesn't exist.
+            return NEG_ENOENT;
         }
-        // FAT32 not mounted — fall through to ramdisk.
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
@@ -4095,7 +4095,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                 };
             }
         }
-        return NEG_EROFS;
+        return NEG_ENOENT;
     }
 
     let rel = match tmpfs_relative_path(name) {
@@ -4205,7 +4205,7 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
                 };
             }
         }
-        return NEG_EROFS;
+        return NEG_ENOENT;
     }
 
     let rel = match tmpfs_relative_path(name) {
