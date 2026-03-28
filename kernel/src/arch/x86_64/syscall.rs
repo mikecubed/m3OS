@@ -359,6 +359,7 @@ pub extern "C" fn syscall_handler(
         21 => sys_access(arg0),
         // Phase 14: pipe and dup2
         22 => sys_pipe_with_flags(arg0, false),
+        32 => sys_dup(arg0),
         33 => sys_dup2(arg0, arg1),
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
@@ -1268,6 +1269,37 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
 }
 
 /// `dup2(oldfd, newfd)` — duplicate a file descriptor (syscall 33).
+fn sys_dup(oldfd: u64) -> u64 {
+    let oldfd = oldfd as usize;
+    if oldfd >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    let entry = match current_fd_entry(oldfd) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    // Increment pipe ref-count for the duplicated FD.
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        _ => {}
+    }
+
+    // POSIX: dup always clears FD_CLOEXEC on the new descriptor.
+    let mut entry_copy = entry;
+    entry_copy.cloexec = false;
+
+    match alloc_fd(0, entry_copy) {
+        Some(newfd) => {
+            log::info!("[dup] fd {} → fd {}", oldfd, newfd);
+            newfd as u64
+        }
+        None => NEG_EMFILE,
+    }
+}
+
 fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     let oldfd = oldfd as usize;
     let newfd = newfd as usize;
