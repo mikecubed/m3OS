@@ -1,9 +1,8 @@
-//! Framebuffer text console — P9 Track A (T001, T002, T003).
+//! Framebuffer text console with ANSI escape sequence support.
 //!
-//! Provides a simple fixed-font (8×16 VGA) text renderer on top of the
-//! UEFI linear framebuffer handed to us by the bootloader.  The module is
-//! intentionally minimal: no heap allocation, no ANSI escape sequences, no
-//! colour support beyond white-on-black.
+//! Provides a fixed-font (8×16 VGA) text renderer on top of the UEFI linear
+//! framebuffer.  Supports VT100/ANSI escape sequences (cursor movement, erase,
+//! SGR color) needed for Ion's `liner` library to redraw prompts in-place.
 //!
 //! Public API
 //! ----------
@@ -13,6 +12,7 @@
 #![allow(dead_code)]
 
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
+use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
 use spin::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -233,7 +233,7 @@ static FONT: [[u8; CHAR_H]; FONT_GLYPHS] = [
 // ---------------------------------------------------------------------------
 
 /// Pixel colour representation (r, g, b).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Colour {
     r: u8,
     g: u8,
@@ -250,6 +250,94 @@ const BG: Colour = Colour {
     g: 0x00,
     b: 0x00,
 }; // black
+
+/// Standard VGA color palette (SGR 30–37 / 40–47).
+const VGA_COLORS: [Colour; 8] = [
+    Colour {
+        r: 0x00,
+        g: 0x00,
+        b: 0x00,
+    }, // 0: Black
+    Colour {
+        r: 0xAA,
+        g: 0x00,
+        b: 0x00,
+    }, // 1: Red
+    Colour {
+        r: 0x00,
+        g: 0xAA,
+        b: 0x00,
+    }, // 2: Green
+    Colour {
+        r: 0xAA,
+        g: 0x55,
+        b: 0x00,
+    }, // 3: Yellow/Brown
+    Colour {
+        r: 0x00,
+        g: 0x00,
+        b: 0xAA,
+    }, // 4: Blue
+    Colour {
+        r: 0xAA,
+        g: 0x00,
+        b: 0xAA,
+    }, // 5: Magenta
+    Colour {
+        r: 0x00,
+        g: 0xAA,
+        b: 0xAA,
+    }, // 6: Cyan
+    Colour {
+        r: 0xAA,
+        g: 0xAA,
+        b: 0xAA,
+    }, // 7: White (light gray)
+];
+
+/// Bright VGA color palette (SGR 90–97 / 100–107).
+const VGA_BRIGHT_COLORS: [Colour; 8] = [
+    Colour {
+        r: 0x55,
+        g: 0x55,
+        b: 0x55,
+    }, // 0: Bright Black (dark gray)
+    Colour {
+        r: 0xFF,
+        g: 0x55,
+        b: 0x55,
+    }, // 1: Bright Red
+    Colour {
+        r: 0x55,
+        g: 0xFF,
+        b: 0x55,
+    }, // 2: Bright Green
+    Colour {
+        r: 0xFF,
+        g: 0xFF,
+        b: 0x55,
+    }, // 3: Bright Yellow
+    Colour {
+        r: 0x55,
+        g: 0x55,
+        b: 0xFF,
+    }, // 4: Bright Blue
+    Colour {
+        r: 0xFF,
+        g: 0x55,
+        b: 0xFF,
+    }, // 5: Bright Magenta
+    Colour {
+        r: 0x55,
+        g: 0xFF,
+        b: 0xFF,
+    }, // 6: Bright Cyan
+    Colour {
+        r: 0xFF,
+        g: 0xFF,
+        b: 0xFF,
+    }, // 7: Bright White
+];
 
 /// Internal framebuffer console state.
 struct FbConsole {
@@ -268,6 +356,14 @@ struct FbConsole {
     pixel_format: PixelFormat,
     cursor_col: usize,
     cursor_row: usize,
+    /// ANSI escape sequence parser state machine.
+    parser: AnsiParser,
+    /// Current foreground color for text rendering.
+    fg_color: Colour,
+    /// Current background color for text rendering.
+    bg_color: Colour,
+    /// Whether the cursor is visible (DECTCEM).
+    cursor_visible: bool,
 }
 
 // SAFETY: FbConsole is only accessed under a spin::Mutex; the raw pointer is
@@ -286,6 +382,10 @@ impl FbConsole {
             pixel_format: info.pixel_format,
             cursor_col: 0,
             cursor_row: 0,
+            parser: AnsiParser::new(),
+            fg_color: FG,
+            bg_color: BG,
+            cursor_visible: true,
         }
     }
 
@@ -367,10 +467,12 @@ impl FbConsole {
             }
         };
 
+        let fg = self.fg_color;
+        let bg = self.bg_color;
         for (gy, &row_bits) in glyph.iter().enumerate() {
             for gx in 0..CHAR_W {
                 let set = (row_bits >> (7 - gx)) & 1 != 0;
-                let colour = if set { FG } else { BG };
+                let colour = if set { fg } else { bg };
                 self.write_pixel(px_x + gx, px_y + gy, colour);
             }
         }
@@ -381,11 +483,8 @@ impl FbConsole {
         let row_bytes = self.stride * self.bytes_per_pixel * CHAR_H;
         let total = self.stride * self.bytes_per_pixel * self.height;
         if row_bytes == 0 || total == 0 || row_bytes >= total {
-            // No full text row fits in the framebuffer. Clear what we have and
-            // avoid underflowing `total - row_bytes`.
-            unsafe {
-                core::ptr::write_bytes(self.buf, 0x00, total);
-            }
+            // No full text row fits in the framebuffer. Clear what we have.
+            self.clear_region(0, 0, self.cols(), self.rows());
             return;
         }
         // SAFETY: `self.buf` points to the framebuffer with `total` bytes. We
@@ -396,26 +495,74 @@ impl FbConsole {
         unsafe {
             // Shift buffer up by one text row.
             core::ptr::copy(self.buf.add(row_bytes), self.buf, total - row_bytes);
-            // Zero the last row (background colour = black = 0x00).
-            core::ptr::write_bytes(self.buf.add(total - row_bytes), 0x00, row_bytes);
+        }
+        // Clear the last row using the current background color.
+        let rows = self.rows();
+        if rows > 0 {
+            self.clear_region(0, rows - 1, self.cols(), rows);
         }
     }
 
-    /// Render one character, advancing the cursor.  Handles '\n' and '\x08'.
-    fn put_char(&mut self, c: char) {
+    /// Render one visible character, advancing the cursor with line wrapping.
+    fn put_visible_char(&mut self, c: char) {
         let rows = self.rows();
         let cols = self.cols();
         if rows == 0 || cols == 0 {
             return;
         }
 
-        match c {
-            '\n' => {
+        if self.cursor_col >= cols {
+            self.cursor_col = 0;
+            self.cursor_row += 1;
+            if self.cursor_row >= rows {
+                self.scroll_up();
+                self.cursor_row = rows - 1;
+            }
+        }
+        self.render_char_at(self.cursor_col, self.cursor_row, c);
+        self.cursor_col += 1;
+    }
+
+    /// Clear a rectangular region of character cells with the background color.
+    fn clear_region(&mut self, col_start: usize, row_start: usize, col_end: usize, row_end: usize) {
+        let cols = self.cols();
+        let rows = self.rows();
+        let bg = self.bg_color;
+        for row in row_start..core::cmp::min(row_end, rows) {
+            for col in col_start..core::cmp::min(col_end, cols) {
+                let px_x = col * CHAR_W;
+                let px_y = row * CHAR_H;
+                for gy in 0..CHAR_H {
+                    for gx in 0..CHAR_W {
+                        self.write_pixel(px_x + gx, px_y + gy, bg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute a parsed console command.
+    fn execute_cmd(&mut self, cmd: ConsoleCmd) {
+        let rows = self.rows();
+        let cols = self.cols();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+
+        match cmd {
+            ConsoleCmd::PutChar(c) => self.put_visible_char(c),
+            ConsoleCmd::CarriageReturn => {
+                self.cursor_col = 0;
+            }
+            ConsoleCmd::Newline => {
                 self.cursor_col = 0;
                 self.cursor_row += 1;
+                if self.cursor_row >= rows {
+                    self.scroll_up();
+                    self.cursor_row = rows - 1;
+                }
             }
-            '\x08' => {
-                // Backspace: erase previous cell.
+            ConsoleCmd::Backspace => {
                 if self.cursor_col > 0 {
                     self.cursor_col -= 1;
                 } else if self.cursor_row > 0 {
@@ -426,31 +573,169 @@ impl FbConsole {
                 }
                 self.render_char_at(self.cursor_col, self.cursor_row, ' ');
             }
-            _ => {
-                if self.cursor_col >= cols {
+            ConsoleCmd::Tab => {
+                let next_tab = (self.cursor_col + 8) & !7;
+                if next_tab >= cols {
                     self.cursor_col = 0;
                     self.cursor_row += 1;
                     if self.cursor_row >= rows {
                         self.scroll_up();
                         self.cursor_row = rows - 1;
                     }
+                } else {
+                    self.cursor_col = next_tab;
                 }
-                self.render_char_at(self.cursor_col, self.cursor_row, c);
-                self.cursor_col += 1;
             }
-        }
-
-        // Scroll if we've gone past the last row.
-        if self.cursor_row >= rows {
-            self.scroll_up();
-            self.cursor_row = rows - 1;
+            ConsoleCmd::CursorUp(n) => {
+                let n = n as usize;
+                self.cursor_row = self.cursor_row.saturating_sub(n);
+            }
+            ConsoleCmd::CursorDown(n) => {
+                let n = n as usize;
+                self.cursor_row = core::cmp::min(self.cursor_row + n, rows - 1);
+            }
+            ConsoleCmd::CursorForward(n) => {
+                let n = n as usize;
+                self.cursor_col = core::cmp::min(self.cursor_col + n, cols - 1);
+            }
+            ConsoleCmd::CursorBack(n) => {
+                let n = n as usize;
+                self.cursor_col = self.cursor_col.saturating_sub(n);
+            }
+            ConsoleCmd::CursorHorizontalAbsolute(n) => {
+                // n is 1-based.
+                let col = (n as usize).saturating_sub(1);
+                self.cursor_col = core::cmp::min(col, cols - 1);
+            }
+            ConsoleCmd::CursorPosition(row, col) => {
+                // Both 1-based.
+                let r = (row as usize).saturating_sub(1);
+                let c = (col as usize).saturating_sub(1);
+                self.cursor_row = core::cmp::min(r, rows - 1);
+                self.cursor_col = core::cmp::min(c, cols - 1);
+            }
+            ConsoleCmd::EraseLine(mode) => {
+                match mode {
+                    0 => {
+                        // Erase from cursor to end of line.
+                        self.clear_region(
+                            self.cursor_col,
+                            self.cursor_row,
+                            cols,
+                            self.cursor_row + 1,
+                        );
+                    }
+                    1 => {
+                        // Erase from start of line to cursor.
+                        self.clear_region(
+                            0,
+                            self.cursor_row,
+                            self.cursor_col + 1,
+                            self.cursor_row + 1,
+                        );
+                    }
+                    2 => {
+                        // Erase entire line.
+                        self.clear_region(0, self.cursor_row, cols, self.cursor_row + 1);
+                    }
+                    _ => {}
+                }
+            }
+            ConsoleCmd::EraseDisplay(mode) => {
+                match mode {
+                    0 => {
+                        // Erase from cursor to end of screen.
+                        self.clear_region(
+                            self.cursor_col,
+                            self.cursor_row,
+                            cols,
+                            self.cursor_row + 1,
+                        );
+                        if self.cursor_row + 1 < rows {
+                            self.clear_region(0, self.cursor_row + 1, cols, rows);
+                        }
+                    }
+                    1 => {
+                        // Erase from start of screen to cursor.
+                        if self.cursor_row > 0 {
+                            self.clear_region(0, 0, cols, self.cursor_row);
+                        }
+                        self.clear_region(
+                            0,
+                            self.cursor_row,
+                            self.cursor_col + 1,
+                            self.cursor_row + 1,
+                        );
+                    }
+                    2 => {
+                        // Erase entire screen (don't move cursor).
+                        self.clear_region(0, 0, cols, rows);
+                    }
+                    _ => {}
+                }
+            }
+            ConsoleCmd::SetCursorVisible(visible) => {
+                self.cursor_visible = visible;
+            }
+            ConsoleCmd::Sgr(sgr) => {
+                self.apply_sgr(&sgr);
+            }
+            ConsoleCmd::Nop => {}
         }
     }
 
-    /// Write all characters in `s`, handling control chars along the way.
+    /// Apply SGR (Select Graphic Rendition) parameters.
+    fn apply_sgr(&mut self, sgr: &SgrParams) {
+        for i in 0..sgr.count {
+            match sgr.params[i] {
+                0 => {
+                    // Reset all attributes.
+                    self.fg_color = FG;
+                    self.bg_color = BG;
+                }
+                1 => {
+                    // Bold/bright — map standard foreground colors to their
+                    // bright variants. This is idempotent: if the current
+                    // foreground is already a bright color (or a non-palette
+                    // color), we leave it unchanged.
+                    if let Some(idx) = VGA_COLORS.iter().position(|&col| col == self.fg_color) {
+                        self.fg_color = VGA_BRIGHT_COLORS[idx];
+                    }
+                }
+                // Standard foreground colors 30–37.
+                n @ 30..=37 => {
+                    self.fg_color = VGA_COLORS[(n - 30) as usize];
+                }
+                39 => {
+                    // Default foreground.
+                    self.fg_color = FG;
+                }
+                // Standard background colors 40–47.
+                n @ 40..=47 => {
+                    self.bg_color = VGA_COLORS[(n - 40) as usize];
+                }
+                49 => {
+                    // Default background.
+                    self.bg_color = BG;
+                }
+                // Bright foreground colors 90–97.
+                n @ 90..=97 => {
+                    self.fg_color = VGA_BRIGHT_COLORS[(n - 90) as usize];
+                }
+                // Bright background colors 100–107.
+                n @ 100..=107 => {
+                    self.bg_color = VGA_BRIGHT_COLORS[(n - 100) as usize];
+                }
+                _ => {} // Unknown SGR parameter — ignore.
+            }
+        }
+    }
+
+    /// Write all characters in `s`, processing through the ANSI parser.
     fn write_str(&mut self, s: &str) {
         for c in s.chars() {
-            self.put_char(c);
+            let cmd = self.parser.process_char(c);
+            self.execute_cmd(cmd);
         }
     }
 }

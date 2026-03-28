@@ -91,6 +91,7 @@ flowchart TD
 | 20 | Userspace PID 1 init, ring-3 shell, remove kernel shell | [Userspace Init and Shell](./roadmap/20-userspace-init-shell.md) |
 | 21 | ion shell (Redox OS) replaces minimal custom shell | [Ion Shell Integration](./roadmap/21-ion-shell.md) |
 | 22 | termios, cooked/raw mode, PTY stubs, window size, ion default shell | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
+| 22b | ANSI/VT100 escape sequences, CSI parser, cursor movement, erase, SGR colors | [ANSI Escape Sequences](./roadmap/22-tty-pty.md#phase-22b-vt100--ansi-escape-sequence-processing-completed) |
 
 ### Usability Phases (planned)
 
