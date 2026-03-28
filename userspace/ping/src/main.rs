@@ -62,7 +62,9 @@ pub extern "C" fn _start() -> ! {
         // Wait for reply (recvfrom returns the tick count as data)
         let mut reply_buf = [0u8; 8];
         let n = read(fd, &mut reply_buf);
-        if n == 8 {
+        if n < 0 {
+            write_str(STDOUT_FILENO, "ping: read error\n");
+        } else if n == 8 {
             let reply_tick = u64::from_le_bytes(reply_buf);
             let rtt = reply_tick.wrapping_sub(send_tick);
             // Convert ticks to approximate ms (PIT at ~100 Hz → 1 tick ≈ 10ms)
@@ -116,13 +118,11 @@ fn get_tick() -> u64 {
     let mut ts = [0u64; 2]; // tv_sec, tv_nsec
     unsafe {
         syscall_lib::syscall2(
-            228, // SYS_CLOCK_GETTIME
-            1,   // CLOCK_MONOTONIC
+            syscall_lib::SYS_CLOCK_GETTIME,
+            syscall_lib::CLOCK_MONOTONIC,
             ts.as_mut_ptr() as u64,
         );
     }
-    // Convert back to ticks: kernel uses ~100Hz tick rate
-    // tv_sec * 100 gives approximate tick count
     ts[0] * 100
 }
 

@@ -180,6 +180,7 @@ pub const SYS_GETSOCKNAME: u64 = 51;
 pub const SYS_GETPEERNAME: u64 = 52;
 pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
+pub const SYS_CLOCK_GETTIME: u64 = 228;
 
 // ===========================================================================
 // File flags and constants
@@ -217,6 +218,9 @@ pub const SO_SNDBUF: u64 = 7;
 pub const TCP_NODELAY: u64 = 1;
 
 // Shutdown modes
+// Clock IDs
+pub const CLOCK_MONOTONIC: u64 = 1;
+
 pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;

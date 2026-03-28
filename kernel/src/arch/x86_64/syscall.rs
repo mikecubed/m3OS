@@ -4739,7 +4739,7 @@ fn sys_listen(fd: u64, _backlog: u64) -> u64 {
 }
 
 /// accept(fd, addr, addrlen) — syscall 43
-fn sys_accept(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -4798,6 +4798,14 @@ fn sys_accept(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
                         crate::net::free_socket(new_handle);
                         return e;
+                    }
+                }
+
+                if addr_len_ptr != 0 {
+                    let len_buf = 16u32.to_ne_bytes();
+                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+                        crate::net::free_socket(new_handle);
+                        return NEG_EFAULT;
                     }
                 }
 
@@ -5002,7 +5010,10 @@ fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                let _ = sockaddr_to_user(addr_ptr, remote_addr, remote_port);
+                                if let Err(e) = sockaddr_to_user(addr_ptr, remote_addr, remote_port)
+                                {
+                                    return e;
+                                }
                             }
                             return n as u64;
                         }
@@ -5038,7 +5049,11 @@ fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                let _ = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port);
+                                if let Err(e) =
+                                    sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
+                                {
+                                    return e;
+                                }
                             }
                             return n as u64;
                         }
@@ -5071,7 +5086,9 @@ fn sys_recvfrom_socket(
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
-                                let _ = sockaddr_to_user(addr_ptr, remote_addr, 0);
+                                if let Err(e) = sockaddr_to_user(addr_ptr, remote_addr, 0) {
+                                    return e;
+                                }
                             }
                             return n as u64;
                         }
@@ -5167,7 +5184,7 @@ fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
 }
 
 /// getsockname(fd, addr, addrlen) — syscall 51
-fn sys_getsockname(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -5177,13 +5194,20 @@ fn sys_getsockname(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
         None => return NEG_EBADF,
     };
     match sockaddr_to_user(addr_ptr, ip, port) {
-        Ok(()) => 0,
-        Err(e) => e,
+        Ok(()) => {}
+        Err(e) => return e,
     }
+    if addr_len_ptr != 0 {
+        let len_buf = 16u32.to_ne_bytes();
+        if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+    0
 }
 
 /// getpeername(fd, addr, addrlen) — syscall 52
-fn sys_getpeername(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
+fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -5197,9 +5221,16 @@ fn sys_getpeername(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
         return NEG_ENOTCONN;
     }
     match sockaddr_to_user(addr_ptr, ip, port) {
-        Ok(()) => 0,
-        Err(e) => e,
+        Ok(()) => {}
+        Err(e) => return e,
     }
+    if addr_len_ptr != 0 {
+        let len_buf = 16u32.to_ne_bytes();
+        if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+    0
 }
 
 /// setsockopt(fd, level, optname, optval, optlen) — syscall 54
@@ -5290,7 +5321,9 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr
     }
     if optlen_ptr != 0 {
         let len_buf = 4u32.to_ne_bytes();
-        let _ = crate::mm::user_mem::copy_to_user(optlen_ptr, &len_buf);
+        if crate::mm::user_mem::copy_to_user(optlen_ptr, &len_buf).is_err() {
+            return NEG_EFAULT;
+        }
     }
     0
 }
