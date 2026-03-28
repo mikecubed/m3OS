@@ -151,6 +151,14 @@ impl Fat32Volume {
             let entry = self.read_fat_entry(candidate)?;
             if entry == 0 {
                 self.write_fat_entry(candidate, FAT_EOC)?;
+
+                // Zero the newly allocated cluster to avoid leaking stale data.
+                let lba = self.cluster_to_lba(candidate);
+                let size = self.bpb.sectors_per_cluster as usize * 512;
+                let zero_buf = vec![0u8; size];
+                crate::blk::write_sectors(lba, self.bpb.sectors_per_cluster as usize, &zero_buf)
+                    .map_err(|_| Fat32Error::IoError)?;
+
                 self.alloc_hint = candidate + 1;
                 return Ok(candidate);
             }
@@ -377,6 +385,13 @@ impl Fat32Volume {
         attr: u8,
     ) -> Result<Fat32DirEntry, Fat32Error> {
         let formatted_name = fat32::format_8_3(name);
+
+        // Check for duplicate name before creating.
+        let existing = self.read_dir(dir_cluster)?;
+        if existing.iter().any(|e| fat32::name_matches(&e.name, name)) {
+            return Err(Fat32Error::DirFull); // name already exists
+        }
+
         let chain = self.read_chain(dir_cluster)?;
         let cluster_size = self.bpb.sectors_per_cluster as usize * 512;
 
@@ -437,6 +452,12 @@ impl Fat32Volume {
 
     /// Create a subdirectory.
     pub fn mkdir(&mut self, dir_cluster: u32, name: &str) -> Result<Fat32DirEntry, Fat32Error> {
+        // Check for duplicate name before allocating.
+        let existing = self.read_dir(dir_cluster)?;
+        if existing.iter().any(|e| fat32::name_matches(&e.name, name)) {
+            return Err(Fat32Error::DirFull); // name already exists
+        }
+
         // Allocate a cluster for the new directory's contents.
         let new_dir_cluster = self.alloc_cluster()?;
         let cluster_size = self.bpb.sectors_per_cluster as usize * 512;

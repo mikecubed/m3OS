@@ -2447,12 +2447,12 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     Ok((new_start, new_size)) => {
                         // Extract filename from path for dir entry update.
                         let file_name = path.rsplit('/').next().unwrap_or(&path);
-                        let _ = vol.update_dir_entry(
-                            dir_cluster,
-                            file_name,
-                            new_start,
-                            new_size as u32,
-                        );
+                        if vol
+                            .update_dir_entry(dir_cluster, file_name, new_start, new_size as u32)
+                            .is_err()
+                        {
+                            return NEG_EIO;
+                        }
 
                         let new_offset = offset + copied;
                         with_current_fd_mut(fd_idx, |slot| {
@@ -2879,7 +2879,8 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                         };
 
                         if truncate && writable {
-                            // Truncation not yet supported on fat32 — just reset size.
+                            log::warn!("[open] O_TRUNC not supported on FAT32 files: {}", name);
+                            return NEG_EINVAL;
                         }
 
                         return match alloc_fd(3, fd_entry) {
@@ -4292,6 +4293,15 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
 
     if fstype != "vfat" {
         log::warn!("[mount] unsupported fstype: {}", fstype);
+        return NEG_EINVAL;
+    }
+
+    // Only /data is supported as a mount target until VFS tracks mountpoints.
+    if resolved_target != "/data" {
+        log::warn!(
+            "[mount] unsupported mountpoint {}; only /data is currently supported",
+            resolved_target
+        );
         return NEG_EINVAL;
     }
 

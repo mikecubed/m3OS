@@ -1101,7 +1101,8 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
 
     let format_options = fatfs::FormatVolumeOptions::new()
         .volume_label(*b"M3OS_DATA  ")
-        .fat_type(fatfs::FatType::Fat32);
+        .fat_type(fatfs::FatType::Fat32)
+        .bytes_per_cluster(4096);
     fatfs::format_volume(&mut partition, format_options).unwrap_or_else(|e| {
         eprintln!("Error: failed to format data disk partition as FAT32: {e}");
         std::process::exit(1);

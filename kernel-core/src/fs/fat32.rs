@@ -103,6 +103,9 @@ pub fn parse_bpb(sector: &[u8; 512]) -> Result<Fat32Bpb, Fat32Error> {
     }
 
     let sectors_per_cluster = sector[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
+        return Err(Fat32Error::UnsupportedSectorSize);
+    }
     let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]);
     let num_fats = sector[16];
 

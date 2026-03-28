@@ -162,8 +162,12 @@ impl Virtqueue {
         }
 
         let queue_size = unsafe { Port::<u16>::new(io_base + VIRTIO_QUEUE_SIZE).read() };
-        if queue_size == 0 {
-            log::warn!("[virtio-blk] queue {} size is 0 — skipping", queue_index);
+        if queue_size < 3 {
+            log::warn!(
+                "[virtio-blk] queue {} size {} too small (need >= 3) — skipping",
+                queue_index,
+                queue_size
+            );
             return None;
         }
         if queue_size > MAX_QUEUE_SIZE {
@@ -234,7 +238,7 @@ impl Virtqueue {
     /// Submit a 3-descriptor chain for a block I/O request and wait for completion.
     ///
     /// Returns the status byte from the device (0 = success).
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn submit_request(
         &mut self,
         req_type: u32,
@@ -242,6 +246,8 @@ impl Virtqueue {
         data_buf_phys: u64,
         data_buf_virt: *mut u8,
         data_len: usize,
+        scratch_phys: u64,
+        scratch_virt: *mut u8,
     ) -> u8 {
         // We use 3 consecutive descriptor indices starting from 0.
         // Since we hold the driver lock and process one request at a time,
@@ -249,30 +255,6 @@ impl Virtqueue {
         let hdr_desc_idx: u16 = 0;
         let data_desc_idx: u16 = 1;
         let status_desc_idx: u16 = 2;
-
-        // Build the request header on the stack and copy to a known physical location.
-        // We use the data buffer area for the header as well — place header at the
-        // start of descriptor 0's buffer area. We need separate physical memory for
-        // each descriptor, so we'll allocate frames for header and status.
-        //
-        // For simplicity, use a static scratch area: place the header in the first
-        // 16 bytes of data_buf, but that conflicts with the data descriptor.
-        // Instead, use fixed locations relative to the virtqueue memory.
-        // Actually, the simplest approach: allocate the header and status byte
-        // from the end of the virtqueue allocation (there is padding).
-        //
-        // Simplest correct approach: use frame allocator for header+status page.
-
-        // Allocate a scratch frame for the request header (16 bytes) and status (1 byte).
-        let scratch_frame = match frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => {
-                log::error!("[virtio-blk] failed to allocate scratch frame");
-                return 0xFF;
-            }
-        };
-        let scratch_phys = scratch_frame.start_address().as_u64();
-        let scratch_virt = (crate::mm::phys_offset() + scratch_phys) as *mut u8;
 
         // Place VirtioBlkReq at offset 0 of scratch page.
         let req = VirtioBlkReq {
@@ -398,7 +380,16 @@ struct VirtioBlkDriver {
     io_base: u16,
     capacity_sectors: u64,
     request_queue: Virtqueue,
+    /// Persistent scratch frame for request headers and status bytes.
+    scratch_phys: u64,
+    scratch_virt: *mut u8,
+    /// Persistent DMA frame for sector data transfers.
+    dma_phys: u64,
+    dma_virt: *mut u8,
 }
+
+// SAFETY: VirtioBlkDriver raw pointers are only accessed under the DRIVER lock.
+unsafe impl Send for VirtioBlkDriver {}
 
 static DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 
@@ -444,26 +435,21 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         return Err(0xFF);
     }
 
-    // Process one sector at a time using a scratch data frame.
-    // For simplicity, allocate one frame for the data transfer buffer.
-    let data_frame = match frame_allocator::allocate_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[virtio-blk] read_sectors: failed to allocate data frame");
-            return Err(0xFF);
-        }
-    };
-    let data_phys = data_frame.start_address().as_u64();
-    let data_virt = (crate::mm::phys_offset() + data_phys) as *mut u8;
+    let dma_phys = driver.dma_phys;
+    let dma_virt = driver.dma_virt;
+    let scratch_phys = driver.scratch_phys;
+    let scratch_virt = driver.scratch_virt;
 
     for i in 0..count {
         let sector = start_sector + i as u64;
         let status = driver.request_queue.submit_request(
             VIRTIO_BLK_T_IN,
             sector,
-            data_phys,
-            data_virt,
+            dma_phys,
+            dma_virt,
             SECTOR_SIZE,
+            scratch_phys,
+            scratch_virt,
         );
         if status != 0 {
             log::error!(
@@ -476,7 +462,7 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         // Copy from DMA buffer to caller's buffer.
         let offset = i * SECTOR_SIZE;
         unsafe {
-            core::ptr::copy_nonoverlapping(data_virt, buf[offset..].as_mut_ptr(), SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(dma_virt, buf[offset..].as_mut_ptr(), SECTOR_SIZE);
         }
     }
 
@@ -518,29 +504,26 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
         return Err(0xFF);
     }
 
-    let data_frame = match frame_allocator::allocate_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[virtio-blk] write_sectors: failed to allocate data frame");
-            return Err(0xFF);
-        }
-    };
-    let data_phys = data_frame.start_address().as_u64();
-    let data_virt = (crate::mm::phys_offset() + data_phys) as *mut u8;
+    let dma_phys = driver.dma_phys;
+    let dma_virt = driver.dma_virt;
+    let scratch_phys = driver.scratch_phys;
+    let scratch_virt = driver.scratch_virt;
 
     for i in 0..count {
         let sector = start_sector + i as u64;
         // Copy caller's data to DMA buffer.
         let offset = i * SECTOR_SIZE;
         unsafe {
-            core::ptr::copy_nonoverlapping(buf[offset..].as_ptr(), data_virt, SECTOR_SIZE);
+            core::ptr::copy_nonoverlapping(buf[offset..].as_ptr(), dma_virt, SECTOR_SIZE);
         }
         let status = driver.request_queue.submit_request(
             VIRTIO_BLK_T_OUT,
             sector,
-            data_phys,
-            data_virt,
+            dma_phys,
+            dma_virt,
             SECTOR_SIZE,
+            scratch_phys,
+            scratch_virt,
         );
         if status != 0 {
             log::error!(
@@ -674,10 +657,35 @@ pub fn init() {
         (capacity_sectors * SECTOR_SIZE as u64) / (1024 * 1024)
     );
 
+    // Allocate persistent scratch and DMA frames (reused across all requests).
+    let scratch_frame = match frame_allocator::allocate_frame() {
+        Some(f) => f,
+        None => {
+            log::error!("[virtio-blk] failed to allocate scratch frame");
+            return;
+        }
+    };
+    let scratch_phys = scratch_frame.start_address().as_u64();
+    let scratch_virt = (crate::mm::phys_offset() + scratch_phys) as *mut u8;
+
+    let dma_frame = match frame_allocator::allocate_frame() {
+        Some(f) => f,
+        None => {
+            log::error!("[virtio-blk] failed to allocate DMA frame");
+            return;
+        }
+    };
+    let dma_phys = dma_frame.start_address().as_u64();
+    let dma_virt = (crate::mm::phys_offset() + dma_phys) as *mut u8;
+
     let driver = VirtioBlkDriver {
         io_base,
         capacity_sectors,
         request_queue,
+        scratch_phys,
+        scratch_virt,
+        dma_phys,
+        dma_virt,
     };
 
     *DRIVER.lock() = Some(driver);
@@ -710,6 +718,10 @@ fn alloc_contiguous_frames(count: usize) -> Option<u64> {
                 frame.start_address().as_u64(),
                 expected
             );
+            // Free all already-allocated frames to avoid leaking them.
+            for j in 0..=i {
+                frame_allocator::free_frame(base + (j as u64) * 4096);
+            }
             return None;
         }
     }
