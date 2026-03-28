@@ -115,15 +115,19 @@ fn print_ip(ip: [u8; 4]) {
 
 /// Read the PIT tick count via clock_gettime(CLOCK_MONOTONIC).
 fn get_tick() -> u64 {
-    let mut ts = [0u64; 2]; // tv_sec, tv_nsec
-    unsafe {
+    let mut ts = [0u64; 2];
+    let ret = unsafe {
         syscall_lib::syscall2(
             syscall_lib::SYS_CLOCK_GETTIME,
             syscall_lib::CLOCK_MONOTONIC,
             ts.as_mut_ptr() as u64,
-        );
+        )
+    };
+    if ret as i64 >= 0 {
+        ts[0] * 100
+    } else {
+        0
     }
-    ts[0] * 100
 }
 
 #[panic_handler]

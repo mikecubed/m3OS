@@ -4530,7 +4530,10 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if domain != 2 {
         return NEG_EAFNOSUPPORT;
     }
-    let (kind, proto) = match socktype {
+    let sock_flags = socktype & (0x80000 | 0x800); // SOCK_CLOEXEC | SOCK_NONBLOCK
+    let socktype_raw = socktype & !(0x80000 | 0x800);
+    let _ = sock_flags; // TODO: honor SOCK_CLOEXEC/SOCK_NONBLOCK in future
+    let (kind, proto) = match socktype_raw {
         1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
         2 => {
             // SOCK_DGRAM — protocol determines UDP vs ICMP
@@ -4799,6 +4802,18 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 
                 // Write peer address to userspace
                 if addr_ptr != 0 {
+                    if addr_len_ptr != 0 {
+                        let mut len_buf = [0u8; 4];
+                        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err()
+                        {
+                            crate::net::free_socket(new_handle);
+                            return NEG_EFAULT;
+                        }
+                        if u32::from_ne_bytes(len_buf) < 16 {
+                            crate::net::free_socket(new_handle);
+                            return NEG_EINVAL;
+                        }
+                    }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
                         crate::net::free_socket(new_handle);
                         return e;
@@ -4999,6 +5014,17 @@ fn sys_recvfrom_socket(
             let (proto, tcp_slot, local_port, remote_addr, remote_port, shut_rd) = info;
             if shut_rd {
                 return 0; // EOF
+            }
+
+            // Validate addr_len if addr_ptr is provided
+            if addr_ptr != 0 && addr_len_ptr != 0 {
+                let mut len_buf = [0u8; 4];
+                if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+                    return NEG_EFAULT;
+                }
+                if u32::from_ne_bytes(len_buf) < 16 {
+                    return NEG_EINVAL;
+                }
             }
 
             let capped = (count as usize).min(4096);
@@ -5227,6 +5253,15 @@ fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
         Some(v) => v,
         None => return NEG_EBADF,
     };
+    if addr_len_ptr != 0 {
+        let mut len_buf = [0u8; 4];
+        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        if u32::from_ne_bytes(len_buf) < 16 {
+            return NEG_EINVAL;
+        }
+    }
     match sockaddr_to_user(addr_ptr, ip, port) {
         Ok(()) => {}
         Err(e) => return e,
@@ -5253,6 +5288,15 @@ fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (ip, port, state) = info;
     if !matches!(state, crate::net::SocketState::Connected) {
         return NEG_ENOTCONN;
+    }
+    if addr_len_ptr != 0 {
+        let mut len_buf = [0u8; 4];
+        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        if u32::from_ne_bytes(len_buf) < 16 {
+            return NEG_EINVAL;
+        }
     }
     match sockaddr_to_user(addr_ptr, ip, port) {
         Ok(()) => {}
@@ -5284,7 +5328,7 @@ fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u6
         }
         i32::from_ne_bytes(buf)
     } else {
-        0
+        return NEG_EFAULT;
     };
 
     const SOL_SOCKET: u64 = 1;
