@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod fb;
 pub mod fs;
 pub mod ipc;
 pub mod net;
