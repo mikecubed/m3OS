@@ -16,6 +16,11 @@ pub fn bind(port: u16) -> bool {
     UDP_BINDINGS.lock().bind(port)
 }
 
+/// Unbind a UDP port.
+pub fn unbind(port: u16) {
+    UDP_BINDINGS.lock().unbind(port);
+}
+
 /// Send a UDP datagram.
 pub fn send(dst_ip: Ipv4Addr, dst_port: u16, src_port: u16, data: &[u8]) {
     let udp_pkt = build(src_port, dst_port, data);

@@ -119,6 +119,18 @@ impl UdpBindings {
         None
     }
 
+    /// Unbind a UDP port, releasing it for future use.
+    pub fn unbind(&mut self, port: u16) {
+        for slot in self.bindings.iter_mut() {
+            if let Some(b) = slot {
+                if b.port == port {
+                    *slot = None;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Check if a bound port has pending datagrams without dequeuing.
     pub fn has_data(&self, port: u16) -> bool {
         for b in self.bindings.iter().flatten() {
@@ -198,6 +210,25 @@ mod tests {
         let mut bindings = UdpBindings::new();
         assert!(bindings.bind(80));
         assert!(!bindings.bind(80)); // duplicate
+    }
+
+    #[test]
+    fn has_data_peek() {
+        let mut bindings = UdpBindings::new();
+        assert!(bindings.bind(9000));
+        assert!(!bindings.has_data(9000));
+        bindings.enqueue(
+            9000,
+            UdpDatagram {
+                src_ip: [10, 0, 0, 1],
+                src_port: 1234,
+                data: vec![1, 2, 3],
+            },
+        );
+        assert!(bindings.has_data(9000));
+        // Dequeue and verify has_data returns false
+        let _ = bindings.dequeue(9000);
+        assert!(!bindings.has_data(9000));
     }
 
     #[test]

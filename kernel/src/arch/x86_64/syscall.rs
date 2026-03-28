@@ -4791,6 +4791,10 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     crate::net::with_socket_mut(handle, |s| {
                         s.tcp_slot = Some(new_tcp);
                     });
+                } else {
+                    log::warn!(
+                        "[socket] accept: no TCP slots for new listener on port {listen_port}"
+                    );
                 }
 
                 // Write peer address to userspace
@@ -4837,7 +4841,7 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 }
 
 /// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
-fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -4887,6 +4891,9 @@ fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, _addr
                 crate::net::SocketProtocol::Udp => {
                     // Use provided addr or connected peer
                     let (dst_ip, dst_port) = if addr_ptr != 0 {
+                        if addr_len < 16 {
+                            return NEG_EINVAL;
+                        }
                         match sockaddr_from_user(addr_ptr) {
                             Ok(v) => v,
                             Err(e) => return e,
@@ -4903,6 +4910,9 @@ fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, _addr
                 crate::net::SocketProtocol::Icmp => {
                     // Build and send ICMP echo request
                     let dst_ip = if addr_ptr != 0 {
+                        if addr_len < 16 {
+                            return NEG_EINVAL;
+                        }
                         match sockaddr_from_user(addr_ptr) {
                             Ok((ip, _)) => ip,
                             Err(e) => return e,
@@ -4956,7 +4966,7 @@ fn sys_recvfrom_socket(
     count: u64,
     flags: u64,
     addr_ptr: u64,
-    _addr_len_ptr: u64,
+    addr_len_ptr: u64,
 ) -> u64 {
     const MSG_DONTWAIT: u64 = 0x40;
     let nonblock = flags & MSG_DONTWAIT != 0;
@@ -5014,6 +5024,14 @@ fn sys_recvfrom_socket(
                                 {
                                     return e;
                                 }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 16u32.to_ne_bytes();
+                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
+                                }
                             }
                             return n as u64;
                         }
@@ -5054,6 +5072,14 @@ fn sys_recvfrom_socket(
                                 {
                                     return e;
                                 }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 16u32.to_ne_bytes();
+                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
+                                }
                             }
                             return n as u64;
                         }
@@ -5088,6 +5114,14 @@ fn sys_recvfrom_socket(
                             if addr_ptr != 0 {
                                 if let Err(e) = sockaddr_to_user(addr_ptr, remote_addr, 0) {
                                     return e;
+                                }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 16u32.to_ne_bytes();
+                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
                                 }
                             }
                             return n as u64;
@@ -5240,7 +5274,10 @@ fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u6
         Err(e) => return e,
     };
     // Read the option value (up to 4 bytes for int options)
-    let val = if optlen >= 4 && optval_ptr != 0 {
+    if optlen < 4 {
+        return NEG_EINVAL;
+    }
+    let val = if optval_ptr != 0 {
         let mut buf = [0u8; 4];
         if crate::mm::user_mem::copy_from_user(&mut buf, optval_ptr).is_err() {
             return NEG_EFAULT;
@@ -5312,6 +5349,18 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr
         }
         _ => return NEG_ENOPROTOOPT,
     };
+
+    // Validate caller's buffer size
+    if optlen_ptr != 0 {
+        let mut len_buf = [0u8; 4];
+        if crate::mm::user_mem::copy_from_user(&mut len_buf, optlen_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let caller_len = u32::from_ne_bytes(len_buf);
+        if caller_len < 4 {
+            return NEG_EINVAL;
+        }
+    }
 
     if optval_ptr != 0 {
         let buf = val.to_ne_bytes();

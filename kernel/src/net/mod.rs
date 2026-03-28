@@ -146,7 +146,9 @@ pub fn free_socket(handle: SocketHandle) {
             tcp::close(tcp_idx);
             tcp::destroy(tcp_idx);
         }
-        // Note: UDP unbind would go here if we had an unbind API
+        if entry.udp_bound {
+            udp::unbind(entry.local_port);
+        }
     }
     if let Some(slot) = table.entries.get_mut(handle as usize) {
         *slot = None;

@@ -232,13 +232,16 @@ pub const POLLERR: i16 = 0x008;
 pub const POLLHUP: i16 = 0x010;
 
 /// IPv4 socket address, matching Linux `struct sockaddr_in` layout.
+/// `sin_port` is stored in network byte order (big-endian).
+/// `sin_addr` is stored so that in-memory bytes match the IP octets
+/// (e.g., 10.0.2.15 → bytes [10, 0, 2, 15] at the field offset).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SockaddrIn {
     pub sin_family: u16,
     /// Port in **network byte order** (big-endian).
     pub sin_port: u16,
-    /// IPv4 address in **network byte order** (big-endian).
+    /// IPv4 address — in-memory bytes are the IP octets in network order.
     pub sin_addr: u32,
     pub sin_zero: [u8; 8],
 }
