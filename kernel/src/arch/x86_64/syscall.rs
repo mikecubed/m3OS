@@ -4778,7 +4778,7 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     crate::net::SocketProtocol::Tcp,
                 ) {
                     Some(h) => h,
-                    None => return NEG_EMFILE,
+                    None => return NEG_ENFILE,
                 };
 
                 // Get peer info from the TCP connection
