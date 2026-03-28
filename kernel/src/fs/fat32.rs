@@ -522,6 +522,8 @@ impl Fat32Volume {
             }
         }
 
+        // No free slot found — free the orphaned cluster before returning.
+        self.write_fat_entry(new_dir_cluster, 0)?;
         Err(Fat32Error::DirFull)
     }
 
