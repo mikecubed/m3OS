@@ -710,37 +710,45 @@ fn align_up(val: usize, alignment: usize) -> usize {
 }
 
 /// Allocate `count` physically contiguous 4 KiB frames.
+///
+/// Allocates all frames, sorts by physical address, and checks for
+/// contiguity. This works regardless of allocator ordering (LIFO,
+/// ascending, etc.). Returns the base physical address on success.
 fn alloc_contiguous_frames(count: usize) -> Option<u64> {
-    let first = frame_allocator::allocate_frame()?;
-    let base = first.start_address().as_u64();
+    use alloc::vec::Vec;
 
-    for i in 1..count {
-        let frame = match frame_allocator::allocate_frame() {
-            Some(f) => f,
+    // Allocate all requested frames.
+    let mut frames: Vec<u64> = Vec::with_capacity(count);
+    for _ in 0..count {
+        match frame_allocator::allocate_frame() {
+            Some(f) => frames.push(f.start_address().as_u64()),
             None => {
-                // Out of frames: free the contiguous frames allocated so far.
-                for j in 0..i {
-                    frame_allocator::free_frame(base + (j as u64) * 4096);
+                // OOM: free everything we allocated so far.
+                for &phys in &frames {
+                    frame_allocator::free_frame(phys);
                 }
                 return None;
             }
-        };
-        let expected = base + (i as u64) * 4096;
-        if frame.start_address().as_u64() != expected {
+        }
+    }
+
+    // Sort by physical address and check contiguity.
+    frames.sort_unstable();
+    let base = frames[0];
+    for (i, &phys) in frames.iter().enumerate() {
+        if phys != base + (i as u64) * 4096 {
             log::error!(
-                "[virtio-blk] frame {} not contiguous: got {:#x}, expected {:#x}",
+                "[virtio-blk] frames not contiguous: frame {} at {:#x}, expected {:#x}",
                 i,
-                frame.start_address().as_u64(),
-                expected
+                phys,
+                base + (i as u64) * 4096
             );
-            // Free the contiguous frames allocated so far (indices 0..i).
-            for j in 0..i {
-                frame_allocator::free_frame(base + (j as u64) * 4096);
+            for &p in &frames {
+                frame_allocator::free_frame(p);
             }
-            // Free the non-contiguous frame we just got.
-            frame_allocator::free_frame(frame.start_address().as_u64());
             return None;
         }
     }
+
     Some(base)
 }

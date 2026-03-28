@@ -1498,6 +1498,7 @@ fn cmd_run() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
 }
 
@@ -1505,6 +1506,7 @@ fn cmd_run_gui() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
     launch_qemu(&uefi_image, QemuDisplayMode::Gui);
 }
 
