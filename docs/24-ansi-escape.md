@@ -104,8 +104,10 @@ pub struct AnsiParser {
 }
 ```
 
-The parser is `Clone + Copy`-friendly through `SgrParams` and is embedded
-directly inside `FbConsole` (not heap-allocated):
+The parser type (`AnsiParser`) is `Clone` (but not `Copy`) and is stored
+directly by value inside `FbConsole` (not heap-allocated). The command type
+it produces, `ConsoleCmd`, *is* `Copy` thanks to using `SgrParams` with
+inline storage, so parsed commands can be passed around by value cheaply:
 
 ```rust
 struct FbConsole {
@@ -398,7 +400,11 @@ fn apply_sgr(&mut self, sgr: &SgrParams) {
     for i in 0..sgr.count {
         match sgr.params[i] {
             0        => { self.fg_color = FG; self.bg_color = BG; }  // reset
-            1        => { self.fg_color = brighten(self.fg_color); }  // bold
+            1        => {                                              // bold
+                if let Some(idx) = VGA_COLORS.iter().position(|&c| c == self.fg_color) {
+                    self.fg_color = VGA_BRIGHT_COLORS[idx];
+                }
+            }
             n @ 30..=37 => { self.fg_color = VGA_COLORS[(n - 30) as usize]; }
             39       => { self.fg_color = FG; }   // default fg
             n @ 40..=47 => { self.bg_color = VGA_COLORS[(n - 40) as usize]; }
@@ -445,28 +451,24 @@ pure black (`0x00, 0x00, 0x00`).
 
 ### Bold / Bright Attribute (SGR 1)
 
-SGR 1 (bold) brightens the current foreground color using `brighten()`:
+SGR 1 (bold) maps the current foreground to its bright variant if it is
+one of the 8 standard VGA colors. The operation is idempotent -- applying
+bold multiple times has no additional effect:
 
 ```rust
-fn brighten(c: Colour) -> Colour {
-    for (i, &std_c) in VGA_COLORS.iter().enumerate() {
-        if c.r == std_c.r && c.g == std_c.g && c.b == std_c.b {
-            return VGA_BRIGHT_COLORS[i];
-        }
-    }
-    // Already bright or custom — saturating add.
-    Colour {
-        r: c.r.saturating_add(0x55),
-        g: c.g.saturating_add(0x55),
-        b: c.b.saturating_add(0x55),
+1 => {
+    // Only map standard colors to their bright variants.
+    // Already-bright or non-palette colors are left unchanged.
+    if let Some(idx) = VGA_COLORS.iter().position(|&col| col == self.fg_color) {
+        self.fg_color = VGA_BRIGHT_COLORS[idx];
     }
 }
 ```
 
 If the current foreground exactly matches one of the 8 standard VGA colors,
-`brighten` returns the corresponding bright palette entry. Otherwise it adds
-`0x55` to each channel with saturation (so `0xFF` stays at `0xFF`). This
-covers the case where the foreground was already set to a bright color.
+it is replaced with the corresponding bright palette entry. If the foreground
+is already a bright color or a non-palette color, it is left unchanged. This
+ensures that sequences like `\x1b[1;1;1m` behave identically to `\x1b[1m`.
 
 Note that SGR bold does not affect background color, text weight, or any
 other attribute -- the framebuffer font is a fixed 8x16 bitmap with no bold
