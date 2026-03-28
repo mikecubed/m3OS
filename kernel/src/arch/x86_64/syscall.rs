@@ -448,7 +448,7 @@ pub extern "C" fn syscall_handler(
         131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
-        // Phase 24: mount(source, target, fstype, flags, data)
+        // Phase 24: mount(source, target, fstype)
         165 => sys_linux_mount(arg0, arg1, arg2),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
         186 => sys_getpid(),
@@ -2859,7 +2859,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                             let parent_path = parts[..parts.len() - 1].join("/");
                             match vol.lookup(&parent_path) {
                                 Ok(pe) => pe.start_cluster(),
-                                Err(_) => vol.bpb.root_cluster,
+                                Err(_) => return NEG_EIO,
                             }
                         };
 
@@ -4087,6 +4087,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                         log::info!("[mkdir] {} (fat32)", name);
                         0
                     }
+                    Err(kernel_core::fs::fat32::Fat32Error::AlreadyExists) => NEG_EEXIST,
                     Err(_) => NEG_EIO,
                 };
             }
@@ -4272,7 +4273,7 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 24: mount(source, target, fstype, flags, data) — syscall 165
+// Phase 24: mount(source, target, fstype) — syscall 165
 // ---------------------------------------------------------------------------
 
 fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {

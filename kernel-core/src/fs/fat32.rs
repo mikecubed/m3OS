@@ -82,6 +82,8 @@ pub enum Fat32Error {
     DiskFull,
     /// Directory is full (no free entry slots).
     DirFull,
+    /// An entry with this name already exists.
+    AlreadyExists,
     /// Attempted to delete a non-empty directory.
     DirNotEmpty,
     /// Chain length limit exceeded (likely corruption).

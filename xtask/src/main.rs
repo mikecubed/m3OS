@@ -982,7 +982,13 @@ impl PartitionSlice {
     /// Current position within the partition (relative to partition start).
     fn partition_pos(&mut self) -> io::Result<u64> {
         let abs = self.file.stream_position()?;
-        Ok(abs.saturating_sub(self.offset))
+        if abs < self.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file cursor is before the start of the partition slice",
+            ));
+        }
+        Ok(abs - self.offset)
     }
 }
 
@@ -1002,7 +1008,10 @@ impl io::Write for PartitionSlice {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let pos = self.partition_pos()?;
         if pos >= self.size {
-            return Ok(0);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write past end of partition",
+            ));
         }
         let remaining = (self.size - pos) as usize;
         let max_write = buf.len().min(remaining);

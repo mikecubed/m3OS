@@ -131,8 +131,11 @@ impl Fat32Volume {
                 return Err(Fat32Error::ChainTooLong);
             }
             let next = self.read_fat_entry(cluster)?;
+            if next == 0x0FFF_FFF7 {
+                return Err(Fat32Error::InvalidCluster); // bad cluster marker
+            }
             if !(2..FAT_EOC).contains(&next) {
-                break;
+                break; // end-of-chain or free
             }
             cluster = next;
         }
@@ -389,7 +392,7 @@ impl Fat32Volume {
         // Check for duplicate name before creating.
         let existing = self.read_dir(dir_cluster)?;
         if existing.iter().any(|e| fat32::name_matches(&e.name, name)) {
-            return Err(Fat32Error::DirFull); // name already exists
+            return Err(Fat32Error::AlreadyExists);
         }
 
         let chain = self.read_chain(dir_cluster)?;
@@ -455,7 +458,7 @@ impl Fat32Volume {
         // Check for duplicate name before allocating.
         let existing = self.read_dir(dir_cluster)?;
         if existing.iter().any(|e| fat32::name_matches(&e.name, name)) {
-            return Err(Fat32Error::DirFull); // name already exists
+            return Err(Fat32Error::AlreadyExists);
         }
 
         // Allocate a cluster for the new directory's contents.

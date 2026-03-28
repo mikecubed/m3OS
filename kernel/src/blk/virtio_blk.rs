@@ -718,10 +718,12 @@ fn alloc_contiguous_frames(count: usize) -> Option<u64> {
                 frame.start_address().as_u64(),
                 expected
             );
-            // Free all already-allocated frames to avoid leaking them.
-            for j in 0..=i {
+            // Free the contiguous frames allocated so far (indices 0..i).
+            for j in 0..i {
                 frame_allocator::free_frame(base + (j as u64) * 4096);
             }
+            // Free the non-contiguous frame we just got.
+            frame_allocator::free_frame(frame.start_address().as_u64());
             return None;
         }
     }
