@@ -155,22 +155,22 @@ during investigation. All were fixed in the `fix/pipe-refcount-init` branch:
 
 Ion is now the default boot shell. sh0 remains available as fallback.
 
-## Next: VT100 / ANSI Escape Sequence Processing
+## Phase 22b: VT100 / ANSI Escape Sequence Processing (Completed)
 
-Ion's `liner` library redraws the prompt on every keystroke using ANSI escape
-sequences (`\x1b[K` clear-to-end, `\x1b[nG` cursor column, `\r` carriage
-return). The framebuffer console currently ignores these, causing each redraw
-to append rather than overwrite in place. Minimum viable subset needed:
+The framebuffer console now processes ANSI/VT100 escape sequences, enabling
+Ion's `liner` library to redraw prompts in-place. Implementation:
 
-- `\r` (CR) — move cursor to column 0 (may already work)
-- `\x1b[K` (EL) — erase from cursor to end of line
-- `\x1b[nG` (CHA) — move cursor to column n
-- `\x1b[?25l` / `\x1b[?25h` — hide/show cursor
-- `\x1b[m` / `\x1b[0m` — reset attributes (SGR, can be a no-op initially)
-- `\x1b[nA` / `\x1b[nB` / `\x1b[nC` / `\x1b[nD` — cursor up/down/forward/back
+- **Parser**: Host-testable CSI state machine in `kernel-core/src/fb.rs`
+  (Normal → Escape → Csi/CsiPrivate states, 17 unit tests)
+- **Control characters**: `\r` (CR), `\t` (tab), ESC routing
+- **Cursor movement**: CUU/CUD/CUF/CUB, CHA, CUP with boundary clamping
+- **Erase sequences**: EL (0/1/2), ED (0/1/2)
+- **DECTCEM**: cursor visibility flag (`\x1b[?25l` / `\x1b[?25h`)
+- **SGR colors**: 8+8 VGA palette (30–37, 40–47, 90–97, 100–107), bold/bright,
+  reset (`\x1b[0m`), default fg/bg (39/49)
 
 See [Phase 22b Task List](./tasks/22b-ansi-escape-tasks.md) for the full
-implementation plan.
+task breakdown.
 
 ## Deferred Until Later
 

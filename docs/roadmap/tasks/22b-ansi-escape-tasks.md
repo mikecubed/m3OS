@@ -70,10 +70,10 @@ Add basic control character handling that the console currently lacks.
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T001 | Handle `\r` (0x0D) in `put_char()`: set `cursor_col = 0` without advancing row | |
-| P22b-T002 | Handle `\t` (0x09) in `put_char()`: advance `cursor_col` to next 8-column tab stop; wrap if past last column | |
-| P22b-T003 | Handle `\x1b` (ESC, 0x1B) in `put_char()`: do not render as visible glyph — route to escape parser (Track B) | |
-| P22b-T004 | `cargo xtask check` passes; sh0 and Ion still boot | |
+| P22b-T001 | Handle `\r` (0x0D) in `put_char()`: set `cursor_col = 0` without advancing row | Done |
+| P22b-T002 | Handle `\t` (0x09) in `put_char()`: advance `cursor_col` to next 8-column tab stop; wrap if past last column | Done |
+| P22b-T003 | Handle `\x1b` (ESC, 0x1B) in `put_char()`: do not render as visible glyph — route to escape parser (Track B) | Done |
+| P22b-T004 | `cargo xtask check` passes; sh0 and Ion still boot | Done |
 
 ## Track B — Escape Sequence Parser State Machine
 
@@ -83,15 +83,15 @@ semicolon-separated decimal numbers.
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T005 | Add `EscState` enum to `FbConsole`: `Normal`, `Escape` (saw ESC), `Csi` (saw ESC [), `CsiPrivate` (saw ESC [ ?) | |
-| P22b-T006 | Add parser fields to `FbConsole`: `esc_state: EscState`, `esc_params: [u16; 8]`, `esc_param_count: usize`, `esc_private: bool` | |
-| P22b-T007 | Refactor `write_str()` / `put_char()`: route characters through `process_char()` which dispatches based on `esc_state` | |
-| P22b-T008 | Implement `Normal` state: printable chars → render; `\x1b` → transition to `Escape`; control chars (`\r`, `\n`, `\x08`, `\t`) handled directly | |
-| P22b-T009 | Implement `Escape` state: `[` → transition to `Csi`; any other char → discard and return to `Normal` (unknown escape) | |
-| P22b-T010 | Implement `Csi` state: digit chars accumulate into current param; `;` advances to next param; `?` sets private flag and transitions to `CsiPrivate`; letter (0x40–0x7E) is the final byte → dispatch to handler and return to `Normal` | |
-| P22b-T011 | Add `dispatch_csi()` method: match on final byte and delegate to Track C/D/E handlers; unknown sequences silently ignored | |
-| P22b-T012 | Add `kernel-core` unit tests for parser: verify state transitions for `\x1b[2J`, `\x1b[10;20H`, `\x1b[?25l`, `\x1b[m`, malformed sequences | |
-| P22b-T013 | `cargo xtask check` passes | |
+| P22b-T005 | Add `EscState` enum to `FbConsole`: `Normal`, `Escape` (saw ESC), `Csi` (saw ESC [), `CsiPrivate` (saw ESC [ ?) | Done |
+| P22b-T006 | Add parser fields to `FbConsole`: `esc_state: EscState`, `esc_params: [u16; 8]`, `esc_param_count: usize`, `esc_private: bool` | Done |
+| P22b-T007 | Refactor `write_str()` / `put_char()`: route characters through `process_char()` which dispatches based on `esc_state` | Done |
+| P22b-T008 | Implement `Normal` state: printable chars → render; `\x1b` → transition to `Escape`; control chars (`\r`, `\n`, `\x08`, `\t`) handled directly | Done |
+| P22b-T009 | Implement `Escape` state: `[` → transition to `Csi`; any other char → discard and return to `Normal` (unknown escape) | Done |
+| P22b-T010 | Implement `Csi` state: digit chars accumulate into current param; `;` advances to next param; `?` sets private flag and transitions to `CsiPrivate`; letter (0x40–0x7E) is the final byte → dispatch to handler and return to `Normal` | Done |
+| P22b-T011 | Add `dispatch_csi()` method: match on final byte and delegate to Track C/D/E handlers; unknown sequences silently ignored | Done |
+| P22b-T012 | Add `kernel-core` unit tests for parser: verify state transitions for `\x1b[2J`, `\x1b[10;20H`, `\x1b[?25l`, `\x1b[m`, malformed sequences | Done |
+| P22b-T013 | `cargo xtask check` passes | Done |
 
 ## Track C — Cursor Movement Sequences
 
@@ -99,14 +99,14 @@ Implement the CSI sequences that move the cursor.
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T014 | Implement `CUU` (`\x1b[nA`): move cursor up n rows (default n=1); clamp at row 0 | |
-| P22b-T015 | Implement `CUD` (`\x1b[nB`): move cursor down n rows (default n=1); clamp at last row | |
-| P22b-T016 | Implement `CUF` (`\x1b[nC`): move cursor forward n columns (default n=1); clamp at last column | |
-| P22b-T017 | Implement `CUB` (`\x1b[nD`): move cursor back n columns (default n=1); clamp at column 0 | |
-| P22b-T018 | Implement `CHA` (`\x1b[nG`): move cursor to absolute column n (1-based, default 1); clamp to valid range | |
-| P22b-T019 | Implement `CUP` (`\x1b[n;mH`): move cursor to row n, column m (both 1-based, default 1;1); clamp to valid range | |
-| P22b-T020 | Add `kernel-core` unit tests: verify cursor position after each movement sequence, clamping at boundaries | |
-| P22b-T021 | `cargo xtask check` passes | |
+| P22b-T014 | Implement `CUU` (`\x1b[nA`): move cursor up n rows (default n=1); clamp at row 0 | Done |
+| P22b-T015 | Implement `CUD` (`\x1b[nB`): move cursor down n rows (default n=1); clamp at last row | Done |
+| P22b-T016 | Implement `CUF` (`\x1b[nC`): move cursor forward n columns (default n=1); clamp at last column | Done |
+| P22b-T017 | Implement `CUB` (`\x1b[nD`): move cursor back n columns (default n=1); clamp at column 0 | Done |
+| P22b-T018 | Implement `CHA` (`\x1b[nG`): move cursor to absolute column n (1-based, default 1); clamp to valid range | Done |
+| P22b-T019 | Implement `CUP` (`\x1b[n;mH`): move cursor to row n, column m (both 1-based, default 1;1); clamp to valid range | Done |
+| P22b-T020 | Add `kernel-core` unit tests: verify cursor position after each movement sequence, clamping at boundaries | Done |
+| P22b-T021 | `cargo xtask check` passes | Done |
 
 ## Track D — Erase Sequences
 
@@ -114,15 +114,15 @@ Implement the CSI sequences that clear portions of the screen.
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T022 | Add `clear_region()` helper to `FbConsole`: fill a rectangular region of character cells with spaces (background color) | |
-| P22b-T023 | Implement `EL` (`\x1b[K` / `\x1b[0K`): erase from cursor to end of current line | |
-| P22b-T024 | Implement `EL` (`\x1b[1K`): erase from start of line to cursor | |
-| P22b-T025 | Implement `EL` (`\x1b[2K`): erase entire current line | |
-| P22b-T026 | Implement `ED` (`\x1b[J` / `\x1b[0J`): erase from cursor to end of screen | |
-| P22b-T027 | Implement `ED` (`\x1b[2J`): erase entire screen (clear all cells, do NOT reset cursor — programs often follow with `\x1b[H`) | |
-| P22b-T028 | Implement `DECTCEM` hide/show cursor (`\x1b[?25l` / `\x1b[?25h`): store `cursor_visible: bool` in `FbConsole`; actual cursor rendering is a stretch goal — for now just track the flag | |
-| P22b-T029 | Add `kernel-core` unit tests for erase operations (verify cursor position unchanged after erase) | |
-| P22b-T030 | `cargo xtask check` passes | |
+| P22b-T022 | Add `clear_region()` helper to `FbConsole`: fill a rectangular region of character cells with spaces (background color) | Done |
+| P22b-T023 | Implement `EL` (`\x1b[K` / `\x1b[0K`): erase from cursor to end of current line | Done |
+| P22b-T024 | Implement `EL` (`\x1b[1K`): erase from start of line to cursor | Done |
+| P22b-T025 | Implement `EL` (`\x1b[2K`): erase entire current line | Done |
+| P22b-T026 | Implement `ED` (`\x1b[J` / `\x1b[0J`): erase from cursor to end of screen | Done |
+| P22b-T027 | Implement `ED` (`\x1b[2J`): erase entire screen (clear all cells, do NOT reset cursor — programs often follow with `\x1b[H`) | Done |
+| P22b-T028 | Implement `DECTCEM` hide/show cursor (`\x1b[?25l` / `\x1b[?25h`): store `cursor_visible: bool` in `FbConsole`; actual cursor rendering is a stretch goal — for now just track the flag | Done |
+| P22b-T029 | Add `kernel-core` unit tests for erase operations (verify cursor position unchanged after erase) | Done |
+| P22b-T030 | `cargo xtask check` passes | Done |
 
 ## Track E — SGR / Color Support (Stretch)
 
@@ -132,31 +132,31 @@ messages benefit from it.
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T031 | Add `fg_color: Colour` and `bg_color: Colour` fields to `FbConsole`; initialize to white-on-black | |
-| P22b-T032 | Update `render_char_at()` to use `self.fg_color` / `self.bg_color` instead of hardcoded `FG` / `BG` | |
-| P22b-T033 | Implement SGR reset (`\x1b[0m`): restore `fg_color` and `bg_color` to defaults | |
-| P22b-T034 | Implement SGR 30–37 (standard foreground colors): map to VGA color palette | |
-| P22b-T035 | Implement SGR 40–47 (standard background colors): map to VGA color palette | |
-| P22b-T036 | Implement SGR 1 (bold/bright): use bright color variants for foreground (90–97 equivalent) | |
-| P22b-T037 | Implement SGR 39 (default foreground) and SGR 49 (default background): reset to white / black | |
-| P22b-T038 | Define VGA color palette: 8 standard + 8 bright colors matching xterm defaults | |
-| P22b-T039 | `cargo xtask check` passes | |
+| P22b-T031 | Add `fg_color: Colour` and `bg_color: Colour` fields to `FbConsole`; initialize to white-on-black | Done |
+| P22b-T032 | Update `render_char_at()` to use `self.fg_color` / `self.bg_color` instead of hardcoded `FG` / `BG` | Done |
+| P22b-T033 | Implement SGR reset (`\x1b[0m`): restore `fg_color` and `bg_color` to defaults | Done |
+| P22b-T034 | Implement SGR 30–37 (standard foreground colors): map to VGA color palette | Done |
+| P22b-T035 | Implement SGR 40–47 (standard background colors): map to VGA color palette | Done |
+| P22b-T036 | Implement SGR 1 (bold/bright): use bright color variants for foreground (90–97 equivalent) | Done |
+| P22b-T037 | Implement SGR 39 (default foreground) and SGR 49 (default background): reset to white / black | Done |
+| P22b-T038 | Define VGA color palette: 8 standard + 8 bright colors matching xterm defaults | Done |
+| P22b-T039 | `cargo xtask check` passes | Done |
 
 ## Track F — Validation and Cleanup
 
 | Task | Description | Status |
 |---|---|---|
-| P22b-T040 | Acceptance: Ion prompt redraws in-place on each keystroke (no appending/garbling) | |
-| P22b-T041 | Acceptance: Ion prompt appears at correct position after running a command | |
-| P22b-T042 | Acceptance: `echo -e '\x1b[2J\x1b[H'` clears the screen (if Ion supports echo -e, or test via C program) | |
-| P22b-T043 | Acceptance: backspace in Ion erases the character and cursor moves back visually | |
-| P22b-T044 | Acceptance: long command lines wrap correctly and can be edited | |
-| P22b-T045 | Acceptance: external command output (`ls`, `cat`) displays correctly after Ion prompt | |
-| P22b-T046 | Acceptance: sh0 still works correctly (cooked mode echo + line discipline unaffected) | |
-| P22b-T047 | Acceptance: `cargo xtask check` passes (clippy + fmt + host tests) | |
-| P22b-T048 | Acceptance: QEMU boot — no panics, no regressions from Phase 22 | |
-| P22b-T049 | Remove `docs/roadmap/tasks/22-ion-interactive-followup.md` — all issues resolved by PR #32 | |
-| P22b-T050 | Update `docs/08-roadmap.md`: mark ANSI escape support as completed | |
+| P22b-T040 | Acceptance: Ion prompt redraws in-place on each keystroke (no appending/garbling) | Deferred (manual QEMU visual test) |
+| P22b-T041 | Acceptance: Ion prompt appears at correct position after running a command | Deferred (manual QEMU visual test) |
+| P22b-T042 | Acceptance: `echo -e '\x1b[2J\x1b[H'` clears the screen (if Ion supports echo -e, or test via C program) | Deferred (manual QEMU visual test) |
+| P22b-T043 | Acceptance: backspace in Ion erases the character and cursor moves back visually | Deferred (manual QEMU visual test) |
+| P22b-T044 | Acceptance: long command lines wrap correctly and can be edited | Deferred (manual QEMU visual test) |
+| P22b-T045 | Acceptance: external command output (`ls`, `cat`) displays correctly after Ion prompt | Deferred (manual QEMU visual test) |
+| P22b-T046 | Acceptance: sh0 still works correctly (cooked mode echo + line discipline unaffected) | Deferred (manual QEMU visual test) |
+| P22b-T047 | Acceptance: `cargo xtask check` passes (clippy + fmt + host tests) | Done |
+| P22b-T048 | Acceptance: QEMU boot — no panics, no regressions from Phase 22 | Done |
+| P22b-T049 | Remove `docs/roadmap/tasks/22-ion-interactive-followup.md` — all issues resolved by PR #32 | Done |
+| P22b-T050 | Update `docs/08-roadmap.md`: mark ANSI escape support as completed | Done |
 
 ---
 
