@@ -247,7 +247,7 @@ impl SockaddrIn {
         Self {
             sin_family: AF_INET as u16,
             sin_port: port.to_be(),
-            sin_addr: u32::from_be_bytes(ip),
+            sin_addr: u32::from_ne_bytes(ip),
             sin_zero: [0; 8],
         }
     }
@@ -259,7 +259,7 @@ impl SockaddrIn {
 
     /// Return the IP address as a 4-byte array in host order.
     pub fn ip(&self) -> [u8; 4] {
-        self.sin_addr.to_be_bytes()
+        self.sin_addr.to_ne_bytes()
     }
 }
 
@@ -452,11 +452,9 @@ pub fn listen(fd: i32, backlog: i32) -> isize {
 
 /// Accept an incoming connection. Returns new fd on success.
 pub fn accept(fd: i32, addr: Option<&mut SockaddrIn>) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
     let (addr_ptr, len_ptr) = match addr {
-        Some(a) => {
-            let mut len: u32 = core::mem::size_of::<SockaddrIn>() as u32;
-            (a as *mut SockaddrIn as u64, &mut len as *mut u32 as u64)
-        }
+        Some(a) => (a as *mut SockaddrIn as u64, &mut len as *mut u32 as u64),
         None => (0u64, 0u64),
     };
     unsafe { syscall3(SYS_ACCEPT, fd as u64, addr_ptr, len_ptr) as isize }

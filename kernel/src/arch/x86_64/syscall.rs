@@ -4563,11 +4563,14 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
 }
 
 /// bind(fd, addr, addrlen) — syscall 49
-fn sys_bind(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     let (handle, kind, proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if addr_len < 16 {
+        return NEG_EINVAL;
+    }
     let (ip, port) = match sockaddr_from_user(addr_ptr) {
         Ok(v) => v,
         Err(e) => return e,
@@ -4609,11 +4612,14 @@ fn sys_bind(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
 }
 
 /// connect(fd, addr, addrlen) — syscall 42
-fn sys_connect(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
+fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     let (handle, _kind, proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if addr_len < 16 {
+        return NEG_EINVAL;
+    }
     let (ip, port) = match sockaddr_from_user(addr_ptr) {
         Ok(v) => v,
         Err(e) => return e,
@@ -4648,7 +4654,7 @@ fn sys_connect(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
             // Block until connected or error
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
             let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
-            let mut tries = 0u32;
+            let start_tick = crate::arch::x86_64::interrupts::tick_count();
             loop {
                 let state = crate::net::tcp::state(tcp_idx);
                 match state {
@@ -4667,8 +4673,9 @@ fn sys_connect(fd: u64, addr_ptr: u64, _addr_len: u64) -> u64 {
                         return NEG_ECONNREFUSED;
                     }
                     _ => {
-                        tries += 1;
-                        if tries > 3000 {
+                        if crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start_tick)
+                            > 3000
+                        {
                             // ~30 seconds timeout
                             crate::net::tcp::destroy(tcp_idx);
                             crate::net::with_socket_mut(handle, |s| {
@@ -4770,6 +4777,11 @@ fn sys_accept(fd: u64, addr_ptr: u64, _addr_len_ptr: u64) -> u64 {
                     s.local_port = local_port;
                     s.local_addr = crate::net::config::our_ip();
                     s.state = crate::net::SocketState::Connected;
+                });
+
+                // Transfer ownership: clear old socket's tcp_slot first
+                crate::net::with_socket_mut(handle, |s| {
+                    s.tcp_slot = None;
                 });
 
                 // Create a new listen slot on the original socket
@@ -5237,7 +5249,7 @@ fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u6
 }
 
 /// getsockopt(fd, level, optname, optval, optlen) — syscall 55
-fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, _optlen_ptr: u64) -> u64 {
+fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -5275,6 +5287,10 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, _optlen_pt
         if crate::mm::user_mem::copy_to_user(optval_ptr, &buf).is_err() {
             return NEG_EFAULT;
         }
+    }
+    if optlen_ptr != 0 {
+        let len_buf = 4u32.to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(optlen_ptr, &len_buf);
     }
     0
 }

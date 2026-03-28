@@ -62,7 +62,7 @@ pub extern "C" fn _start() -> ! {
         // Wait for reply (recvfrom returns the tick count as data)
         let mut reply_buf = [0u8; 8];
         let n = read(fd, &mut reply_buf);
-        if n > 0 {
+        if n == 8 {
             let reply_tick = u64::from_le_bytes(reply_buf);
             let rtt = reply_tick.wrapping_sub(send_tick);
             // Convert ticks to approximate ms (PIT at ~100 Hz → 1 tick ≈ 10ms)
@@ -113,17 +113,17 @@ fn print_ip(ip: [u8; 4]) {
 
 /// Read the PIT tick count via clock_gettime(CLOCK_MONOTONIC).
 fn get_tick() -> u64 {
-    // Use nanosleep(0) as a way to get current tick — or use clock_gettime.
-    // We'll use the gettimeofday syscall which returns ticks.
-    let mut tv = [0u64; 2]; // tv_sec, tv_usec
+    let mut ts = [0u64; 2]; // tv_sec, tv_nsec
     unsafe {
         syscall_lib::syscall2(
-            96, // SYS_GETTIMEOFDAY
-            tv.as_mut_ptr() as u64,
-            0,
+            228, // SYS_CLOCK_GETTIME
+            1,   // CLOCK_MONOTONIC
+            ts.as_mut_ptr() as u64,
         );
     }
-    tv[0] // seconds (actually tick-derived)
+    // Convert back to ticks: kernel uses ~100Hz tick rate
+    // tv_sec * 100 gives approximate tick count
+    ts[0] * 100
 }
 
 #[panic_handler]

@@ -46,11 +46,12 @@ mod tests {
         let addr = SockaddrIn {
             sin_family: 2, // AF_INET
             sin_port: 80u16.to_be(),
-            sin_addr: u32::from_be_bytes([10, 0, 2, 15]),
+            sin_addr: u32::from_ne_bytes([10, 0, 2, 15]),
             sin_zero: [0; 8],
         };
         assert_eq!(addr.sin_family, 2);
-        assert_eq!(u16::from_be(addr.sin_port), 80);
-        assert_eq!(addr.sin_addr.to_be_bytes(), [10, 0, 2, 15]);
+        // In-memory bytes must be network order
+        assert_eq!(addr.sin_port.to_ne_bytes(), 80u16.to_be_bytes());
+        assert_eq!(addr.sin_addr.to_ne_bytes(), [10, 0, 2, 15]);
     }
 }
