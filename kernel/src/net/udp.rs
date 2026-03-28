@@ -27,6 +27,11 @@ pub fn recv(port: u16) -> Option<UdpDatagram> {
     UDP_BINDINGS.lock().dequeue(port)
 }
 
+/// Check if a bound UDP port has pending datagrams.
+pub fn has_data(port: u16) -> bool {
+    UDP_BINDINGS.lock().has_data(port)
+}
+
 /// Handle an incoming UDP packet from the IPv4 layer.
 pub fn handle_udp(ip_header: &Ipv4Header, payload: &[u8]) {
     let (udp_hdr, udp_data) = match parse(payload) {

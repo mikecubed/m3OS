@@ -118,6 +118,16 @@ impl UdpBindings {
         }
         None
     }
+
+    /// Check if a bound port has pending datagrams without dequeuing.
+    pub fn has_data(&self, port: u16) -> bool {
+        for b in self.bindings.iter().flatten() {
+            if b.port == port {
+                return !b.queue.is_empty();
+            }
+        }
+        false
+    }
 }
 
 impl Default for UdpBindings {

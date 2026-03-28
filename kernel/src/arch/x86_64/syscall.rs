@@ -5332,6 +5332,59 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                                 revents = events & POLLIN;
                             }
                         }
+                        FdBackend::Socket { handle } => {
+                            const POLLOUT: i16 = 0x004;
+                            const POLLHUP: i16 = 0x010;
+                            let h = *handle;
+                            if let Some((readable, writable, closed)) =
+                                crate::net::with_socket(h, |s| {
+                                    let readable = match s.protocol {
+                                        crate::net::SocketProtocol::Tcp => {
+                                            if let Some(tcp_idx) = s.tcp_slot {
+                                                crate::net::tcp::has_recv_data(tcp_idx)
+                                                    || matches!(
+                                                        crate::net::tcp::state(tcp_idx),
+                                                        crate::net::tcp::TcpState::CloseWait
+                                                            | crate::net::tcp::TcpState::Closed
+                                                            | crate::net::tcp::TcpState::TimeWait
+                                                    )
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        crate::net::SocketProtocol::Udp => {
+                                            crate::net::udp::has_data(s.local_port)
+                                        }
+                                        crate::net::SocketProtocol::Icmp => {
+                                            crate::net::icmp::PING_REPLY_RECEIVED
+                                                .load(core::sync::atomic::Ordering::Acquire)
+                                        }
+                                    };
+                                    let writable = match s.protocol {
+                                        crate::net::SocketProtocol::Tcp => {
+                                            s.tcp_slot.is_some()
+                                                && matches!(
+                                                    s.state,
+                                                    crate::net::SocketState::Connected
+                                                )
+                                        }
+                                        _ => true, // UDP/ICMP always writable
+                                    };
+                                    let closed = matches!(s.state, crate::net::SocketState::Closed);
+                                    (readable, writable, closed)
+                                })
+                            {
+                                if readable && events & POLLIN != 0 {
+                                    revents |= POLLIN;
+                                }
+                                if writable && events & POLLOUT != 0 {
+                                    revents |= POLLOUT;
+                                }
+                                if closed {
+                                    revents |= POLLHUP;
+                                }
+                            }
+                        }
                         _ => {
                             // Optimistic: report writable fds as ready.
                             revents = events;
