@@ -2251,6 +2251,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             const NEG_ENOSYS: u64 = (-38_i64) as u64;
             NEG_ENOSYS
         }
+        FdBackend::Socket { .. } => NEG_ENOSYS, // placeholder, wired up in Track D
     }
 }
 
@@ -2373,6 +2374,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             const NEG_ENOSYS: u64 = (-38_i64) as u64;
             NEG_ENOSYS
         }
+        FdBackend::Socket { .. } => NEG_ENOSYS, // placeholder, wired up in Track D
     }
 }
 
@@ -2882,6 +2884,7 @@ fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
+            FdBackend::Socket { handle } => crate::net::free_socket(*handle),
             _ => {}
         }
     }
@@ -2961,6 +2964,17 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return 0;
     }
 
+    // Socket fds get S_IFSOCK mode.
+    if matches!(&entry.backend, FdBackend::Socket { .. }) {
+        let mut stat = [0u8; 144];
+        let mode: u32 = 0xC000 | 0o755; // S_IFSOCK | rwxr-xr-x
+        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     let size = match &entry.backend {
         FdBackend::Stdout
         | FdBackend::Stdin
@@ -2978,7 +2992,8 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         | FdBackend::DevNull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
-        | FdBackend::PtySlave { .. } => {
+        | FdBackend::PtySlave { .. }
+        | FdBackend::Socket { .. } => {
             unreachable!() // handled above
         }
     };
@@ -3028,7 +3043,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::DevNull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
-        | FdBackend::PtySlave { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::PtySlave { .. }
+        | FdBackend::Socket { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -3958,7 +3974,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::DevNull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
-        | FdBackend::PtySlave { .. } => NEG_EINVAL,
+        | FdBackend::PtySlave { .. }
+        | FdBackend::Socket { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();

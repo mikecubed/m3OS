@@ -98,6 +98,8 @@ pub enum FdBackend {
     PtyMaster { pty_id: u32 },
     /// PTY slave — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).
     PtySlave { pty_id: u32 },
+    /// Network socket — Phase 23.
+    Socket { handle: u32 },
 }
 
 /// A single open-file entry in the per-process FD table.
