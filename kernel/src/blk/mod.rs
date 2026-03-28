@@ -1,7 +1,9 @@
 //! Block device subsystem — Phase 24.
 //!
-//! Provides a virtio-blk driver for reading and writing disk sectors.
+//! Provides a virtio-blk driver for reading and writing disk sectors,
+//! and MBR partition parsing.
 
+pub mod mbr;
 pub mod virtio_blk;
 
 #[allow(unused_imports)]

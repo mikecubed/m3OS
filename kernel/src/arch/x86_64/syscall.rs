@@ -30,6 +30,7 @@ extern crate alloc;
 #[allow(dead_code)]
 const NEG_EPERM: u64 = (-1_i64) as u64;
 const NEG_ENOENT: u64 = (-2_i64) as u64;
+const NEG_EIO: u64 = (-5_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
 #[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
@@ -447,6 +448,8 @@ pub extern "C" fn syscall_handler(
         131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
+        // Phase 24: mount(source, target, fstype, flags, data)
+        165 => sys_linux_mount(arg0, arg1, arg2),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
         186 => sys_getpid(),
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
@@ -2245,6 +2248,43 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
+        FdBackend::Fat32Disk {
+            start_cluster,
+            file_size,
+            ..
+        } => {
+            let capped_count = (count as usize).min(64 * 1024);
+            let start_cluster = *start_cluster;
+            let file_size = *file_size;
+            let offset = entry.offset;
+
+            if start_cluster < 2 || offset >= file_size as usize {
+                return 0; // EOF or empty file
+            }
+
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                let mut read_buf = alloc::vec![0u8; capped_count];
+                match vol.read_file(start_cluster, file_size, offset, &mut read_buf) {
+                    Ok(0) => 0,
+                    Ok(n) => {
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &read_buf[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+
+                        with_current_fd_mut(fd, |slot| {
+                            if let Some(e) = slot {
+                                e.offset += n;
+                            }
+                        });
+                        n as u64
+                    }
+                    Err(_) => NEG_EIO,
+                }
+            } else {
+                NEG_EIO
+            }
+        }
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
             let capped = (count as usize).min(4096);
@@ -2368,6 +2408,75 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             written as u64
         }
+        FdBackend::Fat32Disk {
+            path,
+            start_cluster,
+            dir_cluster,
+            ..
+        } => {
+            let len = (count as usize).min(64 * 1024);
+            let path = path.clone();
+            let start_cluster = *start_cluster;
+            let dir_cluster = *dir_cluster;
+            let offset = entry.offset;
+
+            // Read user data in 4 KiB chunks.
+            let mut data = alloc::vec![0u8; len];
+            let mut copied = 0usize;
+            while copied < len {
+                let chunk = (len - copied).min(4096);
+                let user_ptr = match buf_ptr.checked_add(copied as u64) {
+                    Some(p) => p,
+                    None => break,
+                };
+                let mut tmp = [0u8; 4096];
+                if crate::mm::user_mem::copy_from_user(&mut tmp[..chunk], user_ptr).is_err() {
+                    if copied == 0 {
+                        return NEG_EFAULT;
+                    }
+                    break;
+                }
+                data[copied..copied + chunk].copy_from_slice(&tmp[..chunk]);
+                copied += chunk;
+            }
+            let data = &data[..copied];
+
+            let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_mut() {
+                match vol.write_file(start_cluster, offset, data) {
+                    Ok((new_start, new_size)) => {
+                        // Extract filename from path for dir entry update.
+                        let file_name = path.rsplit('/').next().unwrap_or(&path);
+                        let _ = vol.update_dir_entry(
+                            dir_cluster,
+                            file_name,
+                            new_start,
+                            new_size as u32,
+                        );
+
+                        let new_offset = offset + copied;
+                        with_current_fd_mut(fd_idx, |slot| {
+                            if let Some(e) = slot {
+                                e.offset = new_offset;
+                                if let FdBackend::Fat32Disk {
+                                    start_cluster: ref mut sc,
+                                    file_size: ref mut fs,
+                                    ..
+                                } = e.backend
+                                {
+                                    *sc = new_start;
+                                    *fs = new_size as u32;
+                                }
+                            }
+                        });
+                        copied as u64
+                    }
+                    Err(_) => NEG_EIO,
+                }
+            } else {
+                NEG_EIO
+            }
+        }
         FdBackend::PipeWrite { pipe_id } => {
             let pipe_id = *pipe_id;
             let len = (count as usize).min(4096);
@@ -2468,6 +2577,19 @@ fn is_directory(path: &str) -> bool {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
     }
+    // Phase 24: check FAT32 /data directory.
+    if let Some(rel) = fat32_relative_path(path) {
+        if rel.is_empty() {
+            return crate::fs::fat32::is_mounted(); // /data itself
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return vol.lookup(rel).map(|e| e.is_dir()).unwrap_or(false);
+            }
+        }
+        return false;
+    }
     // Check ramdisk directory tree.
     match crate::fs::ramdisk::ramdisk_lookup(path) {
         Some(node) => node.is_dir(),
@@ -2489,6 +2611,26 @@ fn tmpfs_relative_path(path: &str) -> Option<&str> {
     };
 
     // For non-empty relative paths, reject `.`, `..`, and empty segments.
+    if !rest.is_empty() {
+        for segment in rest.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return None;
+            }
+        }
+    }
+
+    Some(rest)
+}
+
+/// Return the relative path within `/data` if this path starts with `/data`.
+fn fat32_relative_path(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    let rest = if trimmed == "data" {
+        ""
+    } else {
+        trimmed.strip_prefix("data/")?
+    };
+
     if !rest.is_empty() {
         for segment in rest.split('/') {
             if segment.is_empty() || segment == "." || segment == ".." {
@@ -2671,6 +2813,133 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                 return NEG_EMFILE;
             }
         }
+    }
+
+    // Phase 24: check if this is a FAT32 /data path.
+    if let Some(rel) = fat32_relative_path(name) {
+        if rel.is_empty() {
+            // /data itself — handled as directory above; shouldn't reach here.
+            return NEG_EISDIR;
+        }
+
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                match vol.lookup(rel) {
+                    Ok(entry) => {
+                        if entry.is_dir() {
+                            if writable || create || truncate {
+                                return NEG_EISDIR;
+                            }
+                            let fd_entry = FdEntry {
+                                backend: FdBackend::Dir {
+                                    path: alloc::string::String::from(name),
+                                },
+                                offset: 0,
+                                readable: true,
+                                writable: false,
+                                cloexec: false,
+                            };
+
+                            return match alloc_fd(3, fd_entry) {
+                                Some(i) => {
+                                    log::info!("[open] {} → fd {} (fat32 dir)", name, i);
+                                    i as u64
+                                }
+                                None => NEG_EMFILE,
+                            };
+                        }
+
+                        // Find parent dir cluster for writes.
+                        let parts: alloc::vec::Vec<&str> =
+                            rel.split('/').filter(|s| !s.is_empty()).collect();
+                        let parent_cluster = if parts.len() <= 1 {
+                            vol.bpb.root_cluster
+                        } else {
+                            let parent_path = parts[..parts.len() - 1].join("/");
+                            match vol.lookup(&parent_path) {
+                                Ok(pe) => pe.start_cluster(),
+                                Err(_) => vol.bpb.root_cluster,
+                            }
+                        };
+
+                        let initial_offset = if append { entry.file_size as usize } else { 0 };
+
+                        let fd_entry = FdEntry {
+                            backend: FdBackend::Fat32Disk {
+                                path: alloc::string::String::from(rel),
+                                start_cluster: entry.start_cluster(),
+                                file_size: entry.file_size,
+                                dir_cluster: parent_cluster,
+                            },
+                            offset: initial_offset,
+                            readable,
+                            writable,
+                            cloexec: false,
+                        };
+
+                        if truncate && writable {
+                            // Truncation not yet supported on fat32 — just reset size.
+                        }
+
+                        return match alloc_fd(3, fd_entry) {
+                            Some(i) => {
+                                log::info!("[open] {} → fd {} (fat32)", name, i);
+                                i as u64
+                            }
+                            None => NEG_EMFILE,
+                        };
+                    }
+                    Err(kernel_core::fs::fat32::Fat32Error::NotFound) if create => {
+                        // Create a new file.
+
+                        let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                        if let Some(vol) = vol.as_mut() {
+                            let parts: alloc::vec::Vec<&str> =
+                                rel.split('/').filter(|s| !s.is_empty()).collect();
+                            let (parent_cluster, file_name) = if parts.len() <= 1 {
+                                (vol.bpb.root_cluster, rel)
+                            } else {
+                                let parent_path = parts[..parts.len() - 1].join("/");
+                                let parent_cluster = match vol.lookup(&parent_path) {
+                                    Ok(pe) if pe.is_dir() => pe.start_cluster(),
+                                    _ => return NEG_ENOENT,
+                                };
+                                (parent_cluster, parts[parts.len() - 1])
+                            };
+
+                            match vol.create_file(parent_cluster, file_name) {
+                                Ok(_entry) => {
+                                    let fd_entry = FdEntry {
+                                        backend: FdBackend::Fat32Disk {
+                                            path: alloc::string::String::from(rel),
+                                            start_cluster: 0,
+                                            file_size: 0,
+                                            dir_cluster: parent_cluster,
+                                        },
+                                        offset: 0,
+                                        readable,
+                                        writable,
+                                        cloexec: false,
+                                    };
+
+                                    return match alloc_fd(3, fd_entry) {
+                                        Some(i) => {
+                                            log::info!("[open] {} → fd {} (fat32 new)", name, i);
+                                            i as u64
+                                        }
+                                        None => NEG_EMFILE,
+                                    };
+                                }
+                                Err(_) => return NEG_EIO,
+                            }
+                        }
+                    }
+                    Err(_) => return NEG_ENOENT,
+                }
+            }
+        }
+        // FAT32 not mounted — fall through to ramdisk.
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
@@ -3022,6 +3291,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
+        FdBackend::Fat32Disk { file_size, .. } => *file_size as u64,
         FdBackend::Dir { .. }
         | FdBackend::DevNull
         | FdBackend::DeviceTTY { .. }
@@ -3087,6 +3357,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
                 Err(_) => return NEG_ENOENT,
             }
         }
+        FdBackend::Fat32Disk { file_size, .. } => *file_size as usize,
     };
 
     let offset = offset as i64;
@@ -3790,9 +4061,41 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
+    // Phase 24: FAT32 /data mkdir.
+    if let Some(rel) = fat32_relative_path(name) {
+        if rel.is_empty() {
+            return NEG_EINVAL;
+        }
+        if crate::fs::fat32::is_mounted() {
+            let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_mut() {
+                let parts: alloc::vec::Vec<&str> =
+                    rel.split('/').filter(|s| !s.is_empty()).collect();
+                let (parent_cluster, dir_name) = if parts.len() <= 1 {
+                    (vol.bpb.root_cluster, rel)
+                } else {
+                    let parent_path = parts[..parts.len() - 1].join("/");
+                    let parent_cluster = match vol.lookup(&parent_path) {
+                        Ok(pe) if pe.is_dir() => pe.start_cluster(),
+                        _ => return NEG_ENOENT,
+                    };
+                    (parent_cluster, parts[parts.len() - 1])
+                };
+                return match vol.mkdir(parent_cluster, dir_name) {
+                    Ok(_) => {
+                        log::info!("[mkdir] {} (fat32)", name);
+                        0
+                    }
+                    Err(_) => NEG_EIO,
+                };
+            }
+        }
+        return NEG_EROFS;
+    }
+
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
-        None => return NEG_EROFS, // can only mkdir in tmpfs
+        None => return NEG_EROFS, // can only mkdir in tmpfs or /data
     };
     if rel.is_empty() {
         return NEG_EINVAL; // can't mkdir /tmp itself
@@ -3866,6 +4169,39 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
+    // Phase 24: FAT32 /data unlink.
+    if let Some(rel) = fat32_relative_path(name) {
+        if rel.is_empty() {
+            return NEG_EINVAL;
+        }
+        if crate::fs::fat32::is_mounted() {
+            let mut vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_mut() {
+                let parts: alloc::vec::Vec<&str> =
+                    rel.split('/').filter(|s| !s.is_empty()).collect();
+                let (parent_cluster, file_name) = if parts.len() <= 1 {
+                    (vol.bpb.root_cluster, rel)
+                } else {
+                    let parent_path = parts[..parts.len() - 1].join("/");
+                    let parent_cluster = match vol.lookup(&parent_path) {
+                        Ok(pe) if pe.is_dir() => pe.start_cluster(),
+                        _ => return NEG_ENOENT,
+                    };
+                    (parent_cluster, parts[parts.len() - 1])
+                };
+                return match vol.unlink(parent_cluster, file_name) {
+                    Ok(()) => {
+                        log::info!("[unlink] {} (fat32)", name);
+                        0
+                    }
+                    Err(kernel_core::fs::fat32::Fat32Error::NotFound) => NEG_ENOENT,
+                    Err(_) => NEG_EIO,
+                };
+            }
+        }
+        return NEG_EROFS;
+    }
+
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
         None => return NEG_EROFS,
@@ -3931,6 +4267,57 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
         }
         Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
         Err(_) => NEG_EINVAL,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 24: mount(source, target, fstype, flags, data) — syscall 165
+// ---------------------------------------------------------------------------
+
+fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
+    let mut buf_target = [0u8; 512];
+    let target = match read_user_cstr(target_ptr, &mut buf_target) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let mut buf_fstype = [0u8; 512];
+    let fstype = match read_user_cstr(fstype_ptr, &mut buf_fstype) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let cwd = current_cwd();
+    let resolved_target = resolve_path(&cwd, target);
+
+    if fstype != "vfat" {
+        log::warn!("[mount] unsupported fstype: {}", fstype);
+        return NEG_EINVAL;
+    }
+
+    // Probe MBR for the FAT32 partition.
+    let (base_lba, _sector_count) = match crate::blk::mbr::probe() {
+        Some(p) => p,
+        None => {
+            log::error!("[mount] no FAT32 partition found on virtio-blk");
+            const NEG_ENODEV: u64 = (-19_i64) as u64;
+            return NEG_ENODEV;
+        }
+    };
+
+    match crate::fs::fat32::mount_fat32(base_lba) {
+        Ok(()) => {
+            log::info!(
+                "[mount] {} mounted at {} (vfat)",
+                "virtio-blk",
+                resolved_target
+            );
+            0
+        }
+        Err(e) => {
+            log::error!("[mount] FAT32 mount failed: {:?}", e);
+            NEG_EIO
+        }
     }
 }
 
@@ -4019,6 +4406,10 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
                 Err(_) => NEG_EINVAL,
             }
         }
+        FdBackend::Fat32Disk { .. } => {
+            // FAT32 truncate not yet implemented.
+            NEG_EINVAL
+        }
     }
 }
 
@@ -4075,6 +4466,29 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             Err(_) => return NEG_ENOENT,
         }
+    } else if let Some(rel) = fat32_relative_path(&dir_path) {
+        // Phase 24: FAT32 /data directory listing.
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                let dir_cluster = if rel.is_empty() {
+                    vol.bpb.root_cluster
+                } else {
+                    match vol.lookup(rel) {
+                        Ok(e) if e.is_dir() => e.start_cluster(),
+                        _ => return NEG_ENOENT,
+                    }
+                };
+                match vol.list_dir(dir_cluster) {
+                    Ok(children) => {
+                        for (name, is_dir) in children {
+                            entries.push((name, is_dir));
+                        }
+                    }
+                    Err(_) => return NEG_EIO,
+                }
+            }
+        }
     } else if dir_path == "/" {
         // Unified root listing: ramdisk top-level dirs + tmpfs "tmp".
         if let Some(ramdisk_children) = crate::fs::ramdisk::ramdisk_list_dir("/") {
@@ -4084,6 +4498,10 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         // Add "tmp" for the tmpfs mount point.
         entries.push((alloc::string::String::from("tmp"), true));
+        // Add "data" if FAT32 is mounted.
+        if crate::fs::fat32::is_mounted() {
+            entries.push((alloc::string::String::from("data"), true));
+        }
     } else {
         // Ramdisk directory listing.
         if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
