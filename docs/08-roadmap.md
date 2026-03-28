@@ -92,12 +92,12 @@ flowchart TD
 | 21 | ion shell (Redox OS) replaces minimal custom shell | [Ion Shell Integration](./roadmap/21-ion-shell.md) |
 | 22 | termios, cooked/raw mode, PTY stubs, window size, ion default shell | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
 | 22b | ANSI/VT100 escape sequences, CSI parser, cursor movement, erase, SGR colors | [ANSI Escape Sequences](./roadmap/22-tty-pty.md#phase-22b-vt100--ansi-escape-sequence-processing-completed) |
+| 23 | Socket syscalls, expose TCP/UDP stack to userspace, userspace ping | [Socket API](./roadmap/23-socket-api.md) |
 
 ### Usability Phases (planned)
 
 | Phase | Focus | Link |
 |---|---|---|
-| 23 | Socket syscalls, expose TCP/UDP stack to userspace | [Socket API](./roadmap/23-socket-api.md) |
 | 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
 
 ### Advanced Phases (deferred)

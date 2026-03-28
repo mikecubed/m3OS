@@ -44,6 +44,7 @@ pub struct TcpConnection {
     pub rcv_nxt: u32,
     pub rcv_wnd: u16,
     pub recv_buf: VecDeque<u8>,
+    #[allow(dead_code)]
     pub send_buf: VecDeque<u8>,
 }
 

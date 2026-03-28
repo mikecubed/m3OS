@@ -2,21 +2,14 @@
 //!
 //! Layers: virtio-net driver → Ethernet → ARP → IPv4 → ICMP / UDP / TCP.
 
-#[allow(dead_code)]
 pub mod arp;
-#[allow(dead_code)]
 pub mod config;
 #[allow(dead_code)]
 pub mod dispatch;
-#[allow(dead_code)]
 pub mod ethernet;
-#[allow(dead_code)]
 pub mod icmp;
-#[allow(dead_code)]
 pub mod ipv4;
-#[allow(dead_code)]
 pub mod tcp;
-#[allow(dead_code)]
 pub mod udp;
 pub mod virtio_net;
 
@@ -27,16 +20,13 @@ pub mod virtio_net;
 use spin::Mutex;
 
 /// Maximum number of open sockets system-wide.
-#[allow(dead_code)]
 pub const MAX_SOCKETS: usize = 32;
 
 /// Socket handle — index into the global socket table.
-#[allow(dead_code)]
 pub type SocketHandle = u32;
 
 /// Socket kind: stream (TCP) or datagram (UDP/ICMP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SocketKind {
     Stream,
     Dgram,
@@ -44,7 +34,6 @@ pub enum SocketKind {
 
 /// Socket protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SocketProtocol {
     Tcp,
     Udp,
@@ -53,7 +42,6 @@ pub enum SocketProtocol {
 
 /// Socket lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SocketState {
     Unbound,
     Bound,
@@ -64,7 +52,6 @@ pub enum SocketState {
 
 /// Socket options set by setsockopt.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct SocketOptions {
     pub reuse_addr: bool,
     pub keep_alive: bool,
@@ -86,7 +73,6 @@ impl SocketOptions {
 }
 
 /// A single socket entry in the global table.
-#[allow(dead_code)]
 pub struct SocketEntry {
     pub kind: SocketKind,
     pub protocol: SocketProtocol,
@@ -106,7 +92,6 @@ pub struct SocketEntry {
     pub shut_wr: bool,
 }
 
-#[allow(dead_code)]
 struct SocketTable {
     entries: [Option<SocketEntry>; MAX_SOCKETS],
 }
@@ -124,7 +109,6 @@ impl SocketTable {
 static SOCKET_TABLE: Mutex<SocketTable> = Mutex::new(SocketTable::new());
 
 /// Allocate a new socket entry. Returns the handle (index) or None if full.
-#[allow(dead_code)]
 pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<SocketHandle> {
     let mut table = SOCKET_TABLE.lock();
     for (i, slot) in table.entries.iter_mut().enumerate() {
@@ -170,7 +154,6 @@ pub fn free_socket(handle: SocketHandle) {
 }
 
 /// Access a socket entry immutably under the lock.
-#[allow(dead_code)]
 pub fn with_socket<F, R>(handle: SocketHandle, f: F) -> Option<R>
 where
     F: FnOnce(&SocketEntry) -> R,
@@ -180,7 +163,6 @@ where
 }
 
 /// Access a socket entry mutably under the lock.
-#[allow(dead_code)]
 pub fn with_socket_mut<F, R>(handle: SocketHandle, f: F) -> Option<R>
 where
     F: FnOnce(&mut SocketEntry) -> R,
