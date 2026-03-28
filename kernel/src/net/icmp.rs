@@ -65,27 +65,5 @@ pub static PING_REPLY_TICK: AtomicU64 = AtomicU64::new(0);
 pub static PING_EXPECTED_ID: AtomicU16 = AtomicU16::new(0);
 pub static PING_EXPECTED_SEQ: AtomicU16 = AtomicU16::new(0);
 
-/// Send an ICMP echo request to the given IP address.
-pub fn ping(target_ip: super::arp::Ipv4Addr, seq: u16) -> u64 {
-    PING_REPLY_RECEIVED.store(false, Ordering::Release);
-    PING_EXPECTED_ID.store(1, Ordering::Release);
-    PING_EXPECTED_SEQ.store(seq, Ordering::Release);
-
-    let rest = [0x00, 0x01, (seq >> 8) as u8, seq as u8];
-    let payload = [0xABu8; 32];
-
-    let icmp_pkt = build(ICMP_ECHO_REQUEST, 0, rest, &payload);
-    let send_tick = crate::arch::x86_64::interrupts::tick_count();
-    ipv4::send(target_ip, ipv4::PROTO_ICMP, &icmp_pkt);
-
-    log::debug!(
-        "[icmp] echo request sent to {}.{}.{}.{} seq={}",
-        target_ip[0],
-        target_ip[1],
-        target_ip[2],
-        target_ip[3],
-        seq,
-    );
-
-    send_tick
-}
+// Kernel ping builtin removed in Phase 23 — ping is now a userspace binary.
+// See userspace/ping/ for the socket-based implementation.

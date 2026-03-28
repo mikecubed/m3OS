@@ -116,6 +116,7 @@ fn build_userspace_bins() {
         ("exit0", "exit0"),
         ("fork-test", "fork-test"),
         ("echo-args", "echo-args"),
+        ("ping", "ping"),
         ("init", "init"),
         ("shell", "sh0"),
     ];
