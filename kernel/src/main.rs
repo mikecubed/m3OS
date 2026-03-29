@@ -21,6 +21,7 @@ mod pipe;
 mod process;
 mod serial;
 mod signal;
+mod smp;
 mod stdin;
 mod task;
 #[cfg(test)]
@@ -117,6 +118,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     } else {
         log::warn!("[apic] MADT/I/O APIC not found — staying on legacy PIC");
     }
+
+    // Phase 25: Initialize per-core data structures for the BSP.
+    // Must be called after ACPI/MADT parsing and APIC initialization.
+    smp::init_bsp_per_core();
 
     // Phase 16: Initialize virtio-net driver and route its IRQ.
     net::virtio_net::init();
