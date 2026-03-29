@@ -88,12 +88,15 @@ fn build_trampoline_code() -> alloc::vec::Vec<u8> {
     c.extend_from_slice(&0x0000_8F38u32.to_le_bytes());
     c.extend_from_slice(&[0x0F, 0x22, 0xD8]); // mov cr3, eax
 
-    // Enable long mode via EFER
+    // Enable long mode + NXE via EFER.
+    // NXE (bit 11) MUST be set before enabling paging, because the bootloader's
+    // page tables use the NX bit (bit 63). Without NXE, bit 63 is reserved and
+    // accessing any page with NX set causes a page fault.
     c.extend_from_slice(&[0xB9]); // mov ecx, imm32
     c.extend_from_slice(&0xC000_0080u32.to_le_bytes());
     c.extend_from_slice(&[0x0F, 0x32]); // rdmsr
     c.extend_from_slice(&[0x0D]); // or eax, imm32
-    c.extend_from_slice(&0x0000_0100u32.to_le_bytes());
+    c.extend_from_slice(&0x0000_0900u32.to_le_bytes()); // LME (bit 8) + NXE (bit 11)
     c.extend_from_slice(&[0x0F, 0x30]); // wrmsr
 
     // Enable paging
@@ -200,20 +203,11 @@ fn install_trampoline() {
         ((phys_off + TRAMPOLINE_PHYS + DATA_CR4 as u64) as *mut u64).write(cr4);
     }
 
-    // Save the BSP's IDTR so APs can load it without accessing kernel statics.
-    unsafe {
-        core::arch::asm!(
-            "sidt [{}]",
-            in(reg) (phys_off + TRAMPOLINE_PHYS + DATA_IDTR as u64) as *mut u8,
-            options(nostack, preserves_flags),
-        );
-    }
+    // Note: DATA_IDTR is no longer used — APs now access the IDT via the
+    // Lazy static directly (EFER.NXE fix enables kernel static access).
 
-    // Create temporary identity mappings.
+    // Create temporary identity mapping for the trampoline page.
     identity_map_trampoline();
-    // Also identity-map the LAPIC page so APs can access it before
-    // the phys_offset mapping is available (workaround for AP page table issue).
-    identity_map_page(0xFEE00000);
 
     log::info!(
         "[smp] trampoline installed at phys={:#x}, entry={:#x}",
@@ -394,36 +388,27 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
         super::per_core_gdt_init(data);
     }
 
-    // Load the IDT from the saved IDTR in the trampoline page.
-    let idtr_ptr = (TRAMPOLINE_PHYS + DATA_IDTR as u64) as *const u8;
-    unsafe {
-        core::arch::asm!(
-            "lidt [{}]",
-            in(reg) idtr_ptr,
-            options(nostack, preserves_flags),
-        );
-    }
+    // Load the shared IDT. With EFER.NXE set, the AP can now access
+    // kernel statics including the IDT Lazy.
+    crate::arch::x86_64::interrupts::init();
 
     // Set gs_base to this AP's PerCoreData.
     super::write_gs_base(per_core_data_ptr as u64);
 
-    // Initialize this AP's LAPIC (enable it, but DON'T start the timer).
-    // The timer handler accesses kernel statics (RESCHEDULE) which are
-    // not accessible from APs yet. Timer will be enabled in Track C
-    // after the scheduler is made per-core.
-    const LAPIC_PHYS: usize = 0xFEE0_0000;
-    unsafe {
-        // Enable LAPIC with spurious vector 0xFF.
-        let spur = core::ptr::read_volatile((LAPIC_PHYS + 0x0F0) as *const u32);
-        core::ptr::write_volatile((LAPIC_PHYS + 0x0F0) as *mut u32, spur | 0x1FF);
-        // Accept all priorities.
-        core::ptr::write_volatile((LAPIC_PHYS + 0x080) as *mut u32, 0);
-    }
+    // Initialize this AP's LAPIC and timer using the phys_offset-based address.
+    // Now that EFER.NXE is set, APs can access the phys_offset range.
+    ap_lapic_init_from(data.lapic_virt_base as usize, data.lapic_ticks_per_ms);
 
     // Signal that this AP is online.
     data.is_online.store(true, Ordering::Release);
 
-    // Enter idle loop. Replaced by per-core scheduler loop in Track C.
+    log::info!(
+        "[smp] AP core_id={} fully initialized (GDT, IDT, LAPIC timer)",
+        data.core_id
+    );
+
+    // Enter idle loop with interrupts enabled (timer fires for scheduling).
+    // Replaced by per-core scheduler loop in Track C.
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
     }
