@@ -168,6 +168,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // Phase 25: Boot Application Processors.
+    // Must be called after APIC init and per-core data setup, before the
+    // scheduler loop starts. Each AP initializes its own LAPIC timer and
+    // enters an idle loop (replaced by the per-core scheduler in Track C).
+    smp::boot::boot_aps();
+
     // Phase 7: Core Servers demo
     //
     // init_task creates a console IPC endpoint, registers it in the service

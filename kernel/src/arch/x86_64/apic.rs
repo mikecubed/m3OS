@@ -310,6 +310,15 @@ fn ioapic_init() {
 static IOAPIC_MAX_REDIR: Once<u32> = Once::new();
 static LAPIC_TICKS_PER_MS: Once<u32> = Once::new();
 
+/// Return the BSP-calibrated LAPIC timer ticks per millisecond.
+///
+/// Used by APs to configure their LAPIC timers without re-calibrating.
+pub fn lapic_ticks_per_ms() -> u32 {
+    *LAPIC_TICKS_PER_MS
+        .get()
+        .expect("LAPIC timer not calibrated")
+}
+
 /// Calibrate the LAPIC timer by using PIT channel 2 as a ~10 ms reference.
 ///
 /// Returns the number of LAPIC timer ticks per millisecond (with divide-by-16).
