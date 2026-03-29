@@ -94,17 +94,22 @@ flowchart TD
 | 22b | ANSI/VT100 escape sequences, CSI parser, cursor movement, erase, SGR colors | [ANSI Escape Sequences](./roadmap/22-tty-pty.md#phase-22b-vt100--ansi-escape-sequence-processing-completed) |
 | 23 | Socket syscalls, expose TCP/UDP stack to userspace, userspace ping | [Socket API](./roadmap/23-socket-api.md) |
 
-### Usability Phases (planned)
+### Usability Phases (complete)
 
 | Phase | Focus | Link |
 |---|---|---|
 | 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
 
-### Advanced Phases (deferred)
+### Advanced Phases (planned)
 
 | Phase | Focus | Link |
 |---|---|---|
 | 25 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/25-smp.md) |
+
+### Advanced Phases (deferred)
+
+| Phase | Focus | Link |
+|---|---|---|
 | 26 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/26-compiler-bootstrap.md) |
 
 ## Documentation Expectation Per Phase
