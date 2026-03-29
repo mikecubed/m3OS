@@ -60,7 +60,8 @@ const SYSCALL_STACK_SIZE: usize = 4096 * 4; // 16 KiB
 /// it in O(1) without MMIO.
 #[repr(C)]
 pub struct PerCoreData {
-    /// Self-pointer at offset 0 — used by `per_core()` via `gs:[0]`.
+    /// Self-pointer at offset 0 — reserved for future `gs:[0]` access.
+    /// Currently unused: `per_core()` reads `IA32_GS_BASE` via `rdmsr`.
     self_ptr: *const PerCoreData,
     /// Logical core index (0 = BSP, 1..n = APs in MADT order).
     pub core_id: u8,

@@ -341,8 +341,7 @@ pub fn wake_task(id: TaskId) {
             _ => {}
         }
     }
-    // Signal reschedule on the current core (the woken task will be picked
-    // up by whichever core next checks its queue).
+    // Signal reschedule on the BSP (only the BSP dispatches non-idle tasks).
     per_core_reschedule().store(true, Ordering::Relaxed);
 }
 

@@ -185,9 +185,16 @@ fn install_trampoline() {
     }
 
     // Write the kernel PML4 physical address.
+    // The trampoline loads CR3 via `mov eax, [moffs32]` (32-bit), so the
+    // PML4 physical address must fit in 32 bits.
+    let pml4_phys = crate::mm::kernel_pml4_phys();
+    assert!(
+        pml4_phys < 0x1_0000_0000,
+        "kernel PML4 at {:#x} exceeds 4 GiB — trampoline CR3 load would truncate",
+        pml4_phys
+    );
     unsafe {
-        ((phys_off + TRAMPOLINE_PHYS + DATA_PML4 as u64) as *mut u64)
-            .write(crate::mm::kernel_pml4_phys());
+        ((phys_off + TRAMPOLINE_PHYS + DATA_PML4 as u64) as *mut u64).write(pml4_phys);
     }
 
     // Write the Rust AP entry point.
