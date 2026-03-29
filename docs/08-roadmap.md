@@ -54,8 +54,35 @@ flowchart TD
     P15 --> P24
     P17 --> P25["25. SMP"]
     P4 --> P25
-    P20 --> P26["26. Compiler Bootstrap"]
+
+    %% Productivity phases
+    P22 --> P26["26. Text Editor"]
     P24 --> P26
+    P12 --> P27["27. User Accounts"]
+    P24 --> P27
+    P22 --> P28["28. PTY Subsystem"]
+    P27 --> P28
+    P23 --> P29["29. Telnet Server"]
+    P27 --> P29
+    P28 --> P29
+    P26 --> P30["30. Compiler Bootstrap"]
+    P14 --> P30
+    P30 --> P31["31. Build Tools"]
+    P26 --> P31
+    P14 --> P32["32. Expanded Coreutils"]
+    P27 --> P32
+    P30 --> P33["33. Crypto Primitives"]
+    P33 --> P34["34. SSH Server"]
+    P28 --> P34
+    P27 --> P34
+    P12 --> P35["35. Rust Cross-Compilation"]
+    P24 --> P35
+    P30 --> P36["36. Ports System"]
+    P31 --> P36
+    P32 --> P36
+    P27 --> P37["37. System Services"]
+    P29 --> P37
+    P24 --> P37
 ```
 
 ## Detailed Phase Pages
@@ -85,6 +112,11 @@ flowchart TD
 | 14 | Pipes, redirection, job control, core utilities | [Shell and Tools](./roadmap/14-shell-and-tools.md) |
 | 15 | ACPI parsing, PCI enumeration, APIC replaces PIC | [Hardware Discovery](./roadmap/15-hardware-discovery.md) |
 | 16 | virtio-net driver, Ethernet/ARP/IP/UDP/TCP | [Network](./roadmap/16-network.md) |
+
+### Usability Phases (complete)
+
+| Phase | Focus | Link |
+|---|---|---|
 | 17 | Frame reclaim, heap growth, CoW fork, kernel stack cleanup | [Memory Reclamation](./roadmap/17-memory-reclamation.md) |
 | 18 | `getdents64`, directory fds, real cwd, ramdisk layout | [Directory and VFS](./roadmap/18-directory-vfs.md) |
 | 19 | User signal handlers, trampolines, `sigreturn`, `sigprocmask` | [Signal Handlers](./roadmap/19-signal-handlers.md) |
@@ -93,24 +125,25 @@ flowchart TD
 | 22 | termios, cooked/raw mode, PTY stubs, window size, ion default shell | [TTY and Terminal Control](./roadmap/22-tty-pty.md) |
 | 22b | ANSI/VT100 escape sequences, CSI parser, cursor movement, erase, SGR colors | [ANSI Escape Sequences](./roadmap/22-tty-pty.md#phase-22b-vt100--ansi-escape-sequence-processing-completed) |
 | 23 | Socket syscalls, expose TCP/UDP stack to userspace, userspace ping | [Socket API](./roadmap/23-socket-api.md) |
-
-### Usability Phases (complete)
-
-| Phase | Focus | Link |
-|---|---|---|
 | 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
-
-### Advanced Phases (planned)
-
-| Phase | Focus | Link |
-|---|---|---|
 | 25 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/25-smp.md) |
 
-### Advanced Phases (deferred)
+### Productivity Phases (planned — "do real work inside the OS")
 
 | Phase | Focus | Link |
 |---|---|---|
-| 26 | TCC runs and compiles itself inside the OS | [Compiler Bootstrap](./roadmap/26-compiler-bootstrap.md) |
+| 26 | Full-screen text editor (kilo-based) | [Text Editor](./roadmap/26-text-editor.md) |
+| 27 | User accounts, login, file permissions | [User Accounts](./roadmap/27-user-accounts.md) |
+| 28 | Pseudo-terminal pairs for remote sessions | [PTY Subsystem](./roadmap/28-pty-subsystem.md) |
+| 29 | Telnet server for remote shell access | [Telnet Server](./roadmap/29-telnet-server.md) |
+| 30 | TCC compiles C programs and itself inside the OS | [Compiler Bootstrap](./roadmap/30-compiler-bootstrap.md) |
+| 31 | make, ar, and scripting for multi-file projects | [Build Tools](./roadmap/31-build-tools.md) |
+| 32 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/32-expanded-coreutils.md) |
+| 33 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/33-crypto-primitives.md) |
+| 34 | SSH server for encrypted remote access | [SSH Server](./roadmap/34-ssh-server.md) |
+| 35 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/35-rust-cross-compilation.md) |
+| 36 | Source-based ports tree for building third-party software | [Ports System](./roadmap/36-ports-system.md) |
+| 37 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/37-system-services.md) |
 
 ## Documentation Expectation Per Phase
 
