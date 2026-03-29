@@ -401,6 +401,14 @@ pub struct Process {
     /// FS.base MSR value (TLS pointer, set by arch_prctl ARCH_SET_FS).
     /// Saved on syscall entry, restored on context switch (Phase 21).
     pub fs_base: u64,
+    /// Real user ID (Phase 27). 0 = root.
+    pub uid: u32,
+    /// Real group ID (Phase 27). 0 = root.
+    pub gid: u32,
+    /// Effective user ID (Phase 27). Used for permission checks.
+    pub euid: u32,
+    /// Effective group ID (Phase 27). Used for permission checks.
+    pub egid: u32,
 }
 
 impl Process {
@@ -434,6 +442,10 @@ impl Process {
             alt_stack_flags: 0,
             cwd: String::from("/"),
             fs_base: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
         }
     }
 }
@@ -552,6 +564,10 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         alt_stack_flags: 0,
         cwd: String::from("/"),
         fs_base: 0,
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -596,6 +612,10 @@ pub fn spawn_process_with_cr3(
         alt_stack_flags: 0,
         cwd: String::from("/"),
         fs_base: 0,
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -644,6 +664,10 @@ pub fn spawn_process_with_cr3_and_fds(
         alt_stack_flags: 0,
         cwd: String::from("/"),
         fs_base: 0,
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

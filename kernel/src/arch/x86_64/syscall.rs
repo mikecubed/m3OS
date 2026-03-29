@@ -434,11 +434,15 @@ pub extern "C" fn syscall_handler(
         83 => sys_linux_mkdir(arg0, arg1),
         84 => sys_linux_rmdir(arg0),
         87 => sys_linux_unlink(arg0),
-        // Phase 21: user/group ID stubs — single-user OS, always root (0)
-        102 => 0, // getuid
-        104 => 0, // getgid
-        107 => 0, // geteuid
-        108 => 0, // getegid
+        // Phase 27: user/group identity syscalls
+        102 => sys_linux_getuid(),
+        104 => sys_linux_getgid(),
+        105 => sys_linux_setuid(arg0),
+        106 => sys_linux_setgid(arg0),
+        107 => sys_linux_geteuid(),
+        108 => sys_linux_getegid(),
+        113 => sys_linux_setreuid(arg0, arg1),
+        114 => sys_linux_setregid(arg0, arg1),
         // Phase 14: process group syscalls
         109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
@@ -1420,6 +1424,150 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 27: User/group identity syscalls
+// ---------------------------------------------------------------------------
+
+/// Helper: get the uid/gid/euid/egid of the current process.
+fn current_process_ids() -> (u32, u32, u32, u32) {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => (p.uid, p.gid, p.euid, p.egid),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// `getuid()` — return real user ID (syscall 102).
+fn sys_linux_getuid() -> u64 {
+    current_process_ids().0 as u64
+}
+
+/// `getgid()` — return real group ID (syscall 104).
+fn sys_linux_getgid() -> u64 {
+    current_process_ids().1 as u64
+}
+
+/// `geteuid()` — return effective user ID (syscall 107).
+fn sys_linux_geteuid() -> u64 {
+    current_process_ids().2 as u64
+}
+
+/// `getegid()` — return effective group ID (syscall 108).
+fn sys_linux_getegid() -> u64 {
+    current_process_ids().3 as u64
+}
+
+/// `setuid(uid)` — set user ID (syscall 105).
+///
+/// If euid == 0 (root): sets both real uid and effective uid.
+/// If euid != 0: only allows setting euid back to real uid.
+fn sys_linux_setuid(uid_arg: u64) -> u64 {
+    let new_uid = uid_arg as u32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+    if proc.euid == 0 {
+        proc.uid = new_uid;
+        proc.euid = new_uid;
+    } else if new_uid == proc.uid {
+        proc.euid = new_uid;
+    } else {
+        return NEG_EPERM;
+    }
+    0
+}
+
+/// `setgid(gid)` — set group ID (syscall 106).
+fn sys_linux_setgid(gid_arg: u64) -> u64 {
+    let new_gid = gid_arg as u32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+    if proc.egid == 0 {
+        proc.gid = new_gid;
+        proc.egid = new_gid;
+    } else if new_gid == proc.gid {
+        proc.egid = new_gid;
+    } else {
+        return NEG_EPERM;
+    }
+    0
+}
+
+/// `setreuid(ruid, euid)` — set real and effective user IDs (syscall 113).
+///
+/// If ruid != -1: set real uid (only if euid==0 or ruid matches current real/effective uid).
+/// If euid != -1: set effective uid (only if euid==0 or value matches current real uid).
+fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
+    let ruid = ruid_arg as i32;
+    let euid = euid_arg as i32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+
+    if ruid != -1 {
+        let new_ruid = ruid as u32;
+        if proc.euid == 0 || new_ruid == proc.uid || new_ruid == proc.euid {
+            proc.uid = new_ruid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    if euid != -1 {
+        let new_euid = euid as u32;
+        if proc.euid == 0 || new_euid == proc.uid || new_euid == proc.euid {
+            proc.euid = new_euid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    0
+}
+
+/// `setregid(rgid, egid)` — set real and effective group IDs (syscall 114).
+fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
+    let rgid = rgid_arg as i32;
+    let egid = egid_arg as i32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+
+    if rgid != -1 {
+        let new_rgid = rgid as u32;
+        if proc.egid == 0 || new_rgid == proc.gid || new_rgid == proc.egid {
+            proc.gid = new_rgid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    if egid != -1 {
+        let new_egid = egid as u32;
+        if proc.egid == 0 || new_egid == proc.gid || new_egid == proc.egid {
+            proc.egid = new_egid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    0
+}
+
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
 ///
 /// Allocates a fresh page table for the child (eager copy of user pages),
@@ -1468,6 +1616,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_signal_actions,
         parent_alt_stack,
         parent_fs_base,
+        parent_ids,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1481,6 +1630,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.signal_actions,
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
+                (p.uid, p.gid, p.euid, p.egid),
             ),
             None => (
                 0,
@@ -1495,6 +1645,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 [crate::process::SignalAction::Default; 32],
                 (0u64, 0u64, 0u32),
                 0,
+                (0u32, 0u32, 0u32, 0u32),
             ),
         }
     };
@@ -1526,6 +1677,10 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.alt_stack_size = parent_alt_stack.1;
             child.alt_stack_flags = parent_alt_stack.2;
             child.fs_base = parent_fs_base;
+            child.uid = parent_ids.0;
+            child.gid = parent_ids.1;
+            child.euid = parent_ids.2;
+            child.egid = parent_ids.3;
         }
     }
 
