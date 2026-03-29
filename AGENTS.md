@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.25.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, and signals.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.25.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, signals, and a text editor.
 
 ## Build & Run
 
@@ -62,7 +62,8 @@ Ring 0 (kernel/):                Ring 3 (userspace/):
   - Page table manager             - sh0 (built-in shell)
   - Scheduler (SMP-aware)          - coreutils (cat, ls, grep, etc.)
   - IPC engine + capabilities      - ping (ICMP network tool)
-  - IDT / APIC / interrupt router  - ion shell (external)
+  - IDT / APIC / interrupt router  - edit (text editor)
+                                   - ion shell (external)
   - Syscall gate
   - VFS + FAT32 + tmpfs
   - Network stack (IPv4/TCP/UDP)
@@ -88,6 +89,7 @@ userspace/
   init/                   # PID 1 init daemon
   shell/                  # sh0 shell (binary name: sh0)
   ping/                   # ICMP ping utility
+  edit/                   # full-screen text editor (kibi-style)
   coreutils/              # C implementations: cat, cp, echo, env, grep, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -231,6 +233,7 @@ Read before making significant changes:
 | `docs/22-signal-handlers.md` | Before touching signal delivery |
 | `docs/23-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
+| `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–37) with corresponding `docs/roadmap/tasks/` breakdowns.

@@ -76,13 +76,13 @@ Porting strategy:
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | syscall-lib extensions + heap allocator | — | Not started |
-| B | Terminal raw mode verification | A | Not started |
-| C | Port kibi core (editor logic) | A | Not started |
-| D | m3OS platform backend | A | Not started |
-| E | File I/O and search | C, D | Not started |
-| F | Build system and shell integration | C | Not started |
-| G | Validation and documentation | E, F | Not started |
+| A | syscall-lib extensions + heap allocator | — | Done |
+| B | Terminal raw mode verification | A | Done |
+| C | Port kibi core (editor logic) | A | Done |
+| D | m3OS platform backend | A | Done |
+| E | File I/O and search | C, D | Done |
+| F | Build system and shell integration | C | Done |
+| G | Validation and documentation | E, F | In progress |
 
 ### Implementation Notes
 
