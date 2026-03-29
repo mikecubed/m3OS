@@ -152,7 +152,25 @@ impl Scheduler {
     ///
     /// Prefers non-idle `Ready` tasks using round-robin. Falls back to this
     /// core's idle task if no non-idle task is ready.
+    ///
+    /// **SMP restriction**: Only the BSP (core 0) dispatches non-idle tasks.
+    /// APs only run their idle tasks. This is because the syscall entry stub
+    /// uses global `static mut` variables (SYSCALL_STACK_TOP, SYSCALL_USER_*,
+    /// FORK_ENTRY_CTX) that are not yet per-core. Running userspace tasks on
+    /// APs would corrupt these statics. Making them per-core requires changing
+    /// the assembly syscall entry path to use gs-relative addressing.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
+        // APs: only dispatch the idle task (SMP hardening — see doc above).
+        if core_id != 0 {
+            if let Some(idle_idx) = self.idle_tasks[core_id as usize] {
+                if self.tasks[idle_idx].state == TaskState::Ready {
+                    return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
+                }
+            }
+            return None;
+        }
+
+        // BSP: normal round-robin dispatch.
         let n = self.tasks.len();
         if n == 0 {
             return None;
@@ -161,7 +179,6 @@ impl Scheduler {
         let start = (self.last_run + 1) % n;
         for i in 0..n {
             let idx = (start + i) % n;
-            // Skip ALL idle tasks in the main rotation.
             if self.idle_tasks.contains(&Some(idx)) {
                 continue;
             }
@@ -174,8 +191,8 @@ impl Scheduler {
             }
         }
 
-        // No non-idle task is ready — fall back to this core's idle task.
-        if let Some(idle_idx) = self.idle_tasks[core_id as usize] {
+        // BSP idle task.
+        if let Some(idle_idx) = self.idle_tasks[0] {
             if self.tasks[idle_idx].state == TaskState::Ready {
                 return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
             }
