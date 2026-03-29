@@ -55,8 +55,8 @@ pub mod scheduler;
 pub use scheduler::{
     block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
     current_task_id, deliver_message, insert_cap, mark_current_dead, remove_task_cap, run,
-    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle, take_message,
-    task_cap, wake_task, yield_now,
+    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle,
+    spawn_idle_for_core, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------

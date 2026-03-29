@@ -82,6 +82,9 @@ pub struct PerCoreData {
     pub scheduler_rsp: u64,
     /// Per-core reschedule flag (replaces the global `RESCHEDULE`).
     pub reschedule: AtomicBool,
+    /// Index of the task currently running on this core in the global task vec.
+    /// -1 means no task (scheduler loop is running).
+    pub current_task_idx: core::sync::atomic::AtomicI32,
     /// LAPIC virtual base address (phys_offset + LAPIC phys addr).
     /// Stored here so APs can access it without touching kernel statics.
     pub lapic_virt_base: u64,
@@ -143,6 +146,15 @@ pub fn core_count() -> u8 {
 // ---------------------------------------------------------------------------
 // Per-core access via gs_base (T004)
 // ---------------------------------------------------------------------------
+
+/// Check if per-core data is initialized on the calling core.
+///
+/// Returns `false` during early boot before `init_bsp_per_core()` has been
+/// called. Used by `signal_reschedule()` to avoid accessing gs_base before
+/// it's set.
+pub fn is_per_core_ready() -> bool {
+    read_gs_base() != 0
+}
 
 /// Return a reference to the calling core's [`PerCoreData`].
 ///
@@ -247,6 +259,7 @@ pub fn init_bsp_per_core() {
         kernel_stack_top: crate::arch::x86_64::gdt::syscall_stack_top(),
         scheduler_rsp: 0, // set when scheduler loop starts
         reschedule: AtomicBool::new(false),
+        current_task_idx: core::sync::atomic::AtomicI32::new(-1),
         lapic_virt_base: {
             let phys = crate::acpi::local_apic_address() as u64;
             crate::mm::phys_offset() + phys
@@ -323,6 +336,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         kernel_stack_top,
         scheduler_rsp: 0,
         reschedule: AtomicBool::new(false),
+        current_task_idx: core::sync::atomic::AtomicI32::new(-1),
         lapic_virt_base: {
             let phys = crate::acpi::local_apic_address() as u64;
             crate::mm::phys_offset() + phys

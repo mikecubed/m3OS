@@ -403,12 +403,19 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     data.is_online.store(true, Ordering::Release);
 
     log::info!(
-        "[smp] AP core_id={} fully initialized (GDT, IDT, LAPIC timer)",
+        "[smp] AP core_id={} fully initialized, entering scheduler",
         data.core_id
     );
 
-    // Enter idle loop with interrupts enabled (timer fires for scheduling).
-    // Replaced by per-core scheduler loop in Track C.
+    // Spawn a per-core idle task for this AP.
+    crate::task::spawn_idle_for_core(ap_idle_task, data.core_id);
+
+    // Enter the per-core scheduler loop (never returns).
+    crate::task::run()
+}
+
+/// Idle task for AP cores — halts until an interrupt wakes the core.
+fn ap_idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
     }
