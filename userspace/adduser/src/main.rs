@@ -3,8 +3,7 @@
 #![no_main]
 
 use syscall_lib::{
-    chmod, chown, close, exit, geteuid, open, read, write, write_str, write_u64, O_RDONLY,
-    STDOUT_FILENO,
+    chown, close, exit, geteuid, open, read, write, write_str, write_u64, O_RDONLY, STDOUT_FILENO,
 };
 
 const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";

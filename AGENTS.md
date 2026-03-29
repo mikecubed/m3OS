@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.26.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, signals, and a text editor.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.27.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, and multi-user accounts with permission enforcement.
 
 ## Build & Run
 
@@ -63,6 +63,8 @@ Ring 0 (kernel/):                Ring 3 (userspace/):
   - Scheduler (SMP-aware)          - coreutils (cat, ls, grep, etc.)
   - IPC engine + capabilities      - ping (ICMP network tool)
   - IDT / APIC / interrupt router  - edit (text editor)
+                                   - login, su, passwd, adduser
+                                   - id, whoami
                                    - ion shell (external)
   - Syscall gate
   - VFS + FAT32 + tmpfs
@@ -90,7 +92,11 @@ userspace/
   shell/                  # sh0 shell (binary name: sh0)
   ping/                   # ICMP ping utility
   edit/                   # full-screen text editor (kibi-style)
-  coreutils/              # C implementations: cat, cp, echo, env, grep, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt
+  login/                  # login authentication (Phase 27)
+  su/                     # switch user (Phase 27)
+  passwd/                 # change password (Phase 27)
+  adduser/                # create user account (Phase 27)
+  coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
   stdin-test/             # C stdin test
