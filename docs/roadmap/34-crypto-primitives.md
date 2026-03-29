@@ -1,9 +1,9 @@
-# Phase 33 - Cryptography Primitives
+# Phase 34 - Cryptography Primitives
 
 ## Milestone Goal
 
 The OS has a cryptography library providing hash functions, symmetric encryption, and
-asymmetric key operations. This is the foundation layer that SSH (Phase 34) and future
+asymmetric key operations. This is the foundation layer that SSH (Phase 35) and future
 security features build upon.
 
 ## Learning Goals
@@ -74,7 +74,7 @@ most but takes the longest. Reserve for stretch goals.
 | Phase | Why needed |
 |---|---|
 | Phase 12 (POSIX Compat) | libc functions (memcpy, malloc) |
-| Phase 30 (Compiler) | Optionally compile crypto code inside the OS |
+| Phase 31 (Compiler) | Optionally compile crypto code inside the OS |
 | Phase 24 (Persistent Storage) | Store keys on disk |
 
 ## Implementation Outline
@@ -86,7 +86,7 @@ most but takes the longest. Reserve for stretch goals.
 5. Verify X25519 key exchange with test vectors.
 6. Verify AES or ChaCha20 with test vectors.
 7. Build `sha256sum` and `genkey` utilities.
-8. Document the library's API for use by the SSH server in Phase 34.
+8. Document the library's API for use by the SSH server in Phase 35.
 
 ## Acceptance Criteria
 
@@ -100,7 +100,7 @@ most but takes the longest. Reserve for stretch goals.
 
 ## Companion Task List
 
-- [Phase 33 Task List](./tasks/33-crypto-primitives-tasks.md)
+- [Phase 34 Task List](./tasks/34-crypto-primitives-tasks.md)
 
 ## How Real OS Implementations Differ
 

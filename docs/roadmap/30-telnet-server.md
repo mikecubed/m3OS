@@ -1,4 +1,4 @@
-# Phase 29 - Telnet Server
+# Phase 30 - Telnet Server
 
 ## Milestone Goal
 
@@ -37,7 +37,7 @@ another terminal on the host) and do real work.
 ### Integration with Existing Infrastructure
 
 - Uses TCP sockets from Phase 23.
-- Uses PTY pairs from Phase 28.
+- Uses PTY pairs from Phase 29.
 - Uses login from Phase 27.
 - Launched by init at boot time.
 
@@ -53,7 +53,7 @@ forwarding configuration.
 |---|---|
 | Phase 23 (Socket API) | TCP server sockets |
 | Phase 27 (User Accounts) | login authentication |
-| Phase 28 (PTY) | Terminal sessions for remote users |
+| Phase 29 (PTY) | Terminal sessions for remote users |
 
 ## Implementation Outline
 
@@ -79,7 +79,7 @@ forwarding configuration.
 
 ## Companion Task List
 
-- [Phase 29 Task List](./tasks/29-telnet-server-tasks.md)
+- [Phase 30 Task List](./tasks/30-telnet-server-tasks.md)
 
 ## How Real OS Implementations Differ
 
@@ -102,11 +102,11 @@ Telnet transmits everything in plaintext, including passwords. This is acceptabl
 - Trusted local networks during development
 - Learning the protocol concepts
 
-Phase 34 (SSH) will provide encrypted remote access for untrusted networks.
+Phase 35 (SSH) will provide encrypted remote access for untrusted networks.
 
 ## Deferred Until Later
 
-- Encryption (that's SSH, Phase 34)
+- Encryption (that's SSH, Phase 35)
 - inetd/xinetd super-server
 - TCP wrappers or IP-based access control
 - Telnet LINEMODE option

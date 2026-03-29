@@ -60,29 +60,31 @@ flowchart TD
     P24 --> P26
     P12 --> P27["27. User Accounts"]
     P24 --> P27
-    P22 --> P28["28. PTY Subsystem"]
-    P27 --> P28
-    P23 --> P29["29. Telnet Server"]
+    P27 --> P28["28. ext2 Filesystem"]
+    P24 --> P28
+    P22 --> P29["29. PTY Subsystem"]
     P27 --> P29
-    P28 --> P29
-    P26 --> P30["30. Compiler Bootstrap"]
-    P14 --> P30
-    P30 --> P31["31. Build Tools"]
-    P26 --> P31
-    P14 --> P32["32. Expanded Coreutils"]
-    P27 --> P32
-    P30 --> P33["33. Crypto Primitives"]
-    P33 --> P34["34. SSH Server"]
-    P28 --> P34
-    P27 --> P34
-    P12 --> P35["35. Rust Cross-Compilation"]
-    P24 --> P35
-    P30 --> P36["36. Ports System"]
-    P31 --> P36
-    P32 --> P36
-    P27 --> P37["37. System Services"]
-    P29 --> P37
-    P24 --> P37
+    P23 --> P30["30. Telnet Server"]
+    P27 --> P30
+    P29 --> P30
+    P26 --> P31["31. Compiler Bootstrap"]
+    P14 --> P31
+    P31 --> P32["32. Build Tools"]
+    P26 --> P32
+    P14 --> P33["33. Expanded Coreutils"]
+    P27 --> P33
+    P31 --> P34["34. Crypto Primitives"]
+    P34 --> P35["35. SSH Server"]
+    P29 --> P35
+    P27 --> P35
+    P12 --> P36["36. Rust Cross-Compilation"]
+    P24 --> P36
+    P31 --> P37["37. Ports System"]
+    P32 --> P37
+    P33 --> P37
+    P27 --> P38["38. System Services"]
+    P30 --> P38
+    P24 --> P38
 ```
 
 ## Detailed Phase Pages
@@ -134,16 +136,17 @@ flowchart TD
 |---|---|---|
 | 26 | Full-screen text editor (kilo-based) | [Text Editor](./roadmap/26-text-editor.md) |
 | 27 | User accounts, login, file permissions | [User Accounts](./roadmap/27-user-accounts.md) |
-| 28 | Pseudo-terminal pairs for remote sessions | [PTY Subsystem](./roadmap/28-pty-subsystem.md) |
-| 29 | Telnet server for remote shell access | [Telnet Server](./roadmap/29-telnet-server.md) |
-| 30 | TCC compiles C programs and itself inside the OS | [Compiler Bootstrap](./roadmap/30-compiler-bootstrap.md) |
-| 31 | make, ar, and scripting for multi-file projects | [Build Tools](./roadmap/31-build-tools.md) |
-| 32 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/32-expanded-coreutils.md) |
-| 33 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/33-crypto-primitives.md) |
-| 34 | SSH server for encrypted remote access | [SSH Server](./roadmap/34-ssh-server.md) |
-| 35 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/35-rust-cross-compilation.md) |
-| 36 | Source-based ports tree for building third-party software | [Ports System](./roadmap/36-ports-system.md) |
-| 37 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/37-system-services.md) |
+| 28 | ext2 filesystem with native Unix permissions | [ext2 Filesystem](./roadmap/28-ext2-filesystem.md) |
+| 29 | Pseudo-terminal pairs for remote sessions | [PTY Subsystem](./roadmap/29-pty-subsystem.md) |
+| 30 | Telnet server for remote shell access | [Telnet Server](./roadmap/30-telnet-server.md) |
+| 31 | TCC compiles C programs and itself inside the OS | [Compiler Bootstrap](./roadmap/31-compiler-bootstrap.md) |
+| 32 | make, ar, and scripting for multi-file projects | [Build Tools](./roadmap/32-build-tools.md) |
+| 33 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/33-expanded-coreutils.md) |
+| 34 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/34-crypto-primitives.md) |
+| 35 | SSH server for encrypted remote access | [SSH Server](./roadmap/35-ssh-server.md) |
+| 36 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/36-rust-cross-compilation.md) |
+| 37 | Source-based ports tree for building third-party software | [Ports System](./roadmap/37-ports-system.md) |
+| 38 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/38-system-services.md) |
 
 ## Documentation Expectation Per Phase
 

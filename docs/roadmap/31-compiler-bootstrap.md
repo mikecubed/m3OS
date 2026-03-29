@@ -1,4 +1,4 @@
-# Phase 30 - Compiler Bootstrap
+# Phase 31 - Compiler Bootstrap
 
 ## Milestone Goal
 
@@ -87,7 +87,7 @@ enables running unmodified C programs from the wider ecosystem.
 
 ## Companion Task List
 
-- [Phase 30 Task List](./tasks/30-compiler-bootstrap-tasks.md)
+- [Phase 31 Task List](./tasks/31-compiler-bootstrap-tasks.md)
 
 ## Documentation Deliverables
 

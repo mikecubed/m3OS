@@ -78,29 +78,31 @@ flowchart TD
     P24 --> P26
     P12 --> P27["Phase 27<br/>User Accounts"]
     P24 --> P27
-    P22 --> P28["Phase 28<br/>PTY Subsystem"]
-    P27 --> P28
-    P23 --> P29["Phase 29<br/>Telnet Server"]
+    P27 --> P28["Phase 28<br/>ext2 Filesystem"]
+    P24 --> P28
+    P22 --> P29["Phase 29<br/>PTY Subsystem"]
     P27 --> P29
-    P28 --> P29
-    P26 --> P30["Phase 30<br/>Compiler Bootstrap"]
-    P14 --> P30
-    P30 --> P31["Phase 31<br/>Build Tools"]
-    P26 --> P31
-    P14 --> P32["Phase 32<br/>Expanded Coreutils"]
-    P27 --> P32
-    P30 --> P33["Phase 33<br/>Crypto Primitives"]
-    P33 --> P34["Phase 34<br/>SSH Server"]
-    P28 --> P34
-    P27 --> P34
-    P12 --> P35["Phase 35<br/>Rust Cross-Compilation"]
-    P24 --> P35
-    P30 --> P36["Phase 36<br/>Ports System"]
-    P31 --> P36
-    P32 --> P36
-    P27 --> P37["Phase 37<br/>System Services"]
-    P29 --> P37
-    P24 --> P37
+    P23 --> P30["Phase 30<br/>Telnet Server"]
+    P27 --> P30
+    P29 --> P30
+    P26 --> P31["Phase 31<br/>Compiler Bootstrap"]
+    P14 --> P31
+    P31 --> P32["Phase 32<br/>Build Tools"]
+    P26 --> P32
+    P14 --> P33["Phase 33<br/>Expanded Coreutils"]
+    P27 --> P33
+    P31 --> P34["Phase 34<br/>Crypto Primitives"]
+    P34 --> P35["Phase 35<br/>SSH Server"]
+    P29 --> P35
+    P27 --> P35
+    P12 --> P36["Phase 36<br/>Rust Cross-Compilation"]
+    P24 --> P36
+    P31 --> P37["Phase 37<br/>Ports System"]
+    P32 --> P37
+    P33 --> P37
+    P27 --> P38["Phase 38<br/>System Services"]
+    P30 --> P38
+    P24 --> P38
 ```
 
 ## Milestone Summary
@@ -151,17 +153,18 @@ flowchart TD
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
 | 26 | Text Editor | Full-screen editor for creating and modifying files | [Phase 26](./26-text-editor.md) | [Tasks](./tasks/26-text-editor-tasks.md) |
-| 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | *not yet created* |
-| 28 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 28](./28-pty-subsystem.md) | *not yet created* |
-| 29 | Telnet Server | Remote shell access over the network | [Phase 29](./29-telnet-server.md) | *not yet created* |
-| 30 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 30](./30-compiler-bootstrap.md) | *not yet created* |
-| 31 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 31](./31-build-tools.md) | *not yet created* |
-| 32 | Expanded Coreutils | head, tail, sort, find, diff, ps, less, and more | [Phase 32](./32-expanded-coreutils.md) | *not yet created* |
-| 33 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 33](./33-crypto-primitives.md) | *not yet created* |
-| 34 | SSH Server | Encrypted remote shell access | [Phase 34](./34-ssh-server.md) | *not yet created* |
-| 35 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 35](./35-rust-cross-compilation.md) | *not yet created* |
-| 36 | Ports System | Source-based package building and installation | [Phase 36](./36-ports-system.md) | *not yet created* |
-| 37 | System Services | Service manager, syslog, cron, shutdown | [Phase 37](./37-system-services.md) | *not yet created* |
+| 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | [Tasks](./tasks/27-user-accounts-tasks.md) |
+| 28 | ext2 Filesystem | Native Unix permissions, replaces FAT32 | [Phase 28](./28-ext2-filesystem.md) | *not yet created* |
+| 29 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 29](./29-pty-subsystem.md) | *not yet created* |
+| 30 | Telnet Server | Remote shell access over the network | [Phase 30](./30-telnet-server.md) | *not yet created* |
+| 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 31](./31-compiler-bootstrap.md) | *not yet created* |
+| 32 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 32](./32-build-tools.md) | *not yet created* |
+| 33 | Expanded Coreutils | head, tail, sort, find, diff, ps, less, and more | [Phase 33](./33-expanded-coreutils.md) | *not yet created* |
+| 34 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 34](./34-crypto-primitives.md) | *not yet created* |
+| 35 | SSH Server | Encrypted remote shell access | [Phase 35](./35-ssh-server.md) | *not yet created* |
+| 36 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 36](./36-rust-cross-compilation.md) | *not yet created* |
+| 37 | Ports System | Source-based package building and installation | [Phase 37](./37-ports-system.md) | *not yet created* |
+| 38 | System Services | Service manager, syslog, cron, shutdown | [Phase 38](./38-system-services.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
@@ -210,16 +213,17 @@ gantt
     section Productivity (planned)
     Text Editor          :active, p26, after p24, 1
     User Accounts        :p27, after p26, 1
-    PTY Subsystem        :p28, after p27, 1
-    Telnet Server        :p29, after p28, 1
-    Compiler Bootstrap   :p30, after p26, 1
-    Build Tools          :p31, after p30, 1
-    Expanded Coreutils   :p32, after p27, 1
-    Crypto Primitives    :p33, after p30, 1
-    SSH Server           :p34, after p33, 1
-    Rust Cross-Compile   :p35, after p24, 1
-    Ports System         :p36, after p31, 1
-    System Services      :p37, after p29, 1
+    ext2 Filesystem      :p28, after p27, 1
+    PTY Subsystem        :p29, after p27, 1
+    Telnet Server        :p30, after p29, 1
+    Compiler Bootstrap   :p31, after p26, 1
+    Build Tools          :p32, after p31, 1
+    Expanded Coreutils   :p33, after p27, 1
+    Crypto Primitives    :p34, after p31, 1
+    SSH Server           :p35, after p34, 1
+    Rust Cross-Compile   :p36, after p24, 1
+    Ports System         :p37, after p32, 1
+    System Services      :p38, after p30, 1
 ```
 
 ## Required Documentation for Every Phase

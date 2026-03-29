@@ -1,4 +1,4 @@
-# Phase 34 - SSH Server
+# Phase 35 - SSH Server
 
 ## Milestone Goal
 
@@ -21,7 +21,7 @@ milestone: the OS is now a secure, networked, multi-user system.
 
 **Transport Layer**
 - SSH-2 protocol only (SSH-1 is obsolete and insecure).
-- Key exchange: `curve25519-sha256` (using crypto from Phase 33).
+- Key exchange: `curve25519-sha256` (using crypto from Phase 34).
 - Host key: Ed25519 (generated on first boot, stored at `/etc/ssh/ssh_host_ed25519_key`).
 - Encryption: `chacha20-poly1305@openssh.com` or `aes256-ctr`.
 - MAC: `hmac-sha2-256` (if not using authenticated encryption).
@@ -88,8 +88,8 @@ ssh -p 2222 user@localhost
 |---|---|
 | Phase 23 (Socket API) | TCP server sockets |
 | Phase 27 (User Accounts) | Authentication, UID/GID |
-| Phase 28 (PTY) | Terminal sessions |
-| Phase 33 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
+| Phase 29 (PTY) | Terminal sessions |
+| Phase 34 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
 
 ## Implementation Outline
 
@@ -119,7 +119,7 @@ ssh -p 2222 user@localhost
 
 ## Companion Task List
 
-- [Phase 34 Task List](./tasks/34-ssh-server-tasks.md)
+- [Phase 35 Task List](./tasks/35-ssh-server-tasks.md)
 
 ## How Real OS Implementations Differ
 

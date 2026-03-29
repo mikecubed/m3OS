@@ -102,19 +102,18 @@ Real Unix systems have:
 Our implementation uses the classic Unix permission model (user/group/other with
 rwx bits), which is simple to understand and sufficient for learning.
 
-## Follow-Up: Phase 27b — ext2 Filesystem
+## Follow-Up: Phase 28 — ext2 Filesystem
 
-FAT32 has no native Unix permissions, so Phase 27 uses an in-memory metadata
-overlay that is lost on reboot. **Phase 27b** adds an ext2 filesystem with native
-inode-level uid/gid/mode/timestamps, replacing FAT32 as the primary persistent
-filesystem and making permissions survive reboots.
+FAT32 has no native Unix permissions, so Phase 27 uses a permissions index file
+(`.m3os_permissions`) to persist ownership and modes on the FAT32 partition.
+**Phase 28** replaces FAT32 entirely with an ext2 filesystem that stores
+uid/gid/mode/timestamps natively in inodes.
 
-See the [Phase 27 Task List](./tasks/27-user-accounts-tasks.md#follow-up-phase-27b--ext2-filesystem)
-for detailed ext2 scope.
+See [Phase 28 — ext2 Filesystem](./28-ext2-filesystem.md) for full scope.
 
 ## Deferred Until Later
 
-- ext2 filesystem (Phase 27b)
+- ext2 filesystem (Phase 28)
 - PAM or pluggable authentication
 - Supplementary groups
 - ACLs (Access Control Lists)

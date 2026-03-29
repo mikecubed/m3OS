@@ -1,4 +1,4 @@
-# Phase 36 - Ports and Package System
+# Phase 37 - Ports and Package System
 
 ## Milestone Goal
 
@@ -75,9 +75,9 @@ once an HTTP client is ported.
 
 | Phase | Why needed |
 |---|---|
-| Phase 30 (Compiler) | TCC to compile port sources |
-| Phase 31 (Build Tools) | make for building ports |
-| Phase 32 (Coreutils) | patch, find, xargs for port infrastructure |
+| Phase 31 (Compiler) | TCC to compile port sources |
+| Phase 32 (Build Tools) | make for building ports |
+| Phase 33 (Coreutils) | patch, find, xargs for port infrastructure |
 | Phase 24 (Persistent Storage) | Install to persistent storage |
 
 ## Implementation Outline
@@ -104,7 +104,7 @@ once an HTTP client is ported.
 
 ## Companion Task List
 
-- [Phase 36 Task List](./tasks/36-ports-system-tasks.md)
+- [Phase 37 Task List](./tasks/37-ports-system-tasks.md)
 
 ## How Real OS Implementations Differ
 

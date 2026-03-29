@@ -1,4 +1,4 @@
-# Phase 32 - Expanded Coreutils
+# Phase 33 - Expanded Coreutils
 
 ## Milestone Goal
 
@@ -92,7 +92,7 @@ syscalls as needed.
 |---|---|
 | Phase 14 (Shell and Tools) | Existing basic coreutils as foundation |
 | Phase 27 (User Accounts) | chmod/chown need UID/GID support |
-| Phase 30 (Compiler) | Can compile new tools inside the OS (stretch goal) |
+| Phase 31 (Compiler) | Can compile new tools inside the OS (stretch goal) |
 
 ## Implementation Outline
 
@@ -118,7 +118,7 @@ syscalls as needed.
 
 ## Companion Task List
 
-- [Phase 32 Task List](./tasks/32-expanded-coreutils-tasks.md)
+- [Phase 33 Task List](./tasks/33-expanded-coreutils-tasks.md)
 
 ## How Real OS Implementations Differ
 

@@ -1,4 +1,4 @@
-# Phase 37 - System Services
+# Phase 38 - System Services
 
 ## Milestone Goal
 
@@ -82,8 +82,8 @@ A minimal cron daemon:
 | Phase | Why needed |
 |---|---|
 | Phase 27 (User Accounts) | Service ownership, user crontabs |
-| Phase 28 (PTY) | who/w reads PTY session info |
-| Phase 29 (Telnet) / Phase 34 (SSH) | Remote services to manage |
+| Phase 29 (PTY) | who/w reads PTY session info |
+| Phase 30 (Telnet) / Phase 35 (SSH) | Remote services to manage |
 | Phase 24 (Persistent Storage) | Log files, crontabs persist |
 | Phase 19 (Signals) | SIGTERM/SIGKILL for service management |
 
@@ -116,7 +116,7 @@ A minimal cron daemon:
 
 ## Companion Task List
 
-- [Phase 37 Task List](./tasks/37-system-services-tasks.md)
+- [Phase 38 Task List](./tasks/38-system-services-tasks.md)
 
 ## How Real OS Implementations Differ
 
