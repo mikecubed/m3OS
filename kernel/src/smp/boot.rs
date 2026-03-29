@@ -337,6 +337,7 @@ pub fn boot_aps() {
                 started = true;
                 break;
             }
+            core::hint::spin_loop();
         }
 
         if started {
@@ -531,8 +532,5 @@ fn ap_lapic_init_from(lapic_base: usize, tpm: u32) {
 
 fn remove_trampoline_identity_map() {
     remove_identity_map(TRAMPOLINE_PHYS);
-    // Note: the LAPIC identity mapping at 0xFEE00000 is kept — APs need
-    // it for LAPIC EOI in interrupt handlers. It will be removed once
-    // APs switch to using phys_offset-based LAPIC access.
     log::info!("[smp] removed trampoline identity mapping");
 }
