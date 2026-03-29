@@ -412,17 +412,17 @@ pub fn close(fd: i32) -> isize {
 // ===========================================================================
 
 /// Perform an ioctl operation on a file descriptor.
-pub fn ioctl(fd: usize, request: usize, arg: usize) -> isize {
+pub fn ioctl(fd: i32, request: usize, arg: usize) -> isize {
     unsafe { syscall3(SYS_IOCTL, fd as u64, request as u64, arg as u64) as isize }
 }
 
 /// Seek to a position in a file descriptor.
-pub fn lseek(fd: usize, offset: i64, whence: usize) -> isize {
+pub fn lseek(fd: i32, offset: i64, whence: usize) -> isize {
     unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) as isize }
 }
 
 /// Get terminal attributes.
-pub fn tcgetattr(fd: usize) -> Result<Termios, isize> {
+pub fn tcgetattr(fd: i32) -> Result<Termios, isize> {
     let mut t = Termios {
         c_iflag: 0,
         c_oflag: 0,
@@ -440,7 +440,7 @@ pub fn tcgetattr(fd: usize) -> Result<Termios, isize> {
 }
 
 /// Set terminal attributes.
-pub fn tcsetattr(fd: usize, termios: &Termios) -> Result<(), isize> {
+pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
     let ret = ioctl(fd, TCSETS, termios as *const Termios as usize);
     if ret < 0 {
         Err(ret)
@@ -450,7 +450,7 @@ pub fn tcsetattr(fd: usize, termios: &Termios) -> Result<(), isize> {
 }
 
 /// Get terminal window size (rows, cols).
-pub fn get_window_size(fd: usize) -> Result<(u16, u16), isize> {
+pub fn get_window_size(fd: i32) -> Result<(u16, u16), isize> {
     let mut ws = Winsize {
         ws_row: 0,
         ws_col: 0,

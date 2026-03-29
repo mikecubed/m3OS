@@ -5,16 +5,24 @@
 
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
 extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, Ordering};
 use syscall_lib::heap::BrkAllocator;
 
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    syscall_lib::write(1, b"\r\nedit: out of memory\r\n");
+    syscall_lib::exit(1)
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,6 +31,12 @@ static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 const TAB_STOP: usize = 4;
 const QUIT_TIMES: u8 = 3;
 const VERSION: &str = "0.1.0";
+
+// ---------------------------------------------------------------------------
+// Global state for panic handler
+// ---------------------------------------------------------------------------
+
+static mut ORIG_TERMIOS: Option<syscall_lib::Termios> = None;
 
 // ---------------------------------------------------------------------------
 // SIGWINCH support
@@ -246,7 +260,14 @@ impl Editor {
         let mut buf = [0u8; 4096];
         loop {
             let n = syscall_lib::read(fd as i32, &mut buf);
-            if n <= 0 {
+            if n < 0 {
+                syscall_lib::close(fd as i32);
+                self.rows.push(Row::new(Vec::new()));
+                self.modified = false;
+                self.set_status_msg("Error reading file");
+                return;
+            }
+            if n == 0 {
                 break;
             }
             content.extend_from_slice(&buf[..n as usize]);
@@ -318,18 +339,23 @@ impl Editor {
             return;
         }
 
-        let written = syscall_lib::write(fd as i32, &content);
+        let mut total_written: usize = 0;
+        while total_written < content.len() {
+            let n = syscall_lib::write(fd as i32, &content[total_written..]);
+            if n <= 0 {
+                syscall_lib::close(fd as i32);
+                self.set_status_msg("Error: write failed");
+                return;
+            }
+            total_written += n as usize;
+        }
         syscall_lib::close(fd as i32);
 
-        if written as usize == content.len() {
-            self.modified = false;
-            let mut msg = String::from("Saved ");
-            append_usize(&mut msg, content.len());
-            msg.push_str(" bytes");
-            self.set_status_msg(&msg);
-        } else {
-            self.set_status_msg("Error: write failed");
-        }
+        self.modified = false;
+        let mut msg = String::from("Saved ");
+        append_usize(&mut msg, content.len());
+        msg.push_str(" bytes");
+        self.set_status_msg(&msg);
     }
 
     // -----------------------------------------------------------------------
@@ -923,6 +949,11 @@ fn enable_raw_mode() -> syscall_lib::Termios {
         c_cc: [0; syscall_lib::NCCS],
     });
 
+    // Store for panic handler (single-threaded process, safe)
+    unsafe {
+        ORIG_TERMIOS = Some(orig);
+    }
+
     let mut raw = orig;
     raw.c_iflag &= !(syscall_lib::ICRNL
         | syscall_lib::IXON
@@ -1082,16 +1113,12 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // Try to restore terminal on panic
-    let orig = syscall_lib::Termios {
-        c_iflag: syscall_lib::ICRNL,
-        c_oflag: syscall_lib::OPOST,
-        c_cflag: syscall_lib::CS8,
-        c_lflag: syscall_lib::ICANON | syscall_lib::ECHO | syscall_lib::ISIG,
-        c_line: 0,
-        c_cc: [0; syscall_lib::NCCS],
-    };
-    let _ = syscall_lib::tcsetattr(0, &orig);
+    // Restore the actual original terminal settings saved at startup
+    unsafe {
+        if let Some(ref orig) = ORIG_TERMIOS {
+            let _ = syscall_lib::tcsetattr(0, orig);
+        }
+    }
     syscall_lib::write(1, b"\r\npanic in edit\r\n");
     syscall_lib::exit(101)
 }
