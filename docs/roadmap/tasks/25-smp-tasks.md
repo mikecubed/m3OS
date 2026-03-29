@@ -54,15 +54,28 @@ Already implemented (no new work needed):
 
 ## Track Layout
 
-| Track | Scope | Dependencies |
-|---|---|---|
-| A | Per-core data structures | — |
-| B | AP bootstrap (trampoline + startup) | A |
-| C | Per-core scheduler | A |
-| D | IPI infrastructure | B |
-| E | TLB shootdown | C, D |
-| F | Spinlock audit and SMP hardening | B, C |
-| G | Validation and documentation | D, E, F |
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Per-core data structures | — | **Done** |
+| B | AP bootstrap (trampoline + startup) | A | **Done** |
+| C | Per-core scheduler | A | Pending |
+| D | IPI infrastructure | B | **Done** |
+| E | TLB shootdown | C, D | **Done** (handler+API; munmap hook deferred) |
+| F | Spinlock audit and SMP hardening | B, C | Pending |
+| G | Validation and documentation | D, E, F | Pending |
+
+### Implementation Notes
+
+- **EFER.NXE**: The AP trampoline must set EFER.NXE (bit 11) along with LME.
+  The bootloader's page tables use the NX bit on data pages; without NXE, bit 63
+  is reserved and triggers page faults on any access to NX-marked pages.
+- **AP LAPIC init**: APs use the phys_offset-based LAPIC address (same as BSP).
+  Identity-mapping the LAPIC was explored as a workaround but is not needed once
+  NXE is set correctly.
+- **GDT pre-allocation**: AP GDTs are pre-allocated on the BSP and stored in
+  PerCoreData to avoid heap access from the AP before full initialization.
+- **IDT sharing**: All cores share the same IDT (loaded via the Lazy static).
+  The double-fault IST index references each core's own TSS.
 
 ---
 
