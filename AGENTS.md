@@ -4,25 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m³OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Goal is a functional userspace shell.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.25.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, and signals.
 
 ## Build & Run
 
 Uses the `xtask` pattern — always build through `cargo xtask`, never `cargo build` directly.
 
 ```bash
-cargo xtask run          # build + launch in QEMU (primary dev workflow)
+cargo xtask run          # build + launch in QEMU (headless, serial output)
+cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
+cargo xtask image --sign # build + sign EFI binary for Secure Boot
 cargo xtask check        # clippy (-D warnings) + rustfmt + kernel-core host tests
 cargo xtask fmt --fix    # auto-format all workspace source
 cargo xtask test         # run all kernel tests in QEMU via ISA debug exit
 cargo xtask test --test <name>  # run a single QEMU test binary
 cargo xtask test --timeout 120  # custom timeout (default 60s)
 cargo xtask test --display      # show QEMU window for debugging
+cargo xtask sign         # sign EFI binary with Secure Boot keys
 cargo test -p kernel-core       # run kernel-core host-side unit tests directly
 ```
 
 Tests cannot use `cargo test` on the kernel — it is `no_std` and tests run inside QEMU via the xtask harness. Pure-logic code lives in `kernel-core` and is testable on the host via `cargo test -p kernel-core`.
+
+## Git Workflow
+
+All work must happen on a feature branch with a pull request to `main`. Never commit directly to `main`.
+
+```bash
+git checkout -b feat/my-feature       # 1. create feature branch
+# ... make changes ...
+git add <files> && git commit         # 2. commit
+git push -u origin feat/my-feature    # 3. push
+gh pr create --base main              # 4. open PR to main
+# 5. user merges PR after review
+```
+
+Branch naming: `feat/`, `fix/`, `refactor/`, `docs/` prefixes as appropriate.
 
 ## First-Time Setup
 
@@ -36,29 +54,85 @@ This sets `core.hooksPath` to `.githooks/`, which contains pre-commit and pre-pu
 
 ## Architecture
 
-Microkernel: ring 0 kernel handles only memory management, scheduling, IPC, and interrupt routing. Everything else is a ring 3 userspace server communicating through IPC.
+Microkernel: ring 0 kernel handles memory management, scheduling, IPC, interrupt routing, and device drivers. Userspace processes run in ring 3 and communicate through IPC and syscalls.
 
 ```
-Ring 0 (kernel/):           Ring 3 (userspace/ — planned Phase 5+):
-  - Frame allocator           - init, console_server, vfs_server
-  - Page table manager        - fat_server, kbd_server, shell
-  - Scheduler
-  - IPC engine
-  - IDT / interrupt router
+Ring 0 (kernel/):                Ring 3 (userspace/):
+  - Frame allocator                - init (PID 1 daemon)
+  - Page table manager             - sh0 (built-in shell)
+  - Scheduler (SMP-aware)          - coreutils (cat, ls, grep, etc.)
+  - IPC engine + capabilities      - ping (ICMP network tool)
+  - IDT / APIC / interrupt router  - ion shell (external)
   - Syscall gate
+  - VFS + FAT32 + tmpfs
+  - Network stack (IPv4/TCP/UDP)
+  - VirtIO drivers (blk, net)
+  - ACPI / PCI enumeration
+  - Framebuffer console
+  - TTY + signal handling
+  - SMP (multi-core boot + IPI)
 ```
 
-### Workspace
+### Workspace Crates
+
+```
+Cargo.toml                # workspace root (default-members = ["kernel"])
+kernel/                   # main OS kernel binary (no_std)
+kernel-core/              # shared library — host-testable pure logic (no_std + std feature)
+xtask/                    # build system (host, std)
+userspace/
+  syscall-lib/            # syscall wrapper library for userspace Rust binaries
+  exit0/                  # test binary: simple exit
+  fork-test/              # test binary: fork behavior
+  echo-args/              # test binary: argument echo
+  init/                   # PID 1 init daemon
+  shell/                  # sh0 shell (binary name: sh0)
+  ping/                   # ICMP ping utility
+  coreutils/              # C implementations: cat, cp, echo, env, grep, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt
+  hello-c/                # C hello world test
+  signal-test/            # C signal handling test
+  stdin-test/             # C stdin test
+  tmpfs-test/             # C tmpfs test
+```
+
+### Kernel Source Layout
 
 ```
 kernel/src/
-  arch/x86_64/   # GDT, IDT, paging, syscall gate
-  mm/            # frame allocator, page tables, heap
-  task/          # scheduler, context switch
-  ipc/           # endpoints, capabilities, send/recv
-  drivers/       # serial only (uart_16550 wrapper)
-xtask/           # build system (host, std)
-userspace/       # ring 3 server binaries (no_std) — not yet implemented
+  main.rs              # entry point, boot sequence
+  serial.rs            # serial I/O + log backend
+  pipe.rs              # inter-process pipes
+  signal.rs            # POSIX-style signal handling
+  stdin.rs             # stdin abstraction
+  tty.rs               # TTY/terminal subsystem
+  testing.rs           # QEMU test framework
+  arch/x86_64/         # GDT, IDT (APIC-based), paging, syscall gate
+  acpi/                # ACPI table parsing (RSDP, MADT)
+  blk/                 # block devices: VirtIO-blk, MBR parsing
+  fb/                  # framebuffer console driver
+  fs/                  # VFS layer, FAT32, tmpfs, ramdisk, protocol
+  ipc/                 # endpoints, capabilities, messages, notifications, registry
+  mm/                  # frame allocator, paging, heap, user_space, ELF loader, memory_map
+  net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, VirtIO-net, dispatch
+  pci/                 # PCI device enumeration
+  process/             # process management (fork, exec, exit, wait)
+  smp/                 # AP boot, IPI, TLB shootdown
+  task/                # scheduler (SMP-aware round-robin)
+kernel/initrd/           # pre-built ELF binaries embedded as initial ramdisk
+```
+
+### kernel-core Source Layout
+
+```
+kernel-core/src/
+  lib.rs               # module declarations
+  types.rs             # shared types
+  fb.rs                # framebuffer abstractions
+  pipe.rs              # pipe abstractions
+  tty.rs               # TTY abstractions
+  fs/                  # FAT32, MBR, tmpfs abstractions
+  ipc/                 # capability, message, registry abstractions
+  net/                 # ARP, Ethernet, ICMP, IPv4, TCP, UDP abstractions
 ```
 
 ## Critical Conventions
@@ -72,11 +146,11 @@ In `.cargo/config.toml` / target spec:
 
 ### `no_std` everywhere in kernel and userspace
 
-All crates under `kernel/` and `userspace/` are `#![no_std]`. Only use `alloc` types (`Vec`, `Box`, `Arc`) after Phase 2 heap initialization.
+All crates under `kernel/` and `userspace/` are `#![no_std]`. Only use `alloc` types (`Vec`, `Box`, `Arc`) after heap initialization. `kernel-core` supports both `no_std` (kernel) and `std` (host tests) via feature flags.
 
 ### `unsafe` only at hardware boundaries
 
-Acceptable only for: hardware register/port I/O, page table/GDT/IDT setup, `enter_userspace()`/`switch_context()` asm stubs, global allocator initialization. Always wrap in a safe abstraction immediately.
+Acceptable only for: hardware register/port I/O, page table/GDT/IDT setup, `enter_userspace()`/`switch_context()` asm stubs, global allocator initialization, APIC/ACPI MMIO access, VirtIO ring manipulation. Always wrap in a safe abstraction immediately.
 
 ### IPC model — read the doc before touching `kernel/src/ipc/`
 
@@ -107,6 +181,13 @@ Integer index into the current process's `CapabilityTable`. Kernel validates eve
 
 `switch_context(current, next)` saves/restores only callee-saved registers (`rbx`, `rbp`, `r12`–`r15`, `rsp`, `rip`). Do not change without auditing every call site.
 
+### SMP conventions
+
+- BSP (bootstrap processor) completes full kernel init before waking APs
+- APs initialize their own GDT, IDT, APIC, and enter the scheduler idle loop
+- Use IPI for TLB shootdown on page table updates affecting multiple cores
+- Per-CPU data accessed via APIC ID — avoid global mutable state without proper locking
+
 ### QEMU test exit convention
 
 ```rust
@@ -131,6 +212,7 @@ Parse memory regions, framebuffer, RSDP during `kernel_main` init and store in t
 | `linked_list_allocator` | `#[global_allocator]` for kernel heap |
 | `spin` | `Mutex`/`RwLock` for `no_std` |
 | `log` | Logging facade; backend writes to serial |
+| `kernel-core` | Shared pure-logic library, host-testable |
 
 ## Documentation in `docs/`
 
@@ -139,7 +221,16 @@ Read before making significant changes:
 | File | When |
 |---|---|
 | `docs/01-architecture.md` | Orientation — kernel vs. userspace split |
-| `docs/06-ipc.md` | Before touching `kernel/src/ipc/` or syscalls |
 | `docs/03-memory.md` | Before touching frame allocator, page tables, or heap |
-| `docs/08-roadmap.md` | Open design questions and per-phase scope |
+| `docs/06-ipc.md` | Before touching `kernel/src/ipc/` or syscalls |
+| `docs/08-storage-and-vfs.md` | Before touching `kernel/src/fs/` or block devices |
 | `docs/09-testing.md` | Before writing kernel tests or modifying the xtask harness |
+| `docs/11-elf-loader-and-process-model.md` | Before touching ELF loading or process lifecycle |
+| `docs/12-posix-compatibility-layer.md` | Before adding syscalls or POSIX behavior |
+| `docs/16-network.md` | Before touching `kernel/src/net/` |
+| `docs/22-signal-handlers.md` | Before touching signal delivery |
+| `docs/23-tty-terminal.md` | Before touching TTY/terminal subsystem |
+| `docs/25-smp.md` | Before touching SMP or multi-core code |
+| `docs/08-roadmap.md` | Open design questions and per-phase scope |
+
+Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–37) with corresponding `docs/roadmap/tasks/` breakdowns.
