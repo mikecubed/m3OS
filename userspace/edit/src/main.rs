@@ -236,6 +236,8 @@ impl Editor {
         let fd = syscall_lib::open(&path_buf, syscall_lib::O_RDONLY, 0);
         if fd < 0 {
             // New file — start with empty buffer
+            self.rows.push(Row::new(Vec::new()));
+            self.modified = false;
             self.set_status_msg("(New file)");
             return;
         }
@@ -823,10 +825,9 @@ impl Editor {
         match key {
             Key::Ctrl(b'q') => {
                 if self.modified && self.quit_times > 0 {
-                    let remaining = self.quit_times;
                     self.quit_times -= 1;
                     let mut msg = String::from("WARNING: File has unsaved changes. Press Ctrl+Q ");
-                    append_usize(&mut msg, remaining as usize);
+                    append_usize(&mut msg, self.quit_times as usize);
                     msg.push_str(" more time(s) to quit.");
                     self.set_status_msg(&msg);
                     return true;
@@ -948,29 +949,31 @@ fn terminal_size() -> (usize, usize) {
     }
 }
 
-fn register_sigwinch_handler() {
-    // The restorer trampoline performs the sigreturn syscall.
-    // For no_std Rust, we embed a minimal restorer in our binary.
-    #[cfg(target_arch = "x86_64")]
-    {
-        // sigreturn trampoline: mov rax, 15; syscall
-        static RESTORER: [u8; 9] = [
-            0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 15
-            0x0f, 0x05, // syscall
-        ];
+// Signal restorer trampoline — must live in executable .text segment.
+// Performs rt_sigreturn (syscall 15) so the kernel can restore context.
+core::arch::global_asm!(
+    ".global __sigrestorer",
+    "__sigrestorer:",
+    "mov rax, 15",
+    "syscall",
+);
 
-        let sa = syscall_lib::SigAction {
-            sa_handler: sigwinch_handler as *const () as u64,
-            sa_flags: syscall_lib::SA_RESTORER,
-            sa_restorer: RESTORER.as_ptr() as u64,
-            sa_mask: 0,
-        };
-        syscall_lib::rt_sigaction(
-            syscall_lib::SIGWINCH as usize,
-            &sa as *const syscall_lib::SigAction,
-            core::ptr::null_mut(),
-        );
-    }
+extern "C" {
+    fn __sigrestorer();
+}
+
+fn register_sigwinch_handler() {
+    let sa = syscall_lib::SigAction {
+        sa_handler: sigwinch_handler as *const () as u64,
+        sa_flags: syscall_lib::SA_RESTORER,
+        sa_restorer: __sigrestorer as *const () as u64,
+        sa_mask: 0,
+    };
+    syscall_lib::rt_sigaction(
+        syscall_lib::SIGWINCH as usize,
+        &sa as *const syscall_lib::SigAction,
+        core::ptr::null_mut(),
+    );
 }
 
 extern "C" fn sigwinch_handler(_sig: i32) {
