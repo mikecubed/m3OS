@@ -27,7 +27,7 @@ fn login_once() {
     }
     let username = &username[..ulen];
 
-    // Prompt for password (in clear text for now — no echo disable in Phase 27).
+    // Prompt for password with echo disabled.
     write_str(STDOUT_FILENO, "Password: ");
 
     // Disable echo for password input.
@@ -73,8 +73,10 @@ fn login_once() {
     write_str(STDOUT_FILENO, "\n");
 
     // Set GID and UID.
-    setgid(gid);
-    setuid(uid);
+    if setgid(gid) != 0 || setuid(uid) != 0 {
+        write_str(STDOUT_FILENO, "login: failed to set credentials\n");
+        return;
+    }
 
     // Build environment.
     let mut home_env = [0u8; 128];

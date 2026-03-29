@@ -9,9 +9,15 @@ use syscall_lib::{
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // Parse argv to get target username (default: root).
-    // argv[0] is the program name, argv[1] is the target user.
-    let target = get_argv1().unwrap_or(b"root");
+    // Read target username (default: root if empty).
+    write_str(STDOUT_FILENO, "su: target user (default root): ");
+    let mut target_buf = [0u8; 64];
+    let tlen = read_line(&mut target_buf);
+    let target: &[u8] = if tlen == 0 {
+        b"root"
+    } else {
+        &target_buf[..tlen]
+    };
 
     // Look up target user in /etc/passwd.
     let mut passwd_buf = [0u8; 2048];
@@ -67,16 +73,6 @@ pub extern "C" fn _start() -> ! {
     write_u64(STDOUT_FILENO, (-ret) as u64);
     write_str(STDOUT_FILENO, ")\n");
     exit(1);
-}
-
-fn get_argv1() -> Option<&'static [u8]> {
-    // Read argv from the stack. In m3OS ABI, argc is at RSP on entry,
-    // followed by argv pointers. We access via inline assembly.
-    // For simplicity, we read from /proc/self/cmdline or use a fixed default.
-    // Actually, m3OS passes argc/argv on the stack in the standard way.
-    // Since we're in _start, RSP points to argc. But we can't easily access
-    // the original RSP. For now, default to "root".
-    None
 }
 
 fn read_line(buf: &mut [u8]) -> usize {

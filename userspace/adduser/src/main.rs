@@ -144,7 +144,6 @@ pub extern "C" fn _start() -> ! {
     hp += 1;
 
     // mkdir the home directory under /tmp.
-    let _ = syscall_lib::open(&home_path[..hp], syscall_lib::O_RDONLY, 0); // test if exists
     let mkdir_ret =
         unsafe { syscall_lib::syscall2(syscall_lib::SYS_MKDIR, home_path.as_ptr() as u64, 0o755) };
     if mkdir_ret == 0 || mkdir_ret as i64 == -17 {

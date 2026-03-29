@@ -34,7 +34,7 @@ pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
     let perms = FAT32_PERMISSIONS.lock();
     match perms.get(path) {
         Some(m) => (m.uid, m.gid, m.mode),
-        None => (0, 0, 0o644), // default: root-owned, 0o644
+        None => (0, 0, 0o755), // default: root-owned, 0o755
     }
 }
 

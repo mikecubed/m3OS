@@ -42,7 +42,13 @@ pub extern "C" fn _start() -> ! {
 
     // Phase 27: Set initial file permissions.
     // /data/etc/shadow should be root-only readable.
-    syscall_lib::chmod(b"/data/etc/shadow\0", 0o600);
+    let chmod_ret = syscall_lib::chmod(b"/data/etc/shadow\0", 0o600);
+    if chmod_ret != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "init: warning: chmod /data/etc/shadow failed\n",
+        );
+    }
 
     // Spawn the first login session.
     let mut login_pid = spawn_login();

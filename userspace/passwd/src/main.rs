@@ -15,10 +15,14 @@ const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     let euid = geteuid();
+    if euid != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "passwd: must be root (non-root password change not yet supported)\n",
+        );
+        exit(1);
+    }
     let uid = getuid();
-
-    // Determine target user: for non-root, always self. Root could specify argv[1].
-    // For simplicity, passwd always changes the current user's password.
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
@@ -37,25 +41,6 @@ pub extern "C" fn _start() -> ! {
     write_str(STDOUT_FILENO, "Changing password for ");
     let _ = write(STDOUT_FILENO, username);
     write_str(STDOUT_FILENO, "\n");
-
-    // If non-root, verify current password first.
-    if euid != 0 {
-        write_str(STDOUT_FILENO, "Current password: ");
-        let saved = disable_echo();
-        let mut cur_input = [0u8; 128];
-        let cur_len = read_line(&mut cur_input);
-        restore_echo(saved);
-        let _ = write(STDOUT_FILENO, b"\n");
-
-        let mut shadow_buf = [0u8; 2048];
-        let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
-        if shadow_len == 0
-            || !verify_shadow(&shadow_buf[..shadow_len], username, &cur_input[..cur_len])
-        {
-            write_str(STDOUT_FILENO, "passwd: Authentication failure\n");
-            exit(1);
-        }
-    }
 
     // Get new password.
     write_str(STDOUT_FILENO, "New password: ");
@@ -170,22 +155,6 @@ fn parse_u32(s: &[u8]) -> u32 {
         }
     }
     n
-}
-
-fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
-    for line in shadow.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            if &line[..colon] == username {
-                let rest = &line[colon + 1..];
-                let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-                return syscall_lib::sha256::verify_password(password, &rest[..hash_end]);
-            }
-        }
-    }
-    false
 }
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {

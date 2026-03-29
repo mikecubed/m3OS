@@ -335,7 +335,7 @@ pub extern "C" fn syscall_handler(
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
         1 => sys_linux_write(arg0, arg1, arg2),
-        2 => sys_linux_open(arg0, arg1),
+        2 => sys_linux_open(arg0, arg1, arg2),
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
         // Phase 22: poll stub — report all requested fds as ready.
@@ -2848,7 +2848,7 @@ fn fat32_relative_path(path: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
+fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -2875,6 +2875,16 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
             let (_, _, euid, egid) = current_process_ids();
             let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
             if required != 0 && !check_permission(fu, fg, fm, euid, egid, required) {
+                return NEG_EACCES;
+            }
+        }
+    }
+
+    // Phase 27: When creating a new file, check parent directory write+execute permission.
+    if create && path_metadata(name).is_none() {
+        if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+            let (_, _, euid_c, egid_c) = current_process_ids();
+            if !check_permission(pu, pg, pm, euid_c, egid_c, 3) {
                 return NEG_EACCES;
             }
         }
@@ -2988,8 +2998,13 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
 
         // Open or create the file with caller's ownership.
+        let create_mode = if (mode_arg as u16) & 0o777 != 0 {
+            (mode_arg as u16) & 0o7777
+        } else {
+            0o644
+        };
         let (_, _, caller_euid, caller_egid) = current_process_ids();
-        match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, 0o644) {
+        match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, create_mode) {
             Ok(_created) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
@@ -3200,9 +3215,11 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
+    let mode_arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
     if dirfd == AT_FDCWD {
         // Resolve relative to process cwd — same as sys_linux_open.
-        return sys_linux_open(path_ptr, flags);
+        return sys_linux_open(path_ptr, flags, mode_arg);
     }
 
     // dirfd is a directory fd — resolve path relative to it.
@@ -3332,8 +3349,13 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             return NEG_EISDIR;
         }
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        let create_mode = if (mode_arg as u16) & 0o777 != 0 {
+            (mode_arg as u16) & 0o7777
+        } else {
+            0o644
+        };
         let (_, _, caller_euid2, caller_egid2) = current_process_ids();
-        match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, 0o644) {
+        match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, create_mode) {
             Ok(_) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
@@ -3582,7 +3604,12 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
-    if abs_path == "/" || abs_path.starts_with("/dev") || abs_path.starts_with("/proc") {
+    if abs_path == "/"
+        || abs_path == "/data"
+        || abs_path == "/tmp"
+        || abs_path.starts_with("/dev")
+        || abs_path.starts_with("/proc")
+    {
         return Some((0, 0, 0o755));
     }
     None
