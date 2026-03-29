@@ -179,8 +179,16 @@ impl ABuf {
     }
 
     fn flush(&self) {
-        if !self.buf.is_empty() {
-            syscall_lib::write(1, &self.buf);
+        if self.buf.is_empty() {
+            return;
+        }
+        let mut written = 0usize;
+        while written < self.buf.len() {
+            let n = syscall_lib::write(1, &self.buf[written..]);
+            if n <= 0 {
+                break;
+            }
+            written += n as usize;
         }
     }
 
