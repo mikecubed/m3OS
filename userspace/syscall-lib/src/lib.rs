@@ -160,6 +160,7 @@ pub const SYS_GETPID: u64 = 39;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPGID: u64 = 121;
+pub const SYS_MOUNT: u64 = 165;
 
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
@@ -422,6 +423,15 @@ pub fn nanosleep(seconds: u64) -> isize {
 // ===========================================================================
 // High-level wrappers — Sockets (Phase 23)
 // ===========================================================================
+
+// ===========================================================================
+// Phase 24: mount syscall
+// ===========================================================================
+
+/// Mount a filesystem. Returns 0 on success, negative errno on error.
+pub fn mount(source: *const u8, target: *const u8, fstype: *const u8) -> isize {
+    unsafe { syscall3(SYS_MOUNT, source as u64, target as u64, fstype as u64) as isize }
+}
 
 /// Create a socket. Returns fd on success, negative errno on error.
 pub fn socket(domain: i32, socktype: i32, protocol: i32) -> isize {

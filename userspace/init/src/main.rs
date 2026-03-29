@@ -9,7 +9,9 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{execve, exit, fork, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG};
+use syscall_lib::{
+    execve, exit, fork, mount, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG,
+};
 
 const ION_PATH: &[u8] = b"/bin/ion\0";
 const ION_ARGV0: &[u8] = b"/bin/ion\0";
@@ -23,6 +25,20 @@ const ENV_TERM: &[u8] = b"TERM=m3os\0";
 pub extern "C" fn _start() -> ! {
     // Fds 0/1/2 are pre-opened by the kernel for PID 1.
     write_str(STDOUT_FILENO, "\nm3OS init (PID 1)\n");
+
+    // Phase 24: Mount persistent storage at /data.
+    let ret = mount(
+        b"/dev/blk0\0".as_ptr(),
+        b"/data\0".as_ptr(),
+        b"vfat\0".as_ptr(),
+    );
+    if ret == 0 {
+        write_str(STDOUT_FILENO, "init: /data mounted (vfat)\n");
+    } else {
+        write_str(STDOUT_FILENO, "init: /data mount failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+    }
 
     // Spawn the first shell.
     let mut shell_pid = spawn_shell();

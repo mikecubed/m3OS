@@ -689,25 +689,40 @@ fn align_up(val: usize, alignment: usize) -> usize {
 /// allocation fails. Uses the bump allocator which already allocates
 /// sequentially from contiguous regions.
 fn alloc_contiguous_frames(count: usize) -> Option<u64> {
-    // The bump allocator hands out frames sequentially within each
-    // contiguous usable region, so allocating `count` frames in a row
-    // gives us a contiguous block as long as the region has enough space.
-    let first = frame_allocator::allocate_frame()?;
-    let base = first.start_address().as_u64();
+    use alloc::vec::Vec;
 
-    for i in 1..count {
-        let frame = frame_allocator::allocate_frame()?;
-        let expected = base + (i as u64) * 4096;
-        if frame.start_address().as_u64() != expected {
+    // Allocate all requested frames, sort by address, and verify contiguity.
+    // This works regardless of allocator ordering (LIFO free-list returns
+    // descending addresses after init).
+    let mut frames: Vec<u64> = Vec::with_capacity(count);
+    for _ in 0..count {
+        match frame_allocator::allocate_frame() {
+            Some(f) => frames.push(f.start_address().as_u64()),
+            None => {
+                for &phys in &frames {
+                    frame_allocator::free_frame(phys);
+                }
+                return None;
+            }
+        }
+    }
+
+    frames.sort_unstable();
+    let base = frames[0];
+    for (i, &phys) in frames.iter().enumerate() {
+        if phys != base + (i as u64) * 4096 {
             log::error!(
-                "[virtio-net] frame {} not contiguous: got {:#x}, expected {:#x} — \
-                 virtqueue requires contiguous physical memory",
+                "[virtio-net] frames not contiguous: frame {} at {:#x}, expected {:#x}",
                 i,
-                frame.start_address().as_u64(),
-                expected
+                phys,
+                base + (i as u64) * 4096
             );
+            for &p in &frames {
+                frame_allocator::free_frame(p);
+            }
             return None;
         }
     }
+
     Some(base)
 }

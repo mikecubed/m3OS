@@ -84,6 +84,14 @@ pub enum FdBackend {
     /// Writable tmpfs file, identified by its path (e.g. "foo/bar.txt"
     /// relative to tmpfs root — no leading `/tmp/`).
     Tmpfs { path: String },
+    /// FAT32 on-disk file (Phase 24). Stores the relative path within /data,
+    /// the start cluster, file size, and parent directory cluster.
+    Fat32Disk {
+        path: String,
+        start_cluster: u32,
+        file_size: u32,
+        dir_cluster: u32,
+    },
     /// Read end of a kernel pipe (Phase 14).
     PipeRead { pipe_id: usize },
     /// Write end of a kernel pipe (Phase 14).

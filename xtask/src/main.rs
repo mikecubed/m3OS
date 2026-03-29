@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Seek};
+use std::io::{self, Seek, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::SystemTime;
@@ -442,6 +442,15 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         "-netdev".to_string(),
         "user,id=net0".to_string(),
     ]);
+
+    // Phase 24: virtio-blk data disk.
+    let data_disk = uefi_image.parent().unwrap().join("disk.img");
+    if data_disk.exists() {
+        args.extend([
+            "-drive".to_string(),
+            format!("file={},format=raw,if=virtio", data_disk.display()),
+        ]);
+    }
 
     args.extend(["-no-reboot".to_string()]);
     args
@@ -957,10 +966,178 @@ fn signed_path(path: &Path) -> PathBuf {
     }
 }
 
+/// A Read+Write+Seek wrapper over a region of a file, used to expose a
+/// partition as if it were a standalone device for FAT formatting.
+struct PartitionSlice {
+    file: File,
+    offset: u64,
+    size: u64,
+}
+
+impl PartitionSlice {
+    fn new(file: File, offset: u64, size: u64) -> Self {
+        Self { file, offset, size }
+    }
+
+    /// Current position within the partition (relative to partition start).
+    fn partition_pos(&mut self) -> io::Result<u64> {
+        let abs = self.file.stream_position()?;
+        if abs < self.offset {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file cursor is before the start of the partition slice",
+            ));
+        }
+        Ok(abs - self.offset)
+    }
+}
+
+impl io::Read for PartitionSlice {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let pos = self.partition_pos()?;
+        if pos >= self.size {
+            return Ok(0);
+        }
+        let remaining = (self.size - pos) as usize;
+        let max_read = buf.len().min(remaining);
+        self.file.read(&mut buf[..max_read])
+    }
+}
+
+impl io::Write for PartitionSlice {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let pos = self.partition_pos()?;
+        if pos >= self.size {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "write past end of partition",
+            ));
+        }
+        let remaining = (self.size - pos) as usize;
+        let max_write = buf.len().min(remaining);
+        self.file.write(&buf[..max_write])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl io::Seek for PartitionSlice {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let new_partition_pos = match pos {
+            io::SeekFrom::Start(n) => i64::try_from(n).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
+            })?,
+            io::SeekFrom::End(n) => self.size as i64 + n,
+            io::SeekFrom::Current(n) => self.partition_pos()? as i64 + n,
+        };
+
+        if new_partition_pos < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start of partition",
+            ));
+        }
+
+        let abs = self.offset + new_partition_pos as u64;
+        self.file.seek(io::SeekFrom::Start(abs))?;
+        Ok(new_partition_pos as u64)
+    }
+}
+
+/// Create a 64 MB raw data disk image with an MBR partition table and a
+/// FAT32-formatted partition. The image is placed at `output_dir/disk.img`.
+/// Skips creation if the image already exists to preserve persisted data.
+fn create_data_disk(output_dir: &Path) -> PathBuf {
+    let disk_path = output_dir.join("disk.img");
+    if disk_path.exists() {
+        println!("Data disk: {} (existing, preserved)", disk_path.display());
+        return disk_path;
+    }
+    const DISK_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+    const SECTOR_SIZE: u64 = 512;
+    const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
+    let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
+    let partition_sectors = total_sectors - PARTITION_START_LBA;
+    let partition_offset = PARTITION_START_LBA as u64 * SECTOR_SIZE;
+    let partition_size = partition_sectors as u64 * SECTOR_SIZE;
+
+    // Create the disk image file, zeroed out.
+    let mut disk_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&disk_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: failed to create disk.img: {e}");
+            std::process::exit(1);
+        });
+    disk_file.set_len(DISK_SIZE).unwrap_or_else(|e| {
+        eprintln!("Error: failed to set disk.img size: {e}");
+        std::process::exit(1);
+    });
+
+    // Write MBR.
+    let mut mbr = [0u8; 512];
+
+    // Partition entry 1 at offset 446 (16 bytes).
+    let entry = &mut mbr[446..462];
+    entry[0] = 0x80; // status: active
+    entry[1] = 0xFE; // CHS start (LBA mode)
+    entry[2] = 0xFF;
+    entry[3] = 0xFF;
+    entry[4] = 0x0C; // type: FAT32 LBA
+    entry[5] = 0xFE; // CHS end (LBA mode)
+    entry[6] = 0xFF;
+    entry[7] = 0xFF;
+    // LBA start (little-endian u32)
+    entry[8..12].copy_from_slice(&PARTITION_START_LBA.to_le_bytes());
+    // Sector count (little-endian u32)
+    entry[12..16].copy_from_slice(&partition_sectors.to_le_bytes());
+
+    // MBR signature.
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    disk_file.seek(io::SeekFrom::Start(0)).unwrap();
+    disk_file.write_all(&mbr).unwrap_or_else(|e| {
+        eprintln!("Error: failed to write MBR: {e}");
+        std::process::exit(1);
+    });
+
+    // Format the partition area as FAT32.
+    let partition_file = disk_file.try_clone().unwrap_or_else(|e| {
+        eprintln!("Error: failed to clone disk file handle: {e}");
+        std::process::exit(1);
+    });
+    let mut partition = PartitionSlice::new(partition_file, partition_offset, partition_size);
+    partition.seek(io::SeekFrom::Start(0)).unwrap();
+
+    // Use 512 bytes/cluster (1 sector/cluster) to ensure enough clusters
+    // for FAT32 (needs >= 65525). With 63 MB / 512 B = ~129000 clusters.
+    let format_options = fatfs::FormatVolumeOptions::new()
+        .volume_label(*b"M3OS_DATA  ")
+        .fat_type(fatfs::FatType::Fat32)
+        .bytes_per_cluster(512);
+    fatfs::format_volume(&mut partition, format_options).unwrap_or_else(|e| {
+        eprintln!("Error: failed to format data disk partition as FAT32: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Data disk: {}", disk_path.display());
+    disk_path
+}
+
 fn cmd_image(image_args: &ImageArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+
+    // Phase 24: create a data disk image alongside the UEFI boot image.
+    let output_dir = uefi_image.parent().unwrap();
+    create_data_disk(output_dir);
 
     if !image_args.sign {
         return;
@@ -1323,6 +1500,7 @@ fn cmd_run() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
 }
 
@@ -1330,6 +1508,7 @@ fn cmd_run_gui() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
     launch_qemu(&uefi_image, QemuDisplayMode::Gui);
 }
 
