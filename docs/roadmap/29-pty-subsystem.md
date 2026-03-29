@@ -1,4 +1,4 @@
-# Phase 28 - PTY Subsystem
+# Phase 29 - PTY Subsystem
 
 ## Milestone Goal
 
@@ -71,7 +71,7 @@ terminal multiplexing.
 
 ## Companion Task List
 
-- [Phase 28 Task List](./tasks/28-pty-subsystem-tasks.md)
+- [Phase 29 Task List](./tasks/29-pty-subsystem-tasks.md)
 
 ## How Real OS Implementations Differ
 

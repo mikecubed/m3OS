@@ -1,4 +1,4 @@
-# Phase 31 - Build Tools and Scripting
+# Phase 32 - Build Tools and Scripting
 
 ## Milestone Goal
 
@@ -67,7 +67,7 @@ Editing one file and re-running `make` only recompiles the changed file.
 | Phase | Why needed |
 |---|---|
 | Phase 26 (Text Editor) | Edit Makefiles and source files |
-| Phase 30 (Compiler) | TCC for compilation |
+| Phase 31 (Compiler) | TCC for compilation |
 | Phase 24 (Persistent Storage) | File timestamps for make |
 
 ## Implementation Outline
@@ -93,7 +93,7 @@ Editing one file and re-running `make` only recompiles the changed file.
 
 ## Companion Task List
 
-- [Phase 31 Task List](./tasks/31-build-tools-tasks.md)
+- [Phase 32 Task List](./tasks/32-build-tools-tasks.md)
 
 ## How Real OS Implementations Differ
 

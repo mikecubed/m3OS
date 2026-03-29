@@ -80,22 +80,22 @@ Needs to be added or extended:
   plaintext. A minimal SHA-256 implementation (standalone C or Rust) avoids
   external dependencies.
 - **VFS metadata trait (ext2-ready)**: The `FileMetadata` abstraction in Track B
-  must be a filesystem-agnostic trait so that a future ext2 implementation (Phase
-  27b) can return native inode metadata directly. The trait should cover uid, gid,
-  mode, size, and timestamps. Each filesystem backend implements this trait — ext2
-  will store metadata natively in inodes, while FAT32 uses an overlay.
-- **FAT32 limitation**: FAT32 has no native support for Unix permissions or
-  ownership. For Phase 27, use an in-memory permission overlay: a `BTreeMap`
-  keyed by path that stores uid/gid/mode. Files default to uid=0, gid=0,
-  mode=0o644 (files) or 0o755 (dirs). This overlay does not persist across
-  reboots — acceptable for Phase 27 since ext2 (Phase 27b) will replace FAT32
-  as the primary persistent filesystem with native permission support.
+  must be a filesystem-agnostic trait so that Phase 28 (ext2) can return native
+  inode metadata directly. The trait should cover uid, gid, mode, size, and
+  timestamps. Each filesystem backend implements this trait — ext2 will store
+  metadata natively in inodes, while FAT32 uses a permissions index file.
+- **FAT32 permissions index file**: FAT32 has no native support for Unix
+  permissions or ownership. Store a `.m3os_permissions` index file on the FAT32
+  partition that maps `path → uid:gid:mode`. Read it into a `BTreeMap` on mount,
+  write it back on chmod/chown/file creation. Files default to uid=0, gid=0,
+  mode=0o644 (files) or 0o755 (dirs) if not in the index. This gives persistent
+  permissions across reboots until Phase 28 (ext2) replaces FAT32 entirely.
 - **Tmpfs and ramdisk**: These already exist in memory — add uid/gid/mode fields
   directly to their node structures.
 - **ext2 forward-compatibility**: All permission checks in Track C must go through
   the VFS metadata trait, never directly access FAT32/tmpfs/ramdisk internals.
-  This ensures ext2 can be added as a new backend without touching permission
-  enforcement code.
+  This ensures ext2 (Phase 28) can be added as a new backend without touching
+  permission enforcement code.
 - **Login flow**: init spawns `/bin/login` instead of shell. `login` reads
   `/etc/passwd`, prompts for username/password, verifies against `/etc/shadow`,
   then calls `setuid`/`setgid` and `execve` to spawn the user's shell.
@@ -126,7 +126,7 @@ backends.
 | P27-T007 | Define a `FileMetadata` struct and a `VfsMetadata` trait in the VFS layer: `uid: u32`, `gid: u32`, `mode: u16` (Unix permission bits including file type), `size: u64`, `mtime: u64`. The trait provides `fn metadata(&self, path) -> FileMetadata` and `fn set_metadata(&mut self, path, meta)`. Each filesystem backend (ramdisk, tmpfs, FAT32, and future ext2) implements this trait. Permission enforcement in Track C calls only the trait methods, never backend-specific code. |
 | P27-T008 | Extend **ramdisk** nodes (`kernel/src/fs/ramdisk.rs`): add `uid`, `gid`, `mode` fields to `RamdiskNode::File` and `RamdiskNode::Dir` variants. Default to uid=0, gid=0, mode=0o644 (files) or 0o755 (dirs). Populate these when creating new nodes. |
 | P27-T009 | Extend **tmpfs** nodes (`kernel/src/fs/tmpfs.rs`): add `uid`, `gid`, `mode` fields to tmpfs file/directory entries. Default to uid=0, gid=0, mode=0o644/0o755. |
-| P27-T010 | Handle **FAT32** metadata (`kernel/src/fs/fat32.rs`): since FAT32 has no native Unix permission support, use an in-memory overlay. Maintain a `BTreeMap<String, FileMetadata>` keyed by path for files on the FAT32 partition. Default all FAT32 files to uid=0, gid=0, mode=0o644 (files) or 0o755 (dirs). Chown/chmod updates modify the in-memory map. Persistence of this metadata is deferred (acceptable loss on reboot for Phase 27). |
+| P27-T010 | Handle **FAT32** metadata (`kernel/src/fs/fat32.rs`): since FAT32 has no native Unix permission support, implement a permissions index file. On mount, read `.m3os_permissions` from the FAT32 root into a `BTreeMap<String, FileMetadata>` keyed by path. Default all FAT32 files to uid=0, gid=0, mode=0o644 (files) or 0o755 (dirs) if not in the index. Chown/chmod updates modify the in-memory map AND write the updated index back to `.m3os_permissions` on disk. Format: one line per file, `path:uid:gid:mode` (text, easy to debug). |
 | P27-T011 | Update `sys_linux_fstat` to return real `st_uid`, `st_gid`, and `st_mode` from the file's metadata instead of hardcoded values. The stat struct layout must match Linux x86_64: `st_mode` at offset 24, `st_uid` at offset 28, `st_gid` at offset 32. |
 | P27-T012 | Update `sys_linux_open` to store the mode argument (arg2) when creating new files (`O_CREAT`). The mode should be applied to the newly created file's metadata. If no mode is specified, default to 0o644. |
 | P27-T013 | Implement `sys_linux_chmod` (syscall 90): resolve the path, verify the caller is the file owner or root (euid==0), then update the file's permission mode. Return 0 on success, -EPERM if not authorized, -ENOENT if not found. |
@@ -228,35 +228,18 @@ Modify the boot sequence so users must log in before accessing the shell.
 | P27-T062 | Acceptance: `adduser testuser` (as root) creates a new account; logging out and logging in as `testuser` works. |
 | P27-T063 | Acceptance: `cargo xtask check` passes (clippy + fmt) with all new code. |
 | P27-T064 | Acceptance: QEMU boot validation — full login cycle works without panics or regressions. Test with both `cargo xtask run` and `cargo xtask run-gui`. |
-| P27-T065 | Write `docs/27-user-accounts.md` (design doc): kernel UID/GID model, VFS permission enforcement architecture, password hashing scheme, login flow diagram, FAT32 metadata overlay design, and how this foundation enables Phase 29 (Telnet) and Phase 34 (SSH). |
+| P27-T065 | Write `docs/27-user-accounts.md` (design doc): kernel UID/GID model, VFS permission enforcement architecture, password hashing scheme, login flow diagram, FAT32 metadata overlay design, and how this foundation enables Phase 30 (Telnet) and Phase 35 (SSH). |
 
 ---
 
-## Follow-Up: Phase 27b — ext2 Filesystem
+## Follow-Up: Phase 28 — ext2 Filesystem
 
-Phase 27's FAT32 permission overlay is intentionally temporary. FAT32 has no
-native Unix metadata, so permissions are lost on reboot. **Phase 27b** adds an
-ext2 filesystem implementation that stores uid/gid/mode/timestamps natively in
-inodes, replacing FAT32 as the primary persistent filesystem.
+Phase 27's FAT32 permissions index file is a functional workaround, but FAT32
+was never designed for Unix metadata. **Phase 28** adds an ext2 filesystem
+implementation that stores uid/gid/mode/timestamps natively in inodes, replacing
+FAT32 as the primary persistent filesystem.
 
-**Why ext2:**
-- Native Unix permissions in every inode (uid, gid, mode, timestamps)
-- Simple and well-documented (no journaling complexity like ext3/ext4)
-- Standard Linux tools (`mkfs.ext2`, `debugfs`, `e2fsck`) for image creation
-- Fits naturally on the existing virtio-blk device
-
-**Scope of Phase 27b:**
-- ext2 superblock, block group descriptor, and inode table parsing
-- Block bitmap and inode bitmap allocation
-- Directory entry reading and creation (linked-list format)
-- File read/write via direct, indirect, and double-indirect blocks
-- Implement the `VfsMetadata` trait from Phase 27 (native inode metadata)
-- `mkfs.ext2` in the xtask image builder (or use host `mkfs.ext2`)
-- Mount ext2 as `/data` instead of FAT32
-- Migrate `/etc/passwd`, `/etc/shadow`, `/etc/group` to ext2
-
-**Phase 27b depends on:** Phase 24 (Persistent Storage), Phase 27 (VFS metadata
-trait). **Feeds into:** Phase 28+ get persistent permissions for free.
+See [Phase 28 — ext2 Filesystem](../28-ext2-filesystem.md) for full scope.
 
 Phase 27's `VfsMetadata` trait is specifically designed so that ext2 can implement
 it natively without any changes to the permission enforcement code in Track C.
@@ -267,7 +250,7 @@ it natively without any changes to the permission enforcement code in Track C.
 
 These items are explicitly out of scope for Phase 27:
 
-- **ext2 filesystem** — deferred to Phase 27b (see above)
+- **ext2 filesystem** — deferred to Phase 28 (see above)
 - PAM (Pluggable Authentication Modules)
 - NSS (Name Service Switch) for external user databases
 - Supplementary groups (user in multiple groups)
@@ -279,8 +262,8 @@ These items are explicitly out of scope for Phase 27:
 - Account lockout after failed login attempts
 - `/dev/urandom` or proper entropy source (use TSC-based PRNG for salt)
 - ACLs (Access Control Lists) beyond rwxrwxrwx
-- Persistent FAT32 permission metadata (in-memory overlay is sufficient; ext2
-  in Phase 27b provides the real solution)
+- Persistent FAT32 permission metadata beyond the index file (ext2 in Phase 28
+  provides the real solution)
 - Password aging and expiration fields in /etc/shadow
 - `umask` syscall and per-process file creation mask
 - `sudo` (deferred — su is sufficient for Phase 27)

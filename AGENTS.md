@@ -236,4 +236,4 @@ Read before making significant changes:
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
-Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–37) with corresponding `docs/roadmap/tasks/` breakdowns.
+Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–38) with corresponding `docs/roadmap/tasks/` breakdowns.
