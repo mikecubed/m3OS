@@ -1788,6 +1788,14 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Err(()) => return NEG_EFAULT,
     };
 
+    // Phase 27: Execute permission check.
+    if let Some((fu, fg, fm)) = path_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(fu, fg, fm, euid, egid, 1) {
+            return NEG_EACCES;
+        }
+    }
+
     // Read the binary from the ramdisk (get_file handles both absolute and bare names).
     let data = match crate::fs::ramdisk::get_file(name) {
         Some(d) => d,
@@ -2859,6 +2867,19 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         2 => (true, true),      // O_RDWR
         _ => return NEG_EINVAL, // invalid combination
     };
+
+    // Phase 27: Permission check for existing files.
+    let create = (flags & 0x40) != 0; // O_CREAT
+    if !create || path_metadata(name).is_some() {
+        if let Some((fu, fg, fm)) = path_metadata(name) {
+            let (_, _, euid, egid) = current_process_ids();
+            let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
+            if required != 0 && !check_permission(fu, fg, fm, euid, egid, required) {
+                return NEG_EACCES;
+            }
+        }
+    }
+
     // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
     // Placed after flags decode so O_RDONLY/O_WRONLY are respected.
     if name == "/dev/null" {
@@ -3512,6 +3533,72 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
 // Phase 27: chmod, fchmod, chown, fchown
 // ---------------------------------------------------------------------------
 
+const NEG_EACCES: u64 = (-13_i64) as u64;
+
+// ---------------------------------------------------------------------------
+// Phase 27 Track C: Permission enforcement
+// ---------------------------------------------------------------------------
+
+/// Check if a caller has the required permission on a file/directory.
+///
+/// `required` is a bitmask: 4=read, 2=write, 1=execute.
+/// Returns true if access is allowed.
+fn check_permission(
+    file_uid: u32,
+    file_gid: u32,
+    file_mode: u16,
+    caller_uid: u32,
+    caller_gid: u32,
+    required: u8,
+) -> bool {
+    // Root bypasses all permission checks.
+    if caller_uid == 0 {
+        return true;
+    }
+
+    let bits = if caller_uid == file_uid {
+        ((file_mode >> 6) & 0o7) as u8
+    } else if caller_gid == file_gid {
+        ((file_mode >> 3) & 0o7) as u8
+    } else {
+        (file_mode & 0o7) as u8
+    };
+
+    (bits & required) == required
+}
+
+/// Get file metadata for permission checking on a resolved absolute path.
+fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        if let Ok(s) = tmpfs.stat(rel) {
+            return Some((s.uid, s.gid, s.mode));
+        }
+        return None;
+    }
+    if let Some(rel) = abs_path.strip_prefix("/data/") {
+        return Some(crate::fs::fat32::get_fat32_meta(rel));
+    }
+    if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
+        return Some((0, 0, 0o755));
+    }
+    if abs_path == "/" || abs_path.starts_with("/dev") || abs_path.starts_with("/proc") {
+        return Some((0, 0, 0o755));
+    }
+    None
+}
+
+/// Get metadata for the parent directory of a path.
+fn parent_dir_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    let trimmed = abs_path.trim_end_matches('/');
+    if let Some(pos) = trimmed.rfind('/') {
+        let parent = if pos == 0 { "/" } else { &trimmed[..pos] };
+        path_metadata(parent)
+    } else {
+        path_metadata("/")
+    }
+}
+
 /// Helper to resolve a path and apply a metadata-changing operation.
 /// Returns the filesystem-relative path and which FS it belongs to.
 enum FsTarget {
@@ -4112,6 +4199,14 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, name);
 
+    // Phase 27: Execute (search) permission on target directory.
+    if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(fu, fg, fm, euid, egid, 1) {
+            return NEG_EACCES;
+        }
+    }
+
     // Verify the resolved path exists and is a directory.
     if !is_directory(&resolved) {
         // Path is not a directory — check if it exists at all to choose error.
@@ -4435,6 +4530,14 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
+    // Phase 27: Write permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 2) {
+            return NEG_EACCES;
+        }
+    }
+
     // Phase 24: FAT32 /data mkdir.
     if let Some(rel) = fat32_relative_path(name) {
         if rel.is_empty() {
@@ -4501,10 +4604,17 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+
+    // Phase 27: Write permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 2) {
+            return NEG_EACCES;
+        }
+    }
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
@@ -4544,6 +4654,14 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+
+    // Phase 27: Write permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 2) {
+            return NEG_EACCES;
+        }
+    }
 
     // Phase 24: FAT32 /data unlink.
     if let Some(rel) = fat32_relative_path(name) {
@@ -4626,6 +4744,21 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let old_str_raw = core::str::from_utf8(&old_owned[..old_len]).unwrap();
     let old_resolved = resolve_path(&cwd, old_str_raw);
     let new_resolved = resolve_path(&cwd, new_raw);
+
+    // Phase 27: Write permission on both parent directories.
+    {
+        let (_, _, euid, egid) = current_process_ids();
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 2) {
+                return NEG_EACCES;
+            }
+        }
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 2) {
+                return NEG_EACCES;
+            }
+        }
+    }
 
     let old_rel = match tmpfs_relative_path(&old_resolved) {
         Some(r) => r,

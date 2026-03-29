@@ -166,6 +166,20 @@ pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_MOUNT: u64 = 165;
 
+// Phase 27: User identity and file permission syscalls
+pub const SYS_CHMOD: u64 = 90;
+pub const SYS_FCHMOD: u64 = 91;
+pub const SYS_CHOWN: u64 = 92;
+pub const SYS_FCHOWN: u64 = 93;
+pub const SYS_GETUID: u64 = 102;
+pub const SYS_GETGID: u64 = 104;
+pub const SYS_SETUID: u64 = 105;
+pub const SYS_SETGID: u64 = 106;
+pub const SYS_GETEUID: u64 = 107;
+pub const SYS_GETEGID: u64 = 108;
+pub const SYS_SETREUID: u64 = 113;
+pub const SYS_SETREGID: u64 = 114;
+
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 
@@ -528,6 +542,50 @@ pub fn exit(code: i32) -> ! {
         syscall1(SYS_EXIT, code as u64);
     }
     loop {}
+}
+
+// ===========================================================================
+// High-level wrappers — User identity (Phase 27)
+// ===========================================================================
+
+/// Get the real user ID of the calling process.
+pub fn getuid() -> u32 {
+    unsafe { syscall0(SYS_GETUID) as u32 }
+}
+
+/// Get the real group ID of the calling process.
+pub fn getgid() -> u32 {
+    unsafe { syscall0(SYS_GETGID) as u32 }
+}
+
+/// Get the effective user ID of the calling process.
+pub fn geteuid() -> u32 {
+    unsafe { syscall0(SYS_GETEUID) as u32 }
+}
+
+/// Get the effective group ID of the calling process.
+pub fn getegid() -> u32 {
+    unsafe { syscall0(SYS_GETEGID) as u32 }
+}
+
+/// Set the user ID of the calling process.
+pub fn setuid(uid: u32) -> isize {
+    unsafe { syscall1(SYS_SETUID, uid as u64) as isize }
+}
+
+/// Set the group ID of the calling process.
+pub fn setgid(gid: u32) -> isize {
+    unsafe { syscall1(SYS_SETGID, gid as u64) as isize }
+}
+
+/// Change file mode bits. `path` must be null-terminated.
+pub fn chmod(path: &[u8], mode: u16) -> isize {
+    unsafe { syscall2(SYS_CHMOD, path.as_ptr() as u64, mode as u64) as isize }
+}
+
+/// Change file ownership. `path` must be null-terminated.
+pub fn chown(path: &[u8], uid: u32, gid: u32) -> isize {
+    unsafe { syscall3(SYS_CHOWN, path.as_ptr() as u64, uid as u64, gid as u64) as isize }
 }
 
 // ===========================================================================
