@@ -38,10 +38,131 @@ pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
     }
 }
 
-/// Set metadata for a FAT32 file in the permissions index.
+/// Set metadata for a FAT32 file in the permissions index and persist to disk.
 pub fn set_fat32_meta(path: &str, uid: u32, gid: u32, mode: u16) {
+    {
+        let mut perms = FAT32_PERMISSIONS.lock();
+        perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
+    }
+    // Persist the updated index to disk.
+    save_permissions_index();
+}
+
+/// Name of the on-disk permissions index file in the FAT32 root.
+const PERMS_INDEX_FILE: &str = ".m3os_permissions";
+
+/// Load the `.m3os_permissions` index from the FAT32 root into memory.
+///
+/// Format: one line per entry, `path:uid:gid:mode\n` (text).
+/// Called during mount. Silently ignores missing/corrupt index.
+pub fn load_permissions_index() {
+    let vol_guard = FAT32_VOLUME.lock();
+    let vol = match vol_guard.as_ref() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let entry = match vol.lookup(PERMS_INDEX_FILE) {
+        Ok(e) => e,
+        Err(_) => return, // No index file yet — use defaults.
+    };
+
+    let size = entry.file_size as usize;
+    if size == 0 || size > 64 * 1024 {
+        return; // Empty or suspiciously large.
+    }
+
+    let mut buf = vec![0u8; size];
+    let read = match vol.read_file(entry.start_cluster(), entry.file_size, 0, &mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    let text = match core::str::from_utf8(&buf[..read]) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
     let mut perms = FAT32_PERMISSIONS.lock();
-    perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // Format: path:uid:gid:mode
+        let mut parts = line.splitn(4, ':');
+        let path = match parts.next() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        let uid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let gid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mode: u16 = parts
+            .next()
+            .and_then(|s| u16::from_str_radix(s, 8).ok())
+            .unwrap_or(0o755);
+        perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
+    }
+
+    let count = perms.len();
+    log::info!(
+        "[fat32] loaded {} permission entries from {}",
+        count,
+        PERMS_INDEX_FILE
+    );
+}
+
+/// Persist the in-memory permissions index to `.m3os_permissions` on disk.
+///
+/// Serializes as `path:uid:gid:mode\n` (mode in octal).
+fn save_permissions_index() {
+    let perms = FAT32_PERMISSIONS.lock();
+    if perms.is_empty() {
+        return;
+    }
+
+    // Serialize to a text buffer.
+    let mut buf = String::new();
+    for (path, meta) in perms.iter() {
+        use core::fmt::Write;
+        let _ = writeln!(buf, "{}:{}:{}:{:o}", path, meta.uid, meta.gid, meta.mode);
+    }
+    drop(perms);
+
+    let data = buf.as_bytes();
+
+    // Write to the FAT32 volume.
+    let mut vol_guard = FAT32_VOLUME.lock();
+    let vol = match vol_guard.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Look up the existing file or create it.
+    let (start_cluster, current_size) = match vol.lookup(PERMS_INDEX_FILE) {
+        Ok(entry) => (entry.start_cluster(), entry.file_size as usize),
+        Err(_) => {
+            // Create the file in the root directory.
+            match vol.create_file(vol.bpb.root_cluster, PERMS_INDEX_FILE) {
+                Ok(_) => (0u32, 0usize),
+                Err(_) => return,
+            }
+        }
+    };
+
+    match vol.write_file(start_cluster, 0, data, current_size) {
+        Ok((new_cluster, new_size)) => {
+            // Update the directory entry with the new size.
+            let _ = vol.update_dir_entry(
+                vol.bpb.root_cluster,
+                PERMS_INDEX_FILE,
+                new_cluster,
+                new_size as u32,
+            );
+        }
+        Err(e) => {
+            log::warn!("[fat32] failed to save permissions index: {:?}", e);
+        }
+    }
 }
 
 /// A mounted FAT32 volume backed by virtio-blk sectors.
@@ -684,6 +805,8 @@ pub fn mount_fat32(base_lba: u64) -> Result<(), Fat32Error> {
     let vol = Fat32Volume::mount(base_lba)?;
     *FAT32_VOLUME.lock() = Some(vol);
     log::info!("[fat32] volume mounted at base LBA {}", base_lba);
+    // Phase 27: Load persisted permissions from .m3os_permissions index file.
+    load_permissions_index();
     Ok(())
 }
 
