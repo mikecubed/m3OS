@@ -21,6 +21,8 @@ Each phase page includes:
 - Keep each phase runnable before moving on.
 - Add documentation alongside implementation, not afterward.
 - Defer performance and advanced hardware support until the core ideas are clear.
+- Borrow existing open-source software where it makes sense — porting teaches as much
+  as writing from scratch.
 
 ## Milestone Dependency Map
 
@@ -70,8 +72,35 @@ flowchart TD
     P15 --> P24
     P17 --> P25["Phase 25<br/>SMP"]
     P4 --> P25
-    P20 --> P26["Phase 26<br/>Compiler Bootstrap"]
+
+    %% Productivity phases
+    P22 --> P26["Phase 26<br/>Text Editor"]
     P24 --> P26
+    P12 --> P27["Phase 27<br/>User Accounts"]
+    P24 --> P27
+    P22 --> P28["Phase 28<br/>PTY Subsystem"]
+    P27 --> P28
+    P23 --> P29["Phase 29<br/>Telnet Server"]
+    P27 --> P29
+    P28 --> P29
+    P26 --> P30["Phase 30<br/>Compiler Bootstrap"]
+    P14 --> P30
+    P30 --> P31["Phase 31<br/>Build Tools"]
+    P26 --> P31
+    P14 --> P32["Phase 32<br/>Expanded Coreutils"]
+    P27 --> P32
+    P30 --> P33["Phase 33<br/>Crypto Primitives"]
+    P33 --> P34["Phase 34<br/>SSH Server"]
+    P28 --> P34
+    P27 --> P34
+    P12 --> P35["Phase 35<br/>Rust Cross-Compilation"]
+    P24 --> P35
+    P30 --> P36["Phase 36<br/>Ports System"]
+    P31 --> P36
+    P32 --> P36
+    P27 --> P37["Phase 37<br/>System Services"]
+    P29 --> P37
+    P24 --> P37
 ```
 
 ## Milestone Summary
@@ -91,7 +120,7 @@ flowchart TD
 | 9 | Framebuffer and Shell | Text UI and tiny shell become usable | [Phase 9](./09-framebuffer-and-shell.md) | [Tasks](./tasks/09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot | Kernel boots on real hardware with Secure Boot on | [Phase 10](./10-secure-boot.md) | [Tasks](./tasks/10-secure-boot-tasks.md) |
 
-### POSIX and Userspace Phases
+### POSIX and Userspace Phases (complete)
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
@@ -102,7 +131,7 @@ flowchart TD
 | 15 | Hardware Discovery | ACPI + PCI enumeration; APIC replaces legacy PIC | [Phase 15](./15-hardware-discovery.md) | [Tasks](./tasks/15-hardware-discovery-tasks.md) |
 | 16 | Network | virtio-net driver and minimal TCP/IP stack | [Phase 16](./16-network.md) | [Tasks](./tasks/16-network-tasks.md) |
 
-### Usability Phases
+### Usability Phases (complete)
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
@@ -111,16 +140,28 @@ flowchart TD
 | 19 | Signal Handlers | User signal handlers, trampolines, `sigreturn` | [Phase 19](./19-signal-handlers.md) | [Tasks](./tasks/19-signal-handlers-tasks.md) |
 | 20 | Userspace Init and Shell | Ring-3 PID 1 init, remove kernel shell | [Phase 20](./20-userspace-init-shell.md) | [Tasks](./tasks/20-userspace-init-shell-tasks.md) |
 | 21 | Ion Shell Integration | ion (Redox OS shell) replaces the minimal custom shell | [Phase 21](./21-ion-shell.md) | [Tasks](./tasks/21-ion-shell-tasks.md) |
-| 22 | TTY and Terminal Control | termios, cooked/raw mode, PTY pairs | [Phase 22](./22-tty-pty.md) | [Tasks](./tasks/22-tty-pty-tasks.md) |
+| 22 | TTY and Terminal Control | termios, cooked/raw mode, PTY stubs | [Phase 22](./22-tty-pty.md) | [Tasks](./tasks/22-tty-pty-tasks.md) |
+| 22b | ANSI Escape Sequences | VT100 CSI parser, cursor movement, SGR colors | [Phase 22](./22-tty-pty.md) | [Tasks](./tasks/22b-ansi-escape-tasks.md) |
 | 23 | Socket API | BSD socket syscalls over TCP/UDP stack | [Phase 23](./23-socket-api.md) | [Tasks](./tasks/23-socket-api-tasks.md) |
 | 24 | Persistent Storage | virtio-blk driver, FAT32 read/write | [Phase 24](./24-persistent-storage.md) | [Tasks](./tasks/24-persistent-storage-tasks.md) |
+| 25 | SMP | All CPU cores run the scheduler simultaneously | [Phase 25](./25-smp.md) | [Tasks](./tasks/25-smp-tasks.md) |
 
-### Advanced Phases (deferred)
+### Productivity Phases (planned — "do real work inside the OS")
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
-| 25 | SMP | All CPU cores run the scheduler simultaneously | [Phase 25](./25-smp.md) | [Tasks](./tasks/25-smp-tasks.md) |
-| 26 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 26](./26-compiler-bootstrap.md) | *not yet created* |
+| 26 | Text Editor | Full-screen editor for creating and modifying files | [Phase 26](./26-text-editor.md) | *not yet created* |
+| 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | *not yet created* |
+| 28 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 28](./28-pty-subsystem.md) | *not yet created* |
+| 29 | Telnet Server | Remote shell access over the network | [Phase 29](./29-telnet-server.md) | *not yet created* |
+| 30 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 30](./30-compiler-bootstrap.md) | *not yet created* |
+| 31 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 31](./31-build-tools.md) | *not yet created* |
+| 32 | Expanded Coreutils | head, tail, sort, find, diff, ps, less, and more | [Phase 32](./32-expanded-coreutils.md) | *not yet created* |
+| 33 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 33](./33-crypto-primitives.md) | *not yet created* |
+| 34 | SSH Server | Encrypted remote shell access | [Phase 34](./34-ssh-server.md) | *not yet created* |
+| 35 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 35](./35-rust-cross-compilation.md) | *not yet created* |
+| 36 | Ports System | Source-based package building and installation | [Phase 36](./36-ports-system.md) | *not yet created* |
+| 37 | System Services | Service manager, syslog, cron, shutdown | [Phase 37](./37-system-services.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
@@ -151,22 +192,34 @@ gantt
     Writable FS          :done, p13, after p8, 1
     Shell and Tools      :done, p14, after p12, 1
 
-    section Hardware (in progress)
-    Hardware Discovery   :active, p15, after p3, 1
-    Network              :active, p16, after p15, 1
+    section Hardware and Network (complete)
+    Hardware Discovery   :done, p15, after p3, 1
+    Network              :done, p16, after p15, 1
 
-    section Usability
-    Memory Reclamation   :p17, after p14, 1
-    Directory and VFS    :p18, after p17, 1
-    Signal Handlers      :p19, after p18, 1
-    Userspace Init       :p20, after p19, 1
-    TTY and Terminal     :p21, after p20, 1
-    Socket API           :p22, after p16, 1
-    Persistent Storage   :p23, after p18, 1
+    section Usability (complete)
+    Memory Reclamation   :done, p17, after p14, 1
+    Directory and VFS    :done, p18, after p17, 1
+    Signal Handlers      :done, p19, after p18, 1
+    Userspace Init       :done, p20, after p19, 1
+    Ion Shell            :done, p21, after p20, 1
+    TTY and Terminal     :done, p22, after p21, 1
+    Socket API           :done, p23, after p22, 1
+    Persistent Storage   :done, p24, after p18, 1
+    SMP                  :done, p25, after p17, 1
 
-    section Advanced
-    SMP                  :p24, after p17, 1
-    Compiler Bootstrap   :p25, after p23, 1
+    section Productivity (planned)
+    Text Editor          :active, p26, after p24, 1
+    User Accounts        :p27, after p26, 1
+    PTY Subsystem        :p28, after p27, 1
+    Telnet Server        :p29, after p28, 1
+    Compiler Bootstrap   :p30, after p26, 1
+    Build Tools          :p31, after p30, 1
+    Expanded Coreutils   :p32, after p27, 1
+    Crypto Primitives    :p33, after p30, 1
+    SSH Server           :p34, after p33, 1
+    Rust Cross-Compile   :p35, after p24, 1
+    Ports System         :p36, after p31, 1
+    System Services      :p37, after p29, 1
 ```
 
 ## Required Documentation for Every Phase

@@ -1,10 +1,10 @@
-# Phase 26 - Compiler Bootstrap
+# Phase 30 - Compiler Bootstrap
 
 ## Milestone Goal
 
 Run a C compiler natively inside the OS. A C source file written at the shell prompt
-can be compiled and executed without leaving the OS. The ultimate target is
-self-hosting: the compiler compiles itself.
+(using the editor from Phase 26) can be compiled and executed without leaving the OS.
+The ultimate target is self-hosting: the compiler compiles itself.
 
 ```mermaid
 flowchart TD
@@ -17,6 +17,8 @@ flowchart TD
 
     subgraph OS["inside the OS"]
         Image --> Shell["shell"]
+        Shell -->|"edit hello.c"| Editor["text editor"]
+        Editor -->|"save"| Source["hello.c"]
         Shell -->|"tcc hello.c -o hello"| TCC_run["tcc (running)"]
         TCC_run -->|"writes ELF"| Hello["hello (ELF binary)"]
         Shell -->|"./hello"| Hello
@@ -31,15 +33,16 @@ flowchart TD
 - Understand what "bootstrapping" means: deriving a tool from itself.
 - See what a compiler actually needs from an OS: file I/O, heap, process execution.
 - Learn why musl is the right libc target for a resource-constrained system.
+- Experience the edit-compile-run cycle inside your own OS.
 
 ## Feature Scope
 
 **Path A — TinyCC (primary)**
 
-- TinyCC (TCC) cross-compiled on the host targeting x86-64 ELF, linked against musl
-- musl `libc.a` and C headers bundled in the disk image at `/usr/lib` and `/usr/include`
-- `tcc hello.c -o hello` works inside the OS
-- `tcc tcc.c -o tcc2` works inside the OS (self-hosting milestone)
+- TinyCC (TCC) cross-compiled on the host targeting x86-64 ELF, linked against musl.
+- musl `libc.a` and C headers bundled in the disk image at `/usr/lib` and `/usr/include`.
+- `tcc hello.c -o hello` works inside the OS.
+- `tcc tcc.c -o tcc2` works inside the OS (self-hosting milestone).
 
 **Path B — Native tiny language (alternative)**
 
@@ -55,14 +58,13 @@ enables running unmodified C programs from the wider ecosystem.
 
 ## Prerequisites
 
-This phase depends on all of the following being complete:
-
 | Phase | Why needed |
 |---|---|
 | Phase 11 (Process Model) | ELF loader, `execve`, `fork`, `wait` |
 | Phase 12 (POSIX Compat) | `open`/`read`/`write`, `brk`/`mmap`, musl-compatible syscalls |
 | Phase 13 (Writable FS) | `/tmp` for intermediate object files and output binaries |
-| Phase 14 (Shell + Tools) | interactive shell, pipes, `PATH` lookup for running the compiler |
+| Phase 14 (Shell + Tools) | Interactive shell, pipes, `PATH` lookup for running the compiler |
+| Phase 26 (Text Editor) | Edit source code inside the OS before compiling |
 
 ## Implementation Outline
 
@@ -70,7 +72,7 @@ This phase depends on all of the following being complete:
 2. Verify the resulting binary is a static x86-64 ELF linked against musl.
 3. Add TCC binary, musl `libc.a`, and the musl headers to the disk image build in xtask.
 4. Boot the OS and verify `tcc --version` prints the expected string.
-5. Write a `hello.c` inside the OS using the shell, compile it, and run it.
+5. Write a `hello.c` inside the OS using the editor, compile it, and run it.
 6. Compile a slightly larger program (e.g., a fibonacci calculator) to stress the heap.
 7. Attempt the self-hosting milestone: `tcc /usr/src/tcc/tcc.c -o /tmp/tcc2`.
 8. Verify the self-compiled TCC produces identical output for `hello.c`.
@@ -85,22 +87,22 @@ This phase depends on all of the following being complete:
 
 ## Companion Task List
 
-- [Phase 26 Task List](./tasks/26-compiler-bootstrap-tasks.md)
+- [Phase 30 Task List](./tasks/30-compiler-bootstrap-tasks.md)
 
 ## Documentation Deliverables
 
-- explain what "bootstrapping" means and why it is a meaningful milestone
-- document what TCC needs from the OS and how each syscall maps to OS functionality
-- explain the musl libc build process and what headers/libs end up in the image
-- document Path B and when it is the right choice vs. Path A
-- write a short essay on the history of compiler bootstrapping (Ken Thompson's
-  "Trusting Trust" lecture is the canonical reference)
+- Explain what "bootstrapping" means and why it is a meaningful milestone.
+- Document what TCC needs from the OS and how each syscall maps to OS functionality.
+- Explain the musl libc build process and what headers/libs end up in the image.
+- Document Path B and when it is the right choice vs. Path A.
+- Write a short essay on the history of compiler bootstrapping (Ken Thompson's
+  "Trusting Trust" lecture is the canonical reference).
 
 ## How Real OS Implementations Differ
 
 Real systems ship with a full toolchain: compiler, assembler, linker, debugger, make,
 and a package manager. Bootstrapping a modern Linux distribution from source requires
-a carefully ordered multi-stage build (tarballs → stage-1 gcc → stage-2 gcc → full
+a carefully ordered multi-stage build (tarballs -> stage-1 gcc -> stage-2 gcc -> full
 system) documented by projects like Linux From Scratch. This phase achieves the same
 conceptual milestone — a system that can build and run its own tools — using TCC's
 single-file simplicity instead of a multi-stage GCC build.
@@ -108,8 +110,6 @@ single-file simplicity instead of a multi-stage GCC build.
 ## Deferred Until Later
 
 - GCC or Clang as the native compiler
-- dynamic linking and shared libraries
-- a package manager or ports tree
-- make or other build tools
-- debugger support (`gdb` or `lldb`)
-- multi-stage bootstrap to remove host-compiled binaries from the chain entirely
+- Dynamic linking and shared libraries
+- Debugger support (`gdb` or `lldb`)
+- Multi-stage bootstrap to remove host-compiled binaries from the chain entirely
