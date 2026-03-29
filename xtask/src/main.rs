@@ -121,6 +121,7 @@ fn build_userspace_bins() {
         ("init", "init", false),
         ("shell", "sh0", false),
         ("edit", "edit", true),
+        ("login", "login", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -198,6 +199,9 @@ fn build_musl_bins() {
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
+        // Phase 27: user identity utilities
+        ("userspace/coreutils/id.c", "id"),
+        ("userspace/coreutils/whoami.c", "whoami"),
     ];
 
     for (src_rel, name) in bins {
@@ -1136,7 +1140,37 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         std::process::exit(1);
     });
 
-    println!("Data disk: {}", disk_path.display());
+    // Phase 27: Populate /etc with user account configuration files.
+    partition.seek(io::SeekFrom::Start(0)).unwrap();
+    {
+        let fs = fatfs::FileSystem::new(&mut partition, fatfs::FsOptions::new())
+            .expect("failed to open FAT32 for populating /etc");
+        let root_dir = fs.root_dir();
+        match root_dir.create_dir("etc") {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("failed to create /etc on data disk: {e}"),
+        }
+
+        // /etc/passwd
+        let passwd = b"root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
+        let mut f = root_dir.create_file("etc/passwd").expect("create passwd");
+        f.truncate().unwrap();
+        f.write_all(passwd).expect("write passwd");
+
+        // /etc/shadow (hashed passwords for root:root and user:user)
+        let shadow = b"root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
+        let mut f = root_dir.create_file("etc/shadow").expect("create shadow");
+        f.truncate().unwrap();
+        f.write_all(shadow).expect("write shadow");
+
+        // /etc/group
+        let group = b"root:x:0:root\nuser:x:1000:user\n";
+        let mut f = root_dir.create_file("etc/group").expect("create group");
+        f.truncate().unwrap();
+        f.write_all(group).expect("write group");
+    }
+    println!("Data disk: {} (with /etc files)", disk_path.display());
     disk_path
 }
 
