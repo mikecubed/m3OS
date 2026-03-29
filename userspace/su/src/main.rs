@@ -35,15 +35,15 @@ pub extern "C" fn _start() -> ! {
         // Prompt for target user's password.
         write_str(STDOUT_FILENO, "Password: ");
         let saved = disable_echo();
-        let mut password = [0u8; 128];
-        let plen = read_line(&mut password);
+        let mut pw_input = [0u8; 128];
+        let plen = read_line(&mut pw_input);
         restore_echo(saved);
         let _ = write(STDOUT_FILENO, b"\n");
 
         // Verify against /etc/shadow.
         let mut shadow_buf = [0u8; 2048];
         let shadow_len = read_file(b"/data/etc/shadow\0", &mut shadow_buf);
-        if shadow_len == 0 || !verify_shadow(&shadow_buf[..shadow_len], target, &password[..plen]) {
+        if shadow_len == 0 || !verify_shadow(&shadow_buf[..shadow_len], target, &pw_input[..plen]) {
             write_str(STDOUT_FILENO, "su: Authentication failure\n");
             exit(1);
         }

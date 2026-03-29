@@ -185,10 +185,10 @@ pub fn verify_password(password: &[u8], shadow_entry: &[u8]) -> bool {
     let hex_salt = &rest[..dollar_pos];
     let hex_hash = &rest[dollar_pos + 1..];
 
-    let mut salt = [0u8; 32];
-    let salt_len = from_hex(hex_salt, &mut salt);
+    let mut parsed_salt = [0u8; 32];
+    let salt_len = from_hex(hex_salt, &mut parsed_salt);
 
-    let computed = hash_password(password, &salt[..salt_len]);
+    let computed = hash_password(password, &parsed_salt[..salt_len]);
 
     let mut computed_hex = [0u8; 64];
     to_hex(&computed, &mut computed_hex);

@@ -42,15 +42,15 @@ pub extern "C" fn _start() -> ! {
     if euid != 0 {
         write_str(STDOUT_FILENO, "Current password: ");
         let saved = disable_echo();
-        let mut cur_pw = [0u8; 128];
-        let cur_len = read_line(&mut cur_pw);
+        let mut cur_input = [0u8; 128];
+        let cur_len = read_line(&mut cur_input);
         restore_echo(saved);
         let _ = write(STDOUT_FILENO, b"\n");
 
         let mut shadow_buf = [0u8; 2048];
         let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
         if shadow_len == 0
-            || !verify_shadow(&shadow_buf[..shadow_len], username, &cur_pw[..cur_len])
+            || !verify_shadow(&shadow_buf[..shadow_len], username, &cur_input[..cur_len])
         {
             write_str(STDOUT_FILENO, "passwd: Authentication failure\n");
             exit(1);
@@ -60,8 +60,8 @@ pub extern "C" fn _start() -> ! {
     // Get new password.
     write_str(STDOUT_FILENO, "New password: ");
     let saved = disable_echo();
-    let mut new_pw = [0u8; 128];
-    let new_len = read_line(&mut new_pw);
+    let mut new_input = [0u8; 128];
+    let new_len = read_line(&mut new_input);
     restore_echo(saved);
     let _ = write(STDOUT_FILENO, b"\n");
 
@@ -72,14 +72,14 @@ pub extern "C" fn _start() -> ! {
     restore_echo(saved2);
     let _ = write(STDOUT_FILENO, b"\n");
 
-    if new_len != confirm_len || new_pw[..new_len] != confirm[..confirm_len] {
+    if new_len != confirm_len || new_input[..new_len] != confirm[..confirm_len] {
         write_str(STDOUT_FILENO, "passwd: passwords don't match\n");
         exit(1);
     }
 
     // Generate new hash with a simple salt from username bytes.
     let salt = username; // Use username as salt (simple but deterministic).
-    let hash = syscall_lib::sha256::hash_password(&new_pw[..new_len], salt);
+    let hash = syscall_lib::sha256::hash_password(&new_input[..new_len], salt);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];

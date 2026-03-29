@@ -32,11 +32,11 @@ fn login_once() {
 
     // Disable echo for password input.
     let saved = disable_echo();
-    let mut password = [0u8; 128];
-    let plen = read_line(&mut password);
+    let mut pw_input = [0u8; 128];
+    let plen = read_line(&mut pw_input);
     restore_echo(saved);
     let _ = write(STDOUT_FILENO, b"\n");
-    let password = &password[..plen];
+    let pw_input = &pw_input[..plen];
 
     // Look up user in /etc/passwd.
     let mut passwd_buf = [0u8; 2048];
@@ -62,7 +62,7 @@ fn login_once() {
         return;
     }
 
-    if !verify_shadow(&shadow_buf[..shadow_len], username, password) {
+    if !verify_shadow(&shadow_buf[..shadow_len], username, pw_input) {
         write_str(STDOUT_FILENO, "Login incorrect\n");
         return;
     }

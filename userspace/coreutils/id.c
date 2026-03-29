@@ -3,7 +3,13 @@
 #include <fcntl.h>
 #include <string.h>
 
-static void write_str(const char *s) { write(1, s, strlen(s)); }
+static size_t safe_strlen(const char *s, size_t maxlen) {
+    size_t i = 0;
+    while (i < maxlen && s[i]) i++;
+    return i;
+}
+
+static void write_str(const char *s) { write(1, s, safe_strlen(s, 256)); }
 static void write_u32(unsigned n) {
     char buf[12]; int i = 11;
     buf[i] = 0;
@@ -43,9 +49,9 @@ static int lookup_name(const char *file, unsigned id, int id_field, char *out, i
             for (char *d = fields[id_field]; *d; d++)
                 fid = fid * 10 + (*d - '0');
             if (fid == id) {
-                int slen = strlen(fields[0]);
+                int slen = (int)safe_strlen(fields[0], outlen);
                 if (slen >= outlen) slen = outlen - 1;
-                memcpy(out, fields[0], slen);
+                for (int j = 0; j < slen; j++) out[j] = fields[0][j];
                 out[slen] = 0;
                 return 1;
             }

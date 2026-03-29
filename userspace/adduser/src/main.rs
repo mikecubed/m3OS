@@ -30,8 +30,8 @@ pub extern "C" fn _start() -> ! {
     // Get password.
     write_str(STDOUT_FILENO, "Password: ");
     let saved = disable_echo();
-    let mut password = [0u8; 128];
-    let plen = read_line(&mut password);
+    let mut pw_input = [0u8; 128];
+    let plen = read_line(&mut pw_input);
     restore_echo(saved);
     let _ = write(STDOUT_FILENO, b"\n");
 
@@ -63,7 +63,7 @@ pub extern "C" fn _start() -> ! {
 
     // Hash the password.
     let salt = username;
-    let hash = syscall_lib::sha256::hash_password(&password[..plen], salt);
+    let hash = syscall_lib::sha256::hash_password(&pw_input[..plen], salt);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];

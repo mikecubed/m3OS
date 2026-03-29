@@ -3,6 +3,12 @@
 #include <fcntl.h>
 #include <string.h>
 
+static size_t safe_strlen(const char *s, size_t maxlen) {
+    size_t i = 0;
+    while (i < maxlen && s[i]) i++;
+    return i;
+}
+
 int main(void) {
     unsigned euid = geteuid();
 
@@ -35,7 +41,8 @@ int main(void) {
         while (*p && *p != ':') { uid = uid * 10 + (*p - '0'); p++; }
 
         if (uid == euid) {
-            write(1, name_start, strlen(name_start));
+            size_t nlen = safe_strlen(name_start, 64);
+            write(1, name_start, nlen);
             write(1, "\n", 1);
             return 0;
         }
