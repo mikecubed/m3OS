@@ -342,8 +342,11 @@ pub const OPOST: u32 = 0o000001;
 // c_cflag constants
 pub const CS8: u32 = 0o000060;
 
-/// Terminal I/O settings, binary-compatible with Linux `struct termios`.
-/// Size: 36 bytes (matching kernel ioctl copy size).
+/// Terminal I/O settings, matching the Linux *kernel* `termios` layout
+/// used by the TCGETS/TCSETS ioctls (36 bytes).
+///
+/// This is the kernel ioctl copy format, **not** the libc/musl userland
+/// `struct termios` layout (which is 60 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Termios {

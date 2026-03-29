@@ -20,6 +20,11 @@ static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
+    unsafe {
+        if let Some(ref orig) = ORIG_TERMIOS {
+            let _ = syscall_lib::tcsetattr(0, orig);
+        }
+    }
     syscall_lib::write(1, b"\r\nedit: out of memory\r\n");
     syscall_lib::exit(1)
 }
@@ -219,8 +224,8 @@ impl Editor {
             rx: 0,
             row_offset: 0,
             col_offset: 0,
-            screen_rows: rows.saturating_sub(2), // status bar + message bar
-            screen_cols: cols,
+            screen_rows: rows.saturating_sub(2).max(1),
+            screen_cols: cols.max(1),
             rows: Vec::new(),
             filename: None,
             status_msg: String::new(),
@@ -699,8 +704,8 @@ impl Editor {
         // Check for terminal resize
         if WINCH_RECEIVED.swap(false, Ordering::Relaxed) {
             let (rows, cols) = terminal_size();
-            self.screen_rows = rows.saturating_sub(2);
-            self.screen_cols = cols;
+            self.screen_rows = rows.saturating_sub(2).max(1);
+            self.screen_cols = cols.max(1);
         }
 
         self.scroll();
@@ -760,16 +765,7 @@ impl Editor {
                 let start = self.col_offset.min(render.len());
                 let end = (self.col_offset + self.screen_cols).min(render.len());
                 if start < end {
-                    // Check if this row has a search match for highlighting
-                    if let Some(match_row) = self.search_last_match {
-                        if match_row == file_row {
-                            ab.push_str(&render[start..end]);
-                        } else {
-                            ab.push_str(&render[start..end]);
-                        }
-                    } else {
-                        ab.push_str(&render[start..end]);
-                    }
+                    ab.push_str(&render[start..end]);
                 }
             }
 
