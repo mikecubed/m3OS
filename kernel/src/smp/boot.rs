@@ -209,8 +209,11 @@ fn install_trampoline() {
         );
     }
 
-    // Create temporary identity mapping for the trampoline page.
+    // Create temporary identity mappings.
     identity_map_trampoline();
+    // Also identity-map the LAPIC page so APs can access it before
+    // the phys_offset mapping is available (workaround for AP page table issue).
+    identity_map_page(0xFEE00000);
 
     log::info!(
         "[smp] trampoline installed at phys={:#x}, entry={:#x}",
@@ -404,17 +407,25 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // Set gs_base to this AP's PerCoreData.
     super::write_gs_base(per_core_data_ptr as u64);
 
+    // Initialize this AP's LAPIC (enable it, but DON'T start the timer).
+    // The timer handler accesses kernel statics (RESCHEDULE) which are
+    // not accessible from APs yet. Timer will be enabled in Track C
+    // after the scheduler is made per-core.
+    const LAPIC_PHYS: usize = 0xFEE0_0000;
+    unsafe {
+        // Enable LAPIC with spurious vector 0xFF.
+        let spur = core::ptr::read_volatile((LAPIC_PHYS + 0x0F0) as *const u32);
+        core::ptr::write_volatile((LAPIC_PHYS + 0x0F0) as *mut u32, spur | 0x1FF);
+        // Accept all priorities.
+        core::ptr::write_volatile((LAPIC_PHYS + 0x080) as *mut u32, 0);
+    }
+
     // Signal that this AP is online.
     data.is_online.store(true, Ordering::Release);
 
-    // Note: LAPIC timer init is deferred — the AP's LAPIC MMIO address
-    // is in the phys_offset range which requires investigation to access
-    // from APs. APs idle without a timer for now; Track D (IPI) will
-    // provide a wake mechanism.
-
-    // Enter idle loop (interrupts disabled — no timer to service).
+    // Enter idle loop. Replaced by per-core scheduler loop in Track C.
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
@@ -422,82 +433,129 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
 // Identity mapping for the trampoline page
 // ---------------------------------------------------------------------------
 
-fn identity_map_trampoline() {
-    use x86_64::structures::paging::PageTableFlags;
+/// Identity-map a physical page at virtual address = physical address.
+///
+/// Allocates intermediate page table levels as needed.
+fn identity_map_page(phys_addr: u64) {
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
 
     let phys_off = crate::mm::phys_offset();
     let pml4_phys = crate::mm::kernel_pml4_phys();
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let page_aligned = phys_addr & !0xFFF;
+
+    let p4_idx = ((page_aligned >> 39) & 0x1FF) as usize;
+    let p3_idx = ((page_aligned >> 30) & 0x1FF) as usize;
+    let p2_idx = ((page_aligned >> 21) & 0x1FF) as usize;
+    let p1_idx = ((page_aligned >> 12) & 0x1FF) as usize;
 
     unsafe {
-        use x86_64::structures::paging::PageTable;
-
         let pml4: &mut PageTable = &mut *((phys_off + pml4_phys) as *mut PageTable);
 
-        if !pml4[0].flags().contains(PageTableFlags::PRESENT) {
-            let frame = crate::mm::frame_allocator::allocate_frame()
-                .expect("OOM: PDPT for trampoline identity map");
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pml4[0].set_addr(frame.start_address(), flags);
+        if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+            let frame =
+                crate::mm::frame_allocator::allocate_frame().expect("OOM: identity map PDPT");
+            core::ptr::write_bytes(
+                (phys_off + frame.start_address().as_u64()) as *mut u8,
+                0,
+                4096,
+            );
+            pml4[p4_idx].set_addr(frame.start_address(), flags);
         }
 
-        let pdpt: &mut PageTable = &mut *((phys_off + pml4[0].addr().as_u64()) as *mut PageTable);
-
-        if !pdpt[0].flags().contains(PageTableFlags::PRESENT) {
-            let frame = crate::mm::frame_allocator::allocate_frame()
-                .expect("OOM: PD for trampoline identity map");
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pdpt[0].set_addr(frame.start_address(), flags);
+        let pdpt: &mut PageTable =
+            &mut *((phys_off + pml4[p4_idx].addr().as_u64()) as *mut PageTable);
+        if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+            let frame = crate::mm::frame_allocator::allocate_frame().expect("OOM: identity map PD");
+            core::ptr::write_bytes(
+                (phys_off + frame.start_address().as_u64()) as *mut u8,
+                0,
+                4096,
+            );
+            pdpt[p3_idx].set_addr(frame.start_address(), flags);
         }
 
-        let pd: &mut PageTable = &mut *((phys_off + pdpt[0].addr().as_u64()) as *mut PageTable);
-
-        if !pd[0].flags().contains(PageTableFlags::PRESENT) {
-            let frame = crate::mm::frame_allocator::allocate_frame()
-                .expect("OOM: PT for trampoline identity map");
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pd[0].set_addr(frame.start_address(), flags);
+        let pd: &mut PageTable =
+            &mut *((phys_off + pdpt[p3_idx].addr().as_u64()) as *mut PageTable);
+        if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+            let frame = crate::mm::frame_allocator::allocate_frame().expect("OOM: identity map PT");
+            core::ptr::write_bytes(
+                (phys_off + frame.start_address().as_u64()) as *mut u8,
+                0,
+                4096,
+            );
+            pd[p2_idx].set_addr(frame.start_address(), flags);
         }
 
-        let pt: &mut PageTable = &mut *((phys_off + pd[0].addr().as_u64()) as *mut PageTable);
-        let pt_index = (TRAMPOLINE_PHYS >> 12) as usize;
-        pt[pt_index].set_addr(x86_64::PhysAddr::new(TRAMPOLINE_PHYS), flags);
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(TRAMPOLINE_PHYS));
+        let pt: &mut PageTable = &mut *((phys_off + pd[p2_idx].addr().as_u64()) as *mut PageTable);
+        // Use WRITE_THROUGH and NO_CACHE for MMIO pages.
+        let mmio_flags = flags | PageTableFlags::WRITE_THROUGH | PageTableFlags::NO_CACHE;
+        pt[p1_idx].set_addr(x86_64::PhysAddr::new(page_aligned), mmio_flags);
+        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_aligned));
     }
+}
 
+fn identity_map_trampoline() {
+    identity_map_page(TRAMPOLINE_PHYS);
     log::info!(
         "[smp] identity-mapped trampoline page at {:#x}",
         TRAMPOLINE_PHYS
     );
 }
 
-fn remove_trampoline_identity_map() {
+/// Remove the identity mapping for a page.
+fn remove_identity_map(phys_addr: u64) {
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
     let phys_off = crate::mm::phys_offset();
     let pml4_phys = crate::mm::kernel_pml4_phys();
+    let page_aligned = phys_addr & !0xFFF;
+
+    let p4_idx = ((page_aligned >> 39) & 0x1FF) as usize;
+    let p3_idx = ((page_aligned >> 30) & 0x1FF) as usize;
+    let p2_idx = ((page_aligned >> 21) & 0x1FF) as usize;
+    let p1_idx = ((page_aligned >> 12) & 0x1FF) as usize;
 
     unsafe {
         let pml4: &mut PageTable = &mut *((phys_off + pml4_phys) as *mut PageTable);
-        if !pml4[0].flags().contains(PageTableFlags::PRESENT) {
+        if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
             return;
         }
-        let pdpt: &mut PageTable = &mut *((phys_off + pml4[0].addr().as_u64()) as *mut PageTable);
-        if !pdpt[0].flags().contains(PageTableFlags::PRESENT) {
+        let pdpt: &mut PageTable =
+            &mut *((phys_off + pml4[p4_idx].addr().as_u64()) as *mut PageTable);
+        if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
             return;
         }
-        let pd: &mut PageTable = &mut *((phys_off + pdpt[0].addr().as_u64()) as *mut PageTable);
-        if !pd[0].flags().contains(PageTableFlags::PRESENT) {
+        let pd: &mut PageTable =
+            &mut *((phys_off + pdpt[p3_idx].addr().as_u64()) as *mut PageTable);
+        if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
             return;
         }
-        let pt: &mut PageTable = &mut *((phys_off + pd[0].addr().as_u64()) as *mut PageTable);
-        let pt_index = (TRAMPOLINE_PHYS >> 12) as usize;
-        pt[pt_index].set_unused();
-        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(TRAMPOLINE_PHYS));
+        let pt: &mut PageTable = &mut *((phys_off + pd[p2_idx].addr().as_u64()) as *mut PageTable);
+        pt[p1_idx].set_unused();
+        x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_aligned));
     }
+}
 
+/// Initialize the LAPIC on an AP using a direct base address and BSP-calibrated ticks/ms.
+fn ap_lapic_init_from(lapic_base: usize, tpm: u32) {
+    unsafe {
+        let spur = core::ptr::read_volatile((lapic_base + 0x0F0) as *const u32);
+        core::ptr::write_volatile((lapic_base + 0x0F0) as *mut u32, spur | 0x1FF);
+        core::ptr::write_volatile((lapic_base + 0x080) as *mut u32, 0); // TPR = 0
+
+        // LAPIC timer: periodic, vector 32, 10 ms period.
+        core::ptr::write_volatile((lapic_base + 0x320) as *mut u32, 32 | (1 << 17));
+        core::ptr::write_volatile((lapic_base + 0x3E0) as *mut u32, 0x03); // divide-by-16
+        let init_count = (tpm as u64 * 10).min(u32::MAX as u64) as u32;
+        core::ptr::write_volatile((lapic_base + 0x380) as *mut u32, init_count);
+    }
+}
+
+fn remove_trampoline_identity_map() {
+    remove_identity_map(TRAMPOLINE_PHYS);
+    // Note: the LAPIC identity mapping at 0xFEE00000 is kept — APs need
+    // it for LAPIC EOI in interrupt handlers. It will be removed once
+    // APs switch to using phys_offset-based LAPIC access.
     log::info!("[smp] removed trampoline identity mapping");
 }
