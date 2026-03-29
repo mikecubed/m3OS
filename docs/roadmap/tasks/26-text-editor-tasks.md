@@ -82,7 +82,7 @@ Porting strategy:
 | D | m3OS platform backend | A | Done |
 | E | File I/O and search | C, D | Done |
 | F | Build system and shell integration | C | Done |
-| G | Validation and documentation | E, F | In progress |
+| G | Validation and documentation | E, F | Done |
 
 ### Implementation Notes
 
