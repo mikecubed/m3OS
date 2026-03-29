@@ -30,6 +30,13 @@ pub fn phys_offset() -> u64 {
     *PHYS_OFFSET.get().expect("mm not initialized")
 }
 
+/// Return the physical address of the kernel's PML4 page table.
+///
+/// Used by the SMP trampoline to load the correct CR3 on AP cores.
+pub fn kernel_pml4_phys() -> u64 {
+    *KERNEL_PML4_PHYS.get().expect("mm not initialized")
+}
+
 /// Switch CR3 back to the kernel's original page table.
 ///
 /// Called from process-exit paths (syscall handlers, fault trampolines) that

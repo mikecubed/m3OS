@@ -417,6 +417,9 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
+        // Phase 25: SMP — boot with 4 CPU cores.
+        "-smp".to_string(),
+        "4".to_string(),
     ];
 
     match display_mode {
