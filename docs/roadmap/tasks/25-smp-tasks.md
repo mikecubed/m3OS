@@ -58,11 +58,11 @@ Already implemented (no new work needed):
 |---|---|---|---|
 | A | Per-core data structures | — | **Done** |
 | B | AP bootstrap (trampoline + startup) | A | **Done** |
-| C | Per-core scheduler | A | Pending |
+| C | Per-core scheduler | A | **Done** (BSP-only dispatch; per-core syscall deferred) |
 | D | IPI infrastructure | B | **Done** |
 | E | TLB shootdown | C, D | **Done** (handler+API; munmap hook deferred) |
-| F | Spinlock audit and SMP hardening | B, C | Pending |
-| G | Validation and documentation | D, E, F | Pending |
+| F | Spinlock audit and SMP hardening | B, C | **Done** (audit complete; BSP-only mitigation) |
+| G | Validation and documentation | D, E, F | **Done** |
 
 ### Implementation Notes
 
