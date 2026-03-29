@@ -3,6 +3,7 @@
 //! Wraps the kernel-core parsing primitives with actual virtio-blk I/O
 //! to provide a complete read/write FAT32 volume for `/data`.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -11,6 +12,37 @@ use spin::Mutex;
 
 /// Maximum cluster chain length before we assume corruption.
 const MAX_CHAIN_LEN: usize = 65536;
+
+// ---------------------------------------------------------------------------
+// Phase 27: FAT32 permissions overlay
+// ---------------------------------------------------------------------------
+
+/// Per-file Unix metadata overlay for FAT32 (which has no native support).
+#[derive(Clone, Copy)]
+pub struct Fat32FileMeta {
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u16,
+}
+
+/// In-memory permissions index for the FAT32 volume.
+/// Key is the relative path within /data (e.g. "etc/passwd").
+pub static FAT32_PERMISSIONS: Mutex<BTreeMap<String, Fat32FileMeta>> = Mutex::new(BTreeMap::new());
+
+/// Get metadata for a FAT32 file, returning defaults if not in the index.
+pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
+    let perms = FAT32_PERMISSIONS.lock();
+    match perms.get(path) {
+        Some(m) => (m.uid, m.gid, m.mode),
+        None => (0, 0, 0o644), // default: root-owned, 0o644
+    }
+}
+
+/// Set metadata for a FAT32 file in the permissions index.
+pub fn set_fat32_meta(path: &str, uid: u32, gid: u32, mode: u16) {
+    let mut perms = FAT32_PERMISSIONS.lock();
+    perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
+}
 
 /// A mounted FAT32 volume backed by virtio-blk sectors.
 pub struct Fat32Volume {
