@@ -42,13 +42,13 @@ fn per_core_reschedule() -> &'static core::sync::atomic::AtomicBool {
 /// Get a mutable pointer to the current core's scheduler RSP.
 fn per_core_scheduler_rsp_ptr() -> *mut u64 {
     let data = crate::smp::per_core();
-    // Safety: scheduler_rsp is only written by switch_context on this core.
-    core::ptr::addr_of!(data.scheduler_rsp) as *mut u64
+    data.scheduler_rsp.get()
 }
 
 /// Get the current core's scheduler RSP value.
 fn per_core_scheduler_rsp() -> u64 {
-    crate::smp::per_core().scheduler_rsp
+    let data = crate::smp::per_core();
+    unsafe { *data.scheduler_rsp.get() }
 }
 
 /// Get/set the current task index on this core.

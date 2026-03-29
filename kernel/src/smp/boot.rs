@@ -136,6 +136,8 @@ fn build_trampoline_code() -> alloc::vec::Vec<u8> {
     // Load entry point and jump
     c.extend_from_slice(&[0x48, 0xA1]);
     c.extend_from_slice(&0x0000_0000_0000_8F48u64.to_le_bytes());
+    // Align RSP to 8 mod 16 (System V ABI: RSP is 8-mod-16 at function entry)
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
     c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
 
     c
@@ -489,9 +491,7 @@ fn identity_map_page(phys_addr: u64) {
         }
 
         let pt: &mut PageTable = &mut *((phys_off + pd[p2_idx].addr().as_u64()) as *mut PageTable);
-        // Use WRITE_THROUGH and NO_CACHE for MMIO pages.
-        let mmio_flags = flags | PageTableFlags::WRITE_THROUGH | PageTableFlags::NO_CACHE;
-        pt[p1_idx].set_addr(x86_64::PhysAddr::new(page_aligned), mmio_flags);
+        pt[p1_idx].set_addr(x86_64::PhysAddr::new(page_aligned), flags);
         x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page_aligned));
     }
 }

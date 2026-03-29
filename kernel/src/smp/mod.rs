@@ -80,7 +80,9 @@ pub struct PerCoreData {
     /// Top of this core's syscall/kernel stack.
     pub kernel_stack_top: u64,
     /// Scheduler loop RSP for this core (replaces the global `SCHEDULER_RSP`).
-    pub scheduler_rsp: u64,
+    /// Uses `UnsafeCell` for interior mutability — only written via `switch_context`
+    /// on the owning core.
+    pub scheduler_rsp: core::cell::UnsafeCell<u64>,
     /// Per-core reschedule flag (replaces the global `RESCHEDULE`).
     pub reschedule: AtomicBool,
     /// Index of the task currently running on this core in the global task vec.
@@ -211,8 +213,50 @@ fn write_gs_base(value: u64) {
 /// Must be called after ACPI/MADT parsing and LAPIC initialization, but
 /// before AP bootstrap.
 pub fn init_bsp_per_core() {
-    let madt = crate::acpi::madt_info();
-    let bsp_apic_id = read_lapic_id();
+    // If MADT is available, enumerate cores. Otherwise, BSP-only single-core mode.
+    let (bsp_apic_id, total_cores, lapic_virt_base, lapic_tpm) =
+        if crate::acpi::io_apic_address().is_some() {
+            let madt = crate::acpi::madt_info();
+            let bsp_apic_id = read_lapic_id();
+
+            // Enumerate APs from MADT and assign core IDs.
+            let mut next_core_id: u8 = 1;
+            for i in 0..madt.local_apic_count {
+                if let Some(entry) = &madt.local_apics[i] {
+                    if entry.apic_id == bsp_apic_id {
+                        continue;
+                    }
+                    if entry.flags & 1 == 0 {
+                        continue;
+                    }
+                    if next_core_id >= MAX_CORES as u8 {
+                        log::warn!(
+                            "[smp] skipping AP APIC ID={}: exceeds MAX_CORES ({})",
+                            entry.apic_id,
+                            MAX_CORES
+                        );
+                        break;
+                    }
+                    unsafe {
+                        APIC_TO_CORE[entry.apic_id as usize] = next_core_id;
+                    }
+                    next_core_id += 1;
+                }
+            }
+
+            let lapic_virt = {
+                let phys = crate::acpi::local_apic_address() as u64;
+                crate::mm::phys_offset() + phys
+            };
+            let lapic_tpm = crate::arch::x86_64::apic::lapic_ticks_per_ms();
+
+            (bsp_apic_id, next_core_id, lapic_virt, lapic_tpm)
+        } else {
+            // No MADT — single-core BSP-only mode.
+            log::info!("[smp] no MADT/I/O APIC — single-core BSP-only mode");
+            (0u8, 1u8, 0u64, 0u32)
+        };
+
     BSP_APIC_ID.store(bsp_apic_id, Ordering::Relaxed);
 
     // BSP is always core 0.
@@ -220,32 +264,6 @@ pub fn init_bsp_per_core() {
         APIC_TO_CORE[bsp_apic_id as usize] = 0;
     }
 
-    // Enumerate APs from MADT and assign core IDs.
-    let mut next_core_id: u8 = 1;
-    for i in 0..madt.local_apic_count {
-        if let Some(entry) = &madt.local_apics[i] {
-            if entry.apic_id == bsp_apic_id {
-                continue;
-            }
-            if entry.flags & 1 == 0 {
-                continue;
-            }
-            if next_core_id >= MAX_CORES as u8 {
-                log::warn!(
-                    "[smp] skipping AP APIC ID={}: exceeds MAX_CORES ({})",
-                    entry.apic_id,
-                    MAX_CORES
-                );
-                break;
-            }
-            unsafe {
-                APIC_TO_CORE[entry.apic_id as usize] = next_core_id;
-            }
-            next_core_id += 1;
-        }
-    }
-
-    let total_cores = next_core_id;
     CORE_COUNT.store(total_cores, Ordering::Release);
     log::info!(
         "[smp] {} core(s) discovered (BSP APIC ID={})",
@@ -266,14 +284,11 @@ pub fn init_bsp_per_core() {
         gdt_data: SegmentSelector(0),
         gdt_tss: SegmentSelector(0),
         kernel_stack_top: crate::arch::x86_64::gdt::syscall_stack_top(),
-        scheduler_rsp: 0, // set when scheduler loop starts
+        scheduler_rsp: core::cell::UnsafeCell::new(0), // set when scheduler loop starts
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
-        lapic_virt_base: {
-            let phys = crate::acpi::local_apic_address() as u64;
-            crate::mm::phys_offset() + phys
-        },
-        lapic_ticks_per_ms: crate::arch::x86_64::apic::lapic_ticks_per_ms(),
+        lapic_virt_base,
+        lapic_ticks_per_ms: lapic_tpm,
     }));
 
     // Fill self-pointer and store in global array.
@@ -348,7 +363,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         gdt_data,
         gdt_tss,
         kernel_stack_top,
-        scheduler_rsp: 0,
+        scheduler_rsp: core::cell::UnsafeCell::new(0),
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
         lapic_virt_base: {

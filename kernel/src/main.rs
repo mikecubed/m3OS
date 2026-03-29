@@ -120,10 +120,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Phase 25: Initialize per-core data structures for the BSP.
-    // Only if MADT was parsed (APIC mode); on legacy PIC systems SMP is not available.
-    if acpi::io_apic_address().is_some() {
-        smp::init_bsp_per_core();
-    }
+    // Always called — gs_base must be set for the scheduler. If no MADT is
+    // available, init_bsp_per_core() falls back to single-core BSP-only mode.
+    smp::init_bsp_per_core();
 
     // Phase 16: Initialize virtio-net driver and route its IRQ.
     net::virtio_net::init();
@@ -171,8 +170,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // Phase 25: Boot Application Processors.
-    // Only if SMP was initialized (requires MADT/APIC).
-    if smp::is_per_core_ready() {
+    // Only if SMP was initialized and there are APs to boot.
+    if smp::is_per_core_ready() && smp::core_count() > 1 {
         smp::boot::boot_aps();
     }
 
