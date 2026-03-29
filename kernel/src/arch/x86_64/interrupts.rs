@@ -309,6 +309,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // APIC spurious interrupt vector — must NOT send EOI.
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
 
+    // SMP IPI vectors (Phase 25).
+    idt[crate::smp::ipi::IPI_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
+    idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
+
     idt
 });
 
@@ -584,6 +588,28 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
     // Spurious interrupt (vector 0xFF) — no EOI must be sent.
+}
+
+// ---------------------------------------------------------------------------
+// SMP IPI handlers (Phase 25)
+// ---------------------------------------------------------------------------
+
+/// Reschedule IPI handler (vector 0xFE).
+///
+/// Sets the reschedule flag on the receiving core, causing the scheduler to
+/// pick the next ready task on the next opportunity.
+extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::task::signal_reschedule();
+    super::apic::lapic_eoi();
+}
+
+/// TLB shootdown IPI handler (vector 0xFD).
+///
+/// Invalidates a specific page on this core's TLB. The target address and
+/// synchronization are managed by the TLB shootdown request in `smp::tlb`.
+extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::smp::tlb::handle_tlb_shootdown_ipi();
+    super::apic::lapic_eoi();
 }
 
 // ---------------------------------------------------------------------------

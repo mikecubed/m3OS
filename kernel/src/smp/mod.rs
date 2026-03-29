@@ -16,6 +16,8 @@
 #![allow(dead_code)]
 
 pub mod boot;
+pub mod ipi;
+pub mod tlb;
 
 extern crate alloc;
 
