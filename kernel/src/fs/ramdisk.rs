@@ -81,6 +81,9 @@ static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0.elf");
 static ION_ELF: &[u8] = include_bytes!("../../initrd/ion.elf");
 static EDIT_ELF: &[u8] = include_bytes!("../../initrd/edit.elf");
 static LOGIN_ELF: &[u8] = include_bytes!("../../initrd/login.elf");
+static SU_ELF: &[u8] = include_bytes!("../../initrd/su.elf");
+static PASSWD_ELF: &[u8] = include_bytes!("../../initrd/passwd.elf");
+static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser.elf");
 static ID_ELF: &[u8] = include_bytes!("../../initrd/id.elf");
 static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami.elf");
 
@@ -161,6 +164,32 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("edit.elf", RamdiskNode::File { content: EDIT_ELF }),
     ("login", RamdiskNode::File { content: LOGIN_ELF }),
     ("login.elf", RamdiskNode::File { content: LOGIN_ELF }),
+    ("su", RamdiskNode::File { content: SU_ELF }),
+    ("su.elf", RamdiskNode::File { content: SU_ELF }),
+    (
+        "passwd",
+        RamdiskNode::File {
+            content: PASSWD_ELF,
+        },
+    ),
+    (
+        "passwd.elf",
+        RamdiskNode::File {
+            content: PASSWD_ELF,
+        },
+    ),
+    (
+        "adduser",
+        RamdiskNode::File {
+            content: ADDUSER_ELF,
+        },
+    ),
+    (
+        "adduser.elf",
+        RamdiskNode::File {
+            content: ADDUSER_ELF,
+        },
+    ),
     ("id", RamdiskNode::File { content: ID_ELF }),
     ("id.elf", RamdiskNode::File { content: ID_ELF }),
     (

@@ -122,6 +122,9 @@ fn build_userspace_bins() {
         ("shell", "sh0", false),
         ("edit", "edit", true),
         ("login", "login", false),
+        ("su", "su", false),
+        ("passwd", "passwd", false),
+        ("adduser", "adduser", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
