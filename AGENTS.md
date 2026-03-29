@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.25.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, signals, and a text editor.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.26.0 with a functional userspace including init, shell, coreutils, networking, SMP, persistent storage, signals, and a text editor.
 
 ## Build & Run
 
