@@ -150,13 +150,20 @@ pub fn core_count() -> u8 {
 // Per-core access via gs_base (T004)
 // ---------------------------------------------------------------------------
 
+/// Dedicated flag set after `init_bsp_per_core()` completes.
+///
+/// Using a dedicated `AtomicBool` instead of checking `gs_base != 0` avoids
+/// false positives when firmware leaves a non-zero `gs_base` value before
+/// SMP init runs.
+static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Check if per-core data is initialized on the calling core.
 ///
 /// Returns `false` during early boot before `init_bsp_per_core()` has been
 /// called. Used by `signal_reschedule()` to avoid accessing gs_base before
 /// it's set.
 pub fn is_per_core_ready() -> bool {
-    read_gs_base() != 0
+    SMP_INITIALIZED.load(Ordering::Acquire)
 }
 
 /// Return a reference to the calling core's [`PerCoreData`].
@@ -301,6 +308,8 @@ pub fn init_bsp_per_core() {
     write_gs_base(bsp_data as u64);
 
     log::info!("[smp] BSP per-core data initialized, gs_base set");
+
+    SMP_INITIALIZED.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

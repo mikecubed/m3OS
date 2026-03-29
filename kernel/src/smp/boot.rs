@@ -235,33 +235,10 @@ fn set_trampoline_ap_data(stack_top: u64, per_core_data_ptr: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// IPI sending
+// IPI sending (delegates to super::ipi LAPIC helpers)
 // ---------------------------------------------------------------------------
 
-const LAPIC_ICR_LOW: usize = 0x300;
-const LAPIC_ICR_HIGH: usize = 0x310;
-
-unsafe fn lapic_read(offset: usize) -> u32 {
-    let base = {
-        let phys = crate::acpi::local_apic_address() as u64;
-        (crate::mm::phys_offset() + phys) as usize
-    };
-    core::ptr::read_volatile((base + offset) as *const u32)
-}
-
-unsafe fn lapic_write(offset: usize, value: u32) {
-    let base = {
-        let phys = crate::acpi::local_apic_address() as u64;
-        (crate::mm::phys_offset() + phys) as usize
-    };
-    core::ptr::write_volatile((base + offset) as *mut u32, value);
-}
-
-unsafe fn wait_icr_idle() {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
-    }
-}
+use super::ipi::{lapic_read, lapic_write, wait_icr_idle, LAPIC_ICR_HIGH, LAPIC_ICR_LOW};
 
 fn send_init_ipi(apic_id: u8) {
     unsafe {
@@ -284,16 +261,15 @@ fn send_sipi(apic_id: u8, vector: u8) {
     }
 }
 
+/// LAPIC timer current-count register offset.
+const LAPIC_TIMER_CURRENT: usize = 0x390;
+
 fn delay_us(us: u64) {
     let tpm = crate::arch::x86_64::apic::lapic_ticks_per_ms();
     let target_ticks = (tpm as u64 * us) / 1000;
-    let lapic_base = {
-        let phys = crate::acpi::local_apic_address() as u64;
-        (crate::mm::phys_offset() + phys) as usize
-    };
-    let start = unsafe { core::ptr::read_volatile((lapic_base + 0x390) as *const u32) };
+    let start = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
     loop {
-        let current = unsafe { core::ptr::read_volatile((lapic_base + 0x390) as *const u32) };
+        let current = unsafe { lapic_read(LAPIC_TIMER_CURRENT) };
         let elapsed = start.wrapping_sub(current) as u64;
         if elapsed >= target_ticks {
             break;

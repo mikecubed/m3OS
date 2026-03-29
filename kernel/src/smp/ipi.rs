@@ -17,23 +17,23 @@ pub const IPI_TLB_SHOOTDOWN: u8 = 0xFD;
 // LAPIC ICR helpers
 // ---------------------------------------------------------------------------
 
-const LAPIC_ICR_LOW: usize = 0x300;
-const LAPIC_ICR_HIGH: usize = 0x310;
+pub(super) const LAPIC_ICR_LOW: usize = 0x300;
+pub(super) const LAPIC_ICR_HIGH: usize = 0x310;
 
 fn lapic_base() -> usize {
     let phys = crate::acpi::local_apic_address() as u64;
     (crate::mm::phys_offset() + phys) as usize
 }
 
-unsafe fn lapic_read(offset: usize) -> u32 {
+pub(super) unsafe fn lapic_read(offset: usize) -> u32 {
     core::ptr::read_volatile((lapic_base() + offset) as *const u32)
 }
 
-unsafe fn lapic_write(offset: usize, value: u32) {
+pub(super) unsafe fn lapic_write(offset: usize, value: u32) {
     core::ptr::write_volatile((lapic_base() + offset) as *mut u32, value);
 }
 
-unsafe fn wait_icr_idle() {
+pub(super) unsafe fn wait_icr_idle() {
     while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
         core::hint::spin_loop();
     }
@@ -74,26 +74,4 @@ pub fn send_ipi_all_excluding_self(vector: u8) {
 /// Used when a task is spawned or unblocked on a remote core's queue.
 pub fn send_reschedule_ipi(target_apic_id: u8) {
     send_ipi(target_apic_id, IPI_RESCHEDULE);
-}
-
-// ---------------------------------------------------------------------------
-// IDT handler registration (T027, T028)
-// ---------------------------------------------------------------------------
-
-/// Register the IPI handlers in the IDT.
-///
-/// Must be called once during BSP init, before APs are booted.
-/// The IDT is shared across all cores.
-pub fn register_ipi_handlers() {
-    // The IDT is a Lazy static in interrupts.rs. We need to add entries
-    // for our IPI vectors. Since the IDT is already initialized, we'll
-    // add the handlers by modifying the IDT entries directly.
-    //
-    // However, the x86_64 crate's IDT is initialized via Lazy and doesn't
-    // support post-init modification easily. Instead, we add the handlers
-    // during IDT construction by modifying interrupts.rs.
-    //
-    // For now, this function serves as documentation. The actual handler
-    // registration is done in interrupts.rs.
-    log::info!("[smp] IPI handlers registered (reschedule=0xFE, TLB=0xFD)");
 }
