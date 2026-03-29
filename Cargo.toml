@@ -13,6 +13,8 @@ members = [
     "userspace/shell",
     # Phase 23 userspace ping
     "userspace/ping",
+    # Phase 26 text editor
+    "userspace/edit",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",

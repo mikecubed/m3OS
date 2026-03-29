@@ -9,6 +9,9 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "alloc")]
+pub mod heap;
+
 // ===========================================================================
 // Raw syscall wrappers
 // ===========================================================================
@@ -144,6 +147,7 @@ pub const SYS_FSTAT: u64 = 5;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_BRK: u64 = 12;
+pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_IOCTL: u64 = 16;
 pub const SYS_PIPE: u64 = 22;
 pub const SYS_DUP2: u64 = 33;
@@ -278,6 +282,14 @@ impl SockaddrIn {
 pub const WNOHANG: i32 = 1;
 
 // ===========================================================================
+// Lseek whence constants
+// ===========================================================================
+
+pub const SEEK_SET: usize = 0;
+pub const SEEK_CUR: usize = 1;
+pub const SEEK_END: usize = 2;
+
+// ===========================================================================
 // Signal numbers
 // ===========================================================================
 
@@ -285,6 +297,87 @@ pub const SIGINT: i32 = 2;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;
 pub const SIGTSTP: i32 = 20;
+pub const SIGWINCH: i32 = 28;
+
+// ===========================================================================
+// Signal action constants
+// ===========================================================================
+
+pub const SA_RESTORER: u64 = 0x0400_0000;
+
+// ===========================================================================
+// Ioctl request numbers
+// ===========================================================================
+
+pub const TCGETS: usize = 0x5401;
+pub const TCSETS: usize = 0x5402;
+pub const TCSETSW: usize = 0x5403;
+pub const TCSETSF: usize = 0x5404;
+pub const TIOCGWINSZ: usize = 0x5413;
+pub const TIOCSWINSZ: usize = 0x5414;
+
+// ===========================================================================
+// Termios types and constants (matching kernel-core layout)
+// ===========================================================================
+
+pub const NCCS: usize = 19;
+
+// c_lflag constants
+pub const ISIG: u32 = 0o000001;
+pub const ICANON: u32 = 0o000002;
+pub const ECHO: u32 = 0o000010;
+pub const ECHOE: u32 = 0o000020;
+pub const IEXTEN: u32 = 0o100000;
+
+// c_iflag constants
+pub const ICRNL: u32 = 0o000400;
+pub const IXON: u32 = 0o002000;
+pub const BRKINT: u32 = 0o000002;
+pub const INPCK: u32 = 0o000020;
+pub const ISTRIP: u32 = 0o000040;
+
+// c_oflag constants
+pub const OPOST: u32 = 0o000001;
+
+// c_cflag constants
+pub const CS8: u32 = 0o000060;
+
+/// Terminal I/O settings, matching the Linux *kernel* `termios` layout
+/// used by the TCGETS/TCSETS ioctls (36 bytes).
+///
+/// This is the kernel ioctl copy format, **not** the libc/musl userland
+/// `struct termios` layout (which is 60 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; NCCS],
+}
+
+/// Terminal window size, binary-compatible with Linux `struct winsize`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+}
+
+/// Signal action struct for rt_sigaction, matching Linux layout.
+/// Layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub sa_handler: u64,
+    pub sa_flags: u64,
+    pub sa_restorer: u64,
+    pub sa_mask: u64,
+}
 
 // ===========================================================================
 // High-level wrappers — File I/O
@@ -315,6 +408,74 @@ pub fn open(path: &[u8], flags: u64, mode: u64) -> isize {
 /// Close a file descriptor.
 pub fn close(fd: i32) -> isize {
     unsafe { syscall1(SYS_CLOSE, fd as u64) as isize }
+}
+
+// ===========================================================================
+// High-level wrappers — ioctl, lseek, termios, signals
+// ===========================================================================
+
+/// Perform an ioctl operation on a file descriptor.
+pub fn ioctl(fd: i32, request: usize, arg: usize) -> isize {
+    unsafe { syscall3(SYS_IOCTL, fd as u64, request as u64, arg as u64) as isize }
+}
+
+/// Seek to a position in a file descriptor.
+pub fn lseek(fd: i32, offset: i64, whence: usize) -> isize {
+    unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) as isize }
+}
+
+/// Get terminal attributes.
+pub fn tcgetattr(fd: i32) -> Result<Termios, isize> {
+    let mut t = Termios {
+        c_iflag: 0,
+        c_oflag: 0,
+        c_cflag: 0,
+        c_lflag: 0,
+        c_line: 0,
+        c_cc: [0; NCCS],
+    };
+    let ret = ioctl(fd, TCGETS, &mut t as *mut Termios as usize);
+    if ret < 0 {
+        Err(ret)
+    } else {
+        Ok(t)
+    }
+}
+
+/// Set terminal attributes.
+pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
+    let ret = ioctl(fd, TCSETS, termios as *const Termios as usize);
+    if ret < 0 {
+        Err(ret)
+    } else {
+        Ok(())
+    }
+}
+
+/// Get terminal window size (rows, cols).
+pub fn get_window_size(fd: i32) -> Result<(u16, u16), isize> {
+    let mut ws = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ret = ioctl(fd, TIOCGWINSZ, &mut ws as *mut Winsize as usize);
+    if ret < 0 {
+        Err(ret)
+    } else {
+        Ok((ws.ws_row, ws.ws_col))
+    }
+}
+
+/// Install a signal handler via rt_sigaction (syscall 13).
+pub fn rt_sigaction(signum: usize, act: *const SigAction, oldact: *mut SigAction) -> isize {
+    unsafe { syscall3(SYS_RT_SIGACTION, signum as u64, act as u64, oldact as u64) as isize }
+}
+
+/// brk syscall — set or query the program break.
+pub fn brk(addr: u64) -> u64 {
+    unsafe { syscall1(SYS_BRK, addr) }
 }
 
 // ===========================================================================

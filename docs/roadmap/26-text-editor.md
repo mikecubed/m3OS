@@ -17,17 +17,20 @@ without an editor.
 
 ## Feature Scope
 
-**Primary: Port `e3` (tiny editor)**
+**Primary: Port [kibi](https://github.com/ilai-deutel/kibi) (Rust kilo clone)**
 
-[e3](https://sites.google.com/site/e3editor/) is a ~15 KB editor written in x86
-assembly with C wrappers. It supports WordStar, Emacs, vi, and pstrict keybindings.
-However, its assembly core may be difficult to port.
+Kibi is a text editor in <=1024 lines of Rust by Ilai Deutel, a direct port of
+antirez's [kilo](https://github.com/antirez/kilo). MIT/Apache-2.0 dual license.
 
-**Recommended alternative: Port `kilo` or write a kilo-inspired editor**
-
-[kilo](https://github.com/antirez/kilo) is a minimal text editor in ~1000 lines of C
-by Salvatore Sanfilippo (antirez). It requires only VT100 escape sequences and a
-handful of POSIX calls — exactly what m3OS already supports.
+Why kibi over kilo (C) or other editors:
+- Same ~1000-line philosophy as kilo, but in Rust with memory safety
+- Only two runtime dependencies: `unicode-width` (no_std-compatible) and `libc`
+  (replaced by our m3OS platform backend)
+- Clean platform abstraction: separate `unix.rs`, `windows.rs`, `wasi.rs`
+  backends — we write an `m3os.rs` backend (~60-80 lines)
+- Keeps the codebase uniform with init, sh0, and ping (all Rust, no_std)
+- Hardcodes VT100 escape sequences (no terminfo/ncurses dependency)
+- Features: cursor movement, scrolling, search, syntax highlighting, status bar
 
 Required OS features (all already implemented):
 - Raw terminal mode (`termios` / `tcsetattr`) — Phase 22
@@ -36,16 +39,16 @@ Required OS features (all already implemented):
 - Signal handling (`SIGWINCH` for terminal resize) — Phase 19
 - `ioctl(TIOCGWINSZ)` for terminal size — Phase 22
 
-The editor should support:
+The editor will support:
 - Open, edit, and save files
 - Line-by-line scrolling and cursor movement
-- Search (find text)
-- Syntax highlighting (optional, but kilo supports it in <200 extra lines)
+- Search (find text) with incremental matching
 - Status bar showing filename, line number, modification state
+- Dirty-file tracking with quit confirmation
 
 **Fallback: Minimal `ed`-style line editor**
 
-If full-screen editing proves too complex, a line editor (`ed` clone) provides basic
+If the kibi port proves too complex, a line editor (`ed` clone) provides basic
 file editing with much simpler terminal requirements. This is historically accurate —
 early Unix development was done entirely in `ed`.
 
@@ -59,13 +62,13 @@ early Unix development was done entirely in `ed`.
 
 ## Implementation Outline
 
-1. Cross-compile kilo (or a kilo-inspired editor) with musl on the host.
-2. Add the binary to the disk image at `/bin/edit` (or `/bin/kilo`).
-3. Verify raw mode works: editor takes over the full terminal screen.
-4. Test file operations: create a new file, edit it, save it, reopen it.
-5. Test search functionality.
-6. Add syntax highlighting for `.c` files (stretch goal).
-7. Add the editor to PATH and create a shell alias (`$EDITOR`).
+1. Extend `syscall-lib` with ioctl, lseek, termios, and winsize wrappers.
+2. Add a userspace heap allocator (kibi uses `Vec`/`String` via `alloc`).
+3. Create `userspace/edit/` crate (no_std, `x86_64-unknown-none` target).
+4. Write an m3OS platform backend (~60-80 lines) implementing terminal I/O.
+5. Port kibi's core modules, replacing `std::fs`/`std::io` with syscall-lib.
+6. Verify raw mode, file save/load, and search work end-to-end.
+7. Add to xtask build, initrd, and set `$EDITOR=/bin/edit`.
 
 ## Acceptance Criteria
 
@@ -89,6 +92,11 @@ like terminfo/termcap databases that abstract terminal capabilities. Our approac
 hardcodes VT100 escape sequences, which is fine because QEMU's serial console and
 virtually all modern terminal emulators support VT100. A production OS would also
 provide shared libraries for TUI development (ncurses), which we defer.
+
+A notable side effect of this phase is establishing the pattern for Rust userspace
+programs that need heap allocation (`Vec`, `String`, `format!`). The userspace heap
+allocator built here will be reusable by future phases (compiler bootstrap, build
+tools, etc.).
 
 ## Deferred Until Later
 

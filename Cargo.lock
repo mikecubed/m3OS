@@ -147,6 +147,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "edit"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",

@@ -150,7 +150,7 @@ flowchart TD
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
-| 26 | Text Editor | Full-screen editor for creating and modifying files | [Phase 26](./26-text-editor.md) | *not yet created* |
+| 26 | Text Editor | Full-screen editor for creating and modifying files | [Phase 26](./26-text-editor.md) | [Tasks](./tasks/26-text-editor-tasks.md) |
 | 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | *not yet created* |
 | 28 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 28](./28-pty-subsystem.md) | *not yet created* |
 | 29 | Telnet Server | Remote shell access over the network | [Phase 29](./29-telnet-server.md) | *not yet created* |
