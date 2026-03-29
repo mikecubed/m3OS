@@ -112,16 +112,23 @@ fn build_userspace_bins() {
         );
     });
 
-    let bins: &[(&str, &str)] = &[
-        ("exit0", "exit0"),
-        ("fork-test", "fork-test"),
-        ("echo-args", "echo-args"),
-        ("ping", "ping"),
-        ("init", "init"),
-        ("shell", "sh0"),
+    // (package, binary, needs_alloc)
+    let bins: &[(&str, &str, bool)] = &[
+        ("exit0", "exit0", false),
+        ("fork-test", "fork-test", false),
+        ("echo-args", "echo-args", false),
+        ("ping", "ping", false),
+        ("init", "init", false),
+        ("shell", "sh0", false),
+        ("edit", "edit", true),
     ];
 
-    for (pkg, bin) in bins {
+    for &(pkg, bin, needs_alloc) in bins {
+        let build_std = if needs_alloc {
+            "-Zbuild-std=core,compiler_builtins,alloc"
+        } else {
+            "-Zbuild-std=core,compiler_builtins"
+        };
         let status = Command::new(env!("CARGO"))
             .current_dir(&root)
             .args([
@@ -133,7 +140,7 @@ fn build_userspace_bins() {
                 bin,
                 "--target",
                 "x86_64-unknown-none",
-                "-Zbuild-std=core,compiler_builtins",
+                build_std,
                 "-Zbuild-std-features=compiler-builtins-mem",
             ])
             .status()

@@ -20,6 +20,7 @@ const SH0_ARGV0: &[u8] = b"/bin/sh0\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/tmp\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
+const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
@@ -74,10 +75,11 @@ fn spawn_shell() -> isize {
     let pid = fork();
     if pid == 0 {
         // Child: exec ion as primary interactive shell, fall back to sh0.
-        let envp: [*const u8; 4] = [
+        let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
             ENV_TERM.as_ptr(),
+            ENV_EDITOR.as_ptr(),
             core::ptr::null(),
         ];
 

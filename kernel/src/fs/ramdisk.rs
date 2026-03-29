@@ -79,6 +79,7 @@ static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test.elf");
 static INIT_ELF: &[u8] = include_bytes!("../../initrd/init.elf");
 static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0.elf");
 static ION_ELF: &[u8] = include_bytes!("../../initrd/ion.elf");
+static EDIT_ELF: &[u8] = include_bytes!("../../initrd/edit.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -153,6 +154,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("sh0.elf", RamdiskNode::File { content: SH0_ELF }),
     ("ion", RamdiskNode::File { content: ION_ELF }),
     ("ion.elf", RamdiskNode::File { content: ION_ELF }),
+    ("edit", RamdiskNode::File { content: EDIT_ELF }),
+    ("edit.elf", RamdiskNode::File { content: EDIT_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
