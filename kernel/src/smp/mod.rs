@@ -229,6 +229,14 @@ pub fn init_bsp_per_core() {
             if entry.flags & 1 == 0 {
                 continue;
             }
+            if next_core_id >= MAX_CORES as u8 {
+                log::warn!(
+                    "[smp] skipping AP APIC ID={}: exceeds MAX_CORES ({})",
+                    entry.apic_id,
+                    MAX_CORES
+                );
+                break;
+            }
             unsafe {
                 APIC_TO_CORE[entry.apic_id as usize] = next_core_id;
             }
@@ -290,6 +298,11 @@ pub fn init_bsp_per_core() {
 ///
 /// Called from the BSP before sending SIPI to the AP.
 pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
+    assert!(
+        (core_id as usize) < MAX_CORES,
+        "core_id {} exceeds MAX_CORES",
+        core_id
+    );
     // Allocate stacks.
     let kernel_stack = Box::leak(alloc::vec![0u8; SYSCALL_STACK_SIZE].into_boxed_slice());
     // Align stack top to 16 bytes (x86-64 ABI requirement).

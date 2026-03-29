@@ -18,6 +18,26 @@ static SHOOTDOWN_ADDR: AtomicU64 = AtomicU64::new(0);
 /// Number of cores that still need to acknowledge the shootdown.
 static SHOOTDOWN_PENDING: AtomicU8 = AtomicU8::new(0);
 
+/// Serializes concurrent TLB shootdown requests.
+static SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Count the number of cores that are actually online.
+fn online_core_count() -> u8 {
+    let mut count = 0u8;
+    for i in 0..super::core_count() {
+        if let Some(data) = super::get_core_data(i) {
+            if data.is_online.load(core::sync::atomic::Ordering::Acquire) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 // ---------------------------------------------------------------------------
 // Public API (T031, T034)
 // ---------------------------------------------------------------------------
@@ -29,7 +49,9 @@ static SHOOTDOWN_PENDING: AtomicU8 = AtomicU8::new(0);
 ///
 /// If only one core is online, skips the IPI (single-core fast path, T034).
 pub fn tlb_shootdown(addr: u64) {
-    let online = super::core_count();
+    let _lock = SHOOTDOWN_LOCK.lock();
+
+    let online = online_core_count();
 
     // Always invalidate locally.
     x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));

@@ -337,9 +337,11 @@ pub fn boot_aps() {
             entry.apic_id
         );
 
-        // INIT-SIPI sequence per Intel spec.
+        // INIT-SIPI-SIPI sequence per Intel spec.
         send_init_ipi(entry.apic_id);
         delay_us(10_000); // 10 ms after INIT
+        send_sipi(entry.apic_id, SIPI_VECTOR);
+        delay_us(200);
         send_sipi(entry.apic_id, SIPI_VECTOR);
 
         // Wait for AP to signal via is_online.

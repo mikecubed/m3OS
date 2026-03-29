@@ -219,7 +219,8 @@ pub fn signal_reschedule() {
 }
 
 /// Spawn a new kernel task. The task is placed in the `Ready` state and
-/// will be picked up by any core's scheduler on the next tick.
+/// will be picked up by the BSP's scheduler on the next tick (APs are
+/// idle-only until per-core syscall statics are implemented).
 pub fn spawn(entry: fn() -> !, name: &'static str) {
     let task = Task::new(entry, name);
     SCHEDULER.lock().tasks.push(task);
@@ -230,6 +231,7 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
 /// Each core should have its own idle task that runs when no other task
 /// is ready on that core.
 pub fn spawn_idle_for_core(entry: fn() -> !, core_id: u8) {
+    assert!((core_id as usize) < crate::smp::MAX_CORES);
     let task = Task::new(entry, "idle");
     let mut sched = SCHEDULER.lock();
     let idx = sched.tasks.len();
@@ -420,8 +422,8 @@ pub fn run() -> ! {
             crate::ipc::notification::drain_pending_waiters();
         }
 
-        // Remove dead tasks.
-        {
+        // Remove dead tasks (BSP only to avoid contention).
+        if core_id == 0 {
             let mut sched = SCHEDULER.lock();
             sched.drain_dead();
         }
