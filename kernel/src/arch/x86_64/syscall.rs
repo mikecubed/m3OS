@@ -4931,7 +4931,7 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
     match crate::fs::ramdisk::ramdisk_lookup(name) {
         Some(crate::fs::ramdisk::RamdiskNode::File { content }) => {
             let mut stat = [0u8; 144];
-            let mode: u32 = 0x8000 | 0o644; // S_IFREG
+            let mode: u32 = 0x8000 | 0o755; // S_IFREG + executable (ramdisk binaries)
             stat[24..28].copy_from_slice(&mode.to_ne_bytes());
             let size = content.len() as u64;
             stat[48..56].copy_from_slice(&size.to_ne_bytes());
