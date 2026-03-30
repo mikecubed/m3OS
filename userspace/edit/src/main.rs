@@ -311,18 +311,21 @@ impl Editor {
     }
 
     fn save_file(&mut self) {
-        let filename = match &self.filename {
-            Some(f) => f.clone(),
-            None => match self.prompt(b"Save as: ", None) {
-                Some(name) if !name.is_empty() => {
-                    self.filename = Some(name.clone());
-                    name
-                }
-                _ => {
-                    self.set_status_msg("Save aborted");
-                    return;
-                }
-            },
+        // Prefill with existing filename if we have one.
+        let prefill: Vec<u8> = match &self.filename {
+            Some(f) => f.as_bytes().to_vec(),
+            None => Vec::new(),
+        };
+
+        let filename = match self.prompt_with_initial(b"Save as: ", &prefill, None) {
+            Some(name) if !name.is_empty() => {
+                self.filename = Some(name.clone());
+                name
+            }
+            _ => {
+                self.set_status_msg("Save aborted");
+                return;
+            }
         };
 
         // Serialize all rows
@@ -629,7 +632,16 @@ impl Editor {
         prompt: &[u8],
         callback: Option<fn(&mut Editor, &[u8], Key)>,
     ) -> Option<String> {
-        let mut input = Vec::new();
+        self.prompt_with_initial(prompt, &[], callback)
+    }
+
+    fn prompt_with_initial(
+        &mut self,
+        prompt: &[u8],
+        initial: &[u8],
+        callback: Option<fn(&mut Editor, &[u8], Key)>,
+    ) -> Option<String> {
+        let mut input = Vec::from(initial);
 
         loop {
             let mut msg = String::new();
