@@ -3155,6 +3155,20 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                     cloexec: false,
                                 };
 
+                                // Set ownership and permissions on the newly created file.
+                                let create_mode = if (mode_arg as u16) & 0o777 != 0 {
+                                    (mode_arg as u16) & 0o7777
+                                } else {
+                                    0o644
+                                };
+                                let (_, _, caller_euid, caller_egid) = current_process_ids();
+                                crate::fs::fat32::set_fat32_meta(
+                                    rel,
+                                    caller_euid,
+                                    caller_egid,
+                                    create_mode,
+                                );
+
                                 return match alloc_fd(3, fd_entry) {
                                     Some(i) => {
                                         log::info!("[open] {} → fd {} (fat32 new)", name, i);
@@ -4557,10 +4571,10 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
-    // Phase 27: Write permission on parent directory.
+    // Phase 27: Write+execute permission on parent directory.
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
         let (_, _, euid, egid) = current_process_ids();
-        if !check_permission(pu, pg, pm, euid, egid, 2) {
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
             return NEG_EACCES;
         }
     }
@@ -4635,10 +4649,10 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
-    // Phase 27: Write permission on parent directory.
+    // Phase 27: Write+execute permission on parent directory.
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
         let (_, _, euid, egid) = current_process_ids();
-        if !check_permission(pu, pg, pm, euid, egid, 2) {
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
             return NEG_EACCES;
         }
     }
@@ -4682,10 +4696,10 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
-    // Phase 27: Write permission on parent directory.
+    // Phase 27: Write+execute permission on parent directory.
     if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
         let (_, _, euid, egid) = current_process_ids();
-        if !check_permission(pu, pg, pm, euid, egid, 2) {
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
             return NEG_EACCES;
         }
     }
@@ -4772,16 +4786,16 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let old_resolved = resolve_path(&cwd, old_str_raw);
     let new_resolved = resolve_path(&cwd, new_raw);
 
-    // Phase 27: Write permission on both parent directories.
+    // Phase 27: Write+execute permission on both parent directories.
     {
         let (_, _, euid, egid) = current_process_ids();
         if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
-            if !check_permission(pu, pg, pm, euid, egid, 2) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
                 return NEG_EACCES;
             }
         }
         if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
-            if !check_permission(pu, pg, pm, euid, egid, 2) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
                 return NEG_EACCES;
             }
         }

@@ -590,6 +590,26 @@ pub fn chown(path: &[u8], uid: u32, gid: u32) -> isize {
     unsafe { syscall3(SYS_CHOWN, path.as_ptr() as u64, uid as u64, gid as u64) as isize }
 }
 
+/// Change file mode bits by fd.
+pub fn fchmod(fd: i32, mode: u16) -> isize {
+    unsafe { syscall2(SYS_FCHMOD, fd as u64, mode as u64) as isize }
+}
+
+/// Change file ownership by fd.
+pub fn fchown(fd: i32, uid: u32, gid: u32) -> isize {
+    unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) as isize }
+}
+
+/// Set real and effective user IDs.
+pub fn setreuid(ruid: u32, euid: u32) -> isize {
+    unsafe { syscall2(SYS_SETREUID, ruid as u64, euid as u64) as isize }
+}
+
+/// Set real and effective group IDs.
+pub fn setregid(rgid: u32, egid: u32) -> isize {
+    unsafe { syscall2(SYS_SETREGID, rgid as u64, egid as u64) as isize }
+}
+
 // ===========================================================================
 // High-level wrappers — Pipes and redirection
 // ===========================================================================

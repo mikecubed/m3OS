@@ -87,7 +87,7 @@ pub extern "C" fn _start() -> ! {
         write_u32_to_fd(fd as i32, new_gid);
         let _ = write(fd as i32, b":");
         let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":/home/");
+        let _ = write(fd as i32, b":/tmp/home/");
         let _ = write(fd as i32, username);
         let _ = write(fd as i32, b":/bin/ion\n");
         close(fd as i32);

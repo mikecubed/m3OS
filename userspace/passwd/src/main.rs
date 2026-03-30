@@ -1,7 +1,6 @@
 //! m3OS passwd — change user password (Phase 27).
 //!
-//! Non-root users can only change their own password.
-//! Root can change any user's password.
+//! Only root can change passwords (non-root support requires setuid-bit, deferred).
 #![no_std]
 #![no_main]
 
