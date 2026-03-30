@@ -985,89 +985,11 @@ fn signed_path(path: &Path) -> PathBuf {
     }
 }
 
-/// A Read+Write+Seek wrapper over a region of a file, used to expose a
-/// partition as if it were a standalone device for FAT formatting.
-struct PartitionSlice {
-    file: File,
-    offset: u64,
-    size: u64,
-}
-
-impl PartitionSlice {
-    fn new(file: File, offset: u64, size: u64) -> Self {
-        Self { file, offset, size }
-    }
-
-    /// Current position within the partition (relative to partition start).
-    fn partition_pos(&mut self) -> io::Result<u64> {
-        let abs = self.file.stream_position()?;
-        if abs < self.offset {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file cursor is before the start of the partition slice",
-            ));
-        }
-        Ok(abs - self.offset)
-    }
-}
-
-impl io::Read for PartitionSlice {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let pos = self.partition_pos()?;
-        if pos >= self.size {
-            return Ok(0);
-        }
-        let remaining = (self.size - pos) as usize;
-        let max_read = buf.len().min(remaining);
-        self.file.read(&mut buf[..max_read])
-    }
-}
-
-impl io::Write for PartitionSlice {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let pos = self.partition_pos()?;
-        if pos >= self.size {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write past end of partition",
-            ));
-        }
-        let remaining = (self.size - pos) as usize;
-        let max_write = buf.len().min(remaining);
-        self.file.write(&buf[..max_write])
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-impl io::Seek for PartitionSlice {
-    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        let new_partition_pos = match pos {
-            io::SeekFrom::Start(n) => i64::try_from(n).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
-            })?,
-            io::SeekFrom::End(n) => self.size as i64 + n,
-            io::SeekFrom::Current(n) => self.partition_pos()? as i64 + n,
-        };
-
-        if new_partition_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek before start of partition",
-            ));
-        }
-
-        let abs = self.offset + new_partition_pos as u64;
-        self.file.seek(io::SeekFrom::Start(abs))?;
-        Ok(new_partition_pos as u64)
-    }
-}
-
-/// Create a 64 MB raw data disk image with an MBR partition table and a
-/// FAT32-formatted partition. The image is placed at `output_dir/disk.img`.
+/// Create a 64 MB raw data disk image with an MBR partition table and an
+/// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
+///
+/// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
 fn create_data_disk(output_dir: &Path) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     if disk_path.exists() {
@@ -1107,7 +1029,7 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     entry[1] = 0xFE; // CHS start (LBA mode)
     entry[2] = 0xFF;
     entry[3] = 0xFF;
-    entry[4] = 0x0C; // type: FAT32 LBA
+    entry[4] = 0x83; // type: Linux / ext2
     entry[5] = 0xFE; // CHS end (LBA mode)
     entry[6] = 0xFF;
     entry[7] = 0xFF;
@@ -1125,58 +1047,144 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         eprintln!("Error: failed to write MBR: {e}");
         std::process::exit(1);
     });
+    drop(disk_file);
 
-    // Format the partition area as FAT32.
-    let partition_file = disk_file.try_clone().unwrap_or_else(|e| {
-        eprintln!("Error: failed to clone disk file handle: {e}");
-        std::process::exit(1);
-    });
-    let mut partition = PartitionSlice::new(partition_file, partition_offset, partition_size);
-    partition.seek(io::SeekFrom::Start(0)).unwrap();
-
-    // Use 512 bytes/cluster (1 sector/cluster) to ensure enough clusters
-    // for FAT32 (needs >= 65525). With 63 MB / 512 B = ~129000 clusters.
-    let format_options = fatfs::FormatVolumeOptions::new()
-        .volume_label(*b"M3OS_DATA  ")
-        .fat_type(fatfs::FatType::Fat32)
-        .bytes_per_cluster(512);
-    fatfs::format_volume(&mut partition, format_options).unwrap_or_else(|e| {
-        eprintln!("Error: failed to format data disk partition as FAT32: {e}");
-        std::process::exit(1);
-    });
-
-    // Phase 27: Populate /etc with user account configuration files.
-    partition.seek(io::SeekFrom::Start(0)).unwrap();
+    // Extract partition area to a temp file, format as ext2, copy back.
+    let part_tmp = output_dir.join("disk_partition.tmp");
     {
-        let fs = fatfs::FileSystem::new(&mut partition, fatfs::FsOptions::new())
-            .expect("failed to open FAT32 for populating /etc");
-        let root_dir = fs.root_dir();
-        match root_dir.create_dir("etc") {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => panic!("failed to create /etc on data disk: {e}"),
-        }
-
-        // /etc/passwd
-        let passwd = b"root:x:0:0:root:/tmp/home/root:/bin/ion\nuser:x:1000:1000:user:/tmp/home/user:/bin/ion\n";
-        let mut f = root_dir.create_file("etc/passwd").expect("create passwd");
-        f.truncate().unwrap();
-        f.write_all(passwd).expect("write passwd");
-
-        // /etc/shadow (hashed passwords for root:root and user:user)
-        let shadow = b"root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
-        let mut f = root_dir.create_file("etc/shadow").expect("create shadow");
-        f.truncate().unwrap();
-        f.write_all(shadow).expect("write shadow");
-
-        // /etc/group
-        let group = b"root:x:0:root\nuser:x:1000:user\n";
-        let mut f = root_dir.create_file("etc/group").expect("create group");
-        f.truncate().unwrap();
-        f.write_all(group).expect("write group");
+        let pf = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&part_tmp)
+            .expect("create partition temp file");
+        pf.set_len(partition_size)
+            .expect("set partition temp file size");
     }
-    println!("Data disk: {} (with /etc files)", disk_path.display());
+
+    // Format with mkfs.ext2 (4K blocks, ext2 rev 0, no optional features).
+    let mkfs_status = Command::new("mkfs.ext2")
+        .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
+        .arg(&part_tmp)
+        .status()
+        .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
+    if !mkfs_status.success() {
+        eprintln!("Error: mkfs.ext2 failed (exit {})", mkfs_status);
+        std::process::exit(1);
+    }
+
+    // Populate files using debugfs.
+    populate_ext2_files(&part_tmp, output_dir);
+
+    // Validate with e2fsck.
+    let fsck_status = Command::new("e2fsck")
+        .args(["-n", "-f"])
+        .arg(&part_tmp)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run e2fsck");
+    if !fsck_status.success() {
+        eprintln!("Warning: e2fsck returned non-zero (exit {})", fsck_status);
+    }
+
+    // Copy the formatted partition back into the disk image at the offset.
+    {
+        let part_data = fs::read(&part_tmp).expect("read partition temp file");
+        let mut disk = fs::OpenOptions::new()
+            .write(true)
+            .open(&disk_path)
+            .expect("reopen disk image");
+        disk.seek(io::SeekFrom::Start(partition_offset)).unwrap();
+        disk.write_all(&part_data).expect("write partition to disk");
+    }
+    let _ = fs::remove_file(&part_tmp);
+
+    println!("Data disk: {} (ext2, with /etc files)", disk_path.display());
     disk_path
+}
+
+/// Populate the ext2 partition image with initial directories and files
+/// using `debugfs -w`. Creates temp host files for the `write` command.
+fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
+    let passwd_content =
+        "root:x:0:0:root:/tmp/home/root:/bin/ion\nuser:x:1000:1000:user:/tmp/home/user:/bin/ion\n";
+    let shadow_content = "root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
+    let group_content = "root:x:0:root\nuser:x:1000:user\n";
+
+    // Create temp host files for debugfs `write` command.
+    let passwd_tmp = output_dir.join("_tmp_passwd");
+    let shadow_tmp = output_dir.join("_tmp_shadow");
+    let group_tmp = output_dir.join("_tmp_group");
+    fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
+    fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
+    fs::write(&group_tmp, group_content).expect("write temp group");
+
+    // debugfs mode values: S_IFDIR|perm or S_IFREG|perm
+    // S_IFDIR = 0o40000 = 0x4000, S_IFREG = 0o100000 = 0x8000
+    // 0o40755 = 0x41ED, 0o40700 = 0x41C0, 0o100644 = 0x81A4, 0o100600 = 0x8180
+    let cmds = format!(
+        "mkdir etc\n\
+         mkdir root\n\
+         mkdir home\n\
+         mkdir home/user\n\
+         write {passwd} etc/passwd\n\
+         write {shadow} etc/shadow\n\
+         write {group} etc/group\n\
+         sif etc mode 0x41ED\n\
+         sif etc uid 0\n\
+         sif etc gid 0\n\
+         sif root mode 0x41C0\n\
+         sif root uid 0\n\
+         sif root gid 0\n\
+         sif home mode 0x41ED\n\
+         sif home uid 0\n\
+         sif home gid 0\n\
+         sif home/user mode 0x41ED\n\
+         sif home/user uid 1000\n\
+         sif home/user gid 1000\n\
+         sif etc/passwd mode 0x81A4\n\
+         sif etc/passwd uid 0\n\
+         sif etc/passwd gid 0\n\
+         sif etc/shadow mode 0x8180\n\
+         sif etc/shadow uid 0\n\
+         sif etc/shadow gid 0\n\
+         sif etc/group mode 0x81A4\n\
+         sif etc/group uid 0\n\
+         sif etc/group gid 0\n\
+         q\n",
+        passwd = passwd_tmp.display(),
+        shadow = shadow_tmp.display(),
+        group = group_tmp.display(),
+    );
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs — is e2fsprogs installed?");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write debugfs commands");
+    }
+    let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
+    if !debugfs_output.status.success() {
+        let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
+        eprintln!(
+            "Warning: debugfs exited with {}: {}",
+            debugfs_output.status, stderr
+        );
+    }
+
+    // Clean up temp files.
+    let _ = fs::remove_file(&passwd_tmp);
+    let _ = fs::remove_file(&shadow_tmp);
+    let _ = fs::remove_file(&group_tmp);
 }
 
 fn cmd_image(image_args: &ImageArgs) {
