@@ -869,6 +869,73 @@ pub fn write_str(fd: i32, s: &str) -> isize {
     write(fd, s.as_bytes())
 }
 
+/// `setsid()` — create a new session (syscall 112).
+pub fn setsid() -> i64 {
+    unsafe { syscall0(112) as i64 }
+}
+
+/// `getsid(pid)` — get session ID (syscall 124).
+pub fn getsid(pid: u32) -> i64 {
+    unsafe { syscall1(124, pid as u64) as i64 }
+}
+
+/// Open a PTY pair. Returns `Ok((master_fd, slave_fd))` or `Err(errno)`.
+pub fn openpty() -> Result<(i32, i32), i32> {
+    // Open /dev/ptmx to allocate a new PTY pair.
+    let master_fd = open(b"/dev/ptmx\0", 2, 0); // O_RDWR
+    if master_fd < 0 {
+        return Err(master_fd as i32);
+    }
+    let mfd = master_fd as i32;
+
+    // Unlock the slave side.
+    let zero: i32 = 0;
+    let ret = ioctl(mfd, 0x40045431, &zero as *const _ as usize); // TIOCSPTLCK
+    if ret < 0 {
+        close(mfd);
+        return Err(ret as i32);
+    }
+
+    // Get the PTY number.
+    let mut pty_num: u32 = 0;
+    let ret = ioctl(mfd, 0x80045430, &mut pty_num as *mut _ as usize); // TIOCGPTN
+    if ret < 0 {
+        close(mfd);
+        return Err(ret as i32);
+    }
+
+    // Construct /dev/pts/N path.
+    let mut path = [0u8; 32];
+    let prefix = b"/dev/pts/";
+    path[..prefix.len()].copy_from_slice(prefix);
+    let mut pos = prefix.len();
+    if pty_num == 0 {
+        path[pos] = b'0';
+        pos += 1;
+    } else {
+        let mut digits = [0u8; 10];
+        let mut dpos = digits.len();
+        let mut n = pty_num;
+        while n > 0 {
+            dpos -= 1;
+            digits[dpos] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let len = digits.len() - dpos;
+        path[pos..pos + len].copy_from_slice(&digits[dpos..]);
+        pos += len;
+    }
+    path[pos] = 0; // null terminator
+
+    let slave_fd = open(&path, 2, 0); // O_RDWR
+    if slave_fd < 0 {
+        close(mfd);
+        return Err(slave_fd as i32);
+    }
+
+    Ok((mfd, slave_fd as i32))
+}
+
 /// Write a u64 as decimal text to a file descriptor (no alloc needed).
 pub fn write_u64(fd: i32, mut n: u64) {
     if n == 0 {

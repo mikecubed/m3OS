@@ -19,6 +19,7 @@ mod net;
 mod pci;
 mod pipe;
 mod process;
+mod pty;
 mod serial;
 mod signal;
 mod smp;

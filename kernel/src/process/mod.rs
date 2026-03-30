@@ -158,6 +158,8 @@ pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
 pub fn close_cloexec_fds(pid: Pid) {
     let mut readers = alloc::vec::Vec::new();
     let mut writers = alloc::vec::Vec::new();
+    let mut pty_masters = alloc::vec::Vec::new();
+    let mut pty_slaves = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -171,6 +173,8 @@ pub fn close_cloexec_fds(pid: Pid) {
                 match &entry.backend {
                     FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
                     FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                    FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
+                    FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     _ => {}
                 }
                 *slot = None;
@@ -182,6 +186,12 @@ pub fn close_cloexec_fds(pid: Pid) {
     }
     for id in writers {
         crate::pipe::pipe_close_writer(id);
+    }
+    for id in pty_masters {
+        crate::pty::close_master(id);
+    }
+    for id in pty_slaves {
+        crate::pty::close_slave(id);
     }
 }
 
@@ -196,6 +206,8 @@ pub fn close_all_fds_for(pid: Pid) {
     // locking PIPE_TABLE.
     let mut readers = alloc::vec::Vec::new();
     let mut writers = alloc::vec::Vec::new();
+    let mut pty_masters = alloc::vec::Vec::new();
+    let mut pty_slaves = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -207,6 +219,8 @@ pub fn close_all_fds_for(pid: Pid) {
                 match &entry.backend {
                     FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
                     FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                    FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
+                    FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     _ => {}
                 }
             }
@@ -217,6 +231,12 @@ pub fn close_all_fds_for(pid: Pid) {
     }
     for id in writers {
         crate::pipe::pipe_close_writer(id);
+    }
+    for id in pty_masters {
+        crate::pty::close_master(id);
+    }
+    for id in pty_slaves {
+        crate::pty::close_slave(id);
     }
 }
 
@@ -417,6 +437,19 @@ pub struct Process {
     pub euid: u32,
     /// Effective group ID (Phase 27). Used for permission checks.
     pub egid: u32,
+    /// Session ID (Phase 29). Equals the PID of the session leader.
+    pub session_id: u32,
+    /// Controlling terminal (Phase 29).
+    pub controlling_tty: Option<ControllingTty>,
+}
+
+/// Identifies the controlling terminal for a process.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControllingTty {
+    /// The hardware console (TTY0).
+    Console,
+    /// A pseudo-terminal with the given PTY ID.
+    Pty(u32),
 }
 
 impl Process {
@@ -454,6 +487,8 @@ impl Process {
             gid: 0,
             euid: 0,
             egid: 0,
+            session_id: pid,
+            controlling_tty: Some(ControllingTty::Console),
         }
     }
 }
@@ -576,6 +611,8 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         gid: 0,
         euid: 0,
         egid: 0,
+        session_id: pid,
+        controlling_tty: Some(ControllingTty::Console),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -624,6 +661,8 @@ pub fn spawn_process_with_cr3(
         gid: 0,
         euid: 0,
         egid: 0,
+        session_id: pid,
+        controlling_tty: Some(ControllingTty::Console),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -676,6 +715,8 @@ pub fn spawn_process_with_cr3_and_fds(
         gid: 0,
         euid: 0,
         egid: 0,
+        session_id: pid,
+        controlling_tty: Some(ControllingTty::Console),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
