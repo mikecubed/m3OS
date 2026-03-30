@@ -26,6 +26,12 @@ pub enum TmpfsError {
 pub struct TmpfsStat {
     pub is_dir: bool,
     pub size: usize,
+    /// Owner user ID (Phase 27).
+    pub uid: u32,
+    /// Owner group ID (Phase 27).
+    pub gid: u32,
+    /// Unix permission mode bits (Phase 27). E.g. 0o755 for dirs, 0o644 for files.
+    pub mode: u16,
 }
 
 enum TmpfsNode {
@@ -35,18 +41,16 @@ enum TmpfsNode {
 
 struct FileData {
     content: Vec<u8>,
+    uid: u32,
+    gid: u32,
+    mode: u16,
 }
 
 struct DirData {
     children: BTreeMap<String, TmpfsNode>,
-}
-
-impl DirData {
-    fn new() -> Self {
-        DirData {
-            children: BTreeMap::new(),
-        }
-    }
+    uid: u32,
+    gid: u32,
+    mode: u16,
 }
 
 /// A complete tmpfs filesystem instance.
@@ -59,6 +63,9 @@ impl Tmpfs {
         Tmpfs {
             root: TmpfsNode::Dir(DirData {
                 children: BTreeMap::new(),
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
             }),
         }
     }
@@ -132,6 +139,17 @@ impl Tmpfs {
     }
 
     pub fn create_file(&mut self, path: &str) -> Result<(), TmpfsError> {
+        self.create_file_with_meta(path, 0, 0, 0o644)
+    }
+
+    /// Create a file with specific ownership and mode.
+    pub fn create_file_with_meta(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Result<(), TmpfsError> {
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -140,6 +158,9 @@ impl Tmpfs {
             name.to_string(),
             TmpfsNode::File(FileData {
                 content: Vec::new(),
+                uid,
+                gid,
+                mode,
             }),
         );
         Ok(())
@@ -188,10 +209,16 @@ impl Tmpfs {
             TmpfsNode::File(file) => Ok(TmpfsStat {
                 is_dir: false,
                 size: file.content.len(),
+                uid: file.uid,
+                gid: file.gid,
+                mode: file.mode,
             }),
-            TmpfsNode::Dir(_) => Ok(TmpfsStat {
+            TmpfsNode::Dir(dir) => Ok(TmpfsStat {
                 is_dir: true,
                 size: 0,
+                uid: dir.uid,
+                gid: dir.gid,
+                mode: dir.mode,
             }),
         }
     }
@@ -209,13 +236,30 @@ impl Tmpfs {
     }
 
     pub fn mkdir(&mut self, path: &str) -> Result<(), TmpfsError> {
+        self.mkdir_with_meta(path, 0, 0, 0o755)
+    }
+
+    /// Create a directory with specific ownership and mode.
+    pub fn mkdir_with_meta(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Result<(), TmpfsError> {
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
         }
-        parent
-            .children
-            .insert(name.to_string(), TmpfsNode::Dir(DirData::new()));
+        parent.children.insert(
+            name.to_string(),
+            TmpfsNode::Dir(DirData {
+                children: BTreeMap::new(),
+                uid,
+                gid,
+                mode,
+            }),
+        );
         Ok(())
     }
 
@@ -305,6 +349,32 @@ impl Tmpfs {
         }
     }
 
+    /// Change the permission mode of a file or directory.
+    pub fn chmod(&mut self, path: &str, mode: u16) -> Result<(), TmpfsError> {
+        let node = self.get_node_mut(path)?;
+        match node {
+            TmpfsNode::File(f) => f.mode = mode,
+            TmpfsNode::Dir(d) => d.mode = mode,
+        }
+        Ok(())
+    }
+
+    /// Change the owner uid/gid of a file or directory.
+    pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), TmpfsError> {
+        let node = self.get_node_mut(path)?;
+        match node {
+            TmpfsNode::File(f) => {
+                f.uid = uid;
+                f.gid = gid;
+            }
+            TmpfsNode::Dir(d) => {
+                d.uid = uid;
+                d.gid = gid;
+            }
+        }
+        Ok(())
+    }
+
     pub fn truncate(&mut self, path: &str, new_size: usize) -> Result<(), TmpfsError> {
         if new_size > MAX_FILE_SIZE {
             return Err(TmpfsError::NoSpace);
@@ -320,11 +390,23 @@ impl Tmpfs {
     }
 
     pub fn open_or_create(&mut self, path: &str, create: bool) -> Result<bool, TmpfsError> {
+        self.open_or_create_with_meta(path, create, 0, 0, 0o644)
+    }
+
+    /// Open an existing file or create it with specific ownership and mode.
+    pub fn open_or_create_with_meta(
+        &mut self,
+        path: &str,
+        create: bool,
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Result<bool, TmpfsError> {
         match self.get_node(path) {
             Ok(TmpfsNode::File(_)) => Ok(false),
             Ok(TmpfsNode::Dir(_)) => Err(TmpfsError::WrongType),
             Err(TmpfsError::NotFound) if create => {
-                self.create_file(path)?;
+                self.create_file_with_meta(path, uid, gid, mode)?;
                 Ok(true)
             }
             Err(e) => Err(e),

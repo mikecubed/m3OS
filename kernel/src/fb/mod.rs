@@ -827,6 +827,13 @@ pub unsafe fn init_from_parts(buf_ptr: *mut u8, info: FrameBufferInfo) -> bool {
     true
 }
 
+/// Return the framebuffer console text dimensions (rows, cols), or None
+/// if no framebuffer console is active.
+pub fn console_text_size() -> Option<(u16, u16)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| (c.rows() as u16, c.cols() as u16))
+}
+
 /// Write a string to the framebuffer console at the current cursor position.
 ///
 /// Handles `'\n'` (newline) and `'\x08'` (backspace).  Characters outside

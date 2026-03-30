@@ -335,7 +335,7 @@ pub extern "C" fn syscall_handler(
         // Linux-compatible file I/O (Phase 12, T013–T017)
         0 => sys_linux_read(arg0, arg1, arg2),
         1 => sys_linux_write(arg0, arg1, arg2),
-        2 => sys_linux_open(arg0, arg1),
+        2 => sys_linux_open(arg0, arg1, arg2),
         3 => sys_linux_close(arg0),
         5 => sys_linux_fstat(arg0, arg1),
         // Phase 22: poll stub — report all requested fds as ready.
@@ -434,11 +434,20 @@ pub extern "C" fn syscall_handler(
         83 => sys_linux_mkdir(arg0, arg1),
         84 => sys_linux_rmdir(arg0),
         87 => sys_linux_unlink(arg0),
-        // Phase 21: user/group ID stubs — single-user OS, always root (0)
-        102 => 0, // getuid
-        104 => 0, // getgid
-        107 => 0, // geteuid
-        108 => 0, // getegid
+        // Phase 27: file permission syscalls
+        90 => sys_linux_chmod(arg0, arg1),
+        91 => sys_linux_fchmod(arg0, arg1),
+        92 => sys_linux_chown(arg0, arg1, arg2),
+        93 => sys_linux_fchown(arg0, arg1, arg2),
+        // Phase 27: user/group identity syscalls
+        102 => sys_linux_getuid(),
+        104 => sys_linux_getgid(),
+        105 => sys_linux_setuid(arg0),
+        106 => sys_linux_setgid(arg0),
+        107 => sys_linux_geteuid(),
+        108 => sys_linux_getegid(),
+        113 => sys_linux_setreuid(arg0, arg1),
+        114 => sys_linux_setregid(arg0, arg1),
         // Phase 14: process group syscalls
         109 => sys_setpgid(arg0, arg1),
         110 => sys_getppid(),
@@ -1420,6 +1429,150 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 27: User/group identity syscalls
+// ---------------------------------------------------------------------------
+
+/// Helper: get the uid/gid/euid/egid of the current process.
+fn current_process_ids() -> (u32, u32, u32, u32) {
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => (p.uid, p.gid, p.euid, p.egid),
+        None => (0, 0, 0, 0),
+    }
+}
+
+/// `getuid()` — return real user ID (syscall 102).
+fn sys_linux_getuid() -> u64 {
+    current_process_ids().0 as u64
+}
+
+/// `getgid()` — return real group ID (syscall 104).
+fn sys_linux_getgid() -> u64 {
+    current_process_ids().1 as u64
+}
+
+/// `geteuid()` — return effective user ID (syscall 107).
+fn sys_linux_geteuid() -> u64 {
+    current_process_ids().2 as u64
+}
+
+/// `getegid()` — return effective group ID (syscall 108).
+fn sys_linux_getegid() -> u64 {
+    current_process_ids().3 as u64
+}
+
+/// `setuid(uid)` — set user ID (syscall 105).
+///
+/// If euid == 0 (root): sets both real uid and effective uid.
+/// If euid != 0: only allows setting euid back to real uid.
+fn sys_linux_setuid(uid_arg: u64) -> u64 {
+    let new_uid = uid_arg as u32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+    if proc.euid == 0 {
+        proc.uid = new_uid;
+        proc.euid = new_uid;
+    } else if new_uid == proc.uid {
+        proc.euid = new_uid;
+    } else {
+        return NEG_EPERM;
+    }
+    0
+}
+
+/// `setgid(gid)` — set group ID (syscall 106).
+fn sys_linux_setgid(gid_arg: u64) -> u64 {
+    let new_gid = gid_arg as u32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+    if proc.egid == 0 {
+        proc.gid = new_gid;
+        proc.egid = new_gid;
+    } else if new_gid == proc.gid {
+        proc.egid = new_gid;
+    } else {
+        return NEG_EPERM;
+    }
+    0
+}
+
+/// `setreuid(ruid, euid)` — set real and effective user IDs (syscall 113).
+///
+/// If ruid != -1: set real uid (only if euid==0 or ruid matches current real/effective uid).
+/// If euid != -1: set effective uid (only if euid==0 or value matches current real uid).
+fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
+    let ruid = ruid_arg as i32;
+    let euid = euid_arg as i32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+
+    if ruid != -1 {
+        let new_ruid = ruid as u32;
+        if proc.euid == 0 || new_ruid == proc.uid || new_ruid == proc.euid {
+            proc.uid = new_ruid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    if euid != -1 {
+        let new_euid = euid as u32;
+        if proc.euid == 0 || new_euid == proc.uid || new_euid == proc.euid {
+            proc.euid = new_euid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    0
+}
+
+/// `setregid(rgid, egid)` — set real and effective group IDs (syscall 114).
+fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
+    let rgid = rgid_arg as i32;
+    let egid = egid_arg as i32;
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let proc = match table.find_mut(pid) {
+        Some(p) => p,
+        None => return NEG_EPERM,
+    };
+
+    if rgid != -1 {
+        let new_rgid = rgid as u32;
+        if proc.egid == 0 || new_rgid == proc.gid || new_rgid == proc.egid {
+            proc.gid = new_rgid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    if egid != -1 {
+        let new_egid = egid as u32;
+        if proc.egid == 0 || new_egid == proc.gid || new_egid == proc.egid {
+            proc.egid = new_egid;
+        } else {
+            return NEG_EPERM;
+        }
+    }
+
+    0
+}
+
 /// `fork()` — create a child process that resumes after the syscall with rax=0.
 ///
 /// Allocates a fresh page table for the child (eager copy of user pages),
@@ -1468,6 +1621,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_signal_actions,
         parent_alt_stack,
         parent_fs_base,
+        parent_ids,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1481,6 +1635,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.signal_actions,
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
+                (p.uid, p.gid, p.euid, p.egid),
             ),
             None => (
                 0,
@@ -1495,6 +1650,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 [crate::process::SignalAction::Default; 32],
                 (0u64, 0u64, 0u32),
                 0,
+                (0u32, 0u32, 0u32, 0u32),
             ),
         }
     };
@@ -1526,6 +1682,10 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.alt_stack_size = parent_alt_stack.1;
             child.alt_stack_flags = parent_alt_stack.2;
             child.fs_base = parent_fs_base;
+            child.uid = parent_ids.0;
+            child.gid = parent_ids.1;
+            child.euid = parent_ids.2;
+            child.egid = parent_ids.3;
         }
     }
 
@@ -1627,6 +1787,14 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Ok(v) => v,
         Err(()) => return NEG_EFAULT,
     };
+
+    // Phase 27: Execute permission check.
+    if let Some((fu, fg, fm)) = path_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(fu, fg, fm, euid, egid, 1) {
+            return NEG_EACCES;
+        }
+    }
 
     // Read the binary from the ramdisk (get_file handles both absolute and bare names).
     let data = match crate::fs::ramdisk::get_file(name) {
@@ -2680,7 +2848,7 @@ fn fat32_relative_path(path: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
+fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -2699,6 +2867,29 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
         2 => (true, true),      // O_RDWR
         _ => return NEG_EINVAL, // invalid combination
     };
+
+    // Phase 27: Permission check for existing files.
+    let create = (flags & 0x40) != 0; // O_CREAT
+    if !create || path_metadata(name).is_some() {
+        if let Some((fu, fg, fm)) = path_metadata(name) {
+            let (_, _, euid, egid) = current_process_ids();
+            let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
+            if required != 0 && !check_permission(fu, fg, fm, euid, egid, required) {
+                return NEG_EACCES;
+            }
+        }
+    }
+
+    // Phase 27: When creating a new file, check parent directory write+execute permission.
+    if create && path_metadata(name).is_none() {
+        if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+            let (_, _, euid_c, egid_c) = current_process_ids();
+            if !check_permission(pu, pg, pm, euid_c, egid_c, 3) {
+                return NEG_EACCES;
+            }
+        }
+    }
+
     // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
     // Placed after flags decode so O_RDONLY/O_WRONLY are respected.
     if name == "/dev/null" {
@@ -2806,8 +2997,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
 
-        // Open or create the file.
-        match tmpfs.open_or_create(rel, create) {
+        // Open or create the file with caller's ownership.
+        let create_mode = (mode_arg as u16) & 0o7777;
+        let (_, _, caller_euid, caller_egid) = current_process_ids();
+        match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, create_mode) {
             Ok(_created) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::WrongType) => {
@@ -2958,6 +3151,16 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
                                     cloexec: false,
                                 };
 
+                                // Set ownership and permissions on the newly created file.
+                                let create_mode = (mode_arg as u16) & 0o7777;
+                                let (_, _, caller_euid, caller_egid) = current_process_ids();
+                                crate::fs::fat32::set_fat32_meta(
+                                    rel,
+                                    caller_euid,
+                                    caller_egid,
+                                    create_mode,
+                                );
+
                                 return match alloc_fd(3, fd_entry) {
                                     Some(i) => {
                                         log::info!("[open] {} → fd {} (fat32 new)", name, i);
@@ -2986,6 +3189,38 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
     let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => {
+            // Phase 27: /etc/* fallback — try /data/etc/* on FAT32.
+            if let Some(etc_rel) = name.strip_prefix("/etc/") {
+                if !etc_rel.is_empty() && crate::fs::fat32::is_mounted() {
+                    let fat_rel = alloc::format!("etc/{}", etc_rel);
+                    let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                    if let Some(vol) = vol.as_ref() {
+                        if let Ok(entry) = vol.lookup(&fat_rel) {
+                            if !entry.is_dir() {
+                                let fd_entry = FdEntry {
+                                    backend: FdBackend::Fat32Disk {
+                                        path: fat_rel,
+                                        start_cluster: entry.start_cluster(),
+                                        file_size: entry.file_size,
+                                        dir_cluster: vol.bpb.root_cluster,
+                                    },
+                                    offset: 0,
+                                    readable: true,
+                                    writable: false,
+                                    cloexec: false,
+                                };
+                                return match alloc_fd(3, fd_entry) {
+                                    Some(i) => {
+                                        log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
+                                        i as u64
+                                    }
+                                    None => NEG_EMFILE,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             log::warn!("[open] file not found: {}", name);
             return NEG_ENOENT;
         }
@@ -3018,9 +3253,11 @@ fn sys_linux_open(path_ptr: u64, flags: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+    // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
+    let mode_arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
     if dirfd == AT_FDCWD {
         // Resolve relative to process cwd — same as sys_linux_open.
-        return sys_linux_open(path_ptr, flags);
+        return sys_linux_open(path_ptr, flags, mode_arg);
     }
 
     // dirfd is a directory fd — resolve path relative to it.
@@ -3150,7 +3387,9 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             return NEG_EISDIR;
         }
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        match tmpfs.open_or_create(rel, create) {
+        let create_mode = (mode_arg as u16) & 0o7777;
+        let (_, _, caller_euid2, caller_egid2) = current_process_ids();
+        match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, create_mode) {
             Ok(_) => {}
             Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
             Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
@@ -3249,6 +3488,30 @@ fn sys_linux_close(fd: u64) -> u64 {
 ///
 /// Only `st_size` (offset 48) and `st_mode` (offset 24) are filled in;
 /// all other fields are zero.  This satisfies musl's `fstat` use in `fopen`.
+/// Get uid/gid/mode for a directory path from the appropriate filesystem.
+fn dir_metadata(path: &str) -> (u32, u32, u16) {
+    // Tmpfs directories (under /tmp)
+    if path.starts_with("/tmp") || path == "tmp" {
+        let rel = path.strip_prefix("/tmp").unwrap_or(path);
+        let lookup = if rel.is_empty() { "/" } else { rel };
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        if let Ok(s) = tmpfs.stat(lookup) {
+            return (s.uid, s.gid, s.mode);
+        }
+    }
+    // FAT32 directories (under /data)
+    if let Some(rel) = path.strip_prefix("/data/") {
+        return crate::fs::fat32::get_fat32_meta(rel);
+    }
+    // Default for ramdisk and other directories
+    (0, 0, 0o755)
+}
+
+/// Get uid/gid/mode for a FAT32 file by its relative path.
+fn fat32_file_metadata(path: &str) -> (u32, u32, u16) {
+    crate::fs::fat32::get_fat32_meta(path)
+}
+
 fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -3258,101 +3521,322 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         Some(e) => e,
         None => return NEG_EBADF,
     };
-    // Handle directory fds separately — they get S_IFDIR mode.
-    if matches!(&entry.backend, FdBackend::Dir { .. }) {
-        let mut stat = [0u8; 144];
-        let mode: u32 = 0x4000 | 0o755; // S_IFDIR | rwxr-xr-x
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        let blksize: u64 = 4096;
-        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-            return NEG_EFAULT;
-        }
-        return 0;
-    }
+    // x86_64 stat struct layout (144 bytes):
+    //  0: st_dev (u64)      8: st_ino (u64)    16: st_nlink (u64)
+    // 24: st_mode (u32)    28: st_uid (u32)    32: st_gid (u32)
+    // 36: __pad0 (u32)     40: st_rdev (u64)   48: st_size (i64)
+    // 56: st_blksize (i64) 64: st_blocks (i64)
+    let mut stat = [0u8; 144];
+    let blksize: u64 = 4096;
 
-    // DevNull gets S_IFCHR mode.
-    if matches!(&entry.backend, FdBackend::DevNull) {
-        let mut stat = [0u8; 144];
-        let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-            return NEG_EFAULT;
+    // Determine mode, uid, gid, size, rdev based on backend type.
+    let (mode, uid, gid, size, rdev): (u32, u32, u32, u64, u64) = match &entry.backend {
+        FdBackend::Dir { path } => {
+            // Try to get metadata from tmpfs for dirs under /tmp
+            let (u, g, m) = dir_metadata(path);
+            (0x4000 | m as u32, u, g, 0, 0)
         }
-        return 0;
-    }
-
-    // DeviceTTY / PTY gets S_IFCHR mode with appropriate rdev encoding.
-    if matches!(
-        &entry.backend,
-        FdBackend::DeviceTTY { .. } | FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. }
-    ) {
-        let mut stat = [0u8; 144];
-        let mode: u32 = 0x2000 | 0o620; // S_IFCHR | rw--w----
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        let rdev: u64 = match &entry.backend {
-            FdBackend::DeviceTTY { tty_id } => ((5u64) << 8) | (*tty_id as u64),
-            FdBackend::PtyMaster { pty_id } => ((5u64) << 8) | (2 + *pty_id as u64),
-            FdBackend::PtySlave { pty_id } => ((136u64) << 8) | (*pty_id as u64),
-            _ => 0,
-        };
-        stat[32..40].copy_from_slice(&rdev.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-            return NEG_EFAULT;
+        FdBackend::DevNull => (0x2000 | 0o666, 0, 0, 0, 0),
+        FdBackend::DeviceTTY { tty_id } => {
+            (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
         }
-        return 0;
-    }
-
-    // Socket fds get S_IFSOCK mode.
-    if matches!(&entry.backend, FdBackend::Socket { .. }) {
-        let mut stat = [0u8; 144];
-        let mode: u32 = 0xC000 | 0o755; // S_IFSOCK | rwxr-xr-x
-        stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-            return NEG_EFAULT;
+        FdBackend::PtyMaster { pty_id } => (
+            0x2000 | 0o620,
+            0,
+            0,
+            0,
+            ((5u64) << 8) | (2 + *pty_id as u64),
+        ),
+        FdBackend::PtySlave { pty_id } => {
+            (0x2000 | 0o620, 0, 0, 0, ((136u64) << 8) | (*pty_id as u64))
         }
-        return 0;
-    }
-
-    let size = match &entry.backend {
-        FdBackend::Stdout
-        | FdBackend::Stdin
-        | FdBackend::PipeRead { .. }
-        | FdBackend::PipeWrite { .. } => 0u64,
-        FdBackend::Ramdisk { content_len, .. } => *content_len as u64,
+        FdBackend::Socket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
+        FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => (0x1000 | 0o600, 0, 0, 0, 0),
+        FdBackend::Ramdisk { content_len, .. } => {
+            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
+            (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
+        }
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-            match tmpfs.file_size(path) {
-                Ok(size) => size as u64,
+            match tmpfs.stat(path) {
+                Ok(s) => (0x8000 | s.mode as u32, s.uid, s.gid, s.size as u64, 0),
                 Err(_) => return NEG_ENOENT,
             }
         }
-        FdBackend::Fat32Disk { file_size, .. } => *file_size as u64,
-        FdBackend::Dir { .. }
-        | FdBackend::DevNull
-        | FdBackend::DeviceTTY { .. }
-        | FdBackend::PtyMaster { .. }
-        | FdBackend::PtySlave { .. }
-        | FdBackend::Socket { .. } => {
-            unreachable!() // handled above
+        FdBackend::Fat32Disk {
+            path, file_size, ..
+        } => {
+            let (u, g, m) = fat32_file_metadata(path);
+            (0x8000 | m as u32, u, g, *file_size as u64, 0)
         }
     };
 
-    // x86_64 stat struct (144 bytes, all little-endian).
-    let mut stat = [0u8; 144];
-    // st_mode at offset 24: S_IFREG (0x8000) | 0o644
-    let mode: u32 = 0x8000 | 0o644;
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-    // st_size at offset 48: file size
+    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
+    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
+    stat[40..48].copy_from_slice(&rdev.to_ne_bytes());
     stat[48..56].copy_from_slice(&size.to_ne_bytes());
-    // st_blksize at offset 56: 4096
-    let blksize: u64 = 4096;
     stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
 
     if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
         return NEG_EFAULT;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 27: chmod, fchmod, chown, fchown
+// ---------------------------------------------------------------------------
+
+const NEG_EACCES: u64 = (-13_i64) as u64;
+
+// ---------------------------------------------------------------------------
+// Phase 27 Track C: Permission enforcement
+// ---------------------------------------------------------------------------
+
+/// Check if a caller has the required permission on a file/directory.
+///
+/// `required` is a bitmask: 4=read, 2=write, 1=execute.
+/// Returns true if access is allowed.
+fn check_permission(
+    file_uid: u32,
+    file_gid: u32,
+    file_mode: u16,
+    caller_uid: u32,
+    caller_gid: u32,
+    required: u8,
+) -> bool {
+    // Root bypasses all permission checks.
+    if caller_uid == 0 {
+        return true;
+    }
+
+    let bits = if caller_uid == file_uid {
+        ((file_mode >> 6) & 0o7) as u8
+    } else if caller_gid == file_gid {
+        ((file_mode >> 3) & 0o7) as u8
+    } else {
+        (file_mode & 0o7) as u8
+    };
+
+    (bits & required) == required
+}
+
+/// Get file metadata for permission checking on a resolved absolute path.
+fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        if let Ok(s) = tmpfs.stat(rel) {
+            return Some((s.uid, s.gid, s.mode));
+        }
+        return None;
+    }
+    if let Some(rel) = abs_path.strip_prefix("/data/") {
+        return Some(crate::fs::fat32::get_fat32_meta(rel));
+    }
+    if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
+        return Some((0, 0, 0o755));
+    }
+    if abs_path == "/"
+        || abs_path == "/data"
+        || abs_path == "/tmp"
+        || abs_path.starts_with("/dev")
+        || abs_path.starts_with("/proc")
+    {
+        return Some((0, 0, 0o755));
+    }
+    None
+}
+
+/// Get metadata for the parent directory of a path.
+fn parent_dir_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    let trimmed = abs_path.trim_end_matches('/');
+    if let Some(pos) = trimmed.rfind('/') {
+        let parent = if pos == 0 { "/" } else { &trimmed[..pos] };
+        path_metadata(parent)
+    } else {
+        path_metadata("/")
+    }
+}
+
+/// Helper to resolve a path and apply a metadata-changing operation.
+/// Returns the filesystem-relative path and which FS it belongs to.
+enum FsTarget {
+    Tmpfs(alloc::string::String),
+    Fat32(alloc::string::String),
+    Ramdisk,
+}
+
+fn resolve_fs_target(abs_path: &str) -> FsTarget {
+    if abs_path.starts_with("/tmp/") || abs_path == "/tmp" {
+        let rel = abs_path.strip_prefix("/tmp").unwrap_or("/");
+        FsTarget::Tmpfs(alloc::string::String::from(rel))
+    } else if abs_path.starts_with("/data/") {
+        let rel = abs_path.strip_prefix("/data/").unwrap_or("");
+        FsTarget::Fat32(alloc::string::String::from(rel))
+    } else {
+        FsTarget::Ramdisk
+    }
+}
+
+/// `chmod(path, mode)` — change file mode bits (syscall 90).
+fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+    let cwd = current_cwd();
+    let abs = resolve_path(&cwd, raw);
+    let mode = (mode_arg & 0o7777) as u16;
+
+    // Only owner or root can chmod.
+    let (_, _, euid, _) = current_process_ids();
+
+    match resolve_fs_target(&abs) {
+        FsTarget::Tmpfs(rel) => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            let stat = match tmpfs.stat(&rel) {
+                Ok(s) => s,
+                Err(_) => return NEG_ENOENT,
+            };
+            if euid != 0 && euid != stat.uid {
+                return NEG_EPERM;
+            }
+            if tmpfs.chmod(&rel, mode).is_err() {
+                return NEG_ENOENT;
+            }
+            0
+        }
+        FsTarget::Fat32(rel) => {
+            if euid != 0 {
+                let (owner, _, _) = crate::fs::fat32::get_fat32_meta(&rel);
+                if euid != owner {
+                    return NEG_EPERM;
+                }
+            }
+            let (u, g, _) = crate::fs::fat32::get_fat32_meta(&rel);
+            crate::fs::fat32::set_fat32_meta_and_save(&rel, u, g, mode);
+            0
+        }
+        FsTarget::Ramdisk => NEG_EROFS,
+    }
+}
+
+/// `fchmod(fd, mode)` — change file mode bits by fd (syscall 91).
+fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let mode = (mode_arg & 0o7777) as u16;
+    let (_, _, euid, _) = current_process_ids();
+
+    match &entry.backend {
+        FdBackend::Tmpfs { path } => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            let stat = match tmpfs.stat(path) {
+                Ok(s) => s,
+                Err(_) => return NEG_ENOENT,
+            };
+            if euid != 0 && euid != stat.uid {
+                return NEG_EPERM;
+            }
+            if tmpfs.chmod(path, mode).is_err() {
+                return NEG_ENOENT;
+            }
+            0
+        }
+        FdBackend::Fat32Disk { path, .. } => {
+            if euid != 0 {
+                let (owner, _, _) = crate::fs::fat32::get_fat32_meta(path);
+                if euid != owner {
+                    return NEG_EPERM;
+                }
+            }
+            let (u, g, _) = crate::fs::fat32::get_fat32_meta(path);
+            crate::fs::fat32::set_fat32_meta_and_save(path, u, g, mode);
+            0
+        }
+        FdBackend::Ramdisk { .. } => NEG_EROFS,
+        _ => NEG_EBADF,
+    }
+}
+
+/// `chown(path, uid, gid)` — change file owner (syscall 92).
+/// Only root can change file ownership.
+fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+    let cwd = current_cwd();
+    let abs = resolve_path(&cwd, raw);
+    let new_uid = uid_arg as u32;
+    let new_gid = gid_arg as u32;
+
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
+
+    match resolve_fs_target(&abs) {
+        FsTarget::Tmpfs(rel) => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            if tmpfs.chown(&rel, new_uid, new_gid).is_err() {
+                return NEG_ENOENT;
+            }
+            0
+        }
+        FsTarget::Fat32(rel) => {
+            let (_, _, m) = crate::fs::fat32::get_fat32_meta(&rel);
+            crate::fs::fat32::set_fat32_meta_and_save(&rel, new_uid, new_gid, m);
+            0
+        }
+        FsTarget::Ramdisk => NEG_EROFS,
+    }
+}
+
+/// `fchown(fd, uid, gid)` — change file owner by fd (syscall 93).
+fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+    let new_uid = uid_arg as u32;
+    let new_gid = gid_arg as u32;
+
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
+
+    match &entry.backend {
+        FdBackend::Tmpfs { path } => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            if tmpfs.chown(path, new_uid, new_gid).is_err() {
+                return NEG_ENOENT;
+            }
+            0
+        }
+        FdBackend::Fat32Disk { path, .. } => {
+            let (_, _, m) = crate::fs::fat32::get_fat32_meta(path);
+            crate::fs::fat32::set_fat32_meta_and_save(path, new_uid, new_gid, m);
+            0
+        }
+        FdBackend::Ramdisk { .. } => NEG_EROFS,
+        _ => NEG_EBADF,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3776,6 +4260,14 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, name);
 
+    // Phase 27: Execute (search) permission on target directory.
+    if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(fu, fg, fm, euid, egid, 1) {
+            return NEG_EACCES;
+        }
+    }
+
     // Verify the resolved path exists and is a directory.
     if !is_directory(&resolved) {
         // Path is not a directory — check if it exists at all to choose error.
@@ -4010,12 +4502,14 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             Err(_) => return NEG_EINVAL,
         };
         let mode: u32 = if st.is_dir {
-            0x4000 | 0o755 // S_IFDIR
+            0x4000 | st.mode as u32
         } else {
-            0x8000 | 0o644 // S_IFREG
+            0x8000 | st.mode as u32
         };
         let mut stat = [0u8; 144];
         stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
+        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
         let size = st.size as u64;
         stat[48..56].copy_from_slice(&size.to_ne_bytes());
         let blksize: u64 = 4096;
@@ -4097,6 +4591,14 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
+    // Phase 27: Write+execute permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
+
     // Phase 24: FAT32 /data mkdir.
     if let Some(rel) = fat32_relative_path(name) {
         if rel.is_empty() {
@@ -4120,6 +4622,9 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                 return match vol.mkdir(parent_cluster, dir_name) {
                     Ok(_) => {
                         log::info!("[mkdir] {} (fat32)", name);
+                        // Set permissions overlay for the new directory.
+                        let (_, _, mk_euid2, mk_egid2) = current_process_ids();
+                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, 0o755);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::AlreadyExists) => NEG_EEXIST,
@@ -4139,7 +4644,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     }
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-    match tmpfs.mkdir(rel) {
+    let (_, _, mk_euid, mk_egid) = current_process_ids();
+    match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, 0o755) {
         Ok(()) => {
             log::info!("[mkdir] {}", name);
             0
@@ -4162,10 +4668,17 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+
+    // Phase 27: Write+execute permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
 
     let rel = match tmpfs_relative_path(name) {
         Some(r) => r,
@@ -4205,6 +4718,14 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let cwd = current_cwd();
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
+
+    // Phase 27: Write+execute permission on parent directory.
+    if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
 
     // Phase 24: FAT32 /data unlink.
     if let Some(rel) = fat32_relative_path(name) {
@@ -4287,6 +4808,21 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let old_str_raw = core::str::from_utf8(&old_owned[..old_len]).unwrap();
     let old_resolved = resolve_path(&cwd, old_str_raw);
     let new_resolved = resolve_path(&cwd, new_raw);
+
+    // Phase 27: Write+execute permission on both parent directories.
+    {
+        let (_, _, euid, egid) = current_process_ids();
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+        }
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+            if !check_permission(pu, pg, pm, euid, egid, 3) {
+                return NEG_EACCES;
+            }
+        }
+    }
 
     let old_rel = match tmpfs_relative_path(&old_resolved) {
         Some(r) => r,

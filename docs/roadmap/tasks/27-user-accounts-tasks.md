@@ -60,15 +60,15 @@ Needs to be added or extended:
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Process UID/GID and identity syscalls | — | Not started |
-| B | VFS file metadata and permission model | A | Not started |
-| C | Permission enforcement in VFS operations | B | Not started |
-| D | syscall-lib and libc extensions | A | Not started |
-| E | Password hashing and /etc files | — | Not started |
-| F | Userspace programs (login, id, whoami) | C, D, E | Not started |
-| G | Userspace programs (su, passwd, adduser) | F | Not started |
-| H | Init integration and boot flow | F | Not started |
-| I | Build system and validation | G, H | Not started |
+| A | Process UID/GID and identity syscalls | — | Done |
+| B | VFS file metadata and permission model | A | Done |
+| C | Permission enforcement in VFS operations | B | Done |
+| D | syscall-lib and libc extensions | A | Done |
+| E | Password hashing and /etc files | — | Done |
+| F | Userspace programs (login, id, whoami) | C, D, E | Done |
+| G | Userspace programs (su, passwd, adduser) | F | Done |
+| H | Init integration and boot flow | F | Done |
+| I | Build system and validation | G, H | Done |
 
 ### Implementation Notes
 

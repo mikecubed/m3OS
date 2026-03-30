@@ -1,10 +1,11 @@
-//! m3OS init — PID 1 userspace process (Phase 20–22).
+//! m3OS init — PID 1 userspace process (Phase 20–27).
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Fork+exec `/bin/ion` as the interactive shell (sh0 as fallback)
+//! - Mount persistent storage at /data
+//! - Fork+exec `/bin/login` for user authentication (Phase 27)
 //! - Reap all orphaned children (zombie prevention)
-//! - Re-spawn the shell if it exits
+//! - Re-spawn login when the shell exits
 //! - Never exit (kernel panics if PID 1 dies)
 #![no_std]
 #![no_main]
@@ -13,12 +14,10 @@ use syscall_lib::{
     execve, exit, fork, mount, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG,
 };
 
-const ION_PATH: &[u8] = b"/bin/ion\0";
-const ION_ARGV0: &[u8] = b"/bin/ion\0";
-const SH0_PATH: &[u8] = b"/bin/sh0\0";
-const SH0_ARGV0: &[u8] = b"/bin/sh0\0";
+const LOGIN_PATH: &[u8] = b"/bin/login\0";
+const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-const ENV_HOME: &[u8] = b"HOME=/tmp\0";
+const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 
@@ -41,40 +40,66 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, ")\n");
     }
 
-    // Spawn the first shell.
-    let mut shell_pid = spawn_shell();
-    if shell_pid < 0 {
-        write_str(STDOUT_FILENO, "init: failed to spawn shell\n");
+    // Phase 27: Set initial file permissions.
+    // /data/etc/shadow should be root-only readable.
+    let chmod_ret = syscall_lib::chmod(b"/data/etc/shadow\0", 0o600);
+    if chmod_ret != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "init: warning: chmod /data/etc/shadow failed\n",
+        );
+    }
+
+    // Create /tmp/home for user home directories.
+    let mkdir_ret = unsafe {
+        syscall_lib::syscall2(
+            syscall_lib::SYS_MKDIR,
+            b"/tmp/home\0".as_ptr() as u64,
+            0o755,
+        )
+    };
+    if mkdir_ret as i64 != 0 && mkdir_ret as i64 != -17 {
+        write_str(STDOUT_FILENO, "init: mkdir /tmp/home failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-(mkdir_ret as i64)) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+    }
+
+    // Make /tmp world-writable so non-root users can create files.
+    syscall_lib::chmod(b"/tmp\0", 0o1777);
+
+    // Spawn the first login session.
+    let mut login_pid = spawn_login();
+    if login_pid < 0 {
+        write_str(STDOUT_FILENO, "init: failed to spawn login\n");
         exit(1);
     }
 
-    // Reap loop: wait for any child, re-spawn shell if it exits.
+    // Reap loop: wait for any child, re-spawn login if it exits.
     loop {
         let mut status: i32 = 0;
         let ret = waitpid(-1, &mut status, WNOHANG);
 
         if ret > 0 {
-            // A child exited. If it was the shell, re-spawn it.
-            if ret == shell_pid {
-                write_str(STDOUT_FILENO, "\ninit: shell exited, respawning...\n");
-                shell_pid = spawn_shell();
-                if shell_pid < 0 {
-                    write_str(STDOUT_FILENO, "init: failed to respawn shell\n");
+            if ret == login_pid {
+                write_str(
+                    STDOUT_FILENO,
+                    "\ninit: session ended, respawning login...\n",
+                );
+                login_pid = spawn_login();
+                if login_pid < 0 {
+                    write_str(STDOUT_FILENO, "init: failed to respawn login\n");
                     exit(1);
                 }
             }
-            // Otherwise, we just reaped an orphan — continue.
         } else {
-            // No children ready or ECHILD — yield CPU time.
             nanosleep(1);
         }
     }
 }
 
-fn spawn_shell() -> isize {
+fn spawn_login() -> isize {
     let pid = fork();
     if pid == 0 {
-        // Child: exec ion as primary interactive shell, fall back to sh0.
         let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -83,25 +108,15 @@ fn spawn_shell() -> isize {
             core::ptr::null(),
         ];
 
-        // Ion interactive mode now works. Use it as primary shell.
-        let ion_argv: [*const u8; 2] = [ION_ARGV0.as_ptr(), core::ptr::null()];
-        let ion_ret = execve(ION_PATH, &ion_argv, &envp);
+        let argv: [*const u8; 2] = [LOGIN_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(LOGIN_PATH, &argv, &envp);
 
-        // Ion execve failed — fall back to sh0.
-        write_str(STDOUT_FILENO, "init: ion execve failed (");
-        syscall_lib::write_u64(STDOUT_FILENO, (-ion_ret) as u64);
-        write_str(STDOUT_FILENO, "), trying sh0\n");
-        let sh0_argv: [*const u8; 2] = [SH0_ARGV0.as_ptr(), core::ptr::null()];
-        let ret = execve(SH0_PATH, &sh0_argv, &envp);
-
-        // Both failed.
-        write_str(STDOUT_FILENO, "init: execve failed (");
+        write_str(STDOUT_FILENO, "init: login execve failed (");
         syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
         write_str(STDOUT_FILENO, ")\n");
         exit(1);
     }
     if pid as u64 == u64::MAX {
-        // fork failed
         return -1;
     }
     pid
