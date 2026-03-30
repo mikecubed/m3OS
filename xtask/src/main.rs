@@ -1107,8 +1107,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
 /// Populate the ext2 partition image with initial directories and files
 /// using `debugfs -w`. Creates temp host files for the `write` command.
 fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
+    // Standard Unix root filesystem layout.
     let passwd_content =
-        "root:x:0:0:root:/tmp/home/root:/bin/ion\nuser:x:1000:1000:user:/tmp/home/user:/bin/ion\n";
+        "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
     let shadow_content = "root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
@@ -1120,17 +1121,30 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
 
+    // Standard Unix root filesystem directories and files.
     // debugfs mode values: S_IFDIR|perm or S_IFREG|perm
     // S_IFDIR = 0o40000 = 0x4000, S_IFREG = 0o100000 = 0x8000
     // 0o40755 = 0x41ED, 0o40700 = 0x41C0, 0o100644 = 0x81A4, 0o100600 = 0x8180
+    // 0o41777 = 0x43FF (sticky + 0o777)
     let cmds = format!(
-        "mkdir etc\n\
+        "mkdir bin\n\
+         mkdir sbin\n\
+         mkdir etc\n\
          mkdir root\n\
          mkdir home\n\
          mkdir home/user\n\
+         mkdir tmp\n\
+         mkdir var\n\
+         mkdir dev\n\
          write {passwd} etc/passwd\n\
          write {shadow} etc/shadow\n\
          write {group} etc/group\n\
+         sif bin mode 0x41ED\n\
+         sif bin uid 0\n\
+         sif bin gid 0\n\
+         sif sbin mode 0x41ED\n\
+         sif sbin uid 0\n\
+         sif sbin gid 0\n\
          sif etc mode 0x41ED\n\
          sif etc uid 0\n\
          sif etc gid 0\n\
@@ -1143,6 +1157,15 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          sif home/user mode 0x41ED\n\
          sif home/user uid 1000\n\
          sif home/user gid 1000\n\
+         sif tmp mode 0x43FF\n\
+         sif tmp uid 0\n\
+         sif tmp gid 0\n\
+         sif var mode 0x41ED\n\
+         sif var uid 0\n\
+         sif var gid 0\n\
+         sif dev mode 0x41ED\n\
+         sif dev uid 0\n\
+         sif dev gid 0\n\
          sif etc/passwd mode 0x81A4\n\
          sif etc/passwd uid 0\n\
          sif etc/passwd gid 0\n\

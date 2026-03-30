@@ -1,8 +1,8 @@
-//! m3OS init — PID 1 userspace process (Phase 20–27).
+//! m3OS init — PID 1 userspace process (Phase 20–28).
 //!
 //! Responsibilities:
 //! - Print boot banner
-//! - Mount persistent storage at /data
+//! - Mount ext2 root filesystem at /
 //! - Fork+exec `/bin/login` for user authentication (Phase 27)
 //! - Reap all orphaned children (zombie prevention)
 //! - Re-spawn login when the shell exits
@@ -26,41 +26,13 @@ pub extern "C" fn _start() -> ! {
     // Fds 0/1/2 are pre-opened by the kernel for PID 1.
     write_str(STDOUT_FILENO, "\nm3OS init (PID 1)\n");
 
-    // Phase 24: Mount persistent storage at /data.
-    let ret = mount(
-        b"/dev/blk0\0".as_ptr(),
-        b"/data\0".as_ptr(),
-        b"ext2\0".as_ptr(),
-    );
+    // Phase 28: Mount ext2 root filesystem at /.
+    let ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
     if ret == 0 {
-        write_str(STDOUT_FILENO, "init: /data mounted (ext2)\n");
+        write_str(STDOUT_FILENO, "init: / mounted (ext2)\n");
     } else {
-        write_str(STDOUT_FILENO, "init: /data mount failed (");
+        write_str(STDOUT_FILENO, "init: / mount failed (");
         syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
-        write_str(STDOUT_FILENO, ")\n");
-    }
-
-    // Phase 27: Set initial file permissions.
-    // /data/etc/shadow should be root-only readable.
-    let chmod_ret = syscall_lib::chmod(b"/data/etc/shadow\0", 0o600);
-    if chmod_ret != 0 {
-        write_str(
-            STDOUT_FILENO,
-            "init: warning: chmod /data/etc/shadow failed\n",
-        );
-    }
-
-    // Create /tmp/home for user home directories.
-    let mkdir_ret = unsafe {
-        syscall_lib::syscall2(
-            syscall_lib::SYS_MKDIR,
-            b"/tmp/home\0".as_ptr() as u64,
-            0o755,
-        )
-    };
-    if mkdir_ret as i64 != 0 && mkdir_ret as i64 != -17 {
-        write_str(STDOUT_FILENO, "init: mkdir /tmp/home failed (");
-        syscall_lib::write_u64(STDOUT_FILENO, (-(mkdir_ret as i64)) as u64);
         write_str(STDOUT_FILENO, ")\n");
     }
 

@@ -2892,16 +2892,23 @@ fn is_directory(path: &str) -> bool {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         return tmpfs.stat(rel).map(|s| s.is_dir).unwrap_or(false);
     }
-    // Phase 24/28: check data partition directory (ext2 or FAT32).
-    if let Some(rel) = fat32_relative_path(path) {
-        if rel.is_empty() {
-            return data_is_mounted(); // /data itself
-        }
-        if crate::fs::ext2::is_mounted() {
+    // Check ramdisk first (overlays /bin, /sbin).
+    if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(path) {
+        return node.is_dir();
+    }
+    // ext2 root filesystem.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(path) {
             let vol = crate::fs::ext2::EXT2_VOLUME.lock();
             if let Some(vol) = vol.as_ref() {
                 return vol.is_dir(rel);
             }
+        }
+    }
+    // Legacy: /data paths for FAT32 fallback.
+    if let Some(rel) = fat32_relative_path(path) {
+        if rel.is_empty() {
+            return data_is_mounted();
         }
         if crate::fs::fat32::is_mounted() {
             let vol = crate::fs::fat32::FAT32_VOLUME.lock();
@@ -2909,13 +2916,8 @@ fn is_directory(path: &str) -> bool {
                 return vol.lookup(rel).map(|e| e.is_dir()).unwrap_or(false);
             }
         }
-        return false;
     }
-    // Check ramdisk directory tree.
-    match crate::fs::ramdisk::ramdisk_lookup(path) {
-        Some(node) => node.is_dir(),
-        None => false,
-    }
+    false
 }
 
 /// Check if a path targets the tmpfs mount at `/tmp`.
@@ -2944,6 +2946,7 @@ fn tmpfs_relative_path(path: &str) -> Option<&str> {
 }
 
 /// Return the relative path within `/data` if this path starts with `/data`.
+/// Kept for backwards compatibility with FAT32 fallback.
 fn fat32_relative_path(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
     let rest = if trimmed == "data" {
@@ -2952,6 +2955,31 @@ fn fat32_relative_path(path: &str) -> Option<&str> {
         trimmed.strip_prefix("data/")?
     };
 
+    if !rest.is_empty() {
+        for segment in rest.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                return None;
+            }
+        }
+    }
+
+    Some(rest)
+}
+
+/// Return the ext2 root-relative path for an absolute path.
+///
+/// When ext2 is mounted at `/`, every path is potentially on ext2.
+/// Returns `None` only for paths claimed by tmpfs (`/tmp`) or that
+/// fail traversal validation.
+fn ext2_root_path(path: &str) -> Option<&str> {
+    // /tmp is always tmpfs, never ext2
+    if path == "/tmp" || path.starts_with("/tmp/") {
+        return None;
+    }
+
+    let rest = path.strip_prefix('/').unwrap_or(path);
+
+    // Reject `.`, `..`, and empty segments.
     if !rest.is_empty() {
         for segment in rest.split('/') {
             if segment.is_empty() || segment == "." || segment == ".." {
@@ -3301,23 +3329,46 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         }
     }
 
+    // Phase 28: ext2 root filesystem — try before ramdisk for non-/bin, non-/sbin.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(name) {
+            // Check if ramdisk has this path (e.g. /bin/cat) — ramdisk takes priority.
+            if crate::fs::ramdisk::ramdisk_lookup(name).is_none() {
+                return open_ext2_file(
+                    name, rel, readable, writable, create, append, truncate, mode_arg,
+                );
+            }
+        }
+    }
+
     // Fall through to ramdisk lookup — ramdisk is read-only.
     if writable || create {
+        // If ext2 is mounted, try creating there before giving up.
+        if crate::fs::ext2::is_mounted() {
+            if let Some(rel) = ext2_root_path(name) {
+                return open_ext2_file(
+                    name, rel, readable, writable, create, append, truncate, mode_arg,
+                );
+            }
+        }
         return NEG_EROFS;
     }
 
     let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => {
-            // Phase 27/28: /etc/* fallback — try /data/etc/* on ext2 or FAT32.
+            // Try ext2 root for anything ramdisk doesn't have.
+            if crate::fs::ext2::is_mounted() {
+                if let Some(rel) = ext2_root_path(name) {
+                    return open_ext2_file(
+                        name, rel, readable, writable, create, append, truncate, mode_arg,
+                    );
+                }
+            }
+            // Legacy: /etc/* fallback — try /data/etc/* on FAT32 only.
             if let Some(etc_rel) = name.strip_prefix("/etc/") {
-                if !etc_rel.is_empty() && data_is_mounted() {
+                if !etc_rel.is_empty() && crate::fs::fat32::is_mounted() {
                     let data_rel = alloc::format!("etc/{}", etc_rel);
-                    if crate::fs::ext2::is_mounted() {
-                        return open_ext2_file(
-                            name, &data_rel, true, false, false, false, false, 0,
-                        );
-                    }
                     let vol = crate::fs::fat32::FAT32_VOLUME.lock();
                     if let Some(vol) = vol.as_ref() {
                         if let Ok(entry) = vol.lookup(&data_rel) {
@@ -3624,7 +3675,13 @@ fn dir_metadata(path: &str) -> (u32, u32, u16) {
             return (s.uid, s.gid, s.mode);
         }
     }
-    // Persistent storage directories (under /data) — ext2 or FAT32.
+    // ext2 root filesystem directories.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(path) {
+            return data_file_metadata(rel);
+        }
+    }
+    // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = path.strip_prefix("/data/") {
         return data_file_metadata(rel);
     }
@@ -3938,14 +3995,21 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
         }
         return None;
     }
-    if let Some(rel) = abs_path.strip_prefix("/data/") {
-        return Some(data_file_metadata(rel));
-    }
+    // Ramdisk files (/bin/*, /sbin/*) are root-owned, 0o755.
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
+    // ext2 root filesystem — check for any path.
+    if let Some(rel) = ext2_root_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            return Some(data_file_metadata(rel));
+        }
+    }
+    // Legacy: /data paths for FAT32 fallback.
+    if let Some(rel) = abs_path.strip_prefix("/data/") {
+        return Some(data_file_metadata(rel));
+    }
     if abs_path == "/"
-        || abs_path == "/data"
         || abs_path == "/tmp"
         || abs_path.starts_with("/dev")
         || abs_path.starts_with("/proc")
@@ -3970,6 +4034,7 @@ fn parent_dir_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
 /// Returns the filesystem-relative path and which FS it belongs to.
 enum FsTarget {
     Tmpfs(alloc::string::String),
+    /// ext2 root (or FAT32 /data fallback). The string is the root-relative path.
     Fat32(alloc::string::String),
     Ramdisk,
 }
@@ -3977,13 +4042,20 @@ enum FsTarget {
 fn resolve_fs_target(abs_path: &str) -> FsTarget {
     if abs_path.starts_with("/tmp/") || abs_path == "/tmp" {
         let rel = abs_path.strip_prefix("/tmp").unwrap_or("/");
-        FsTarget::Tmpfs(alloc::string::String::from(rel))
-    } else if abs_path.starts_with("/data/") {
-        let rel = abs_path.strip_prefix("/data/").unwrap_or("");
-        FsTarget::Fat32(alloc::string::String::from(rel))
-    } else {
-        FsTarget::Ramdisk
+        return FsTarget::Tmpfs(alloc::string::String::from(rel));
     }
+    // When ext2 is mounted at root, route non-ramdisk paths to ext2.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(abs_path) {
+            return FsTarget::Fat32(alloc::string::String::from(rel));
+        }
+    }
+    // Legacy: /data paths for FAT32 fallback.
+    if abs_path.starts_with("/data/") {
+        let rel = abs_path.strip_prefix("/data/").unwrap_or("");
+        return FsTarget::Fat32(alloc::string::String::from(rel));
+    }
+    FsTarget::Ramdisk
 }
 
 /// `chmod(path, mode)` — change file mode bits (syscall 90).
@@ -4903,7 +4975,39 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
         }
     }
 
-    // Phase 24/28: /data mkdir (ext2 or FAT32).
+    // Phase 28: ext2 root mkdir.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(name) {
+            if !rel.is_empty() {
+                let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                if let Some(vol) = vol.as_mut() {
+                    let parts: alloc::vec::Vec<&str> =
+                        rel.split('/').filter(|s| !s.is_empty()).collect();
+                    let (parent_ino, dir_name) = if parts.len() <= 1 {
+                        (kernel_core::fs::ext2::EXT2_ROOT_INO, rel)
+                    } else {
+                        let parent_path = parts[..parts.len() - 1].join("/");
+                        match vol.resolve_path(&parent_path) {
+                            Ok(p) => (p, parts[parts.len() - 1]),
+                            Err(_) => return NEG_ENOENT,
+                        }
+                    };
+                    let (_, _, mk_euid, mk_egid) = current_process_ids();
+                    return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid)
+                    {
+                        Ok(_) => {
+                            log::info!("[mkdir] {} (ext2)", name);
+                            0
+                        }
+                        Err(_) => NEG_EIO,
+                    };
+                }
+                return NEG_EIO;
+            }
+        }
+    }
+
+    // Legacy: /data mkdir (ext2 or FAT32 fallback).
     if let Some(rel) = fat32_relative_path(name) {
         if rel.is_empty() {
             return NEG_EINVAL;
@@ -5055,7 +5159,40 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
         }
     }
 
-    // Phase 24/28: /data unlink (ext2 or FAT32).
+    // Phase 28: ext2 root unlink.
+    if crate::fs::ext2::is_mounted() {
+        if let Some(rel) = ext2_root_path(name) {
+            if !rel.is_empty() {
+                let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                if let Some(vol) = vol.as_mut() {
+                    let parts: alloc::vec::Vec<&str> =
+                        rel.split('/').filter(|s| !s.is_empty()).collect();
+                    let parent_ino = if parts.len() <= 1 {
+                        kernel_core::fs::ext2::EXT2_ROOT_INO
+                    } else {
+                        let parent_path = parts[..parts.len() - 1].join("/");
+                        match vol.resolve_path(&parent_path) {
+                            Ok(p) => p,
+                            Err(_) => return NEG_ENOENT,
+                        }
+                    };
+                    let file_name = parts.last().copied().unwrap_or(rel);
+                    return match vol.delete_file(parent_ino, file_name) {
+                        Ok(()) => {
+                            log::info!("[unlink] {} (ext2)", name);
+                            0
+                        }
+                        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+                        Err(kernel_core::fs::ext2::Ext2Error::IsDirectory) => NEG_EISDIR,
+                        Err(_) => NEG_EIO,
+                    };
+                }
+                return NEG_EIO;
+            }
+        }
+    }
+
+    // Legacy: /data unlink (ext2 or FAT32 fallback).
     if let Some(rel) = fat32_relative_path(name) {
         if rel.is_empty() {
             return NEG_EINVAL;
@@ -5224,10 +5361,10 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    // Only /data is supported as a mount target until VFS tracks mountpoints.
-    if resolved_target != "/data" {
+    // Support mounting at / (ext2 root) or /data (legacy).
+    if resolved_target != "/" && resolved_target != "/data" {
         log::warn!(
-            "[mount] unsupported mountpoint {}; only /data is currently supported",
+            "[mount] unsupported mountpoint {}; only / and /data are supported",
             resolved_target
         );
         return NEG_EINVAL;
@@ -5417,22 +5554,59 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             Err(_) => return NEG_ENOENT,
         }
-    } else if let Some(rel) = fat32_relative_path(&dir_path) {
-        // Phase 24/28: data partition directory listing (ext2 or FAT32).
+    } else if dir_path == "/" {
+        // Root directory: merge ext2 root + ramdisk overlays + virtual mounts.
+        // Start with ext2 root entries if mounted.
+        let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
             let vol = crate::fs::ext2::EXT2_VOLUME.lock();
             if let Some(vol) = vol.as_ref() {
-                let path = if rel.is_empty() { "/" } else { rel };
-                match vol.list_dir(path) {
-                    Ok(children) => {
-                        for (name, is_dir) in children {
-                            entries.push((name, is_dir));
-                        }
+                if let Ok(children) = vol.list_dir("/") {
+                    for (name, is_dir) in children {
+                        seen.insert(name.clone());
+                        entries.push((name, is_dir));
                     }
-                    Err(_) => return NEG_EIO,
                 }
             }
-        } else if crate::fs::fat32::is_mounted() {
+        }
+        // Overlay ramdisk top-level dirs (/bin, /sbin, /etc).
+        if let Some(ramdisk_children) = crate::fs::ramdisk::ramdisk_list_dir("/") {
+            for (name, is_dir) in ramdisk_children {
+                if !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    entries.push((name, is_dir));
+                }
+            }
+        }
+        // Add virtual mount points.
+        if !seen.contains("tmp") {
+            entries.push((alloc::string::String::from("tmp"), true));
+        }
+    } else if crate::fs::ext2::is_mounted() {
+        // ext2 subdirectory listing (e.g. /home, /etc).
+        if let Some(rel) = ext2_root_path(&dir_path) {
+            // Check ramdisk first for overlaid dirs like /bin.
+            if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
+                for (name, is_dir) in children {
+                    entries.push((name, is_dir));
+                }
+            } else {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                if let Some(vol) = vol.as_ref() {
+                    match vol.list_dir(rel) {
+                        Ok(children) => {
+                            for (name, is_dir) in children {
+                                entries.push((name, is_dir));
+                            }
+                        }
+                        Err(_) => return NEG_EIO,
+                    }
+                }
+            }
+        }
+    } else if let Some(rel) = fat32_relative_path(&dir_path) {
+        // Legacy: /data directory listing for FAT32 fallback.
+        if crate::fs::fat32::is_mounted() {
             let vol = crate::fs::fat32::FAT32_VOLUME.lock();
             if let Some(vol) = vol.as_ref() {
                 let dir_cluster = if rel.is_empty() {
@@ -5452,19 +5626,6 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     Err(_) => return NEG_EIO,
                 }
             }
-        }
-    } else if dir_path == "/" {
-        // Unified root listing: ramdisk top-level dirs + tmpfs "tmp".
-        if let Some(ramdisk_children) = crate::fs::ramdisk::ramdisk_list_dir("/") {
-            for (name, is_dir) in ramdisk_children {
-                entries.push((name, is_dir));
-            }
-        }
-        // Add "tmp" for the tmpfs mount point.
-        entries.push((alloc::string::String::from("tmp"), true));
-        // Add "data" if FAT32 is mounted.
-        if data_is_mounted() {
-            entries.push((alloc::string::String::from("data"), true));
         }
     } else {
         // Ramdisk directory listing.
