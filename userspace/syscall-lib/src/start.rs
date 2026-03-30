@@ -38,6 +38,7 @@ pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! 
     let mut arg_strs: [&str; MAX_ARGS] = [""; MAX_ARGS];
     let count = argc.min(MAX_ARGS);
 
+    let mut parsed = 0;
     for i in 0..count {
         let ptr = unsafe { *argv_base.add(i) };
         if ptr.is_null() {
@@ -50,10 +51,11 @@ pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! 
         let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
         if let Ok(s) = core::str::from_utf8(bytes) {
             arg_strs[i] = s;
+            parsed += 1;
         }
     }
 
-    let code = main_fn(&arg_strs[..count]);
+    let code = main_fn(&arg_strs[..parsed]);
     crate::exit(code)
 }
 

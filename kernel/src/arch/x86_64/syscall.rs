@@ -3002,8 +3002,9 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
     // Phase 27: Permission check for existing files.
     let create = (flags & 0x40) != 0; // O_CREAT
-    if (!create || path_metadata(name).is_some())
-        && let Some((fu, fg, fm)) = path_metadata(name)
+    let file_meta = path_metadata(name);
+    if (!create || file_meta.is_some())
+        && let Some((fu, fg, fm)) = file_meta
     {
         let (_, _, euid, egid) = current_process_ids();
         let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
@@ -3014,7 +3015,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
     // Phase 27: When creating a new file, check parent directory write+execute permission.
     if create
-        && path_metadata(name).is_none()
+        && file_meta.is_none()
         && let Some((pu, pg, pm)) = parent_dir_metadata(name)
     {
         let (_, _, euid_c, egid_c) = current_process_ids();
