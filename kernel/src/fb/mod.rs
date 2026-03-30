@@ -478,6 +478,37 @@ impl FbConsole {
         }
     }
 
+    /// Draw or erase the cursor by inverting the cell at the current position.
+    fn draw_cursor(&mut self) {
+        if !self.cursor_visible {
+            return;
+        }
+        let cols = self.cols();
+        let rows = self.rows();
+        let col = self.cursor_col.min(cols.saturating_sub(1));
+        let row = self.cursor_row.min(rows.saturating_sub(1));
+        let px_x = col * CHAR_W;
+        let px_y = row * CHAR_H;
+
+        // Invert every pixel in the cell (XOR with white).
+        for gy in 0..CHAR_H {
+            for gx in 0..CHAR_W {
+                let x = px_x + gx;
+                let y = px_y + gy;
+                let offset = (y * self.stride + x) * self.bytes_per_pixel;
+                if offset + self.bytes_per_pixel > self.byte_len {
+                    continue;
+                }
+                let pixel = unsafe {
+                    core::slice::from_raw_parts_mut(self.buf.add(offset), self.bytes_per_pixel)
+                };
+                for byte in pixel.iter_mut() {
+                    *byte ^= 0xFF;
+                }
+            }
+        }
+    }
+
     /// Scroll the framebuffer up by one character row, clearing the last row.
     fn scroll_up(&mut self) {
         let row_bytes = self.stride * self.bytes_per_pixel * CHAR_H;
@@ -675,7 +706,13 @@ impl FbConsole {
                 }
             }
             ConsoleCmd::SetCursorVisible(visible) => {
-                self.cursor_visible = visible;
+                if visible != self.cursor_visible {
+                    // Erase old cursor (if was visible) or draw new one.
+                    // draw_cursor is an XOR toggle, so call it in both cases:
+                    // hiding → erase; showing → draw.
+                    self.cursor_visible = visible;
+                    self.draw_cursor();
+                }
             }
             ConsoleCmd::Sgr(sgr) => {
                 self.apply_sgr(&sgr);
@@ -733,9 +770,17 @@ impl FbConsole {
 
     /// Write all characters in `s`, processing through the ANSI parser.
     fn write_str(&mut self, s: &str) {
+        // Erase cursor before modifying the framebuffer.
+        if self.cursor_visible {
+            self.draw_cursor();
+        }
         for c in s.chars() {
             let cmd = self.parser.process_char(c);
             self.execute_cmd(cmd);
+        }
+        // Redraw cursor at (possibly new) position.
+        if self.cursor_visible {
+            self.draw_cursor();
         }
     }
 }
