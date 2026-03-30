@@ -174,8 +174,7 @@ OS, not a production system.
 
 ## Configuration Files
 
-Three files on the ext2 partition at `/data/etc/` (accessed by
-userspace programs as `/data/etc/passwd`, etc.):
+Three files on the ext2 partition at `/etc/` (ext2 is mounted at `/`):
 
 | File | Mode | Contents |
 |---|---|---|
@@ -201,8 +200,8 @@ init (PID 1)
   └─ fork + execve("/bin/login")
        ├─ print "m3OS login: ", read username
        ├─ print "Password: ", disable echo, read password, restore echo
-       ├─ parse /data/etc/passwd → (uid, gid, home, shell)
-       ├─ read /data/etc/shadow → verify_password()
+       ├─ parse /etc/passwd → (uid, gid, home, shell)
+       ├─ read /etc/shadow → verify_password()
        ├─ on failure: print "Login incorrect", loop
        └─ on success:
             ├─ create home directory (while still root)
@@ -234,21 +233,22 @@ shell exec.
 
 ### su (`userspace/su/`)
 
-Rust no_std binary. `su <username>` (defaults to root). Requires the
-caller to already be root (no setuid-bit support). Prompts for the
-target user's password, verifies against shadow, then drops to the
-target identity and execs their shell.
+Rust no_std binary. `su <username>` (defaults to root). Any user can
+run `su`; non-root callers are prompted for the target user's password.
+Root skips the password prompt. Verifies against shadow, then switches
+to the target identity and execs their shell. (The kernel's `setuid`/
+`setgid` syscalls are unconditional until setuid-bit support is added.)
 
 ### passwd (`userspace/passwd/`)
 
 Rust no_std binary. Root-only. Reads the current username from
-`/data/etc/passwd` by UID lookup, prompts for a new password twice,
-hashes with SHA-256, and rewrites `/data/etc/shadow` with the updated
+`/etc/passwd` by UID lookup, prompts for a new password twice,
+hashes with SHA-256, and rewrites `/etc/shadow` with the updated
 entry.
 
 ### adduser (`userspace/adduser/`)
 
-Rust no_std binary. Root-only. Scans `/data/etc/passwd` for the maximum
+Rust no_std binary. Root-only. Scans `/etc/passwd` for the maximum
 UID, assigns `new_uid = max_uid + 1`. Validates the username (max 32
 chars, no `:`, `\n`, or `\0`). Appends entries to passwd, shadow, and
 group files. Creates the home directory and sets ownership.
@@ -256,13 +256,12 @@ group files. Creates the home directory and sets ownership.
 ### id (`userspace/id/`)
 
 Rust no_std binary. Calls `getuid()`/`getgid()`, looks up names from
-`/data/etc/passwd` and `/data/etc/group`, prints
-`uid=N(name) gid=N(name)`.
+`/etc/passwd` and `/etc/group`, prints `uid=N(name) gid=N(name)`.
 
 ### whoami (`userspace/whoami/`)
 
 Rust no_std binary. Calls `geteuid()`, looks up the username in
-`/data/etc/passwd`, prints it.
+`/etc/passwd`, prints it.
 
 ## syscall-lib Extensions
 
@@ -280,8 +279,9 @@ C libc stubs were added to the coreutils libc for `getuid`, `getgid`,
 
 ## Known Limitations
 
-- **No setuid-bit on executables** — `su` and `passwd` require the
-  caller to already be root. Setuid-on-exec is deferred.
+- **No setuid-bit on executables** — `setuid`/`setgid` syscalls are
+  unconditional; password auth in `su`/`login` is the security boundary.
+  Setuid-on-exec is deferred.
 - **No sticky bit enforcement** — `/tmp` is mode `0o1777` but
   `check_permission` does not prevent users from deleting each other's
   files in sticky directories.
@@ -289,9 +289,6 @@ C libc stubs were added to the coreutils libc for `getuid`, `getgid`,
 - **No umask** — file creation mode is not masked.
 - **Salt is username bytes** — not cryptographically random. A proper
   entropy source (`/dev/urandom`) is deferred.
-- **Path prefix convention** — userspace programs access `/data/etc/`
-  rather than `/etc/` due to the ext2 mount point. This will be
-  normalized when ext2 is mounted at `/` natively.
 
 ## Foundation for Future Phases
 
