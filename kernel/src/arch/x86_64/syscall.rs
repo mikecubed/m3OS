@@ -3189,6 +3189,38 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let content = match crate::fs::ramdisk::get_file(name) {
         Some(c) => c,
         None => {
+            // Phase 27: /etc/* fallback — try /data/etc/* on FAT32.
+            if let Some(etc_rel) = name.strip_prefix("/etc/") {
+                if !etc_rel.is_empty() && crate::fs::fat32::is_mounted() {
+                    let fat_rel = alloc::format!("etc/{}", etc_rel);
+                    let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                    if let Some(vol) = vol.as_ref() {
+                        if let Ok(entry) = vol.lookup(&fat_rel) {
+                            if !entry.is_dir() {
+                                let fd_entry = FdEntry {
+                                    backend: FdBackend::Fat32Disk {
+                                        path: fat_rel,
+                                        start_cluster: entry.start_cluster(),
+                                        file_size: entry.file_size,
+                                        dir_cluster: vol.bpb.root_cluster,
+                                    },
+                                    offset: 0,
+                                    readable: true,
+                                    writable: false,
+                                    cloexec: false,
+                                };
+                                return match alloc_fd(3, fd_entry) {
+                                    Some(i) => {
+                                        log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
+                                        i as u64
+                                    }
+                                    None => NEG_EMFILE,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             log::warn!("[open] file not found: {}", name);
             return NEG_ENOENT;
         }

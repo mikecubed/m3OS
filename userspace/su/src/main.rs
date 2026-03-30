@@ -27,7 +27,7 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    let (uid, gid, _home, shell) = match find_user(&passwd_buf[..passwd_len], target) {
+    let (uid, gid, home, shell) = match find_user(&passwd_buf[..passwd_len], target) {
         Some(v) => v,
         None => {
             write_str(STDOUT_FILENO, "su: unknown user\n");
@@ -58,6 +58,9 @@ pub extern "C" fn _start() -> ! {
             exit(1);
         }
     }
+    // Create home directory before dropping privileges.
+    create_home_dir(home, uid, gid);
+
     if setgid(gid) != 0 || setuid(uid) != 0 {
         write_str(STDOUT_FILENO, "su: failed to set credentials\n");
         exit(1);
@@ -168,6 +171,20 @@ fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn create_home_dir(home: &[u8], uid: u32, gid: u32) {
+    if home.is_empty() || home == b"/" {
+        return;
+    }
+    let mut path = [0u8; 128];
+    let len = home.len().min(path.len() - 1);
+    path[..len].copy_from_slice(&home[..len]);
+    path[len] = 0;
+    let ret = unsafe { syscall_lib::syscall2(syscall_lib::SYS_MKDIR, path.as_ptr() as u64, 0o755) };
+    if ret == 0 {
+        syscall_lib::chown(&path[..len + 1], uid, gid);
+    }
 }
 
 fn copy_nul(src: &[u8], dst: &mut [u8]) -> usize {

@@ -72,6 +72,9 @@ fn login_once() {
     write_u64(STDOUT_FILENO, uid as u64);
     write_str(STDOUT_FILENO, "\n");
 
+    // Create home directory if it doesn't exist (still running as root).
+    create_home_dir(home, uid, gid);
+
     // Set GID and UID.
     if setgid(gid) != 0 || setuid(uid) != 0 {
         write_str(STDOUT_FILENO, "login: failed to set credentials\n");
@@ -250,6 +253,28 @@ fn build_env(prefix: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
         pos += 1;
     }
     pos
+}
+
+/// Create the user's home directory if it doesn't exist.
+/// Called before setuid so we still have root privileges.
+fn create_home_dir(home: &[u8], uid: u32, gid: u32) {
+    if home.is_empty() || home == b"/" {
+        return;
+    }
+
+    // Build null-terminated path for mkdir.
+    let mut path = [0u8; 128];
+    let len = home.len().min(path.len() - 1);
+    path[..len].copy_from_slice(&home[..len]);
+    path[len] = 0;
+
+    // Try mkdir — ignore EEXIST (-17).
+    let ret = unsafe { syscall_lib::syscall2(syscall_lib::SYS_MKDIR, path.as_ptr() as u64, 0o755) };
+    if ret == 0 {
+        // Set ownership on newly created directory.
+        syscall_lib::chown(&path[..len + 1], uid, gid);
+    }
+    // ret == -17 (EEXIST) is fine — directory already exists.
 }
 
 /// Copy bytes with a null terminator.
