@@ -2998,11 +2998,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
 
         // Open or create the file with caller's ownership.
-        let create_mode = if (mode_arg as u16) & 0o777 != 0 {
-            (mode_arg as u16) & 0o7777
-        } else {
-            0o644
-        };
+        let create_mode = (mode_arg as u16) & 0o7777;
         let (_, _, caller_euid, caller_egid) = current_process_ids();
         match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, create_mode) {
             Ok(_created) => {}
@@ -3156,11 +3152,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                 };
 
                                 // Set ownership and permissions on the newly created file.
-                                let create_mode = if (mode_arg as u16) & 0o777 != 0 {
-                                    (mode_arg as u16) & 0o7777
-                                } else {
-                                    0o644
-                                };
+                                let create_mode = (mode_arg as u16) & 0o7777;
                                 let (_, _, caller_euid, caller_egid) = current_process_ids();
                                 crate::fs::fat32::set_fat32_meta(
                                     rel,
@@ -3363,11 +3355,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             return NEG_EISDIR;
         }
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        let create_mode = if (mode_arg as u16) & 0o777 != 0 {
-            (mode_arg as u16) & 0o7777
-        } else {
-            0o644
-        };
+        let create_mode = (mode_arg as u16) & 0o7777;
         let (_, _, caller_euid2, caller_egid2) = current_process_ids();
         match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, create_mode) {
             Ok(_) => {}
@@ -4602,6 +4590,9 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                 return match vol.mkdir(parent_cluster, dir_name) {
                     Ok(_) => {
                         log::info!("[mkdir] {} (fat32)", name);
+                        // Set permissions overlay for the new directory.
+                        let (_, _, mk_euid2, mk_egid2) = current_process_ids();
+                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, 0o755);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::AlreadyExists) => NEG_EEXIST,

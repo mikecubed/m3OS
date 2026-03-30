@@ -56,6 +56,10 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Switch identity.
+    if geteuid() != 0 {
+        write_str(STDOUT_FILENO, "su: must be run as root\n");
+        exit(1);
+    }
     if setgid(gid) != 0 || setuid(uid) != 0 {
         write_str(STDOUT_FILENO, "su: failed to set credentials\n");
         exit(1);

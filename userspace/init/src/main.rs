@@ -50,6 +50,9 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
+    // Make /tmp world-writable so non-root users can create files.
+    syscall_lib::chmod(b"/tmp\0", 0o1777);
+
     // Spawn the first login session.
     let mut login_pid = spawn_login();
     if login_pid < 0 {

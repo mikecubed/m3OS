@@ -601,13 +601,19 @@ pub fn fchown(fd: i32, uid: u32, gid: u32) -> isize {
 }
 
 /// Set real and effective user IDs.
-pub fn setreuid(ruid: u32, euid: u32) -> isize {
-    unsafe { syscall2(SYS_SETREUID, ruid as u64, euid as u64) as isize }
+/// Pass `None` for an ID you do not want to change (translated to -1 for the kernel).
+pub fn setreuid(ruid: Option<u32>, euid: Option<u32>) -> isize {
+    let r = ruid.map(|id| id as u64).unwrap_or(u32::MAX as u64);
+    let e = euid.map(|id| id as u64).unwrap_or(u32::MAX as u64);
+    unsafe { syscall2(SYS_SETREUID, r, e) as isize }
 }
 
 /// Set real and effective group IDs.
-pub fn setregid(rgid: u32, egid: u32) -> isize {
-    unsafe { syscall2(SYS_SETREGID, rgid as u64, egid as u64) as isize }
+/// Pass `None` for an ID you do not want to change (translated to -1 for the kernel).
+pub fn setregid(rgid: Option<u32>, egid: Option<u32>) -> isize {
+    let r = rgid.map(|id| id as u64).unwrap_or(u32::MAX as u64);
+    let e = egid.map(|id| id as u64).unwrap_or(u32::MAX as u64);
+    unsafe { syscall2(SYS_SETREGID, r, e) as isize }
 }
 
 // ===========================================================================

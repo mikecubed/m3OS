@@ -1155,7 +1155,7 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         }
 
         // /etc/passwd
-        let passwd = b"root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
+        let passwd = b"root:x:0:0:root:/tmp/home/root:/bin/ion\nuser:x:1000:1000:user:/tmp/home/user:/bin/ion\n";
         let mut f = root_dir.create_file("etc/passwd").expect("create passwd");
         f.truncate().unwrap();
         f.write_all(passwd).expect("write passwd");
