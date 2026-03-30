@@ -5057,6 +5057,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                     log::info!("[mkdir] {} (ext2)", name);
                     0
                 }
+                Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
                 Err(_) => NEG_EIO,
             };
         }
@@ -5088,6 +5089,7 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                         log::info!("[mkdir] {} (ext2)", name);
                         0
                     }
+                    Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
                     Err(_) => NEG_EIO,
                 };
             }

@@ -73,6 +73,8 @@ pub enum Ext2Error {
     PermissionDenied,
     /// Directory is not empty.
     NotEmpty,
+    /// File or directory already exists.
+    AlreadyExists,
 }
 
 // ---------------------------------------------------------------------------

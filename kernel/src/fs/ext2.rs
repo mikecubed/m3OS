@@ -829,6 +829,11 @@ impl Ext2Volume {
             return Err(Ext2Error::NotDirectory);
         }
 
+        // Check if an entry with this name already exists.
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+
         let parent_group = kernel_core::fs::ext2::inode_block_group(
             parent_inode_num,
             self.superblock.inodes_per_group,
