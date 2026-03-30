@@ -107,7 +107,7 @@ FAT32 permissions index file workaround from Phase 27 is no longer needed.
 
 ## Companion Task List
 
-- [Phase 28 Task List](./tasks/28-ext2-filesystem-tasks.md) *(to be created)*
+- [Phase 28 Task List](./tasks/28-ext2-filesystem-tasks.md)
 
 ## How Real OS Implementations Differ
 
