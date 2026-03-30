@@ -4,8 +4,8 @@ use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, S
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8000_0000_0000;
-/// Initial heap size mapped at boot (1 MiB).
-pub const HEAP_INITIAL_SIZE: usize = 1024 * 1024; // 1 MiB
+/// Initial heap size mapped at boot (4 MiB).
+pub const HEAP_INITIAL_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 /// Maximum heap size the kernel may grow to (64 MiB).
 pub const HEAP_MAX_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 

@@ -50,6 +50,15 @@ pub extern "C" fn _start() -> ! {
         );
     }
 
+    // Create /tmp/home for user home directories.
+    unsafe {
+        syscall_lib::syscall2(
+            syscall_lib::SYS_MKDIR,
+            b"/tmp/home\0".as_ptr() as u64,
+            0o755,
+        );
+    }
+
     // Make /tmp world-writable so non-root users can create files.
     syscall_lib::chmod(b"/tmp\0", 0o1777);
 
