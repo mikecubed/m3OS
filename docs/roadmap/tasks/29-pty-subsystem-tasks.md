@@ -53,14 +53,14 @@ Needs to be added or extended:
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | PTY pair data structures and ring buffers | — | Not started |
-| B | PTY allocation and `/dev/ptmx` device | A | Not started |
-| C | PTY read/write data paths | B | Not started |
-| D | Line discipline integration on slave side | C | Not started |
-| E | Session management and setsid() | — | Not started |
-| F | Controlling terminal ioctls | C, E | Not started |
-| G | Signal delivery through PTY (SIGHUP) | C, F | Not started |
-| H | Userspace PTY library and test programs | C, D | Not started |
+| A | PTY pair data structures and ring buffers | — | ✅ Done |
+| B | PTY allocation and `/dev/ptmx` device | A | ✅ Done |
+| C | PTY read/write data paths | B | ✅ Done |
+| D | Line discipline integration on slave side | C | ✅ Done |
+| E | Session management and setsid() | — | ✅ Done |
+| F | Controlling terminal ioctls | C, E | ✅ Done |
+| G | Signal delivery through PTY (SIGHUP) | C, F | ✅ Done |
+| H | Userspace PTY library and test programs | C, D | In progress |
 | I | Validation and acceptance testing | All | Not started |
 
 ### Implementation Notes

@@ -475,6 +475,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pty-test"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

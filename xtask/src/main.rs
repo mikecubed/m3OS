@@ -127,6 +127,7 @@ fn build_userspace_bins() {
         ("adduser", "adduser", false),
         ("id", "id", false),
         ("whoami", "whoami", false),
+        ("pty-test", "pty-test", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
