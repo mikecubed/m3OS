@@ -7,31 +7,13 @@ use syscall_lib::{
     write_str, write_u64,
 };
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    core::arch::naked_asm!("mov rdi, rsp", "call {main}", main = sym su_main);
-}
+syscall_lib::entry_point!(su_main);
 
-fn su_main(stack_ptr: *const u64) -> ! {
-    let argc = unsafe { *stack_ptr } as usize;
-    let argv_base = unsafe { stack_ptr.add(1) } as *const *const u8;
-
+fn su_main(args: &[&str]) -> i32 {
     // Target username from argv[1], or prompt if not provided.
     let mut target_buf = [0u8; 64];
-    let target: &[u8] = if argc >= 2 {
-        let ptr = unsafe { *argv_base.add(1) };
-        if !ptr.is_null() {
-            let mut len = 0;
-            while unsafe { *ptr.add(len) } != 0 {
-                len += 1;
-            }
-            let len = len.min(target_buf.len());
-            target_buf[..len].copy_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) });
-            &target_buf[..len]
-        } else {
-            b"root"
-        }
+    let target: &[u8] = if args.len() >= 2 {
+        args[1].as_bytes()
     } else {
         write_str(STDOUT_FILENO, "su: target user (default root): ");
         let tlen = read_line(&mut target_buf);

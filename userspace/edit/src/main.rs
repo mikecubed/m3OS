@@ -1099,36 +1099,16 @@ fn find_substr(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    // Naked entry: pass the original rsp (pointing to argc) as first arg.
-    core::arch::naked_asm!("mov rdi, rsp", "call {main}", main = sym edit_main);
-}
+syscall_lib::entry_point!(edit_main);
 
-fn edit_main(stack_ptr: *const u64) -> ! {
-    let argc = unsafe { *stack_ptr } as usize;
-    let argv_base = unsafe { stack_ptr.add(1) } as *const *const u8;
-
+fn edit_main(args: &[&str]) -> i32 {
     register_sigwinch_handler();
 
     let mut editor = Editor::new();
 
-    if argc >= 2 {
-        // Read filename from argv[1]
-        let filename_ptr = unsafe { *argv_base.add(1) };
-        if !filename_ptr.is_null() {
-            let mut len = 0;
-            while unsafe { *filename_ptr.add(len) } != 0 {
-                len += 1;
-            }
-            let filename_bytes = unsafe { core::slice::from_raw_parts(filename_ptr, len) };
-            if let Ok(filename) = core::str::from_utf8(filename_bytes) {
-                editor.open_file(filename);
-            }
-        }
+    if args.len() >= 2 {
+        editor.open_file(args[1]);
     } else {
-        // No filename — start with empty buffer
         editor.rows.push(Row::new(Vec::new()));
     }
 
@@ -1141,7 +1121,7 @@ fn edit_main(stack_ptr: *const u64) -> ! {
     // Clear screen on exit
     syscall_lib::write(1, b"\x1b[2J\x1b[H");
 
-    syscall_lib::exit(0)
+    0
 }
 
 #[panic_handler]
