@@ -28,6 +28,7 @@ fn login_once() {
     let username = &username[..ulen];
 
     // Prompt for password with echo disabled.
+    let _ = write(STDOUT_FILENO, b"\n");
     write_str(STDOUT_FILENO, "Password: ");
 
     // Disable echo for password input.
