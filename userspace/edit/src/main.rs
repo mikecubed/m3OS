@@ -252,12 +252,32 @@ impl Editor {
     // -----------------------------------------------------------------------
 
     fn open_file(&mut self, filename: &str) {
-        self.filename = Some(String::from(filename));
+        // Resolve relative paths to absolute using cwd.
+        let abs_name = if filename.starts_with('/') {
+            String::from(filename)
+        } else {
+            let mut cwd_buf = [0u8; 256];
+            let cwd_len = syscall_lib::getcwd(&mut cwd_buf);
+            if cwd_len > 0 {
+                // getcwd returns length including null terminator; strip it.
+                let str_len = (cwd_len as usize).saturating_sub(1);
+                let cwd = core::str::from_utf8(&cwd_buf[..str_len]).unwrap_or("/");
+                let mut path = String::from(cwd);
+                if !path.ends_with('/') {
+                    path.push('/');
+                }
+                path.push_str(filename);
+                path
+            } else {
+                String::from(filename)
+            }
+        };
+        self.filename = Some(abs_name.clone());
         self.rows.clear();
 
         // Build null-terminated path
-        let mut path_buf: Vec<u8> = Vec::with_capacity(filename.len() + 1);
-        path_buf.extend_from_slice(filename.as_bytes());
+        let mut path_buf: Vec<u8> = Vec::with_capacity(abs_name.len() + 1);
+        path_buf.extend_from_slice(abs_name.as_bytes());
         path_buf.push(0);
 
         let fd = syscall_lib::open(&path_buf, syscall_lib::O_RDONLY, 0);
