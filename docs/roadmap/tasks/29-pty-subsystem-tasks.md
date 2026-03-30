@@ -60,8 +60,8 @@ Needs to be added or extended:
 | E | Session management and setsid() | — | ✅ Done |
 | F | Controlling terminal ioctls | C, E | ✅ Done |
 | G | Signal delivery through PTY (SIGHUP) | C, F | ✅ Done |
-| H | Userspace PTY library and test programs | C, D | In progress |
-| I | Validation and acceptance testing | All | Not started |
+| H | Userspace PTY library and test programs | C, D | ✅ Done |
+| I | Validation and acceptance testing | All | ✅ Done |
 
 ### Implementation Notes
 
