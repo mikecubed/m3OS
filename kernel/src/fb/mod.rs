@@ -364,6 +364,8 @@ struct FbConsole {
     bg_color: Colour,
     /// Whether the cursor is visible (DECTCEM).
     cursor_visible: bool,
+    /// Whether the cursor is currently rendered on screen (XOR'd).
+    cursor_rendered: bool,
 }
 
 // SAFETY: FbConsole is only accessed under a spin::Mutex; the raw pointer is
@@ -386,6 +388,7 @@ impl FbConsole {
             fg_color: FG,
             bg_color: BG,
             cursor_visible: true,
+            cursor_rendered: false,
         }
     }
 
@@ -478,19 +481,18 @@ impl FbConsole {
         }
     }
 
-    /// Draw or erase the cursor by inverting the cell at the current position.
-    fn draw_cursor(&mut self) {
-        if !self.cursor_visible {
-            return;
-        }
+    /// XOR-invert the cell at the cursor position (unconditional toggle).
+    fn xor_cursor_cell(&mut self) {
         let cols = self.cols();
         let rows = self.rows();
-        let col = self.cursor_col.min(cols.saturating_sub(1));
-        let row = self.cursor_row.min(rows.saturating_sub(1));
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let col = self.cursor_col.min(cols - 1);
+        let row = self.cursor_row.min(rows - 1);
         let px_x = col * CHAR_W;
         let px_y = row * CHAR_H;
 
-        // Invert every pixel in the cell (XOR with white).
         for gy in 0..CHAR_H {
             for gx in 0..CHAR_W {
                 let x = px_x + gx;
@@ -506,6 +508,22 @@ impl FbConsole {
                     *byte ^= 0xFF;
                 }
             }
+        }
+    }
+
+    /// Ensure the cursor is visually rendered on screen (if visible).
+    fn show_cursor(&mut self) {
+        if self.cursor_visible && !self.cursor_rendered {
+            self.xor_cursor_cell();
+            self.cursor_rendered = true;
+        }
+    }
+
+    /// Ensure the cursor is visually erased from screen (if rendered).
+    fn hide_cursor(&mut self) {
+        if self.cursor_rendered {
+            self.xor_cursor_cell();
+            self.cursor_rendered = false;
         }
     }
 
@@ -706,12 +724,12 @@ impl FbConsole {
                 }
             }
             ConsoleCmd::SetCursorVisible(visible) => {
-                if visible != self.cursor_visible {
-                    // Erase old cursor (if was visible) or draw new one.
-                    // draw_cursor is an XOR toggle, so call it in both cases:
-                    // hiding → erase; showing → draw.
-                    self.cursor_visible = visible;
-                    self.draw_cursor();
+                if visible {
+                    self.cursor_visible = true;
+                    self.show_cursor();
+                } else {
+                    self.hide_cursor();
+                    self.cursor_visible = false;
                 }
             }
             ConsoleCmd::Sgr(sgr) => {
@@ -771,17 +789,13 @@ impl FbConsole {
     /// Write all characters in `s`, processing through the ANSI parser.
     fn write_str(&mut self, s: &str) {
         // Erase cursor before modifying the framebuffer.
-        if self.cursor_visible {
-            self.draw_cursor();
-        }
+        self.hide_cursor();
         for c in s.chars() {
             let cmd = self.parser.process_char(c);
             self.execute_cmd(cmd);
         }
         // Redraw cursor at (possibly new) position.
-        if self.cursor_visible {
-            self.draw_cursor();
-        }
+        self.show_cursor();
     }
 }
 
