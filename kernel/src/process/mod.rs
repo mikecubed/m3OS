@@ -140,11 +140,12 @@ pub fn new_fd_table_pub() -> [Option<FdEntry>; MAX_FDS] {
     new_fd_table()
 }
 
-/// Increment pipe ref-counts for all pipe FDs in a cloned FD table.
+/// Increment refcounts for all resource-backed FDs in a cloned FD table.
 ///
 /// Must be called after cloning a process's FD table (fork/dup2) so that
-/// pipe reader/writer counts stay consistent with the number of open FDs.
-pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
+/// pipe reader/writer counts and PTY refcounts stay consistent with the
+/// number of open FDs.
+pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
     for entry in fd_table.iter().flatten() {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),

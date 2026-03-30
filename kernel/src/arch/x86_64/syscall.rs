@@ -1690,7 +1690,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     };
 
     // Increment pipe ref-counts for cloned FDs before creating the child.
-    crate::process::add_pipe_refs(&parent_fds);
+    crate::process::add_fd_refs(&parent_fds);
 
     // Create child process entry with cloned FD table (Phase 14, P14-T003).
     // Inherit parent's pgid so fork children are in the same process group.
@@ -5138,7 +5138,7 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             return 0;
         }
-        return 0; // no-op for non-PTY
+        return NEG_EINVAL; // not a PTY master
     }
 
     // TIOCGRANTPT: no-op (permissions not enforced yet).

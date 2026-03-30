@@ -69,15 +69,18 @@ pub struct PtyPairState {
     pub winsize: Winsize,          // terminal window size (24x80 default)
     pub edit_buf: EditBuffer,      // canonical-mode line editing buffer
     pub slave_fg_pgid: u32,        // foreground process group on slave
-    pub master_open: bool,         // master has open FD references
-    pub slave_open: bool,          // slave has open FD references
+    pub master_refcount: u32,      // open FD references to master side
+    pub slave_refcount: u32,       // open FD references to slave side
+    pub eof_pending: bool,         // ^D on empty line sets EOF for next read
     pub locked: bool,              // slave locked until unlockpt()
 }
 ```
 
-A new pair starts with `master_open = true`, `slave_open = false`,
-`locked = true`. The slave must be unlocked via `TIOCSPTLCK` before
-it can be opened.
+A new pair starts with `master_refcount = 1`, `slave_refcount = 0`,
+`locked = true`. Refcounts are incremented on fork/dup and decremented
+on close. SIGHUP is only sent when the last master reference closes
+(refcount reaches 0). The slave must be unlocked via `TIOCSPTLCK`
+before it can be opened.
 
 ### PTY Table (kernel)
 
