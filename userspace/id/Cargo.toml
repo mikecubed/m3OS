@@ -1,0 +1,11 @@
+[package]
+name = "id"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "id"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

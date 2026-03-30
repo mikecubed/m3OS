@@ -125,6 +125,8 @@ fn build_userspace_bins() {
         ("su", "su", false),
         ("passwd", "passwd", false),
         ("adduser", "adduser", false),
+        ("id", "id", false),
+        ("whoami", "whoami", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -202,9 +204,6 @@ fn build_musl_bins() {
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
-        // Phase 27: user identity utilities
-        ("userspace/coreutils/id.c", "id"),
-        ("userspace/coreutils/whoami.c", "whoami"),
     ];
 
     for (src_rel, name) in bins {

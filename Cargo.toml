@@ -20,6 +20,8 @@ members = [
     "userspace/su",
     "userspace/passwd",
     "userspace/adduser",
+    "userspace/id",
+    "userspace/whoami",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",
