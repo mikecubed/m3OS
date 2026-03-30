@@ -325,7 +325,6 @@ pub extern "C" fn syscall_handler(
 ) -> u64 {
     // Divergent syscalls (exit, sigreturn) never return — handle them first.
     match number {
-        6 => sys_exit_legacy(arg0),
         15 => sys_sigreturn(user_rsp),
         60 | 231 => sys_exit(arg0 as i32),
         _ => {}
@@ -337,7 +336,10 @@ pub extern "C" fn syscall_handler(
         1 => sys_linux_write(arg0, arg1, arg2),
         2 => sys_linux_open(arg0, arg1, arg2),
         3 => sys_linux_close(arg0),
+        // stat(path, buf) and lstat(path, buf) — no symlinks, both delegate to fstatat.
+        4 => sys_linux_fstatat(u64::MAX, arg0, arg1),
         5 => sys_linux_fstat(arg0, arg1),
+        6 => sys_linux_fstatat(u64::MAX, arg0, arg1),
         // Phase 22: poll stub — report all requested fds as ready.
         // Ion uses poll() to multiplex between signal pipe and stdin.
         7 => sys_poll(arg0, arg1, arg2),
@@ -400,9 +402,9 @@ pub extern "C" fn syscall_handler(
             sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
         }
         // IPC syscalls (Phase 6) — kernel-task only.
+        // Note: syscall 4 was IPC but is now stat (Linux ABI).
         // Note: syscall 7 was IPC but is now poll (Phase 22).
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
-        4 => crate::ipc::dispatch(number, arg0, arg1, arg2, 0, 0),
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
         // Phase 21/22: socketpair — implement as pipe pair.
@@ -715,18 +717,6 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
         log::info!("[userspace] {}", s.trim_end_matches('\n'));
     }
     0
-}
-
-// ---------------------------------------------------------------------------
-// sys_exit (legacy, for HELLO_BIN)
-// ---------------------------------------------------------------------------
-
-fn sys_exit_legacy(code: u64) -> ! {
-    log::info!("[userspace] legacy exit with code {}", code);
-    x86_64::instructions::interrupts::disable();
-    loop {
-        x86_64::instructions::hlt();
-    }
 }
 
 // ---------------------------------------------------------------------------
