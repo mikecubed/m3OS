@@ -12,6 +12,7 @@
 //! - [`tmpfs`] — RAM-backed writable filesystem mounted at `/tmp` (Phase 13).
 //! - [`vfs`] — path routing and the `vfs_server` message handler.
 
+pub mod ext2;
 pub mod fat32;
 pub mod protocol;
 pub mod ramdisk;

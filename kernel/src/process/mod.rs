@@ -92,6 +92,14 @@ pub enum FdBackend {
         file_size: u32,
         dir_cluster: u32,
     },
+    /// ext2 on-disk file (Phase 28). Stores the relative path within /data,
+    /// the inode number, file size, and parent inode number.
+    Ext2Disk {
+        path: String,
+        inode_num: u32,
+        file_size: u32,
+        parent_inode: u32,
+    },
     /// Read end of a kernel pipe (Phase 14).
     PipeRead { pipe_id: usize },
     /// Write end of a kernel pipe (Phase 14).
