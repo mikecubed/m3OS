@@ -80,6 +80,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // touch the framebuffer region.
         if unsafe { fb::init_from_parts(buf_ptr, info) } {
             log::info!("[fb] framebuffer console initialised");
+            // Update TTY0 winsize to match the actual framebuffer dimensions.
+            if let Some((rows, cols)) = fb::console_text_size() {
+                let mut tty = tty::TTY0.lock();
+                tty.winsize.ws_row = rows;
+                tty.winsize.ws_col = cols;
+                log::info!("[fb] TTY winsize set to {}x{}", rows, cols);
+            }
         } else {
             log::warn!("[fb] framebuffer too small for text console");
         }
@@ -835,7 +842,7 @@ fn stdin_feeder_task() -> ! {
 
         // Convert scancode to a byte value.
         let byte = if sc == 0x1C {
-            b'\n'
+            b'\r' // Enter key produces CR; ICRNL translates to LF when enabled
         } else if sc == 0x0E {
             0x7F // DEL / backspace
         } else if ctrl {

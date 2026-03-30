@@ -652,7 +652,7 @@ impl Editor {
                     }
                     return None;
                 }
-                Key::Char(b'\r') => {
+                Key::Char(b'\r') | Key::Char(b'\n') => {
                     if !input.is_empty() {
                         self.status_msg.clear();
                         if let Some(cb) = callback {
@@ -870,7 +870,7 @@ impl Editor {
             Key::Ctrl(b'f') => {
                 self.find();
             }
-            Key::Char(b'\r') => {
+            Key::Char(b'\r') | Key::Char(b'\n') => {
                 self.insert_newline();
             }
             Key::Ctrl(b'h') => {
