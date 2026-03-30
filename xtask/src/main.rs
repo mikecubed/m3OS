@@ -1136,9 +1136,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          mkdir tmp\n\
          mkdir var\n\
          mkdir dev\n\
-         write {passwd} etc/passwd\n\
-         write {shadow} etc/shadow\n\
-         write {group} etc/group\n\
+         write \"{passwd}\" etc/passwd\n\
+         write \"{shadow}\" etc/shadow\n\
+         write \"{group}\" etc/group\n\
          sif bin mode 0x41ED\n\
          sif bin uid 0\n\
          sif bin gid 0\n\
@@ -1199,9 +1199,10 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     if !debugfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
         eprintln!(
-            "Warning: debugfs exited with {}: {}",
+            "Error: debugfs exited with {}: {}",
             debugfs_output.status, stderr
         );
+        std::process::exit(1);
     }
 
     // Clean up temp files.

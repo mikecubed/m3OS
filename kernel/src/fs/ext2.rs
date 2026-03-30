@@ -1131,13 +1131,14 @@ pub fn is_mounted() -> bool {
 }
 
 /// Get uid/gid/mode for an ext2 file by its path relative to /data.
-pub fn get_ext2_meta(path: &str) -> (u32, u32, u16) {
+/// Returns `None` if the file is not found or the volume is not mounted.
+pub fn get_ext2_meta(path: &str) -> Option<(u32, u32, u16)> {
     let vol = EXT2_VOLUME.lock();
     match vol.as_ref() {
         Some(vol) => match vol.metadata(path) {
-            Ok((uid, gid, mode, _, _)) => (uid, gid, mode & 0o7777),
-            Err(_) => (0, 0, 0o755),
+            Ok((uid, gid, mode, _, _)) => Some((uid, gid, mode & 0o7777)),
+            Err(_) => None,
         },
-        None => (0, 0, 0o755),
+        None => None,
     }
 }

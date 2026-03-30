@@ -3692,38 +3692,56 @@ fn dir_metadata(path: &str) -> (u32, u32, u16) {
 /// Get uid/gid/mode for a file on the data partition (ext2 or FAT32).
 fn data_file_metadata(rel: &str) -> (u32, u32, u16) {
     if crate::fs::ext2::is_mounted() {
-        return crate::fs::ext2::get_ext2_meta(rel);
+        return crate::fs::ext2::get_ext2_meta(rel).unwrap_or((0, 0, 0o755));
     }
     crate::fs::fat32::get_fat32_meta(rel)
 }
 
 /// Set permission mode on a data partition file (ext2 or FAT32).
-fn data_chmod(rel: &str, mode: u16) {
+/// Returns 0 on success, NEG_ENOENT if not found, NEG_EIO on error.
+fn data_chmod(rel: &str, mode: u16) -> u64 {
     if crate::fs::ext2::is_mounted() {
         let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_mut() {
-            if let Ok((u, g, _, _, _)) = vol.metadata(rel) {
-                let _ = vol.set_metadata(rel, u, g, mode);
-            }
+        let vol = match vol.as_mut() {
+            Some(v) => v,
+            None => return NEG_EIO,
+        };
+        let (u, g, _, _, _) = match vol.metadata(rel) {
+            Ok(m) => m,
+            Err(_) => return NEG_ENOENT,
+        };
+        match vol.set_metadata(rel, u, g, mode) {
+            Ok(()) => 0,
+            Err(_) => NEG_EIO,
         }
     } else {
         let (u, g, _) = crate::fs::fat32::get_fat32_meta(rel);
         crate::fs::fat32::set_fat32_meta_and_save(rel, u, g, mode);
+        0
     }
 }
 
 /// Set ownership on a data partition file (ext2 or FAT32).
-fn data_chown(rel: &str, new_uid: u32, new_gid: u32) {
+/// Returns 0 on success, NEG_ENOENT if not found, NEG_EIO on error.
+fn data_chown(rel: &str, new_uid: u32, new_gid: u32) -> u64 {
     if crate::fs::ext2::is_mounted() {
         let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_mut() {
-            if let Ok((_, _, mode, _, _)) = vol.metadata(rel) {
-                let _ = vol.set_metadata(rel, new_uid, new_gid, mode & 0o7777);
-            }
+        let vol = match vol.as_mut() {
+            Some(v) => v,
+            None => return NEG_EIO,
+        };
+        let (_, _, mode, _, _) = match vol.metadata(rel) {
+            Ok(m) => m,
+            Err(_) => return NEG_ENOENT,
+        };
+        match vol.set_metadata(rel, new_uid, new_gid, mode & 0o7777) {
+            Ok(()) => 0,
+            Err(_) => NEG_EIO,
         }
     } else {
         let (_, _, m) = crate::fs::fat32::get_fat32_meta(rel);
         crate::fs::fat32::set_fat32_meta_and_save(rel, new_uid, new_gid, m);
+        0
     }
 }
 
@@ -4035,7 +4053,7 @@ fn parent_dir_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
 enum FsTarget {
     Tmpfs(alloc::string::String),
     /// ext2 root (or FAT32 /data fallback). The string is the root-relative path.
-    Fat32(alloc::string::String),
+    DiskData(alloc::string::String),
     Ramdisk,
 }
 
@@ -4044,16 +4062,17 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
         let rel = abs_path.strip_prefix("/tmp").unwrap_or("/");
         return FsTarget::Tmpfs(alloc::string::String::from(rel));
     }
+    // /data paths always go to disk data (FAT32 or ext2 /data fallback),
+    // even when ext2 is mounted at root.
+    if abs_path.starts_with("/data/") {
+        let rel = abs_path.strip_prefix("/data/").unwrap_or("");
+        return FsTarget::DiskData(alloc::string::String::from(rel));
+    }
     // When ext2 is mounted at root, route non-ramdisk paths to ext2.
     if crate::fs::ext2::is_mounted() {
         if let Some(rel) = ext2_root_path(abs_path) {
-            return FsTarget::Fat32(alloc::string::String::from(rel));
+            return FsTarget::DiskData(alloc::string::String::from(rel));
         }
-    }
-    // Legacy: /data paths for FAT32 fallback.
-    if abs_path.starts_with("/data/") {
-        let rel = abs_path.strip_prefix("/data/").unwrap_or("");
-        return FsTarget::Fat32(alloc::string::String::from(rel));
     }
     FsTarget::Ramdisk
 }
@@ -4087,15 +4106,14 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
             }
             0
         }
-        FsTarget::Fat32(rel) => {
+        FsTarget::DiskData(rel) => {
             if euid != 0 {
                 let (owner, _, _) = data_file_metadata(&rel);
                 if euid != owner {
                     return NEG_EPERM;
                 }
             }
-            data_chmod(&rel, mode);
-            0
+            data_chmod(&rel, mode)
         }
         FsTarget::Ramdisk => NEG_EROFS,
     }
@@ -4129,15 +4147,14 @@ fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
             }
             0
         }
-        FdBackend::Fat32Disk { path, .. } => {
+        FdBackend::Fat32Disk { path, .. } | FdBackend::Ext2Disk { path, .. } => {
             if euid != 0 {
                 let (owner, _, _) = data_file_metadata(path);
                 if euid != owner {
                     return NEG_EPERM;
                 }
             }
-            data_chmod(path, mode);
-            0
+            data_chmod(path, mode)
         }
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         _ => NEG_EBADF,
@@ -4170,10 +4187,7 @@ fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
             }
             0
         }
-        FsTarget::Fat32(rel) => {
-            data_chown(&rel, new_uid, new_gid);
-            0
-        }
+        FsTarget::DiskData(rel) => data_chown(&rel, new_uid, new_gid),
         FsTarget::Ramdisk => NEG_EROFS,
     }
 }
@@ -4204,9 +4218,8 @@ fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
             }
             0
         }
-        FdBackend::Fat32Disk { path, .. } => {
-            data_chown(path, new_uid, new_gid);
-            0
+        FdBackend::Fat32Disk { path, .. } | FdBackend::Ext2Disk { path, .. } => {
+            data_chown(path, new_uid, new_gid)
         }
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         _ => NEG_EBADF,
@@ -5370,41 +5383,48 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    // Phase 28: Try ext2 partition first, fall back to FAT32.
-    if let Some((base_lba, _)) = crate::blk::mbr::probe_ext2() {
+    if fstype == "ext2" {
+        let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
+            Some(p) => p,
+            None => {
+                log::error!("[mount] no ext2 partition found on virtio-blk");
+                const NEG_ENODEV: u64 = (-19_i64) as u64;
+                return NEG_ENODEV;
+            }
+        };
         match crate::fs::ext2::mount_ext2(base_lba) {
             Ok(()) => {
                 log::info!("[mount] virtio-blk mounted at {} (ext2)", resolved_target);
-                return 0;
+                0
             }
             Err(e) => {
-                log::warn!("[mount] ext2 mount failed: {:?}", e);
+                log::error!("[mount] ext2 mount failed: {:?}", e);
+                NEG_EIO
             }
         }
-    }
-
-    // Fall back to FAT32.
-    let (base_lba, _sector_count) = match crate::blk::mbr::probe() {
-        Some(p) => p,
-        None => {
-            log::error!("[mount] no FAT32 or ext2 partition found on virtio-blk");
-            const NEG_ENODEV: u64 = (-19_i64) as u64;
-            return NEG_ENODEV;
-        }
-    };
-
-    match crate::fs::fat32::mount_fat32(base_lba) {
-        Ok(()) => {
-            log::info!(
-                "[mount] {} mounted at {} (vfat)",
-                "virtio-blk",
-                resolved_target
-            );
-            0
-        }
-        Err(e) => {
-            log::error!("[mount] FAT32 mount failed: {:?}", e);
-            NEG_EIO
+    } else {
+        // fstype == "vfat"
+        let (base_lba, _sector_count) = match crate::blk::mbr::probe() {
+            Some(p) => p,
+            None => {
+                log::error!("[mount] no FAT32 partition found on virtio-blk");
+                const NEG_ENODEV: u64 = (-19_i64) as u64;
+                return NEG_ENODEV;
+            }
+        };
+        match crate::fs::fat32::mount_fat32(base_lba) {
+            Ok(()) => {
+                log::info!(
+                    "[mount] {} mounted at {} (vfat)",
+                    "virtio-blk",
+                    resolved_target
+                );
+                0
+            }
+            Err(e) => {
+                log::error!("[mount] FAT32 mount failed: {:?}", e);
+                NEG_EIO
+            }
         }
     }
 }

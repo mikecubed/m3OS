@@ -454,7 +454,7 @@ impl Ext2DirEntry {
 
             let name = core::str::from_utf8(&block_data[offset + 8..name_end])
                 .map(String::from)
-                .unwrap_or_else(|_| String::new());
+                .map_err(|_| Ext2Error::CorruptedEntry)?;
 
             entries.push(Ext2DirEntry {
                 inode,
