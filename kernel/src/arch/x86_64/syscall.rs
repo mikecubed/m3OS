@@ -2595,6 +2595,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
         FdBackend::PtyMaster { pty_id } => {
+            if count == 0 {
+                return 0;
+            }
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -2628,6 +2631,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::PtySlave { pty_id } => {
+            if count == 0 {
+                return 0;
+            }
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
             let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -3072,7 +3078,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             // ^D: if edit buffer has content, flush as a line.
                             // If empty, signal EOF to the reader.
                             if !pair.edit_buf.is_empty() {
-                                pair.edit_buf.push(b'\n');
+                                if !pair.edit_buf.push(b'\n') {
+                                    // Edit buffer full — stop accepting input.
+                                    written += 1;
+                                    break;
+                                }
                             } else {
                                 pair.eof_pending = true;
                             }
@@ -3127,12 +3137,12 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 let mut written = 0usize;
                 for &b in &src_data {
                     if opost && onlcr && b == b'\n' {
-                        if pair.s2m.write(b"\r") == 0 {
+                        // Ensure atomic CR+LF: need at least 2 bytes of space.
+                        if pair.s2m.space() < 2 {
                             break;
                         }
-                        if pair.s2m.write(b"\n") == 0 {
-                            break;
-                        }
+                        pair.s2m.write(b"\r");
+                        pair.s2m.write(b"\n");
                     } else if pair.s2m.write(&[b]) == 0 {
                         break;
                     }
@@ -3381,7 +3391,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
-            None => NEG_EMFILE,
+            None => {
+                crate::pty::close_master(pty_id);
+                NEG_EMFILE
+            }
         };
     }
 
@@ -3398,11 +3411,6 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             match result {
                 Err(e) => return e,
                 Ok(()) => {
-                    let mut table = crate::pty::PTY_TABLE.lock();
-                    if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                        pair.slave_refcount += 1;
-                    }
-                    drop(table);
                     let entry = FdEntry {
                         backend: FdBackend::PtySlave { pty_id },
                         offset: 0,
@@ -3411,7 +3419,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                         cloexec: false,
                     };
                     return match alloc_fd(3, entry) {
-                        Some(i) => i as u64,
+                        Some(i) => {
+                            crate::pty::add_slave_ref(pty_id);
+                            i as u64
+                        }
                         None => NEG_EMFILE,
                     };
                 }
@@ -3836,7 +3847,10 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
-            None => NEG_EMFILE,
+            None => {
+                crate::pty::close_master(pty_id);
+                NEG_EMFILE
+            }
         };
     }
 
@@ -3853,11 +3867,6 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             match result {
                 Err(e) => return e,
                 Ok(()) => {
-                    let mut table = crate::pty::PTY_TABLE.lock();
-                    if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                        pair.slave_refcount += 1;
-                    }
-                    drop(table);
                     let entry = FdEntry {
                         backend: FdBackend::PtySlave { pty_id },
                         offset: 0,
@@ -3866,7 +3875,10 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                         cloexec: false,
                     };
                     return match alloc_fd(3, entry) {
-                        Some(i) => i as u64,
+                        Some(i) => {
+                            crate::pty::add_slave_ref(pty_id);
+                            i as u64
+                        }
                         None => NEG_EMFILE,
                     };
                 }
