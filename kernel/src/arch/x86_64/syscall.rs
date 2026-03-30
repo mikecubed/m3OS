@@ -4952,6 +4952,30 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             0
         }
         None => {
+            // ext2 root filesystem: stat any path.
+            if crate::fs::ext2::is_mounted() {
+                if let Some(rel) = ext2_root_path(name) {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    if let Some(vol) = vol.as_ref() {
+                        if let Ok((uid, gid, mode, size, _mtime)) = vol.metadata(rel) {
+                            let mut stat = [0u8; 144];
+                            stat[24..28].copy_from_slice(&(mode as u32).to_ne_bytes());
+                            stat[28..32].copy_from_slice(&uid.to_ne_bytes());
+                            stat[32..36].copy_from_slice(&gid.to_ne_bytes());
+                            stat[48..56].copy_from_slice(&(size as u64).to_ne_bytes());
+                            let blksize: u64 = 4096;
+                            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                            // st_nlink at offset 16 (u64 on x86_64 stat)
+                            let nlink: u64 = 1;
+                            stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
+                            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                                return NEG_EFAULT;
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
             // Device special files.
             if name == "/dev/null" || name == "/dev/ptmx" || name.starts_with("/dev/pts/") {
                 let mut stat = [0u8; 144];
