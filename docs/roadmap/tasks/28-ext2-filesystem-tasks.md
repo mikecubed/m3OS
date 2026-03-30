@@ -45,16 +45,16 @@ Needs to be added or extended:
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | kernel-core ext2 data structures and parsing | — | Not started |
-| B | Inode reading and block pointer traversal | A | Not started |
-| C | Directory entry parsing and path resolution | B | Not started |
-| D | Read-only file access through VFS | C | Not started |
-| E | Block/inode bitmap management and allocation | B | Not started |
-| F | File and directory write operations | D, E | Not started |
-| G | VfsMetadata trait implementation (chmod/chown) | D | Not started |
-| H | Build system: ext2 image creation | — | Not started |
-| I | VFS mount integration and FAT32 removal | F, G, H | Not started |
-| J | Validation and acceptance testing | I | Not started |
+| A | kernel-core ext2 data structures and parsing | — | ✅ Done |
+| B | Inode reading and block pointer traversal | A | ✅ Done |
+| C | Directory entry parsing and path resolution | B | ✅ Done |
+| D | Read-only file access through VFS | C | ✅ Done |
+| E | Block/inode bitmap management and allocation | B | ✅ Done |
+| F | File and directory write operations | D, E | ✅ Done |
+| G | VfsMetadata trait implementation (chmod/chown) | D | ✅ Done |
+| H | Build system: ext2 image creation | — | ✅ Done |
+| I | VFS mount integration and FAT32 removal | F, G, H | ✅ Done (FAT32 overlay kept as fallback) |
+| J | Validation and acceptance testing | I | ✅ Done |
 
 ### Implementation Notes
 

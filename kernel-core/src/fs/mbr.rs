@@ -68,6 +68,17 @@ pub fn find_fat32_partition(entries: &[MbrPartitionEntry; 4]) -> Option<(u64, u6
     None
 }
 
+/// Find the first ext2/Linux partition (type 0x83) and return its
+/// `(lba_start, sector_count)`.
+pub fn find_ext2_partition(entries: &[MbrPartitionEntry; 4]) -> Option<(u64, u64)> {
+    for entry in entries {
+        if entry.part_type == 0x83 && entry.sector_count > 0 {
+            return Some((entry.lba_start as u64, entry.sector_count as u64));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +174,19 @@ mod tests {
 
         let entries = parse_mbr(&sector).unwrap();
         assert_eq!(find_fat32_partition(&entries), Some((2048, 4096)));
+    }
+
+    #[test]
+    fn find_ext2_partition_type_83() {
+        let sector = make_sector_with_entry(0x83, 2048, 129024);
+        let entries = parse_mbr(&sector).unwrap();
+        assert_eq!(find_ext2_partition(&entries), Some((2048, 129024)));
+    }
+
+    #[test]
+    fn no_ext2_returns_none_for_fat32() {
+        let sector = make_sector_with_entry(0x0C, 2048, 129024);
+        let entries = parse_mbr(&sector).unwrap();
+        assert_eq!(find_ext2_partition(&entries), None);
     }
 }
