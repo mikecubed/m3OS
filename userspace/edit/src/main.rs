@@ -1101,21 +1101,21 @@ fn find_substr(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    register_sigwinch_handler();
-
-    let mut editor = Editor::new();
-
-    // Parse argv: [argc, argv[0], argv[1], ..., null]
-    // argv[1] is the filename if provided
+    // Capture rsp FIRST, before any function calls corrupt the initial stack.
+    // The SysV ABI places [argc, argv[0], argv[1], ..., null] at the entry rsp.
     let argc: usize;
     let argv_base: *const *const u8;
     unsafe {
         let rsp: u64;
-        core::arch::asm!("mov {}, rsp", out(reg) rsp);
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
         let stack_ptr = rsp as *const u64;
         argc = *stack_ptr as usize;
         argv_base = stack_ptr.add(1) as *const *const u8;
     }
+
+    register_sigwinch_handler();
+
+    let mut editor = Editor::new();
 
     if argc >= 2 {
         // Read filename from argv[1]
