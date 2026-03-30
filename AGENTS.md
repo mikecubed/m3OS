@@ -245,6 +245,7 @@ Read before making significant changes:
 | `docs/23-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
+| `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–38) with corresponding `docs/roadmap/tasks/` breakdowns.
