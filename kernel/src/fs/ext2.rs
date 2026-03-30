@@ -752,7 +752,6 @@ impl Ext2Volume {
 
         self.write_block(new_block, &block_data)?;
         dir_inode.size += bs as u32;
-        dir_inode.blocks += self.block_size / 512;
         self.write_inode(dir_inode_num, dir_inode)?;
         Ok(())
     }

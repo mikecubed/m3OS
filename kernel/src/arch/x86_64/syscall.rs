@@ -4957,21 +4957,27 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
                 if let Some(rel) = ext2_root_path(name) {
                     let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                     if let Some(vol) = vol.as_ref() {
-                        if let Ok((uid, gid, mode, size, _mtime)) = vol.metadata(rel) {
-                            let mut stat = [0u8; 144];
-                            stat[24..28].copy_from_slice(&(mode as u32).to_ne_bytes());
-                            stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                            stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                            stat[48..56].copy_from_slice(&(size as u64).to_ne_bytes());
-                            let blksize: u64 = 4096;
-                            stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                            // st_nlink at offset 16 (u64 on x86_64 stat)
-                            let nlink: u64 = 1;
-                            stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-                                return NEG_EFAULT;
+                        if let Ok(ino) = vol.resolve_path(rel) {
+                            if let Ok(inode) = vol.read_inode(ino) {
+                                let mode = inode.mode as u32;
+                                let uid = inode.uid as u32;
+                                let gid = inode.gid as u32;
+                                let size = inode.size as u64;
+                                let nlink = inode.links_count as u64;
+                                let blksize = vol.block_size as u64;
+                                let mut stat = [0u8; 144];
+                                // st_nlink at offset 16 (u64 on x86_64 stat)
+                                stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
+                                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                                stat[28..32].copy_from_slice(&uid.to_ne_bytes());
+                                stat[32..36].copy_from_slice(&gid.to_ne_bytes());
+                                stat[48..56].copy_from_slice(&size.to_ne_bytes());
+                                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return 0;
                             }
-                            return 0;
                         }
                     }
                 }
@@ -5652,6 +5658,12 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Add virtual mount points.
         if !seen.contains("tmp") {
             entries.push((alloc::string::String::from("tmp"), true));
+        }
+        if !crate::fs::ext2::is_mounted()
+            && crate::fs::fat32::is_mounted()
+            && !seen.contains("data")
+        {
+            entries.push((alloc::string::String::from("data"), true));
         }
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).

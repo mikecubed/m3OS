@@ -105,27 +105,28 @@ int main(int argc, char **argv) {
                     memcpy(fullpath, basepath, blen);
                     memcpy(fullpath + blen, d->d_name, nlen);
                     fullpath[blen + nlen] = '\0';
-                } else {
-                    fullpath[0] = '\0';
-                }
 
-                struct stat st;
-                memset(&st, 0, sizeof(st));
-                /* Use newfstatat (syscall 262) */
-                long sr = syscall(SYS_newfstatat, -100 /* AT_FDCWD */, fullpath, &st, 0);
-                if (sr == 0) {
-                    char mode_str[10];
-                    format_mode(st.st_mode, mode_str);
-                    write(1, mode_str, 10);
-                    write(1, " ", 1);
-                    write_padded_uint(1, st.st_uid, 5);
-                    write(1, " ", 1);
-                    write_padded_uint(1, st.st_gid, 5);
-                    write(1, " ", 1);
-                    write_padded_uint(1, st.st_size, 8);
-                    write(1, " ", 1);
+                    struct stat st;
+                    memset(&st, 0, sizeof(st));
+                    /* Use newfstatat (syscall 262) */
+                    long sr = syscall(SYS_newfstatat, -100 /* AT_FDCWD */, fullpath, &st, 0);
+                    if (sr == 0) {
+                        char mode_str[10];
+                        format_mode(st.st_mode, mode_str);
+                        write(1, mode_str, 10);
+                        write(1, " ", 1);
+                        write_padded_uint(1, st.st_uid, 5);
+                        write(1, " ", 1);
+                        write_padded_uint(1, st.st_gid, 5);
+                        write(1, " ", 1);
+                        write_padded_uint(1, st.st_size, 8);
+                        write(1, " ", 1);
+                    } else {
+                        /* stat failed — print placeholder */
+                        write_str(1, "?????????? ? ? ? ");
+                    }
                 } else {
-                    /* stat failed — print placeholder */
+                    /* path overflow — skip syscall, print placeholder */
                     write_str(1, "?????????? ? ? ? ");
                 }
             }
