@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.27.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, and multi-user accounts with permission enforcement.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.28.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, and multi-user accounts with permission enforcement.
 
 ## Build & Run
 
@@ -159,6 +159,8 @@ All crates under `kernel/` and `userspace/` are `#![no_std]`. Only use `alloc` t
 ### `unsafe` only at hardware boundaries
 
 Acceptable only for: hardware register/port I/O, page table/GDT/IDT setup, `enter_userspace()`/`switch_context()` asm stubs, global allocator initialization, APIC/ACPI MMIO access, VirtIO ring manipulation. Always wrap in a safe abstraction immediately.
+
+All crates use Rust **edition 2024** — the body of an `unsafe fn` is *not* implicitly unsafe. You must wrap unsafe operations in explicit `unsafe {}` blocks inside unsafe functions.
 
 ### IPC model — read the doc before touching `kernel/src/ipc/`
 
