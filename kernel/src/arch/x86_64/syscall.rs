@@ -2511,24 +2511,19 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 }
             }
         }
-        FdBackend::Ext2Disk {
-            inode_num,
-            file_size,
-            ..
-        } => {
+        FdBackend::Ext2Disk { inode_num, .. } => {
             let capped_count = (count as usize).min(64 * 1024);
             let inode_num = *inode_num;
-            let file_size = *file_size;
             let offset = entry.offset;
-
-            if offset >= file_size as usize {
-                return 0;
-            }
 
             let vol = crate::fs::ext2::EXT2_VOLUME.lock();
             if let Some(vol) = vol.as_ref() {
                 match vol.read_inode(inode_num) {
                     Ok(inode) => {
+                        let actual_size = inode.size as usize;
+                        if offset >= actual_size {
+                            return 0;
+                        }
                         let mut read_buf = alloc::vec![0u8; capped_count];
                         match vol.read_file_data(&inode, offset as u64, &mut read_buf) {
                             Ok(0) => 0,
@@ -2541,6 +2536,13 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 with_current_fd_mut(fd, |slot| {
                                     if let Some(e) = slot {
                                         e.offset += n;
+                                        if let FdBackend::Ext2Disk {
+                                            file_size: ref mut fs,
+                                            ..
+                                        } = e.backend
+                                        {
+                                            *fs = inode.size;
+                                        }
                                     }
                                 });
                                 n as u64
@@ -5402,6 +5404,12 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
+    // ext2 can only mount at /, not /data.
+    if fstype == "ext2" && resolved_target == "/data" {
+        log::warn!("[mount] ext2 cannot be mounted at /data; only / is supported for ext2");
+        return NEG_EINVAL;
+    }
+
     if fstype == "ext2" {
         let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
             Some(p) => p,
@@ -5624,21 +5632,23 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).
         if let Some(rel) = ext2_root_path(&dir_path) {
-            // Check ramdisk first for overlaid dirs like /bin.
+            // Merge entries from both ramdisk and ext2 for overlaid dirs.
+            let mut seen = alloc::collections::BTreeSet::new();
             if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
                 for (name, is_dir) in children {
+                    seen.insert(name.clone());
                     entries.push((name, is_dir));
                 }
-            } else {
+            }
+            {
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref() {
-                    match vol.list_dir(rel) {
-                        Ok(children) => {
-                            for (name, is_dir) in children {
+                    if let Ok(children) = vol.list_dir(rel) {
+                        for (name, is_dir) in children {
+                            if !seen.contains(&name) {
                                 entries.push((name, is_dir));
                             }
                         }
-                        Err(_) => return NEG_EIO,
                     }
                 }
             }

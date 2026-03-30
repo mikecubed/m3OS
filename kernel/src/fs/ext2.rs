@@ -364,7 +364,9 @@ impl Ext2Volume {
             let mut bitmap = self.read_block(bitmap_block)?;
 
             let blocks_in_group = if group == bg_count - 1 {
-                self.superblock.blocks_count - (group as u32) * self.superblock.blocks_per_group
+                self.superblock.blocks_count
+                    - self.superblock.first_data_block
+                    - (group as u32) * self.superblock.blocks_per_group
             } else {
                 self.superblock.blocks_per_group
             };
@@ -431,6 +433,11 @@ impl Ext2Volume {
             let inodes_in_group = self.superblock.inodes_per_group;
 
             for bit in 0..inodes_in_group {
+                let abs_inode = (group as u32) * self.superblock.inodes_per_group + bit + 1;
+                if abs_inode > self.superblock.inodes_count {
+                    continue; // This bit is beyond the actual inode count
+                }
+
                 let byte_idx = (bit / 8) as usize;
                 let bit_idx = bit % 8;
                 if bitmap[byte_idx] & (1 << bit_idx) == 0 {
@@ -439,8 +446,6 @@ impl Ext2Volume {
 
                     self.bgd_table[group].free_inodes_count -= 1;
                     self.superblock.free_inodes_count -= 1;
-
-                    let abs_inode = (group as u32) * self.superblock.inodes_per_group + bit + 1;
 
                     self.flush_metadata()?;
                     return Ok(abs_inode);
@@ -761,6 +766,11 @@ impl Ext2Volume {
         uid: u32,
         gid: u32,
     ) -> Result<u32, Ext2Error> {
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+
         let parent_group = kernel_core::fs::ext2::inode_block_group(
             parent_inode_num,
             self.superblock.inodes_per_group,
@@ -795,6 +805,11 @@ impl Ext2Volume {
         uid: u32,
         gid: u32,
     ) -> Result<u32, Ext2Error> {
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+
         let parent_group = kernel_core::fs::ext2::inode_block_group(
             parent_inode_num,
             self.superblock.inodes_per_group,

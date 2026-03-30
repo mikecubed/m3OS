@@ -181,7 +181,7 @@ impl Ext2Superblock {
 
     /// Number of block groups on this volume.
     pub fn block_group_count(&self) -> u32 {
-        self.blocks_count.div_ceil(self.blocks_per_group)
+        (self.blocks_count - self.first_data_block).div_ceil(self.blocks_per_group)
     }
 
     /// Serialize the superblock back to bytes (for writeback).
