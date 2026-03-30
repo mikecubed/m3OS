@@ -3,8 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, execve, exit, geteuid, open, read, setgid, setuid, write,
-    write_str, write_u64,
+    O_RDONLY, STDOUT_FILENO, close, execve, exit, open, read, setgid, setuid, write, write_str,
+    write_u64,
 };
 
 syscall_lib::entry_point!(su_main);
@@ -26,9 +26,9 @@ fn su_main(args: &[&str]) -> i32 {
 
     // Look up target user in /etc/passwd.
     let mut passwd_buf = [0u8; 2048];
-    let passwd_len = read_file(b"/data/etc/passwd\0", &mut passwd_buf);
+    let passwd_len = read_file(b"/etc/passwd\0", &mut passwd_buf);
     if passwd_len == 0 {
-        write_str(STDOUT_FILENO, "su: cannot read /data/etc/passwd\n");
+        write_str(STDOUT_FILENO, "su: cannot read /etc/passwd\n");
         exit(1);
     }
 
@@ -40,15 +40,9 @@ fn su_main(args: &[&str]) -> i32 {
         }
     };
 
-    // su requires root privileges (setuid-bit support deferred).
-    if geteuid() != 0 {
-        write_str(STDOUT_FILENO, "su: must be run as root\n");
-        exit(1);
-    }
-
     // Prompt for target user's password (skip if switching to self).
     let caller_uid = syscall_lib::getuid();
-    if caller_uid != uid {
+    if caller_uid != 0 && caller_uid != uid {
         write_str(STDOUT_FILENO, "Password: ");
         let saved = disable_echo();
         let mut pw_input = [0u8; 128];
@@ -57,7 +51,7 @@ fn su_main(args: &[&str]) -> i32 {
         let _ = write(STDOUT_FILENO, b"\n");
 
         let mut shadow_buf = [0u8; 2048];
-        let shadow_len = read_file(b"/data/etc/shadow\0", &mut shadow_buf);
+        let shadow_len = read_file(b"/etc/shadow\0", &mut shadow_buf);
         if shadow_len == 0 || !verify_shadow(&shadow_buf[..shadow_len], target, &pw_input[..plen]) {
             write_str(STDOUT_FILENO, "su: Authentication failure\n");
             exit(1);

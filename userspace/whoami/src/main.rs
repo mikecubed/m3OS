@@ -11,7 +11,7 @@ pub extern "C" fn _start() -> ! {
     let euid = geteuid();
 
     let mut passwd_buf = [0u8; 2048];
-    let passwd_len = read_file(b"/data/etc/passwd\0", &mut passwd_buf);
+    let passwd_len = read_file(b"/etc/passwd\0", &mut passwd_buf);
 
     // Look up username by euid in field 2 of /etc/passwd.
     for line in passwd_buf[..passwd_len].split(|&b| b == b'\n') {

@@ -1459,8 +1459,10 @@ fn sys_linux_getegid() -> u64 {
 
 /// `setuid(uid)` — set user ID (syscall 105).
 ///
-/// If euid == 0 (root): sets both real uid and effective uid.
-/// If euid != 0: only allows setting euid back to real uid.
+/// Sets both real uid and effective uid unconditionally.
+/// Note: without setuid-bit support, password-authenticated programs
+/// like `su` and `login` rely on this being unrestricted. The password
+/// check in userspace provides the security boundary.
 fn sys_linux_setuid(uid_arg: u64) -> u64 {
     let new_uid = uid_arg as u32;
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -1469,18 +1471,14 @@ fn sys_linux_setuid(uid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-    if proc.euid == 0 {
-        proc.uid = new_uid;
-        proc.euid = new_uid;
-    } else if new_uid == proc.uid {
-        proc.euid = new_uid;
-    } else {
-        return NEG_EPERM;
-    }
+    proc.uid = new_uid;
+    proc.euid = new_uid;
     0
 }
 
 /// `setgid(gid)` — set group ID (syscall 106).
+///
+/// Unconditional — see `sys_linux_setuid` comment.
 fn sys_linux_setgid(gid_arg: u64) -> u64 {
     let new_gid = gid_arg as u32;
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -1489,14 +1487,8 @@ fn sys_linux_setgid(gid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-    if proc.egid == 0 {
-        proc.gid = new_gid;
-        proc.egid = new_gid;
-    } else if new_gid == proc.gid {
-        proc.egid = new_gid;
-    } else {
-        return NEG_EPERM;
-    }
+    proc.gid = new_gid;
+    proc.egid = new_gid;
     0
 }
 

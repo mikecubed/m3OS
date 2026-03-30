@@ -12,10 +12,10 @@ pub extern "C" fn _start() -> ! {
     let gid = getgid();
 
     let mut passwd_buf = [0u8; 2048];
-    let passwd_len = read_file(b"/data/etc/passwd\0", &mut passwd_buf);
+    let passwd_len = read_file(b"/etc/passwd\0", &mut passwd_buf);
 
     let mut group_buf = [0u8; 2048];
-    let group_len = read_file(b"/data/etc/group\0", &mut group_buf);
+    let group_len = read_file(b"/etc/group\0", &mut group_buf);
 
     write_str(STDOUT_FILENO, "uid=");
     write_u64(STDOUT_FILENO, uid as u64);

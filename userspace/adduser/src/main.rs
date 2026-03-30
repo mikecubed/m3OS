@@ -6,9 +6,9 @@ use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, chown, close, exit, geteuid, open, read, write, write_str, write_u64,
 };
 
-const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";
-const SHADOW_PATH: &[u8] = b"/data/etc/shadow\0";
-const GROUP_PATH: &[u8] = b"/data/etc/group\0";
+const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
+const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
+const GROUP_PATH: &[u8] = b"/etc/group\0";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -88,7 +88,7 @@ pub extern "C" fn _start() -> ! {
             0,
         );
         if fd < 0 {
-            write_str(STDOUT_FILENO, "adduser: cannot open /data/etc/passwd\n");
+            write_str(STDOUT_FILENO, "adduser: cannot open /etc/passwd\n");
             exit(1);
         }
         let _ = write(fd as i32, username);
@@ -112,7 +112,7 @@ pub extern "C" fn _start() -> ! {
             0,
         );
         if fd < 0 {
-            write_str(STDOUT_FILENO, "adduser: cannot open /data/etc/shadow\n");
+            write_str(STDOUT_FILENO, "adduser: cannot open /etc/shadow\n");
             exit(1);
         }
         let _ = write(fd as i32, username);
@@ -128,7 +128,7 @@ pub extern "C" fn _start() -> ! {
     {
         let fd = open(GROUP_PATH, syscall_lib::O_WRONLY | syscall_lib::O_APPEND, 0);
         if fd < 0 {
-            write_str(STDOUT_FILENO, "adduser: cannot open /data/etc/group\n");
+            write_str(STDOUT_FILENO, "adduser: cannot open /etc/group\n");
             exit(1);
         }
         let _ = write(fd as i32, username);

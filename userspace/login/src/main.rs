@@ -7,8 +7,8 @@ use syscall_lib::{
     write_u64,
 };
 
-const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";
-const SHADOW_PATH: &[u8] = b"/data/etc/shadow\0";
+const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
+const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -43,7 +43,7 @@ fn login_once() {
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
-        write_str(STDOUT_FILENO, "login: cannot read /data/etc/passwd\n");
+        write_str(STDOUT_FILENO, "login: cannot read /etc/passwd\n");
         return;
     }
 
@@ -59,7 +59,7 @@ fn login_once() {
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
-        write_str(STDOUT_FILENO, "login: cannot read /data/etc/shadow\n");
+        write_str(STDOUT_FILENO, "login: cannot read /etc/shadow\n");
         return;
     }
 
