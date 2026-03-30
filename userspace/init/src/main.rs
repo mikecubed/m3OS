@@ -51,12 +51,17 @@ pub extern "C" fn _start() -> ! {
     }
 
     // Create /tmp/home for user home directories.
-    unsafe {
+    let mkdir_ret = unsafe {
         syscall_lib::syscall2(
             syscall_lib::SYS_MKDIR,
             b"/tmp/home\0".as_ptr() as u64,
             0o755,
-        );
+        )
+    };
+    if mkdir_ret as i64 != 0 && mkdir_ret as i64 != -17 {
+        write_str(STDOUT_FILENO, "init: mkdir /tmp/home failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-(mkdir_ret as i64)) as u64);
+        write_str(STDOUT_FILENO, ")\n");
     }
 
     // Make /tmp world-writable so non-root users can create files.
