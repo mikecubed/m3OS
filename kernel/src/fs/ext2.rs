@@ -517,6 +517,7 @@ impl Ext2Volume {
                 let zero = vec![0u8; self.block_size as usize];
                 self.write_block(new_block, &zero)?;
                 inode.block[logical_block as usize] = new_block;
+                inode.blocks += self.block_size / 512;
             }
             return Ok(inode.block[logical_block as usize]);
         }
@@ -530,6 +531,7 @@ impl Ext2Volume {
                 let zero = vec![0u8; self.block_size as usize];
                 self.write_block(ind, &zero)?;
                 inode.block[EXT2_IND_BLOCK] = ind;
+                inode.blocks += self.block_size / 512;
             }
             let ind_block = inode.block[EXT2_IND_BLOCK];
             let mut ind_data = self.read_block(ind_block)?;
@@ -546,6 +548,7 @@ impl Ext2Volume {
                 self.write_block(new_block, &zero)?;
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)?;
+                inode.blocks += self.block_size / 512;
                 return Ok(new_block);
             }
             return Ok(existing);
@@ -560,6 +563,7 @@ impl Ext2Volume {
                 let zero = vec![0u8; self.block_size as usize];
                 self.write_block(dind, &zero)?;
                 inode.block[EXT2_DIND_BLOCK] = dind;
+                inode.blocks += self.block_size / 512;
             }
             let dind_block = inode.block[EXT2_DIND_BLOCK];
             let mut dind_data = self.read_block(dind_block)?;
@@ -578,6 +582,7 @@ impl Ext2Volume {
                 self.write_block(ind_block, &zero)?;
                 dind_data[off..off + 4].copy_from_slice(&ind_block.to_le_bytes());
                 self.write_block(dind_block, &dind_data)?;
+                inode.blocks += self.block_size / 512;
             }
 
             let mut ind_data = self.read_block(ind_block)?;
@@ -595,6 +600,7 @@ impl Ext2Volume {
                 self.write_block(new_block, &zero)?;
                 ind_data[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
                 self.write_block(ind_block, &ind_data)?;
+                inode.blocks += self.block_size / 512;
                 return Ok(new_block);
             }
             return Ok(existing);
@@ -654,10 +660,6 @@ impl Ext2Volume {
             inode.size = end_offset as u32;
         }
 
-        // Update block count (512-byte sectors).
-        let total_logical_blocks = (inode.size as u64).div_ceil(bs) as u32;
-        inode.blocks = total_logical_blocks * (self.block_size / 512);
-
         self.write_inode(inode_num, inode)?;
         Ok(written)
     }
@@ -701,6 +703,10 @@ impl Ext2Volume {
 
                 let entry_name_len = block_data[offset + 6] as usize;
                 let actual_size = (8 + entry_name_len).div_ceil(4) * 4;
+                if rec_len < actual_size {
+                    offset += rec_len;
+                    continue;
+                }
                 let slack = rec_len - actual_size;
 
                 if slack >= needed_size {
@@ -1023,7 +1029,7 @@ impl Ext2Volume {
         let entries = self.read_directory_entries(&child_inode)?;
         for (entry_name, _, _) in &entries {
             if entry_name != "." && entry_name != ".." {
-                return Err(Ext2Error::NotDirectory); // Not empty
+                return Err(Ext2Error::NotEmpty); // Not empty
             }
         }
 
@@ -1130,7 +1136,7 @@ pub fn is_mounted() -> bool {
     EXT2_VOLUME.lock().is_some()
 }
 
-/// Get uid/gid/mode for an ext2 file by its path relative to /data.
+/// Get uid/gid/mode for an ext2 file by its root-relative path.
 /// Returns `None` if the file is not found or the volume is not mounted.
 pub fn get_ext2_meta(path: &str) -> Option<(u32, u32, u16)> {
     let vol = EXT2_VOLUME.lock();

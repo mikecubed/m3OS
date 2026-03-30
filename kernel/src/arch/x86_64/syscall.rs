@@ -3678,23 +3678,24 @@ fn dir_metadata(path: &str) -> (u32, u32, u16) {
     // ext2 root filesystem directories.
     if crate::fs::ext2::is_mounted() {
         if let Some(rel) = ext2_root_path(path) {
-            return data_file_metadata(rel);
+            return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
         }
     }
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = path.strip_prefix("/data/") {
-        return data_file_metadata(rel);
+        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
     }
     // Default for ramdisk and other directories
     (0, 0, 0o755)
 }
 
 /// Get uid/gid/mode for a file on the data partition (ext2 or FAT32).
-fn data_file_metadata(rel: &str) -> (u32, u32, u16) {
+/// Returns `None` if the file is not found or the volume is not mounted.
+fn data_file_metadata(rel: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ext2::is_mounted() {
-        return crate::fs::ext2::get_ext2_meta(rel).unwrap_or((0, 0, 0o755));
+        return crate::fs::ext2::get_ext2_meta(rel);
     }
-    crate::fs::fat32::get_fat32_meta(rel)
+    Some(crate::fs::fat32::get_fat32_meta(rel))
 }
 
 /// Set permission mode on a data partition file (ext2 or FAT32).
@@ -3796,6 +3797,12 @@ fn open_ext2_file(
                     Some(i) => i as u64,
                     None => NEG_EMFILE,
                 };
+            }
+
+            // Truncate if requested.
+            let mut inode = inode;
+            if truncate && writable && vol.truncate_file(ino, &mut inode).is_err() {
+                return NEG_EIO;
             }
 
             let initial_offset = if append { inode.size as usize } else { 0 };
@@ -3942,13 +3949,13 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Fat32Disk {
             path, file_size, ..
         } => {
-            let (u, g, m) = data_file_metadata(path);
+            let (u, g, m) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
             (0x8000 | m as u32, u, g, *file_size as u64, 0)
         }
         FdBackend::Ext2Disk {
             path, file_size, ..
         } => {
-            let (u, g, m) = data_file_metadata(path);
+            let (u, g, m) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
             (0x8000 | m as u32, u, g, *file_size as u64, 0)
         }
     };
@@ -4020,12 +4027,12 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     // ext2 root filesystem — check for any path.
     if let Some(rel) = ext2_root_path(abs_path) {
         if crate::fs::ext2::is_mounted() {
-            return Some(data_file_metadata(rel));
+            return data_file_metadata(rel);
         }
     }
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = abs_path.strip_prefix("/data/") {
-        return Some(data_file_metadata(rel));
+        return data_file_metadata(rel);
     }
     if abs_path == "/"
         || abs_path == "/tmp"
@@ -4108,7 +4115,10 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
         }
         FsTarget::DiskData(rel) => {
             if euid != 0 {
-                let (owner, _, _) = data_file_metadata(&rel);
+                let (owner, _, _) = match data_file_metadata(&rel) {
+                    Some(m) => m,
+                    None => return NEG_ENOENT,
+                };
                 if euid != owner {
                     return NEG_EPERM;
                 }
@@ -4149,7 +4159,10 @@ fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
         }
         FdBackend::Fat32Disk { path, .. } | FdBackend::Ext2Disk { path, .. } => {
             if euid != 0 {
-                let (owner, _, _) = data_file_metadata(path);
+                let (owner, _, _) = match data_file_metadata(path) {
+                    Some(m) => m,
+                    None => return NEG_ENOENT,
+                };
                 if euid != owner {
                     return NEG_EPERM;
                 }
@@ -5380,6 +5393,12 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
             "[mount] unsupported mountpoint {}; only / and /data are supported",
             resolved_target
         );
+        return NEG_EINVAL;
+    }
+
+    // vfat can only mount at /data, not /.
+    if fstype == "vfat" && resolved_target == "/" {
+        log::warn!("[mount] vfat cannot be mounted at /; only /data is supported for vfat");
         return NEG_EINVAL;
     }
 

@@ -71,6 +71,8 @@ pub enum Ext2Error {
     TruncatedInput,
     /// Permission denied.
     PermissionDenied,
+    /// Directory is not empty.
+    NotEmpty,
 }
 
 // ---------------------------------------------------------------------------
