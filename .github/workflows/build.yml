@@ -45,9 +45,9 @@ jobs:
       - name: Boot smoke test
         run: |
           timeout 30 cargo xtask run 2>&1 | tee boot.log || true
-          # Phase 20: verify userspace init banner and shell prompt
+          # Phase 27: verify userspace init banner and login prompt
           grep -q 'm3OS init (PID 1)' boot.log
-          grep -qE '(\$ |ion# )' boot.log
+          grep -qE '(login:|ion# |\$ )' boot.log
           # Verify no kernel panics
           ! grep -q 'panicked at' boot.log
 
