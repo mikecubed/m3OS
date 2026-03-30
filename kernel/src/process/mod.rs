@@ -149,6 +149,8 @@ pub fn add_pipe_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+            FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+            FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
             _ => {}
         }
     }

@@ -29,6 +29,28 @@ fn fail(name: &[u8]) {
     print(b"\n");
 }
 
+/// Build a `/dev/pts/N\0` path from a PTY number.
+fn pts_path(pty_num: u32) -> [u8; 16] {
+    let mut path = [0u8; 16];
+    path[..9].copy_from_slice(b"/dev/pts/");
+    let mut n = pty_num;
+    let mut tmp = [0u8; 3];
+    let mut len = 0;
+    loop {
+        tmp[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..len {
+        path[9 + i] = tmp[len - 1 - i];
+    }
+    path[9 + len] = 0;
+    path
+}
+
 /// Test 1: Open /dev/ptmx and verify we get a valid master FD.
 fn test_ptmx_open() -> bool {
     let fd = open(b"/dev/ptmx\0", 2, 0); // O_RDWR
@@ -80,13 +102,14 @@ fn test_slave_open() -> bool {
 
     // Get PTY number.
     let mut pty_num: u32 = 0;
-    ioctl(mfd, TIOCGPTN, &mut pty_num as *mut _ as usize);
+    let ret = ioctl(mfd, TIOCGPTN, &mut pty_num as *mut _ as usize);
+    if ret < 0 {
+        close(mfd);
+        fail(b"slave_open: get pty number failed");
+        return false;
+    }
 
-    // Construct /dev/pts/N path.
-    let mut path = [0u8; 16];
-    path[..10].copy_from_slice(b"/dev/pts/0");
-    path[9] = b'0' + pty_num as u8;
-    path[10] = 0;
+    let path = pts_path(pty_num);
 
     let sfd = open(&path, 2, 0);
     close(mfd);
@@ -110,12 +133,14 @@ fn test_slave_locked() -> bool {
 
     // Get PTY number (don't unlock).
     let mut pty_num: u32 = 0;
-    ioctl(mfd, TIOCGPTN, &mut pty_num as *mut _ as usize);
+    let ret = ioctl(mfd, TIOCGPTN, &mut pty_num as *mut _ as usize);
+    if ret < 0 {
+        close(mfd);
+        fail(b"slave_locked: get pty number failed");
+        return false;
+    }
 
-    let mut path = [0u8; 16];
-    path[..10].copy_from_slice(b"/dev/pts/0");
-    path[9] = b'0' + pty_num as u8;
-    path[10] = 0;
+    let path = pts_path(pty_num);
 
     let sfd = open(&path, 2, 0);
     close(mfd);

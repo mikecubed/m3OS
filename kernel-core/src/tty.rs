@@ -274,6 +274,15 @@ impl EditBuffer {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Remove the first `n` bytes from the buffer, shifting remaining bytes.
+    pub fn drain(&mut self, n: usize) {
+        let n = n.min(self.len);
+        if n < self.len {
+            self.buf.copy_within(n..self.len, 0);
+        }
+        self.len -= n;
+    }
 }
 
 // ---------------------------------------------------------------------------

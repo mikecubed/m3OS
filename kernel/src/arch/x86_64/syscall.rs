@@ -1403,15 +1403,8 @@ fn sys_setsid() -> u64 {
 
     // Check if already a session leader.
     if let Some(proc) = table.find(calling_pid) {
-        if proc.session_id == calling_pid {
-            return NEG_EPERM;
-        }
-        // Check if any other process shares our pgid.
-        let our_pgid = proc.pgid;
-        let conflict = table
-            .iter()
-            .any(|p| p.pid != calling_pid && p.pgid == our_pgid);
-        if conflict {
+        // POSIX: fail if the caller is already a process-group leader (pgid == pid).
+        if proc.pgid == calling_pid {
             return NEG_EPERM;
         }
     } else {
@@ -2620,7 +2613,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             }
                             return n as u64;
                         }
-                        if !pair.slave_open {
+                        if pair.slave_refcount == 0 {
                             return 0; // EOF — slave closed
                         }
                     } else {
@@ -2649,20 +2642,24 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             let has_line = line.contains(&b'\n');
                             if has_line {
                                 let eol = line.iter().position(|&b| b == b'\n').unwrap() + 1;
-                                let to_copy = eol.min(count as usize);
-                                let data: alloc::vec::Vec<u8> =
-                                    pair.edit_buf.as_slice()[..to_copy].to_vec();
-                                // Remove consumed bytes from edit buffer.
-                                let remaining = pair.edit_buf.as_slice()[to_copy..].to_vec();
-                                pair.edit_buf.clear();
-                                for &b in &remaining {
-                                    pair.edit_buf.push(b);
-                                }
+                                let to_copy = eol.min(count as usize).min(4096);
+                                let mut dst = [0u8; 4096];
+                                dst[..to_copy]
+                                    .copy_from_slice(&pair.edit_buf.as_slice()[..to_copy]);
+                                pair.edit_buf.drain(to_copy);
                                 drop(table);
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &data).is_err() {
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
+                                    .is_err()
+                                {
                                     return NEG_EFAULT;
                                 }
-                                return data.len() as u64;
+                                return to_copy as u64;
+                            }
+                            // VEOF (^D) on empty line → return 0 (EOF).
+                            if pair.eof_pending {
+                                pair.eof_pending = false;
+                                drop(table);
+                                return 0;
                             }
                         } else {
                             // Raw mode: read directly from m2s.
@@ -2677,7 +2674,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 return n as u64;
                             }
                         }
-                        if !pair.master_open {
+                        if pair.master_refcount == 0 {
                             return 0; // EOF — master closed
                         }
                     } else {
@@ -2963,9 +2960,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             let mut table = crate::pty::PTY_TABLE.lock();
             if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                if !pair.slave_open && !pair.locked {
-                    // If slave was opened and then closed, return EIO.
-                    // But if slave was never opened (still locked), allow writes.
+                if pair.slave_refcount == 0 && !pair.locked {
+                    drop(table);
+                    return NEG_EIO;
                 }
                 let is_canonical = pair.termios.is_canonical();
                 let is_echo = pair.termios.is_echo();
@@ -3072,14 +3069,20 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 }
                             }
                         } else if b == veof {
-                            // ^D: if edit buffer has content, flush it as a line.
+                            // ^D: if edit buffer has content, flush as a line.
                             // If empty, signal EOF to the reader.
                             if !pair.edit_buf.is_empty() {
                                 pair.edit_buf.push(b'\n');
+                            } else {
+                                pair.eof_pending = true;
                             }
                             // Don't echo ^D.
                         } else {
-                            pair.edit_buf.push(b);
+                            if !pair.edit_buf.push(b) {
+                                // Edit buffer full — stop accepting input.
+                                written += 1;
+                                break;
+                            }
                             if is_echo {
                                 if b == b'\n' || echonl || b >= 0x20 {
                                     pair.s2m.write(&[b]);
@@ -3091,7 +3094,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         }
                     } else {
                         // Raw mode: write directly to m2s.
-                        pair.m2s.write(&[b]);
+                        if pair.m2s.write(&[b]) == 0 {
+                            break; // buffer full
+                        }
                         if is_echo {
                             pair.s2m.write(&[b]);
                         }
@@ -3114,7 +3119,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             let mut table = crate::pty::PTY_TABLE.lock();
             if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                if !pair.master_open {
+                if pair.master_refcount == 0 {
                     return NEG_EIO;
                 }
                 let opost = pair.termios.c_oflag & kernel_core::tty::OPOST != 0;
@@ -3122,9 +3127,14 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 let mut written = 0usize;
                 for &b in &src_data {
                     if opost && onlcr && b == b'\n' {
-                        pair.s2m.write(b"\r\n");
-                    } else {
-                        pair.s2m.write(&[b]);
+                        if pair.s2m.write(b"\r") == 0 {
+                            break;
+                        }
+                        if pair.s2m.write(b"\n") == 0 {
+                            break;
+                        }
+                    } else if pair.s2m.write(&[b]) == 0 {
+                        break;
                     }
                     written += 1;
                 }
@@ -3390,7 +3400,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 Ok(()) => {
                     let mut table = crate::pty::PTY_TABLE.lock();
                     if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                        pair.slave_open = true;
+                        pair.slave_refcount += 1;
                     }
                     drop(table);
                     let entry = FdEntry {
@@ -3845,7 +3855,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 Ok(()) => {
                     let mut table = crate::pty::PTY_TABLE.lock();
                     if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                        pair.slave_open = true;
+                        pair.slave_refcount += 1;
                     }
                     drop(table);
                     let entry = FdEntry {
@@ -3985,36 +3995,8 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
-            FdBackend::PtyMaster { pty_id } => {
-                let pty_id = *pty_id;
-                let mut table = crate::pty::PTY_TABLE.lock();
-                if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                    pair.master_open = false;
-                    // Deliver SIGHUP + SIGCONT to slave's foreground process group.
-                    let fg = pair.slave_fg_pgid;
-                    let slave_closed = !pair.slave_open;
-                    drop(table);
-                    if fg != 0 {
-                        crate::process::send_signal_to_group(fg, crate::process::SIGHUP);
-                        crate::process::send_signal_to_group(fg, crate::process::SIGCONT);
-                    }
-                    if slave_closed {
-                        crate::pty::free_pty(pty_id);
-                    }
-                }
-            }
-            FdBackend::PtySlave { pty_id } => {
-                let pty_id = *pty_id;
-                let mut table = crate::pty::PTY_TABLE.lock();
-                if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
-                    pair.slave_open = false;
-                    let master_closed = !pair.master_open;
-                    drop(table);
-                    if master_closed {
-                        crate::pty::free_pty(pty_id);
-                    }
-                }
-            }
+            FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+            FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             _ => {}
         }
     }

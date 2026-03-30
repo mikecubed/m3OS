@@ -104,10 +104,12 @@ pub struct PtyPairState {
     pub edit_buf: EditBuffer,
     /// Foreground process group on the slave side.
     pub slave_fg_pgid: u32,
-    /// True if the master side has open FD references.
-    pub master_open: bool,
-    /// True if the slave side has open FD references.
-    pub slave_open: bool,
+    /// Number of open FD references to the master side.
+    pub master_refcount: u32,
+    /// Number of open FD references to the slave side.
+    pub slave_refcount: u32,
+    /// True when ^D was pressed on an empty edit buffer (EOF pending).
+    pub eof_pending: bool,
     /// PTY lock — slave cannot be opened until unlocked via TIOCSPTLCK(0).
     pub locked: bool,
 }
@@ -122,8 +124,9 @@ impl PtyPairState {
             winsize: Winsize::default_console(),
             edit_buf: EditBuffer::new(),
             slave_fg_pgid: 0,
-            master_open: true,
-            slave_open: false,
+            master_refcount: 1,
+            slave_refcount: 0,
+            eof_pending: false,
             locked: true,
         }
     }
@@ -236,8 +239,8 @@ mod tests {
     #[test]
     fn pair_state_defaults() {
         let pair = PtyPairState::new(0);
-        assert!(pair.master_open);
-        assert!(!pair.slave_open);
+        assert_eq!(pair.master_refcount, 1);
+        assert_eq!(pair.slave_refcount, 0);
         assert!(pair.locked);
         assert!(pair.m2s.is_empty());
         assert!(pair.s2m.is_empty());
