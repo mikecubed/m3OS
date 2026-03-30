@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
+use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 
 pub const HEAP_START: usize = 0xFFFF_8000_0000_0000;
 /// Initial heap size mapped at boot (4 MiB).
@@ -74,7 +74,7 @@ pub fn init_heap(
 /// if at least one new page was mapped; returns `Err(())` if growth would
 /// exceed `HEAP_MAX_SIZE` or no pages could be mapped at all.
 pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
-    use super::paging::{get_mapper, GlobalFrameAlloc};
+    use super::paging::{GlobalFrameAlloc, get_mapper};
 
     // Round up to page boundary.
     let page_size: usize = 4096;

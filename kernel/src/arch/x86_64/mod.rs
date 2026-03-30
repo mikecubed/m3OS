@@ -24,8 +24,10 @@ pub fn init() {
 /// Enabling interrupts before that point can cause IRQ handlers to observe
 /// partially-initialized state.
 pub unsafe fn enable_interrupts() {
-    interrupts::init_pics();
-    x86_64::instructions::interrupts::enable();
+    unsafe {
+        interrupts::init_pics();
+        x86_64::instructions::interrupts::enable();
+    }
 }
 
 /// Transfer execution to ring 3 (userspace).
@@ -44,21 +46,23 @@ pub unsafe fn enable_interrupts() {
 ///   address (highest address; stack grows downward).
 /// * Must be called after `init()` so that GDT user segments are loaded.
 pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
-    use core::arch::asm;
-    asm!(
-        "push {ss}",
-        "push {rsp}",
-        "push {rflags}",
-        "push {cs}",
-        "push {rip}",
-        "iretq",
-        ss     = in(reg) u64::from(gdt::user_data_selector().0),
-        rsp    = in(reg) user_stack_top,
-        rflags = const 0x202u64,
-        cs     = in(reg) u64::from(gdt::user_code_selector().0),
-        rip    = in(reg) entry,
-        options(noreturn)
-    )
+    unsafe {
+        use core::arch::asm;
+        asm!(
+            "push {ss}",
+            "push {rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip}",
+            "iretq",
+            ss     = in(reg) u64::from(gdt::user_data_selector().0),
+            rsp    = in(reg) user_stack_top,
+            rflags = const 0x202u64,
+            cs     = in(reg) u64::from(gdt::user_code_selector().0),
+            rip    = in(reg) entry,
+            options(noreturn)
+        )
+    }
 }
 
 /// Enter ring 3 at `rip` with `rsp` as the stack pointer and `rax` as the
@@ -70,23 +74,25 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
 /// `iretq` so the child sees it as its syscall return value.
 #[allow(dead_code)]
 pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
-    use core::arch::asm;
-    asm!(
-        "push {ss}",
-        "push {rsp_val}",
-        "push {rflags}",
-        "push {cs}",
-        "push {rip_val}",
-        "mov rax, {rax_val}",
-        "iretq",
-        ss      = in(reg) u64::from(gdt::user_data_selector().0),
-        rsp_val = in(reg) rsp,
-        rflags  = const 0x202u64,
-        cs      = in(reg) u64::from(gdt::user_code_selector().0),
-        rip_val = in(reg) rip,
-        rax_val = in(reg) rax,
-        options(noreturn)
-    )
+    unsafe {
+        use core::arch::asm;
+        asm!(
+            "push {ss}",
+            "push {rsp_val}",
+            "push {rflags}",
+            "push {cs}",
+            "push {rip_val}",
+            "mov rax, {rax_val}",
+            "iretq",
+            ss      = in(reg) u64::from(gdt::user_data_selector().0),
+            rsp_val = in(reg) rsp,
+            rflags  = const 0x202u64,
+            cs      = in(reg) u64::from(gdt::user_code_selector().0),
+            rip_val = in(reg) rip,
+            rax_val = in(reg) rax,
+            options(noreturn)
+        )
+    }
 }
 
 /// Context for entering ring 3 from a fork child, stored in a static so
@@ -118,7 +124,7 @@ pub struct ForkEntryCtx {
 
 /// Static storage for the fork child entry context.
 /// Single-CPU: only one fork child enters userspace at a time.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
     rip: 0,
     rsp: 0,
@@ -178,7 +184,7 @@ global_asm!(
     "iretq",
 );
 
-extern "C" {
+unsafe extern "C" {
     fn fork_enter_userspace() -> !;
 }
 
@@ -205,24 +211,26 @@ pub unsafe fn enter_userspace_fork(
     r10: u64,
     rflags: u64,
 ) -> ! {
-    FORK_ENTRY_CTX = ForkEntryCtx {
-        rip,
-        rsp,
-        rbx,
-        rbp,
-        r12,
-        r13,
-        r14,
-        r15,
-        ss: u64::from(gdt::user_data_selector().0),
-        cs: u64::from(gdt::user_code_selector().0),
-        rdi,
-        rsi,
-        rdx,
-        r8,
-        r9,
-        r10,
-        rflags,
-    };
-    fork_enter_userspace()
+    unsafe {
+        FORK_ENTRY_CTX = ForkEntryCtx {
+            rip,
+            rsp,
+            rbx,
+            rbp,
+            r12,
+            r13,
+            r14,
+            r15,
+            ss: u64::from(gdt::user_data_selector().0),
+            cs: u64::from(gdt::user_code_selector().0),
+            rdi,
+            rsi,
+            rdx,
+            r8,
+            r9,
+            r10,
+            rflags,
+        };
+        fork_enter_userspace()
+    }
 }

@@ -12,9 +12,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::ext2::{
-    Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock, EXT2_DIND_BLOCK,
-    EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, S_IFDIR,
-    S_IFREG,
+    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS,
+    EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock,
+    S_IFDIR, S_IFREG,
 };
 use spin::Mutex;
 
@@ -827,6 +827,11 @@ impl Ext2Volume {
         let parent_inode = self.read_inode(parent_inode_num)?;
         if !parent_inode.is_dir() {
             return Err(Ext2Error::NotDirectory);
+        }
+
+        // Check if an entry with this name already exists.
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
         }
 
         let parent_group = kernel_core::fs::ext2::inode_block_group(

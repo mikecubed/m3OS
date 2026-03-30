@@ -6,7 +6,7 @@ use spin::Mutex;
 use super::ethernet::{self, MAC_BROADCAST};
 use super::virtio_net::{self, MacAddr};
 
-pub use kernel_core::net::arp::{build, parse, ArpPacket, ARP_OP_REPLY, ARP_OP_REQUEST};
+pub use kernel_core::net::arp::{ARP_OP_REPLY, ARP_OP_REQUEST, ArpPacket, build, parse};
 pub use kernel_core::types::Ipv4Addr;
 
 // ===========================================================================
@@ -65,11 +65,11 @@ impl ArpCache {
         let mut oldest_idx = 0;
         let mut oldest_tick = u64::MAX;
         for (i, entry) in self.entries.iter().enumerate() {
-            if let Some(e) = entry {
-                if e.tick < oldest_tick {
-                    oldest_tick = e.tick;
-                    oldest_idx = i;
-                }
+            if let Some(e) = entry
+                && e.tick < oldest_tick
+            {
+                oldest_tick = e.tick;
+                oldest_idx = i;
             }
         }
         self.entries[oldest_idx] = Some(ArpEntry { ip, mac, tick });

@@ -4,7 +4,7 @@
 use spin::Mutex;
 
 #[allow(unused_imports)]
-pub use kernel_core::fs::tmpfs::{Tmpfs, TmpfsError, TmpfsStat, MAX_FILE_SIZE};
+pub use kernel_core::fs::tmpfs::{MAX_FILE_SIZE, Tmpfs, TmpfsError, TmpfsStat};
 
 /// Global tmpfs instance mounted at `/tmp`.
 pub static TMPFS: Mutex<Tmpfs> = Mutex::new(Tmpfs::new());

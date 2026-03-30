@@ -26,16 +26,20 @@ fn lapic_base() -> usize {
 }
 
 pub(super) unsafe fn lapic_read(offset: usize) -> u32 {
-    core::ptr::read_volatile((lapic_base() + offset) as *const u32)
+    unsafe { core::ptr::read_volatile((lapic_base() + offset) as *const u32) }
 }
 
 pub(super) unsafe fn lapic_write(offset: usize, value: u32) {
-    core::ptr::write_volatile((lapic_base() + offset) as *mut u32, value);
+    unsafe {
+        core::ptr::write_volatile((lapic_base() + offset) as *mut u32, value);
+    }
 }
 
 pub(super) unsafe fn wait_icr_idle() {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
+    unsafe {
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
     }
 }
 

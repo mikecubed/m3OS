@@ -14,6 +14,8 @@ pub mod heap;
 
 pub mod sha256;
 
+pub mod start;
+
 // ===========================================================================
 // Raw syscall wrappers
 // ===========================================================================
@@ -21,120 +23,134 @@ pub mod sha256;
 /// Raw zero-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall0(num: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw one-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall1(num: u64, a0: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw two-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        in("rsi") a1,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            in("rsi") a1,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw three-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw four-argument syscall. Note: arg4 uses r10 (not rcx, which is clobbered).
 #[inline(always)]
 pub unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        in("r10") a3,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw five-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        in("r10") a3,
-        in("r8") a4,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 /// Raw six-argument syscall.
 #[inline(always)]
 pub unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    let mut rax = num;
-    asm!(
-        "syscall",
-        inlateout("rax") rax,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        in("r10") a3,
-        in("r8") a4,
-        in("r9") a5,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-    rax
+    unsafe {
+        let mut rax = num;
+        asm!(
+            "syscall",
+            inlateout("rax") rax,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            in("r9") a5,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+        rax
+    }
 }
 
 // ===========================================================================
@@ -451,21 +467,13 @@ pub fn tcgetattr(fd: i32) -> Result<Termios, isize> {
         c_cc: [0; NCCS],
     };
     let ret = ioctl(fd, TCGETS, &mut t as *mut Termios as usize);
-    if ret < 0 {
-        Err(ret)
-    } else {
-        Ok(t)
-    }
+    if ret < 0 { Err(ret) } else { Ok(t) }
 }
 
 /// Set terminal attributes.
 pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
     let ret = ioctl(fd, TCSETS, termios as *const Termios as usize);
-    if ret < 0 {
-        Err(ret)
-    } else {
-        Ok(())
-    }
+    if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
 /// Get terminal window size (rows, cols).

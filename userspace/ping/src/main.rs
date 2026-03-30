@@ -7,14 +7,14 @@
 #![no_main]
 
 use syscall_lib::{
-    close, exit, nanosleep, read, sendto, socket, write_str, write_u64, SockaddrIn, AF_INET,
-    IPPROTO_ICMP, SOCK_DGRAM, STDOUT_FILENO,
+    AF_INET, IPPROTO_ICMP, SOCK_DGRAM, STDOUT_FILENO, SockaddrIn, close, exit, nanosleep, read,
+    sendto, socket, write_str, write_u64,
 };
 
 const DEFAULT_TARGET: [u8; 4] = [10, 0, 2, 2];
 const PING_COUNT: u16 = 4;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let target = DEFAULT_TARGET;
 
@@ -123,11 +123,7 @@ fn get_tick() -> u64 {
             ts.as_mut_ptr() as u64,
         )
     };
-    if ret as i64 >= 0 {
-        ts[0] * 100
-    } else {
-        0
-    }
+    if ret as i64 >= 0 { ts[0] * 100 } else { 0 }
 }
 
 #[panic_handler]

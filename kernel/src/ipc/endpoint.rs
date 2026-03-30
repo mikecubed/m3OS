@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use spin::Mutex;
 
 use super::{Capability, Message};
-use crate::task::{scheduler, TaskId};
+use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::EndpointId;
 

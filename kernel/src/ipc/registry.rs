@@ -6,7 +6,7 @@ use spin::Mutex;
 use super::EndpointId;
 
 #[allow(unused_imports)]
-pub use kernel_core::ipc::registry::{RegistryError, MAX_SERVICES};
+pub use kernel_core::ipc::registry::{MAX_SERVICES, RegistryError};
 
 use kernel_core::ipc::registry::Registry;
 

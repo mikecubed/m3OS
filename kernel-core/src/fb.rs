@@ -111,11 +111,7 @@ impl AnsiParser {
     fn param(&self, idx: usize, default: u16) -> u16 {
         if idx < self.param_count {
             let v = self.params[idx];
-            if v == 0 {
-                default
-            } else {
-                v
-            }
+            if v == 0 { default } else { v }
         } else {
             default
         }

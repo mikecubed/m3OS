@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
-use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
+use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 const PAGE_SIZE: u64 = 4096;
 

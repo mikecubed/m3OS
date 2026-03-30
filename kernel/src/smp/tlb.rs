@@ -4,7 +4,7 @@
 //! cached in their TLB must be notified to invalidate it. This module
 //! provides the shootdown request/response mechanism.
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use super::ipi;
 
@@ -29,10 +29,10 @@ static SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 fn online_core_count() -> u8 {
     let mut count = 0u8;
     for i in 0..super::core_count() {
-        if let Some(data) = super::get_core_data(i) {
-            if data.is_online.load(core::sync::atomic::Ordering::Acquire) {
-                count += 1;
-            }
+        if let Some(data) = super::get_core_data(i)
+            && data.is_online.load(core::sync::atomic::Ordering::Acquire)
+        {
+            count += 1;
         }
     }
     count

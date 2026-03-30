@@ -7,7 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use kernel_core::fs::fat32::{self, Fat32Bpb, Fat32DirEntry, Fat32Error, FAT_ENTRY_MASK, FAT_EOC};
+use kernel_core::fs::fat32::{self, FAT_ENTRY_MASK, FAT_EOC, Fat32Bpb, Fat32DirEntry, Fat32Error};
 use spin::Mutex;
 
 /// Maximum cluster chain length before we assume corruption.

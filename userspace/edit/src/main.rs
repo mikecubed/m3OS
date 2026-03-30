@@ -1025,7 +1025,7 @@ core::arch::global_asm!(
     "syscall",
 );
 
-extern "C" {
+unsafe extern "C" {
     fn __sigrestorer();
 }
 
@@ -1099,39 +1099,16 @@ fn find_substr(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+syscall_lib::entry_point!(edit_main);
+
+fn edit_main(args: &[&str]) -> i32 {
     register_sigwinch_handler();
 
     let mut editor = Editor::new();
 
-    // Parse argv: [argc, argv[0], argv[1], ..., null]
-    // argv[1] is the filename if provided
-    let argc: usize;
-    let argv_base: *const *const u8;
-    unsafe {
-        let rsp: u64;
-        core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        let stack_ptr = rsp as *const u64;
-        argc = *stack_ptr as usize;
-        argv_base = stack_ptr.add(1) as *const *const u8;
-    }
-
-    if argc >= 2 {
-        // Read filename from argv[1]
-        let filename_ptr = unsafe { *argv_base.add(1) };
-        if !filename_ptr.is_null() {
-            let mut len = 0;
-            while unsafe { *filename_ptr.add(len) } != 0 {
-                len += 1;
-            }
-            let filename_bytes = unsafe { core::slice::from_raw_parts(filename_ptr, len) };
-            if let Ok(filename) = core::str::from_utf8(filename_bytes) {
-                editor.open_file(filename);
-            }
-        }
+    if args.len() >= 2 {
+        editor.open_file(args[1]);
     } else {
-        // No filename — start with empty buffer
         editor.rows.push(Row::new(Vec::new()));
     }
 
@@ -1144,7 +1121,7 @@ pub extern "C" fn _start() -> ! {
     // Clear screen on exit
     syscall_lib::write(1, b"\x1b[2J\x1b[H");
 
-    syscall_lib::exit(0)
+    0
 }
 
 #[panic_handler]

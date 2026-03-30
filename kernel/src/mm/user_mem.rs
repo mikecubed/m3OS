@@ -11,8 +11,8 @@
 //! target process's page table must be loaded before calling these functions.
 
 use x86_64::{
-    structures::paging::{mapper::TranslateResult, PageTableFlags, Translate},
     VirtAddr,
+    structures::paging::{PageTableFlags, Translate, mapper::TranslateResult},
 };
 
 /// Maximum length (bytes) accepted for a single copy_from_user / copy_to_user

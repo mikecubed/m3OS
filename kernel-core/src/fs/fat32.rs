@@ -224,7 +224,7 @@ mod tests {
         s[36..40].copy_from_slice(&fat_size_32.to_le_bytes());
         s[44..48].copy_from_slice(&root_cluster.to_le_bytes());
         s[48..50].copy_from_slice(&1u16.to_le_bytes()); // fs_info_sector
-                                                        // "FAT32   " at offset 82 (optional but common).
+        // "FAT32   " at offset 82 (optional but common).
         s[82..90].copy_from_slice(b"FAT32   ");
         // Boot signature.
         s[510] = 0x55;

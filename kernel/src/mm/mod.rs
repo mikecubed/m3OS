@@ -10,8 +10,8 @@ pub mod user_space;
 use bootloader_api::BootInfo;
 use spin::Once;
 use x86_64::{
-    structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
     VirtAddr,
+    structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
 static PHYS_OFFSET: Once<u64> = Once::new();
@@ -51,9 +51,9 @@ pub fn kernel_pml4_phys() -> u64 {
 /// is a privileged operation).
 pub fn restore_kernel_cr3() {
     use x86_64::{
+        PhysAddr,
         registers::control::{Cr3, Cr3Flags},
         structures::paging::PhysFrame,
-        PhysAddr,
     };
     let phys = *KERNEL_PML4_PHYS.get().expect("mm not initialized");
     // SAFETY: phys is the bootloader's PML4 frame — always valid.
@@ -253,29 +253,31 @@ pub fn free_process_page_table(cr3_phys: u64) {
         count: usize,
         filter: fn(PageTableFlags) -> bool,
     ) -> Vec<u64> {
-        // Validate the table physical address before dereferencing.
-        if table_phys == 0 || table_phys & 0xFFF != 0 {
-            return Vec::new();
+        unsafe {
+            // Validate the table physical address before dereferencing.
+            if table_phys == 0 || table_phys & 0xFFF != 0 {
+                return Vec::new();
+            }
+            let mut addrs = Vec::with_capacity(count);
+            let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
+            for i in 0..count {
+                let entry = &pt[i];
+                let flags = entry.flags();
+                if !flags.contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                if !filter(flags) {
+                    continue;
+                }
+                let addr = entry.addr().as_u64();
+                // Skip entries with invalid physical addresses.
+                if addr == 0 || addr & 0xFFF != 0 {
+                    continue;
+                }
+                addrs.push(addr);
+            }
+            addrs
         }
-        let mut addrs = Vec::with_capacity(count);
-        let pt: &PageTable = &*(phys_off + table_phys).as_ptr::<PageTable>();
-        for i in 0..count {
-            let entry = &pt[i];
-            let flags = entry.flags();
-            if !flags.contains(PageTableFlags::PRESENT) {
-                continue;
-            }
-            if !filter(flags) {
-                continue;
-            }
-            let addr = entry.addr().as_u64();
-            // Skip entries with invalid physical addresses.
-            if addr == 0 || addr & 0xFFF != 0 {
-                continue;
-            }
-            addrs.push(addr);
-        }
-        addrs
     }
 
     fn not_huge(flags: PageTableFlags) -> bool {
@@ -347,8 +349,10 @@ pub fn free_process_page_table(cr3_phys: u64) {
 /// - The physical memory offset must be valid (i.e. `mm::init` must have run).
 #[allow(dead_code)]
 pub unsafe fn mapper_for_frame(cr3_frame: PhysFrame<Size4KiB>) -> OffsetPageTable<'static> {
-    let phys_off = VirtAddr::new(phys_offset());
-    let pml4_virt = phys_off + cr3_frame.start_address().as_u64();
-    let pml4: &'static mut PageTable = &mut *pml4_virt.as_mut_ptr();
-    OffsetPageTable::new(pml4, phys_off)
+    unsafe {
+        let phys_off = VirtAddr::new(phys_offset());
+        let pml4_virt = phys_off + cr3_frame.start_address().as_u64();
+        let pml4: &'static mut PageTable = &mut *pml4_virt.as_mut_ptr();
+        OffsetPageTable::new(pml4, phys_off)
+    }
 }

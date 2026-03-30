@@ -4,9 +4,9 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{exit, serial_print, syscall0, syscall2, SYS_FORK, SYS_WAITPID};
+use syscall_lib::{SYS_FORK, SYS_WAITPID, exit, serial_print, syscall0, syscall2};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let child_pid = unsafe { syscall0(SYS_FORK) };
 

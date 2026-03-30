@@ -81,36 +81,38 @@ pub struct SavedUserRegs {
 /// Must be called from the syscall return path (after `syscall_handler`
 /// has been called) while still on the same kernel stack.  Single-CPU only.
 pub unsafe fn read_saved_user_regs(syscall_result: u64) -> SavedUserRegs {
-    let top = crate::arch::x86_64::syscall::SYSCALL_STACK_TOP;
-    let user_rsp = core::ptr::read_volatile(core::ptr::addr_of!(
-        crate::arch::x86_64::syscall::SYSCALL_USER_RSP
-    ));
+    unsafe {
+        let top = crate::arch::x86_64::syscall::SYSCALL_STACK_TOP;
+        let user_rsp = core::ptr::read_volatile(core::ptr::addr_of!(
+            crate::arch::x86_64::syscall::SYSCALL_USER_RSP
+        ));
 
-    // Helper: read a u64 at SYSCALL_STACK_TOP - offset.
-    let read_at = |neg_offset: u64| -> u64 {
-        let addr = (top - neg_offset) as *const u64;
-        core::ptr::read_volatile(addr)
-    };
+        // Helper: read a u64 at SYSCALL_STACK_TOP - offset.
+        let read_at = |neg_offset: u64| -> u64 {
+            let addr = (top - neg_offset) as *const u64;
+            core::ptr::read_volatile(addr)
+        };
 
-    SavedUserRegs {
-        rax: syscall_result,
-        rcx: read_at(8),  // was user RIP (cpu puts rip in rcx on syscall)
-        r11: read_at(16), // was user RFLAGS
-        rbx: read_at(24),
-        rbp: read_at(32),
-        r12: read_at(40),
-        r13: read_at(48),
-        r14: read_at(56),
-        r15: read_at(64),
-        rdi: read_at(72),
-        rsi: read_at(80),
-        rdx: read_at(88),
-        r10: read_at(96),
-        r8: read_at(104),
-        r9: read_at(112),
-        rip: read_at(8),     // user RIP = what was in rcx
-        rflags: read_at(16), // user RFLAGS = what was in r11
-        rsp: user_rsp,
+        SavedUserRegs {
+            rax: syscall_result,
+            rcx: read_at(8),  // was user RIP (cpu puts rip in rcx on syscall)
+            r11: read_at(16), // was user RFLAGS
+            rbx: read_at(24),
+            rbp: read_at(32),
+            r12: read_at(40),
+            r13: read_at(48),
+            r14: read_at(56),
+            r15: read_at(64),
+            rdi: read_at(72),
+            rsi: read_at(80),
+            rdx: read_at(88),
+            r10: read_at(96),
+            r8: read_at(104),
+            r9: read_at(112),
+            rip: read_at(8),     // user RIP = what was in rcx
+            rflags: read_at(16), // user RFLAGS = what was in r11
+            rsp: user_rsp,
+        }
     }
 }
 

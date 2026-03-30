@@ -73,6 +73,8 @@ pub enum Ext2Error {
     PermissionDenied,
     /// Directory is not empty.
     NotEmpty,
+    /// File or directory already exists.
+    AlreadyExists,
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +546,7 @@ mod tests {
         assert_eq!(sb.blocks_per_group, 8192);
         assert_eq!(sb.inodes_per_group, 128);
         assert_eq!(sb.block_group_count(), 1); // 1024/8192 rounds up to 1
-                                               // Rev 0 defaults
+        // Rev 0 defaults
         assert_eq!(sb.first_ino, 11);
         assert_eq!(sb.inode_size, 128);
     }

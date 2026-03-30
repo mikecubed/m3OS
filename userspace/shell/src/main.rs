@@ -7,8 +7,8 @@
 #![no_main]
 
 use syscall_lib::{
-    chdir, close, dup2, execve, exit, fork, open, pipe, read, waitpid, write, write_str, write_u64,
     O_APPEND, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO,
+    chdir, close, dup2, execve, exit, fork, open, pipe, read, waitpid, write, write_str, write_u64,
 };
 
 const MAX_LINE: usize = 256;
@@ -18,7 +18,7 @@ const MAX_PATH: usize = 128;
 /// PATH directories to search for commands.
 const PATH_DIRS: [&[u8]; 3] = [b"/bin", b"/sbin", b"/usr/bin"];
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     main_loop();
 }

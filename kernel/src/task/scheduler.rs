@@ -21,7 +21,7 @@ use core::sync::atomic::Ordering;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
-use super::{switch_context, Task, TaskId, TaskState};
+use super::{Task, TaskId, TaskState, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message};
 
 // ---------------------------------------------------------------------------
@@ -56,11 +56,7 @@ fn get_current_task_idx() -> Option<usize> {
     let val = crate::smp::per_core()
         .current_task_idx
         .load(Ordering::Relaxed);
-    if val < 0 {
-        None
-    } else {
-        Some(val as usize)
-    }
+    if val < 0 { None } else { Some(val as usize) }
 }
 
 fn set_current_task_idx(idx: Option<usize>) {
@@ -162,10 +158,10 @@ impl Scheduler {
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
         // APs: only dispatch the idle task (SMP hardening — see doc above).
         if core_id != 0 {
-            if let Some(idle_idx) = self.idle_tasks[core_id as usize] {
-                if self.tasks[idle_idx].state == TaskState::Ready {
-                    return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
-                }
+            if let Some(idle_idx) = self.idle_tasks[core_id as usize]
+                && self.tasks[idle_idx].state == TaskState::Ready
+            {
+                return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
             }
             return None;
         }
@@ -192,10 +188,10 @@ impl Scheduler {
         }
 
         // BSP idle task.
-        if let Some(idle_idx) = self.idle_tasks[0] {
-            if self.tasks[idle_idx].state == TaskState::Ready {
-                return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
-            }
+        if let Some(idle_idx) = self.idle_tasks[0]
+            && self.tasks[idle_idx].state == TaskState::Ready
+        {
+            return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
         }
 
         None

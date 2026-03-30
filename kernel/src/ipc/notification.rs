@@ -47,10 +47,10 @@
 // Keep dead-code allowance for unused APIs.
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::task::{scheduler, TaskId};
+use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::NotifId;
 

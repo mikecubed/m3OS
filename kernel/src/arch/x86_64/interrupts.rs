@@ -1,8 +1,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use spin::{Lazy, Mutex};
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::VirtAddr;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::serial::_panic_print;
 
@@ -343,18 +343,19 @@ extern "x86-interrupt" fn page_fault_handler(
         // page marked with BIT_9 (the CoW marker set by cow_clone_user_pages).
         let is_write = err.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
         let is_present = err.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
-        if is_write && is_present {
-            if let Ok(fault_vaddr) = addr {
-                let fault_addr_u64 = fault_vaddr.as_u64();
-                if has_cow_marker(fault_addr_u64) {
-                    // CoW fault — resolve directly in the ISR. Safe because
-                    // the fault is from ring 3 (no kernel locks held) and
-                    // we're on a single CPU. On OOM, fall through to kill.
-                    if resolve_cow_fault(fault_addr_u64) {
-                        return;
-                    }
-                    // OOM during CoW — fall through to kill the process.
+        if is_write
+            && is_present
+            && let Ok(fault_vaddr) = addr
+        {
+            let fault_addr_u64 = fault_vaddr.as_u64();
+            if has_cow_marker(fault_addr_u64) {
+                // CoW fault — resolve directly in the ISR. Safe because
+                // the fault is from ring 3 (no kernel locks held) and
+                // we're on a single CPU. On OOM, fall through to kill.
+                if resolve_cow_fault(fault_addr_u64) {
+                    return;
                 }
+                // OOM during CoW — fall through to kill the process.
             }
         }
 
@@ -362,19 +363,20 @@ extern "x86-interrupt" fn page_fault_handler(
         // write above ELF_STACK_TOP (Linux maps an 8 MB region so this is
         // always valid there). When the fault is a write to an unmapped page
         // within 8 MiB above ELF_STACK_TOP, allocate a fresh frame and map it.
-        if is_write && !is_present {
-            if let Ok(fault_vaddr) = addr {
-                let fault_addr_u64 = fault_vaddr.as_u64();
-                let stack_top = crate::mm::elf::ELF_STACK_TOP;
-                let stack_bottom = stack_top - crate::mm::elf::STACK_PAGES * 4096;
-                // Allow demand-paging 8 MiB above ELF_STACK_TOP and down to guard page.
-                const DEMAND_LIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
-                if fault_addr_u64 >= stack_bottom
-                    && fault_addr_u64 < stack_top + DEMAND_LIMIT
-                    && demand_map_user_page(fault_addr_u64)
-                {
-                    return;
-                }
+        if is_write
+            && !is_present
+            && let Ok(fault_vaddr) = addr
+        {
+            let fault_addr_u64 = fault_vaddr.as_u64();
+            let stack_top = crate::mm::elf::ELF_STACK_TOP;
+            let stack_bottom = stack_top - crate::mm::elf::STACK_PAGES * 4096;
+            // Allow demand-paging 8 MiB above ELF_STACK_TOP and down to guard page.
+            const DEMAND_LIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
+            if fault_addr_u64 >= stack_bottom
+                && fault_addr_u64 < stack_top + DEMAND_LIMIT
+                && demand_map_user_page(fault_addr_u64)
+            {
+                return;
             }
         }
 
@@ -487,13 +489,15 @@ static PICS: Mutex<pic8259::ChainedPics> = Mutex::new(unsafe { pic8259::ChainedP
 /// Calling it out of order can cause IRQs to fire without a registered handler,
 /// resulting in a triple fault.
 pub unsafe fn init_pics() {
-    let mut pics = PICS.lock();
-    pics.initialize();
-    // Mask every IRQ line except IRQ0 (timer) and IRQ1 (keyboard).
-    // A set bit disables the line. Any unmasked line without an IDT handler
-    // would vector into an uninitialized entry and cause a triple fault.
-    // master: bits 2–7 masked (0b1111_1100), slave: all 8 lines masked.
-    pics.write_masks(0b1111_1100, 0b1111_1111);
+    unsafe {
+        let mut pics = PICS.lock();
+        pics.initialize();
+        // Mask every IRQ line except IRQ0 (timer) and IRQ1 (keyboard).
+        // A set bit disables the line. Any unmasked line without an IDT handler
+        // would vector into an uninitialized entry and cause a triple fault.
+        // master: bits 2–7 masked (0b1111_1100), slave: all 8 lines masked.
+        pics.write_masks(0b1111_1100, 0b1111_1111);
+    }
 }
 
 // ---------------------------------------------------------------------------

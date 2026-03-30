@@ -4,9 +4,9 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use super::ipv4::{self, Ipv4Header};
 
-use kernel_core::net::icmp::{build, parse};
 #[allow(unused_imports)]
-pub use kernel_core::net::icmp::{IcmpHeader, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST};
+pub use kernel_core::net::icmp::{ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST, IcmpHeader};
+use kernel_core::net::icmp::{build, parse};
 
 /// Handle an incoming ICMP packet.
 pub fn handle_icmp(ip_header: &Ipv4Header, payload: &[u8]) {

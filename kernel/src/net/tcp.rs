@@ -7,8 +7,8 @@ use spin::Mutex;
 use super::arp::Ipv4Addr;
 use super::ipv4::{self, Ipv4Header};
 
-use kernel_core::net::tcp::{build, parse, TcpBuildParams};
-pub use kernel_core::net::tcp::{TcpHeader, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
+pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
+use kernel_core::net::tcp::{TcpBuildParams, build, parse};
 
 // ===========================================================================
 // TCP State
@@ -258,28 +258,28 @@ pub fn create(local_port: u16) -> Option<usize> {
 
 pub fn connect(conn_idx: usize, remote_ip: Ipv4Addr, remote_port: u16) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx) {
-        if let Some(conn) = slot.as_mut() {
-            conn.connect(remote_ip, remote_port);
-        }
+    if let Some(slot) = conns.conns.get_mut(conn_idx)
+        && let Some(conn) = slot.as_mut()
+    {
+        conn.connect(remote_ip, remote_port);
     }
 }
 
 pub fn listen(conn_idx: usize) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx) {
-        if let Some(conn) = slot.as_mut() {
-            conn.listen();
-        }
+    if let Some(slot) = conns.conns.get_mut(conn_idx)
+        && let Some(conn) = slot.as_mut()
+    {
+        conn.listen();
     }
 }
 
 pub fn send(conn_idx: usize, data: &[u8]) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx) {
-        if let Some(conn) = slot.as_mut() {
-            conn.tcp_send(data);
-        }
+    if let Some(slot) = conns.conns.get_mut(conn_idx)
+        && let Some(conn) = slot.as_mut()
+    {
+        conn.tcp_send(data);
     }
 }
 
@@ -308,10 +308,10 @@ pub fn state(conn_idx: usize) -> TcpState {
 
 pub fn close(conn_idx: usize) {
     let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx) {
-        if let Some(conn) = slot.as_mut() {
-            conn.close();
-        }
+    if let Some(slot) = conns.conns.get_mut(conn_idx)
+        && let Some(conn) = slot.as_mut()
+    {
+        conn.close();
     }
 }
 

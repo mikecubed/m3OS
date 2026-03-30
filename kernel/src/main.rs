@@ -29,7 +29,7 @@ mod testing;
 mod tty;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
-use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
+use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -136,14 +136,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
         // Route the virtio-net PCI interrupt through the I/O APIC.
         let mut irq_routed = false;
-        if let Some(dev) = net::virtio_net::find_virtio_net_device() {
-            if acpi::io_apic_address().is_some() && dev.interrupt_line != 0xFF {
-                arch::x86_64::apic::route_pci_irq(
-                    dev.interrupt_line,
-                    arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
-                );
-                irq_routed = true;
-            }
+        if let Some(dev) = net::virtio_net::find_virtio_net_device()
+            && acpi::io_apic_address().is_some()
+            && dev.interrupt_line != 0xFF
+        {
+            arch::x86_64::apic::route_pci_irq(
+                dev.interrupt_line,
+                arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
+            );
+            irq_routed = true;
         }
         VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
         if !irq_routed {
@@ -182,11 +183,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         smp::boot::boot_aps();
     }
 
-    // Phase 7: Core Servers demo
-    //
-    // init_task creates a console IPC endpoint, registers it in the service
-    // registry, spawns the server tasks, and then yields.
-    // console_client_task demonstrates service discovery and IPC-based output.
     task::spawn(init_task, "init");
     task::spawn_idle(idle_task);
 
@@ -227,12 +223,10 @@ fn init_task() -> ! {
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
     task::spawn(kbd_server_task, "kbd");
-    task::spawn(console_client_task, "console-client");
 
     // Spawn Phase 8 storage tasks.
     task::spawn(fat_server_task, "fat");
     task::spawn(vfs_server_task, "vfs");
-    task::spawn(fs_client_task, "fs-client");
 
     // Spawn Phase 16 network processing task.
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
@@ -245,10 +239,6 @@ fn init_task() -> ! {
     // Phase 21: serial stdin feeder — reads bytes from COM1, feeds stdin buffer.
     // Allows testing ion interactively via `cargo xtask run` with piped input.
     task::spawn(serial_stdin_feeder_task, "serial-stdin");
-
-    // Phase 20: re-enable p11 launcher now that restore_caller_context
-    // preserves per-process syscall state across yields.
-    task::spawn(p11_launcher_task, "p11-launcher");
 
     // Phase 20: load /sbin/init from ramdisk as userspace PID 1.
     spawn_userspace_init();
@@ -483,37 +473,6 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 ///          scancode is available, so this call always returns a real scancode.
 const KBD_READ: u64 = 1;
 
-/// Demo client: looks up the console service and sends one write request.
-///
-/// Demonstrates that a client task can discover the console service via the
-/// registry and send output through it without knowing the endpoint ID up front.
-static CONSOLE_MSG: &str = "Hello from console_client!";
-
-fn console_client_task() -> ! {
-    let my_id = task::current_task_id().expect("[console-client] no task id");
-
-    // Discover the console service endpoint via the registry.
-    let ep_id =
-        ipc::registry::lookup("console").expect("[console-client] console service not found");
-
-    // Insert an endpoint capability so we can call it.
-    task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("[console-client] failed to insert endpoint cap");
-
-    log::info!("[console-client] sending write request to console service");
-
-    // Send: label=0 (CONSOLE_WRITE), data[0]=ptr, data[1]=len.
-    let msg = ipc::Message::with2(0, CONSOLE_MSG.as_ptr() as u64, CONSOLE_MSG.len() as u64);
-    let reply_label = ipc::endpoint::call(my_id, ep_id, msg);
-    log::info!("[console-client] got ack (label={:#x})", reply_label);
-
-    log::info!("[console-client] Phase 7 core-servers demo complete");
-
-    loop {
-        task::yield_now();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 8 storage tasks
 // ---------------------------------------------------------------------------
@@ -609,104 +568,6 @@ fn vfs_server_task() -> ! {
     }
 }
 
-/// Demo client: exercises the full VFS stack — open, read, and close two files
-/// through vfs_server → fat_server → ramdisk.
-///
-/// Validates P8-T006 (open and read a known file), P8-T007 (missing file
-/// returns predictable error), and P8-T008 (ownership boundary is exercised
-/// across two IPC hops).
-fn fs_client_task() -> ! {
-    let my_id = task::current_task_id().expect("[fs-client] no task id");
-
-    // Discover the VFS service endpoint.
-    // call_msg() takes EndpointId directly; no cap insert is needed here.
-    let vfs_ep_id = ipc::registry::lookup("vfs").expect("[fs-client] vfs service not found");
-
-    // --- Open hello.txt (P8-T006) ---
-    let name = "hello.txt";
-    let open_msg = ipc::Message::with2(
-        crate::fs::protocol::FILE_OPEN,
-        name.as_ptr() as u64,
-        name.len() as u64,
-    );
-    let open_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_msg);
-    // Check the IPC label first: call_msg() returns label=u64::MAX with zeroed
-    // data on IPC-level failure, which would be silently misread as fd=0.
-    let fd = open_reply.data[0];
-    if open_reply.label == u64::MAX || fd == u64::MAX {
-        log::error!("[fs-client] FILE_OPEN(hello.txt) failed — unexpected");
-    } else {
-        log::info!("[fs-client] opened {} → fd={}", name, fd);
-
-        // Read up to 256 bytes from offset 0.
-        let read_msg = ipc::Message {
-            label: crate::fs::protocol::FILE_READ,
-            data: [fd, 0, 256, 0],
-        };
-        let read_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, read_msg);
-        let content_ptr = read_reply.data[0] as *const u8;
-        let content_len = read_reply.data[1] as usize;
-
-        if read_reply.label == u64::MAX || content_ptr.is_null() {
-            // IPC failure (label=u64::MAX) or protocol error (data[0]=null ptr).
-            // content_len==0 alone is not an error — it indicates EOF.
-            log::error!(
-                "[fs-client] FILE_READ failed (label={:#x}, ptr={:?}) — unexpected",
-                read_reply.label,
-                content_ptr
-            );
-        } else if content_len == 0 {
-            log::info!("[fs-client] FILE_READ returned 0 bytes (EOF or empty file)");
-        } else {
-            // SAFETY: Phase 8 — fat_server returns a pointer into 'static
-            // ramdisk content. The pointer is valid for the lifetime of the
-            // kernel, content_ptr is non-null (checked above), and
-            // content_len is bounded by MAX_READ_LEN (4096).
-            let bytes = unsafe { core::slice::from_raw_parts(content_ptr, content_len) };
-            if let Ok(text) = core::str::from_utf8(bytes) {
-                log::info!(
-                    "[fs-client] read {} bytes: {:?}",
-                    content_len,
-                    text.trim_end_matches('\n')
-                );
-            } else {
-                log::warn!("[fs-client] content is not valid UTF-8");
-            }
-        }
-
-        // Close the fd (no-op in Phase 8, but exercises the close path).
-        let close_msg = ipc::Message::with1(crate::fs::protocol::FILE_CLOSE, fd);
-        let _ = ipc::endpoint::call_msg(my_id, vfs_ep_id, close_msg);
-    }
-
-    // --- Open a missing file (P8-T007: predictable error) ---
-    let missing = "does-not-exist.txt";
-    let open_missing = ipc::Message::with2(
-        crate::fs::protocol::FILE_OPEN,
-        missing.as_ptr() as u64,
-        missing.len() as u64,
-    );
-    let missing_reply = ipc::endpoint::call_msg(my_id, vfs_ep_id, open_missing);
-    if missing_reply.label == u64::MAX {
-        // IPC-level failure (VFS or fat_server unreachable) — unexpected in a healthy system.
-        log::error!(
-            "[fs-client] FILE_OPEN({}) → IPC failure (unexpected)",
-            missing
-        );
-    } else if missing_reply.data[0] == u64::MAX {
-        // Protocol not-found sentinel — the expected outcome for a missing file.
-        log::info!("[fs-client] FILE_OPEN({}) → not found (expected)", missing);
-    } else {
-        log::error!("[fs-client] FILE_OPEN missing file returned fd — unexpected");
-    }
-
-    log::info!("[fs-client] Phase 8 storage demo complete");
-
-    loop {
-        task::yield_now();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Phase 9 shell tasks (T004–T009)
 // ---------------------------------------------------------------------------
@@ -766,11 +627,7 @@ fn scancode_to_char(sc: u8, shift: bool) -> Option<char> {
         0x39 => (Some(' '), Some(' ')),
         _ => (None, None),
     };
-    if shift {
-        hi
-    } else {
-        lo
-    }
+    if shift { hi } else { lo }
 }
 
 /// Send a string slice to the console server via CONSOLE_WRITE IPC.
@@ -840,9 +697,42 @@ fn stdin_feeder_task() -> ! {
             continue;
         }
 
-        // Convert scancode to a byte value.
+        // Convert scancode to byte(s).
+        // Arrow keys, Home, End, Delete, PageUp/Down, and Escape produce
+        // VT100 escape sequences so that raw-mode programs (e.g. edit) can
+        // parse them with standard ANSI sequence handling.
+        let escape_seq: Option<&[u8]> = match sc {
+            0x48 => Some(b"\x1b[A"),  // Arrow Up
+            0x50 => Some(b"\x1b[B"),  // Arrow Down
+            0x4D => Some(b"\x1b[C"),  // Arrow Right
+            0x4B => Some(b"\x1b[D"),  // Arrow Left
+            0x47 => Some(b"\x1b[H"),  // Home
+            0x4F => Some(b"\x1b[F"),  // End
+            0x53 => Some(b"\x1b[3~"), // Delete
+            0x49 => Some(b"\x1b[5~"), // Page Up
+            0x51 => Some(b"\x1b[6~"), // Page Down
+            0x01 => Some(b"\x1b"),    // Escape
+            _ => None,
+        };
+
+        if let Some(seq) = escape_seq {
+            // Read termios to check canonical mode.
+            let canonical = tty::TTY0.lock().termios.c_lflag & ICANON != 0;
+            if canonical {
+                // In cooked mode, escape sequences are not useful — skip them
+                // to avoid polluting the line buffer.
+                continue;
+            }
+            for &b in seq {
+                stdin::push_char(b);
+            }
+            continue;
+        }
+
         let byte = if sc == 0x1C {
             b'\r' // Enter key produces CR; ICRNL translates to LF when enabled
+        } else if sc == 0x0F {
+            b'\t' // Tab
         } else if sc == 0x0E {
             0x7F // DEL / backspace
         } else if ctrl {
@@ -1044,284 +934,6 @@ fn serial_stdin_feeder_task() -> ! {
         } else {
             task::yield_now();
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 11 — userspace launcher (P11-T017 / P11-T018)
-// ---------------------------------------------------------------------------
-
-/// Kernel task that demonstrates Phase 11: load ELF binaries from the
-/// ramdisk, run them as ring-3 processes, and collect their exit codes.
-///
-/// This is the initial integration test that validates the ELF loader,
-/// process table, and core process syscalls end-to-end.
-fn p11_launcher_task() -> ! {
-    log::info!("[p11] launcher started");
-
-    // -----------------------------------------------------------------------
-    // Test 0 (P11-T023): malformed ELF inputs must return errors, not panic
-    // -----------------------------------------------------------------------
-    test_elf_error_cases();
-
-    // -----------------------------------------------------------------------
-    // Test 1 (P11-T019): load exit0.elf → expect exit code 0
-    // -----------------------------------------------------------------------
-    run_elf_and_report("exit0.elf");
-
-    // -----------------------------------------------------------------------
-    // Test 2 (P11-T020): echo-args prints argc/argv via serial
-    // -----------------------------------------------------------------------
-    run_elf_and_report("echo-args.elf");
-
-    // -----------------------------------------------------------------------
-    // Test 3 (P11-T021): load fork-test.elf → parent waits for child(42)
-    // -----------------------------------------------------------------------
-    run_elf_and_report("fork-test.elf");
-
-    // -----------------------------------------------------------------------
-    // Test 4 (P11-T022): two sequential processes, separate address spaces
-    // -----------------------------------------------------------------------
-    run_elf_and_report("exit0.elf");
-    run_elf_and_report("exit0.elf");
-    log::info!("[p11] T022: both exit0 instances completed — address spaces isolated");
-
-    log::info!("[p11] all Phase 11 tests complete");
-
-    // -----------------------------------------------------------------------
-    // Phase 12 T030: musl hello world — exercises Linux syscall ABI end-to-end
-    // -----------------------------------------------------------------------
-    log::info!("[p12] T030: running hello.elf (musl-compiled C binary)");
-    run_elf_and_report("hello.elf");
-    log::info!("[p12] T030: hello.elf launch complete");
-
-    // -----------------------------------------------------------------------
-    // Phase 13: tmpfs validation — exercises writable filesystem syscalls
-    // -----------------------------------------------------------------------
-    log::info!("[p13] running tmpfs-test.elf (writable filesystem validation)");
-    run_elf_and_report("tmpfs-test.elf");
-    log::info!("[p13] tmpfs-test.elf launch complete");
-
-    // Phase 19: signal handler validation
-    // -----------------------------------------------------------------------
-    log::info!("[p13] running signal-test.elf (signal handler validation)");
-    run_elf_and_report("signal-test.elf");
-    log::info!("[p13] signal-test.elf launch complete");
-
-    loop {
-        task::yield_now();
-    }
-}
-
-/// P11-T023: verify that malformed ELF data returns errors without panicking.
-///
-/// These tests all fail at header parse time (before any segment mapping),
-/// so we reuse the current address space mapper to avoid allocating and
-/// leaking a per-test PML4 frame.  The mapper is never mutated.
-fn test_elf_error_cases() {
-    use mm::elf::{load_elf_into, ElfError};
-
-    // 64-byte "bad magic" ELF-sized buffer with wrong magic bytes.
-    let bad_magic = {
-        let mut b = [0u8; 64];
-        b[0] = 0xFF;
-        b[1] = 0xFF;
-        b[2] = 0xFF;
-        b[3] = 0xFF;
-        b
-    };
-
-    // Header with a program-header offset near u64::MAX. This must be rejected
-    // as a truncated program-header table rather than panicking on offset math.
-    let phdr_overflow = {
-        let mut b = [0u8; 64];
-        b[0..4].copy_from_slice(b"\x7FELF");
-        b[4] = 2; // ELFCLASS64
-        b[5] = 1; // little-endian
-        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
-        b[32..40].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // e_phoff
-        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-        b
-    };
-
-    // Valid ELF header + PT_LOAD phdr, but with a segment file offset near
-    // u64::MAX. This must be rejected as truncated instead of panicking while
-    // computing the backing file range.
-    let segment_offset_overflow = {
-        let mut b = [0u8; 120];
-        b[0..4].copy_from_slice(b"\x7FELF");
-        b[4] = 2; // ELFCLASS64
-        b[5] = 1; // little-endian
-        b[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
-        b[24..32].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // e_entry
-        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
-
-        let ph = &mut b[64..120];
-        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-        ph[4..8].copy_from_slice(&0x5u32.to_le_bytes()); // PF_R | PF_X
-        ph[8..16].copy_from_slice(&(u64::MAX - 32).to_le_bytes()); // p_offset
-        ph[16..24].copy_from_slice(&0x0040_0000u64.to_le_bytes()); // p_vaddr
-        ph[32..40].copy_from_slice(&64u64.to_le_bytes()); // p_filesz
-        ph[40..48].copy_from_slice(&64u64.to_le_bytes()); // p_memsz
-        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
-        b
-    };
-
-    let cases: &[(&str, &[u8])] = &[
-        ("empty", &[]),
-        ("bad magic", &bad_magic),
-        ("truncated", &[0x7f, b'E', b'L', b'F']),
-        ("phdr overflow", &phdr_overflow),
-        ("segment offset overflow", &segment_offset_overflow),
-    ];
-
-    // All cases fail before any page mapping — reuse current mapper to avoid
-    // allocating PML4 frames that cannot be freed (bump allocator).
-    // SAFETY: no other OffsetPageTable over the current CR3 is alive here.
-    let phys_off = mm::phys_offset();
-    let mut mapper = unsafe { mm::paging::get_mapper() };
-
-    let mut all_ok = true;
-    for (label, data) in cases {
-        let result = unsafe { load_elf_into(&mut mapper, phys_off, data) };
-        match result {
-            Err(ElfError::TruncatedHeader) | Err(ElfError::InvalidMagic) => {
-                log::info!(
-                    "[p11-T023] '{}': correctly rejected (truncated or bad magic)",
-                    label
-                );
-            }
-            Err(e) => {
-                log::info!("[p11-T023] '{}': rejected with {:?}", label, e);
-            }
-            Ok(_) => {
-                log::warn!(
-                    "[p11-T023] '{}': UNEXPECTED success — should have been rejected",
-                    label
-                );
-                all_ok = false;
-            }
-        }
-    }
-    if all_ok {
-        log::info!("[p11-T023] all malformed ELF cases correctly rejected");
-    }
-}
-
-/// Load an ELF from the ramdisk, register it as a process, schedule it,
-/// then wait for it to exit and log the exit code.
-fn run_elf_and_report(name: &'static str) {
-    use mm::elf::load_elf_into;
-    use process::{spawn_process_with_cr3, PROCESS_TABLE};
-
-    let data = match fs::ramdisk::get_file(name) {
-        Some(d) => d,
-        None => {
-            log::warn!("[p11] ELF not found in ramdisk: {}", name);
-            return;
-        }
-    };
-
-    if data.is_empty() {
-        log::warn!("[p11] ELF file is empty (not yet built?): {}", name);
-        return;
-    }
-
-    log::info!("[p11] loading {}: {} bytes", name, data.len());
-
-    let new_cr3 = match mm::new_process_page_table() {
-        Some(f) => f,
-        None => {
-            log::warn!("[p11] out of frames for {}", name);
-            return;
-        }
-    };
-
-    let phys_off = mm::phys_offset();
-    let (loaded, user_rsp) = {
-        // SAFETY: new_cr3 was just allocated; exclusive.
-        let mut mapper = unsafe { mm::mapper_for_frame(new_cr3) };
-        let loaded = match unsafe { load_elf_into(&mut mapper, phys_off, data) } {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("[p11] ELF load failed for {}: {:?}", name, e);
-                return;
-            }
-        };
-        // Build the SysV AMD64 ABI initial stack: [argc, argv[0], NULL, envp NULL, ...]
-        // argv[0] = binary name.
-        let argv: &[&[u8]] = &[name.as_bytes()];
-        // SAFETY: stack pages were just mapped by load_elf_into; mapper is valid.
-        let user_rsp = match unsafe {
-            mm::elf::setup_abi_stack(
-                loaded.stack_top,
-                &mapper,
-                phys_off,
-                argv,
-                loaded.phdr_vaddr,
-                loaded.phnum,
-            )
-        } {
-            Ok(rsp) => rsp,
-            Err(e) => {
-                log::warn!("[p11] ABI stack setup failed: {:?}", e);
-                return;
-            }
-        };
-        (loaded, user_rsp)
-    };
-
-    log::info!(
-        "[p11] {} loaded: entry={:#x} rsp={:#x}",
-        name,
-        loaded.entry,
-        user_rsp,
-    );
-
-    let pid = spawn_process_with_cr3(
-        0,
-        loaded.entry,
-        user_rsp,
-        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
-        0,
-        0,
-    );
-    log::info!("[p11] {} registered as pid {}", name, pid);
-
-    // Push a fork context so fork_child_trampoline can pick it up.
-    // fork_child_trampoline sets CURRENT_PID when it runs — the launcher
-    // must not set it here because the launcher kernel task is not the
-    // new userspace process.
-    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
-
-    // Spawn the kernel task; it will run fork_child_trampoline which
-    // sets CURRENT_PID, switches CR3, and enters ring 3.
-    task::spawn(process::fork_child_trampoline, "p11-elf");
-
-    // Wait for the process to exit.
-    log::info!("[p11] waiting for pid {}...", pid);
-    loop {
-        let done = {
-            let table = PROCESS_TABLE.lock();
-            table
-                .find(pid)
-                .map(|p| p.state == process::ProcessState::Zombie)
-                .unwrap_or(false)
-        };
-        if done {
-            let code = {
-                let mut table = PROCESS_TABLE.lock();
-                let code = table.find(pid).and_then(|p| p.exit_code).unwrap_or(-1);
-                table.reap(pid);
-                code
-            };
-            log::info!("[p11] {} (pid {}) exited with code {}", name, pid, code);
-            break;
-        }
-        task::yield_now();
     }
 }
 
