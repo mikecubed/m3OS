@@ -697,7 +697,38 @@ fn stdin_feeder_task() -> ! {
             continue;
         }
 
-        // Convert scancode to a byte value.
+        // Convert scancode to byte(s).
+        // Arrow keys, Home, End, Delete, PageUp/Down, and Escape produce
+        // VT100 escape sequences so that raw-mode programs (e.g. edit) can
+        // parse them with standard ANSI sequence handling.
+        let escape_seq: Option<&[u8]> = match sc {
+            0x48 => Some(b"\x1b[A"),  // Arrow Up
+            0x50 => Some(b"\x1b[B"),  // Arrow Down
+            0x4D => Some(b"\x1b[C"),  // Arrow Right
+            0x4B => Some(b"\x1b[D"),  // Arrow Left
+            0x47 => Some(b"\x1b[H"),  // Home
+            0x4F => Some(b"\x1b[F"),  // End
+            0x53 => Some(b"\x1b[3~"), // Delete
+            0x49 => Some(b"\x1b[5~"), // Page Up
+            0x51 => Some(b"\x1b[6~"), // Page Down
+            0x01 => Some(b"\x1b"),    // Escape
+            _ => None,
+        };
+
+        if let Some(seq) = escape_seq {
+            // Read termios to check canonical mode.
+            let canonical = tty::TTY0.lock().termios.c_lflag & ICANON != 0;
+            if canonical {
+                // In cooked mode, escape sequences are not useful — skip them
+                // to avoid polluting the line buffer.
+                continue;
+            }
+            for &b in seq {
+                stdin::push_char(b);
+            }
+            continue;
+        }
+
         let byte = if sc == 0x1C {
             b'\r' // Enter key produces CR; ICRNL translates to LF when enabled
         } else if sc == 0x0E {
