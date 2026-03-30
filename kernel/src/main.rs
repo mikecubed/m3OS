@@ -731,6 +731,8 @@ fn stdin_feeder_task() -> ! {
 
         let byte = if sc == 0x1C {
             b'\r' // Enter key produces CR; ICRNL translates to LF when enabled
+        } else if sc == 0x0F {
+            b'\t' // Tab
         } else if sc == 0x0E {
             0x7F // DEL / backspace
         } else if ctrl {
