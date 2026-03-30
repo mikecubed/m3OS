@@ -30,10 +30,10 @@ pub extern "C" fn _start() -> ! {
     let ret = mount(
         b"/dev/blk0\0".as_ptr(),
         b"/data\0".as_ptr(),
-        b"vfat\0".as_ptr(),
+        b"ext2\0".as_ptr(),
     );
     if ret == 0 {
-        write_str(STDOUT_FILENO, "init: /data mounted (vfat)\n");
+        write_str(STDOUT_FILENO, "init: /data mounted (ext2)\n");
     } else {
         write_str(STDOUT_FILENO, "init: /data mount failed (");
         syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
