@@ -230,8 +230,8 @@ impl Ext2Volume {
             ]));
         }
 
-        // Triple-indirect — deferred
-        Err(Ext2Error::IoError)
+        // Triple-indirect — deferred; files this large shouldn't exist on our 64MB filesystem.
+        Err(Ext2Error::CorruptedEntry)
     }
 
     // -----------------------------------------------------------------------
@@ -398,8 +398,14 @@ impl Ext2Volume {
 
     /// Free a block (P28-T028).
     pub fn free_block(&mut self, block_num: u32) -> Result<(), Ext2Error> {
+        if block_num < self.superblock.first_data_block {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         let relative = block_num - self.superblock.first_data_block;
         let group = (relative / self.superblock.blocks_per_group) as usize;
+        if group >= self.bgd_table.len() {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         let bit = relative % self.superblock.blocks_per_group;
 
         let bgd = &self.bgd_table[group];
@@ -408,6 +414,10 @@ impl Ext2Volume {
 
         let byte_idx = (bit / 8) as usize;
         let bit_idx = bit % 8;
+        // Detect double-free: the bit must be set (allocated) before we clear it.
+        if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         bitmap[byte_idx] &= !(1 << bit_idx);
         self.write_block(bitmap_block, &bitmap)?;
 
@@ -458,9 +468,15 @@ impl Ext2Volume {
 
     /// Free an inode (P28-T031).
     pub fn free_inode(&mut self, inode_num: u32) -> Result<(), Ext2Error> {
+        if inode_num == 0 || inode_num > self.superblock.inodes_count {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         let group =
             kernel_core::fs::ext2::inode_block_group(inode_num, self.superblock.inodes_per_group)
                 as usize;
+        if group >= self.bgd_table.len() {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         let index = kernel_core::fs::ext2::inode_index_in_group(
             inode_num,
             self.superblock.inodes_per_group,
@@ -472,6 +488,10 @@ impl Ext2Volume {
 
         let byte_idx = (index / 8) as usize;
         let bit_idx = index % 8;
+        // Detect double-free: the bit must be set (allocated) before we clear it.
+        if bitmap[byte_idx] & (1 << bit_idx) == 0 {
+            return Err(Ext2Error::CorruptedEntry);
+        }
         bitmap[byte_idx] &= !(1 << bit_idx);
         self.write_block(bitmap_block, &bitmap)?;
 

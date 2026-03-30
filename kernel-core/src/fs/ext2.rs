@@ -134,6 +134,15 @@ impl Ext2Superblock {
             return Err(Ext2Error::InvalidBlockSize);
         }
 
+        let blocks_per_group = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+        if blocks_per_group == 0 {
+            return Err(Ext2Error::CorruptedEntry);
+        }
+        let inodes_per_group = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        if inodes_per_group == 0 {
+            return Err(Ext2Error::CorruptedEntry);
+        }
+
         let (first_ino, inode_size) = if rev_level >= 1 {
             (
                 u32::from_le_bytes([bytes[84], bytes[85], bytes[86], bytes[87]]),
@@ -152,9 +161,9 @@ impl Ext2Superblock {
             first_data_block: u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
             log_block_size,
             log_frag_size: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
-            blocks_per_group: u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+            blocks_per_group,
             frags_per_group: u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]),
-            inodes_per_group: u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
+            inodes_per_group,
             mtime: u32::from_le_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]),
             wtime: u32::from_le_bytes([bytes[48], bytes[49], bytes[50], bytes[51]]),
             mnt_count: u16::from_le_bytes([bytes[52], bytes[53]]),

@@ -5659,10 +5659,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         if !seen.contains("tmp") {
             entries.push((alloc::string::String::from("tmp"), true));
         }
-        if !crate::fs::ext2::is_mounted()
-            && crate::fs::fat32::is_mounted()
-            && !seen.contains("data")
-        {
+        if crate::fs::fat32::is_mounted() && !seen.contains("data") {
             entries.push((alloc::string::String::from("data"), true));
         }
     } else if crate::fs::ext2::is_mounted() {
