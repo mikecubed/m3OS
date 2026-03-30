@@ -3717,7 +3717,7 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
                 }
             }
             let (u, g, _) = crate::fs::fat32::get_fat32_meta(&rel);
-            crate::fs::fat32::set_fat32_meta(&rel, u, g, mode);
+            crate::fs::fat32::set_fat32_meta_and_save(&rel, u, g, mode);
             0
         }
         FsTarget::Ramdisk => NEG_EROFS,
@@ -3760,7 +3760,7 @@ fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
                 }
             }
             let (u, g, _) = crate::fs::fat32::get_fat32_meta(path);
-            crate::fs::fat32::set_fat32_meta(path, u, g, mode);
+            crate::fs::fat32::set_fat32_meta_and_save(path, u, g, mode);
             0
         }
         FdBackend::Ramdisk { .. } => NEG_EROFS,
@@ -3796,7 +3796,7 @@ fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
         }
         FsTarget::Fat32(rel) => {
             let (_, _, m) = crate::fs::fat32::get_fat32_meta(&rel);
-            crate::fs::fat32::set_fat32_meta(&rel, new_uid, new_gid, m);
+            crate::fs::fat32::set_fat32_meta_and_save(&rel, new_uid, new_gid, m);
             0
         }
         FsTarget::Ramdisk => NEG_EROFS,
@@ -3831,7 +3831,7 @@ fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
         }
         FdBackend::Fat32Disk { path, .. } => {
             let (_, _, m) = crate::fs::fat32::get_fat32_meta(path);
-            crate::fs::fat32::set_fat32_meta(path, new_uid, new_gid, m);
+            crate::fs::fat32::set_fat32_meta_and_save(path, new_uid, new_gid, m);
             0
         }
         FdBackend::Ramdisk { .. } => NEG_EROFS,

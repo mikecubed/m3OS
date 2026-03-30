@@ -38,13 +38,21 @@ pub fn get_fat32_meta(path: &str) -> (u32, u32, u16) {
     }
 }
 
-/// Set metadata for a FAT32 file in the permissions index and persist to disk.
+/// Update metadata in the in-memory permissions index (does NOT persist to disk).
+///
+/// Call `save_permissions_index()` separately after releasing any `FAT32_VOLUME`
+/// lock to avoid deadlock.
 pub fn set_fat32_meta(path: &str, uid: u32, gid: u32, mode: u16) {
+    let mut perms = FAT32_PERMISSIONS.lock();
+    perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
+}
+
+/// Update metadata and persist to disk. Only call when `FAT32_VOLUME` is NOT held.
+pub fn set_fat32_meta_and_save(path: &str, uid: u32, gid: u32, mode: u16) {
     {
         let mut perms = FAT32_PERMISSIONS.lock();
         perms.insert(String::from(path), Fat32FileMeta { uid, gid, mode });
     }
-    // Persist the updated index to disk.
     save_permissions_index();
 }
 
