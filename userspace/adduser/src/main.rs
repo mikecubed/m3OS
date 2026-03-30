@@ -25,7 +25,18 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "adduser: empty username\n");
         exit(1);
     }
+    if ulen > 32 {
+        write_str(STDOUT_FILENO, "adduser: username too long (max 32)\n");
+        exit(1);
+    }
     let username = &username[..ulen];
+    // Reject usernames containing ':' or '\n' (would corrupt /etc/passwd format).
+    for &b in username {
+        if b == b':' || b == b'\n' || b == b'\0' {
+            write_str(STDOUT_FILENO, "adduser: invalid character in username\n");
+            exit(1);
+        }
+    }
 
     // Get password.
     write_str(STDOUT_FILENO, "Password: ");

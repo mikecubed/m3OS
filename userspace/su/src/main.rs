@@ -35,10 +35,15 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // If caller is already root, no password needed.
-    let caller_euid = geteuid();
-    if caller_euid != 0 {
-        // Prompt for target user's password.
+    // su requires root privileges (setuid-bit support deferred).
+    if geteuid() != 0 {
+        write_str(STDOUT_FILENO, "su: must be run as root\n");
+        exit(1);
+    }
+
+    // Prompt for target user's password (skip if switching to self).
+    let caller_uid = syscall_lib::getuid();
+    if caller_uid != uid {
         write_str(STDOUT_FILENO, "Password: ");
         let saved = disable_echo();
         let mut pw_input = [0u8; 128];
@@ -46,19 +51,12 @@ pub extern "C" fn _start() -> ! {
         restore_echo(saved);
         let _ = write(STDOUT_FILENO, b"\n");
 
-        // Verify against /etc/shadow.
         let mut shadow_buf = [0u8; 2048];
         let shadow_len = read_file(b"/data/etc/shadow\0", &mut shadow_buf);
         if shadow_len == 0 || !verify_shadow(&shadow_buf[..shadow_len], target, &pw_input[..plen]) {
             write_str(STDOUT_FILENO, "su: Authentication failure\n");
             exit(1);
         }
-    }
-
-    // Switch identity.
-    if geteuid() != 0 {
-        write_str(STDOUT_FILENO, "su: must be run as root\n");
-        exit(1);
     }
     if setgid(gid) != 0 || setuid(uid) != 0 {
         write_str(STDOUT_FILENO, "su: failed to set credentials\n");

@@ -3522,7 +3522,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => (0x1000 | 0o600, 0, 0, 0, 0),
         FdBackend::Ramdisk { content_len, .. } => {
-            // Ramdisk files: root-owned, mode 0o755 for executables, 0o644 for others
+            // Ramdisk files: root-owned, mode 0o755 (all files, including non-executables)
             (0x8000 | 0o755, 0, 0, *content_len as u64, 0)
         }
         FdBackend::Tmpfs { path } => {
