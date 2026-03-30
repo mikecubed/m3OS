@@ -5,13 +5,13 @@
 #![no_main]
 
 use syscall_lib::{
-    close, exit, geteuid, getuid, open, read, write, write_str, O_RDONLY, STDOUT_FILENO,
+    O_RDONLY, STDOUT_FILENO, close, exit, geteuid, getuid, open, read, write, write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/data/etc/shadow\0";
 const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let euid = geteuid();
     if euid != 0 {

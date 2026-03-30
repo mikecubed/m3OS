@@ -24,11 +24,11 @@ pub fn _print(args: core::fmt::Arguments) {
 #[doc(hidden)]
 pub fn _panic_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    if let Some(mut guard) = SERIAL1.try_lock() {
-        if let Some(ref mut serial) = *guard {
-            let _ = serial.write_fmt(args);
-            return;
-        }
+    if let Some(mut guard) = SERIAL1.try_lock()
+        && let Some(ref mut serial) = *guard
+    {
+        let _ = serial.write_fmt(args);
+        return;
     }
     let mut serial = unsafe { SerialPort::new(COM1_PORT) };
     serial.init();

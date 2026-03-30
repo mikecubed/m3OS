@@ -12,7 +12,7 @@
 
 use syscall_lib::{exit, serial_print};
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // Read argc and argv from the initial stack frame.
     // On entry, rsp points to argc.  We capture it via inline asm.

@@ -12,9 +12,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::ext2::{
-    Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock, EXT2_DIND_BLOCK,
-    EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, S_IFDIR,
-    S_IFREG,
+    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS,
+    EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock,
+    S_IFDIR, S_IFREG,
 };
 use spin::Mutex;
 

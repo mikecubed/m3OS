@@ -1,12 +1,12 @@
 use spin::Lazy;
 use x86_64::{
+    VirtAddr,
     instructions::{segmentation::Segment, tables::load_tss},
     registers::segmentation::{CS, DS, SS},
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,
     },
-    VirtAddr,
 };
 
 /// IST index used for the double-fault handler stack.
@@ -138,14 +138,16 @@ pub fn syscall_stack_top() -> u64 {
 /// kernel stack. Passing an invalid address will silently corrupt the stack
 /// on the next ring-3 interrupt.
 pub unsafe fn set_kernel_stack(rsp0: u64) {
-    // Safety: `&*TSS` forces the Lazy to initialize and gives us a &TaskStateSegment
-    // at the correct address for the inner value (not the Lazy wrapper).
-    // Casting to *mut is sound here because:
-    //   1. We only call this on the single-CPU init path, before any ring-3 code runs.
-    //   2. No interrupt handler references privilege_stack_table[0] between
-    //      gdt::init() and the first iretq into userspace.
-    let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
-    (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(rsp0);
+    unsafe {
+        // Safety: `&*TSS` forces the Lazy to initialize and gives us a &TaskStateSegment
+        // at the correct address for the inner value (not the Lazy wrapper).
+        // Casting to *mut is sound here because:
+        //   1. We only call this on the single-CPU init path, before any ring-3 code runs.
+        //   2. No interrupt handler references privilege_stack_table[0] between
+        //      gdt::init() and the first iretq into userspace.
+        let tss_ptr = &*TSS as *const TaskStateSegment as *mut TaskStateSegment;
+        (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(rsp0);
+    }
 }
 
 /// Load the GDT and TSS, and reload the segment registers.

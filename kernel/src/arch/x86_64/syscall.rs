@@ -107,11 +107,11 @@ fn current_cwd() -> alloc::string::String {
 use core::arch::global_asm;
 
 use x86_64::{
+    VirtAddr,
     registers::{
         model_specific::{Efer, EferFlags, LStar, SFMask, Star},
         rflags::RFlags,
     },
-    VirtAddr,
 };
 
 use super::gdt;
@@ -121,7 +121,7 @@ use super::gdt;
 // ---------------------------------------------------------------------------
 
 /// Scratch space to save the user RSP during a syscall.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
 
 /// Saved value of R10 at SYSCALL entry.
@@ -129,50 +129,50 @@ pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
 /// R10 carries syscall arg3 in the Linux ABI (e.g. mmap flags).  It is not
 /// a SysV argument-passing register, so the assembly entry stub saves it
 /// here before the register setup for `syscall_handler`.  Single-CPU: safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 static mut SYSCALL_ARG3: u64 = 0;
 
 /// Saved user callee-saved registers at syscall entry (for fork child restore).
 /// These are the registers that the SYSCALL instruction does NOT clobber,
 /// so they carry the user's values into the kernel. The fork child trampoline
 /// reads these to enter userspace with the correct register state.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RBX: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RBP: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R12: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R13: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R14: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R15: u64 = 0;
 
 /// Saved user caller-saved registers at syscall entry (for fork child restore).
 /// The Linux syscall ABI preserves ALL registers except RAX (return value),
 /// RCX (return address), and R11 (RFLAGS). The fork child must restore these
 /// so the child resumes with the same register state as the parent.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RDI: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RSI: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RDX: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R8: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R9: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_R10: u64 = 0;
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_USER_RFLAGS: u64 = 0;
 
 /// Virtual address of the top of the kernel syscall stack.
 ///
 /// Updated by the fork-child trampoline when switching to a per-process
 /// kernel stack, so that SYSCALL entry uses the correct stack.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub(crate) static mut SYSCALL_STACK_TOP: u64 = 0;
 
 // ---------------------------------------------------------------------------
@@ -314,7 +314,7 @@ global_asm!(
 /// |     231 | exit_group  | ✓ same as Phase 11    |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(
     number: u64,
     arg0: u64,
@@ -685,14 +685,16 @@ unsafe fn enter_signal_handler(
     sig: u64,
     saved_regs: &crate::signal::SavedUserRegs,
 ) -> ! {
-    // Build a modified copy of the interrupted user context: RIP→handler,
-    // RSP→sigframe, RDI→signal number. All other GPRs retain the
-    // interrupted values so no kernel register state leaks to ring 3.
-    let mut regs = *saved_regs;
-    regs.rip = handler;
-    regs.rsp = rsp;
-    regs.rdi = sig;
-    restore_and_enter_userspace(&regs)
+    unsafe {
+        // Build a modified copy of the interrupted user context: RIP→handler,
+        // RSP→sigframe, RDI→signal number. All other GPRs retain the
+        // interrupted values so no kernel register state leaks to ring 3.
+        let mut regs = *saved_regs;
+        regs.rip = handler;
+        regs.rsp = rsp;
+        regs.rdi = sig;
+        restore_and_enter_userspace(&regs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -906,55 +908,57 @@ fn sys_sigreturn(user_rsp: u64) -> ! {
 ///
 /// `regs` must contain valid userspace addresses for RIP and RSP.
 unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! {
-    use core::arch::asm;
-    // We need to restore all GPRs.  The simplest approach: push the iretq
-    // frame first, then load all GPRs from the struct, then iretq.
-    //
-    // We save the struct pointer in a register, set up the iretq frame,
-    // then load all registers from the struct.
-    let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
-    let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
-    // Sanitize rflags: clear all privileged/reserved bits that could cause
-    // #GP during iretq, then force IF (bit 9) and reserved bit 1.
-    // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
-    const PRIV_MASK: u64 =
-        (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
-    let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
+    unsafe {
+        use core::arch::asm;
+        // We need to restore all GPRs.  The simplest approach: push the iretq
+        // frame first, then load all GPRs from the struct, then iretq.
+        //
+        // We save the struct pointer in a register, set up the iretq frame,
+        // then load all registers from the struct.
+        let ss = u64::from(crate::arch::x86_64::gdt::user_data_selector().0);
+        let cs = u64::from(crate::arch::x86_64::gdt::user_code_selector().0);
+        // Sanitize rflags: clear all privileged/reserved bits that could cause
+        // #GP during iretq, then force IF (bit 9) and reserved bit 1.
+        // Cleared: IOPL (12-13), NT (14), VM (17), VIF (19), VIP (20), ID (21).
+        const PRIV_MASK: u64 =
+            (1 << 12) | (1 << 13) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 21);
+        let rflags = (regs.rflags & !PRIV_MASK) | 0x202;
 
-    asm!(
-        // Build the iretq frame on the kernel stack.
-        "push {ss}",
-        "push {user_rsp}",
-        "push {rflags}",
-        "push {cs}",
-        "push {user_rip}",
-        // Now restore all GPRs from the SavedUserRegs struct.
-        // r14 holds the pointer to the struct (chosen because we restore it last-ish).
-        "mov r15, [r14 + 120]",  // r15 offset
-        "mov r13, [r14 + 104]",  // r13
-        "mov r12, [r14 + 96]",   // r12
-        "mov r11, [r14 + 88]",   // r11
-        "mov r10, [r14 + 80]",   // r10
-        "mov r9, [r14 + 72]",    // r9
-        "mov r8, [r14 + 64]",    // r8
-        "mov rbp, [r14 + 48]",   // rbp
-        "mov rbx, [r14 + 8]",    // rbx
-        "mov rdx, [r14 + 24]",   // rdx
-        "mov rsi, [r14 + 32]",   // rsi
-        "mov rdi, [r14 + 40]",   // rdi
-        "mov rcx, [r14 + 16]",   // rcx
-        "mov rax, [r14 + 0]",    // rax
-        // Restore r14 last (it was our pointer register).
-        "mov r14, [r14 + 112]",  // r14
-        "iretq",
-        ss       = in(reg) ss,
-        user_rsp = in(reg) regs.rsp,
-        rflags   = in(reg) rflags,
-        cs       = in(reg) cs,
-        user_rip = in(reg) regs.rip,
-        in("r14") regs as *const crate::signal::SavedUserRegs as u64,
-        options(noreturn)
-    )
+        asm!(
+            // Build the iretq frame on the kernel stack.
+            "push {ss}",
+            "push {user_rsp}",
+            "push {rflags}",
+            "push {cs}",
+            "push {user_rip}",
+            // Now restore all GPRs from the SavedUserRegs struct.
+            // r14 holds the pointer to the struct (chosen because we restore it last-ish).
+            "mov r15, [r14 + 120]",  // r15 offset
+            "mov r13, [r14 + 104]",  // r13
+            "mov r12, [r14 + 96]",   // r12
+            "mov r11, [r14 + 88]",   // r11
+            "mov r10, [r14 + 80]",   // r10
+            "mov r9, [r14 + 72]",    // r9
+            "mov r8, [r14 + 64]",    // r8
+            "mov rbp, [r14 + 48]",   // rbp
+            "mov rbx, [r14 + 8]",    // rbx
+            "mov rdx, [r14 + 24]",   // rdx
+            "mov rsi, [r14 + 32]",   // rsi
+            "mov rdi, [r14 + 40]",   // rdi
+            "mov rcx, [r14 + 16]",   // rcx
+            "mov rax, [r14 + 0]",    // rax
+            // Restore r14 last (it was our pointer register).
+            "mov r14, [r14 + 112]",  // r14
+            "iretq",
+            ss       = in(reg) ss,
+            user_rsp = in(reg) regs.rsp,
+            rflags   = in(reg) rflags,
+            cs       = in(reg) cs,
+            user_rip = in(reg) regs.rip,
+            in("r14") regs as *const crate::signal::SavedUserRegs as u64,
+            options(noreturn)
+        )
+    }
 }
 
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
@@ -1249,7 +1253,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
             // Only the read FD exists — close it properly.
             with_current_fd_mut(read_fd, |slot| *slot = None);
             crate::pipe::pipe_close_reader(pipe_id); // reader_count: 1 → 0
-                                                     // writer_count is still 0, so pipe slot is now freed.
+            // writer_count is still 0, so pipe slot is now freed.
             return NEG_EMFILE;
         }
     };
@@ -2142,92 +2146,93 @@ unsafe fn cow_clone_user_pages(
     phys_off: u64,
     dst_mapper: &mut x86_64::structures::paging::OffsetPageTable<'_>,
 ) -> Result<(), crate::mm::elf::ElfError> {
-    use x86_64::{
-        registers::control::Cr3,
-        structures::paging::{Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
-        VirtAddr,
-    };
+    unsafe {
+        use x86_64::{
+            VirtAddr,
+            registers::control::Cr3,
+            structures::paging::{Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
+        };
 
-    let phys_offset = VirtAddr::new(phys_off);
+        let phys_offset = VirtAddr::new(phys_off);
 
-    let (src_frame, _) = Cr3::read();
-    let src_pml4: &PageTable =
-        &*(phys_offset + src_frame.start_address().as_u64()).as_ptr::<PageTable>();
+        let (src_frame, _) = Cr3::read();
+        let src_pml4: &PageTable =
+            &*(phys_offset + src_frame.start_address().as_u64()).as_ptr::<PageTable>();
 
-    let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
+        let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
 
-    // Walk indices 0–255 (user half).
-    for p4 in 0usize..256 {
-        let p4e = &src_pml4[p4];
-        if !p4e.flags().contains(PageTableFlags::PRESENT) {
-            continue;
-        }
-
-        let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
-        for p3 in 0usize..512 {
-            let p3e = &pdpt[p3];
-            if !p3e.flags().contains(PageTableFlags::PRESENT) {
-                continue;
-            }
-            if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
+        // Walk indices 0–255 (user half).
+        for p4 in 0usize..256 {
+            let p4e = &src_pml4[p4];
+            if !p4e.flags().contains(PageTableFlags::PRESENT) {
                 continue;
             }
 
-            let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
-            for p2 in 0usize..512 {
-                let p2e = &pd[p2];
-                if !p2e.flags().contains(PageTableFlags::PRESENT) {
+            let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
+            for p3 in 0usize..512 {
+                let p3e = &pdpt[p3];
+                if !p3e.flags().contains(PageTableFlags::PRESENT) {
                     continue;
                 }
-                if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                if p3e.flags().contains(PageTableFlags::HUGE_PAGE) {
                     continue;
                 }
 
-                // Get a mutable reference to the parent's PT so we can clear
-                // WRITABLE on CoW pages.
-                let pt: &mut PageTable =
-                    &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
-                for p1 in 0usize..512 {
-                    let pte = &mut pt[p1];
-                    if !pte.flags().contains(PageTableFlags::PRESENT) {
+                let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
+                for p2 in 0usize..512 {
+                    let p2e = &pd[p2];
+                    if !p2e.flags().contains(PageTableFlags::PRESENT) {
                         continue;
                     }
-                    if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                    if p2e.flags().contains(PageTableFlags::HUGE_PAGE) {
                         continue;
                     }
 
-                    let vaddr: u64 = ((p4 as u64) << 39)
-                        | ((p3 as u64) << 30)
-                        | ((p2 as u64) << 21)
-                        | ((p1 as u64) << 12);
+                    // Get a mutable reference to the parent's PT so we can clear
+                    // WRITABLE on CoW pages.
+                    let pt: &mut PageTable =
+                        &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
+                    for p1 in 0usize..512 {
+                        let pte = &mut pt[p1];
+                        if !pte.flags().contains(PageTableFlags::PRESENT) {
+                            continue;
+                        }
+                        if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+                            continue;
+                        }
 
-                    let src_phys = pte.addr();
-                    let flags = pte.flags();
-                    let was_writable = flags.contains(PageTableFlags::WRITABLE);
+                        let vaddr: u64 = ((p4 as u64) << 39)
+                            | ((p3 as u64) << 30)
+                            | ((p2 as u64) << 21)
+                            | ((p1 as u64) << 12);
 
-                    // Compute child flags: if the page was writable, clear
-                    // WRITABLE and set BIT_9 (CoW marker) in the child.
-                    // Don't mutate parent PTE yet — defer until map_to succeeds.
-                    let child_flags = if was_writable {
-                        (flags & !PageTableFlags::WRITABLE) | PageTableFlags::BIT_9
-                    } else {
-                        flags
-                    };
+                        let src_phys = pte.addr();
+                        let flags = pte.flags();
+                        let was_writable = flags.contains(PageTableFlags::WRITABLE);
 
-                    // Map the same physical frame in the child.
-                    let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr)).map_err(
-                        |_| crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork"),
-                    )?;
-                    let frame = PhysFrame::from_start_address(src_phys)
-                        .expect("CoW: unaligned frame address");
-                    // Intermediate page table entries (PD, PDPT, PML4) must always
-                    // have WRITABLE set so that after CoW resolution makes the PTE
-                    // writable, writes can actually succeed. The leaf PTE is the
-                    // only level that controls CoW (no WRITABLE + BIT_9).
-                    let parent_flags = PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::USER_ACCESSIBLE;
-                    unsafe {
+                        // Compute child flags: if the page was writable, clear
+                        // WRITABLE and set BIT_9 (CoW marker) in the child.
+                        // Don't mutate parent PTE yet — defer until map_to succeeds.
+                        let child_flags = if was_writable {
+                            (flags & !PageTableFlags::WRITABLE) | PageTableFlags::BIT_9
+                        } else {
+                            flags
+                        };
+
+                        // Map the same physical frame in the child.
+                        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr))
+                            .map_err(|_| {
+                                crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork")
+                            })?;
+                        let frame = PhysFrame::from_start_address(src_phys)
+                            .expect("CoW: unaligned frame address");
+                        // Intermediate page table entries (PD, PDPT, PML4) must always
+                        // have WRITABLE set so that after CoW resolution makes the PTE
+                        // writable, writes can actually succeed. The leaf PTE is the
+                        // only level that controls CoW (no WRITABLE + BIT_9).
+                        let parent_flags = PageTableFlags::PRESENT
+                            | PageTableFlags::WRITABLE
+                            | PageTableFlags::USER_ACCESSIBLE;
                         dst_mapper
                             .map_to_with_table_flags(
                                 page,
@@ -2240,25 +2245,25 @@ unsafe fn cow_clone_user_pages(
                                 crate::mm::elf::ElfError::MappingFailed("map_to failed in cow fork")
                             })?
                             .ignore();
-                    }
 
-                    // Child mapping succeeded — now mutate the parent PTE to
-                    // match (clear WRITABLE, set BIT_9) and bump refcount.
-                    if was_writable {
-                        pte.set_addr(src_phys, child_flags);
+                        // Child mapping succeeded — now mutate the parent PTE to
+                        // match (clear WRITABLE, set BIT_9) and bump refcount.
+                        if was_writable {
+                            pte.set_addr(src_phys, child_flags);
+                        }
+                        crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                     }
-                    crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                 }
             }
         }
+
+        // Flush parent's TLB to ensure CPU sees the cleared WRITABLE bits.
+        // A full CR3 reload is the simplest approach.
+        let (current_cr3, cr3_flags) = Cr3::read();
+        Cr3::write(current_cr3, cr3_flags);
+
+        Ok(())
     }
-
-    // Flush parent's TLB to ensure CPU sees the cleared WRITABLE bits.
-    // A full CR3 reload is the simplest approach.
-    let (current_cr3, cr3_flags) = Cr3::read();
-    Cr3::write(current_cr3, cr3_flags);
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2282,7 +2287,7 @@ pub fn init() {
     )
     .expect("STAR MSR write failed: segment selector layout mismatch");
 
-    extern "C" {
+    unsafe extern "C" {
         fn syscall_entry();
     }
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
@@ -2328,10 +2333,10 @@ fn current_fd_entry(fd: usize) -> Option<FdEntry> {
 fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     let mut table = crate::process::PROCESS_TABLE.lock();
-    if let Some(proc) = table.find_mut(pid) {
-        if let Some(slot) = proc.fd_table.get_mut(fd) {
-            f(slot);
-        }
+    if let Some(proc) = table.find_mut(pid)
+        && let Some(slot) = proc.fd_table.get_mut(fd)
+    {
+        f(slot);
     }
 }
 
@@ -2899,12 +2904,12 @@ fn is_directory(path: &str) -> bool {
         return node.is_dir();
     }
     // ext2 root filesystem.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(path) {
-            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-            if let Some(vol) = vol.as_ref() {
-                return vol.is_dir(rel);
-            }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            return vol.is_dir(rel);
         }
     }
     // Legacy: /data paths for FAT32 fallback.
@@ -3015,23 +3020,24 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
     // Phase 27: Permission check for existing files.
     let create = (flags & 0x40) != 0; // O_CREAT
-    if !create || path_metadata(name).is_some() {
-        if let Some((fu, fg, fm)) = path_metadata(name) {
-            let (_, _, euid, egid) = current_process_ids();
-            let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
-            if required != 0 && !check_permission(fu, fg, fm, euid, egid, required) {
-                return NEG_EACCES;
-            }
+    if (!create || path_metadata(name).is_some())
+        && let Some((fu, fg, fm)) = path_metadata(name)
+    {
+        let (_, _, euid, egid) = current_process_ids();
+        let required = (if readable { 4u8 } else { 0 }) | (if writable { 2u8 } else { 0 });
+        if required != 0 && !check_permission(fu, fg, fm, euid, egid, required) {
+            return NEG_EACCES;
         }
     }
 
     // Phase 27: When creating a new file, check parent directory write+execute permission.
-    if create && path_metadata(name).is_none() {
-        if let Some((pu, pg, pm)) = parent_dir_metadata(name) {
-            let (_, _, euid_c, egid_c) = current_process_ids();
-            if !check_permission(pu, pg, pm, euid_c, egid_c, 3) {
-                return NEG_EACCES;
-            }
+    if create
+        && path_metadata(name).is_none()
+        && let Some((pu, pg, pm)) = parent_dir_metadata(name)
+    {
+        let (_, _, euid_c, egid_c) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid_c, egid_c, 3) {
+            return NEG_EACCES;
         }
     }
 
@@ -3332,26 +3338,26 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     }
 
     // Phase 28: ext2 root filesystem — try before ramdisk for non-/bin, non-/sbin.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(name) {
-            // Check if ramdisk has this path (e.g. /bin/cat) — ramdisk takes priority.
-            if crate::fs::ramdisk::ramdisk_lookup(name).is_none() {
-                return open_ext2_file(
-                    name, rel, readable, writable, create, append, truncate, mode_arg,
-                );
-            }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(name)
+    {
+        // Check if ramdisk has this path (e.g. /bin/cat) — ramdisk takes priority.
+        if crate::fs::ramdisk::ramdisk_lookup(name).is_none() {
+            return open_ext2_file(
+                name, rel, readable, writable, create, append, truncate, mode_arg,
+            );
         }
     }
 
     // Fall through to ramdisk lookup — ramdisk is read-only.
     if writable || create {
         // If ext2 is mounted, try creating there before giving up.
-        if crate::fs::ext2::is_mounted() {
-            if let Some(rel) = ext2_root_path(name) {
-                return open_ext2_file(
-                    name, rel, readable, writable, create, append, truncate, mode_arg,
-                );
-            }
+        if crate::fs::ext2::is_mounted()
+            && let Some(rel) = ext2_root_path(name)
+        {
+            return open_ext2_file(
+                name, rel, readable, writable, create, append, truncate, mode_arg,
+            );
         }
         return NEG_EROFS;
     }
@@ -3360,43 +3366,43 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         Some(c) => c,
         None => {
             // Try ext2 root for anything ramdisk doesn't have.
-            if crate::fs::ext2::is_mounted() {
-                if let Some(rel) = ext2_root_path(name) {
-                    return open_ext2_file(
-                        name, rel, readable, writable, create, append, truncate, mode_arg,
-                    );
-                }
+            if crate::fs::ext2::is_mounted()
+                && let Some(rel) = ext2_root_path(name)
+            {
+                return open_ext2_file(
+                    name, rel, readable, writable, create, append, truncate, mode_arg,
+                );
             }
             // Legacy: /etc/* fallback — try /data/etc/* on FAT32 only.
-            if let Some(etc_rel) = name.strip_prefix("/etc/") {
-                if !etc_rel.is_empty() && crate::fs::fat32::is_mounted() {
-                    let data_rel = alloc::format!("etc/{}", etc_rel);
-                    let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-                    if let Some(vol) = vol.as_ref() {
-                        if let Ok(entry) = vol.lookup(&data_rel) {
-                            if !entry.is_dir() {
-                                let fd_entry = FdEntry {
-                                    backend: FdBackend::Fat32Disk {
-                                        path: data_rel,
-                                        start_cluster: entry.start_cluster(),
-                                        file_size: entry.file_size,
-                                        dir_cluster: vol.bpb.root_cluster,
-                                    },
-                                    offset: 0,
-                                    readable: true,
-                                    writable: false,
-                                    cloexec: false,
-                                };
-                                return match alloc_fd(3, fd_entry) {
-                                    Some(i) => {
-                                        log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
-                                        i as u64
-                                    }
-                                    None => NEG_EMFILE,
-                                };
-                            }
+            if let Some(etc_rel) = name.strip_prefix("/etc/")
+                && !etc_rel.is_empty()
+                && crate::fs::fat32::is_mounted()
+            {
+                let data_rel = alloc::format!("etc/{}", etc_rel);
+                let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                if let Some(vol) = vol.as_ref()
+                    && let Ok(entry) = vol.lookup(&data_rel)
+                    && !entry.is_dir()
+                {
+                    let fd_entry = FdEntry {
+                        backend: FdBackend::Fat32Disk {
+                            path: data_rel,
+                            start_cluster: entry.start_cluster(),
+                            file_size: entry.file_size,
+                            dir_cluster: vol.bpb.root_cluster,
+                        },
+                        offset: 0,
+                        readable: true,
+                        writable: false,
+                        cloexec: false,
+                    };
+                    return match alloc_fd(3, fd_entry) {
+                        Some(i) => {
+                            log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
+                            i as u64
                         }
-                    }
+                        None => NEG_EMFILE,
+                    };
                 }
             }
             log::warn!("[open] file not found: {}", name);
@@ -3651,11 +3657,7 @@ fn sys_linux_close(fd: u64) -> u64 {
             found = true;
         }
     });
-    if found {
-        0
-    } else {
-        NEG_EBADF
-    }
+    if found { 0 } else { NEG_EBADF }
 }
 
 // ---------------------------------------------------------------------------
@@ -3678,10 +3680,10 @@ fn dir_metadata(path: &str) -> (u32, u32, u16) {
         }
     }
     // ext2 root filesystem directories.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(path) {
-            return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
-        }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(path)
+    {
+        return data_file_metadata(rel).unwrap_or((0, 0, 0o755));
     }
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = path.strip_prefix("/data/") {
@@ -4027,10 +4029,10 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
         return Some((0, 0, 0o755));
     }
     // ext2 root filesystem — check for any path.
-    if let Some(rel) = ext2_root_path(abs_path) {
-        if crate::fs::ext2::is_mounted() {
-            return data_file_metadata(rel);
-        }
+    if let Some(rel) = ext2_root_path(abs_path)
+        && crate::fs::ext2::is_mounted()
+    {
+        return data_file_metadata(rel);
     }
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = abs_path.strip_prefix("/data/") {
@@ -4078,10 +4080,10 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
         return FsTarget::DiskData(alloc::string::String::from(rel));
     }
     // When ext2 is mounted at root, route non-ramdisk paths to ext2.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(abs_path) {
-            return FsTarget::DiskData(alloc::string::String::from(rel));
-        }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        return FsTarget::DiskData(alloc::string::String::from(rel));
     }
     FsTarget::Ramdisk
 }
@@ -4380,8 +4382,8 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
 
     // Map pages in the current address space (current CR3 = this process).
     use x86_64::{
-        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
         VirtAddr,
+        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
     };
     let flags_pt = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -4473,8 +4475,8 @@ fn sys_linux_brk(addr: u64) -> u64 {
     let pages_needed = (new_brk - current) / 4096;
 
     use x86_64::{
-        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
         VirtAddr,
+        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
     };
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -4871,7 +4873,7 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
     fill(&mut utsname[130..195], env!("CARGO_PKG_VERSION").as_bytes()); // release
     fill(&mut utsname[195..260], env!("CARGO_PKG_VERSION").as_bytes()); // version
     fill(&mut utsname[260..325], b"x86_64"); // machine
-                                             // domainname left as zero
+    // domainname left as zero
     if crate::mm::user_mem::copy_to_user(buf_ptr, &utsname).is_err() {
         return NEG_EFAULT;
     }
@@ -4953,33 +4955,32 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         }
         None => {
             // ext2 root filesystem: stat any path.
-            if crate::fs::ext2::is_mounted() {
-                if let Some(rel) = ext2_root_path(name) {
-                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                    if let Some(vol) = vol.as_ref() {
-                        if let Ok(ino) = vol.resolve_path(rel) {
-                            if let Ok(inode) = vol.read_inode(ino) {
-                                let mode = inode.mode as u32;
-                                let uid = inode.uid as u32;
-                                let gid = inode.gid as u32;
-                                let size = inode.size as u64;
-                                let nlink = inode.links_count as u64;
-                                let blksize = vol.block_size as u64;
-                                let mut stat = [0u8; 144];
-                                // st_nlink at offset 16 (u64 on x86_64 stat)
-                                stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
-                                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                                stat[28..32].copy_from_slice(&uid.to_ne_bytes());
-                                stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                                stat[48..56].copy_from_slice(&size.to_ne_bytes());
-                                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
-                                    return NEG_EFAULT;
-                                }
-                                return 0;
-                            }
-                        }
+            if crate::fs::ext2::is_mounted()
+                && let Some(rel) = ext2_root_path(name)
+            {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                if let Some(vol) = vol.as_ref()
+                    && let Ok(ino) = vol.resolve_path(rel)
+                    && let Ok(inode) = vol.read_inode(ino)
+                {
+                    let mode = inode.mode as u32;
+                    let uid = inode.uid as u32;
+                    let gid = inode.gid as u32;
+                    let size = inode.size as u64;
+                    let nlink = inode.links_count as u64;
+                    let blksize = vol.block_size as u64;
+                    let mut stat = [0u8; 144];
+                    // st_nlink at offset 16 (u64 on x86_64 stat)
+                    stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
+                    stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                    stat[28..32].copy_from_slice(&uid.to_ne_bytes());
+                    stat[32..36].copy_from_slice(&gid.to_ne_bytes());
+                    stat[48..56].copy_from_slice(&size.to_ne_bytes());
+                    stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                    if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                        return NEG_EFAULT;
                     }
+                    return 0;
                 }
             }
             // Device special files.
@@ -5034,35 +5035,32 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
     }
 
     // Phase 28: ext2 root mkdir.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(name) {
-            if !rel.is_empty() {
-                let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                if let Some(vol) = vol.as_mut() {
-                    let parts: alloc::vec::Vec<&str> =
-                        rel.split('/').filter(|s| !s.is_empty()).collect();
-                    let (parent_ino, dir_name) = if parts.len() <= 1 {
-                        (kernel_core::fs::ext2::EXT2_ROOT_INO, rel)
-                    } else {
-                        let parent_path = parts[..parts.len() - 1].join("/");
-                        match vol.resolve_path(&parent_path) {
-                            Ok(p) => (p, parts[parts.len() - 1]),
-                            Err(_) => return NEG_ENOENT,
-                        }
-                    };
-                    let (_, _, mk_euid, mk_egid) = current_process_ids();
-                    return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid)
-                    {
-                        Ok(_) => {
-                            log::info!("[mkdir] {} (ext2)", name);
-                            0
-                        }
-                        Err(_) => NEG_EIO,
-                    };
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(name)
+        && !rel.is_empty()
+    {
+        let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_mut() {
+            let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let (parent_ino, dir_name) = if parts.len() <= 1 {
+                (kernel_core::fs::ext2::EXT2_ROOT_INO, rel)
+            } else {
+                let parent_path = parts[..parts.len() - 1].join("/");
+                match vol.resolve_path(&parent_path) {
+                    Ok(p) => (p, parts[parts.len() - 1]),
+                    Err(_) => return NEG_ENOENT,
                 }
-                return NEG_EIO;
-            }
+            };
+            let (_, _, mk_euid, mk_egid) = current_process_ids();
+            return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid) {
+                Ok(_) => {
+                    log::info!("[mkdir] {} (ext2)", name);
+                    0
+                }
+                Err(_) => NEG_EIO,
+            };
         }
+        return NEG_EIO;
     }
 
     // Legacy: /data mkdir (ext2 or FAT32 fallback).
@@ -5218,36 +5216,34 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
     }
 
     // Phase 28: ext2 root unlink.
-    if crate::fs::ext2::is_mounted() {
-        if let Some(rel) = ext2_root_path(name) {
-            if !rel.is_empty() {
-                let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                if let Some(vol) = vol.as_mut() {
-                    let parts: alloc::vec::Vec<&str> =
-                        rel.split('/').filter(|s| !s.is_empty()).collect();
-                    let parent_ino = if parts.len() <= 1 {
-                        kernel_core::fs::ext2::EXT2_ROOT_INO
-                    } else {
-                        let parent_path = parts[..parts.len() - 1].join("/");
-                        match vol.resolve_path(&parent_path) {
-                            Ok(p) => p,
-                            Err(_) => return NEG_ENOENT,
-                        }
-                    };
-                    let file_name = parts.last().copied().unwrap_or(rel);
-                    return match vol.delete_file(parent_ino, file_name) {
-                        Ok(()) => {
-                            log::info!("[unlink] {} (ext2)", name);
-                            0
-                        }
-                        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
-                        Err(kernel_core::fs::ext2::Ext2Error::IsDirectory) => NEG_EISDIR,
-                        Err(_) => NEG_EIO,
-                    };
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(name)
+        && !rel.is_empty()
+    {
+        let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_mut() {
+            let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let parent_ino = if parts.len() <= 1 {
+                kernel_core::fs::ext2::EXT2_ROOT_INO
+            } else {
+                let parent_path = parts[..parts.len() - 1].join("/");
+                match vol.resolve_path(&parent_path) {
+                    Ok(p) => p,
+                    Err(_) => return NEG_ENOENT,
                 }
-                return NEG_EIO;
-            }
+            };
+            let file_name = parts.last().copied().unwrap_or(rel);
+            return match vol.delete_file(parent_ino, file_name) {
+                Ok(()) => {
+                    log::info!("[unlink] {} (ext2)", name);
+                    0
+                }
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+                Err(kernel_core::fs::ext2::Ext2Error::IsDirectory) => NEG_EISDIR,
+                Err(_) => NEG_EIO,
+            };
         }
+        return NEG_EIO;
     }
 
     // Legacy: /data unlink (ext2 or FAT32 fallback).
@@ -5362,15 +5358,15 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     // Phase 27: Write+execute permission on both parent directories.
     {
         let (_, _, euid, egid) = current_process_ids();
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved) {
-            if !check_permission(pu, pg, pm, euid, egid, 3) {
-                return NEG_EACCES;
-            }
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&old_resolved)
+            && !check_permission(pu, pg, pm, euid, egid, 3)
+        {
+            return NEG_EACCES;
         }
-        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
-            if !check_permission(pu, pg, pm, euid, egid, 3) {
-                return NEG_EACCES;
-            }
+        if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved)
+            && !check_permission(pu, pg, pm, euid, egid, 3)
+        {
+            return NEG_EACCES;
         }
     }
 
@@ -5637,12 +5633,12 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
             let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-            if let Some(vol) = vol.as_ref() {
-                if let Ok(children) = vol.list_dir("/") {
-                    for (name, is_dir) in children {
-                        seen.insert(name.clone());
-                        entries.push((name, is_dir));
-                    }
+            if let Some(vol) = vol.as_ref()
+                && let Ok(children) = vol.list_dir("/")
+            {
+                for (name, is_dir) in children {
+                    seen.insert(name.clone());
+                    entries.push((name, is_dir));
                 }
             }
         }
@@ -5675,12 +5671,12 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             {
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                if let Some(vol) = vol.as_ref() {
-                    if let Ok(children) = vol.list_dir(rel) {
-                        for (name, is_dir) in children {
-                            if !seen.contains(&name) {
-                                entries.push((name, is_dir));
-                            }
+                if let Some(vol) = vol.as_ref()
+                    && let Ok(children) = vol.list_dir(rel)
+                {
+                    for (name, is_dir) in children {
+                        if !seen.contains(&name) {
+                            entries.push((name, is_dir));
                         }
                     }
                 }
@@ -5767,7 +5763,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
     // Update the fd offset so the next call resumes.
     with_current_fd_mut(fd_idx, |slot| {
-        if let Some(ref mut e) = slot {
+        if let Some(e) = slot {
             e.offset = idx;
         }
     });

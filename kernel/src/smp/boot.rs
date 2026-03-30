@@ -238,7 +238,7 @@ fn set_trampoline_ap_data(stack_top: u64, per_core_data_ptr: u64) {
 // IPI sending (delegates to super::ipi LAPIC helpers)
 // ---------------------------------------------------------------------------
 
-use super::ipi::{lapic_read, lapic_write, wait_icr_idle, LAPIC_ICR_HIGH, LAPIC_ICR_LOW};
+use super::ipi::{LAPIC_ICR_HIGH, LAPIC_ICR_LOW, lapic_read, lapic_write, wait_icr_idle};
 
 fn send_init_ipi(apic_id: u8) {
     unsafe {

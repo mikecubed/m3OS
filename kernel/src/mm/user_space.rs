@@ -9,8 +9,8 @@
 #![allow(dead_code)]
 
 use x86_64::{
-    structures::paging::{Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB},
     VirtAddr,
+    structures::paging::{Mapper, OffsetPageTable, Page, PageTableFlags, PhysFrame, Size4KiB},
 };
 
 use super::{frame_allocator, paging::GlobalFrameAlloc};
@@ -46,22 +46,24 @@ pub unsafe fn map_user_pages(
     n: u64,
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
-    debug_assert!(
-        virt_base.is_multiple_of(4096),
-        "map_user_pages: virt_base must be 4 KiB-aligned"
-    );
-    let mut alloc = GlobalFrameAlloc;
-    for i in 0..n {
-        let vaddr = VirtAddr::new(virt_base + i * 4096);
-        let page: Page<Size4KiB> = Page::containing_address(vaddr);
-        let frame = frame_allocator::allocate_frame().ok_or("out of physical frames")?;
-        // Safety: frame is freshly allocated, vaddr is within user range.
-        mapper
-            .map_to(page, frame, flags, &mut alloc)
-            .map_err(|_| "map_to failed")?
-            .flush();
+    unsafe {
+        debug_assert!(
+            virt_base.is_multiple_of(4096),
+            "map_user_pages: virt_base must be 4 KiB-aligned"
+        );
+        let mut alloc = GlobalFrameAlloc;
+        for i in 0..n {
+            let vaddr = VirtAddr::new(virt_base + i * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(vaddr);
+            let frame = frame_allocator::allocate_frame().ok_or("out of physical frames")?;
+            // Safety: frame is freshly allocated, vaddr is within user range.
+            mapper
+                .map_to(page, frame, flags, &mut alloc)
+                .map_err(|_| "map_to failed")?
+                .flush();
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Map a contiguous run of physical frames (e.g. for embedded code bytes) at `virt_base`.
@@ -78,20 +80,22 @@ pub unsafe fn map_user_frames(
     frames: &[PhysFrame<Size4KiB>],
     flags: PageTableFlags,
 ) -> Result<(), &'static str> {
-    debug_assert!(
-        virt_base.is_multiple_of(4096),
-        "map_user_frames: virt_base must be 4 KiB-aligned"
-    );
-    let mut alloc = GlobalFrameAlloc;
-    for (i, &frame) in frames.iter().enumerate() {
-        let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
-        let page: Page<Size4KiB> = Page::containing_address(vaddr);
-        mapper
-            .map_to(page, frame, flags, &mut alloc)
-            .map_err(|_| "map_to failed")?
-            .flush();
+    unsafe {
+        debug_assert!(
+            virt_base.is_multiple_of(4096),
+            "map_user_frames: virt_base must be 4 KiB-aligned"
+        );
+        let mut alloc = GlobalFrameAlloc;
+        for (i, &frame) in frames.iter().enumerate() {
+            let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(vaddr);
+            mapper
+                .map_to(page, frame, flags, &mut alloc)
+                .map_err(|_| "map_to failed")?
+                .flush();
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Copy `src` bytes into the user code region at `virt_base`.
@@ -120,26 +124,28 @@ pub fn copy_to_user(virt_base: u64, src: &[u8]) -> Result<(), &'static str> {
 ///
 /// Returns `Ok(())` on success, or an error string if any mapping operation fails.
 pub unsafe fn setup_user_memory(mapper: &mut OffsetPageTable) -> Result<(), &'static str> {
-    // Code: user-accessible, present, writable (no NO_EXECUTE flag → executable).
-    // WRITABLE is required so the kernel can copy the binary into these pages
-    // before iretq (CR0.WP prevents ring-0 writes to read-only pages).
-    // W^X (write-xor-execute) enforcement is deferred to Phase 6+ when a proper
-    // ELF loader will let us separate the copy step from the execute step.
-    let code_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    unsafe {
+        // Code: user-accessible, present, writable (no NO_EXECUTE flag → executable).
+        // WRITABLE is required so the kernel can copy the binary into these pages
+        // before iretq (CR0.WP prevents ring-0 writes to read-only pages).
+        // W^X (write-xor-execute) enforcement is deferred to Phase 6+ when a proper
+        // ELF loader will let us separate the copy step from the execute step.
+        let code_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
-    // Stack: user-accessible, present, writable, no-execute
-    let stack_flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
+        // Stack: user-accessible, present, writable, no-execute
+        let stack_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
 
-    map_user_pages(mapper, USER_CODE_BASE, USER_CODE_PAGES, code_flags)?;
-    map_user_pages(
-        mapper,
-        USER_STACK_TOP - USER_STACK_PAGES * 4096,
-        USER_STACK_PAGES,
-        stack_flags,
-    )?;
-    Ok(())
+        map_user_pages(mapper, USER_CODE_BASE, USER_CODE_PAGES, code_flags)?;
+        map_user_pages(
+            mapper,
+            USER_STACK_TOP - USER_STACK_PAGES * 4096,
+            USER_STACK_PAGES,
+            stack_flags,
+        )?;
+        Ok(())
+    }
 }

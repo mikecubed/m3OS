@@ -29,7 +29,7 @@ mod testing;
 mod tty;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
-use bootloader_api::{config::Mapping, entry_point, BootInfo, BootloaderConfig};
+use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -136,14 +136,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
         // Route the virtio-net PCI interrupt through the I/O APIC.
         let mut irq_routed = false;
-        if let Some(dev) = net::virtio_net::find_virtio_net_device() {
-            if acpi::io_apic_address().is_some() && dev.interrupt_line != 0xFF {
-                arch::x86_64::apic::route_pci_irq(
-                    dev.interrupt_line,
-                    arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
-                );
-                irq_routed = true;
-            }
+        if let Some(dev) = net::virtio_net::find_virtio_net_device()
+            && acpi::io_apic_address().is_some()
+            && dev.interrupt_line != 0xFF
+        {
+            arch::x86_64::apic::route_pci_irq(
+                dev.interrupt_line,
+                arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
+            );
+            irq_routed = true;
         }
         VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
         if !irq_routed {
@@ -766,11 +767,7 @@ fn scancode_to_char(sc: u8, shift: bool) -> Option<char> {
         0x39 => (Some(' '), Some(' ')),
         _ => (None, None),
     };
-    if shift {
-        hi
-    } else {
-        lo
-    }
+    if shift { hi } else { lo }
 }
 
 /// Send a string slice to the console server via CONSOLE_WRITE IPC.
@@ -1119,7 +1116,7 @@ fn p11_launcher_task() -> ! {
 /// so we reuse the current address space mapper to avoid allocating and
 /// leaking a per-test PML4 frame.  The mapper is never mutated.
 fn test_elf_error_cases() {
-    use mm::elf::{load_elf_into, ElfError};
+    use mm::elf::{ElfError, load_elf_into};
 
     // 64-byte "bad magic" ELF-sized buffer with wrong magic bytes.
     let bad_magic = {
@@ -1215,7 +1212,7 @@ fn test_elf_error_cases() {
 /// then wait for it to exit and log the exit code.
 fn run_elf_and_report(name: &'static str) {
     use mm::elf::load_elf_into;
-    use process::{spawn_process_with_cr3, PROCESS_TABLE};
+    use process::{PROCESS_TABLE, spawn_process_with_cr3};
 
     let data = match fs::ramdisk::get_file(name) {
         Some(d) => d,

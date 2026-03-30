@@ -1025,7 +1025,7 @@ core::arch::global_asm!(
     "syscall",
 );
 
-extern "C" {
+unsafe extern "C" {
     fn __sigrestorer();
 }
 
@@ -1099,7 +1099,7 @@ fn find_substr(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     register_sigwinch_handler();
 

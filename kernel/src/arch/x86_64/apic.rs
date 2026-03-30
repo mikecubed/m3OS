@@ -41,9 +41,11 @@ fn lapic_base() -> usize {
 /// `offset` must be a valid LAPIC register offset. The caller must ensure the
 /// LAPIC MMIO region is mapped.
 unsafe fn lapic_read(offset: usize) -> u32 {
-    // SAFETY: LAPIC MMIO is identity-mapped by the bootloader. The register
-    // is naturally aligned and 32 bits wide — volatile access is correct.
-    core::ptr::read_volatile((lapic_base() + offset) as *const u32)
+    unsafe {
+        // SAFETY: LAPIC MMIO is identity-mapped by the bootloader. The register
+        // is naturally aligned and 32 bits wide — volatile access is correct.
+        core::ptr::read_volatile((lapic_base() + offset) as *const u32)
+    }
 }
 
 /// Write a 32-bit LAPIC register.
@@ -52,8 +54,10 @@ unsafe fn lapic_read(offset: usize) -> u32 {
 /// `offset` must be a valid LAPIC register offset. The caller must ensure the
 /// LAPIC MMIO region is mapped and the write is semantically safe.
 unsafe fn lapic_write(offset: usize, value: u32) {
-    // SAFETY: same as `lapic_read`.
-    core::ptr::write_volatile((lapic_base() + offset) as *mut u32, value);
+    unsafe {
+        // SAFETY: same as `lapic_read`.
+        core::ptr::write_volatile((lapic_base() + offset) as *mut u32, value);
+    }
 }
 
 /// Signal end-of-interrupt to the Local APIC.
@@ -106,11 +110,13 @@ fn ioapic_base() -> usize {
 /// `reg` must be a valid I/O APIC register index. The I/O APIC MMIO region
 /// must be mapped.
 unsafe fn ioapic_read(reg: u32) -> u32 {
-    let base = ioapic_base();
-    // SAFETY: I/O APIC MMIO is identity-mapped. Writing to REGSEL selects
-    // the register; reading from WIN returns its value.
-    core::ptr::write_volatile(base as *mut u32, reg);
-    core::ptr::read_volatile((base + IOAPIC_WIN) as *const u32)
+    unsafe {
+        let base = ioapic_base();
+        // SAFETY: I/O APIC MMIO is identity-mapped. Writing to REGSEL selects
+        // the register; reading from WIN returns its value.
+        core::ptr::write_volatile(base as *mut u32, reg);
+        core::ptr::read_volatile((base + IOAPIC_WIN) as *const u32)
+    }
 }
 
 /// Write an I/O APIC register.
@@ -119,10 +125,12 @@ unsafe fn ioapic_read(reg: u32) -> u32 {
 /// Same requirements as `ioapic_read`, plus the value must be semantically
 /// valid for the target register.
 unsafe fn ioapic_write(reg: u32, value: u32) {
-    let base = ioapic_base();
-    // SAFETY: see `ioapic_read`.
-    core::ptr::write_volatile(base as *mut u32, reg);
-    core::ptr::write_volatile((base + IOAPIC_WIN) as *mut u32, value);
+    unsafe {
+        let base = ioapic_base();
+        // SAFETY: see `ioapic_read`.
+        core::ptr::write_volatile(base as *mut u32, reg);
+        core::ptr::write_volatile((base + IOAPIC_WIN) as *mut u32, value);
+    }
 }
 
 /// Write a 64-bit redirection table entry for the given GSI (pin).
@@ -130,11 +138,13 @@ unsafe fn ioapic_write(reg: u32, value: u32) {
 /// # Safety
 /// `gsi` must be within the I/O APIC's redirection entry count.
 unsafe fn ioapic_write_redir(gsi: u32, low: u32, high: u32) {
-    let reg_low = 0x10 + 2 * gsi;
-    let reg_high = 0x11 + 2 * gsi;
-    // SAFETY: caller guarantees `gsi` is valid.
-    ioapic_write(reg_low, low);
-    ioapic_write(reg_high, high);
+    unsafe {
+        let reg_low = 0x10 + 2 * gsi;
+        let reg_high = 0x11 + 2 * gsi;
+        // SAFETY: caller guarantees `gsi` is valid.
+        ioapic_write(reg_low, low);
+        ioapic_write(reg_high, high);
+    }
 }
 
 /// Decode MADT IRQ override flags into (active_low, level_triggered) bools.
@@ -157,8 +167,8 @@ fn decode_override_flags(flags: u16) -> (bool, bool) {
 /// Build the low 32 bits of a redirection table entry.
 fn redir_entry_low(vector: u8, active_low: bool, level_triggered: bool, masked: bool) -> u32 {
     let mut low = vector as u32; // bits 7:0 — vector
-                                 // delivery mode 000 (fixed) — bits 10:8 already zero
-                                 // dest mode 0 (physical) — bit 11 already zero
+    // delivery mode 000 (fixed) — bits 10:8 already zero
+    // dest mode 0 (physical) — bit 11 already zero
     if active_low {
         low |= 1 << 13; // polarity: active-low
     }
@@ -176,11 +186,7 @@ fn redir_entry_low(vector: u8, active_low: bool, level_triggered: bool, masked: 
 /// the resulting pin exceeds `max_redir`.
 fn gsi_to_pin(gsi: u32, gsi_base: u32, max_redir: u32) -> Option<u32> {
     let pin = gsi.checked_sub(gsi_base)?;
-    if pin <= max_redir {
-        Some(pin)
-    } else {
-        None
-    }
+    if pin <= max_redir { Some(pin) } else { None }
 }
 
 /// Program the I/O APIC redirection table.

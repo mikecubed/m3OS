@@ -41,14 +41,16 @@ impl BrkAllocator {
     }
 
     unsafe fn init(&self) {
-        let initialized = &mut *self.initialized.get();
-        if *initialized {
-            return;
+        unsafe {
+            let initialized = &mut *self.initialized.get();
+            if *initialized {
+                return;
+            }
+            // Query current brk
+            let cur = crate::brk(0);
+            self.brk_current.store(cur, Ordering::Relaxed);
+            *initialized = true;
         }
-        // Query current brk
-        let cur = crate::brk(0);
-        self.brk_current.store(cur, Ordering::Relaxed);
-        *initialized = true;
     }
 
     /// Grow the heap by at least `size` bytes (aligned to page size).
@@ -69,71 +71,75 @@ impl BrkAllocator {
 
 unsafe impl GlobalAlloc for BrkAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.init();
+        unsafe {
+            self.init();
 
-        let size = layout.size().max(8);
-        let align = layout.align().max(core::mem::align_of::<BlockHeader>());
-        let total_needed = size + core::mem::size_of::<BlockHeader>();
+            let size = layout.size().max(8);
+            let align = layout.align().max(core::mem::align_of::<BlockHeader>());
+            let total_needed = size + core::mem::size_of::<BlockHeader>();
 
-        // Search free list for a fitting block (first-fit).
-        let free_list = &mut *self.free_list.get();
-        let mut prev: *mut *mut BlockHeader = free_list;
-        let mut cur = *prev;
+            // Search free list for a fitting block (first-fit).
+            let free_list = &mut *self.free_list.get();
+            let mut prev: *mut *mut BlockHeader = free_list;
+            let mut cur = *prev;
 
-        while !cur.is_null() {
-            let block = &mut *cur;
-            let data_ptr = (cur as *mut u8).add(core::mem::size_of::<BlockHeader>());
-            let aligned = align_up(data_ptr as usize, align) as *mut u8;
-            let offset = aligned as usize - data_ptr as usize;
+            while !cur.is_null() {
+                let block = &mut *cur;
+                let data_ptr = (cur as *mut u8).add(core::mem::size_of::<BlockHeader>());
+                let aligned = align_up(data_ptr as usize, align) as *mut u8;
+                let offset = aligned as usize - data_ptr as usize;
 
-            if block.size >= size + offset {
-                // Remove from free list
-                *prev = block.next;
+                if block.size >= size + offset {
+                    // Remove from free list
+                    *prev = block.next;
 
-                // Write the actual block size just before the aligned pointer
-                // so dealloc can find it.
-                let header_ptr = (aligned as *mut BlockHeader).sub(1);
-                (*header_ptr).size = block.size - offset;
-                (*header_ptr).next = core::ptr::null_mut();
+                    // Write the actual block size just before the aligned pointer
+                    // so dealloc can find it.
+                    let header_ptr = (aligned as *mut BlockHeader).sub(1);
+                    (*header_ptr).size = block.size - offset;
+                    (*header_ptr).next = core::ptr::null_mut();
 
-                return aligned;
+                    return aligned;
+                }
+
+                prev = &mut (*cur).next;
+                cur = (*cur).next;
             }
 
-            prev = &mut (*cur).next;
-            cur = (*cur).next;
+            // No free block found — grow the heap.
+            let alloc_size = total_needed.max(MIN_BLOCK);
+            let alloc_size_aligned = (alloc_size + align - 1) & !(align - 1);
+            // Add extra for alignment
+            let raw = self.grow(alloc_size_aligned + align);
+            if raw.is_null() {
+                return core::ptr::null_mut();
+            }
+
+            // Place header at aligned position
+            let data_start = raw.add(core::mem::size_of::<BlockHeader>());
+            let aligned = align_up(data_start as usize, align) as *mut u8;
+            let header_ptr = (aligned as *mut BlockHeader).sub(1);
+            (*header_ptr).size = alloc_size_aligned + align - (aligned as usize - raw as usize);
+            (*header_ptr).next = core::ptr::null_mut();
+
+            aligned
         }
-
-        // No free block found — grow the heap.
-        let alloc_size = total_needed.max(MIN_BLOCK);
-        let alloc_size_aligned = (alloc_size + align - 1) & !(align - 1);
-        // Add extra for alignment
-        let raw = self.grow(alloc_size_aligned + align);
-        if raw.is_null() {
-            return core::ptr::null_mut();
-        }
-
-        // Place header at aligned position
-        let data_start = raw.add(core::mem::size_of::<BlockHeader>());
-        let aligned = align_up(data_start as usize, align) as *mut u8;
-        let header_ptr = (aligned as *mut BlockHeader).sub(1);
-        (*header_ptr).size = alloc_size_aligned + align - (aligned as usize - raw as usize);
-        (*header_ptr).next = core::ptr::null_mut();
-
-        aligned
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        if ptr.is_null() {
-            return;
+        unsafe {
+            if ptr.is_null() {
+                return;
+            }
+
+            // Read back the header just before the pointer.
+            let header = (ptr as *mut BlockHeader).sub(1);
+
+            // Add to front of free list.
+            let free_list = &mut *self.free_list.get();
+            (*header).next = *free_list;
+            *free_list = header;
         }
-
-        // Read back the header just before the pointer.
-        let header = (ptr as *mut BlockHeader).sub(1);
-
-        // Add to front of free list.
-        let free_list = &mut *self.free_list.get();
-        (*header).next = *free_list;
-        *free_list = header;
     }
 }
 

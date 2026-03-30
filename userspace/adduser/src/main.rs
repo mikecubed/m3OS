@@ -3,14 +3,14 @@
 #![no_main]
 
 use syscall_lib::{
-    chown, close, exit, geteuid, open, read, write, write_str, write_u64, O_RDONLY, STDOUT_FILENO,
+    O_RDONLY, STDOUT_FILENO, chown, close, exit, geteuid, open, read, write, write_str, write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/data/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/data/etc/shadow\0";
 const GROUP_PATH: &[u8] = b"/data/etc/group\0";
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     if geteuid() != 0 {
         write_str(STDOUT_FILENO, "adduser: must be root\n");

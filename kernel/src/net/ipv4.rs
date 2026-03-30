@@ -7,7 +7,7 @@ use super::virtio_net;
 
 #[allow(unused_imports)]
 pub use kernel_core::net::ipv4::{
-    build, checksum, parse, Ipv4Header, PROTO_ICMP, PROTO_TCP, PROTO_UDP,
+    Ipv4Header, PROTO_ICMP, PROTO_TCP, PROTO_UDP, build, checksum, parse,
 };
 
 /// Send an IPv4 packet to the given destination.

@@ -25,13 +25,13 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use x86_64::{
+    VirtAddr,
     instructions::{segmentation::Segment, tables::load_tss},
     registers::segmentation::{CS, DS, SS},
     structures::{
         gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector},
         tss::TaskStateSegment,
     },
-    VirtAddr,
 };
 
 use crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX;
@@ -411,13 +411,15 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
 /// Must be called on the AP core itself (not remotely from the BSP).
 /// The core must have a valid stack before calling this.
 pub unsafe fn per_core_gdt_init(data: &PerCoreData) {
-    // GDT was pre-allocated and populated on the BSP. Just load it.
-    let gdt = &*data.gdt_ptr;
-    gdt.load();
-    CS::set_reg(data.gdt_code);
-    DS::set_reg(data.gdt_data);
-    SS::set_reg(data.gdt_data);
-    load_tss(data.gdt_tss);
+    unsafe {
+        // GDT was pre-allocated and populated on the BSP. Just load it.
+        let gdt = &*data.gdt_ptr;
+        gdt.load();
+        CS::set_reg(data.gdt_code);
+        DS::set_reg(data.gdt_data);
+        SS::set_reg(data.gdt_data);
+        load_tss(data.gdt_tss);
+    }
 }
 
 // ---------------------------------------------------------------------------

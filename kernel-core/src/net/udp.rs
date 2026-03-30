@@ -122,11 +122,11 @@ impl UdpBindings {
     /// Unbind a UDP port, releasing it for future use.
     pub fn unbind(&mut self, port: u16) {
         for slot in self.bindings.iter_mut() {
-            if let Some(b) = slot {
-                if b.port == port {
-                    *slot = None;
-                    return;
-                }
+            if let Some(b) = slot
+                && b.port == port
+            {
+                *slot = None;
+                return;
             }
         }
     }

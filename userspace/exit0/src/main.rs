@@ -6,7 +6,7 @@
 
 use syscall_lib::exit;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     exit(0)
 }

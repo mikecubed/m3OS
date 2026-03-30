@@ -3,11 +3,11 @@
 #![no_main]
 
 use syscall_lib::{
-    close, execve, exit, geteuid, open, read, setgid, setuid, write, write_str, write_u64,
-    O_RDONLY, STDOUT_FILENO,
+    O_RDONLY, STDOUT_FILENO, close, execve, exit, geteuid, open, read, setgid, setuid, write,
+    write_str, write_u64,
 };
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // Read target username (default: root if empty).
     write_str(STDOUT_FILENO, "su: target user (default root): ");

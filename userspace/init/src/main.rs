@@ -11,7 +11,7 @@
 #![no_main]
 
 use syscall_lib::{
-    execve, exit, fork, mount, nanosleep, waitpid, write_str, STDOUT_FILENO, WNOHANG,
+    STDOUT_FILENO, WNOHANG, execve, exit, fork, mount, nanosleep, waitpid, write_str,
 };
 
 const LOGIN_PATH: &[u8] = b"/bin/login\0";
@@ -21,7 +21,7 @@ const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     // Fds 0/1/2 are pre-opened by the kernel for PID 1.
     write_str(STDOUT_FILENO, "\nm3OS init (PID 1)\n");

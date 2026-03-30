@@ -221,7 +221,9 @@ fn build_musl_bins() {
         {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("warning: musl-gcc not found — skipping C binary builds (install musl-tools to enable)");
+                eprintln!(
+                    "warning: musl-gcc not found — skipping C binary builds (install musl-tools to enable)"
+                );
                 // Create empty placeholders so include_bytes! doesn't fail.
                 for (_, name) in bins {
                     let dst = initrd.join(format!("{name}.elf"));
@@ -480,7 +482,9 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
     let args = qemu_args(uefi_image, &ovmf, display_mode);
 
     if display_mode == QemuDisplayMode::Gui {
-        println!("QEMU GUI mode: click the window to grab the keyboard, then press Ctrl+Alt+G to release it.");
+        println!(
+            "QEMU GUI mode: click the window to grab the keyboard, then press Ctrl+Alt+G to release it."
+        );
     }
 
     let status = Command::new("qemu-system-x86_64")
@@ -1637,12 +1641,14 @@ mod tests {
         );
 
         assert!(args.windows(2).any(|window| window == ["-display", "sdl"]));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["-audiodev", "none,id=noaudio"]));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"]));
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-audiodev", "none,id=noaudio"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"])
+        );
     }
 
     #[test]

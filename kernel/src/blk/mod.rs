@@ -7,4 +7,4 @@ pub mod mbr;
 pub mod virtio_blk;
 
 #[allow(unused_imports)]
-pub use virtio_blk::{init, read_sectors, write_sectors, VIRTIO_BLK_READY};
+pub use virtio_blk::{VIRTIO_BLK_READY, init, read_sectors, write_sectors};

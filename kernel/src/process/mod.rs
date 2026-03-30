@@ -165,15 +165,15 @@ pub fn close_cloexec_fds(pid: Pid) {
             None => return,
         };
         for slot in proc.fd_table.iter_mut() {
-            if let Some(entry) = slot {
-                if entry.cloexec {
-                    match &entry.backend {
-                        FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
-                        FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
-                        _ => {}
-                    }
-                    *slot = None;
+            if let Some(entry) = slot
+                && entry.cloexec
+            {
+                match &entry.backend {
+                    FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
+                    FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
+                    _ => {}
                 }
+                *slot = None;
             }
         }
     }
@@ -960,9 +960,9 @@ pub fn fork_child_trampoline() -> ! {
     if let Some(cr3) = cr3_phys {
         unsafe {
             use x86_64::{
+                PhysAddr,
                 registers::control::{Cr3, Cr3Flags},
                 structures::paging::{PhysFrame, Size4KiB},
-                PhysAddr,
             };
             let frame: PhysFrame<Size4KiB> =
                 PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
