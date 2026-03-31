@@ -228,7 +228,7 @@ impl TcpConnection {
 // Global TCP state
 // ===========================================================================
 
-const MAX_TCP_CONNECTIONS: usize = 4;
+const MAX_TCP_CONNECTIONS: usize = 8;
 
 struct TcpConnections {
     conns: [Option<TcpConnection>; MAX_TCP_CONNECTIONS],
@@ -237,7 +237,7 @@ struct TcpConnections {
 impl TcpConnections {
     const fn new() -> Self {
         Self {
-            conns: [None, None, None, None],
+            conns: [None, None, None, None, None, None, None, None],
         }
     }
 }

@@ -152,6 +152,7 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
             FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
+            FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
             _ => {}
         }
     }
@@ -163,6 +164,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut writers = alloc::vec::Vec::new();
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
+    let mut sockets = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -178,6 +180,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
+                    FdBackend::Socket { handle } => sockets.push(*handle),
                     _ => {}
                 }
                 *slot = None;
@@ -196,6 +199,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in pty_slaves {
         crate::pty::close_slave(id);
     }
+    for h in sockets {
+        crate::net::free_socket(h);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -211,6 +217,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut writers = alloc::vec::Vec::new();
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
+    let mut sockets = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -224,6 +231,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PipeWrite { pipe_id } => writers.push(*pipe_id),
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
+                    FdBackend::Socket { handle } => sockets.push(*handle),
                     _ => {}
                 }
             }
@@ -240,6 +248,9 @@ pub fn close_all_fds_for(pid: Pid) {
     }
     for id in pty_slaves {
         crate::pty::close_slave(id);
+    }
+    for h in sockets {
+        crate::net::free_socket(h);
     }
 }
 

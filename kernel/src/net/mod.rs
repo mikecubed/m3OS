@@ -90,6 +90,9 @@ pub struct SocketEntry {
     pub shut_rd: bool,
     /// True if shutdown(SHUT_WR) was called.
     pub shut_wr: bool,
+    /// Reference count — number of FDs (across all processes) pointing to this socket.
+    /// Only freed when this drops to zero.
+    pub refcount: u32,
 }
 
 struct SocketTable {
@@ -126,6 +129,7 @@ pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<Socket
                 options: SocketOptions::default(),
                 shut_rd: false,
                 shut_wr: false,
+                refcount: 1,
             });
             return Some(i as SocketHandle);
         }
@@ -133,25 +137,49 @@ pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<Socket
     None
 }
 
-/// Free a socket entry, cleaning up TCP/UDP resources.
+/// Decrement socket refcount; free the entry only when it reaches zero.
 pub fn free_socket(handle: SocketHandle) {
+    let mut table = SOCKET_TABLE.lock();
+    let should_free = if let Some(entry) = table
+        .entries
+        .get_mut(handle as usize)
+        .and_then(|s| s.as_mut())
+    {
+        entry.refcount = entry.refcount.saturating_sub(1);
+        entry.refcount == 0
+    } else {
+        return;
+    };
+    if should_free {
+        // Clean up TCP/UDP resources.
+        if let Some(entry) = table
+            .entries
+            .get_mut(handle as usize)
+            .and_then(|s| s.as_mut())
+        {
+            if let Some(tcp_idx) = entry.tcp_slot {
+                tcp::close(tcp_idx);
+                tcp::destroy(tcp_idx);
+            }
+            if entry.udp_bound {
+                udp::unbind(entry.local_port);
+            }
+        }
+        if let Some(slot) = table.entries.get_mut(handle as usize) {
+            *slot = None;
+        }
+    }
+}
+
+/// Increment socket refcount (called when FD table is cloned on fork).
+pub fn add_socket_ref(handle: SocketHandle) {
     let mut table = SOCKET_TABLE.lock();
     if let Some(entry) = table
         .entries
         .get_mut(handle as usize)
         .and_then(|s| s.as_mut())
     {
-        // Clean up TCP connection slot
-        if let Some(tcp_idx) = entry.tcp_slot {
-            tcp::close(tcp_idx);
-            tcp::destroy(tcp_idx);
-        }
-        if entry.udp_bound {
-            udp::unbind(entry.local_port);
-        }
-    }
-    if let Some(slot) = table.entries.get_mut(handle as usize) {
-        *slot = None;
+        entry.refcount += 1;
     }
 }
 

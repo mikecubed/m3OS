@@ -205,6 +205,8 @@ fn build_musl_bins() {
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
+        // Phase 30: telnet server
+        ("userspace/telnetd/telnetd.c", "telnetd"),
     ];
 
     for (src_rel, name) in bins {
@@ -462,7 +464,7 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         "-device".to_string(),
         "virtio-net-pci,netdev=net0".to_string(),
         "-netdev".to_string(),
-        "user,id=net0".to_string(),
+        "user,id=net0,hostfwd=tcp::2323-:23".to_string(),
     ]);
 
     // Phase 24: virtio-blk data disk.
