@@ -254,6 +254,9 @@ pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
 
+// Phase 32: File timestamp syscall
+pub const SYS_UTIMENSAT: u64 = 280;
+
 // ===========================================================================
 // File flags and constants
 // ===========================================================================
