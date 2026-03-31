@@ -16,6 +16,8 @@ use syscall_lib::{
 
 const LOGIN_PATH: &[u8] = b"/bin/login\0";
 const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
+const TELNETD_PATH: &[u8] = b"/bin/telnetd\0";
+const TELNETD_ARGV0: &[u8] = b"/bin/telnetd\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -38,6 +40,9 @@ pub extern "C" fn _start() -> ! {
 
     // Make /tmp world-writable so non-root users can create files.
     syscall_lib::chmod(b"/tmp\0", 0o1777);
+
+    // Phase 30: spawn telnetd daemon (background, not waited on).
+    spawn_telnetd();
 
     // Spawn the first login session.
     let mut login_pid = spawn_login();
@@ -92,6 +97,24 @@ fn spawn_login() -> isize {
         return -1;
     }
     pid
+}
+
+fn spawn_telnetd() {
+    let pid = fork();
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: telnetd fork failed\n");
+        return;
+    }
+    if pid == 0 {
+        let envp: [*const u8; 3] = [ENV_PATH.as_ptr(), ENV_HOME.as_ptr(), core::ptr::null()];
+        let argv: [*const u8; 2] = [TELNETD_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(TELNETD_PATH, &argv, &envp);
+        write_str(STDOUT_FILENO, "init: telnetd execve failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+        exit(1);
+    }
+    write_str(STDOUT_FILENO, "init: telnetd forked\n");
 }
 
 #[panic_handler]

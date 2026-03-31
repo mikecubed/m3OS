@@ -86,6 +86,7 @@ static PASSWD_ELF: &[u8] = include_bytes!("../../initrd/passwd.elf");
 static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser.elf");
 static ID_ELF: &[u8] = include_bytes!("../../initrd/id.elf");
 static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami.elf");
+static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -202,6 +203,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "whoami.elf",
         RamdiskNode::File {
             content: WHOAMI_ELF,
+        },
+    ),
+    (
+        "telnetd",
+        RamdiskNode::File {
+            content: TELNETD_ELF,
+        },
+    ),
+    (
+        "telnetd.elf",
+        RamdiskNode::File {
+            content: TELNETD_ELF,
         },
     ),
 ];

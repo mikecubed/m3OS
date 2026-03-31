@@ -228,7 +228,7 @@ impl TcpConnection {
 // Global TCP state
 // ===========================================================================
 
-const MAX_TCP_CONNECTIONS: usize = 4;
+const MAX_TCP_CONNECTIONS: usize = 8;
 
 struct TcpConnections {
     conns: [Option<TcpConnection>; MAX_TCP_CONNECTIONS],
@@ -237,7 +237,7 @@ struct TcpConnections {
 impl TcpConnections {
     const fn new() -> Self {
         Self {
-            conns: [None, None, None, None],
+            conns: [None, None, None, None, None, None, None, None],
         }
     }
 }
@@ -351,19 +351,35 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
 
     let mut conns = TCP_CONNS.lock();
 
-    for conn in conns.conns.iter_mut().flatten() {
+    // First pass: prefer exact (established) match over listen match.
+    // This prevents a listen socket on the same port from stealing
+    // data segments destined for an established connection.
+    let mut listen_idx: Option<usize> = None;
+    for (i, conn) in conns.conns.iter_mut().enumerate() {
+        let conn = match conn.as_mut() {
+            Some(c) => c,
+            None => continue,
+        };
         let port_match = conn.local_port == tcp_hdr.dst_port;
-        let is_listen = conn.state == TcpState::Listen;
-        let full_match =
-            port_match && conn.remote_ip == ip_header.src && conn.remote_port == tcp_hdr.src_port;
-
-        if full_match || (is_listen && port_match) {
-            if is_listen {
-                conn.remote_ip = ip_header.src;
-            }
+        if !port_match {
+            continue;
+        }
+        let full_match = conn.remote_ip == ip_header.src && conn.remote_port == tcp_hdr.src_port;
+        if full_match {
             conn.handle_segment(&tcp_hdr, tcp_data);
             return;
         }
+        if conn.state == TcpState::Listen && listen_idx.is_none() {
+            listen_idx = Some(i);
+        }
+    }
+    // No established match — fall back to listen socket (for SYN).
+    if let Some(idx) = listen_idx
+        && let Some(conn) = conns.conns[idx].as_mut()
+    {
+        conn.remote_ip = ip_header.src;
+        conn.handle_segment(&tcp_hdr, tcp_data);
+        return;
     }
 
     if tcp_hdr.flags & TCP_RST == 0 {

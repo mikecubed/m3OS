@@ -205,6 +205,8 @@ fn build_musl_bins() {
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
+        // Phase 30: telnet server
+        ("userspace/telnetd/telnetd.c", "telnetd"),
     ];
 
     for (src_rel, name) in bins {
@@ -458,11 +460,13 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
     }
 
     // Phase 16: virtio-net NIC with QEMU user-mode networking.
+    // Phase 30: port-forward host 2323 → guest 23 for telnet access.
+    // Use a plain netdev for test mode to avoid port conflicts.
     args.extend([
         "-device".to_string(),
         "virtio-net-pci,netdev=net0".to_string(),
         "-netdev".to_string(),
-        "user,id=net0".to_string(),
+        "user,id=net0,hostfwd=tcp::2323-:23".to_string(),
     ]);
 
     // Phase 24: virtio-blk data disk.
@@ -712,6 +716,12 @@ fn qemu_test_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> 
         QemuDisplayMode::Headless
     };
     let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    // Strip hostfwd from netdev to avoid port conflicts during tests.
+    for arg in args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
     // Add ISA debug exit device so the test kernel can signal pass/fail.
     args.extend([
         "-device".to_string(),

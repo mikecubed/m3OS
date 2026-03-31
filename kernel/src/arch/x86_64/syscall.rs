@@ -1288,14 +1288,8 @@ fn sys_dup(oldfd: u64) -> u64 {
         None => return NEG_EBADF,
     };
 
-    // Increment refcount for the duplicated FD.
-    match &entry.backend {
-        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
-        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
-        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
-        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
-        _ => {}
-    }
+    // Remember backend info so we only bump refcount on successful alloc.
+    let backend_clone = entry.backend.clone();
 
     // POSIX: dup always clears FD_CLOEXEC on the new descriptor.
     let mut entry_copy = entry;
@@ -1303,6 +1297,15 @@ fn sys_dup(oldfd: u64) -> u64 {
 
     match alloc_fd(0, entry_copy) {
         Some(newfd) => {
+            // Increment refcount only after successful allocation.
+            match &backend_clone {
+                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+                FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+                FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
+                FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+                _ => {}
+            }
             log::info!("[dup] fd {} → fd {}", oldfd, newfd);
             newfd as u64
         }
@@ -1343,6 +1346,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
+        FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
         _ => {}
     }
 
@@ -2619,7 +2623,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             }
                             return n as u64;
                         }
-                        if pair.slave_refcount == 0 {
+                        if pair.slave_refcount == 0 && pair.slave_opened {
                             return 0; // EOF — slave closed
                         }
                     } else {
@@ -3408,7 +3412,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
                     None => return NEG_ENOENT,
                     Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => pair.slave_refcount += 1,
+                    Some(pair) => {
+                        pair.slave_refcount += 1;
+                        pair.slave_opened = true;
+                    }
                 }
             }
             let entry = FdEntry {
@@ -3862,7 +3869,10 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
                     None => return NEG_ENOENT,
                     Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => pair.slave_refcount += 1,
+                    Some(pair) => {
+                        pair.slave_refcount += 1;
+                        pair.slave_opened = true;
+                    }
                 }
             }
             let entry = FdEntry {
@@ -5061,6 +5071,10 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+    // Musl declares ioctl(int, int, ...) — the request code is sign-extended
+    // from 32 bits.  Truncate to u32 so _IOR/_IOW constants with bit 31 set
+    // (e.g., TIOCGPTN = 0x80045430) compare correctly.
+    let req = (req as u32) as u64;
     use kernel_core::tty::{TERMIOS_SIZE, WINSIZE_SIZE};
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
@@ -6412,6 +6426,9 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::PtySlave { pty_id } => {
                             crate::pty::add_slave_ref(*pty_id);
                         }
+                        FdBackend::Socket { handle } => {
+                            crate::net::add_socket_ref(*handle);
+                        }
                         _ => {}
                     }
                     new_fd as u64
@@ -7613,18 +7630,32 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                             const POLLOUT: i16 = 0x004;
                             const POLLHUP: i16 = 0x010;
                             let h = *handle;
-                            if let Some((readable, writable, closed)) =
-                                crate::net::with_socket(h, |s| {
+                            if let Some((readable, writable, closed)) = crate::net::with_socket(
+                                h,
+                                |s| {
                                     let readable = match s.protocol {
                                         crate::net::SocketProtocol::Tcp => {
                                             if let Some(tcp_idx) = s.tcp_slot {
-                                                crate::net::tcp::has_recv_data(tcp_idx)
-                                                    || matches!(
+                                                // Listening socket: POLLIN when a
+                                                // connection is ready to accept.
+                                                if matches!(
+                                                    s.state,
+                                                    crate::net::SocketState::Listening
+                                                ) {
+                                                    matches!(
                                                         crate::net::tcp::state(tcp_idx),
-                                                        crate::net::tcp::TcpState::CloseWait
-                                                            | crate::net::tcp::TcpState::Closed
-                                                            | crate::net::tcp::TcpState::TimeWait
+                                                        crate::net::tcp::TcpState::Established
+                                                            | crate::net::tcp::TcpState::CloseWait
                                                     )
+                                                } else {
+                                                    crate::net::tcp::has_recv_data(tcp_idx)
+                                                        || matches!(
+                                                            crate::net::tcp::state(tcp_idx),
+                                                            crate::net::tcp::TcpState::CloseWait
+                                                                | crate::net::tcp::TcpState::Closed
+                                                                | crate::net::tcp::TcpState::TimeWait
+                                                        )
+                                                }
                                             } else {
                                                 false
                                             }
@@ -7649,8 +7680,8 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                                     };
                                     let closed = matches!(s.state, crate::net::SocketState::Closed);
                                     (readable, writable, closed)
-                                })
-                            {
+                                },
+                            ) {
                                 if readable && events & POLLIN != 0 {
                                     revents |= POLLIN;
                                 }
@@ -7660,6 +7691,36 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                                 if closed {
                                     revents |= POLLHUP;
                                 }
+                            }
+                        }
+                        FdBackend::PtyMaster { pty_id } => {
+                            const POLLOUT: i16 = 0x004;
+                            const POLLHUP: i16 = 0x010;
+                            const POLLNVAL: i16 = 0x020;
+                            let id = *pty_id;
+                            let table = crate::pty::PTY_TABLE.lock();
+                            if let Some(slot) = table.get(id as usize) {
+                                if let Some(pair) = slot.as_ref() {
+                                    // POLLIN: slave wrote data to s2m buffer.
+                                    if !pair.s2m.is_empty() && events & POLLIN != 0 {
+                                        revents |= POLLIN;
+                                    }
+                                    // POLLHUP: slave side fully closed.
+                                    if pair.slave_refcount == 0 && pair.slave_opened {
+                                        revents |= POLLHUP;
+                                        if events & POLLIN != 0 {
+                                            revents |= POLLIN;
+                                        }
+                                    }
+                                    // POLLOUT: m2s buffer has space.
+                                    if !pair.m2s.is_full() && events & POLLOUT != 0 {
+                                        revents |= POLLOUT;
+                                    }
+                                } else {
+                                    revents |= POLLHUP;
+                                }
+                            } else {
+                                revents |= POLLNVAL;
                             }
                         }
                         _ => {

@@ -51,10 +51,12 @@ pub fn add_slave_ref(id: u32) {
     let mut table = PTY_TABLE.lock();
     if let Some(Some(pair)) = table.get_mut(id as usize) {
         pair.slave_refcount += 1;
+        pair.slave_opened = true;
     }
 }
 
 /// Close one master reference. Sends SIGHUP when last ref is closed.
+/// Also frees the PTY pair if the slave side has already fully closed.
 pub fn close_master(id: u32) {
     let fg;
     {
@@ -64,12 +66,16 @@ pub fn close_master(id: u32) {
                 pair.master_refcount -= 1;
             }
             fg = if pair.master_refcount == 0 {
-                let pgid = pair.slave_fg_pgid;
-                try_free(&mut table, id);
-                pgid
+                pair.slave_fg_pgid
             } else {
                 0
             };
+            // Free if both sides are done and the slave was opened at
+            // least once (prevents a race where master is closed by a
+            // forked child before the slave has been opened).
+            if pair.master_refcount == 0 && pair.slave_refcount == 0 && pair.slave_opened {
+                try_free(&mut table, id);
+            }
         } else {
             return;
         }
