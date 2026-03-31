@@ -54,6 +54,14 @@ fn main() {
             });
             cmd_test(&test_args);
         }
+        Some("smoke-test") => {
+            let smoke_args = parse_smoke_test_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_smoke_test(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -82,7 +90,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -1153,6 +1161,365 @@ fn cmd_test(test_args: &TestArgs) {
     } else {
         eprintln!("\nSome tests failed");
         std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smoke test: boot full OS in QEMU, inject serial input, verify output
+// ---------------------------------------------------------------------------
+
+/// A single step in an expect-style smoke test script.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum SmokeStep {
+    /// Wait for `pattern` to appear in serial output within `timeout_secs`.
+    Wait {
+        pattern: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+    },
+    /// Send `input` to QEMU stdin (serial input to guest OS).
+    Send {
+        input: &'static str,
+        label: &'static str,
+    },
+    /// Pause between steps.
+    Sleep { millis: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct SmokeTestArgs {
+    display: bool,
+    timeout_secs: u64,
+}
+
+fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
+    let mut display = false;
+    let mut timeout_secs = 120u64;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--display" => display = true,
+            "--timeout" => {
+                index += 1;
+                timeout_secs = args
+                    .get(index)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            other => return Err(format!("unknown smoke-test flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(SmokeTestArgs {
+        display,
+        timeout_secs,
+    })
+}
+
+/// Strip ANSI CSI escape sequences from a string.
+///
+/// Handles: ESC [ <params> <letter>  and  ESC <single-char>.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // ESC [ ... <letter>
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // consume parameter bytes (0-9 ; ? and space)
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() || c == ';' || c == '?' || c == ' ' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // consume final byte (letter @ through ~)
+                if let Some(&c) = chars.peek() {
+                    if c.is_ascii() && (c as u8) >= b'@' && (c as u8) <= b'~' {
+                        chars.next();
+                    }
+                }
+            } else {
+                // ESC + single character (e.g., ESC c)
+                chars.next();
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
+/// Background serial output reader.
+///
+/// Spawns a thread that reads from `stdout` and sends chunks over the channel.
+/// The thread exits when the pipe closes (QEMU exits).
+fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// Run an expect-style smoke test script against a running QEMU instance.
+///
+/// Returns `Ok(())` on success or `Err(message)` on failure.
+fn run_smoke_script(
+    child: &mut std::process::Child,
+    steps: &[SmokeStep],
+    global_timeout: std::time::Duration,
+) -> Result<(), String> {
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let rx = spawn_serial_reader(stdout);
+
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let total = steps.len();
+
+    for (i, step) in steps.iter().enumerate() {
+        // Global timeout check.
+        if global_start.elapsed() > global_timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "global timeout ({global_timeout:?}) exceeded at step {}/{}",
+                i + 1,
+                total
+            ));
+        }
+
+        match step {
+            SmokeStep::Wait {
+                pattern,
+                timeout_secs,
+                label,
+            } => {
+                println!(
+                    "[step {}/{}] wait: {label} ({}s)",
+                    i + 1,
+                    total,
+                    timeout_secs
+                );
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+
+                loop {
+                    // Drain any available output.
+                    while let Ok(chunk) = rx.try_recv() {
+                        let text = String::from_utf8_lossy(&chunk);
+                        serial_buf.push_str(&text);
+                    }
+
+                    // Check for pattern in stripped output.
+                    let stripped = strip_ansi(&serial_buf);
+                    if stripped.contains(pattern) {
+                        // Clear buffer up to and including the match to avoid
+                        // re-matching old output in future steps.
+                        serial_buf.clear();
+                        break;
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                        return Err(format!(
+                            "step {}/{} timed out: {label}\n\
+                             expected pattern: \"{pattern}\"\n\
+                             last serial output:\n{tail}",
+                            i + 1,
+                            total
+                        ));
+                    }
+
+                    // Wait a bit before polling again.
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // QEMU exited.
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            if stripped.contains(pattern) {
+                                serial_buf.clear();
+                                break;
+                            }
+                            let tail = tail_lines(&stripped, 50);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}/{}: {label}\n\
+                                 expected pattern: \"{pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                i + 1,
+                                total
+                            ));
+                        }
+                    }
+
+                    // Trim buffer to prevent unbounded growth (keep last 64 KB).
+                    if serial_buf.len() > 64 * 1024 {
+                        let cut = serial_buf.len() - 48 * 1024;
+                        serial_buf.drain(..cut);
+                    }
+                }
+            }
+
+            SmokeStep::Send { input, label } => {
+                println!("[step {}/{}] send: {label}", i + 1, total);
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    if stdin.write_all(input.as_bytes()).is_err() {
+                        return Err(format!("failed to send input at step {}: {label}", i + 1));
+                    }
+                    let _ = stdin.flush();
+                } else {
+                    return Err(format!("no stdin pipe at step {}: {label}", i + 1));
+                }
+            }
+
+            SmokeStep::Sleep { millis } => {
+                println!("[step {}/{}] sleep {}ms", i + 1, total, millis);
+                std::thread::sleep(std::time::Duration::from_millis(*millis));
+            }
+        }
+    }
+
+    // All steps passed — kill QEMU.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Return the last `n` lines of a string.
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Phase 31 smoke test script: login, run TCC, compile and run hello.c.
+fn smoke_test_phase31() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "login:",
+            timeout_secs: 60,
+            label: "wait for login prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter username",
+        },
+        SmokeStep::Wait {
+            pattern: "Password:",
+            timeout_secs: 10,
+            label: "wait for password prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter password",
+        },
+        SmokeStep::Wait {
+            pattern: "$ ",
+            timeout_secs: 10,
+            label: "wait for shell prompt",
+        },
+        SmokeStep::Send {
+            input: "/usr/bin/tcc --version\n",
+            label: "run tcc --version",
+        },
+        SmokeStep::Wait {
+            pattern: "tcc version",
+            timeout_secs: 15,
+            label: "verify TCC version output",
+        },
+        SmokeStep::Wait {
+            pattern: "$ ",
+            timeout_secs: 5,
+            label: "wait for shell prompt after tcc --version",
+        },
+        SmokeStep::Send {
+            input: "tcc /usr/src/hello.c -o /tmp/hello\n",
+            label: "compile hello.c",
+        },
+        SmokeStep::Wait {
+            pattern: "$ ",
+            timeout_secs: 30,
+            label: "wait for compilation to finish",
+        },
+        SmokeStep::Send {
+            input: "/tmp/hello\n",
+            label: "run compiled hello",
+        },
+        SmokeStep::Wait {
+            pattern: "hello, world",
+            timeout_secs: 15,
+            label: "verify hello world output",
+        },
+    ]
+}
+
+fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
+
+    let ovmf = find_ovmf();
+    let display_mode = if smoke_args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let args = qemu_args(&uefi_image, &ovmf, display_mode);
+
+    println!("smoke-test: launching QEMU...");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let steps = smoke_test_phase31();
+    let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("smoke-test: PASSED ({} steps in {}s)", steps.len(), elapsed);
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("smoke-test: FAILED\n{msg}");
+            std::process::exit(1);
+        }
     }
 }
 
