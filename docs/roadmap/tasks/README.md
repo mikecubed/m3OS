@@ -118,7 +118,16 @@ flowchart TD
 | Phase | Focus | Task List |
 |---|---|---|
 | 25 | SMP (AP startup, per-core scheduler, TLB shootdown) | [Phase 25 Tasks](./25-smp-tasks.md) |
-| 25 | Compiler bootstrap (TCC self-hosting) | *not yet created* |
+| 26 | Text editor (kibi-style full-screen editor) | [Phase 26 Tasks](./26-text-editor-tasks.md) |
+| 27 | User accounts (login, passwd, multi-user) | [Phase 27 Tasks](./27-user-accounts-tasks.md) |
+| 28 | ext2 filesystem (persistent storage) | [Phase 28 Tasks](./28-ext2-filesystem-tasks.md) |
+| 29 | PTY subsystem (pseudo-terminal pairs) | [Phase 29 Tasks](./29-pty-subsystem-tasks.md) |
+
+### Productivity Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 30 | Telnet server (remote shell access) | [Phase 30 Tasks](./30-telnet-server-tasks.md) |
 
 ## Suggested Usage
 
