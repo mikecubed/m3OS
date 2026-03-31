@@ -3263,6 +3263,9 @@ fn is_directory(path: &str) -> bool {
 /// Used by `sys_execve` to load binaries from persistent storage instead of
 /// only the ramdisk. Returns `None` if the file is not found on any disk.
 fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    /// Maximum executable size we are willing to load (16 MB).
+    const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
+
     // Try ext2 root filesystem first (most likely location for compiled binaries).
     if crate::fs::ext2::is_mounted() {
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
@@ -3272,6 +3275,15 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
                 && let Ok(inode) = vol.read_inode(inode_num)
             {
                 let size = inode.size as usize;
+                if size > MAX_EXEC_SIZE {
+                    log::warn!(
+                        "[exec] file too large ({} bytes > {} limit): {}",
+                        size,
+                        MAX_EXEC_SIZE,
+                        path
+                    );
+                    return None;
+                }
                 if size > 0 {
                     let mut buf = alloc::vec![0u8; size];
                     if let Ok(n) = vol.read_file_data(&inode, 0, &mut buf) {
@@ -3312,6 +3324,15 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
             && !entry.is_dir()
         {
             let size = entry.file_size as usize;
+            if size > MAX_EXEC_SIZE {
+                log::warn!(
+                    "[exec] file too large ({} bytes > {} limit): {}",
+                    size,
+                    MAX_EXEC_SIZE,
+                    path
+                );
+                return None;
+            }
             if size > 0 {
                 let cluster = entry.start_cluster();
                 let mut buf = alloc::vec![0u8; size];
@@ -3703,11 +3724,16 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                         // output files.
                         if truncate && writable {
                             let old_cluster = entry.start_cluster();
-                            if old_cluster >= 2 {
-                                let _ = vol.free_chain(old_cluster);
+                            if old_cluster >= 2 && vol.free_chain(old_cluster).is_err() {
+                                return NEG_EIO;
                             }
                             let file_short = rel.rsplit('/').next().unwrap_or(rel);
-                            let _ = vol.update_dir_entry(parent_cluster, file_short, 0, 0);
+                            if vol
+                                .update_dir_entry(parent_cluster, file_short, 0, 0)
+                                .is_err()
+                            {
+                                return NEG_EIO;
+                            }
                             fd_entry.backend = FdBackend::Fat32Disk {
                                 path: alloc::string::String::from(rel),
                                 start_cluster: 0,
@@ -4859,10 +4885,13 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     };
     // Phase 31: honour PROT_EXEC — omit NO_EXECUTE when the caller requests
     // executable memory (needed for TCC's `-run` JIT mode).
+    const PROT_WRITE: u64 = 0x2;
     const PROT_EXEC: u64 = 0x4;
     let flags_pt = {
-        let mut f =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if prot & PROT_WRITE != 0 {
+            f |= PageTableFlags::WRITABLE;
+        }
         if prot & PROT_EXEC == 0 {
             f |= PageTableFlags::NO_EXECUTE;
         }

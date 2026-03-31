@@ -48,7 +48,7 @@ Needs to be added:
 | A | Cross-compile TCC and musl library artifacts on the host | — | Done |
 | B | Filesystem layout and disk image packaging | A | Done |
 | C | Kernel syscall audit and fixes for TCC compatibility | — | Done |
-| D | Basic compilation test: hello.c → hello → run | A, B, C | Deferred (manual QEMU) |
+| D | Basic compilation test: hello.c → hello → run | A, B, C | Done (automated smoke test) |
 | E | Advanced compilation and self-hosting milestone | D | Deferred (manual QEMU) |
 | F | Integration testing and validation | All | Partial (check + tests pass) |
 | G | Documentation | All | Done |

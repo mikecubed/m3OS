@@ -419,6 +419,11 @@ fn build_tcc() -> Option<PathBuf> {
 
     // Clone TCC source.
     let tcc_src = root.join("target/tcc-src");
+    if tcc_src.exists() && !tcc_src.join("configure").exists() {
+        // Incomplete clone — delete and re-clone.
+        eprintln!("tcc: incomplete tcc-src cache (configure missing), re-cloning...");
+        let _ = fs::remove_dir_all(&tcc_src);
+    }
     if !tcc_src.join("configure").exists() {
         println!("tcc: cloning TCC from repo.or.cz...");
         let status = Command::new("git")
@@ -1383,8 +1388,10 @@ fn run_smoke_script(
                     total,
                     timeout_secs
                 );
-                let deadline =
+                let step_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
 
                 loop {
                     // Drain any available output.
@@ -1395,10 +1402,42 @@ fn run_smoke_script(
 
                     // Check for pattern in stripped output.
                     let stripped = strip_ansi(&serial_buf);
-                    if stripped.contains(pattern) {
-                        // Clear buffer up to and including the match to avoid
-                        // re-matching old output in future steps.
-                        serial_buf.clear();
+                    if let Some(pos) = stripped.find(pattern) {
+                        // Drain buffer up to end of match to avoid re-matching
+                        // old output while preserving any post-match content.
+                        let drain_end = pos + pattern.len();
+                        // The stripped string may differ in length from
+                        // serial_buf (ANSI sequences removed), so drain the
+                        // same number of *raw* characters that correspond to
+                        // the stripped prefix.  A simple and correct approach:
+                        // rebuild the stripped prefix from serial_buf and find
+                        // how many raw chars produce `drain_end` stripped chars.
+                        let mut raw_idx = 0;
+                        let mut stripped_count = 0;
+                        let raw_bytes = serial_buf.as_bytes();
+                        while stripped_count < drain_end && raw_idx < raw_bytes.len() {
+                            if raw_bytes[raw_idx] == 0x1b {
+                                // Skip ESC sequence.
+                                raw_idx += 1;
+                                if raw_idx < raw_bytes.len() && raw_bytes[raw_idx] == b'[' {
+                                    raw_idx += 1;
+                                    while raw_idx < raw_bytes.len()
+                                        && !raw_bytes[raw_idx].is_ascii_alphabetic()
+                                    {
+                                        raw_idx += 1;
+                                    }
+                                    if raw_idx < raw_bytes.len() {
+                                        raw_idx += 1; // skip final letter
+                                    }
+                                } else if raw_idx < raw_bytes.len() {
+                                    raw_idx += 1; // skip single-char escape
+                                }
+                            } else {
+                                raw_idx += 1;
+                                stripped_count += 1;
+                            }
+                        }
+                        serial_buf.drain(..raw_idx);
                         break;
                     }
 
@@ -1544,6 +1583,17 @@ fn smoke_test_phase31() -> Vec<SmokeStep> {
 }
 
 fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
+    // Fail fast if TCC was not built — avoids a slow QEMU timeout.
+    let tcc_staging_bin = workspace_root().join("target/tcc-staging/usr/bin/tcc");
+    if !tcc_staging_bin.exists() {
+        eprintln!(
+            "error: TCC binary not found at {}\n\
+             Run `cargo xtask image` first to build TCC, or install musl-tools.",
+            tcc_staging_bin.display()
+        );
+        std::process::exit(1);
+    }
+
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
