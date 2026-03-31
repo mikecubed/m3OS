@@ -250,4 +250,4 @@ Read before making significant changes:
 | `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
-Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–38) with corresponding `docs/roadmap/tasks/` breakdowns.
+Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–45) with corresponding `docs/roadmap/tasks/` breakdowns.

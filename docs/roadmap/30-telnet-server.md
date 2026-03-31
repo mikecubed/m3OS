@@ -102,7 +102,7 @@ Telnet transmits everything in plaintext, including passwords. This is acceptabl
 - Trusted local networks during development
 - Learning the protocol concepts
 
-Phase 35 (SSH) will provide encrypted remote access for untrusted networks.
+Phase 42 (SSH) will provide encrypted remote access for untrusted networks.
 
 ## Deferred Until Later
 

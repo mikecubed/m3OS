@@ -1,4 +1,4 @@
-# Phase 36 - Rust Cross-Compilation Pipeline
+# Phase 43 - Rust Cross-Compilation Pipeline
 
 ## Milestone Goal
 
@@ -119,7 +119,7 @@ Extend the `cargo xtask` build system to:
 
 ## Companion Task List
 
-- [Phase 36 Task List](./tasks/36-rust-cross-compilation-tasks.md)
+- [Phase 43 Task List](./tasks/43-rust-cross-compilation-tasks.md)
 
 ## How Real OS Implementations Differ
 

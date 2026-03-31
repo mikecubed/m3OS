@@ -71,20 +71,43 @@ flowchart TD
     P14 --> P31
     P31 --> P32["32. Build Tools"]
     P26 --> P32
-    P14 --> P33["33. Expanded Coreutils"]
-    P27 --> P33
-    P31 --> P34["34. Crypto Primitives"]
-    P34 --> P35["35. SSH Server"]
-    P29 --> P35
-    P27 --> P35
-    P12 --> P36["36. Rust Cross-Compilation"]
-    P24 --> P36
-    P31 --> P37["37. Ports System"]
-    P32 --> P37
-    P33 --> P37
-    P27 --> P38["38. System Services"]
-    P30 --> P38
-    P24 --> P38
+
+    %% Kernel infrastructure phases
+    P17 --> P33["33. Kernel Memory"]
+    P25 --> P33
+    P15 --> P34["34. Real-Time Clock"]
+    P25 --> P35["35. True SMP"]
+    P33 --> P35
+    P23 --> P36["36. I/O Multiplexing"]
+    P22 --> P36
+    P35 --> P36
+    P28 --> P37["37. Filesystem Enhancements"]
+    P27 --> P37
+    P23 --> P38["38. Unix Domain Sockets"]
+    P37 --> P38
+    P36 --> P38
+    P35 --> P39["39. Threading"]
+    P33 --> P39
+
+    %% Application phases
+    P14 --> P40["40. Expanded Coreutils"]
+    P27 --> P40
+    P37 --> P40
+    P31 --> P41["41. Crypto Primitives"]
+    P41 --> P42["42. SSH Server"]
+    P29 --> P42
+    P27 --> P42
+    P36 --> P42
+    P12 --> P43["43. Rust Cross-Compilation"]
+    P24 --> P43
+    P31 --> P44["44. Ports System"]
+    P32 --> P44
+    P40 --> P44
+    P27 --> P45["45. System Services"]
+    P30 --> P45
+    P24 --> P45
+    P34 --> P45
+    P38 --> P45
 ```
 
 ## Detailed Phase Pages
@@ -141,12 +164,29 @@ flowchart TD
 | 30 | Telnet server for remote shell access | [Telnet Server](./roadmap/30-telnet-server.md) |
 | 31 | TCC compiles C programs and itself inside the OS | [Compiler Bootstrap](./roadmap/31-compiler-bootstrap.md) |
 | 32 | make, ar, and scripting for multi-file projects | [Build Tools](./roadmap/32-build-tools.md) |
-| 33 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/33-expanded-coreutils.md) |
-| 34 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/34-crypto-primitives.md) |
-| 35 | SSH server for encrypted remote access | [SSH Server](./roadmap/35-ssh-server.md) |
-| 36 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/36-rust-cross-compilation.md) |
-| 37 | Source-based ports tree for building third-party software | [Ports System](./roadmap/37-ports-system.md) |
-| 38 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/38-system-services.md) |
+
+### Kernel Infrastructure Phases (planned — "Linux/Unix compatibility and performance")
+
+| Phase | Focus | Link |
+|---|---|---|
+| 33 | Slab allocator, OOM retry, working munmap, heap coalescing | [Kernel Memory Improvements](./roadmap/33-kernel-memory-improvements.md) |
+| 34 | CMOS RTC driver, wall-clock time, CLOCK_REALTIME | [Real-Time Clock](./roadmap/34-real-time-clock.md) |
+| 35 | Per-core syscall stacks, multi-core dispatch, priorities, load balancing | [True SMP Multitasking](./roadmap/35-true-smp-multitasking.md) |
+| 36 | select, epoll, non-blocking I/O | [I/O Multiplexing](./roadmap/36-io-multiplexing.md) |
+| 37 | Symlinks, hard links, /proc, permission enforcement, device nodes | [Filesystem Enhancements](./roadmap/37-filesystem-enhancements.md) |
+| 38 | AF_UNIX stream and datagram sockets, socketpair | [Unix Domain Sockets](./roadmap/38-unix-domain-sockets.md) |
+| 39 | clone CLONE_THREAD, futex, TLS, thread groups | [Threading Primitives](./roadmap/39-threading-primitives.md) |
+
+### Application Phases (planned — "ecosystem and services")
+
+| Phase | Focus | Link |
+|---|---|---|
+| 40 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/40-expanded-coreutils.md) |
+| 41 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/41-crypto-primitives.md) |
+| 42 | SSH server for encrypted remote access | [SSH Server](./roadmap/42-ssh-server.md) |
+| 43 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/43-rust-cross-compilation.md) |
+| 44 | Source-based ports tree for building third-party software | [Ports System](./roadmap/44-ports-system.md) |
+| 45 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/45-system-services.md) |
 
 ## Documentation Expectation Per Phase
 

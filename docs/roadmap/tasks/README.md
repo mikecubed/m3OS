@@ -70,6 +70,11 @@ flowchart TD
     P4 --> P25
     P20 --> P26["Phase 26 Tasks"]
     P24 --> P26
+    P25 --> P33["Phase 33 Tasks"]
+    P17 --> P33
+    P33 --> P35["Phase 35 Tasks"]
+    P35 --> P36["Phase 36 Tasks"]
+    P35 --> P39["Phase 39 Tasks"]
 ```
 
 ## Task Documents
@@ -89,7 +94,7 @@ flowchart TD
 | 9 | Framebuffer and shell | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot signing | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
 
-### POSIX and Userspace Phases
+### POSIX and Userspace Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -100,7 +105,7 @@ flowchart TD
 | 15 | Hardware discovery (ACPI + PCI) | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
 | 16 | Network stack | [Phase 16 Tasks](./16-network-tasks.md) |
 
-### Usability Phases
+### Usability Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -113,7 +118,7 @@ flowchart TD
 | 23 | Socket API (BSD sockets over TCP/UDP stack) | [Phase 23 Tasks](./23-socket-api-tasks.md) |
 | 24 | Persistent storage (virtio-blk, FAT32 r/w) | [Phase 24 Tasks](./24-persistent-storage-tasks.md) |
 
-### Advanced Phases
+### Advanced Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -128,6 +133,31 @@ flowchart TD
 | Phase | Focus | Task List |
 |---|---|---|
 | 30 | Telnet server (remote shell access) | [Phase 30 Tasks](./30-telnet-server-tasks.md) |
+| 31 | Compiler bootstrap (TCC) | [Phase 31 Tasks](./31-compiler-bootstrap-tasks.md) |
+| 32 | Build tools (make, ar) | [Phase 32 Tasks](./32-build-tools-tasks.md) |
+
+### Kernel Infrastructure Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 33 | Kernel memory improvements (slab, OOM retry, munmap) | *not yet created* |
+| 34 | Real-time clock and timekeeping | *not yet created* |
+| 35 | True SMP multitasking (per-core dispatch, priorities) | *not yet created* |
+| 36 | I/O multiplexing (select, epoll, non-blocking) | *not yet created* |
+| 37 | Filesystem enhancements (symlinks, /proc, permissions) | *not yet created* |
+| 38 | Unix domain sockets (AF_UNIX) | *not yet created* |
+| 39 | Threading primitives (clone, futex, TLS) | *not yet created* |
+
+### Application Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 40 | Expanded coreutils (head, tail, sort, find, diff, ps) | *not yet created* |
+| 41 | Crypto primitives (SHA-256, Ed25519, ChaCha20) | *not yet created* |
+| 42 | SSH server (encrypted remote access) | *not yet created* |
+| 43 | Rust cross-compilation | *not yet created* |
+| 44 | Ports system (source-based package building) | *not yet created* |
+| 45 | System services (init, syslog, cron) | *not yet created* |
 
 ## Suggested Usage
 

@@ -1,4 +1,4 @@
-# Phase 33 - Expanded Coreutils
+# Phase 40 - Expanded Coreutils
 
 ## Milestone Goal
 
@@ -118,7 +118,7 @@ syscalls as needed.
 
 ## Companion Task List
 
-- [Phase 33 Task List](./tasks/33-expanded-coreutils-tasks.md)
+- [Phase 40 Task List](./tasks/40-expanded-coreutils-tasks.md)
 
 ## How Real OS Implementations Differ
 

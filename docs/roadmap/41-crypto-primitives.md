@@ -1,9 +1,9 @@
-# Phase 34 - Cryptography Primitives
+# Phase 41 - Cryptography Primitives
 
 ## Milestone Goal
 
 The OS has a cryptography library providing hash functions, symmetric encryption, and
-asymmetric key operations. This is the foundation layer that SSH (Phase 35) and future
+asymmetric key operations. This is the foundation layer that SSH (Phase 42) and future
 security features build upon.
 
 ## Learning Goals
@@ -100,7 +100,7 @@ most but takes the longest. Reserve for stretch goals.
 
 ## Companion Task List
 
-- [Phase 34 Task List](./tasks/34-crypto-primitives-tasks.md)
+- [Phase 41 Task List](./tasks/41-crypto-primitives-tasks.md)
 
 ## How Real OS Implementations Differ
 
