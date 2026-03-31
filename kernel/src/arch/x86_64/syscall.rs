@@ -1288,15 +1288,8 @@ fn sys_dup(oldfd: u64) -> u64 {
         None => return NEG_EBADF,
     };
 
-    // Increment refcount for the duplicated FD.
-    match &entry.backend {
-        FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
-        FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
-        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
-        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
-        FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
-        _ => {}
-    }
+    // Remember backend info so we only bump refcount on successful alloc.
+    let backend_clone = entry.backend.clone();
 
     // POSIX: dup always clears FD_CLOEXEC on the new descriptor.
     let mut entry_copy = entry;
@@ -1304,6 +1297,15 @@ fn sys_dup(oldfd: u64) -> u64 {
 
     match alloc_fd(0, entry_copy) {
         Some(newfd) => {
+            // Increment refcount only after successful allocation.
+            match &backend_clone {
+                FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
+                FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+                FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+                FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
+                FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+                _ => {}
+            }
             log::info!("[dup] fd {} → fd {}", oldfd, newfd);
             newfd as u64
         }

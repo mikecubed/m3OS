@@ -130,12 +130,13 @@ static int telnet_parse(const unsigned char *buf, int len,
                     ts->naws_received = 1;
                 }
                 ts->state = IAC_NORMAL;
+            } else if (c == TEL_IAC) {
+                /* IAC IAC inside subnegotiation = literal 0xFF byte */
+                if (ts->subneg_len < (int)sizeof(ts->subneg_buf))
+                    ts->subneg_buf[ts->subneg_len++] = 0xFF;
+                ts->state = IAC_SUBNEG;
             } else {
-                /* False alarm — wasn't IAC SE, keep collecting */
-                if (ts->subneg_len < (int)sizeof(ts->subneg_buf))
-                    ts->subneg_buf[ts->subneg_len++] = TEL_IAC;
-                if (ts->subneg_len < (int)sizeof(ts->subneg_buf))
-                    ts->subneg_buf[ts->subneg_len++] = c;
+                /* Other IAC command inside subneg — ignore and continue */
                 ts->state = IAC_SUBNEG;
             }
             break;
@@ -382,8 +383,8 @@ static void handle_connection(int client_fd) {
                 /* CR/LF translation: NVT → Unix */
                 unsigned char unix_buf[512];
                 int ulen = crlf_to_unix(clean, clen, unix_buf, sizeof(unix_buf));
-                if (ulen > 0)
-                    write_all(master_fd, unix_buf, ulen);
+                if (ulen > 0 && write_all(master_fd, unix_buf, ulen) < 0)
+                    break;
             }
             /* Check NAWS again after parse */
             if (ts.naws_received) {
@@ -407,8 +408,8 @@ static void handle_connection(int client_fd) {
                 break; /* Shell exited */
             /* CR/LF translation: Unix → NVT + IAC escaping */
             int wlen = unix_to_crlf(rbuf, (int)n, wbuf, sizeof(wbuf));
-            if (wlen > 0)
-                write_all(client_fd, wbuf, wlen);
+            if (wlen > 0 && write_all(client_fd, wbuf, wlen) < 0)
+                break;
         }
 
         /* Socket closed */
@@ -490,6 +491,16 @@ int main(int argc, char **argv) {
         /* Reap finished children (non-blocking) */
         while (waitpid(-1, NULL, WNOHANG) > 0)
             ;
+
+        /* Wait for incoming connections with a timeout so we can
+         * reap children regularly even when idle. */
+        struct pollfd lpfd;
+        lpfd.fd = listen_fd;
+        lpfd.events = POLLIN;
+        lpfd.revents = 0;
+        int pr = poll(&lpfd, 1, 1000);
+        if (pr <= 0 || !(lpfd.revents & POLLIN))
+            continue;
 
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
