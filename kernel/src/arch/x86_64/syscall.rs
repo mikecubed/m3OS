@@ -1288,10 +1288,12 @@ fn sys_dup(oldfd: u64) -> u64 {
         None => return NEG_EBADF,
     };
 
-    // Increment pipe ref-count for the duplicated FD.
+    // Increment refcount for the duplicated FD.
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         _ => {}
     }
 
@@ -1335,10 +1337,12 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         sys_linux_close(newfd as u64);
     }
 
-    // Increment pipe ref-count for the duplicated FD.
+    // Increment refcount for the duplicated FD.
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         _ => {}
     }
 
@@ -6391,21 +6395,25 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             if set_cloexec {
                 entry.cloexec = true;
             }
-            // Remember pipe info so we only bump refcount on successful alloc.
-            let pipe_info = match &entry.backend {
-                FdBackend::PipeRead { pipe_id } => Some((true, *pipe_id)),
-                FdBackend::PipeWrite { pipe_id } => Some((false, *pipe_id)),
-                _ => None,
-            };
+            // Remember backend info so we only bump refcount on successful alloc.
+            let backend_clone = entry.backend.clone();
             match alloc_fd(min_fd, entry) {
                 Some(new_fd) => {
-                    // Increment pipe ref-count only after successful allocation.
-                    if let Some((is_read, pipe_id)) = pipe_info {
-                        if is_read {
-                            crate::pipe::pipe_add_reader(pipe_id);
-                        } else {
-                            crate::pipe::pipe_add_writer(pipe_id);
+                    // Increment refcount only after successful allocation.
+                    match &backend_clone {
+                        FdBackend::PipeRead { pipe_id } => {
+                            crate::pipe::pipe_add_reader(*pipe_id);
                         }
+                        FdBackend::PipeWrite { pipe_id } => {
+                            crate::pipe::pipe_add_writer(*pipe_id);
+                        }
+                        FdBackend::PtyMaster { pty_id } => {
+                            crate::pty::add_master_ref(*pty_id);
+                        }
+                        FdBackend::PtySlave { pty_id } => {
+                            crate::pty::add_slave_ref(*pty_id);
+                        }
+                        _ => {}
                     }
                     new_fd as u64
                 }

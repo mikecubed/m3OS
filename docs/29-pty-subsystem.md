@@ -177,8 +177,8 @@ Creates a new session. The calling process becomes the session leader:
 - `pgid` is set to the caller's PID (new process group)
 - `controlling_tty` is cleared (no controlling terminal)
 
-Fails with `EPERM` if the caller is already a session leader or if
-another process shares the caller's process group ID.
+Fails with `EPERM` if the caller is already a process-group leader
+(its process group ID equals its PID).
 
 ### getsid(pid) (syscall 124)
 
@@ -208,13 +208,14 @@ until `TIOCSCTTY` assigns a PTY.
 
 ### SIGHUP on master close
 
-When the last FD referencing a PTY master is closed:
+When the last FD referencing a PTY master is closed (i.e. that PTY's
+`master_refcount` drops to 0):
 
 1. `SIGHUP` is sent to the slave's foreground process group
 2. `SIGCONT` is sent to the same group (in case processes are stopped)
-3. The PTY is marked as disconnected (`master_open = false`)
-4. Subsequent slave reads return EOF (0)
-5. Subsequent slave writes return `-EIO`
+3. The PTY enters a "master-disconnected" state (`master_refcount == 0`)
+4. While `slave_refcount > 0` in this state, subsequent slave reads return EOF (0)
+5. While `slave_refcount > 0` in this state, subsequent slave writes return `-EIO`
 
 This matches Unix behavior: closing an SSH connection sends SIGHUP to
 all processes in the remote shell session.
@@ -255,13 +256,21 @@ PTY FDs use the existing `FdBackend::PtyMaster { pty_id }` and
 `FdBackend::PtySlave { pty_id }` variants. Multiple FDs can reference
 the same PTY pair (e.g., after fork or dup2).
 
-- **fork**: Child inherits all PTY FDs. No re-allocation — they share
-  the same PTY pair via the global PTY_TABLE.
+- **fork**: Child inherits all PTY FDs. `add_fd_refs()` increments
+  `master_refcount`/`slave_refcount` for each inherited PTY FD, so
+  the PTY remains alive until all references are closed.
+- **dup/dup2/fcntl(F_DUPFD)**: Increments the appropriate PTY refcount
+  on successful duplication, matching the pipe refcount pattern.
 - **exec (cloexec)**: FDs with `cloexec = true` are closed during
-  exec, triggering the same close logic (master close → SIGHUP,
-  slave close → lifecycle check).
-- **close**: Sets `master_open = false` or `slave_open = false`. If
-  both are false, `free_pty()` releases the slot.
+  exec, triggering the same close logic as an explicit `close`
+  (master close → SIGHUP, slave close → lifecycle check and
+  refcount decrement).
+- **close**: Each PTY side maintains a refcount. Closing a master FD
+  calls `close_master(pty_id)`, decrementing the master refcount;
+  closing a slave FD calls `close_slave(pty_id)`, decrementing the
+  slave refcount. When both refcounts reach 0, `try_free()` releases
+  the slot. This ensures correct behavior when multiple FDs (via
+  `dup`, `dup2`, or `fork`) reference the same PTY.
 
 ## Userspace API
 

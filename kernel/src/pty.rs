@@ -24,11 +24,17 @@ pub fn alloc_pty() -> Result<u32, ()> {
     Err(())
 }
 
-/// Free a PTY pair slot. Only call when both master and slave refcounts are 0.
-pub fn free_pty(id: u32) {
-    let mut table = PTY_TABLE.lock();
-    if (id as usize) < MAX_PTYS {
-        table[id as usize] = None;
+/// Free a PTY pair slot if both refcounts are 0. Must be called with table locked.
+fn try_free(table: &mut [Option<PtyPairState>; MAX_PTYS], id: u32) {
+    let idx = id as usize;
+    if idx >= MAX_PTYS {
+        return;
+    }
+    if let Some(pair) = &table[idx]
+        && pair.master_refcount == 0
+        && pair.slave_refcount == 0
+    {
+        table[idx] = None;
     }
 }
 
@@ -50,23 +56,28 @@ pub fn add_slave_ref(id: u32) {
 
 /// Close one master reference. Sends SIGHUP when last ref is closed.
 pub fn close_master(id: u32) {
-    let mut table = PTY_TABLE.lock();
-    if let Some(Some(pair)) = table.get_mut(id as usize) {
-        if pair.master_refcount > 0 {
-            pair.master_refcount -= 1;
-        }
-        if pair.master_refcount == 0 {
-            let fg = pair.slave_fg_pgid;
-            let slave_gone = pair.slave_refcount == 0;
-            drop(table);
-            if fg != 0 {
-                crate::process::send_signal_to_group(fg, crate::process::SIGHUP);
-                crate::process::send_signal_to_group(fg, crate::process::SIGCONT);
+    let fg;
+    {
+        let mut table = PTY_TABLE.lock();
+        if let Some(Some(pair)) = table.get_mut(id as usize) {
+            if pair.master_refcount > 0 {
+                pair.master_refcount -= 1;
             }
-            if slave_gone {
-                free_pty(id);
-            }
+            fg = if pair.master_refcount == 0 {
+                let pgid = pair.slave_fg_pgid;
+                try_free(&mut table, id);
+                pgid
+            } else {
+                0
+            };
+        } else {
+            return;
         }
+    }
+    // Send signals outside the lock to avoid deadlock with process table.
+    if fg != 0 {
+        crate::process::send_signal_to_group(fg, crate::process::SIGHUP);
+        crate::process::send_signal_to_group(fg, crate::process::SIGCONT);
     }
 }
 
@@ -78,11 +89,7 @@ pub fn close_slave(id: u32) {
             pair.slave_refcount -= 1;
         }
         if pair.slave_refcount == 0 {
-            let master_gone = pair.master_refcount == 0;
-            drop(table);
-            if master_gone {
-                free_pty(id);
-            }
+            try_free(&mut table, id);
         }
     }
 }

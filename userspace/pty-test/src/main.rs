@@ -283,6 +283,12 @@ fn test_master_close_eof() -> bool {
             let _ = syscall_lib::tcsetattr(sfd, &termios);
 
             let pid = fork();
+            if pid < 0 {
+                close(mfd);
+                close(sfd);
+                fail(b"master_close_eof: fork failed");
+                return false;
+            }
             if pid == 0 {
                 // Child: close master, try to read from slave.
                 close(mfd);
