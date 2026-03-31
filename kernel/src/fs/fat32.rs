@@ -738,7 +738,7 @@ impl Fat32Volume {
     }
 
     /// Free all clusters in a chain.
-    fn free_chain(&mut self, start: u32) -> Result<(), Fat32Error> {
+    pub fn free_chain(&mut self, start: u32) -> Result<(), Fat32Error> {
         let chain = self.read_chain(start)?;
         for &cluster in &chain {
             self.write_fat_entry(cluster, 0)?;
