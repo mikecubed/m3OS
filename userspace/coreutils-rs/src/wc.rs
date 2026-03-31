@@ -16,7 +16,10 @@ fn wc_fd(fd: i32) -> (u64, u64, u64) {
     let mut in_word = false;
     loop {
         let n = read(fd, &mut buf);
-        if n <= 0 {
+        if n < 0 {
+            return (lines, words, bytes);
+        }
+        if n == 0 {
             break;
         }
         let n = n as usize;

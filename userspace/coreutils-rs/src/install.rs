@@ -44,7 +44,13 @@ fn copy_file(src: &str, dst: &str) -> i32 {
     let mut buf = [0u8; 4096];
     loop {
         let n = read(in_fd, &mut buf);
-        if n <= 0 {
+        if n < 0 {
+            write_str(STDERR_FILENO, "install: read error\n");
+            close(in_fd);
+            close(out_fd);
+            return 1;
+        }
+        if n == 0 {
             break;
         }
         let mut off = 0usize;

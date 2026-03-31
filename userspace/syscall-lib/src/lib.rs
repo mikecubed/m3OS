@@ -1062,6 +1062,7 @@ pub struct Stat {
     pub st_mtime_nsec: i64,
     pub st_ctime: i64,
     pub st_ctime_nsec: i64,
+    pub __reserved: [i64; 3],
 }
 
 impl Stat {
@@ -1084,6 +1085,7 @@ impl Stat {
             st_mtime_nsec: 0,
             st_ctime: 0,
             st_ctime_nsec: 0,
+            __reserved: [0; 3],
         }
     }
 }
@@ -1100,7 +1102,7 @@ pub fn fstat(fd: i32, buf: &mut Stat) -> isize {
 }
 
 /// `utimensat(dirfd, path, times, flags)` — update file timestamps.
-/// If `times` is None, sets both atime and mtime to current time.
+/// Sets atime to `atime_sec` and mtime to `mtime_sec` (seconds since epoch).
 pub fn utimensat(path: &[u8], atime_sec: i64, mtime_sec: i64) -> isize {
     // struct timespec { tv_sec: i64, tv_nsec: i64 } × 2 = 32 bytes
     let times: [i64; 4] = [atime_sec, 0, mtime_sec, 0];

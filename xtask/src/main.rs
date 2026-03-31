@@ -381,6 +381,8 @@ fn build_pdpmake() {
                 "clone",
                 "--depth",
                 "1",
+                "--branch",
+                "2.0.4",
                 "https://github.com/rmyorston/pdpmake.git",
                 pdpmake_src.to_str().unwrap(),
             ])
@@ -427,16 +429,28 @@ fn build_pdpmake() {
     args.push("-o".to_string());
     args.push(make_elf.to_str().unwrap().to_string());
 
-    let status = match Command::new("musl-gcc").args(&args).status() {
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else {
+        "musl-gcc"
+    };
+
+    let status = match Command::new(cc).args(&args).status() {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("warning: musl-gcc not found — skipping pdpmake build");
+            eprintln!("warning: {cc} not found — skipping pdpmake build");
             if !make_elf.exists() {
                 fs::write(&make_elf, b"").unwrap();
             }
             return;
         }
-        Err(e) => panic!("failed to run musl-gcc for pdpmake: {e}"),
+        Err(e) => panic!("failed to run {cc} for pdpmake: {e}"),
     };
     if !status.success() {
         eprintln!("warning: pdpmake build failed");

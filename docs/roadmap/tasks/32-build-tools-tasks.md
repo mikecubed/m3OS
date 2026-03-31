@@ -32,7 +32,7 @@ Already implemented (no new work needed):
 - Exec from disk filesystems (Phase 31: ext2, tmpfs, FAT32 fallback)
 
 Needs to be added:
-- `pdpmake` binary cross-compiled and added to disk image at `/usr/bin/make`
+- `pdpmake` binary cross-compiled and added to disk image at `/bin/make`
 - `ar` utility for creating static libraries
 - `touch` utility for updating file timestamps
 - `wc` utility for word/line/byte counting

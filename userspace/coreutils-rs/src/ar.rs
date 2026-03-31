@@ -147,7 +147,13 @@ fn main(args: &[&str]) -> i32 {
         let mut buf = [0u8; 4096];
         loop {
             let n = read(src, &mut buf);
-            if n <= 0 {
+            if n < 0 {
+                write_str(STDERR_FILENO, "ar: read error\n");
+                close(src);
+                close(fd);
+                return 1;
+            }
+            if n == 0 {
                 break;
             }
             write(fd, &buf[..n as usize]);

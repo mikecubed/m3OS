@@ -5770,7 +5770,9 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
             }
             if new_mtime != u32::MAX {
                 inode.mtime = new_mtime;
-                inode.ctime = now; // ctime always updated
+            }
+            if new_atime != u32::MAX || new_mtime != u32::MAX {
+                inode.ctime = now; // ctime always updated when any timestamp changes
             }
             if vol.write_inode(ino, &inode).is_err() {
                 return NEG_EIO;
@@ -5782,8 +5784,8 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
 
     // tmpfs
     if tmpfs_relative_path(name).is_some() {
-        // tmpfs doesn't track timestamps yet — silently succeed
-        return 0;
+        // tmpfs doesn't track timestamps yet — return ENOSYS
+        return NEG_ENOSYS;
     }
 
     NEG_ENOENT
