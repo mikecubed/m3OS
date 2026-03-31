@@ -340,15 +340,6 @@ static void handle_connection(int client_fd) {
     }
 
     /* Child (relay process): relay between socket and PTY master. */
-    /* Verify master FD is still valid (debug) */
-    {
-        struct { unsigned short rows, cols, xpixel, ypixel; } ws;
-        memset(&ws, 0, sizeof(ws));
-        int r = ioctl(master_fd, TIOCSWINSZ, &ws);
-        if (r < 0)
-            write_str(2, "telnetd: WARNING master_fd invalid\n");
-    }
-
     struct telnet_state ts;
     telnet_state_init(&ts);
 
@@ -361,27 +352,10 @@ static void handle_connection(int client_fd) {
     unsigned char rbuf[512];
     unsigned char wbuf[1024];
 
-    /* Debug: write a test message directly to the socket */
-    {
-        const char *msg = "HELLO FROM TELNETD\r\n";
-        int mlen = 0;
-        while (msg[mlen]) mlen++;
-        write(client_fd, msg, mlen);
-    }
-    write_str(2, "telnetd: entering relay loop\n");
-
     for (;;) {
-        pfds[0].revents = 0;
-        pfds[1].revents = 0;
-        int ret = poll(pfds, 2, 5000); /* 5s timeout for debug */
-        if (ret < 0) {
-            write_str(2, "telnetd: poll error\n");
-            break;
-        }
-        if (ret == 0) {
-            write_str(2, "telnetd: poll timeout\n");
+        int ret = poll(pfds, 2, -1);
+        if (ret <= 0)
             continue;
-        }
 
         /* Apply NAWS if received */
         if (ts.naws_received) {
@@ -439,26 +413,12 @@ static void handle_connection(int client_fd) {
         }
 
         /* Socket closed */
-        if (pfds[0].revents & POLLHUP) {
-            write_str(2, "telnetd: socket POLLHUP\n");
+        if (pfds[0].revents & POLLHUP)
             break;
-        }
 
         /* PTY closed (shell exited) */
-        if (pfds[1].revents & POLLHUP) {
-            write_str(2, "telnetd: pty POLLHUP\n");
+        if (pfds[1].revents & POLLHUP)
             break;
-        }
-
-        /* Check for POLLNVAL */
-        if (pfds[0].revents & 0x020) {
-            write_str(2, "telnetd: socket POLLNVAL\n");
-            break;
-        }
-        if (pfds[1].revents & 0x020) {
-            write_str(2, "telnetd: pty POLLNVAL\n");
-            break;
-        }
     }
 
     /* Cleanup */
