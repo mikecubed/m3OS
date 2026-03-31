@@ -1583,18 +1583,20 @@ fn smoke_test_phase31() -> Vec<SmokeStep> {
 }
 
 fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
-    // Fail fast if TCC was not built — avoids a slow QEMU timeout.
+    let kernel_binary = build_kernel();
+
+    // Fail fast if TCC was not built (build_tcc() returned None, e.g. musl
+    // toolchain missing). Check *after* build_kernel() since that calls
+    // build_tcc().
     let tcc_staging_bin = workspace_root().join("target/tcc-staging/usr/bin/tcc");
     if !tcc_staging_bin.exists() {
         eprintln!(
             "error: TCC binary not found at {}\n\
-             Run `cargo xtask image` first to build TCC, or install musl-tools.",
+             The Phase 31 smoke test requires TCC. Install musl-tools and retry.",
             tcc_staging_bin.display()
         );
         std::process::exit(1);
     }
-
-    let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
     create_data_disk(uefi_image.parent().unwrap());

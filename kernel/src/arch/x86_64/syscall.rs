@@ -1846,13 +1846,13 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => {
             // Phase 31: try ext2, FAT32, and tmpfs before giving up.
             match read_file_from_disk(name) {
-                Some(buf) => {
+                Ok(buf) => {
                     disk_buf = buf;
                     &disk_buf
                 }
-                None => {
-                    log::warn!("[execve] file not found: {}", name);
-                    return NEG_ENOENT;
+                Err(errno) => {
+                    log::warn!("[execve] file not found or rejected: {}", name);
+                    return errno;
                 }
             }
         }
@@ -3262,7 +3262,11 @@ fn is_directory(path: &str) -> bool {
 ///
 /// Used by `sys_execve` to load binaries from persistent storage instead of
 /// only the ramdisk. Returns `None` if the file is not found on any disk.
-fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
+/// Error returned by `read_file_from_disk` when the file exists but cannot
+/// be loaded (e.g. too large). The value is the negated errno to return.
+const NEG_E2BIG: u64 = (-7_i64) as u64;
+
+fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
     /// Maximum executable size we are willing to load (16 MB).
     const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
 
@@ -3282,13 +3286,13 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
                         MAX_EXEC_SIZE,
                         path
                     );
-                    return None;
+                    return Err(NEG_E2BIG);
                 }
                 if size > 0 {
                     let mut buf = alloc::vec![0u8; size];
                     if let Ok(n) = vol.read_file_data(&inode, 0, &mut buf) {
                         buf.truncate(n);
-                        return Some(buf);
+                        return Ok(buf);
                     }
                 }
             }
@@ -3303,7 +3307,7 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
         if let Ok(data) = tmpfs.read_file(rel, 0, usize::MAX)
             && !data.is_empty()
         {
-            return Some(data.to_vec());
+            return Ok(data.to_vec());
         }
     }
 
@@ -3311,8 +3315,6 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
     let fat_rel = if let Some(stripped) = path.strip_prefix("/data/") {
         Some(stripped)
     } else if path.starts_with("/usr/") {
-        // TCC artifacts are packaged at /usr/* on the data disk —
-        // map /usr/* → usr/* on FAT32.
         Some(path.trim_start_matches('/'))
     } else {
         None
@@ -3331,32 +3333,21 @@ fn read_file_from_disk(path: &str) -> Option<alloc::vec::Vec<u8>> {
                     MAX_EXEC_SIZE,
                     path
                 );
-                return None;
+                return Err(NEG_E2BIG);
             }
             if size > 0 {
                 let cluster = entry.start_cluster();
                 let mut buf = alloc::vec![0u8; size];
-                let mut offset = 0usize;
-                while offset < size {
-                    let chunk = (size - offset).min(64 * 1024);
-                    let mut tmp = alloc::vec![0u8; chunk];
-                    match vol.read_file(cluster, entry.file_size, offset, &mut tmp) {
-                        Ok(n) if n > 0 => {
-                            buf[offset..offset + n].copy_from_slice(&tmp[..n]);
-                            offset += n;
-                        }
-                        _ => break,
-                    }
-                }
-                buf.truncate(offset);
-                if !buf.is_empty() {
-                    return Some(buf);
+                if let Ok(n) = vol.read_file(cluster, entry.file_size, 0, &mut buf)
+                    && n == size
+                {
+                    return Ok(buf);
                 }
             }
         }
     }
 
-    None
+    Err(NEG_ENOENT)
 }
 
 /// Check if a path targets the tmpfs mount at `/tmp`.
