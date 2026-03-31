@@ -22,6 +22,8 @@ members = [
     "userspace/adduser",
     "userspace/id",
     "userspace/whoami",
+    # Phase 29 PTY test
+    "userspace/pty-test",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",

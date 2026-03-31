@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.28.1 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, and multi-user accounts with permission enforcement.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.29.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, multi-user accounts with permission enforcement, and PTY (pseudo-terminal) pairs.
 
 ## Build & Run
 
@@ -96,6 +96,7 @@ userspace/
   su/                     # switch user (Phase 27)
   passwd/                 # change password (Phase 27)
   adduser/                # create user account (Phase 27)
+  pty-test/               # PTY subsystem test (Phase 29)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -110,6 +111,7 @@ kernel/src/
   main.rs              # entry point, boot sequence
   serial.rs            # serial I/O + log backend
   pipe.rs              # inter-process pipes
+  pty.rs               # PTY pair table and lifecycle (Phase 29)
   signal.rs            # POSIX-style signal handling
   stdin.rs             # stdin abstraction
   tty.rs               # TTY/terminal subsystem
@@ -137,6 +139,7 @@ kernel-core/src/
   types.rs             # shared types
   fb.rs                # framebuffer abstractions
   pipe.rs              # pipe abstractions
+  pty.rs               # PTY pair state, ring buffers (Phase 29)
   tty.rs               # TTY abstractions
   fs/                  # FAT32, MBR, tmpfs abstractions
   ipc/                 # capability, message, registry abstractions
@@ -242,6 +245,7 @@ Read before making significant changes:
 | `docs/23-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
+| `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–38) with corresponding `docs/roadmap/tasks/` breakdowns.

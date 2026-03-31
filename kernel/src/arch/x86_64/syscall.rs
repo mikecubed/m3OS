@@ -43,6 +43,8 @@ const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
 const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ESRCH: u64 = (-3_i64) as u64;
+const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
 
 /// linux_dirent64 type constants.
@@ -455,7 +457,11 @@ pub extern "C" fn syscall_handler(
         110 => sys_getppid(),
         // Phase 21: getpgrp — equivalent to getpgid(0)
         111 => sys_getpgid(0),
+        // Phase 29: setsid — create a new session
+        112 => sys_setsid(),
         121 => sys_getpgid(arg0),
+        // Phase 29: getsid — get session ID
+        124 => sys_getsid(arg0),
         // Phase 19: sigaltstack
         131 => sys_sigaltstack(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
@@ -791,7 +797,6 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 
     // sig=0: permission check only, no signal sent.
     if sig == 0 {
-        const NEG_ESRCH: u64 = (-3_i64) as u64;
         let table = crate::process::PROCESS_TABLE.lock();
         return if table.find(pid as crate::process::Pid).is_some() {
             0
@@ -1283,10 +1288,12 @@ fn sys_dup(oldfd: u64) -> u64 {
         None => return NEG_EBADF,
     };
 
-    // Increment pipe ref-count for the duplicated FD.
+    // Increment refcount for the duplicated FD.
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         _ => {}
     }
 
@@ -1330,10 +1337,12 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         sys_linux_close(newfd as u64);
     }
 
-    // Increment pipe ref-count for the duplicated FD.
+    // Increment refcount for the duplicated FD.
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_add_reader(*pipe_id),
         FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_add_writer(*pipe_id),
+        FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
+        FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         _ => {}
     }
 
@@ -1388,6 +1397,42 @@ fn sys_getpgid(pid: u64) -> u64 {
     match table.find(target) {
         Some(p) => p.pgid as u64,
         None => NEG_EINVAL,
+    }
+}
+
+/// `setsid()` — create a new session (syscall 112).
+fn sys_setsid() -> u64 {
+    let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut table = crate::process::PROCESS_TABLE.lock();
+
+    // POSIX: fail if the caller is already a process-group leader (pgid == pid).
+    if let Some(proc) = table.find(calling_pid) {
+        if proc.pgid == calling_pid {
+            return NEG_EPERM;
+        }
+    } else {
+        return NEG_ESRCH;
+    }
+
+    if let Some(proc) = table.find_mut(calling_pid) {
+        proc.session_id = calling_pid;
+        proc.pgid = calling_pid;
+        proc.controlling_tty = None;
+    }
+    calling_pid as u64
+}
+
+/// `getsid(pid)` — get session ID (syscall 124).
+fn sys_getsid(pid: u64) -> u64 {
+    let target = if pid == 0 {
+        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed)
+    } else {
+        pid as crate::process::Pid
+    };
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(target) {
+        Some(p) => p.session_id as u64,
+        None => NEG_ESRCH,
     }
 }
 
@@ -1608,6 +1653,8 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_alt_stack,
         parent_fs_base,
         parent_ids,
+        parent_session_id,
+        parent_ctty,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1622,6 +1669,8 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
                 (p.uid, p.gid, p.euid, p.egid),
+                p.session_id,
+                p.controlling_tty.clone(),
             ),
             None => (
                 0,
@@ -1637,12 +1686,14 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (0u64, 0u64, 0u32),
                 0,
                 (0u32, 0u32, 0u32, 0u32),
+                0,
+                Some(crate::process::ControllingTty::Console),
             ),
         }
     };
 
-    // Increment pipe ref-counts for cloned FDs before creating the child.
-    crate::process::add_pipe_refs(&parent_fds);
+    // Increment refcounts (pipes + PTYs) for cloned FDs before creating the child.
+    crate::process::add_fd_refs(&parent_fds);
 
     // Create child process entry with cloned FD table (Phase 14, P14-T003).
     // Inherit parent's pgid so fork children are in the same process group.
@@ -1672,6 +1723,8 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.gid = parent_ids.1;
             child.euid = parent_ids.2;
             child.egid = parent_ids.3;
+            child.session_id = parent_session_id;
+            child.controlling_tty = parent_ctty;
         }
     }
 
@@ -2110,8 +2163,6 @@ fn has_pending_signal() -> bool {
     false
 }
 
-const NEG_EINTR: u64 = (-4_i64) as u64;
-
 /// Copy-on-write clone of user-accessible pages from the parent's page table
 /// into the child's page table.
 ///
@@ -2546,10 +2597,105 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
-        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
-            log::trace!("[pty] read: PTY data path not yet implemented");
-            const NEG_ENOSYS: u64 = (-38_i64) as u64;
-            NEG_ENOSYS
+        FdBackend::PtyMaster { pty_id } => {
+            if count == 0 {
+                return 0;
+            }
+            // Master reads from s2m (slave-to-master) buffer.
+            let pty_id = *pty_id;
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            loop {
+                {
+                    let mut table = crate::pty::PTY_TABLE.lock();
+                    if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
+                        if !pair.s2m.is_empty() {
+                            let mut dst = [0u8; 4096];
+                            let to_read = count.min(dst.len() as u64) as usize;
+                            let n = pair.s2m.read(&mut dst[..to_read]);
+                            drop(table);
+                            if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
+                                return NEG_EFAULT;
+                            }
+                            return n as u64;
+                        }
+                        if pair.slave_refcount == 0 {
+                            return 0; // EOF — slave closed
+                        }
+                    } else {
+                        return 0; // PTY freed
+                    }
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+                restore_caller_context(pid, saved_user_rsp);
+            }
+        }
+        FdBackend::PtySlave { pty_id } => {
+            if count == 0 {
+                return 0;
+            }
+            // Slave reads from m2s (master-to-slave) buffer via line discipline.
+            let pty_id = *pty_id;
+            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            loop {
+                {
+                    let mut table = crate::pty::PTY_TABLE.lock();
+                    if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
+                        if pair.termios.is_canonical() {
+                            // Canonical mode: check edit buffer for complete line.
+                            let line = pair.edit_buf.as_slice();
+                            let has_line = line.contains(&b'\n');
+                            if has_line {
+                                let eol = line.iter().position(|&b| b == b'\n').unwrap() + 1;
+                                let to_copy = eol.min(count as usize).min(4096);
+                                let mut dst = [0u8; 4096];
+                                dst[..to_copy]
+                                    .copy_from_slice(&pair.edit_buf.as_slice()[..to_copy]);
+                                pair.edit_buf.drain(to_copy);
+                                drop(table);
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
+                                    .is_err()
+                                {
+                                    return NEG_EFAULT;
+                                }
+                                return to_copy as u64;
+                            }
+                            // VEOF (^D) on empty line → return 0 (EOF).
+                            if pair.eof_pending {
+                                pair.eof_pending = false;
+                                drop(table);
+                                return 0;
+                            }
+                        } else {
+                            // Raw mode: read directly from m2s.
+                            if !pair.m2s.is_empty() {
+                                let mut dst = [0u8; 4096];
+                                let to_read = count.min(dst.len() as u64) as usize;
+                                let n = pair.m2s.read(&mut dst[..to_read]);
+                                drop(table);
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return n as u64;
+                            }
+                        }
+                        if pair.master_refcount == 0 {
+                            return 0; // EOF — master closed
+                        }
+                    } else {
+                        return 0; // PTY freed
+                    }
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::task::yield_now();
+                restore_caller_context(pid, saved_user_rsp);
+            }
         }
         FdBackend::Socket { .. } => {
             // Delegate to recvfrom with no addr
@@ -2813,10 +2959,199 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
         FdBackend::DevNull => count, // silently discard
-        FdBackend::PtyMaster { .. } | FdBackend::PtySlave { .. } => {
-            log::trace!("[pty] write: PTY data path not yet implemented");
-            const NEG_ENOSYS: u64 = (-38_i64) as u64;
-            NEG_ENOSYS
+        FdBackend::PtyMaster { pty_id } => {
+            // Master writes to m2s (master-to-slave) buffer.
+            // Apply line discipline on the slave side (input processing).
+            let pty_id = *pty_id;
+            let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
+            if crate::mm::user_mem::copy_from_user(&mut src_data, buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            let mut table = crate::pty::PTY_TABLE.lock();
+            if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
+                if pair.slave_refcount == 0 && !pair.locked {
+                    drop(table);
+                    return NEG_EIO;
+                }
+                let is_canonical = pair.termios.is_canonical();
+                let is_echo = pair.termios.is_echo();
+                let is_isig = pair.termios.is_isig();
+                let echoe = pair.termios.c_lflag & kernel_core::tty::ECHOE != 0;
+                let echok = pair.termios.c_lflag & kernel_core::tty::ECHOK != 0;
+                let echonl = pair.termios.c_lflag & kernel_core::tty::ECHONL != 0;
+                let icrnl = pair.termios.c_iflag & kernel_core::tty::ICRNL != 0;
+                let inlcr = pair.termios.c_iflag & kernel_core::tty::INLCR != 0;
+                let igncr = pair.termios.c_iflag & kernel_core::tty::IGNCR != 0;
+                let vintr = pair.termios.c_cc[kernel_core::tty::VINTR];
+                let vquit = pair.termios.c_cc[kernel_core::tty::VQUIT];
+                let vsusp = pair.termios.c_cc[kernel_core::tty::VSUSP];
+                let verase = pair.termios.c_cc[kernel_core::tty::VERASE];
+                let vkill = pair.termios.c_cc[kernel_core::tty::VKILL];
+                let vwerase = pair.termios.c_cc[kernel_core::tty::VWERASE];
+                let veof = pair.termios.c_cc[kernel_core::tty::VEOF];
+                let fg_pgid = pair.slave_fg_pgid;
+
+                let mut written = 0usize;
+                for &byte in &src_data {
+                    // Input flag transformations.
+                    let mut b = byte;
+                    if b == b'\r' {
+                        if igncr {
+                            written += 1;
+                            continue;
+                        }
+                        if icrnl {
+                            b = b'\n';
+                        }
+                    } else if b == b'\n' && inlcr {
+                        b = b'\r';
+                    }
+
+                    // Signal generation (ISIG).
+                    if is_isig {
+                        if b == vintr {
+                            if fg_pgid != 0 {
+                                drop(table);
+                                crate::process::send_signal_to_group(
+                                    fg_pgid,
+                                    crate::process::SIGINT,
+                                );
+                                table = crate::pty::PTY_TABLE.lock();
+                            }
+                            written += 1;
+                            continue;
+                        }
+                        if b == vquit {
+                            if fg_pgid != 0 {
+                                drop(table);
+                                crate::process::send_signal_to_group(
+                                    fg_pgid,
+                                    crate::process::SIGQUIT,
+                                );
+                                table = crate::pty::PTY_TABLE.lock();
+                            }
+                            written += 1;
+                            continue;
+                        }
+                        if b == vsusp {
+                            if fg_pgid != 0 {
+                                drop(table);
+                                crate::process::send_signal_to_group(
+                                    fg_pgid,
+                                    crate::process::SIGTSTP,
+                                );
+                                table = crate::pty::PTY_TABLE.lock();
+                            }
+                            written += 1;
+                            continue;
+                        }
+                    }
+
+                    // Re-acquire pair reference after potential drop/reacquire.
+                    let pair = match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                        Some(p) => p,
+                        None => return written as u64,
+                    };
+
+                    if is_canonical {
+                        // Canonical mode: buffer in edit_buf.
+                        if b == verase {
+                            if pair.edit_buf.erase_char().is_some() && is_echo && echoe {
+                                pair.s2m.write(b"\x08 \x08");
+                            }
+                        } else if b == vkill {
+                            let n = pair.edit_buf.kill_line();
+                            if is_echo {
+                                if echok {
+                                    pair.s2m.write(b"\n");
+                                } else {
+                                    for _ in 0..n {
+                                        pair.s2m.write(b"\x08 \x08");
+                                    }
+                                }
+                            }
+                        } else if b == vwerase {
+                            let n = pair.edit_buf.word_erase();
+                            if is_echo {
+                                for _ in 0..n {
+                                    pair.s2m.write(b"\x08 \x08");
+                                }
+                            }
+                        } else if b == veof {
+                            // ^D: if edit buffer has content, flush as a line.
+                            // If empty, signal EOF to the reader.
+                            if !pair.edit_buf.is_empty() {
+                                if !pair.edit_buf.push(b'\n') {
+                                    // Edit buffer full — stop without counting this byte.
+                                    break;
+                                }
+                            } else {
+                                pair.eof_pending = true;
+                            }
+                            // Don't echo ^D.
+                        } else {
+                            if !pair.edit_buf.push(b) {
+                                // Edit buffer full — stop without counting this byte.
+                                break;
+                            }
+                            if is_echo {
+                                if b == b'\n' || echonl || b >= 0x20 {
+                                    pair.s2m.write(&[b]);
+                                } else {
+                                    // Echo control chars as ^X.
+                                    pair.s2m.write(&[b'^', b + 0x40]);
+                                }
+                            }
+                        }
+                    } else {
+                        // Raw mode: write directly to m2s.
+                        if pair.m2s.write(&[b]) == 0 {
+                            break; // buffer full
+                        }
+                        if is_echo {
+                            pair.s2m.write(&[b]);
+                        }
+                    }
+                    written += 1;
+                }
+                written as u64
+            } else {
+                NEG_EIO
+            }
+        }
+        FdBackend::PtySlave { pty_id } => {
+            // Slave writes to s2m (slave-to-master) buffer.
+            // Apply output processing (OPOST).
+            let pty_id = *pty_id;
+            let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
+            if crate::mm::user_mem::copy_from_user(&mut src_data, buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            let mut table = crate::pty::PTY_TABLE.lock();
+            if let Some(Some(pair)) = table.get_mut(pty_id as usize) {
+                if pair.master_refcount == 0 {
+                    return NEG_EIO;
+                }
+                let opost = pair.termios.c_oflag & kernel_core::tty::OPOST != 0;
+                let onlcr = pair.termios.c_oflag & kernel_core::tty::ONLCR != 0;
+                let mut written = 0usize;
+                for &b in &src_data {
+                    if opost && onlcr && b == b'\n' {
+                        // Ensure atomic CR+LF: need at least 2 bytes of space.
+                        if pair.s2m.space() < 2 {
+                            break;
+                        }
+                        pair.s2m.write(b"\r");
+                        pair.s2m.write(b"\n");
+                    } else if pair.s2m.write(&[b]) == 0 {
+                        break;
+                    }
+                    written += 1;
+                }
+                written as u64
+            } else {
+                NEG_EIO
+            }
         }
         FdBackend::Socket { .. } => {
             // Delegate to sendto with no addr
@@ -3040,9 +3375,12 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         };
     }
 
-    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    // Phase 29: /dev/ptmx — allocate a PTY pair and return the master fd.
     if name == "/dev/ptmx" {
-        let pty_id = crate::tty::alloc_pty();
+        let pty_id = match crate::pty::alloc_pty() {
+            Ok(id) => id,
+            Err(()) => return NEG_ENOSPC,
+        };
         log::info!("[pty] allocated PTY pair {}", pty_id);
         let entry = FdEntry {
             backend: FdBackend::PtyMaster { pty_id },
@@ -3053,13 +3391,26 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
-            None => NEG_EMFILE,
+            None => {
+                crate::pty::close_master(pty_id);
+                NEG_EMFILE
+            }
         };
     }
 
-    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    // Phase 29: /dev/pts/N — open the slave side of PTY N.
     if let Some(suffix) = name.strip_prefix("/dev/pts/") {
         if let Ok(pty_id) = suffix.parse::<u32>() {
+            // Check + increment refcount under the same lock to prevent
+            // a race where the PTY is freed between check and alloc_fd.
+            {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                    None => return NEG_ENOENT,
+                    Some(pair) if pair.locked => return NEG_EIO,
+                    Some(pair) => pair.slave_refcount += 1,
+                }
+            }
             let entry = FdEntry {
                 backend: FdBackend::PtySlave { pty_id },
                 offset: 0,
@@ -3069,7 +3420,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
-                None => NEG_EMFILE,
+                None => {
+                    crate::pty::close_slave(pty_id);
+                    NEG_EMFILE
+                }
             };
         }
         return NEG_ENOENT;
@@ -3475,9 +3829,12 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         };
     }
 
-    // Phase 22: /dev/ptmx — allocate a PTY pair and return the master fd.
+    // Phase 29: /dev/ptmx — allocate a PTY pair and return the master fd.
     if name == "/dev/ptmx" {
-        let pty_id = crate::tty::alloc_pty();
+        let pty_id = match crate::pty::alloc_pty() {
+            Ok(id) => id,
+            Err(()) => return NEG_ENOSPC,
+        };
         log::info!("[pty] allocated PTY pair {}", pty_id);
         let entry = FdEntry {
             backend: FdBackend::PtyMaster { pty_id },
@@ -3488,13 +3845,26 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
-            None => NEG_EMFILE,
+            None => {
+                crate::pty::close_master(pty_id);
+                NEG_EMFILE
+            }
         };
     }
 
-    // Phase 22: /dev/pts/N — open the slave side of PTY N.
+    // Phase 29: /dev/pts/N — open the slave side of PTY N.
     if let Some(suffix) = name.strip_prefix("/dev/pts/") {
         if let Ok(pty_id) = suffix.parse::<u32>() {
+            // Check + increment refcount under the same lock to prevent
+            // a race where the PTY is freed between check and alloc_fd.
+            {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                    None => return NEG_ENOENT,
+                    Some(pair) if pair.locked => return NEG_EIO,
+                    Some(pair) => pair.slave_refcount += 1,
+                }
+            }
             let entry = FdEntry {
                 backend: FdBackend::PtySlave { pty_id },
                 offset: 0,
@@ -3504,7 +3874,10 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
-                None => NEG_EMFILE,
+                None => {
+                    crate::pty::close_slave(pty_id);
+                    NEG_EMFILE
+                }
             };
         }
         return NEG_ENOENT;
@@ -3624,12 +3997,14 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
-    // Check if this FD is a pipe end; if so, close it in the pipe table.
+    // Close-time cleanup for resource-backed FDs.
     if let Some(entry) = current_fd_entry(fd) {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
+            FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+            FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             _ => {}
         }
     }
@@ -4717,6 +5092,15 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         return NEG_ENOTTY;
     }
 
+    // Helper: extract PTY ID from the backend (if it's a PTY FD).
+    let pty_id = match &backend {
+        Some(FdBackend::PtyMaster { pty_id }) | Some(FdBackend::PtySlave { pty_id }) => {
+            Some(*pty_id)
+        }
+        _ => None,
+    };
+    let is_pty_master = matches!(&backend, Some(FdBackend::PtyMaster { .. }));
+
     // TIOCGPTN: return PTY number for master fds.
     if req == TIOCGPTN {
         if let Some(FdBackend::PtyMaster { pty_id }) = &backend {
@@ -4729,9 +5113,84 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         return NEG_EINVAL;
     }
 
+    const TIOCSPTLCK: u64 = 0x40045431;
+    const TIOCGRANTPT: u64 = 0x5417;
+    const TIOCSCTTY: u64 = 0x540E;
+    const TIOCNOTTY: u64 = 0x5422;
+
+    // TIOCSPTLCK: lock/unlock the PTY slave.
+    if req == TIOCSPTLCK {
+        if let Some(id) = pty_id
+            && is_pty_master
+        {
+            let mut lock_val = [0u8; 4];
+            if crate::mm::user_mem::copy_from_user(&mut lock_val, arg).is_err() {
+                return NEG_EFAULT;
+            }
+            let val = i32::from_ne_bytes(lock_val);
+            let mut table = crate::pty::PTY_TABLE.lock();
+            if let Some(Some(pair)) = table.get_mut(id as usize) {
+                pair.locked = val != 0;
+                return 0;
+            }
+            return NEG_EIO;
+        }
+        return NEG_EINVAL; // not a PTY master
+    }
+
+    // TIOCGRANTPT: no-op (permissions not enforced yet).
+    if req == TIOCGRANTPT {
+        return 0;
+    }
+
+    // TIOCSCTTY: set controlling terminal for the session.
+    if req == TIOCSCTTY {
+        if let Some(FdBackend::PtySlave { pty_id }) = &backend {
+            let calling_pid =
+                crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let pty_id_val = *pty_id;
+            let mut pt = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = pt.find_mut(calling_pid) {
+                // Must be session leader with no controlling terminal.
+                if proc.session_id != calling_pid || proc.controlling_tty.is_some() {
+                    return NEG_EPERM;
+                }
+                proc.controlling_tty = Some(crate::process::ControllingTty::Pty(pty_id_val));
+            }
+            return 0;
+        }
+        return NEG_EINVAL;
+    }
+
+    // TIOCNOTTY: release controlling terminal.
+    if req == TIOCNOTTY {
+        let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let mut pt = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = pt.find_mut(calling_pid) {
+            proc.controlling_tty = None;
+        }
+        return 0;
+    }
+
     match req {
         TCGETS => {
-            // Copy TTY0.termios (36 bytes) to userspace.
+            if let Some(id) = pty_id {
+                let table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get(id as usize) {
+                    let src = unsafe {
+                        core::slice::from_raw_parts(
+                            &pair.termios as *const _ as *const u8,
+                            TERMIOS_SIZE,
+                        )
+                    };
+                    if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    return 0;
+                }
+                return NEG_EIO;
+            }
+            // Console TTY0.
             let tty = crate::tty::TTY0.lock();
             let src = unsafe {
                 core::slice::from_raw_parts(&tty.termios as *const _ as *const u8, TERMIOS_SIZE)
@@ -4741,8 +5200,7 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
-        TCSETS => {
-            // TCSANOW: apply immediately.
+        TCSETS | TCSETSW => {
             let mut buf = [0u8; TERMIOS_SIZE];
             if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
                 return NEG_EFAULT;
@@ -4750,24 +5208,18 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let new_termios = unsafe {
                 core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
             };
-            crate::tty::TTY0.lock().termios = new_termios;
-            0
-        }
-        TCSETSW => {
-            // TCSADRAIN: drain output then apply. Output is synchronous, so
-            // this is equivalent to TCSANOW.
-            let mut buf = [0u8; TERMIOS_SIZE];
-            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
-                return NEG_EFAULT;
+            if let Some(id) = pty_id {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get_mut(id as usize) {
+                    pair.termios = new_termios;
+                    return 0;
+                }
+                return NEG_EIO;
             }
-            let new_termios = unsafe {
-                core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
-            };
             crate::tty::TTY0.lock().termios = new_termios;
             0
         }
         TCSETSF => {
-            // TCSAFLUSH: flush input, then apply new termios.
             let mut buf = [0u8; TERMIOS_SIZE];
             if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
                 return NEG_EFAULT;
@@ -4775,7 +5227,17 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let new_termios = unsafe {
                 core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Termios)
             };
-            // Flush stdin buffer and edit buffer.
+            if let Some(id) = pty_id {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get_mut(id as usize) {
+                    pair.edit_buf.clear();
+                    pair.m2s.clear();
+                    pair.eof_pending = false;
+                    pair.termios = new_termios;
+                    return 0;
+                }
+                return NEG_EIO;
+            }
             crate::stdin::flush();
             let mut tty = crate::tty::TTY0.lock();
             tty.edit_buf.clear();
@@ -4783,7 +5245,18 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             0
         }
         TIOCGPGRP => {
-            // Return foreground process group.
+            if let Some(id) = pty_id {
+                let table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get(id as usize) {
+                    let pgid = pair.slave_fg_pgid;
+                    let bytes = (pgid as i32).to_ne_bytes();
+                    if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    return 0;
+                }
+                return NEG_EIO;
+            }
             let tty = crate::tty::TTY0.lock();
             let pgid = tty.fg_pgid;
             let bytes = (pgid as i32).to_ne_bytes();
@@ -4793,18 +5266,40 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             0
         }
         TIOCSPGRP => {
-            // Set foreground process group.
             let mut bytes = [0u8; 4];
             if crate::mm::user_mem::copy_from_user(&mut bytes, arg).is_err() {
                 return NEG_EFAULT;
             }
             let pgid = i32::from_ne_bytes(bytes) as u32;
+            if let Some(id) = pty_id {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get_mut(id as usize) {
+                    pair.slave_fg_pgid = pgid;
+                    return 0;
+                }
+                return NEG_EIO;
+            }
             crate::tty::TTY0.lock().fg_pgid = pgid;
             crate::process::FG_PGID.store(pgid, core::sync::atomic::Ordering::Relaxed);
             0
         }
         TIOCGWINSZ => {
-            // Copy TTY0.winsize (8 bytes) to userspace.
+            if let Some(id) = pty_id {
+                let table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get(id as usize) {
+                    let src = unsafe {
+                        core::slice::from_raw_parts(
+                            &pair.winsize as *const _ as *const u8,
+                            WINSIZE_SIZE,
+                        )
+                    };
+                    if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    return 0;
+                }
+                return NEG_EIO;
+            }
             let tty = crate::tty::TTY0.lock();
             let src = unsafe {
                 core::slice::from_raw_parts(&tty.winsize as *const _ as *const u8, WINSIZE_SIZE)
@@ -4815,7 +5310,6 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             0
         }
         TIOCSWINSZ => {
-            // Set window size and send SIGWINCH to foreground group.
             let mut buf = [0u8; WINSIZE_SIZE];
             if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
                 return NEG_EFAULT;
@@ -4823,6 +5317,21 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let new_ws = unsafe {
                 core::ptr::read_unaligned(buf.as_ptr() as *const kernel_core::tty::Winsize)
             };
+            if let Some(id) = pty_id {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                if let Some(Some(pair)) = table.get_mut(id as usize) {
+                    let changed = pair.winsize.ws_row != new_ws.ws_row
+                        || pair.winsize.ws_col != new_ws.ws_col;
+                    pair.winsize = new_ws;
+                    let fg = pair.slave_fg_pgid;
+                    drop(table);
+                    if changed && fg != 0 {
+                        crate::process::send_signal_to_group(fg, crate::process::SIGWINCH);
+                    }
+                    return 0;
+                }
+                return NEG_EIO;
+            }
             let mut tty = crate::tty::TTY0.lock();
             let changed =
                 tty.winsize.ws_row != new_ws.ws_row || tty.winsize.ws_col != new_ws.ws_col;
@@ -4834,8 +5343,6 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             0
         }
-        // TIOCSPTLCK (unlockpt) and TIOCGRANTPT (grantpt) — no-ops for PTY stubs.
-        0x40045431 | 0x5417 => 0,
         _ => NEG_EINVAL,
     }
 }
@@ -5887,21 +6394,25 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             if set_cloexec {
                 entry.cloexec = true;
             }
-            // Remember pipe info so we only bump refcount on successful alloc.
-            let pipe_info = match &entry.backend {
-                FdBackend::PipeRead { pipe_id } => Some((true, *pipe_id)),
-                FdBackend::PipeWrite { pipe_id } => Some((false, *pipe_id)),
-                _ => None,
-            };
+            // Remember backend info so we only bump refcount on successful alloc.
+            let backend_clone = entry.backend.clone();
             match alloc_fd(min_fd, entry) {
                 Some(new_fd) => {
-                    // Increment pipe ref-count only after successful allocation.
-                    if let Some((is_read, pipe_id)) = pipe_info {
-                        if is_read {
-                            crate::pipe::pipe_add_reader(pipe_id);
-                        } else {
-                            crate::pipe::pipe_add_writer(pipe_id);
+                    // Increment refcount only after successful allocation.
+                    match &backend_clone {
+                        FdBackend::PipeRead { pipe_id } => {
+                            crate::pipe::pipe_add_reader(*pipe_id);
                         }
+                        FdBackend::PipeWrite { pipe_id } => {
+                            crate::pipe::pipe_add_writer(*pipe_id);
+                        }
+                        FdBackend::PtyMaster { pty_id } => {
+                            crate::pty::add_master_ref(*pty_id);
+                        }
+                        FdBackend::PtySlave { pty_id } => {
+                            crate::pty::add_slave_ref(*pty_id);
+                        }
+                        _ => {}
                     }
                     new_fd as u64
                 }
