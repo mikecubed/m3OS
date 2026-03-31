@@ -5139,8 +5139,9 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let mut table = crate::pty::PTY_TABLE.lock();
             if let Some(Some(pair)) = table.get_mut(id as usize) {
                 pair.locked = val != 0;
+                return 0;
             }
-            return 0;
+            return NEG_EIO;
         }
         return NEG_EINVAL; // not a PTY master
     }
@@ -5219,8 +5220,9 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 let mut table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.termios = new_termios;
+                    return 0;
                 }
-                return 0;
+                return NEG_EIO;
             }
             crate::tty::TTY0.lock().termios = new_termios;
             0
@@ -5238,8 +5240,9 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.edit_buf.clear();
                     pair.termios = new_termios;
+                    return 0;
                 }
-                return 0;
+                return NEG_EIO;
             }
             crate::stdin::flush();
             let mut tty = crate::tty::TTY0.lock();
@@ -5278,8 +5281,9 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 let mut table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.slave_fg_pgid = pgid;
+                    return 0;
                 }
-                return 0;
+                return NEG_EIO;
             }
             crate::tty::TTY0.lock().fg_pgid = pgid;
             crate::process::FG_PGID.store(pgid, core::sync::atomic::Ordering::Relaxed);
@@ -5330,8 +5334,9 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                     if changed && fg != 0 {
                         crate::process::send_signal_to_group(fg, crate::process::SIGWINCH);
                     }
+                    return 0;
                 }
-                return 0;
+                return NEG_EIO;
             }
             let mut tty = crate::tty::TTY0.lock();
             let changed =
