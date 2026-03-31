@@ -3403,32 +3403,30 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     // Phase 29: /dev/pts/N — open the slave side of PTY N.
     if let Some(suffix) = name.strip_prefix("/dev/pts/") {
         if let Ok(pty_id) = suffix.parse::<u32>() {
-            let table = crate::pty::PTY_TABLE.lock();
-            let result = match table.get(pty_id as usize).and_then(|s| s.as_ref()) {
-                None => Err(NEG_ENOENT),
-                Some(pair) if pair.locked => Err(NEG_EIO),
-                Some(_) => Ok(()),
-            };
-            drop(table);
-            match result {
-                Err(e) => return e,
-                Ok(()) => {
-                    let entry = FdEntry {
-                        backend: FdBackend::PtySlave { pty_id },
-                        offset: 0,
-                        readable: true,
-                        writable: true,
-                        cloexec: false,
-                    };
-                    return match alloc_fd(3, entry) {
-                        Some(i) => {
-                            crate::pty::add_slave_ref(pty_id);
-                            i as u64
-                        }
-                        None => NEG_EMFILE,
-                    };
+            // Check + increment refcount under the same lock to prevent
+            // a race where the PTY is freed between check and alloc_fd.
+            {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                    None => return NEG_ENOENT,
+                    Some(pair) if pair.locked => return NEG_EIO,
+                    Some(pair) => pair.slave_refcount += 1,
                 }
             }
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: false,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => {
+                    crate::pty::close_slave(pty_id);
+                    NEG_EMFILE
+                }
+            };
         }
         return NEG_ENOENT;
     }
@@ -3859,32 +3857,30 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Phase 29: /dev/pts/N — open the slave side of PTY N.
     if let Some(suffix) = name.strip_prefix("/dev/pts/") {
         if let Ok(pty_id) = suffix.parse::<u32>() {
-            let table = crate::pty::PTY_TABLE.lock();
-            let result = match table.get(pty_id as usize).and_then(|s| s.as_ref()) {
-                None => Err(NEG_ENOENT),
-                Some(pair) if pair.locked => Err(NEG_EIO),
-                Some(_) => Ok(()),
-            };
-            drop(table);
-            match result {
-                Err(e) => return e,
-                Ok(()) => {
-                    let entry = FdEntry {
-                        backend: FdBackend::PtySlave { pty_id },
-                        offset: 0,
-                        readable: true,
-                        writable: true,
-                        cloexec: false,
-                    };
-                    return match alloc_fd(3, entry) {
-                        Some(i) => {
-                            crate::pty::add_slave_ref(pty_id);
-                            i as u64
-                        }
-                        None => NEG_EMFILE,
-                    };
+            // Check + increment refcount under the same lock to prevent
+            // a race where the PTY is freed between check and alloc_fd.
+            {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
+                    None => return NEG_ENOENT,
+                    Some(pair) if pair.locked => return NEG_EIO,
+                    Some(pair) => pair.slave_refcount += 1,
                 }
             }
+            let entry = FdEntry {
+                backend: FdBackend::PtySlave { pty_id },
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: false,
+            };
+            return match alloc_fd(3, entry) {
+                Some(i) => i as u64,
+                None => {
+                    crate::pty::close_slave(pty_id);
+                    NEG_EMFILE
+                }
+            };
         }
         return NEG_ENOENT;
     }

@@ -214,7 +214,12 @@ fn test_s2m_io() -> bool {
             };
             termios.c_lflag &= !(0o000002 | 0o000010 | 0o000001);
             termios.c_oflag &= !0o000001; // clear OPOST
-            let _ = syscall_lib::tcsetattr(sfd, &termios);
+            if syscall_lib::tcsetattr(sfd, &termios).is_err() {
+                close(mfd);
+                close(sfd);
+                fail(b"s2m_io: tcsetattr failed");
+                return false;
+            }
 
             // Slave writes, master reads.
             let _ = write(sfd, b"ok");
@@ -280,7 +285,12 @@ fn test_master_close_eof() -> bool {
                 }
             };
             termios.c_lflag &= !(0o000002 | 0o000010 | 0o000001);
-            let _ = syscall_lib::tcsetattr(sfd, &termios);
+            if syscall_lib::tcsetattr(sfd, &termios).is_err() {
+                close(mfd);
+                close(sfd);
+                fail(b"master_close_eof: tcsetattr failed");
+                return false;
+            }
 
             let pid = fork();
             if pid < 0 {
