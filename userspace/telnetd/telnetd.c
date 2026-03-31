@@ -272,8 +272,8 @@ static int unix_to_crlf(const unsigned char *in, int inlen,
 /* ------------------------------------------------------------------ */
 
 static void handle_connection(int client_fd) {
-    /* Send telnet option negotiation */
-    telnet_negotiate(client_fd);
+    /* Skip IAC negotiation for now — debug: test with raw telnet */
+    /* telnet_negotiate(client_fd); */
 
     /* Allocate PTY pair */
     int master_fd = open("/dev/ptmx", O_RDWR);
