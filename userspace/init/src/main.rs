@@ -114,7 +114,7 @@ fn spawn_telnetd() {
         write_str(STDOUT_FILENO, ")\n");
         exit(1);
     }
-    write_str(STDOUT_FILENO, "init: telnetd started\n");
+    write_str(STDOUT_FILENO, "init: telnetd forked\n");
 }
 
 #[panic_handler]

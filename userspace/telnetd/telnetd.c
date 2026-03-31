@@ -62,6 +62,7 @@ struct telnet_state {
     int            naws_received;
     unsigned short naws_cols;
     unsigned short naws_rows;
+    int            pending_cr;
 };
 
 static void telnet_state_init(struct telnet_state *ts) {
@@ -216,24 +217,39 @@ static void pts_path(unsigned int n, char *buf, int buflen) {
 }
 
 /* CR/LF translation: socket → PTY (NVT → Unix).
- * CR NUL → CR, CR LF → LF, bare CR → CR. */
+ * CR NUL → CR, CR LF → LF, bare CR → CR.
+ * Uses ts->pending_cr to handle CR split across read boundaries. */
 static int crlf_to_unix(const unsigned char *in, int inlen,
-                         unsigned char *out, int outsize) {
+                         unsigned char *out, int outsize,
+                         struct telnet_state *ts) {
     int olen = 0;
     for (int i = 0; i < inlen && olen < outsize; i++) {
-        if (in[i] == '\r') {
+        if (ts->pending_cr) {
+            ts->pending_cr = 0;
+            if (in[i] == '\n') {
+                out[olen++] = '\n';
+            } else if (in[i] == '\0') {
+                out[olen++] = '\r';
+            } else {
+                /* Bare CR followed by non-LF/NUL */
+                out[olen++] = '\r';
+                if (olen < outsize)
+                    out[olen++] = in[i];
+            }
+        } else if (in[i] == '\r') {
             if (i + 1 < inlen) {
                 if (in[i + 1] == '\n') {
                     out[olen++] = '\n';
-                    i++; /* skip LF */
+                    i++;
                 } else if (in[i + 1] == '\0') {
                     out[olen++] = '\r';
-                    i++; /* skip NUL */
+                    i++;
                 } else {
                     out[olen++] = '\r';
                 }
             } else {
-                out[olen++] = '\r';
+                /* CR at end of buffer — defer until next read */
+                ts->pending_cr = 1;
             }
         } else {
             out[olen++] = in[i];
@@ -285,11 +301,21 @@ static void handle_connection(int client_fd) {
 
     /* Unlock the PTY slave */
     int unlock = 0;
-    ioctl(master_fd, TIOCSPTLCK, &unlock);
+    if (ioctl(master_fd, TIOCSPTLCK, &unlock) < 0) {
+        write_str(client_fd, "telnetd: PTY unlock failed\r\n");
+        close(master_fd);
+        close(client_fd);
+        _exit(1);
+    }
 
     /* Get PTY number */
     unsigned int pty_num = 0;
-    ioctl(master_fd, TIOCGPTN, &pty_num);
+    if (ioctl(master_fd, TIOCGPTN, &pty_num) < 0) {
+        write_str(client_fd, "telnetd: TIOCGPTN failed\r\n");
+        close(master_fd);
+        close(client_fd);
+        _exit(1);
+    }
 
     /* Build slave path */
     char slave_path[32];
@@ -354,18 +380,13 @@ static void handle_connection(int client_fd) {
 
     for (;;) {
         int ret = poll(pfds, 2, -1);
-        if (ret <= 0)
-            continue;
-
-        /* Apply NAWS if received */
-        if (ts.naws_received) {
-            ts.naws_received = 0;
-            struct { unsigned short rows, cols, xpixel, ypixel; } ws;
-            memset(&ws, 0, sizeof(ws));
-            ws.rows = ts.naws_rows;
-            ws.cols = ts.naws_cols;
-            ioctl(master_fd, TIOCSWINSZ, &ws);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
         }
+        if (ret == 0)
+            continue;
 
         /* Socket → PTY master */
         if (pfds[0].revents & POLLIN) {
@@ -382,7 +403,7 @@ static void handle_connection(int client_fd) {
             if (clen > 0) {
                 /* CR/LF translation: NVT → Unix */
                 unsigned char unix_buf[512];
-                int ulen = crlf_to_unix(clean, clen, unix_buf, sizeof(unix_buf));
+                int ulen = crlf_to_unix(clean, clen, unix_buf, sizeof(unix_buf), &ts);
                 if (ulen > 0 && write_all(master_fd, unix_buf, ulen) < 0)
                     break;
             }

@@ -7692,27 +7692,31 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                         FdBackend::PtyMaster { pty_id } => {
                             const POLLOUT: i16 = 0x004;
                             const POLLHUP: i16 = 0x010;
+                            const POLLNVAL: i16 = 0x020;
                             let id = *pty_id;
                             let table = crate::pty::PTY_TABLE.lock();
-                            if let Some(pair) = table[id as usize].as_ref() {
-                                // POLLIN: slave wrote data to s2m buffer.
-                                if !pair.s2m.is_empty() && events & POLLIN != 0 {
-                                    revents |= POLLIN;
-                                }
-                                // POLLHUP: slave side fully closed (was opened, now all refs gone).
-                                if pair.slave_refcount == 0 && pair.slave_opened {
-                                    revents |= POLLHUP;
-                                    // Also report POLLIN so read() returns 0 (EOF).
-                                    if events & POLLIN != 0 {
+                            if let Some(slot) = table.get(id as usize) {
+                                if let Some(pair) = slot.as_ref() {
+                                    // POLLIN: slave wrote data to s2m buffer.
+                                    if !pair.s2m.is_empty() && events & POLLIN != 0 {
                                         revents |= POLLIN;
                                     }
-                                }
-                                // POLLOUT: m2s buffer has space.
-                                if !pair.m2s.is_full() && events & POLLOUT != 0 {
-                                    revents |= POLLOUT;
+                                    // POLLHUP: slave side fully closed.
+                                    if pair.slave_refcount == 0 && pair.slave_opened {
+                                        revents |= POLLHUP;
+                                        if events & POLLIN != 0 {
+                                            revents |= POLLIN;
+                                        }
+                                    }
+                                    // POLLOUT: m2s buffer has space.
+                                    if !pair.m2s.is_full() && events & POLLOUT != 0 {
+                                        revents |= POLLOUT;
+                                    }
+                                } else {
+                                    revents |= POLLHUP;
                                 }
                             } else {
-                                revents |= POLLHUP;
+                                revents |= POLLNVAL;
                             }
                         }
                         _ => {
