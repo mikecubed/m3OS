@@ -55,34 +55,24 @@ pub fn add_slave_ref(id: u32) {
 }
 
 /// Close one master reference. Sends SIGHUP when last ref is closed.
+///
+/// Does NOT free the PTY pair — that's done by `close_slave` when the
+/// slave side fully closes. This prevents a race where the master is
+/// closed (e.g., by a forked child) before the slave has been opened.
 pub fn close_master(id: u32) {
     let fg;
     {
         let mut table = PTY_TABLE.lock();
         if let Some(Some(pair)) = table.get_mut(id as usize) {
-            let old = pair.master_refcount;
             if pair.master_refcount > 0 {
                 pair.master_refcount -= 1;
             }
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            log::info!(
-                "[pty] close_master({}): pid={} refcount {} → {}, slave_refcount={}",
-                id,
-                pid,
-                old,
-                pair.master_refcount,
-                pair.slave_refcount
-            );
             fg = if pair.master_refcount == 0 {
-                let pgid = pair.slave_fg_pgid;
-                try_free(&mut table, id);
-                pgid
+                pair.slave_fg_pgid
             } else {
                 0
             };
         } else {
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            log::warn!("[pty] close_master({}): pid={} PTY not found!", id, pid);
             return;
         }
     }

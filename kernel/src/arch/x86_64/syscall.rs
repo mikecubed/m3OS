@@ -3331,19 +3331,6 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
-    // Temporary debug: log open calls to /dev/*
-    if name.starts_with("/dev/") {
-        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-        log::info!(
-            "[p{}] open({:?}, flags=0x{:x}) raw={:?} cwd={:?}",
-            pid,
-            name,
-            flags,
-            raw_name,
-            cwd
-        );
-    }
-
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),     // O_RDONLY
@@ -3417,29 +3404,15 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
     // Phase 29: /dev/pts/N — open the slave side of PTY N.
     if let Some(suffix) = name.strip_prefix("/dev/pts/") {
-        log::info!("[open] /dev/pts/ suffix={:?}", suffix);
         if let Ok(pty_id) = suffix.parse::<u32>() {
             // Check + increment refcount under the same lock to prevent
             // a race where the PTY is freed between check and alloc_fd.
             {
                 let mut table = crate::pty::PTY_TABLE.lock();
                 match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
-                    None => {
-                        log::warn!("[open] /dev/pts/{}: PTY not found", pty_id);
-                        return NEG_ENOENT;
-                    }
-                    Some(pair) if pair.locked => {
-                        log::warn!("[open] /dev/pts/{}: PTY locked", pty_id);
-                        return NEG_EIO;
-                    }
-                    Some(pair) => {
-                        log::info!(
-                            "[open] /dev/pts/{}: ok, slave_refcount={}",
-                            pty_id,
-                            pair.slave_refcount
-                        );
-                        pair.slave_refcount += 1;
-                    }
+                    None => return NEG_ENOENT,
+                    Some(pair) if pair.locked => return NEG_EIO,
+                    Some(pair) => pair.slave_refcount += 1,
                 }
             }
             let entry = FdEntry {
@@ -3450,18 +3423,13 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 cloexec: false,
             };
             return match alloc_fd(3, entry) {
-                Some(i) => {
-                    log::info!("[open] /dev/pts/{}: fd={}", pty_id, i);
-                    i as u64
-                }
+                Some(i) => i as u64,
                 None => {
-                    log::warn!("[open] /dev/pts/{}: EMFILE", pty_id);
                     crate::pty::close_slave(pty_id);
                     NEG_EMFILE
                 }
             };
         }
-        log::warn!("[open] /dev/pts/ parse failed for {:?}", suffix);
         return NEG_ENOENT;
     }
 
