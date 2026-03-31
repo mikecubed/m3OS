@@ -39,6 +39,7 @@ pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! 
     let count = argc.min(MAX_ARGS);
 
     let mut parsed = 0;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..count {
         let ptr = unsafe { *argv_base.add(i) };
         if ptr.is_null() {

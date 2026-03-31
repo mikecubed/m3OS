@@ -29,6 +29,7 @@ pub extern "C" fn _start() -> ! {
     write_str(STDOUT_FILENO, "\nm3OS init (PID 1)\n");
 
     // Phase 28: Mount ext2 root filesystem at /.
+    #[allow(clippy::manual_c_str_literals)]
     let ret = mount(b"/dev/blk0\0".as_ptr(), b"/\0".as_ptr(), b"ext2\0".as_ptr());
     if ret == 0 {
         write_str(STDOUT_FILENO, "init: / mounted (ext2)\n");

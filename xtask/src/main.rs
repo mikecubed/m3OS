@@ -165,6 +165,40 @@ fn build_userspace_bins() {
         });
         println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
     }
+
+    // Rust coreutils — build all binaries in one cargo invocation.
+    let coreutils_bins: &[&str] = &[
+        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv",
+    ];
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "coreutils-rs",
+            "--bins",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ])
+        .status()
+        .expect("failed to build coreutils-rs");
+
+    if !status.success() {
+        eprintln!("userspace build failed for coreutils-rs");
+        std::process::exit(1);
+    }
+
+    for bin in coreutils_bins {
+        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let dst = initrd.join(format!("{bin}.elf"));
+        fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("failed to copy {bin} to initrd: {e}");
+        });
+        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+    }
 }
 
 /// Compile Phase 12 musl-linked C binaries and copy them into kernel/initrd/.
@@ -187,20 +221,11 @@ fn build_musl_bins() {
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
-        // Phase 14 core utilities
-        ("userspace/coreutils/echo.c", "echo"),
-        ("userspace/coreutils/true.c", "true"),
-        ("userspace/coreutils/false.c", "false"),
+        // Phase 14 core utilities (only those not yet converted to Rust)
         ("userspace/coreutils/cat.c", "cat"),
         ("userspace/coreutils/ls.c", "ls"),
-        ("userspace/coreutils/pwd.c", "pwd"),
-        ("userspace/coreutils/mkdir.c", "mkdir"),
-        ("userspace/coreutils/rmdir.c", "rmdir"),
-        ("userspace/coreutils/rm.c", "rm"),
         ("userspace/coreutils/cp.c", "cp"),
-        ("userspace/coreutils/mv.c", "mv"),
         ("userspace/coreutils/env.c", "env"),
-        ("userspace/coreutils/sleep.c", "sleep"),
         ("userspace/coreutils/grep.c", "grep"),
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
@@ -525,6 +550,74 @@ fn cmd_check() {
 
     if !status.success() {
         eprintln!("clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Clippy for all userspace crates (same target as kernel).
+    let userspace_pkgs = [
+        "syscall-lib",
+        "exit0",
+        "fork-test",
+        "echo-args",
+        "init",
+        "shell",
+        "ping",
+        "edit",
+        "login",
+        "su",
+        "passwd",
+        "adduser",
+        "id",
+        "whoami",
+        "pty-test",
+        "coreutils-rs",
+    ];
+    let mut clippy_args = vec![
+        "clippy".to_string(),
+        "--target".to_string(),
+        "x86_64-unknown-none".to_string(),
+        "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
+        "-Zbuild-std-features=compiler-builtins-mem".to_string(),
+    ];
+    for pkg in &userspace_pkgs {
+        clippy_args.push("--package".to_string());
+        clippy_args.push(pkg.to_string());
+    }
+    clippy_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
+
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(&clippy_args)
+        .status()
+        .expect("failed to run userspace clippy");
+
+    if !status.success() {
+        eprintln!("userspace clippy reported errors");
+        std::process::exit(1);
+    }
+
+    // Clippy for syscall-lib with the alloc feature enabled (heap code is feature-gated).
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "syscall-lib",
+            "--features",
+            "alloc",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run syscall-lib alloc clippy");
+
+    if !status.success() {
+        eprintln!("syscall-lib (alloc feature) clippy reported errors");
         std::process::exit(1);
     }
 

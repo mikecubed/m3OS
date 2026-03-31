@@ -252,6 +252,7 @@ fn test_multiple_ptys() -> bool {
             Ok((mfd, sfd)) => *slot = (mfd, sfd),
             Err(_) => {
                 // Clean up already allocated.
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..i {
                     close(fds[j].0);
                     close(fds[j].1);

@@ -39,7 +39,7 @@ pub extern "C" fn _start() -> ! {
 
 /// Look up a name (field 0) by numeric id in the given field index.
 /// Works for both /etc/passwd (uid at field 2) and /etc/group (gid at field 2).
-fn lookup_name<'a>(data: &'a [u8], target_id: u32, id_field: usize) -> Option<&'a [u8]> {
+fn lookup_name(data: &[u8], target_id: u32, id_field: usize) -> Option<&[u8]> {
     for line in data.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
@@ -57,10 +57,8 @@ fn lookup_name<'a>(data: &'a [u8], target_id: u32, id_field: usize) -> Option<&'
         if field > 0 {
             fields[field.min(6)] = &line[start..];
         }
-        if field > id_field {
-            if parse_u32(fields[id_field]) == target_id {
-                return Some(fields[0]);
-            }
+        if field > id_field && parse_u32(fields[id_field]) == target_id {
+            return Some(fields[0]);
         }
     }
     None
