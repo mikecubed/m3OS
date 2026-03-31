@@ -41,3 +41,15 @@ path = "src/rmdir.rs"
 [[bin]]
 name = "mv"
 path = "src/mv.rs"
+
+[[bin]]
+name = "cat"
+path = "src/cat.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"

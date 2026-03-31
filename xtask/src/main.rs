@@ -176,7 +176,7 @@ fn build_userspace_bins() {
 
     // Rust coreutils — build all binaries in one cargo invocation.
     let coreutils_bins: &[&str] = &[
-        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv",
+        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -230,11 +230,8 @@ fn build_musl_bins() {
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 14 core utilities (only those not yet converted to Rust)
-        ("userspace/coreutils/cat.c", "cat"),
         ("userspace/coreutils/ls.c", "ls"),
-        ("userspace/coreutils/cp.c", "cp"),
         ("userspace/coreutils/env.c", "env"),
-        ("userspace/coreutils/grep.c", "grep"),
         // Phase 21: ion prompt command + stdin test
         ("userspace/coreutils/prompt.c", "PROMPT"),
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
