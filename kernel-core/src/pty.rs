@@ -118,6 +118,9 @@ pub struct PtyPairState {
     pub eof_pending: bool,
     /// PTY lock — slave cannot be opened until unlocked via TIOCSPTLCK(0).
     pub locked: bool,
+    /// True once slave_refcount has been > 0 at least once.
+    /// Used to distinguish "slave never opened" from "slave closed".
+    pub slave_opened: bool,
 }
 
 impl PtyPairState {
@@ -134,6 +137,7 @@ impl PtyPairState {
             slave_refcount: 0,
             eof_pending: false,
             locked: true,
+            slave_opened: false,
         }
     }
 }

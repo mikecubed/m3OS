@@ -382,14 +382,6 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
         return;
     }
 
-    // No connection matched — send RST for non-RST segments.
-    log::warn!(
-        "[tcp] no match for port {} from {:?}:{} flags=0x{:x} — sending RST",
-        tcp_hdr.dst_port,
-        ip_header.src,
-        tcp_hdr.src_port,
-        tcp_hdr.flags
-    );
     if tcp_hdr.flags & TCP_RST == 0 {
         let local_ip = super::config::our_ip();
         let has_ack = tcp_hdr.flags & TCP_ACK != 0;

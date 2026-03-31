@@ -51,6 +51,7 @@ pub fn add_slave_ref(id: u32) {
     let mut table = PTY_TABLE.lock();
     if let Some(Some(pair)) = table.get_mut(id as usize) {
         pair.slave_refcount += 1;
+        pair.slave_opened = true;
     }
 }
 

@@ -2623,7 +2623,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             }
                             return n as u64;
                         }
-                        if pair.slave_refcount == 0 {
+                        if pair.slave_refcount == 0 && pair.slave_opened {
                             return 0; // EOF — slave closed
                         }
                     } else {
@@ -3412,7 +3412,10 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
                     None => return NEG_ENOENT,
                     Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => pair.slave_refcount += 1,
+                    Some(pair) => {
+                        pair.slave_refcount += 1;
+                        pair.slave_opened = true;
+                    }
                 }
             }
             let entry = FdEntry {
@@ -3866,7 +3869,10 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
                     None => return NEG_ENOENT,
                     Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => pair.slave_refcount += 1,
+                    Some(pair) => {
+                        pair.slave_refcount += 1;
+                        pair.slave_opened = true;
+                    }
                 }
             }
             let entry = FdEntry {
@@ -7693,8 +7699,8 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                                 if !pair.s2m.is_empty() && events & POLLIN != 0 {
                                     revents |= POLLIN;
                                 }
-                                // POLLHUP: slave side fully closed.
-                                if pair.slave_refcount == 0 {
+                                // POLLHUP: slave side fully closed (was opened, now all refs gone).
+                                if pair.slave_refcount == 0 && pair.slave_opened {
                                     revents |= POLLHUP;
                                     // Also report POLLIN so read() returns 0 (EOF).
                                     if events & POLLIN != 0 {

@@ -272,47 +272,8 @@ static int unix_to_crlf(const unsigned char *in, int inlen,
 /* ------------------------------------------------------------------ */
 
 static void handle_connection(int client_fd) {
-    /* DEBUG: poll on socket + PTY master together */
-    {
-        int mfd = open("/dev/ptmx", O_RDWR);
-        if (mfd < 0) { write_str(2, "telnetd: ptmx open failed\n"); _exit(1); }
-        int unlock = 0;
-        ioctl(mfd, TIOCSPTLCK, &unlock);
-
-        unsigned char buf[256];
-        const char *hello = "ECHO-2FD> ";
-        write(client_fd, hello, 10);
-
-        struct pollfd pfds[2];
-        pfds[0].fd = client_fd;
-        pfds[0].events = POLLIN;
-        pfds[1].fd = mfd;
-        pfds[1].events = POLLIN;
-        for (;;) {
-            pfds[0].revents = 0;
-            pfds[1].revents = 0;
-            int r = poll(pfds, 2, -1);
-            if (r <= 0) {
-                write_str(2, "telnetd: 2fd poll failed\n");
-                break;
-            }
-            if (pfds[0].revents & POLLIN) {
-                ssize_t n = read(client_fd, buf, sizeof(buf));
-                if (n <= 0) break;
-                write(client_fd, buf, n);
-            }
-            if (pfds[0].revents & 0x010) break;
-            if (pfds[1].revents & 0x010) {
-                write_str(2, "telnetd: pty POLLHUP\n");
-                break;
-            }
-        }
-        close(mfd);
-        close(client_fd);
-        _exit(0);
-    }
-
-    /* telnet_negotiate(client_fd); */
+    /* Send telnet option negotiation */
+    telnet_negotiate(client_fd);
 
     /* Allocate PTY pair */
     int master_fd = open("/dev/ptmx", O_RDWR);
