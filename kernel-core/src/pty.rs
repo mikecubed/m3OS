@@ -84,6 +84,12 @@ impl PtyRingBuffer {
     pub fn space(&self) -> usize {
         PTY_BUF_SIZE - self.count
     }
+
+    /// Discard all buffered data.
+    pub fn clear(&mut self) {
+        self.read_pos = 0;
+        self.count = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------

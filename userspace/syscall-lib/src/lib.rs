@@ -879,7 +879,8 @@ pub fn getsid(pid: u32) -> i64 {
     unsafe { syscall1(124, pid as u64) as i64 }
 }
 
-/// Open a PTY pair. Returns `Ok((master_fd, slave_fd))` or `Err(errno)`.
+/// Open a PTY pair. Returns `Ok((master_fd, slave_fd))` or `Err(negative_errno)`.
+/// Error values are negative (e.g., -5 for EIO), matching raw syscall convention.
 pub fn openpty() -> Result<(i32, i32), i32> {
     // Open /dev/ptmx to allocate a new PTY pair.
     let master_fd = open(b"/dev/ptmx\0", 2, 0); // O_RDWR

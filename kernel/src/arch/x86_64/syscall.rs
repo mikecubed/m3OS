@@ -3083,8 +3083,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             // If empty, signal EOF to the reader.
                             if !pair.edit_buf.is_empty() {
                                 if !pair.edit_buf.push(b'\n') {
-                                    // Edit buffer full — stop accepting input.
-                                    written += 1;
+                                    // Edit buffer full — stop without counting this byte.
                                     break;
                                 }
                             } else {
@@ -3093,8 +3092,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             // Don't echo ^D.
                         } else {
                             if !pair.edit_buf.push(b) {
-                                // Edit buffer full — stop accepting input.
-                                written += 1;
+                                // Edit buffer full — stop without counting this byte.
                                 break;
                             }
                             if is_echo {
@@ -5239,6 +5237,8 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 let mut table = crate::pty::PTY_TABLE.lock();
                 if let Some(Some(pair)) = table.get_mut(id as usize) {
                     pair.edit_buf.clear();
+                    pair.m2s.clear();
+                    pair.eof_pending = false;
                     pair.termios = new_termios;
                     return 0;
                 }
