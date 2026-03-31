@@ -17,7 +17,9 @@ fn main(_args: &[&str], env: &[&str]) -> i32 {
     let mut user: Option<&str> = None;
     for e in env {
         if let Some(val) = e.strip_prefix("USER=") {
-            user = Some(val);
+            if !val.is_empty() {
+                user = Some(val);
+            }
             break;
         }
     }

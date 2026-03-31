@@ -57,14 +57,14 @@ pub unsafe fn run_main(stack_ptr: *const u64, main_fn: fn(&[&str]) -> i32) -> ! 
     let count = argc.min(MAX_ARGS);
 
     let mut parsed = 0;
-    #[allow(clippy::needless_range_loop)]
     for i in 0..count {
         let ptr = unsafe { *argv_base.add(i) };
-        if let Some(s) = unsafe { parse_cstr(ptr, MAX_ARG_LEN) } {
-            arg_strs[i] = s;
-            parsed += 1;
-        } else if ptr.is_null() {
+        if ptr.is_null() {
             break;
+        }
+        if let Some(s) = unsafe { parse_cstr(ptr, MAX_ARG_LEN) } {
+            arg_strs[parsed] = s;
+            parsed += 1;
         }
     }
 
@@ -85,14 +85,14 @@ pub unsafe fn run_main_with_env(stack_ptr: *const u64, main_fn: fn(&[&str], &[&s
     let mut arg_strs: [&str; MAX_ARGS] = [""; MAX_ARGS];
     let count = argc.min(MAX_ARGS);
     let mut parsed_args = 0;
-    #[allow(clippy::needless_range_loop)]
     for i in 0..count {
         let ptr = unsafe { *argv_base.add(i) };
-        if let Some(s) = unsafe { parse_cstr(ptr, MAX_ARG_LEN) } {
-            arg_strs[i] = s;
-            parsed_args += 1;
-        } else if ptr.is_null() {
+        if ptr.is_null() {
             break;
+        }
+        if let Some(s) = unsafe { parse_cstr(ptr, MAX_ARG_LEN) } {
+            arg_strs[parsed_args] = s;
+            parsed_args += 1;
         }
     }
 
@@ -100,14 +100,13 @@ pub unsafe fn run_main_with_env(stack_ptr: *const u64, main_fn: fn(&[&str], &[&s
     let envp_base = unsafe { stack_ptr.add(1 + argc + 1) } as *const *const u8;
     let mut env_strs: [&str; MAX_ENVS] = [""; MAX_ENVS];
     let mut parsed_envs = 0;
-    #[allow(clippy::needless_range_loop)]
     for i in 0..MAX_ENVS {
         let ptr = unsafe { *envp_base.add(i) };
         if ptr.is_null() {
             break;
         }
         if let Some(s) = unsafe { parse_cstr(ptr, MAX_ARG_LEN) } {
-            env_strs[i] = s;
+            env_strs[parsed_envs] = s;
             parsed_envs += 1;
         }
     }

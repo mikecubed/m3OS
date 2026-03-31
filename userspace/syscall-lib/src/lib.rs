@@ -722,15 +722,26 @@ pub fn getdents64(fd: i32, buf: &mut [u8]) -> isize {
     }
 }
 
-/// Stat a file by path. `path` must be null-terminated. `stat_buf` must be 144 bytes.
+/// Stat a file by path (newfstatat syscall 262).
+///
+/// `path` must be null-terminated. `stat_buf` must be 144 bytes.
+/// Uses `AT_FDCWD` (-100) as dirfd and `flags = 0`.
 pub fn newfstatat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
-    // dirfd = AT_FDCWD (-100), flags = 0
+    newfstatat_flags(path, stat_buf, 0)
+}
+
+/// Stat a file by path with explicit flags (newfstatat syscall 262).
+///
+/// `path` must be null-terminated. `stat_buf` must be 144 bytes.
+/// Uses `AT_FDCWD` (-100) as dirfd.
+pub fn newfstatat_flags(path: &[u8], stat_buf: &mut [u8; 144], flags: u64) -> isize {
     unsafe {
-        syscall3(
+        syscall4(
             SYS_NEWFSTATAT,
             (-100i64) as u64,
             path.as_ptr() as u64,
             stat_buf.as_mut_ptr() as u64,
+            flags,
         ) as isize
     }
 }
