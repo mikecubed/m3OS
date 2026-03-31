@@ -65,3 +65,24 @@ path = "src/prompt.rs"
 [[bin]]
 name = "ls"
 path = "src/ls.rs"
+
+# Phase 32: build tool utilities
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
+name = "stat"
+path = "src/stat_cmd.rs"
+
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "ar"
+path = "src/ar.rs"
+
+[[bin]]
+name = "install"
+path = "src/install.rs"

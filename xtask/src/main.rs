@@ -176,8 +176,10 @@ fn build_userspace_bins() {
 
     // Rust coreutils — build all binaries in one cargo invocation.
     let coreutils_bins: &[&str] = &[
-        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
-        "env", "PROMPT", "ls",
+        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp",
+        "grep", "env", "PROMPT", "ls",
+        // Phase 32: build tool utilities
+        "touch", "stat", "wc", "ar", "install",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -234,12 +236,6 @@ fn build_musl_bins() {
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
         // Phase 30: telnet server
         ("userspace/telnetd/telnetd.c", "telnetd"),
-        // Phase 32: build tool utilities
-        ("userspace/coreutils/touch.c", "touch"),
-        ("userspace/coreutils/stat.c", "stat"),
-        ("userspace/coreutils/wc.c", "wc"),
-        ("userspace/coreutils/ar.c", "ar"),
-        ("userspace/coreutils/install.c", "install"),
     ];
 
     for (src_rel, name) in bins {
@@ -2051,6 +2047,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         populate_tcc_files(&part_tmp, &tcc_staging);
     }
 
+    // Phase 32: populate demo project for make/build-tools testing.
+    populate_demo_project(&part_tmp, &root);
+
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
         .args(["-n", "-f"])
@@ -2292,6 +2291,72 @@ fn collect_staging_entries(
         } else {
             files.push((child_prefix, path));
         }
+    }
+}
+
+/// Phase 32: Populate the demo multi-file C project into `/home/project/`
+/// on the ext2 partition for `make` testing.
+fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
+    let demo_dir = workspace_root.join("userspace/demo-project");
+    if !demo_dir.is_dir() {
+        return;
+    }
+
+    let demo_files: &[(&str, &str)] = &[
+        ("Makefile", "home/project/Makefile"),
+        ("main.c", "home/project/main.c"),
+        ("util.c", "home/project/util.c"),
+        ("util.h", "home/project/util.h"),
+        ("build.sh", "home/project/build.sh"),
+    ];
+
+    let mut cmds = String::new();
+    cmds.push_str("mkdir home/project\n");
+
+    for (src_name, ext2_path) in demo_files {
+        let host_path = demo_dir.join(src_name);
+        if host_path.exists() {
+            cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+        }
+    }
+
+    // Set permissions: directory 0755, files 0644, build.sh 0755.
+    cmds.push_str("sif home/project mode 0x41ED\n");
+    for (src_name, ext2_path) in demo_files {
+        if demo_dir.join(src_name).exists() {
+            if *src_name == "build.sh" {
+                cmds.push_str(&format!("sif {ext2_path} mode 0x81ED\n")); // executable
+            } else {
+                cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n")); // 0644
+            }
+        }
+    }
+
+    cmds.push_str("q\n");
+
+    println!("demo: populating ext2 with demo project in /home/project/");
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for demo project");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write demo debugfs commands");
+    }
+    let output = debugfs.wait_with_output().expect("debugfs wait");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "Warning: debugfs (demo) exited with {}: {}",
+            output.status, stderr
+        );
     }
 }
 

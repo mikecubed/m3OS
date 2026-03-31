@@ -1037,6 +1037,97 @@ pub fn openpty() -> Result<(i32, i32), i32> {
     Ok((mfd, slave_fd as i32))
 }
 
+// ===========================================================================
+// Phase 32: stat and utimensat wrappers
+// ===========================================================================
+
+/// x86_64 Linux stat struct (144 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: i64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: i64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: i64,
+}
+
+impl Stat {
+    pub const fn zeroed() -> Self {
+        Stat {
+            st_dev: 0,
+            st_ino: 0,
+            st_nlink: 0,
+            st_mode: 0,
+            st_uid: 0,
+            st_gid: 0,
+            __pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 0,
+            st_blocks: 0,
+            st_atime: 0,
+            st_atime_nsec: 0,
+            st_mtime: 0,
+            st_mtime_nsec: 0,
+            st_ctime: 0,
+            st_ctime_nsec: 0,
+        }
+    }
+}
+
+/// `stat(path, buf)` — get file metadata by path.
+pub fn stat(path: &[u8], buf: &mut Stat) -> isize {
+    // syscall 4 = stat (path, statbuf)
+    unsafe { syscall2(4, path.as_ptr() as u64, buf as *mut Stat as u64) as isize }
+}
+
+/// `fstat(fd, buf)` — get file metadata by file descriptor.
+pub fn fstat(fd: i32, buf: &mut Stat) -> isize {
+    unsafe { syscall2(SYS_FSTAT, fd as u64, buf as *mut Stat as u64) as isize }
+}
+
+/// `utimensat(dirfd, path, times, flags)` — update file timestamps.
+/// If `times` is None, sets both atime and mtime to current time.
+pub fn utimensat(path: &[u8], atime_sec: i64, mtime_sec: i64) -> isize {
+    // struct timespec { tv_sec: i64, tv_nsec: i64 } × 2 = 32 bytes
+    let times: [i64; 4] = [atime_sec, 0, mtime_sec, 0];
+    unsafe {
+        syscall4(
+            SYS_UTIMENSAT,
+            u64::MAX, // AT_FDCWD
+            path.as_ptr() as u64,
+            times.as_ptr() as u64,
+            0,
+        ) as isize
+    }
+}
+
+/// `utimensat` with NULL times — set both to current time.
+pub fn utimensat_now(path: &[u8]) -> isize {
+    unsafe {
+        syscall4(
+            SYS_UTIMENSAT,
+            u64::MAX, // AT_FDCWD
+            path.as_ptr() as u64,
+            0, // NULL times = set to now
+            0,
+        ) as isize
+    }
+}
+
 /// Write a u64 as decimal text to a file descriptor (no alloc needed).
 pub fn write_u64(fd: i32, mut n: u64) {
     if n == 0 {
