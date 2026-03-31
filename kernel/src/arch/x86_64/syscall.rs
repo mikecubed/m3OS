@@ -3331,6 +3331,12 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let resolved = resolve_path(&cwd, raw_name);
     let name: &str = &resolved;
 
+    // Temporary debug: log open calls to /dev/pts/*
+    if name.starts_with("/dev/pts") {
+        let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        log::info!("[p{}] open({:?}, flags=0x{:x})", pid, name, flags);
+    }
+
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),     // O_RDONLY
