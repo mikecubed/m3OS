@@ -596,6 +596,31 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Clippy for syscall-lib with the alloc feature enabled (heap code is feature-gated).
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "clippy",
+            "--package",
+            "syscall-lib",
+            "--features",
+            "alloc",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins,alloc",
+            "-Zbuild-std-features=compiler-builtins-mem",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .status()
+        .expect("failed to run syscall-lib alloc clippy");
+
+    if !status.success() {
+        eprintln!("syscall-lib (alloc feature) clippy reported errors");
+        std::process::exit(1);
+    }
+
     // Clippy + tests for kernel-core (host target).
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
