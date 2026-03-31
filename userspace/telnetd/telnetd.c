@@ -364,13 +364,17 @@ static void handle_connection(int client_fd) {
     write_str(2, "telnetd: entering relay loop\n");
 
     for (;;) {
-        int ret = poll(pfds, 2, -1);
+        pfds[0].revents = 0;
+        pfds[1].revents = 0;
+        int ret = poll(pfds, 2, 5000); /* 5s timeout for debug */
         if (ret < 0) {
             write_str(2, "telnetd: poll error\n");
             break;
         }
-        if (ret == 0)
+        if (ret == 0) {
+            write_str(2, "telnetd: poll timeout\n");
             continue;
+        }
 
         /* Apply NAWS if received */
         if (ts.naws_received) {
