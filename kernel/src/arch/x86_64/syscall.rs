@@ -5071,6 +5071,10 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+    // Musl declares ioctl(int, int, ...) — the request code is sign-extended
+    // from 32 bits.  Truncate to u32 so _IOR/_IOW constants with bit 31 set
+    // (e.g., TIOCGPTN = 0x80045430) compare correctly.
+    let req = (req as u32) as u64;
     use kernel_core::tty::{TERMIOS_SIZE, WINSIZE_SIZE};
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
