@@ -66,11 +66,15 @@ fn main(args: &[&str]) -> i32 {
         while pos < nread as usize {
             // Parse linux_dirent64: d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name[]
             if pos + 19 > nread as usize {
+                write_str(STDERR_FILENO, "ls: malformed dirent\n");
+                ret = 1;
                 break;
             }
             let d_reclen =
                 u16::from_ne_bytes([dirent_buf[pos + 16], dirent_buf[pos + 17]]) as usize;
             if d_reclen < 19 || pos + d_reclen > nread as usize {
+                write_str(STDERR_FILENO, "ls: malformed dirent\n");
+                ret = 1;
                 break;
             }
 

@@ -149,8 +149,8 @@ macro_rules! entry_point {
 
 /// Declares a `_start` entry point that parses argc/argv/envp and calls your main function.
 ///
-/// The main function receives `(&[&str], &[&str])` — (argv, envp) — and returns an `i32` exit code.
-/// Each envp entry is a `"KEY=value"` string.
+/// The main function receives two slices, `argv: &[&str]` and `envp: &[&str]`, and returns an `i32` exit code.
+/// Each `envp` entry is a `"KEY=value"` string.
 ///
 /// # Example
 ///
