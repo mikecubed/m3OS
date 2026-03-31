@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.29.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, multi-user accounts with permission enforcement, and PTY (pseudo-terminal) pairs.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.30.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, and a telnet server for remote shell access.
 
 ## Build & Run
 
@@ -97,6 +97,7 @@ userspace/
   passwd/                 # change password (Phase 27)
   adduser/                # create user account (Phase 27)
   pty-test/               # PTY subsystem test (Phase 29)
+  telnetd/                # Telnet server daemon (Phase 30)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -246,6 +247,7 @@ Read before making significant changes:
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
 | `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
+| `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–38) with corresponding `docs/roadmap/tasks/` breakdowns.
