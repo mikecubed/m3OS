@@ -3261,9 +3261,8 @@ fn is_directory(path: &str) -> bool {
 /// Phase 31: Read a file's entire contents from disk filesystems (ext2, FAT32, tmpfs).
 ///
 /// Used by `sys_execve` to load binaries from persistent storage instead of
-/// only the ramdisk. Returns `None` if the file is not found on any disk.
-/// Error returned by `read_file_from_disk` when the file exists but cannot
-/// be loaded (e.g. too large). The value is the negated errno to return.
+/// only the ramdisk. Returns `Ok(contents)` on success or `Err(neg_errno)` on
+/// failure (e.g. `NEG_ENOENT` if not found, `NEG_E2BIG` if too large).
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
 fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {

@@ -386,10 +386,26 @@ fn build_tcc() -> Option<PathBuf> {
     let staging = root.join("target/tcc-staging");
     let tcc_bin = staging.join("usr/bin/tcc");
 
-    // Check if we already have a cached build.
-    if tcc_bin.exists() && tcc_bin.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+    // Check if we already have a complete cached build. Validate sentinel
+    // artifacts to avoid reusing a partially-populated staging dir from an
+    // interrupted prior run.
+    let sentinels_ok = [
+        staging.join("usr/lib/libc.a"),
+        staging.join("usr/lib/tcc/libtcc1.a"),
+    ]
+    .iter()
+    .all(|p| p.metadata().map(|m| m.len() > 0).unwrap_or(false));
+    if tcc_bin.exists()
+        && tcc_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && sentinels_ok
+        && staging.join("usr/include").is_dir()
+    {
         println!("tcc: using cached {}", tcc_bin.display());
         return Some(staging);
+    }
+    // Incomplete staging — remove and rebuild.
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
     }
 
     // Check for musl cross-compiler.
@@ -1612,7 +1628,13 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     } else {
         QemuDisplayMode::Headless
     };
-    let args = qemu_args(&uefi_image, &ovmf, display_mode);
+    let mut args = qemu_args(&uefi_image, &ovmf, display_mode);
+    // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
+    for arg in args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
 
     println!("smoke-test: launching QEMU...");
     let mut child = Command::new("qemu-system-x86_64")
