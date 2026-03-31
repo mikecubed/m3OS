@@ -440,6 +440,8 @@ fn build_tcc() -> Option<PathBuf> {
     }
 
     // Configure TCC.
+    // Use --extra-ldflags=-static to produce a fully static, non-PIE binary.
+    // The --extra-cflags=-static alone doesn't prevent PIE on newer toolchains.
     println!("tcc: configuring with {cc} (static, --prefix=/usr)...");
     let configure_status = Command::new("sh")
         .current_dir(&tcc_src)
@@ -448,8 +450,10 @@ fn build_tcc() -> Option<PathBuf> {
             "--prefix=/usr",
             &format!("--cc={cc}"),
             "--extra-cflags=-static",
+            "--extra-ldflags=-static -no-pie",
             "--cpu=x86_64",
             "--triplet=x86_64-linux-musl",
+            "--config-musl",
         ])
         .status()
         .expect("failed to run TCC configure");
@@ -458,11 +462,13 @@ fn build_tcc() -> Option<PathBuf> {
         return None;
     }
 
-    // Build TCC.
+    // Build TCC binary only (skip libtcc1.a which has bcheck.c portability
+    // issues under musl). The tcc binary itself is all we need — musl's libc.a
+    // provides the C runtime for programs TCC compiles.
     println!("tcc: building...");
     let make_status = Command::new("make")
         .current_dir(&tcc_src)
-        .args(["-j4"])
+        .args(["-j4", "tcc"])
         .status()
         .expect("failed to run make for TCC");
     if !make_status.success() {
@@ -477,11 +483,50 @@ fn build_tcc() -> Option<PathBuf> {
         return None;
     }
 
+    // Build libtcc1.a — TCC's own runtime support library.
+    // Skip bcheck.c which has musl portability issues.
+    println!("tcc: building libtcc1.a...");
+    let lib_objects = [
+        ("lib/libtcc1.c", "lib/libtcc1.o"),
+        ("lib/stdatomic.c", "lib/stdatomic.o"),
+        ("lib/atomic.S", "lib/atomic.o"),
+        ("lib/builtin.c", "lib/builtin.o"),
+        ("lib/alloca.S", "lib/alloca.o"),
+        ("lib/dsohandle.c", "lib/dsohandle.o"),
+    ];
+    let mut lib_ok = true;
+    for (src, obj) in &lib_objects {
+        let status = Command::new(tcc_src.join("tcc").to_str().unwrap())
+            .current_dir(&tcc_src)
+            .args(["-c", src, "-o", obj, "-B.", "-I."])
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("warning: failed to compile {src} for libtcc1.a");
+            lib_ok = false;
+            break;
+        }
+    }
+    if lib_ok {
+        let obj_paths: Vec<&str> = lib_objects.iter().map(|(_, o)| *o).collect();
+        let mut ar_args = vec!["-ar", "rcs", "libtcc1.a"];
+        ar_args.extend(obj_paths.iter());
+        let status = Command::new(tcc_src.join("tcc").to_str().unwrap())
+            .current_dir(&tcc_src)
+            .args(&ar_args)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("warning: failed to create libtcc1.a");
+        } else {
+            println!("tcc: libtcc1.a built successfully");
+        }
+    }
+
     // Create staging directory structure.
     let dirs = [
         "usr/bin",
         "usr/lib",
         "usr/lib/tcc/include",
+        "usr/lib/x86_64-linux-musl",
         "usr/include",
         "usr/include/sys",
         "usr/include/bits",
@@ -514,20 +559,36 @@ fn build_tcc() -> Option<PathBuf> {
         human_size(tcc_bin.metadata().map(|m| m.len()).unwrap_or(0))
     );
 
-    // Copy musl libc.a and CRT objects.
+    // Copy musl libc.a and CRT objects to both /usr/lib/ and the triplet path
+    // /usr/lib/x86_64-linux-musl/ (TCC searches the triplet path first for CRT).
     let musl_lib = Path::new("/usr/lib/x86_64-linux-musl");
+    fs::create_dir_all(staging.join("usr/lib/x86_64-linux-musl")).expect("create triplet lib dir");
     let crt_files = ["libc.a", "crt1.o", "crti.o", "crtn.o"];
     for name in &crt_files {
         let src = musl_lib.join(name);
-        let dst = staging.join(format!("usr/lib/{name}"));
         if src.exists() {
+            // Copy to /usr/lib/
+            let dst = staging.join(format!("usr/lib/{name}"));
             fs::copy(&src, &dst).unwrap_or_else(|e| {
                 panic!("failed to copy {name}: {e}");
             });
-            println!("tcc: {name} → staging/usr/lib/{name}");
+            // Also copy to triplet path for TCC's default CRT search.
+            let dst_triplet = staging.join(format!("usr/lib/x86_64-linux-musl/{name}"));
+            fs::copy(&src, &dst_triplet).unwrap_or_else(|e| {
+                panic!("failed to copy {name} to triplet path: {e}");
+            });
+            println!("tcc: {name} → staging/usr/lib/ + triplet");
         } else {
             eprintln!("warning: musl {name} not found at {}", src.display());
         }
+    }
+
+    // Copy libtcc1.a to /usr/lib/tcc/ where TCC expects it.
+    let libtcc1_src = tcc_src.join("libtcc1.a");
+    if libtcc1_src.exists() {
+        let dst = staging.join("usr/lib/tcc/libtcc1.a");
+        fs::copy(&libtcc1_src, &dst).expect("failed to copy libtcc1.a");
+        println!("tcc: libtcc1.a → staging/usr/lib/tcc/libtcc1.a");
     }
 
     // Copy musl headers recursively.
@@ -1443,7 +1504,7 @@ fn smoke_test_phase31() -> Vec<SmokeStep> {
             label: "enter password",
         },
         SmokeStep::Wait {
-            pattern: "$ ",
+            pattern: "# ",
             timeout_secs: 10,
             label: "wait for shell prompt",
         },
@@ -1457,16 +1518,16 @@ fn smoke_test_phase31() -> Vec<SmokeStep> {
             label: "verify TCC version output",
         },
         SmokeStep::Wait {
-            pattern: "$ ",
+            pattern: "# ",
             timeout_secs: 5,
             label: "wait for shell prompt after tcc --version",
         },
         SmokeStep::Send {
-            input: "tcc /usr/src/hello.c -o /tmp/hello\n",
+            input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
             label: "compile hello.c",
         },
         SmokeStep::Wait {
-            pattern: "$ ",
+            pattern: "# ",
             timeout_secs: 30,
             label: "wait for compilation to finish",
         },
