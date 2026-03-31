@@ -126,12 +126,10 @@ fn find_user<'a>(passwd: &'a [u8], username: &[u8]) -> Option<(u32, u32, &'a [u8
         let mut start = 0;
         let mut field = 0;
         for (i, &b) in line.iter().enumerate() {
-            if b == b':' {
-                if field < 7 {
-                    fields[field] = &line[start..i];
-                    field += 1;
-                    start = i + 1;
-                }
+            if b == b':' && field < 7 {
+                fields[field] = &line[start..i];
+                field += 1;
+                start = i + 1;
             }
         }
         if field == 6 {
@@ -161,12 +159,12 @@ fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
         if line.is_empty() {
             continue;
         }
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            if &line[..colon] == username {
-                let rest = &line[colon + 1..];
-                let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-                return syscall_lib::sha256::verify_password(password, &rest[..hash_end]);
-            }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && &line[..colon] == username
+        {
+            let rest = &line[colon + 1..];
+            let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+            return syscall_lib::sha256::verify_password(password, &rest[..hash_end]);
         }
     }
     false

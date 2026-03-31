@@ -85,17 +85,17 @@ pub extern "C" fn _start() -> ! {
         if line.is_empty() {
             continue;
         }
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            if &line[..colon] == username {
-                // Replace this line with new hash.
-                out_pos += copy_to(&mut new_shadow[out_pos..], username);
-                out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256$");
-                out_pos += copy_to(&mut new_shadow[out_pos..], &salt_hex[..salt_hex_len]);
-                out_pos += copy_to(&mut new_shadow[out_pos..], b"$");
-                out_pos += copy_to(&mut new_shadow[out_pos..], &hash_hex[..hash_hex_len]);
-                out_pos += copy_to(&mut new_shadow[out_pos..], b"::::::\n");
-                continue;
-            }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && &line[..colon] == username
+        {
+            // Replace this line with new hash.
+            out_pos += copy_to(&mut new_shadow[out_pos..], username);
+            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256$");
+            out_pos += copy_to(&mut new_shadow[out_pos..], &salt_hex[..salt_hex_len]);
+            out_pos += copy_to(&mut new_shadow[out_pos..], b"$");
+            out_pos += copy_to(&mut new_shadow[out_pos..], &hash_hex[..hash_hex_len]);
+            out_pos += copy_to(&mut new_shadow[out_pos..], b"::::::\n");
+            continue;
         }
         out_pos += copy_to(&mut new_shadow[out_pos..], line);
         out_pos += copy_to(&mut new_shadow[out_pos..], b"\n");
@@ -120,7 +120,7 @@ fn copy_to(dst: &mut [u8], src: &[u8]) -> usize {
     n
 }
 
-fn find_username_by_uid<'a>(passwd: &'a [u8], target_uid: u32) -> Option<&'a [u8]> {
+fn find_username_by_uid(passwd: &[u8], target_uid: u32) -> Option<&[u8]> {
     for line in passwd.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;

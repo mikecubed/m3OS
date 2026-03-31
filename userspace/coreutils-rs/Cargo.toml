@@ -1,0 +1,43 @@
+[package]
+name = "coreutils-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }
+
+[[bin]]
+name = "true"
+path = "src/true.rs"
+
+[[bin]]
+name = "false"
+path = "src/false.rs"
+
+[[bin]]
+name = "echo"
+path = "src/echo.rs"
+
+[[bin]]
+name = "pwd"
+path = "src/pwd.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/sleep.rs"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "rmdir"
+path = "src/rmdir.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"

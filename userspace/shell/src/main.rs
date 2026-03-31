@@ -192,7 +192,7 @@ fn execute_pipeline(left: &[u8], right: &[u8]) {
     if left_pid == 0 {
         // Left child: stdout → write end of pipe.
         close(read_fd);
-        dup2(write_fd, STDOUT_FILENO as i32);
+        dup2(write_fd, STDOUT_FILENO);
         close(write_fd);
         exec_simple_command(left);
         exit(127);
@@ -209,7 +209,7 @@ fn execute_pipeline(left: &[u8], right: &[u8]) {
     if right_pid == 0 {
         // Right child: stdin → read end of pipe.
         close(write_fd);
-        dup2(read_fd, STDIN_FILENO as i32);
+        dup2(read_fd, STDIN_FILENO);
         close(read_fd);
         exec_simple_command(right);
         exit(127);
@@ -269,7 +269,7 @@ fn execute_external(
                 write_str(STDERR_FILENO, "sh: cannot open output file\n");
                 exit(1);
             }
-            dup2(fd as i32, STDOUT_FILENO as i32);
+            dup2(fd as i32, STDOUT_FILENO);
             close(fd as i32);
         }
 
@@ -283,7 +283,7 @@ fn execute_external(
                 write_str(STDERR_FILENO, "sh: cannot open input file\n");
                 exit(1);
             }
-            dup2(fd as i32, STDIN_FILENO as i32);
+            dup2(fd as i32, STDIN_FILENO);
             close(fd as i32);
         }
 

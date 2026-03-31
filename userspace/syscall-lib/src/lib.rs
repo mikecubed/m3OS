@@ -21,6 +21,10 @@ pub mod start;
 // ===========================================================================
 
 /// Raw zero-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number. Side effects depend on the syscall.
 #[inline(always)]
 pub unsafe fn syscall0(num: u64) -> u64 {
     unsafe {
@@ -37,6 +41,10 @@ pub unsafe fn syscall0(num: u64) -> u64 {
 }
 
 /// Raw one-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and argument. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall1(num: u64, a0: u64) -> u64 {
     unsafe {
@@ -54,6 +62,10 @@ pub unsafe fn syscall1(num: u64, a0: u64) -> u64 {
 }
 
 /// Raw two-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and arguments. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
     unsafe {
@@ -72,6 +84,10 @@ pub unsafe fn syscall2(num: u64, a0: u64, a1: u64) -> u64 {
 }
 
 /// Raw three-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and arguments. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     unsafe {
@@ -91,6 +107,10 @@ pub unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
 }
 
 /// Raw four-argument syscall. Note: arg4 uses r10 (not rcx, which is clobbered).
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and arguments. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     unsafe {
@@ -111,6 +131,10 @@ pub unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// Raw five-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and arguments. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     unsafe {
@@ -132,6 +156,10 @@ pub unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) ->
 }
 
 /// Raw six-argument syscall.
+///
+/// # Safety
+///
+/// Caller must pass a valid syscall number and arguments. Pointer arguments must be valid.
 #[inline(always)]
 pub unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     unsafe {
@@ -177,7 +205,10 @@ pub const SYS_WAITPID: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
+pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
+pub const SYS_RMDIR: u64 = 84;
+pub const SYS_UNLINK: u64 = 87;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_SETPGID: u64 = 109;
@@ -551,6 +582,8 @@ pub fn exit(code: i32) -> ! {
     unsafe {
         syscall1(SYS_EXIT, code as u64);
     }
+    // The kernel terminates the process on SYS_EXIT; this is unreachable.
+    #[allow(clippy::empty_loop)]
     loop {}
 }
 
@@ -650,6 +683,26 @@ pub fn chdir(path: &[u8]) -> isize {
 /// Get current working directory into `buf`. Returns bytes written on success.
 pub fn getcwd(buf: &mut [u8]) -> isize {
     unsafe { syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) as isize }
+}
+
+/// Create a directory. `path` must be a null-terminated byte string.
+pub fn mkdir(path: &[u8], mode: u64) -> isize {
+    unsafe { syscall2(SYS_MKDIR, path.as_ptr() as u64, mode) as isize }
+}
+
+/// Remove an empty directory. `path` must be a null-terminated byte string.
+pub fn rmdir(path: &[u8]) -> isize {
+    unsafe { syscall1(SYS_RMDIR, path.as_ptr() as u64) as isize }
+}
+
+/// Remove (unlink) a file. `path` must be a null-terminated byte string.
+pub fn unlink(path: &[u8]) -> isize {
+    unsafe { syscall1(SYS_UNLINK, path.as_ptr() as u64) as isize }
+}
+
+/// Rename a file or directory. Both paths must be null-terminated byte strings.
+pub fn rename(old: &[u8], new: &[u8]) -> isize {
+    unsafe { syscall2(SYS_RENAME, old.as_ptr() as u64, new.as_ptr() as u64) as isize }
 }
 
 // ===========================================================================

@@ -489,26 +489,20 @@ impl Editor {
                     self.cx = self.rows[self.cy].chars.len();
                 }
             }
-            Key::ArrowRight => {
-                if self.cy < self.rows.len() {
-                    let row_len = self.rows[self.cy].chars.len();
-                    if self.cx < row_len {
-                        self.cx += 1;
-                    } else if self.cx == row_len && self.cy < self.rows.len() - 1 {
-                        self.cy += 1;
-                        self.cx = 0;
-                    }
-                }
-            }
-            Key::ArrowUp => {
-                if self.cy > 0 {
-                    self.cy -= 1;
-                }
-            }
-            Key::ArrowDown => {
-                if self.cy < self.rows.len().saturating_sub(1) {
+            Key::ArrowRight if self.cy < self.rows.len() => {
+                let row_len = self.rows[self.cy].chars.len();
+                if self.cx < row_len {
+                    self.cx += 1;
+                } else if self.cx == row_len && self.cy < self.rows.len() - 1 {
                     self.cy += 1;
+                    self.cx = 0;
                 }
+            }
+            Key::ArrowUp if self.cy > 0 => {
+                self.cy -= 1;
+            }
+            Key::ArrowDown if self.cy < self.rows.len().saturating_sub(1) => {
+                self.cy += 1;
             }
             _ => {}
         }
@@ -700,7 +694,7 @@ impl Editor {
                         cb(self, &input, key);
                     }
                 }
-                Key::Char(c) if c >= 32 && c < 127 => {
+                Key::Char(c) if (32..127).contains(&c) => {
                     input.push(c);
                     if let Some(cb) = callback {
                         cb(self, &input, key);
@@ -932,12 +926,10 @@ impl Editor {
             Key::Home => {
                 self.cx = 0;
             }
-            Key::End => {
-                if self.cy < self.rows.len() {
-                    self.cx = self.rows[self.cy].chars.len();
-                }
+            Key::End if self.cy < self.rows.len() => {
+                self.cx = self.rows[self.cy].chars.len();
             }
-            Key::Char(c) if c >= 32 && c < 127 => {
+            Key::Char(c) if (32..127).contains(&c) => {
                 self.insert_char(c);
             }
             Key::Char(b'\t') => {

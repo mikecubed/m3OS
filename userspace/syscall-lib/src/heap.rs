@@ -31,6 +31,12 @@ pub struct BrkAllocator {
 // Safety: Single-threaded userspace processes.
 unsafe impl Sync for BrkAllocator {}
 
+impl Default for BrkAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BrkAllocator {
     pub const fn new() -> Self {
         BrkAllocator {
