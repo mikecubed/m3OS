@@ -6671,13 +6671,16 @@ fn sys_access(path_ptr: u64) -> u64 {
 /// delegate to sys_fork. Otherwise return -ENOSYS.
 fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
     const SIGCHLD: u64 = 17;
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
-    // Accept only flags == SIGCHLD or flags == 0 (bare fork semantics).
-    // Reject any additional CLONE_* bits to avoid silently mis-handling
-    // real thread creation requests.
-    if flags == SIGCHLD || flags == 0 {
+    // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
+    // combination used by musl's posix_spawn/system() — treat all as fork.
+    let dominated = flags & !(SIGCHLD | CLONE_VM | CLONE_VFORK);
+    if dominated == 0 {
         sys_fork(user_rip, user_rsp)
     } else {
+        log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS
     }
 }

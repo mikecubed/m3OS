@@ -416,8 +416,15 @@ fn build_pdpmake() {
     }
 
     // Build with musl-gcc.
+    // Include m3os_system.c to replace musl's system() which uses posix_spawn
+    // (CLONE_VM|CLONE_VFORK) — our kernel treats clone as plain fork, so we
+    // need a system() that uses fork+exec directly.
+    let system_override = root.join("userspace/coreutils/m3os_system.c");
     let mut args = vec!["-static".to_string(), "-O2".to_string()];
     args.extend(c_files);
+    if system_override.exists() {
+        args.push(system_override.to_str().unwrap().to_string());
+    }
     args.push("-o".to_string());
     args.push(make_elf.to_str().unwrap().to_string());
 
@@ -1628,65 +1635,234 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Phase 31 smoke test script: login, run TCC, compile and run hello.c.
-fn smoke_test_phase31() -> Vec<SmokeStep> {
+/// Helper: send a command and wait for the shell prompt to return.
+/// Includes a small sleep before sending to avoid serial input races
+/// where characters get consumed by ANSI escape sequence processing.
+fn cmd_then_prompt(input: &'static str, label: &'static str, timeout: u64) -> Vec<SmokeStep> {
     vec![
-        SmokeStep::Wait {
-            pattern: "login:",
-            timeout_secs: 60,
-            label: "wait for login prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "enter username",
-        },
-        SmokeStep::Wait {
-            pattern: "Password:",
-            timeout_secs: 10,
-            label: "wait for password prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "enter password",
-        },
+        SmokeStep::Sleep { millis: 200 },
+        SmokeStep::Send { input, label },
         SmokeStep::Wait {
             pattern: "# ",
-            timeout_secs: 10,
-            label: "wait for shell prompt",
-        },
-        SmokeStep::Send {
-            input: "/usr/bin/tcc --version\n",
-            label: "run tcc --version",
-        },
-        SmokeStep::Wait {
-            pattern: "tcc version",
-            timeout_secs: 15,
-            label: "verify TCC version output",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 5,
-            label: "wait for shell prompt after tcc --version",
-        },
-        SmokeStep::Send {
-            input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
-            label: "compile hello.c",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for compilation to finish",
-        },
-        SmokeStep::Send {
-            input: "/tmp/hello\n",
-            label: "run compiled hello",
-        },
-        SmokeStep::Wait {
-            pattern: "hello, world",
-            timeout_secs: 15,
-            label: "verify hello world output",
+            timeout_secs: timeout,
+            label,
         },
     ]
+}
+
+/// Comprehensive smoke test: login, coreutils, TCC, Phase 32 build tools.
+///
+/// Replaces the Phase 31 smoke test with a more thorough script that validates
+/// the full userspace stack including new utilities and the make build tool.
+fn smoke_test_script() -> Vec<SmokeStep> {
+    let mut steps = Vec::new();
+
+    // -----------------------------------------------------------------------
+    // 1. Boot and login
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Wait {
+        pattern: "login:",
+        timeout_secs: 60,
+        label: "wait for login prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "enter username",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Password:",
+        timeout_secs: 10,
+        label: "wait for password prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "enter password",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "wait for shell prompt",
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. Basic coreutils sanity
+    // -----------------------------------------------------------------------
+    steps.extend(cmd_then_prompt("echo SMOKE_OK\n", "echo test", 5));
+
+    // -----------------------------------------------------------------------
+    // 3. TCC compiler (Phase 31 regression)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/tcc --version\n",
+        label: "tcc --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "tcc version",
+        timeout_secs: 15,
+        label: "verify TCC version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tcc --version",
+    });
+
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
+        label: "compile hello.c with TCC",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "wait for hello.c compilation",
+    });
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "/tmp/hello\n",
+        label: "run compiled hello",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "hello, world",
+        timeout_secs: 15,
+        label: "verify hello world output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hello",
+    });
+
+    // -----------------------------------------------------------------------
+    // 4. Phase 32 utilities: touch, stat, wc
+    // -----------------------------------------------------------------------
+
+    // touch — create a new file
+    steps.extend(cmd_then_prompt(
+        "touch /tmp/smoke_file\n",
+        "touch: create file",
+        10,
+    ));
+
+    // stat — verify the file exists and shows metadata
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "stat /tmp/smoke_file\n",
+        label: "stat: show file metadata",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "File:",
+        timeout_secs: 10,
+        label: "verify stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after stat",
+    });
+
+    // wc — count words in a known file
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "wc /home/project/main.c\n",
+        label: "wc: count lines in main.c",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main.c",
+        timeout_secs: 10,
+        label: "verify wc output contains filename",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after wc",
+    });
+
+    // -----------------------------------------------------------------------
+    // 5. Demo project: build with make
+    // -----------------------------------------------------------------------
+    steps.extend(cmd_then_prompt(
+        "cd /home/project\n",
+        "cd to demo project",
+        5,
+    ));
+
+    // Full build
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "make\n",
+        label: "make: build demo project",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "wait for make to finish",
+    });
+
+    // Run the built binary
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "./demo\n",
+        label: "run demo binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Demo project running!",
+        timeout_secs: 15,
+        label: "verify demo output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after demo",
+    });
+
+    // -----------------------------------------------------------------------
+    // 7. ar — create a static library (using util.o from make build)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "ar rcs libutil.a util.o\n",
+        label: "ar: create static library",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "wait for ar to finish",
+    });
+
+    // Verify archive was created
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "stat libutil.a\n",
+        label: "stat: verify libutil.a exists",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "File:",
+        timeout_secs: 10,
+        label: "verify libutil.a stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ar stat",
+    });
+
+    // -----------------------------------------------------------------------
+    // 9. make clean
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 200 });
+    steps.push(SmokeStep::Send {
+        input: "make clean\n",
+        label: "make clean",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "wait for make clean",
+    });
+
+    steps
 }
 
 fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
@@ -1699,7 +1875,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if !tcc_staging_bin.exists() {
         eprintln!(
             "error: TCC binary not found at {}\n\
-             The Phase 31 smoke test requires TCC. Install musl-tools and retry.",
+             The smoke test requires TCC. Install musl-tools and retry.",
             tcc_staging_bin.display()
         );
         std::process::exit(1);
@@ -1731,7 +1907,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         .spawn()
         .expect("failed to launch QEMU");
 
-    let steps = smoke_test_phase31();
+    let steps = smoke_test_script();
     let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
     let start = std::time::Instant::now();
 

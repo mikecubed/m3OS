@@ -168,6 +168,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("sh0.elf", RamdiskNode::File { content: SH0_ELF }),
     ("ion", RamdiskNode::File { content: ION_ELF }),
     ("ion.elf", RamdiskNode::File { content: ION_ELF }),
+    // Phase 32: /bin/sh alias for ion (pdpmake and scripts expect /bin/sh)
+    ("sh", RamdiskNode::File { content: ION_ELF }),
     ("edit", RamdiskNode::File { content: EDIT_ELF }),
     ("edit.elf", RamdiskNode::File { content: EDIT_ELF }),
     ("login", RamdiskNode::File { content: LOGIN_ELF }),

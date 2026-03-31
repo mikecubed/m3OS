@@ -1,4 +1,5 @@
-CC = tcc
+SHELL = /bin/sh
+CC = /usr/bin/tcc
 CFLAGS = -static
 
 SRCS = main.c util.c
@@ -16,4 +17,4 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	/bin/rm -f $(OBJS) $(TARGET)
