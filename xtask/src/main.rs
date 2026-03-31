@@ -352,10 +352,271 @@ fn build_ion() {
     println!("ion: {} → kernel/initrd/ion.elf", built.display());
 }
 
+/// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
+///
+/// Strategy: clone TCC source from repo.or.cz (or use cached clone in
+/// target/tcc-src/), configure with `--prefix=/usr` so TCC knows where
+/// to find headers and libraries at runtime inside the OS, build with
+/// `x86_64-linux-musl-gcc -static`, strip, and place the resulting
+/// binary in a staging directory.
+///
+/// Returns the path to the staging directory containing the TCC binary,
+/// or `None` if the build fails (musl cross-compiler not available, etc.).
+///
+/// The staging directory layout:
+///   target/tcc-staging/usr/bin/tcc          — TCC binary
+///   target/tcc-staging/usr/lib/libc.a       — musl libc
+///   target/tcc-staging/usr/lib/crt1.o       — CRT start
+///   target/tcc-staging/usr/lib/crti.o       — CRT init prologue
+///   target/tcc-staging/usr/lib/crtn.o       — CRT init epilogue
+///   target/tcc-staging/usr/lib/tcc/include/ — TCC-specific headers
+///   target/tcc-staging/usr/include/         — musl system headers
+///   target/tcc-staging/usr/src/hello.c      — test program
+///   target/tcc-staging/usr/src/tcc/         — TCC source for self-hosting
+fn build_tcc() -> Option<PathBuf> {
+    let root = workspace_root();
+    let staging = root.join("target/tcc-staging");
+    let tcc_bin = staging.join("usr/bin/tcc");
+
+    // Check if we already have a cached build.
+    if tcc_bin.exists() && tcc_bin.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("tcc: using cached {}", tcc_bin.display());
+        return Some(staging);
+    }
+
+    // Check for musl cross-compiler.
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else if Command::new("musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "musl-gcc"
+    } else {
+        eprintln!(
+            "warning: musl cross-compiler not found — skipping TCC build \
+             (install musl-tools to enable Phase 31)"
+        );
+        return None;
+    };
+
+    // Clone TCC source.
+    let tcc_src = root.join("target/tcc-src");
+    if !tcc_src.join("configure").exists() {
+        println!("tcc: cloning TCC from repo.or.cz...");
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "mob",
+                "https://repo.or.cz/tinycc.git",
+                tcc_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for TCC");
+        if !status.success() {
+            eprintln!("warning: failed to clone TCC — skipping Phase 31 TCC build");
+            return None;
+        }
+    }
+
+    // Configure TCC.
+    println!("tcc: configuring with {cc} (static, --prefix=/usr)...");
+    let configure_status = Command::new("sh")
+        .current_dir(&tcc_src)
+        .args([
+            "./configure",
+            "--prefix=/usr",
+            &format!("--cc={cc}"),
+            "--extra-cflags=-static",
+            "--cpu=x86_64",
+            "--triplet=x86_64-linux-musl",
+        ])
+        .status()
+        .expect("failed to run TCC configure");
+    if !configure_status.success() {
+        eprintln!("warning: TCC configure failed — skipping Phase 31 TCC build");
+        return None;
+    }
+
+    // Build TCC.
+    println!("tcc: building...");
+    let make_status = Command::new("make")
+        .current_dir(&tcc_src)
+        .args(["-j4"])
+        .status()
+        .expect("failed to run make for TCC");
+    if !make_status.success() {
+        eprintln!("warning: TCC build failed — skipping Phase 31 TCC build");
+        return None;
+    }
+
+    // Verify the binary is static.
+    let built_tcc = tcc_src.join("tcc");
+    if !built_tcc.exists() {
+        eprintln!("warning: TCC binary not found after build");
+        return None;
+    }
+
+    // Create staging directory structure.
+    let dirs = [
+        "usr/bin",
+        "usr/lib",
+        "usr/lib/tcc/include",
+        "usr/include",
+        "usr/include/sys",
+        "usr/include/bits",
+        "usr/include/arpa",
+        "usr/include/net",
+        "usr/include/netinet",
+        "usr/include/netpacket",
+        "usr/include/scsi",
+        "usr/src/tcc",
+    ];
+    for d in &dirs {
+        fs::create_dir_all(staging.join(d)).unwrap_or_else(|e| {
+            panic!("failed to create staging dir {d}: {e}");
+        });
+    }
+
+    // Copy TCC binary (stripped).
+    let strip_status = Command::new("strip")
+        .args(["-o", tcc_bin.to_str().unwrap(), built_tcc.to_str().unwrap()])
+        .status();
+    match strip_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            fs::copy(&built_tcc, &tcc_bin).expect("failed to copy TCC binary");
+        }
+    }
+    println!(
+        "tcc: {} → staging/usr/bin/tcc ({})",
+        built_tcc.display(),
+        human_size(tcc_bin.metadata().map(|m| m.len()).unwrap_or(0))
+    );
+
+    // Copy musl libc.a and CRT objects.
+    let musl_lib = Path::new("/usr/lib/x86_64-linux-musl");
+    let crt_files = ["libc.a", "crt1.o", "crti.o", "crtn.o"];
+    for name in &crt_files {
+        let src = musl_lib.join(name);
+        let dst = staging.join(format!("usr/lib/{name}"));
+        if src.exists() {
+            fs::copy(&src, &dst).unwrap_or_else(|e| {
+                panic!("failed to copy {name}: {e}");
+            });
+            println!("tcc: {name} → staging/usr/lib/{name}");
+        } else {
+            eprintln!("warning: musl {name} not found at {}", src.display());
+        }
+    }
+
+    // Copy musl headers recursively.
+    let musl_include = Path::new("/usr/include/x86_64-linux-musl");
+    if musl_include.is_dir() {
+        copy_dir_recursive(musl_include, &staging.join("usr/include"))
+            .expect("failed to copy musl headers");
+        println!("tcc: musl headers → staging/usr/include/");
+    } else {
+        eprintln!(
+            "warning: musl headers not found at {}",
+            musl_include.display()
+        );
+    }
+
+    // Copy TCC-specific headers.
+    let tcc_include = tcc_src.join("include");
+    if tcc_include.is_dir() {
+        copy_dir_recursive(&tcc_include, &staging.join("usr/lib/tcc/include"))
+            .expect("failed to copy TCC headers");
+        println!("tcc: TCC headers → staging/usr/lib/tcc/include/");
+    }
+
+    // Create hello.c test program.
+    let hello_src = staging.join("usr/src/hello.c");
+    fs::write(
+        &hello_src,
+        "#include <stdio.h>\nint main() {\n    printf(\"hello, world\\n\");\n    return 0;\n}\n",
+    )
+    .expect("write hello.c");
+    println!("tcc: hello.c → staging/usr/src/hello.c");
+
+    // Copy TCC source for self-hosting.
+    let tcc_source_files = [
+        "tcc.c",
+        "tcc.h",
+        "libtcc.c",
+        "libtcc.h",
+        "tccpp.c",
+        "tccgen.c",
+        "tccelf.c",
+        "tccasm.c",
+        "tccrun.c",
+        "x86_64-gen.c",
+        "x86_64-link.c",
+        "i386-asm.c",
+        "i386-asm.h",
+        "tcc-doc.h",
+        "config.h",
+        "tcctok.h",
+    ];
+    for name in &tcc_source_files {
+        let src = tcc_src.join(name);
+        if src.exists()
+            && let Err(e) = fs::copy(&src, staging.join(format!("usr/src/tcc/{name}")))
+        {
+            eprintln!("warning: failed to copy TCC source {name}: {e}");
+        }
+    }
+    println!("tcc: TCC source → staging/usr/src/tcc/");
+
+    Some(staging)
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable file size.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    // Phase 31: cross-compile TCC (result used during disk image creation).
+    build_tcc();
     build_ion();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1104,7 +1365,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
-    const DISK_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+    // Phase 31: increased from 64 MB to 128 MB to accommodate TCC binary,
+    // musl libc/headers, TCC source for self-hosting, and compilation output.
+    const DISK_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
@@ -1183,6 +1446,13 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
 
     // Populate files using debugfs.
     populate_ext2_files(&part_tmp, output_dir);
+
+    // Phase 31: populate TCC, musl headers/libs, and test files.
+    let root = workspace_root();
+    let tcc_staging = root.join("target/tcc-staging");
+    if tcc_staging.join("usr/bin/tcc").exists() {
+        populate_tcc_files(&part_tmp, &tcc_staging);
+    }
 
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
@@ -1317,6 +1587,114 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
+}
+
+/// Phase 31: Populate TCC, musl headers/libraries, and test files into the
+/// ext2 partition image from the staging directory.
+///
+/// Walks `staging_dir/usr/` recursively and creates the corresponding
+/// directory tree and files on the ext2 image via `debugfs -w`.
+fn populate_tcc_files(part_path: &Path, staging_dir: &Path) {
+    let usr_root = staging_dir.join("usr");
+    if !usr_root.is_dir() {
+        return;
+    }
+
+    // Collect all directories and files relative to `staging_dir`.
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new(); // (ext2_path, host_path)
+    collect_staging_entries(&usr_root, "usr", &mut dirs, &mut files);
+
+    if files.is_empty() {
+        return;
+    }
+
+    // Build debugfs command script.
+    let mut cmds = String::new();
+
+    // Create directories first (sorted so parents come before children).
+    dirs.sort();
+    for dir in &dirs {
+        cmds.push_str(&format!("mkdir {dir}\n"));
+    }
+
+    // Write files.
+    for (ext2_path, host_path) in &files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
+    // Set permissions: directories 0755, files 0644, TCC binary 0755.
+    for dir in &dirs {
+        cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
+    }
+    for (ext2_path, _) in &files {
+        if ext2_path == "usr/bin/tcc" {
+            // Executable.
+            cmds.push_str(&format!("sif {ext2_path} mode 0x81ED\n"));
+        } else {
+            cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+        }
+    }
+
+    cmds.push_str("q\n");
+
+    println!(
+        "tcc: populating ext2 with {} dirs, {} files",
+        dirs.len(),
+        files.len()
+    );
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for TCC population");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write TCC debugfs commands");
+    }
+    let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
+    if !debugfs_output.status.success() {
+        let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
+        eprintln!(
+            "Warning: debugfs (TCC) exited with {}: {}",
+            debugfs_output.status, stderr
+        );
+    }
+}
+
+/// Recursively collect directories and files from a staging directory.
+fn collect_staging_entries(
+    dir: &Path,
+    prefix: &str,
+    dirs: &mut Vec<String>,
+    files: &mut Vec<(String, PathBuf)>,
+) {
+    dirs.push(prefix.to_string());
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let child_prefix = format!("{prefix}/{name_str}");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_staging_entries(&path, &child_prefix, dirs, files);
+        } else {
+            files.push((child_prefix, path));
+        }
+    }
 }
 
 fn cmd_image(image_args: &ImageArgs) {
