@@ -40,18 +40,28 @@ fn main(args: &[&str]) -> i32 {
         return 1;
     }
 
+    let mut result = 0;
     let mut buf = [0u8; 4096];
     loop {
         let n = read(src_fd as i32, &mut buf);
-        if n <= 0 {
+        if n == 0 {
             break;
         }
-        write_all(dst_fd as i32, &buf[..n as usize]);
+        if n < 0 {
+            write_str(STDERR_FILENO, "cp: read error\n");
+            result = 1;
+            break;
+        }
+        if !write_all(dst_fd as i32, &buf[..n as usize]) {
+            write_str(STDERR_FILENO, "cp: write error\n");
+            result = 1;
+            break;
+        }
     }
 
     close(src_fd as i32);
     close(dst_fd as i32);
-    0
+    result
 }
 
 struct NulPath {
@@ -72,15 +82,16 @@ fn make_path(bytes: &[u8]) -> Option<NulPath> {
     Some(p)
 }
 
-fn write_all(fd: i32, data: &[u8]) {
+fn write_all(fd: i32, data: &[u8]) -> bool {
     let mut off = 0;
     while off < data.len() {
         let w = write(fd, &data[off..]);
         if w <= 0 {
-            break;
+            return false;
         }
         off += w as usize;
     }
+    true
 }
 
 #[panic_handler]

@@ -70,13 +70,13 @@ fn main(args: &[&str]) -> i32 {
             }
             let d_reclen =
                 u16::from_ne_bytes([dirent_buf[pos + 16], dirent_buf[pos + 17]]) as usize;
-            if d_reclen == 0 {
+            if d_reclen < 19 || pos + d_reclen > nread as usize {
                 break;
             }
 
             // d_name starts at offset 19.
             let name_start = pos + 19;
-            let name_end = (pos + d_reclen).min(nread as usize);
+            let name_end = pos + d_reclen;
             let name_bytes = &dirent_buf[name_start..name_end];
             let name_len = name_bytes
                 .iter()

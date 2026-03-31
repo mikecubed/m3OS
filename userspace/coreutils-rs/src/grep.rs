@@ -12,12 +12,17 @@ fn main(args: &[&str]) -> i32 {
         return 1;
     }
     let pattern = args[1].as_bytes();
+    let mut ret = 0;
     if args.len() == 2 {
-        grep_fd(0, pattern);
+        if !grep_fd(0, pattern) {
+            ret = 1;
+        }
     } else {
         for arg in &args[2..] {
             let bytes = arg.as_bytes();
             if bytes.len() > 255 {
+                write_str(STDERR_FILENO, "grep: path too long\n");
+                ret = 1;
                 continue;
             }
             let mut path = [0u8; 256];
@@ -25,16 +30,21 @@ fn main(args: &[&str]) -> i32 {
             path[bytes.len()] = 0;
             let fd = open(&path[..=bytes.len()], O_RDONLY, 0);
             if fd < 0 {
+                write_str(STDERR_FILENO, "grep: cannot open file\n");
+                ret = 1;
                 continue;
             }
-            grep_fd(fd as i32, pattern);
+            if !grep_fd(fd as i32, pattern) {
+                ret = 1;
+            }
             close(fd as i32);
         }
     }
-    0
+    ret
 }
 
-fn grep_fd(fd: i32, pattern: &[u8]) {
+/// Returns true on success, false on I/O error.
+fn grep_fd(fd: i32, pattern: &[u8]) -> bool {
     let mut buf = [0u8; 4096];
     let mut line_start = 0usize;
 
@@ -46,8 +56,12 @@ fn grep_fd(fd: i32, pattern: &[u8]) {
             continue;
         }
         let n = read(fd, &mut buf[line_start..]);
-        if n <= 0 {
+        if n == 0 {
             break;
+        }
+        if n < 0 {
+            write_str(STDERR_FILENO, "grep: read error\n");
+            return false;
         }
         let end = line_start + n as usize;
         let mut pos = 0;
@@ -82,6 +96,7 @@ fn grep_fd(fd: i32, pattern: &[u8]) {
         write_all(STDOUT_FILENO, &buf[..line_start]);
         write_all(STDOUT_FILENO, b"\n");
     }
+    true
 }
 
 /// Fixed-string substring search (equivalent to C strstr).

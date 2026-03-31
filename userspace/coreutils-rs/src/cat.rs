@@ -8,8 +8,7 @@ syscall_lib::entry_point!(main);
 
 fn main(args: &[&str]) -> i32 {
     if args.len() <= 1 {
-        cat_fd(0);
-        return 0;
+        return if cat_fd(0) { 0 } else { 1 };
     }
     let mut ret = 0;
     for arg in &args[1..] {
@@ -28,32 +27,43 @@ fn main(args: &[&str]) -> i32 {
             ret = 1;
             continue;
         }
-        cat_fd(fd as i32);
+        if !cat_fd(fd as i32) {
+            ret = 1;
+        }
         close(fd as i32);
     }
     ret
 }
 
-fn cat_fd(fd: i32) {
+/// Returns true on success, false on I/O error.
+fn cat_fd(fd: i32) -> bool {
     let mut buf = [0u8; 4096];
     loop {
         let n = read(fd, &mut buf);
-        if n <= 0 {
-            break;
+        if n == 0 {
+            return true;
         }
-        write_all(STDOUT_FILENO, &buf[..n as usize]);
+        if n < 0 {
+            write_str(STDERR_FILENO, "cat: read error\n");
+            return false;
+        }
+        if !write_all(STDOUT_FILENO, &buf[..n as usize]) {
+            write_str(STDERR_FILENO, "cat: write error\n");
+            return false;
+        }
     }
 }
 
-fn write_all(fd: i32, data: &[u8]) {
+fn write_all(fd: i32, data: &[u8]) -> bool {
     let mut off = 0;
     while off < data.len() {
         let w = write(fd, &data[off..]);
         if w <= 0 {
-            break;
+            return false;
         }
         off += w as usize;
     }
+    true
 }
 
 #[panic_handler]
