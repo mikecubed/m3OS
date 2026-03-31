@@ -361,9 +361,15 @@ static void handle_connection(int client_fd) {
     unsigned char rbuf[512];
     unsigned char wbuf[1024];
 
+    write_str(2, "telnetd: entering relay loop\n");
+
     for (;;) {
         int ret = poll(pfds, 2, -1);
-        if (ret <= 0)
+        if (ret < 0) {
+            write_str(2, "telnetd: poll error\n");
+            break;
+        }
+        if (ret == 0)
             continue;
 
         /* Apply NAWS if received */
@@ -422,12 +428,26 @@ static void handle_connection(int client_fd) {
         }
 
         /* Socket closed */
-        if (pfds[0].revents & POLLHUP)
+        if (pfds[0].revents & POLLHUP) {
+            write_str(2, "telnetd: socket POLLHUP\n");
             break;
+        }
 
         /* PTY closed (shell exited) */
-        if (pfds[1].revents & POLLHUP)
+        if (pfds[1].revents & POLLHUP) {
+            write_str(2, "telnetd: pty POLLHUP\n");
             break;
+        }
+
+        /* Check for POLLNVAL */
+        if (pfds[0].revents & 0x020) {
+            write_str(2, "telnetd: socket POLLNVAL\n");
+            break;
+        }
+        if (pfds[1].revents & 0x020) {
+            write_str(2, "telnetd: pty POLLNVAL\n");
+            break;
+        }
     }
 
     /* Cleanup */
