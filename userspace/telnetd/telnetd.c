@@ -361,6 +361,13 @@ static void handle_connection(int client_fd) {
     unsigned char rbuf[512];
     unsigned char wbuf[1024];
 
+    /* Debug: write a test message directly to the socket */
+    {
+        const char *msg = "HELLO FROM TELNETD\r\n";
+        int mlen = 0;
+        while (msg[mlen]) mlen++;
+        write(client_fd, msg, mlen);
+    }
     write_str(2, "telnetd: entering relay loop\n");
 
     for (;;) {
