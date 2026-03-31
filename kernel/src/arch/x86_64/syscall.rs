@@ -1405,9 +1405,8 @@ fn sys_setsid() -> u64 {
     let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     let mut table = crate::process::PROCESS_TABLE.lock();
 
-    // Check if already a session leader.
+    // POSIX: fail if the caller is already a process-group leader (pgid == pid).
     if let Some(proc) = table.find(calling_pid) {
-        // POSIX: fail if the caller is already a process-group leader (pgid == pid).
         if proc.pgid == calling_pid {
             return NEG_EPERM;
         }
@@ -1693,7 +1692,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     };
 
-    // Increment pipe ref-counts for cloned FDs before creating the child.
+    // Increment refcounts (pipes + PTYs) for cloned FDs before creating the child.
     crate::process::add_fd_refs(&parent_fds);
 
     // Create child process entry with cloned FD table (Phase 14, P14-T003).
@@ -3115,7 +3114,6 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     written += 1;
                 }
-                // Wake any blocked slave readers.
                 written as u64
             } else {
                 NEG_EIO
