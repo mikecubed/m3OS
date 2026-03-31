@@ -4007,7 +4007,11 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
-            FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
+            FdBackend::PtyMaster { pty_id } => {
+                let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+                log::info!("[close] pid={} fd={} PtyMaster({})", pid, fd, pty_id);
+                crate::pty::close_master(*pty_id);
+            }
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             _ => {}
         }
