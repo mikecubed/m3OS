@@ -349,7 +349,7 @@ pub extern "C" fn syscall_handler(
         // Phase 21: mprotect stub (musl stack guard)
         10 => 0, // no-op — our ELF loader already sets up guard pages
         // Linux-compatible memory (Phase 12, T018–T020)
-        9 => sys_linux_mmap(arg0, arg1),
+        9 => sys_linux_mmap(arg0, arg1, arg2),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
@@ -1839,12 +1839,22 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    // Read the binary from the ramdisk (get_file handles both absolute and bare names).
-    let data = match crate::fs::ramdisk::get_file(name) {
+    // Read the binary from the ramdisk first; fall back to disk filesystems.
+    let disk_buf: alloc::vec::Vec<u8>;
+    let data: &[u8] = match crate::fs::ramdisk::get_file(name) {
         Some(d) => d,
         None => {
-            log::warn!("[execve] file not found: {}", name);
-            return NEG_ENOENT;
+            // Phase 31: try ext2, FAT32, and tmpfs before giving up.
+            match read_file_from_disk(name) {
+                Ok(buf) => {
+                    disk_buf = buf;
+                    &disk_buf
+                }
+                Err(errno) => {
+                    log::warn!("[execve] file not found or rejected: {}", name);
+                    return errno;
+                }
+            }
         }
     };
 
@@ -3248,6 +3258,98 @@ fn is_directory(path: &str) -> bool {
     false
 }
 
+/// Phase 31: Read a file's entire contents from disk filesystems (ext2, FAT32, tmpfs).
+///
+/// Used by `sys_execve` to load binaries from persistent storage instead of
+/// only the ramdisk. Returns `Ok(contents)` on success or `Err(neg_errno)` on
+/// failure (e.g. `NEG_ENOENT` if not found, `NEG_E2BIG` if too large).
+const NEG_E2BIG: u64 = (-7_i64) as u64;
+
+fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
+    /// Maximum executable size we are willing to load (16 MB).
+    const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
+
+    // Try ext2 root filesystem first (most likely location for compiled binaries).
+    // Skip /data/ paths — those are routed to FAT32 by other syscalls.
+    if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            let rel = path.trim_start_matches('/');
+            if let Ok(inode_num) = vol.resolve_path(rel)
+                && let Ok(inode) = vol.read_inode(inode_num)
+            {
+                let size = inode.size as usize;
+                if size > MAX_EXEC_SIZE {
+                    log::warn!(
+                        "[exec] file too large ({} bytes > {} limit): {}",
+                        size,
+                        MAX_EXEC_SIZE,
+                        path
+                    );
+                    return Err(NEG_E2BIG);
+                }
+                if size > 0 {
+                    let mut buf = alloc::vec![0u8; size];
+                    if let Ok(n) = vol.read_file_data(&inode, 0, &mut buf) {
+                        buf.truncate(n);
+                        return Ok(buf);
+                    }
+                }
+            }
+        }
+    }
+
+    // Try tmpfs (/tmp).
+    if let Some(rel) = tmpfs_relative_path(path)
+        && !rel.is_empty()
+    {
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        if let Ok(data) = tmpfs.read_file(rel, 0, usize::MAX)
+            && !data.is_empty()
+        {
+            return Ok(data.to_vec());
+        }
+    }
+
+    // Try FAT32 (/data mount).
+    let fat_rel = if let Some(stripped) = path.strip_prefix("/data/") {
+        Some(stripped)
+    } else if path.starts_with("/usr/") {
+        Some(path.trim_start_matches('/'))
+    } else {
+        None
+    };
+    if let Some(rel) = fat_rel {
+        let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+        if let Some(vol) = vol.as_ref()
+            && let Ok(entry) = vol.lookup(rel)
+            && !entry.is_dir()
+        {
+            let size = entry.file_size as usize;
+            if size > MAX_EXEC_SIZE {
+                log::warn!(
+                    "[exec] file too large ({} bytes > {} limit): {}",
+                    size,
+                    MAX_EXEC_SIZE,
+                    path
+                );
+                return Err(NEG_E2BIG);
+            }
+            if size > 0 {
+                let cluster = entry.start_cluster();
+                let mut buf = alloc::vec![0u8; size];
+                if let Ok(n) = vol.read_file(cluster, entry.file_size, 0, &mut buf)
+                    && n == size
+                {
+                    return Ok(buf);
+                }
+            }
+        }
+    }
+
+    Err(NEG_ENOENT)
+}
+
 /// Check if a path targets the tmpfs mount at `/tmp`.
 ///
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
@@ -3595,7 +3697,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
                         let initial_offset = if append { entry.file_size as usize } else { 0 };
 
-                        let fd_entry = FdEntry {
+                        let mut fd_entry = FdEntry {
                             backend: FdBackend::Fat32Disk {
                                 path: alloc::string::String::from(rel),
                                 start_cluster: entry.start_cluster(),
@@ -3608,9 +3710,28 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                             cloexec: false,
                         };
 
+                        // Phase 31: support O_TRUNC on FAT32 — free the old
+                        // cluster chain and reset size to 0 so TCC can overwrite
+                        // output files.
                         if truncate && writable {
-                            log::warn!("[open] O_TRUNC not supported on FAT32 files: {}", name);
-                            return NEG_EINVAL;
+                            let old_cluster = entry.start_cluster();
+                            if old_cluster >= 2 && vol.free_chain(old_cluster).is_err() {
+                                return NEG_EIO;
+                            }
+                            let file_short = rel.rsplit('/').next().unwrap_or(rel);
+                            if vol
+                                .update_dir_entry(parent_cluster, file_short, 0, 0)
+                                .is_err()
+                            {
+                                return NEG_EIO;
+                            }
+                            fd_entry.backend = FdBackend::Fat32Disk {
+                                path: alloc::string::String::from(rel),
+                                start_cluster: 0,
+                                file_size: 0,
+                                dir_cluster: parent_cluster,
+                            };
+                            fd_entry.offset = 0;
                         }
 
                         return match alloc_fd(3, fd_entry) {
@@ -4688,7 +4809,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 // Only MAP_PRIVATE|MAP_ANONYMOUS (flags 0x22) with fd=-1 is supported.
 // ---------------------------------------------------------------------------
 
-fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
+fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // Read flags from SYSCALL_ARG3 (r10 at syscall entry).
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
     let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
@@ -4753,10 +4874,20 @@ fn sys_linux_mmap(addr_hint: u64, len: u64) -> u64 {
         VirtAddr,
         structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
     };
-    let flags_pt = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
+    // Phase 31: honour PROT_EXEC — omit NO_EXECUTE when the caller requests
+    // executable memory (needed for TCC's `-run` JIT mode).
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+    let flags_pt = {
+        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if prot & PROT_WRITE != 0 {
+            f |= PageTableFlags::WRITABLE;
+        }
+        if prot & PROT_EXEC == 0 {
+            f |= PageTableFlags::NO_EXECUTE;
+        }
+        f
+    };
     // SAFETY: current CR3 is the process's page table; no other mapper is live.
     let mut mapper = unsafe { crate::mm::paging::get_mapper() };
     let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
@@ -6354,6 +6485,37 @@ fn sys_access(path_ptr: u64) -> u64 {
             return 0;
         }
     }
+
+    // Phase 31: check ext2 root filesystem.
+    if crate::fs::ext2::is_mounted() {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            let rel = resolved.trim_start_matches('/');
+            if vol.resolve_path(rel).is_ok() {
+                return 0;
+            }
+        }
+    }
+
+    // Phase 31: check FAT32 (/data mount and /usr paths mapped onto it).
+    {
+        let fat_rel = if let Some(stripped) = resolved.strip_prefix("/data/") {
+            Some(stripped)
+        } else if resolved.starts_with("/usr/") {
+            Some(resolved.trim_start_matches('/'))
+        } else {
+            None
+        };
+        if let Some(rel) = fat_rel {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.lookup(rel).is_ok()
+            {
+                return 0;
+            }
+        }
+    }
+
     NEG_ENOENT
 }
 

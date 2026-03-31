@@ -54,6 +54,14 @@ fn main() {
             });
             cmd_test(&test_args);
         }
+        Some("smoke-test") => {
+            let smoke_args = parse_smoke_test_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_smoke_test(&smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -82,7 +90,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -352,10 +360,353 @@ fn build_ion() {
     println!("ion: {} → kernel/initrd/ion.elf", built.display());
 }
 
+/// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
+///
+/// Strategy: clone TCC source from repo.or.cz (or use cached clone in
+/// target/tcc-src/), configure with `--prefix=/usr` so TCC knows where
+/// to find headers and libraries at runtime inside the OS, build with
+/// `x86_64-linux-musl-gcc -static`, strip, and place the resulting
+/// binary in a staging directory.
+///
+/// Returns the path to the staging directory containing the TCC binary,
+/// or `None` if the build fails (musl cross-compiler not available, etc.).
+///
+/// The staging directory layout:
+///   target/tcc-staging/usr/bin/tcc          — TCC binary
+///   target/tcc-staging/usr/lib/libc.a       — musl libc
+///   target/tcc-staging/usr/lib/crt1.o       — CRT start
+///   target/tcc-staging/usr/lib/crti.o       — CRT init prologue
+///   target/tcc-staging/usr/lib/crtn.o       — CRT init epilogue
+///   target/tcc-staging/usr/lib/tcc/include/ — TCC-specific headers
+///   target/tcc-staging/usr/include/         — musl system headers
+///   target/tcc-staging/usr/src/hello.c      — test program
+///   target/tcc-staging/usr/src/tcc/         — TCC source for self-hosting
+fn build_tcc() -> Option<PathBuf> {
+    let root = workspace_root();
+    let staging = root.join("target/tcc-staging");
+    let tcc_bin = staging.join("usr/bin/tcc");
+
+    // Check if we already have a complete cached build. Validate sentinel
+    // artifacts to avoid reusing a partially-populated staging dir from an
+    // interrupted prior run.
+    let sentinels_ok = [
+        staging.join("usr/lib/libc.a"),
+        staging.join("usr/lib/tcc/libtcc1.a"),
+    ]
+    .iter()
+    .all(|p| p.metadata().map(|m| m.len() > 0).unwrap_or(false));
+    if tcc_bin.exists()
+        && tcc_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && sentinels_ok
+        && staging.join("usr/include").is_dir()
+    {
+        println!("tcc: using cached {}", tcc_bin.display());
+        return Some(staging);
+    }
+    // Incomplete staging — remove and rebuild.
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    // Check for musl cross-compiler.
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else if Command::new("musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "musl-gcc"
+    } else {
+        eprintln!(
+            "warning: musl cross-compiler not found — skipping TCC build \
+             (install musl-tools to enable Phase 31)"
+        );
+        return None;
+    };
+
+    // Clone TCC source.
+    let tcc_src = root.join("target/tcc-src");
+    if tcc_src.exists() && !tcc_src.join("configure").exists() {
+        // Incomplete clone — delete and re-clone.
+        eprintln!("tcc: incomplete tcc-src cache (configure missing), re-cloning...");
+        let _ = fs::remove_dir_all(&tcc_src);
+    }
+    if !tcc_src.join("configure").exists() {
+        println!("tcc: cloning TCC from repo.or.cz...");
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "mob",
+                "https://repo.or.cz/tinycc.git",
+                tcc_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for TCC");
+        if !status.success() {
+            eprintln!("warning: failed to clone TCC — skipping Phase 31 TCC build");
+            return None;
+        }
+    }
+
+    // Configure TCC.
+    // Use --extra-ldflags=-static to produce a fully static, non-PIE binary.
+    // The --extra-cflags=-static alone doesn't prevent PIE on newer toolchains.
+    println!("tcc: configuring with {cc} (static, --prefix=/usr)...");
+    let configure_status = Command::new("sh")
+        .current_dir(&tcc_src)
+        .args([
+            "./configure",
+            "--prefix=/usr",
+            &format!("--cc={cc}"),
+            "--extra-cflags=-static",
+            "--extra-ldflags=-static -no-pie",
+            "--cpu=x86_64",
+            "--triplet=x86_64-linux-musl",
+            "--config-musl",
+        ])
+        .status()
+        .expect("failed to run TCC configure");
+    if !configure_status.success() {
+        eprintln!("warning: TCC configure failed — skipping Phase 31 TCC build");
+        return None;
+    }
+
+    // Build TCC binary only (skip libtcc1.a which has bcheck.c portability
+    // issues under musl). The tcc binary itself is all we need — musl's libc.a
+    // provides the C runtime for programs TCC compiles.
+    println!("tcc: building...");
+    let make_status = Command::new("make")
+        .current_dir(&tcc_src)
+        .args(["-j4", "tcc"])
+        .status()
+        .expect("failed to run make for TCC");
+    if !make_status.success() {
+        eprintln!("warning: TCC build failed — skipping Phase 31 TCC build");
+        return None;
+    }
+
+    // Verify the binary is static.
+    let built_tcc = tcc_src.join("tcc");
+    if !built_tcc.exists() {
+        eprintln!("warning: TCC binary not found after build");
+        return None;
+    }
+
+    // Build libtcc1.a — TCC's own runtime support library.
+    // Skip bcheck.c which has musl portability issues.
+    println!("tcc: building libtcc1.a...");
+    let lib_objects = [
+        ("lib/libtcc1.c", "lib/libtcc1.o"),
+        ("lib/stdatomic.c", "lib/stdatomic.o"),
+        ("lib/atomic.S", "lib/atomic.o"),
+        ("lib/builtin.c", "lib/builtin.o"),
+        ("lib/alloca.S", "lib/alloca.o"),
+        ("lib/dsohandle.c", "lib/dsohandle.o"),
+    ];
+    let mut lib_ok = true;
+    for (src, obj) in &lib_objects {
+        let status = Command::new(tcc_src.join("tcc").to_str().unwrap())
+            .current_dir(&tcc_src)
+            .args(["-c", src, "-o", obj, "-B.", "-I."])
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("warning: failed to compile {src} for libtcc1.a");
+            lib_ok = false;
+            break;
+        }
+    }
+    if lib_ok {
+        let obj_paths: Vec<&str> = lib_objects.iter().map(|(_, o)| *o).collect();
+        let mut ar_args = vec!["-ar", "rcs", "libtcc1.a"];
+        ar_args.extend(obj_paths.iter());
+        let status = Command::new(tcc_src.join("tcc").to_str().unwrap())
+            .current_dir(&tcc_src)
+            .args(&ar_args)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            eprintln!("warning: failed to create libtcc1.a");
+        } else {
+            println!("tcc: libtcc1.a built successfully");
+        }
+    }
+
+    // Create staging directory structure.
+    let dirs = [
+        "usr/bin",
+        "usr/lib",
+        "usr/lib/tcc/include",
+        "usr/lib/x86_64-linux-musl",
+        "usr/include",
+        "usr/include/sys",
+        "usr/include/bits",
+        "usr/include/arpa",
+        "usr/include/net",
+        "usr/include/netinet",
+        "usr/include/netpacket",
+        "usr/include/scsi",
+        "usr/src/tcc",
+    ];
+    for d in &dirs {
+        fs::create_dir_all(staging.join(d)).unwrap_or_else(|e| {
+            panic!("failed to create staging dir {d}: {e}");
+        });
+    }
+
+    // Copy TCC binary (stripped).
+    let strip_status = Command::new("strip")
+        .args(["-o", tcc_bin.to_str().unwrap(), built_tcc.to_str().unwrap()])
+        .status();
+    match strip_status {
+        Ok(s) if s.success() => {}
+        _ => {
+            fs::copy(&built_tcc, &tcc_bin).expect("failed to copy TCC binary");
+        }
+    }
+    println!(
+        "tcc: {} → staging/usr/bin/tcc ({})",
+        built_tcc.display(),
+        human_size(tcc_bin.metadata().map(|m| m.len()).unwrap_or(0))
+    );
+
+    // Copy musl libc.a and CRT objects to both /usr/lib/ and the triplet path
+    // /usr/lib/x86_64-linux-musl/ (TCC searches the triplet path first for CRT).
+    let musl_lib = Path::new("/usr/lib/x86_64-linux-musl");
+    fs::create_dir_all(staging.join("usr/lib/x86_64-linux-musl")).expect("create triplet lib dir");
+    let crt_files = ["libc.a", "crt1.o", "crti.o", "crtn.o"];
+    for name in &crt_files {
+        let src = musl_lib.join(name);
+        if src.exists() {
+            // Copy to /usr/lib/
+            let dst = staging.join(format!("usr/lib/{name}"));
+            fs::copy(&src, &dst).unwrap_or_else(|e| {
+                panic!("failed to copy {name}: {e}");
+            });
+            // Also copy to triplet path for TCC's default CRT search.
+            let dst_triplet = staging.join(format!("usr/lib/x86_64-linux-musl/{name}"));
+            fs::copy(&src, &dst_triplet).unwrap_or_else(|e| {
+                panic!("failed to copy {name} to triplet path: {e}");
+            });
+            println!("tcc: {name} → staging/usr/lib/ + triplet");
+        } else {
+            eprintln!("warning: musl {name} not found at {}", src.display());
+        }
+    }
+
+    // Copy libtcc1.a to /usr/lib/tcc/ where TCC expects it.
+    let libtcc1_src = tcc_src.join("libtcc1.a");
+    if libtcc1_src.exists() {
+        let dst = staging.join("usr/lib/tcc/libtcc1.a");
+        fs::copy(&libtcc1_src, &dst).expect("failed to copy libtcc1.a");
+        println!("tcc: libtcc1.a → staging/usr/lib/tcc/libtcc1.a");
+    }
+
+    // Copy musl headers recursively.
+    let musl_include = Path::new("/usr/include/x86_64-linux-musl");
+    if musl_include.is_dir() {
+        copy_dir_recursive(musl_include, &staging.join("usr/include"))
+            .expect("failed to copy musl headers");
+        println!("tcc: musl headers → staging/usr/include/");
+    } else {
+        eprintln!(
+            "warning: musl headers not found at {}",
+            musl_include.display()
+        );
+    }
+
+    // Copy TCC-specific headers.
+    let tcc_include = tcc_src.join("include");
+    if tcc_include.is_dir() {
+        copy_dir_recursive(&tcc_include, &staging.join("usr/lib/tcc/include"))
+            .expect("failed to copy TCC headers");
+        println!("tcc: TCC headers → staging/usr/lib/tcc/include/");
+    }
+
+    // Create hello.c test program.
+    let hello_src = staging.join("usr/src/hello.c");
+    fs::write(
+        &hello_src,
+        "#include <stdio.h>\nint main() {\n    printf(\"hello, world\\n\");\n    return 0;\n}\n",
+    )
+    .expect("write hello.c");
+    println!("tcc: hello.c → staging/usr/src/hello.c");
+
+    // Copy TCC source for self-hosting.
+    let tcc_source_files = [
+        "tcc.c",
+        "tcc.h",
+        "libtcc.c",
+        "libtcc.h",
+        "tccpp.c",
+        "tccgen.c",
+        "tccelf.c",
+        "tccasm.c",
+        "tccrun.c",
+        "x86_64-gen.c",
+        "x86_64-link.c",
+        "i386-asm.c",
+        "i386-asm.h",
+        "tcc-doc.h",
+        "config.h",
+        "tcctok.h",
+    ];
+    for name in &tcc_source_files {
+        let src = tcc_src.join(name);
+        if src.exists()
+            && let Err(e) = fs::copy(&src, staging.join(format!("usr/src/tcc/{name}")))
+        {
+            eprintln!("warning: failed to copy TCC source {name}: {e}");
+        }
+    }
+    println!("tcc: TCC source → staging/usr/src/tcc/");
+
+    Some(staging)
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Human-readable file size.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    // Phase 31: cross-compile TCC (result used during disk image creation).
+    build_tcc();
     build_ion();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -895,6 +1246,423 @@ fn cmd_test(test_args: &TestArgs) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Smoke test: boot full OS in QEMU, inject serial input, verify output
+// ---------------------------------------------------------------------------
+
+/// A single step in an expect-style smoke test script.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum SmokeStep {
+    /// Wait for `pattern` to appear in serial output within `timeout_secs`.
+    Wait {
+        pattern: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+    },
+    /// Send `input` to QEMU stdin (serial input to guest OS).
+    Send {
+        input: &'static str,
+        label: &'static str,
+    },
+    /// Pause between steps.
+    Sleep { millis: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct SmokeTestArgs {
+    display: bool,
+    timeout_secs: u64,
+}
+
+fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
+    let mut display = false;
+    let mut timeout_secs = 120u64;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--display" => display = true,
+            "--timeout" => {
+                index += 1;
+                timeout_secs = args
+                    .get(index)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            other => return Err(format!("unknown smoke-test flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(SmokeTestArgs {
+        display,
+        timeout_secs,
+    })
+}
+
+/// Strip ANSI CSI escape sequences from a string.
+///
+/// Handles: ESC [ <params> <letter>  and  ESC <single-char>.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // ESC [ ... <letter>
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                // consume parameter bytes (0-9 ; ? and space)
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() || c == ';' || c == '?' || c == ' ' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // consume final byte (letter @ through ~)
+                if let Some(&c) = chars.peek() {
+                    if c.is_ascii() && (c as u8) >= b'@' && (c as u8) <= b'~' {
+                        chars.next();
+                    }
+                }
+            } else {
+                // ESC + single character (e.g., ESC c)
+                chars.next();
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
+/// Background serial output reader.
+///
+/// Spawns a thread that reads from `stdout` and sends chunks over the channel.
+/// The thread exits when the pipe closes (QEMU exits).
+fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// Run an expect-style smoke test script against a running QEMU instance.
+///
+/// Returns `Ok(())` on success or `Err(message)` on failure.
+fn run_smoke_script(
+    child: &mut std::process::Child,
+    steps: &[SmokeStep],
+    global_timeout: std::time::Duration,
+) -> Result<(), String> {
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let rx = spawn_serial_reader(stdout);
+
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+    let total = steps.len();
+
+    for (i, step) in steps.iter().enumerate() {
+        // Global timeout check.
+        if global_start.elapsed() > global_timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "global timeout ({global_timeout:?}) exceeded at step {}/{}",
+                i + 1,
+                total
+            ));
+        }
+
+        match step {
+            SmokeStep::Wait {
+                pattern,
+                timeout_secs,
+                label,
+            } => {
+                println!(
+                    "[step {}/{}] wait: {label} ({}s)",
+                    i + 1,
+                    total,
+                    timeout_secs
+                );
+                let step_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    // Drain any available output.
+                    while let Ok(chunk) = rx.try_recv() {
+                        let text = String::from_utf8_lossy(&chunk);
+                        serial_buf.push_str(&text);
+                    }
+
+                    // Check for pattern in stripped output.
+                    let stripped = strip_ansi(&serial_buf);
+                    if let Some(pos) = stripped.find(pattern) {
+                        // Drain buffer up to end of match to avoid re-matching
+                        // old output while preserving any post-match content.
+                        let drain_end = pos + pattern.len();
+                        // The stripped string may differ in length from
+                        // serial_buf (ANSI sequences removed), so drain the
+                        // same number of *raw* characters that correspond to
+                        // the stripped prefix.  A simple and correct approach:
+                        // rebuild the stripped prefix from serial_buf and find
+                        // how many raw chars produce `drain_end` stripped chars.
+                        let mut raw_idx = 0;
+                        let mut stripped_count = 0;
+                        let raw_bytes = serial_buf.as_bytes();
+                        while stripped_count < drain_end && raw_idx < raw_bytes.len() {
+                            if raw_bytes[raw_idx] == 0x1b {
+                                // Skip ESC sequence.
+                                raw_idx += 1;
+                                if raw_idx < raw_bytes.len() && raw_bytes[raw_idx] == b'[' {
+                                    raw_idx += 1;
+                                    // CSI final byte is in '@'..='~' range,
+                                    // matching strip_ansi()'s terminator rule.
+                                    while raw_idx < raw_bytes.len()
+                                        && !(b'@'..=b'~').contains(&raw_bytes[raw_idx])
+                                    {
+                                        raw_idx += 1;
+                                    }
+                                    if raw_idx < raw_bytes.len() {
+                                        raw_idx += 1; // skip final letter
+                                    }
+                                } else if raw_idx < raw_bytes.len() {
+                                    raw_idx += 1; // skip single-char escape
+                                }
+                            } else {
+                                raw_idx += 1;
+                                stripped_count += 1;
+                            }
+                        }
+                        serial_buf.drain(..raw_idx);
+                        break;
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                        return Err(format!(
+                            "step {}/{} timed out: {label}\n\
+                             expected pattern: \"{pattern}\"\n\
+                             last serial output:\n{tail}",
+                            i + 1,
+                            total
+                        ));
+                    }
+
+                    // Wait a bit before polling again.
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // QEMU exited — check if the pattern arrived
+                            // before the pipe closed. Only treat as success
+                            // on the final step; mid-script disconnect means
+                            // subsequent steps would fail anyway.
+                            let _ = child.wait();
+                            let stripped = strip_ansi(&serial_buf);
+                            if stripped.contains(pattern) && i + 1 == total {
+                                serial_buf.clear();
+                                break;
+                            }
+                            let tail = tail_lines(&stripped, 50);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}/{}: {label}\n\
+                                 expected pattern: \"{pattern}\"\n\
+                                 last serial output:\n{tail}",
+                                i + 1,
+                                total
+                            ));
+                        }
+                    }
+
+                    // Trim buffer to prevent unbounded growth (keep last 64 KB).
+                    if serial_buf.len() > 64 * 1024 {
+                        let cut = serial_buf.len() - 48 * 1024;
+                        serial_buf.drain(..cut);
+                    }
+                }
+            }
+
+            SmokeStep::Send { input, label } => {
+                println!("[step {}/{}] send: {label}", i + 1, total);
+                if let Some(stdin) = child.stdin.as_mut() {
+                    use std::io::Write;
+                    if stdin.write_all(input.as_bytes()).is_err() {
+                        return Err(format!("failed to send input at step {}: {label}", i + 1));
+                    }
+                    let _ = stdin.flush();
+                } else {
+                    return Err(format!("no stdin pipe at step {}: {label}", i + 1));
+                }
+            }
+
+            SmokeStep::Sleep { millis } => {
+                println!("[step {}/{}] sleep {}ms", i + 1, total, millis);
+                std::thread::sleep(std::time::Duration::from_millis(*millis));
+            }
+        }
+    }
+
+    // All steps passed — kill QEMU.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Return the last `n` lines of a string.
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Phase 31 smoke test script: login, run TCC, compile and run hello.c.
+fn smoke_test_phase31() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "login:",
+            timeout_secs: 60,
+            label: "wait for login prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter username",
+        },
+        SmokeStep::Wait {
+            pattern: "Password:",
+            timeout_secs: 10,
+            label: "wait for password prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 10,
+            label: "wait for shell prompt",
+        },
+        SmokeStep::Send {
+            input: "/usr/bin/tcc --version\n",
+            label: "run tcc --version",
+        },
+        SmokeStep::Wait {
+            pattern: "tcc version",
+            timeout_secs: 15,
+            label: "verify TCC version output",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 5,
+            label: "wait for shell prompt after tcc --version",
+        },
+        SmokeStep::Send {
+            input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
+            label: "compile hello.c",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for compilation to finish",
+        },
+        SmokeStep::Send {
+            input: "/tmp/hello\n",
+            label: "run compiled hello",
+        },
+        SmokeStep::Wait {
+            pattern: "hello, world",
+            timeout_secs: 15,
+            label: "verify hello world output",
+        },
+    ]
+}
+
+fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
+    let kernel_binary = build_kernel();
+
+    // Fail fast if TCC was not built (build_tcc() returned None, e.g. musl
+    // toolchain missing). Check *after* build_kernel() since that calls
+    // build_tcc().
+    let tcc_staging_bin = workspace_root().join("target/tcc-staging/usr/bin/tcc");
+    if !tcc_staging_bin.exists() {
+        eprintln!(
+            "error: TCC binary not found at {}\n\
+             The Phase 31 smoke test requires TCC. Install musl-tools and retry.",
+            tcc_staging_bin.display()
+        );
+        std::process::exit(1);
+    }
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+    create_data_disk(uefi_image.parent().unwrap());
+
+    let ovmf = find_ovmf();
+    let display_mode = if smoke_args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut args = qemu_args(&uefi_image, &ovmf, display_mode);
+    // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
+    for arg in args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    println!("smoke-test: launching QEMU...");
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let steps = smoke_test_phase31();
+    let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
+    let start = std::time::Instant::now();
+
+    match run_smoke_script(&mut child, &steps, global_timeout) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs();
+            println!("smoke-test: PASSED ({} steps in {}s)", steps.len(), elapsed);
+        }
+        Err(msg) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("smoke-test: FAILED\n{msg}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn cmd_fmt(fix: bool) {
     let root = workspace_root();
     let mut args = vec!["fmt", "--all"];
@@ -1104,7 +1872,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
-    const DISK_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+    // Phase 31: increased from 64 MB to 128 MB to accommodate TCC binary,
+    // musl libc/headers, TCC source for self-hosting, and compilation output.
+    const DISK_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
@@ -1183,6 +1953,13 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
 
     // Populate files using debugfs.
     populate_ext2_files(&part_tmp, output_dir);
+
+    // Phase 31: populate TCC, musl headers/libs, and test files.
+    let root = workspace_root();
+    let tcc_staging = root.join("target/tcc-staging");
+    if tcc_staging.join("usr/bin/tcc").exists() {
+        populate_tcc_files(&part_tmp, &tcc_staging);
+    }
 
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
@@ -1317,6 +2094,115 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
+}
+
+/// Phase 31: Populate TCC, musl headers/libraries, and test files into the
+/// ext2 partition image from the staging directory.
+///
+/// Walks `staging_dir/usr/` recursively and creates the corresponding
+/// directory tree and files on the ext2 image via `debugfs -w`.
+fn populate_tcc_files(part_path: &Path, staging_dir: &Path) {
+    let usr_root = staging_dir.join("usr");
+    if !usr_root.is_dir() {
+        return;
+    }
+
+    // Collect all directories and files relative to `staging_dir`.
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new(); // (ext2_path, host_path)
+    collect_staging_entries(&usr_root, "usr", &mut dirs, &mut files);
+
+    if files.is_empty() {
+        return;
+    }
+
+    // Build debugfs command script.
+    let mut cmds = String::new();
+
+    // Create directories first (sorted so parents come before children).
+    dirs.sort();
+    for dir in &dirs {
+        cmds.push_str(&format!("mkdir {dir}\n"));
+    }
+
+    // Write files.
+    for (ext2_path, host_path) in &files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
+    // Set permissions: directories 0755, files 0644, TCC binary 0755.
+    for dir in &dirs {
+        cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
+    }
+    for (ext2_path, _) in &files {
+        if ext2_path == "usr/bin/tcc" {
+            // Executable.
+            cmds.push_str(&format!("sif {ext2_path} mode 0x81ED\n"));
+        } else {
+            cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+        }
+    }
+
+    cmds.push_str("q\n");
+
+    println!(
+        "tcc: populating ext2 with {} dirs, {} files",
+        dirs.len(),
+        files.len()
+    );
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for TCC population");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write TCC debugfs commands");
+    }
+    let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
+    if !debugfs_output.status.success() {
+        let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
+        eprintln!(
+            "Error: debugfs (TCC) exited with {}: {}",
+            debugfs_output.status, stderr
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Recursively collect directories and files from a staging directory.
+fn collect_staging_entries(
+    dir: &Path,
+    prefix: &str,
+    dirs: &mut Vec<String>,
+    files: &mut Vec<(String, PathBuf)>,
+) {
+    dirs.push(prefix.to_string());
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let child_prefix = format!("{prefix}/{name_str}");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_staging_entries(&path, &child_prefix, dirs, files);
+        } else {
+            files.push((child_prefix, path));
+        }
+    }
 }
 
 fn cmd_image(image_args: &ImageArgs) {

@@ -23,7 +23,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils
+          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -35,24 +35,20 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: TCC build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/tcc-src
+            target/tcc-staging
+          key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
+          restore-keys: ${{ runner.os }}-tcc-
+
       - name: Lint (clippy + fmt)
         run: cargo xtask check
 
-      - name: Build disk images
-        run: cargo xtask image
-
-      - name: Boot smoke test
+      - name: Smoke test (boot + login + TCC compile)
         run: |
-          timeout 30 cargo xtask run 2>&1 | tee boot.log || true
-          # Phase 27: verify userspace init banner and login prompt
-          grep -q 'm3OS init (PID 1)' boot.log
-          grep -qE '(login:|ion# |\$ )' boot.log
-          ! grep -q 'panicked at' boot.log
-
-      - name: Upload boot log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: boot-log
-          path: boot.log
-          retention-days: 7
+          # Delete cached disk.img so it is regenerated with TCC files.
+          rm -f target/x86_64-unknown-none/release/disk.img
+          cargo xtask smoke-test --timeout 120
