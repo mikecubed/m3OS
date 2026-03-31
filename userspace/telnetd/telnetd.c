@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdlib.h>
+#include <errno.h>
 
 /* ------------------------------------------------------------------ */
 /* Telnet protocol constants                                          */
@@ -144,12 +145,38 @@ static int telnet_parse(const unsigned char *buf, int len,
 }
 
 /* ------------------------------------------------------------------ */
+/* Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+static int write_all(int fd, const unsigned char *buf, int len) {
+    int off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (w == 0)
+            return -1;
+        off += (int)w;
+    }
+    return 0;
+}
+
+static void write_str(int fd, const char *s) {
+    int len = 0;
+    while (s[len]) len++;
+    write(fd, s, len);
+}
+
+/* ------------------------------------------------------------------ */
 /* Telnet option negotiation                                          */
 /* ------------------------------------------------------------------ */
 
 static void telnet_send_option(int fd, unsigned char cmd, unsigned char opt) {
     unsigned char buf[3] = { TEL_IAC, cmd, opt };
-    write(fd, buf, 3);
+    write_all(fd, buf, 3);
 }
 
 static void telnet_negotiate(int fd) {
@@ -159,28 +186,14 @@ static void telnet_negotiate(int fd) {
     telnet_send_option(fd, TEL_DO,   TELOPT_NAWS);
 }
 
-/* ------------------------------------------------------------------ */
-/* Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-static void write_all(int fd, const unsigned char *buf, int len) {
-    int off = 0;
-    while (off < len) {
-        ssize_t w = write(fd, buf + off, len - off);
-        if (w <= 0) break;
-        off += (int)w;
-    }
-}
-
-static void write_str(int fd, const char *s) {
-    write(fd, s, strlen(s));
-}
-
 /* Build a "/dev/pts/N\0" path from a PTY number. */
 static void pts_path(unsigned int n, char *buf, int buflen) {
     const char *prefix = "/dev/pts/";
     int plen = 9;
-    memcpy(buf, prefix, plen);
+    if (buflen <= plen + 1)
+        return;
+    for (int i = 0; i < plen; i++)
+        buf[i] = prefix[i];
     /* Convert n to decimal */
     char tmp[8];
     int tlen = 0;
@@ -192,9 +205,12 @@ static void pts_path(unsigned int n, char *buf, int buflen) {
             n /= 10;
         }
     }
-    for (int i = 0; i < tlen && plen + i < buflen - 1; i++) {
+    /* Clamp digits to available space */
+    int avail = buflen - plen - 1;
+    if (tlen > avail)
+        tlen = avail;
+    for (int i = 0; i < tlen; i++)
         buf[plen + i] = tmp[tlen - 1 - i];
-    }
     buf[plen + tlen] = '\0';
 }
 
@@ -353,7 +369,11 @@ static void handle_connection(int client_fd) {
         /* Socket → PTY master */
         if (pfds[0].revents & POLLIN) {
             ssize_t n = read(client_fd, rbuf, sizeof(rbuf));
-            if (n <= 0)
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0)
                 break; /* Client disconnected */
             /* Strip IAC sequences */
             unsigned char clean[512];
@@ -379,7 +399,11 @@ static void handle_connection(int client_fd) {
         /* PTY master → Socket */
         if (pfds[1].revents & POLLIN) {
             ssize_t n = read(master_fd, rbuf, sizeof(rbuf));
-            if (n <= 0)
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0)
                 break; /* Shell exited */
             /* CR/LF translation: Unix → NVT + IAC escaping */
             int wlen = unix_to_crlf(rbuf, (int)n, wbuf, sizeof(wbuf));

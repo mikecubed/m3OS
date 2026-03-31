@@ -101,6 +101,10 @@ fn spawn_login() -> isize {
 
 fn spawn_telnetd() {
     let pid = fork();
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: telnetd fork failed\n");
+        return;
+    }
     if pid == 0 {
         let envp: [*const u8; 3] = [ENV_PATH.as_ptr(), ENV_HOME.as_ptr(), core::ptr::null()];
         let argv: [*const u8; 2] = [TELNETD_ARGV0.as_ptr(), core::ptr::null()];
@@ -110,9 +114,7 @@ fn spawn_telnetd() {
         write_str(STDOUT_FILENO, ")\n");
         exit(1);
     }
-    if pid > 0 {
-        write_str(STDOUT_FILENO, "init: telnetd started\n");
-    }
+    write_str(STDOUT_FILENO, "init: telnetd started\n");
 }
 
 #[panic_handler]
