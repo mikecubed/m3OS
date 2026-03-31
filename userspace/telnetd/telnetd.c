@@ -310,11 +310,18 @@ static void handle_connection(int client_fd) {
         close(master_fd);
         close(client_fd);
 
-        setsid();
+        if (setsid() < 0) {
+            write_str(2, "telnetd: setsid failed\n");
+            _exit(1);
+        }
 
         int slave_fd = open(slave_path, O_RDWR);
-        if (slave_fd < 0)
+        if (slave_fd < 0) {
+            write_str(2, "telnetd: open slave failed: ");
+            write_str(2, slave_path);
+            write_str(2, "\n");
             _exit(1);
+        }
 
         /* Set controlling terminal */
         ioctl(slave_fd, TIOCSCTTY, 0);
@@ -336,6 +343,7 @@ static void handle_connection(int client_fd) {
             NULL
         };
         execve("/bin/login", login_argv, login_envp);
+        write_str(2, "telnetd: execve /bin/login failed\n");
         _exit(1);
     }
 
