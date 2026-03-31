@@ -56,10 +56,7 @@ pub fn add_slave_ref(id: u32) {
 }
 
 /// Close one master reference. Sends SIGHUP when last ref is closed.
-///
-/// Does NOT free the PTY pair — that's done by `close_slave` when the
-/// slave side fully closes. This prevents a race where the master is
-/// closed (e.g., by a forked child) before the slave has been opened.
+/// Also frees the PTY pair if the slave side has already fully closed.
 pub fn close_master(id: u32) {
     let fg;
     {
@@ -73,6 +70,12 @@ pub fn close_master(id: u32) {
             } else {
                 0
             };
+            // Free if both sides are done and the slave was opened at
+            // least once (prevents a race where master is closed by a
+            // forked child before the slave has been opened).
+            if pair.master_refcount == 0 && pair.slave_refcount == 0 && pair.slave_opened {
+                try_free(&mut table, id);
+            }
         } else {
             return;
         }

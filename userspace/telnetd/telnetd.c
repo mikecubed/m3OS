@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /* Telnet protocol constants                                          */
@@ -520,7 +521,16 @@ int main(int argc, char **argv) {
         lpfd.events = POLLIN;
         lpfd.revents = 0;
         int pr = poll(&lpfd, 1, 1000);
-        if (pr <= 0 || !(lpfd.revents & POLLIN))
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            write_str(2, "telnetd: poll() failed on listen_fd\n");
+            /* Avoid tight spin on persistent error */
+            struct timespec ts_sleep = { .tv_sec = 1, .tv_nsec = 0 };
+            nanosleep(&ts_sleep, NULL);
+            continue;
+        }
+        if (pr == 0 || !(lpfd.revents & POLLIN))
             continue;
 
         struct sockaddr_in client_addr;
