@@ -3271,7 +3271,8 @@ fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
     const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
 
     // Try ext2 root filesystem first (most likely location for compiled binaries).
-    if crate::fs::ext2::is_mounted() {
+    // Skip /data/ paths — those are routed to FAT32 by other syscalls.
+    if crate::fs::ext2::is_mounted() && !path.starts_with("/data/") {
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             let rel = path.trim_start_matches('/');

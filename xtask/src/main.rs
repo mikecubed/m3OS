@@ -1421,8 +1421,10 @@ fn run_smoke_script(
                                 raw_idx += 1;
                                 if raw_idx < raw_bytes.len() && raw_bytes[raw_idx] == b'[' {
                                     raw_idx += 1;
+                                    // CSI final byte is in '@'..='~' range,
+                                    // matching strip_ansi()'s terminator rule.
                                     while raw_idx < raw_bytes.len()
-                                        && !raw_bytes[raw_idx].is_ascii_alphabetic()
+                                        && !(b'@'..=b'~').contains(&raw_bytes[raw_idx])
                                     {
                                         raw_idx += 1;
                                     }
@@ -1462,10 +1464,13 @@ fn run_smoke_script(
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            // QEMU exited.
+                            // QEMU exited — check if the pattern arrived
+                            // before the pipe closed. Only treat as success
+                            // on the final step; mid-script disconnect means
+                            // subsequent steps would fail anyway.
                             let _ = child.wait();
                             let stripped = strip_ansi(&serial_buf);
-                            if stripped.contains(pattern) {
+                            if stripped.contains(pattern) && i + 1 == total {
                                 serial_buf.clear();
                                 break;
                             }
@@ -2142,9 +2147,10 @@ fn populate_tcc_files(part_path: &Path, staging_dir: &Path) {
     if !debugfs_output.status.success() {
         let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
         eprintln!(
-            "Warning: debugfs (TCC) exited with {}: {}",
+            "Error: debugfs (TCC) exited with {}: {}",
             debugfs_output.status, stderr
         );
+        std::process::exit(1);
     }
 }
 
