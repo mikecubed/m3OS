@@ -339,7 +339,16 @@ static void handle_connection(int client_fd) {
         _exit(1);
     }
 
-    /* Child (relay process): close slave, relay between socket and PTY master. */
+    /* Child (relay process): relay between socket and PTY master. */
+    /* Verify master FD is still valid (debug) */
+    {
+        struct { unsigned short rows, cols, xpixel, ypixel; } ws;
+        memset(&ws, 0, sizeof(ws));
+        int r = ioctl(master_fd, TIOCSWINSZ, &ws);
+        if (r < 0)
+            write_str(2, "telnetd: WARNING master_fd invalid\n");
+    }
+
     struct telnet_state ts;
     telnet_state_init(&ts);
 
