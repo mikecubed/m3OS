@@ -272,7 +272,20 @@ static int unix_to_crlf(const unsigned char *in, int inlen,
 /* ------------------------------------------------------------------ */
 
 static void handle_connection(int client_fd) {
-    /* Skip IAC negotiation for now — debug: test with raw telnet */
+    /* DEBUG: simple echo server — no PTY, no fork, just echo */
+    {
+        unsigned char buf[256];
+        const char *hello = "ECHO> ";
+        write(client_fd, hello, 6);
+        for (;;) {
+            ssize_t n = read(client_fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            write(client_fd, buf, n);
+        }
+        close(client_fd);
+        _exit(0);
+    }
+
     /* telnet_negotiate(client_fd); */
 
     /* Allocate PTY pair */
