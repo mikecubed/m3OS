@@ -234,6 +234,12 @@ fn build_musl_bins() {
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
         // Phase 30: telnet server
         ("userspace/telnetd/telnetd.c", "telnetd"),
+        // Phase 32: build tool utilities
+        ("userspace/coreutils/touch.c", "touch"),
+        ("userspace/coreutils/stat.c", "stat"),
+        ("userspace/coreutils/wc.c", "wc"),
+        ("userspace/coreutils/ar.c", "ar"),
+        ("userspace/coreutils/install.c", "install"),
     ];
 
     for (src_rel, name) in bins {
@@ -352,6 +358,93 @@ fn build_ion() {
         }
     }
     println!("ion: {} → kernel/initrd/ion.elf", built.display());
+}
+
+/// Phase 32: Cross-compile pdpmake (POSIX make) for the OS.
+///
+/// Strategy: clone pdpmake from GitHub (or use cached clone in target/pdpmake-src/),
+/// build with `musl-gcc -static -O2`, and place the resulting binary in
+/// kernel/initrd/make.elf.
+fn build_pdpmake() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    let make_elf = initrd.join("make.elf");
+
+    // Check cache.
+    if make_elf.exists() && make_elf.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("pdpmake: using cached {}", make_elf.display());
+        return;
+    }
+
+    // Clone pdpmake source.
+    let pdpmake_src = root.join("target/pdpmake-src");
+    if !pdpmake_src.join("main.c").exists() {
+        println!("pdpmake: cloning from GitHub...");
+        let _ = fs::remove_dir_all(&pdpmake_src);
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/rmyorston/pdpmake.git",
+                pdpmake_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for pdpmake");
+        if !status.success() {
+            eprintln!("warning: failed to clone pdpmake — creating empty placeholder");
+            if !make_elf.exists() {
+                fs::write(&make_elf, b"").unwrap();
+            }
+            return;
+        }
+    }
+
+    // Collect all .c files in the pdpmake source directory.
+    let mut c_files: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&pdpmake_src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "c") {
+                c_files.push(path.to_str().unwrap().to_string());
+            }
+        }
+    }
+
+    if c_files.is_empty() {
+        eprintln!("warning: no .c files found in pdpmake source — creating empty placeholder");
+        if !make_elf.exists() {
+            fs::write(&make_elf, b"").unwrap();
+        }
+        return;
+    }
+
+    // Build with musl-gcc.
+    let mut args = vec!["-static".to_string(), "-O2".to_string()];
+    args.extend(c_files);
+    args.push("-o".to_string());
+    args.push(make_elf.to_str().unwrap().to_string());
+
+    let status = match Command::new("musl-gcc").args(&args).status() {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: musl-gcc not found — skipping pdpmake build");
+            if !make_elf.exists() {
+                fs::write(&make_elf, b"").unwrap();
+            }
+            return;
+        }
+        Err(e) => panic!("failed to run musl-gcc for pdpmake: {e}"),
+    };
+    if !status.success() {
+        eprintln!("warning: pdpmake build failed");
+        if !make_elf.exists() {
+            fs::write(&make_elf, b"").unwrap();
+        }
+        return;
+    }
+
+    println!("pdpmake: built → kernel/initrd/make.elf");
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
@@ -702,6 +795,8 @@ fn build_kernel() -> PathBuf {
     // Phase 31: cross-compile TCC (result used during disk image creation).
     build_tcc();
     build_ion();
+    // Phase 32: cross-compile pdpmake (POSIX make).
+    build_pdpmake();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -875,6 +970,7 @@ fn cmd_check() {
     build_userspace_bins();
     build_musl_bins();
     build_ion();
+    build_pdpmake();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
