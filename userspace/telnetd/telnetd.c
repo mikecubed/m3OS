@@ -272,15 +272,27 @@ static int unix_to_crlf(const unsigned char *in, int inlen,
 /* ------------------------------------------------------------------ */
 
 static void handle_connection(int client_fd) {
-    /* DEBUG: simple echo server — no PTY, no fork, just echo */
+    /* DEBUG: echo server using poll() — test poll on socket FD */
     {
         unsigned char buf[256];
-        const char *hello = "ECHO> ";
-        write(client_fd, hello, 6);
+        const char *hello = "ECHO-POLL> ";
+        write(client_fd, hello, 11);
+        struct pollfd pfd;
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
         for (;;) {
-            ssize_t n = read(client_fd, buf, sizeof(buf));
-            if (n <= 0) break;
-            write(client_fd, buf, n);
+            pfd.revents = 0;
+            int r = poll(&pfd, 1, -1);
+            if (r <= 0) {
+                write_str(2, "telnetd: echo poll failed\n");
+                break;
+            }
+            if (pfd.revents & POLLIN) {
+                ssize_t n = read(client_fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                write(client_fd, buf, n);
+            }
+            if (pfd.revents & 0x010) break; /* POLLHUP */
         }
         close(client_fd);
         _exit(0);
