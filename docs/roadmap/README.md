@@ -156,7 +156,7 @@ flowchart TD
 | 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | [Tasks](./tasks/27-user-accounts-tasks.md) |
 | 28 | ext2 Filesystem | Native Unix permissions, replaces FAT32 | [Phase 28](./28-ext2-filesystem.md) | *not yet created* |
 | 29 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 29](./29-pty-subsystem.md) | *not yet created* |
-| 30 | Telnet Server | Remote shell access over the network | [Phase 30](./30-telnet-server.md) | *not yet created* |
+| 30 | Telnet Server | Remote shell access over the network | [Phase 30](./30-telnet-server.md) | [Phase 30 Tasks](./tasks/30-telnet-server-tasks.md) |
 | 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 31](./31-compiler-bootstrap.md) | *not yet created* |
 | 32 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 32](./32-build-tools.md) | *not yet created* |
 | 33 | Expanded Coreutils | head, tail, sort, find, diff, ps, less, and more | [Phase 33](./33-expanded-coreutils.md) | *not yet created* |
