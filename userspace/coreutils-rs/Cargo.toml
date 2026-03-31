@@ -53,3 +53,15 @@ path = "src/cp.rs"
 [[bin]]
 name = "grep"
 path = "src/grep.rs"
+
+[[bin]]
+name = "env"
+path = "src/env.rs"
+
+[[bin]]
+name = "PROMPT"
+path = "src/prompt.rs"
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"

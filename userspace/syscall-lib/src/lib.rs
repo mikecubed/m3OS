@@ -229,6 +229,10 @@ pub const SYS_GETEGID: u64 = 108;
 pub const SYS_SETREUID: u64 = 113;
 pub const SYS_SETREGID: u64 = 114;
 
+// Directory listing and stat
+pub const SYS_GETDENTS64: u64 = 217;
+pub const SYS_NEWFSTATAT: u64 = 262;
+
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 
@@ -260,6 +264,7 @@ pub const O_RDWR: u64 = 2;
 pub const O_CREAT: u64 = 0x40;
 pub const O_TRUNC: u64 = 0x200;
 pub const O_APPEND: u64 = 0x400;
+pub const O_DIRECTORY: u64 = 0o200000;
 
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
@@ -703,6 +708,31 @@ pub fn unlink(path: &[u8]) -> isize {
 /// Rename a file or directory. Both paths must be null-terminated byte strings.
 pub fn rename(old: &[u8], new: &[u8]) -> isize {
     unsafe { syscall2(SYS_RENAME, old.as_ptr() as u64, new.as_ptr() as u64) as isize }
+}
+
+/// Read directory entries. Returns bytes read, 0 at end, or negative on error.
+pub fn getdents64(fd: i32, buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_GETDENTS64,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// Stat a file by path. `path` must be null-terminated. `stat_buf` must be 144 bytes.
+pub fn newfstatat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
+    // dirfd = AT_FDCWD (-100), flags = 0
+    unsafe {
+        syscall3(
+            SYS_NEWFSTATAT,
+            (-100i64) as u64,
+            path.as_ptr() as u64,
+            stat_buf.as_mut_ptr() as u64,
+        ) as isize
+    }
 }
 
 // ===========================================================================
