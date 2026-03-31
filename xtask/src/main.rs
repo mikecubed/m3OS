@@ -128,16 +128,6 @@ fn build_userspace_bins() {
         ("id", "id", false),
         ("whoami", "whoami", false),
         ("pty-test", "pty-test", false),
-        // Rust coreutils (replacing C musl utilities)
-        ("coreutils-rs", "true", false),
-        ("coreutils-rs", "false", false),
-        ("coreutils-rs", "echo", false),
-        ("coreutils-rs", "pwd", false),
-        ("coreutils-rs", "sleep", false),
-        ("coreutils-rs", "rm", false),
-        ("coreutils-rs", "mkdir", false),
-        ("coreutils-rs", "rmdir", false),
-        ("coreutils-rs", "mv", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -168,6 +158,40 @@ fn build_userspace_bins() {
             std::process::exit(1);
         }
 
+        let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
+        let dst = initrd.join(format!("{bin}.elf"));
+        fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("failed to copy {bin} to initrd: {e}");
+        });
+        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+    }
+
+    // Rust coreutils — build all binaries in one cargo invocation.
+    let coreutils_bins: &[&str] = &[
+        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv",
+    ];
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "coreutils-rs",
+            "--bins",
+            "--target",
+            "x86_64-unknown-none",
+            "-Zbuild-std=core,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ])
+        .status()
+        .expect("failed to build coreutils-rs");
+
+    if !status.success() {
+        eprintln!("userspace build failed for coreutils-rs");
+        std::process::exit(1);
+    }
+
+    for bin in coreutils_bins {
         let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
         let dst = initrd.join(format!("{bin}.elf"));
         fs::copy(&src, &dst).unwrap_or_else(|e| {

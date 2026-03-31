@@ -11,16 +11,24 @@ fn main(args: &[&str]) -> i32 {
         write_str(STDERR_FILENO, "usage: mv <src> <dst>\n");
         return 1;
     }
-    let mut src = [0u8; 256];
     let sb = args[1].as_bytes();
-    let slen = sb.len().min(255);
-    src[..slen].copy_from_slice(&sb[..slen]);
+    if sb.len() > 255 {
+        write_str(STDERR_FILENO, "mv: source path too long\n");
+        return 1;
+    }
+    let mut src = [0u8; 256];
+    let slen = sb.len();
+    src[..slen].copy_from_slice(sb);
     src[slen] = 0;
 
-    let mut dst = [0u8; 256];
     let db = args[2].as_bytes();
-    let dlen = db.len().min(255);
-    dst[..dlen].copy_from_slice(&db[..dlen]);
+    if db.len() > 255 {
+        write_str(STDERR_FILENO, "mv: destination path too long\n");
+        return 1;
+    }
+    let mut dst = [0u8; 256];
+    let dlen = db.len();
+    dst[..dlen].copy_from_slice(db);
     dst[dlen] = 0;
 
     if rename(&src[..=slen], &dst[..=dlen]) < 0 {

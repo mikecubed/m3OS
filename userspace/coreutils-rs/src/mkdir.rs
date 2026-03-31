@@ -13,10 +13,15 @@ fn main(args: &[&str]) -> i32 {
     }
     let mut ret = 0;
     for arg in &args[1..] {
-        let mut path = [0u8; 256];
         let bytes = arg.as_bytes();
-        let len = bytes.len().min(255);
-        path[..len].copy_from_slice(&bytes[..len]);
+        if bytes.len() > 255 {
+            write_str(STDERR_FILENO, "mkdir: path too long\n");
+            ret = 1;
+            continue;
+        }
+        let mut path = [0u8; 256];
+        let len = bytes.len();
+        path[..len].copy_from_slice(bytes);
         path[len] = 0;
         if mkdir(&path[..=len], 0o755) < 0 {
             write_str(STDERR_FILENO, "mkdir: failed\n");
