@@ -5745,7 +5745,8 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
             u32::MAX // sentinel: don't change
         } else {
             // Validate timespec: tv_sec >= 0, tv_sec fits u32, tv_nsec in [0, 1e9)
-            if a_sec < 0 || a_sec > u32::MAX as i64 || !(0..1_000_000_000).contains(&a_nsec) {
+            // Reject u32::MAX (collides with internal OMIT sentinel)
+            if a_sec < 0 || a_sec >= u32::MAX as i64 || !(0..1_000_000_000).contains(&a_nsec) {
                 return NEG_EINVAL;
             }
             a_sec as u32
@@ -5755,7 +5756,7 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
         } else if m_nsec == UTIME_OMIT {
             u32::MAX // sentinel: don't change
         } else {
-            if m_sec < 0 || m_sec > u32::MAX as i64 || !(0..1_000_000_000).contains(&m_nsec) {
+            if m_sec < 0 || m_sec >= u32::MAX as i64 || !(0..1_000_000_000).contains(&m_nsec) {
                 return NEG_EINVAL;
             }
             m_sec as u32

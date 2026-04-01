@@ -66,14 +66,16 @@ int main(int argc, char **argv) {
     long long total_l = 0, total_w = 0, total_c = 0;
     int file_count = argc - first_file;
 
+    int ret = 0;
+
     if (file_count == 0) {
         /* Read from stdin. */
-        wc_fd(0, &total_l, &total_w, &total_c);
+        if (wc_fd(0, &total_l, &total_w, &total_c) < 0) ret = 1;
         if (show_lines) { write_num(1, total_l); write_str(1, " "); }
         if (show_words) { write_num(1, total_w); write_str(1, " "); }
         if (show_bytes) { write_num(1, total_c); }
         write_str(1, "\n");
-        return 0;
+        return ret;
     }
 
     for (int i = first_file; i < argc; i++) {
@@ -82,10 +84,11 @@ int main(int argc, char **argv) {
             write_str(2, "wc: cannot open: ");
             write_str(2, argv[i]);
             write_str(2, "\n");
+            ret = 1;
             continue;
         }
         long long l = 0, w = 0, c = 0;
-        wc_fd(fd, &l, &w, &c);
+        if (wc_fd(fd, &l, &w, &c) < 0) ret = 1;
         close(fd);
         total_l += l; total_w += w; total_c += c;
         if (show_lines) { write_num(1, l); write_str(1, " "); }
@@ -101,5 +104,5 @@ int main(int argc, char **argv) {
         if (show_bytes) { write_num(1, total_c); write_str(1, " "); }
         write_str(1, "total\n");
     }
-    return 0;
+    return ret;
 }
