@@ -164,7 +164,11 @@ unsafe impl GlobalAlloc for BrkAllocator {
             let mut merged = false;
 
             if !prev_block.is_null() {
-                let prev_end = prev_block as usize + header_size + (*prev_block).size;
+                // SAFETY: prev_block was set during the free-list traversal above
+                // and points to a BlockHeader inside a previously allocated heap
+                // region. The pointer is valid because it came from our own free
+                // list (written by a prior dealloc or alloc overflow).
+                let prev_end = prev_block as usize + header_size + (*prev_block).size; // codeql[rust/access-invalid-pointer] prev_block is a valid free-list node set during traversal above
                 if prev_end == block_start {
                     // prev is adjacent — absorb this block into prev.
                     if !cur.is_null() && block_end == cur as usize {
