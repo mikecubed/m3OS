@@ -919,12 +919,17 @@ fn idle_task() -> ! {
 // Phase 21 — serial stdin feeder
 // ---------------------------------------------------------------------------
 
-/// Poll the serial port (COM1) for incoming bytes and process them through
-/// the TTY line discipline (echo, cooked-mode buffering, signal handling).
+/// Poll the serial port (COM1) for incoming bytes and feed them into the
+/// kernel stdin buffer with echo and signal support.
+///
+/// Unlike the keyboard feeder, serial input bypasses cooked-mode line
+/// buffering (the host terminal handles line editing). Bytes are pushed
+/// directly to stdin, with ECHO written back to COM1 and ISIG checked
+/// for ^C/^Z/^\.
 fn serial_stdin_feeder_task() -> ! {
     use kernel_core::tty::*;
 
-    log::info!("[serial-stdin] feeder ready with line discipline");
+    log::info!("[serial-stdin] feeder ready (echo + signals)");
 
     loop {
         // Read from COM1 data port (0x3F8) if data is available.
@@ -947,7 +952,6 @@ fn serial_stdin_feeder_task() -> ! {
             )
         };
 
-        let canonical = c_lflag & ICANON != 0;
         let echo_on = c_lflag & ECHO != 0;
         let isig = c_lflag & ISIG != 0;
 
@@ -973,9 +977,6 @@ fn serial_stdin_feeder_task() -> ! {
             if let Some((sig, name)) = signal {
                 let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
                 if fg != 0 {
-                    if canonical {
-                        tty::TTY0.lock().edit_buf.clear();
-                    }
                     serial_echo(name);
                     serial_echo("\n");
                     process::send_signal_to_group(fg, sig);
@@ -986,98 +987,17 @@ fn serial_stdin_feeder_task() -> ! {
             }
         }
 
-        if canonical {
-            // Cooked mode: buffer in edit_buf, deliver on newline.
+        // Push byte directly to stdin (no cooked-mode buffering).
+        stdin::push_char(byte);
 
-            // VERASE (backspace/DEL)
-            if byte == c_cc_arr[VERASE] || byte == 0x7F {
-                let erased = tty::TTY0.lock().edit_buf.erase_char();
-                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
-                    serial_echo("\x08 \x08");
-                }
-                continue;
-            }
-
-            // VKILL (^U)
-            if byte == c_cc_arr[VKILL] {
-                let n = tty::TTY0.lock().edit_buf.kill_line();
-                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
-                    for _ in 0..n {
-                        serial_echo("\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VWERASE (^W)
-            if byte == c_cc_arr[VWERASE] {
-                let n = tty::TTY0.lock().edit_buf.word_erase();
-                if n > 0 && echo_on {
-                    for _ in 0..n {
-                        serial_echo("\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VEOF (^D)
-            if byte == c_cc_arr[VEOF] {
-                let mut t = tty::TTY0.lock();
-                if t.edit_buf.is_empty() {
-                    drop(t);
-                    stdin::signal_eof();
-                } else {
-                    let len = t.edit_buf.len;
-                    for i in 0..len {
-                        stdin::push_char(t.edit_buf.buf[i]);
-                    }
-                    t.edit_buf.clear();
-                }
-                continue;
-            }
-
-            // Newline: deliver line.
-            if byte == b'\n' {
-                let mut t = tty::TTY0.lock();
-                let len = t.edit_buf.len;
-                for i in 0..len {
-                    stdin::push_char(t.edit_buf.buf[i]);
-                }
-                t.edit_buf.clear();
-                drop(t);
-                stdin::push_char(b'\n');
-
-                if echo_on || (c_lflag & ECHONL != 0) {
-                    if c_oflag & ONLCR != 0 {
-                        serial_echo("\r\n");
-                    } else {
-                        serial_echo("\n");
-                    }
-                }
-                continue;
-            }
-
-            // Regular character: buffer it.
-            tty::TTY0.lock().edit_buf.push(byte);
-
-            if echo_on {
+        // Echo back to serial port.
+        if echo_on {
+            if c_oflag & ONLCR != 0 && byte == b'\n' {
+                serial_echo("\r\n");
+            } else {
                 let echo_buf = [byte];
                 if let Ok(s) = core::str::from_utf8(&echo_buf) {
                     serial_echo(s);
-                }
-            }
-        } else {
-            // Raw mode: push byte immediately.
-            stdin::push_char(byte);
-
-            if echo_on {
-                if c_oflag & ONLCR != 0 && byte == b'\n' {
-                    serial_echo("\r\n");
-                } else {
-                    let echo_buf = [byte];
-                    if let Ok(s) = core::str::from_utf8(&echo_buf) {
-                        serial_echo(s);
-                    }
                 }
             }
         }
