@@ -54,6 +54,7 @@ pub unsafe fn enter_userspace(entry: u64, user_stack_top: u64) -> ! {
             "push {rflags}",
             "push {cs}",
             "push {rip}",
+            "swapgs",
             "iretq",
             ss     = in(reg) u64::from(gdt::user_data_selector().0),
             rsp    = in(reg) user_stack_top,
@@ -83,6 +84,7 @@ pub unsafe fn enter_userspace_with_retval(rip: u64, rsp: u64, rax: u64) -> ! {
             "push {cs}",
             "push {rip_val}",
             "mov rax, {rax_val}",
+            "swapgs",
             "iretq",
             ss      = in(reg) u64::from(gdt::user_data_selector().0),
             rsp_val = in(reg) rsp,
@@ -122,36 +124,47 @@ pub struct ForkEntryCtx {
     pub rflags: u64, // offset 128
 }
 
-/// Static storage for the fork child entry context.
-/// Single-CPU: only one fork child enters userspace at a time.
-#[unsafe(no_mangle)]
-pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
-    rip: 0,
-    rsp: 0,
-    rbx: 0,
-    rbp: 0,
-    r12: 0,
-    r13: 0,
-    r14: 0,
-    r15: 0,
-    ss: 0,
-    cs: 0,
-    rdi: 0,
-    rsi: 0,
-    rdx: 0,
-    r8: 0,
-    r9: 0,
-    r10: 0,
-    rflags: 0,
-};
+impl ForkEntryCtx {
+    pub const ZERO: Self = Self {
+        rip: 0,
+        rsp: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        ss: 0,
+        cs: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        rflags: 0,
+    };
+}
 
-// Assembly trampoline: reads ForkEntryCtx, restores ALL registers, IRETs to ring 3.
+// FORK_ENTRY_CTX has moved to PerCoreData (Phase 35).
+// The fork_enter_userspace assembly reads it via gs-relative addressing.
+
+// Assembly trampoline: reads ForkEntryCtx from per-core data, restores ALL
+// registers, swapgs, then IRETs to ring 3.
 global_asm!(
+    // Offset of fork_entry_ctx within PerCoreData.
+    ".equ OFF_FORK_CTX, {off_fork_ctx}",
+
     ".global fork_enter_userspace",
     "fork_enter_userspace:",
-    // On entry: FORK_ENTRY_CTX is populated.
-    // Use rax as the base pointer (will be zeroed before IRETQ).
-    "lea rax, [rip + FORK_ENTRY_CTX]",
+    // On entry: per-core fork_entry_ctx is populated, gs_base = PerCoreData.
+    // Read IA32_GS_BASE MSR to get PerCoreData pointer, then compute
+    // address of fork_entry_ctx.
+    "mov ecx, 0xC0000101",   // IA32_GS_BASE
+    "rdmsr",
+    "shl rdx, 32",
+    "or  rax, rdx",
+    "add rax, OFF_FORK_CTX",
     // Restore callee-saved registers.
     "mov rbx, [rax + 16]",
     "mov rbp, [rax + 24]",
@@ -181,7 +194,11 @@ global_asm!(
     "mov rdi, [rax + 80]",
     // RAX = 0 (fork child return value).
     "xor eax, eax",
+    // Swap gs_base back to user value before entering ring 3.
+    "swapgs",
     "iretq",
+
+    off_fork_ctx = const crate::smp::offsets::FORK_ENTRY_CTX,
 );
 
 unsafe extern "C" {
@@ -211,8 +228,11 @@ pub unsafe fn enter_userspace_fork(
     r10: u64,
     rflags: u64,
 ) -> ! {
+    // Write to per-core ForkEntryCtx (accessed by assembly via gs-relative addressing).
+    let data =
+        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
     unsafe {
-        FORK_ENTRY_CTX = ForkEntryCtx {
+        (*data).fork_entry_ctx = ForkEntryCtx {
             rip,
             rsp,
             rbx,

@@ -380,8 +380,9 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     // kernel statics including the IDT Lazy.
     crate::arch::x86_64::interrupts::init();
 
-    // Set gs_base to this AP's PerCoreData.
+    // Set gs_base and kernel_gs_base to this AP's PerCoreData.
     super::write_gs_base(per_core_data_ptr as u64);
+    super::write_kernel_gs_base(per_core_data_ptr as u64);
 
     // Initialize this AP's LAPIC and timer using the phys_offset-based address.
     // Now that EFER.NXE is set, APs can access the phys_offset range.

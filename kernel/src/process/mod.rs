@@ -25,14 +25,33 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
 // ---------------------------------------------------------------------------
-// Current-process tracker (single-CPU)
+// Current-process tracker (per-core, Phase 35)
 // ---------------------------------------------------------------------------
 
-/// PID of the userspace process currently running on the CPU.
-///
-/// 0 = no userspace process is running (kernel task context).
-/// Updated by `fork_child_trampoline` and `sys_execve` before entering ring 3.
-pub static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
+/// Legacy global PID tracker — kept for early boot before SMP init.
+/// After SMP init, use [`current_pid()`] and [`set_current_pid()`] instead.
+static CURRENT_PID_LEGACY: AtomicU32 = AtomicU32::new(0);
+
+/// Return the PID of the userspace process currently running on this core.
+/// 0 = no userspace process (kernel task context).
+pub fn current_pid() -> Pid {
+    if crate::smp::is_per_core_ready() {
+        crate::smp::per_core().current_pid.load(Ordering::Relaxed)
+    } else {
+        CURRENT_PID_LEGACY.load(Ordering::Relaxed)
+    }
+}
+
+/// Set the PID of the userspace process running on this core.
+pub fn set_current_pid(pid: Pid) {
+    if crate::smp::is_per_core_ready() {
+        crate::smp::per_core()
+            .current_pid
+            .store(pid, Ordering::Relaxed);
+    } else {
+        CURRENT_PID_LEGACY.store(pid, Ordering::Relaxed);
+    }
+}
 
 #[allow(unused_imports)]
 pub use crate::mm::user_space::{USER_CODE_BASE, USER_STACK_TOP};
@@ -922,28 +941,25 @@ static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::ne
 /// syscall entry. For kernel-spawned processes (p11 launcher), they're
 /// zeroed.
 pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
-    // Read ALL saved user registers (callee-saved + caller-saved).
+    // Read ALL saved user registers from per-core data.
     // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
     // so the fork child must restore all of them.
-    // SAFETY: single-CPU; written at every syscall entry before this call.
-    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10, rflags) = unsafe {
-        use crate::arch::x86_64::syscall::*;
-        (
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBX)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RBP)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R12)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R13)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R14)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R15)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDI)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RSI)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RDX)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R10)),
-            core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_RFLAGS)),
-        )
-    };
+    let pc = crate::smp::per_core();
+    let (rbx, rbp, r12, r13, r14, r15, rdi, rsi, rdx, r8, r9, r10, rflags) = (
+        pc.syscall_user_rbx,
+        pc.syscall_user_rbp,
+        pc.syscall_user_r12,
+        pc.syscall_user_r13,
+        pc.syscall_user_r14,
+        pc.syscall_user_r15,
+        pc.syscall_user_rdi,
+        pc.syscall_user_rsi,
+        pc.syscall_user_rdx,
+        pc.syscall_user_r8,
+        pc.syscall_user_r9,
+        pc.syscall_user_r10,
+        pc.syscall_user_rflags,
+    );
     FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
         pid,
         user_rip,
@@ -1001,7 +1017,7 @@ pub fn fork_child_trampoline() -> ! {
         .pop_front()
         .expect("fork_child_trampoline: FORK_CHILD_QUEUE is empty — missing push_fork_ctx");
 
-    CURRENT_PID.store(ctx.pid, Ordering::Relaxed);
+    set_current_pid(ctx.pid);
 
     // Look up page table root and kernel stack for this process.
     let (cr3_phys, kstack_top) = {
@@ -1010,11 +1026,10 @@ pub fn fork_child_trampoline() -> ! {
         (p.page_table_root, p.kernel_stack_top)
     };
 
-    // Update TSS.RSP0 and SYSCALL_STACK_TOP for this process's kernel stack.
+    // Update TSS.RSP0 and per-core SYSCALL_STACK_TOP for this process's kernel stack.
+    crate::smp::set_current_core_kernel_stack(kstack_top);
     unsafe {
-        crate::arch::x86_64::gdt::set_kernel_stack(kstack_top);
-        // SAFETY: SYSCALL_STACK_TOP is written once per context switch.
-        *(core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::SYSCALL_STACK_TOP)) = kstack_top;
+        crate::arch::x86_64::syscall::set_per_core_syscall_stack_top(kstack_top);
     }
 
     // Restore FS.base (TLS pointer) for the child process.

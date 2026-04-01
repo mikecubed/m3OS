@@ -82,10 +82,8 @@ pub struct SavedUserRegs {
 /// has been called) while still on the same kernel stack.  Single-CPU only.
 pub unsafe fn read_saved_user_regs(syscall_result: u64) -> SavedUserRegs {
     unsafe {
-        let top = crate::arch::x86_64::syscall::SYSCALL_STACK_TOP;
-        let user_rsp = core::ptr::read_volatile(core::ptr::addr_of!(
-            crate::arch::x86_64::syscall::SYSCALL_USER_RSP
-        ));
+        let top = crate::arch::x86_64::syscall::per_core_syscall_stack_top();
+        let user_rsp = crate::arch::x86_64::syscall::per_core_syscall_user_rsp();
 
         // Helper: read a u64 at SYSCALL_STACK_TOP - offset.
         let read_at = |neg_offset: u64| -> u64 {
