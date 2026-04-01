@@ -49,7 +49,9 @@ use crate::ipc::{CapabilityTable, Message};
 
 pub use kernel_core::types::TaskId;
 
+pub mod blocking_mutex;
 pub mod scheduler;
+pub mod wait_queue;
 
 #[allow(unused_imports)]
 pub use scheduler::{
@@ -125,6 +127,12 @@ pub struct Task {
     /// CPU affinity mask (Phase 35): one bit per core (max 64 cores).
     /// Default: all bits set (can run on any core).
     pub affinity_mask: u64,
+    /// Ticks spent in ring 3 (user mode). Updated on context switch.
+    pub user_ticks: u64,
+    /// Ticks spent in ring 0 (syscall handling). Updated on context switch.
+    pub system_ticks: u64,
+    /// Tick count when this task was last dispatched.
+    pub start_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     _stack: Box<[u8]>,
 }
@@ -150,6 +158,9 @@ impl Task {
             assigned_core: 0,
             priority: 20,            // Normal priority (middle of 10-29 range)
             affinity_mask: u64::MAX, // Can run on any core
+            user_ticks: 0,
+            system_ticks: 0,
+            start_tick: 0,
             _stack: stack,
         }
     }

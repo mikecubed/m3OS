@@ -52,7 +52,7 @@ fn per_core_scheduler_rsp() -> u64 {
 }
 
 /// Get/set the current task index on this core.
-fn get_current_task_idx() -> Option<usize> {
+pub fn get_current_task_idx() -> Option<usize> {
     let val = crate::smp::per_core()
         .current_task_idx
         .load(Ordering::Relaxed);
@@ -309,6 +309,13 @@ pub fn spawn_idle(entry: fn() -> !) {
     spawn_idle_for_core(entry, 0);
 }
 
+/// Accumulate elapsed ticks for the current task (user_ticks for simplicity).
+fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    let elapsed = now.saturating_sub(sched.tasks[idx].start_tick);
+    sched.tasks[idx].user_ticks += elapsed;
+}
+
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
     let (task_rsp_ptr, core_id, idx) = {
@@ -317,6 +324,7 @@ pub fn yield_now() {
             Some(i) => i,
             None => return,
         };
+        accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::Ready;
         let core = sched.tasks[idx].assigned_core;
         set_current_task_idx(None);
@@ -336,6 +344,13 @@ pub fn yield_now() {
 // IPC scheduler primitives
 // ---------------------------------------------------------------------------
 
+/// Return the user and system tick counts for the current task.
+pub fn current_task_times() -> Option<(u64, u64)> {
+    let idx = get_current_task_idx()?;
+    let sched = SCHEDULER.lock();
+    Some((sched.tasks[idx].user_ticks, sched.tasks[idx].system_ticks))
+}
+
 /// Return the [`TaskId`] of the task currently running on this core.
 pub fn current_task_id() -> Option<TaskId> {
     let idx = get_current_task_idx()?;
@@ -351,6 +366,7 @@ fn block_current(state: TaskState) {
             Some(i) => i,
             None => return,
         };
+        accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         set_current_task_idx(None);
         core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
@@ -509,6 +525,7 @@ pub fn run() -> ! {
             let mut sched = SCHEDULER.lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
                 sched.tasks[idx].state = TaskState::Running;
+                sched.tasks[idx].start_tick = crate::arch::x86_64::interrupts::tick_count();
                 set_current_task_idx(Some(idx));
                 let name = sched.tasks[idx].name;
                 let id = sched.tasks[idx].id;

@@ -461,6 +461,8 @@ pub extern "C" fn syscall_handler(
         91 => sys_linux_fchmod(arg0, arg1),
         92 => sys_linux_chown(arg0, arg1, arg2),
         93 => sys_linux_fchown(arg0, arg1, arg2),
+        // Phase 35: times(buf) — fill struct tms with CPU time accounting
+        100 => sys_times(arg0),
         // Phase 27: user/group identity syscalls
         102 => sys_linux_getuid(),
         104 => sys_linux_getgid(),
@@ -1533,6 +1535,28 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
         Some(p) => (p.uid, p.gid, p.euid, p.egid),
         None => (0, 0, 0, 0),
     }
+}
+
+/// `times(buf)` — fill struct tms with CPU time accounting (syscall 100).
+///
+/// struct tms layout (Linux compatible, 4 x i64):
+///   offset 0: tms_utime  — user CPU time
+///   offset 8: tms_stime  — system CPU time
+///   offset 16: tms_cutime — children user CPU time
+///   offset 24: tms_cstime — children system CPU time
+/// Returns: clock ticks since boot.
+fn sys_times(buf_ptr: u64) -> u64 {
+    let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+    if buf_ptr != 0 {
+        let buf = buf_ptr as *mut i64;
+        unsafe {
+            buf.write(user_ticks as i64); // tms_utime
+            buf.add(1).write(system_ticks as i64); // tms_stime
+            buf.add(2).write(0); // tms_cutime (children — not tracked yet)
+            buf.add(3).write(0); // tms_cstime
+        }
+    }
+    crate::arch::x86_64::interrupts::tick_count()
 }
 
 /// `getuid()` — return real user ID (syscall 102).
