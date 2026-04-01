@@ -4,6 +4,7 @@ pub mod frame_allocator;
 pub mod heap;
 pub mod memory_map;
 pub mod paging;
+pub mod slab;
 pub mod user_mem;
 pub mod user_space;
 
@@ -106,6 +107,9 @@ pub fn init(boot_info: &'static mut BootInfo) {
 
     // P17-T010: initialize per-frame refcount table (requires heap).
     frame_allocator::init_refcounts();
+
+    // P33: initialize slab caches for fixed-size kernel objects.
+    slab::init();
 
     log::info!("[mm] Memory subsystem initialized");
 }

@@ -1664,6 +1664,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_ids,
         parent_session_id,
         parent_ctty,
+        parent_mappings,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1680,6 +1681,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (p.uid, p.gid, p.euid, p.egid),
                 p.session_id,
                 p.controlling_tty.clone(),
+                p.mappings.clone(),
             ),
             None => (
                 0,
@@ -1697,6 +1699,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (0u32, 0u32, 0u32, 0u32),
                 0,
                 Some(crate::process::ControllingTty::Console),
+                alloc::vec::Vec::new(),
             ),
         }
     };
@@ -1734,6 +1737,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.egid = parent_ids.3;
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
+            child.mappings = parent_mappings;
         }
     }
 
@@ -4963,17 +4967,103 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
+    // Record the mapping in the process's tracking list (Phase 33).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.mappings.push(crate::process::MemoryMapping {
+                start: base,
+                len: total_size,
+            });
+        }
+    }
+
     log::info!("[mmap] anon {}×4K @ {:#x}", pages, base);
     base
 }
 
 // ---------------------------------------------------------------------------
-// T019: munmap(addr, len) — stub (bump allocator; no reclamation in Phase 12)
+// T019: munmap(addr, len) — Phase 33: reclaim frames + TLB shootdown
 // ---------------------------------------------------------------------------
 
-fn sys_linux_munmap(_addr: u64, _len: u64) -> u64 {
-    // Frames are not reclaimed (bump allocator).  Return success so programs
-    // that call munmap (e.g. musl free for large chunks) do not fail.
+fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
+    // Validate: page-aligned address and non-zero length.
+    if addr & 0xFFF != 0 || len == 0 {
+        return NEG_EINVAL;
+    }
+
+    // Must be in userspace canonical range.
+    if addr >= 0x0000_8000_0000_0000 {
+        return NEG_EINVAL;
+    }
+
+    let pages = len.div_ceil(4096) as usize;
+
+    // Validate range doesn't overflow.
+    let total_size = match (pages as u64).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+    if addr.checked_add(total_size).is_none() {
+        return NEG_EINVAL;
+    }
+
+    use x86_64::structures::paging::{Mapper, Page, Size4KiB};
+
+    // SAFETY: current CR3 is the calling process's page table; this is the
+    // same approach used by sys_linux_mmap.
+    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+
+    let mut freed_count = 0usize;
+    for i in 0..pages {
+        let page_addr = addr + (i as u64 * 4096);
+        let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
+
+        // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
+        match mapper.unmap(page) {
+            Ok((frame, flush)) => {
+                flush.flush();
+                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                freed_count += 1;
+            }
+            Err(_) => {
+                // Page wasn't mapped — skip silently.
+            }
+        }
+    }
+
+    // SMP TLB shootdown: notify other cores about the invalidated pages.
+    if freed_count > 0 {
+        for i in 0..pages {
+            let page_addr = addr + (i as u64 * 4096);
+            crate::smp::tlb::tlb_shootdown(page_addr);
+        }
+    }
+
+    // Remove matching mappings from the process tracking list.
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            let unmap_start = addr;
+            let unmap_end = addr + total_size;
+            proc.mappings.retain(|m| {
+                let m_end = m.start + m.len;
+                // Remove mappings fully contained within the unmapped range.
+                !(m.start >= unmap_start && m_end <= unmap_end)
+            });
+        }
+    }
+
+    if freed_count > 0 {
+        log::info!(
+            "[munmap] freed {} pages @ {:#x} (len={:#x})",
+            freed_count,
+            addr,
+            len
+        );
+    }
+
     0
 }
 
