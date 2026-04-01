@@ -93,6 +93,7 @@ static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat.elf");
 static WC_ELF: &[u8] = include_bytes!("../../initrd/wc.elf");
 static AR_ELF: &[u8] = include_bytes!("../../initrd/ar.elf");
 static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
+static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
 static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
 
 // ---------------------------------------------------------------------------
@@ -245,6 +246,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "install.elf",
         RamdiskNode::File {
             content: INSTALL_ELF,
+        },
+    ),
+    (
+        "meminfo",
+        RamdiskNode::File {
+            content: MEMINFO_ELF,
+        },
+    ),
+    (
+        "meminfo.elf",
+        RamdiskNode::File {
+            content: MEMINFO_ELF,
         },
     ),
     ("make", RamdiskNode::File { content: MAKE_ELF }),

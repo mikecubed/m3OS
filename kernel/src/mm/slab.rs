@@ -38,3 +38,24 @@ pub fn init() {
 pub fn caches() -> &'static KernelSlabCaches {
     SLAB_CACHES.get().expect("slab caches not initialized")
 }
+
+/// Summary of all slab cache statistics.
+pub struct AllSlabStats {
+    pub task: kernel_core::slab::SlabStats,
+    pub fd: kernel_core::slab::SlabStats,
+    pub endpoint: kernel_core::slab::SlabStats,
+    pub pipe: kernel_core::slab::SlabStats,
+    pub socket: kernel_core::slab::SlabStats,
+}
+
+/// Returns a snapshot of all slab cache statistics.
+pub fn all_slab_stats() -> AllSlabStats {
+    let c = caches();
+    AllSlabStats {
+        task: c.task_cache.lock().stats(),
+        fd: c.fd_cache.lock().stats(),
+        endpoint: c.endpoint_cache.lock().stats(),
+        pipe: c.pipe_cache.lock().stats(),
+        socket: c.socket_cache.lock().stats(),
+    }
+}

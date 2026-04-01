@@ -236,6 +236,9 @@ pub const SYS_NEWFSTATAT: u64 = 262;
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 
+/// Custom kernel meminfo syscall (Phase 33).
+pub const SYS_MEMINFO: u64 = 0x1001;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -962,6 +965,13 @@ pub fn serial_print(s: &str) {
     unsafe {
         syscall2(SYS_DEBUG_PRINT, s.as_ptr() as u64, s.len() as u64);
     }
+}
+
+/// Query kernel memory statistics.
+///
+/// Writes a text summary into `buf` and returns the number of bytes written.
+pub fn meminfo(buf: &mut [u8]) -> usize {
+    unsafe { syscall2(SYS_MEMINFO, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
 }
 
 /// Write a string slice to a file descriptor.

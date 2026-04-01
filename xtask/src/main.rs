@@ -178,7 +178,7 @@ fn build_userspace_bins() {
     let coreutils_bins: &[&str] = &[
         "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
         "env", "PROMPT", "ls", // Phase 32: build tool utilities
-        "touch", "stat", "wc", "ar", "install",
+        "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)

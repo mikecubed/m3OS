@@ -222,14 +222,25 @@ pub fn try_grow_on_oom() -> bool {
     grow_heap(1024 * 1024).is_ok()
 }
 
-/// Returns the number of successful allocations since boot.
-#[expect(dead_code)]
-pub fn alloc_count() -> u64 {
-    ALLOC_COUNT.load(Ordering::Relaxed)
+/// Kernel heap statistics snapshot.
+pub struct HeapStats {
+    pub total_size: usize,
+    pub used_bytes: usize,
+    pub free_bytes: usize,
+    pub alloc_count: u64,
+    pub dealloc_count: u64,
 }
 
-/// Returns the number of deallocations since boot.
-#[expect(dead_code)]
-pub fn dealloc_count() -> u64 {
-    DEALLOC_COUNT.load(Ordering::Relaxed)
+/// Returns a snapshot of kernel heap statistics.
+pub fn heap_stats() -> HeapStats {
+    let total_size = HEAP_MAPPED.load(Ordering::Relaxed);
+    let free_bytes = ALLOCATOR.inner.lock().free();
+    let used_bytes = total_size.saturating_sub(free_bytes);
+    HeapStats {
+        total_size,
+        used_bytes,
+        free_bytes,
+        alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
+        dealloc_count: DEALLOC_COUNT.load(Ordering::Relaxed),
+    }
 }

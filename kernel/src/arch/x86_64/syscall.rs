@@ -503,6 +503,8 @@ pub extern "C" fn syscall_handler(
         }
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
+        // Custom kernel meminfo (Phase 33 Track F)
+        0x1001 => sys_meminfo(arg0, arg1),
         _ => {
             // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -5065,6 +5067,114 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
 
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 33 Track F: meminfo syscall (0x1001)
+//
+// Writes a text summary of kernel memory statistics into a user buffer.
+// arg0 = user buffer address, arg1 = buffer length.
+// Returns number of bytes written, or 0 on error.
+// ---------------------------------------------------------------------------
+
+fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
+    use core::fmt::Write;
+
+    if buf_addr == 0 || buf_len == 0 {
+        return 0;
+    }
+
+    // Gather stats
+    let heap = crate::mm::heap::heap_stats();
+    let frames = crate::mm::frame_allocator::frame_stats();
+    let slabs = crate::mm::slab::all_slab_stats();
+
+    // Format into a stack buffer
+    let mut tmp = [0u8; 2048];
+    let mut writer = BufWriter::new(&mut tmp);
+
+    let _ = writeln!(writer, "=== Kernel Memory Info ===");
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Heap:");
+    let _ = writeln!(
+        writer,
+        "  total: {} KiB  used: {} KiB  free: {} KiB",
+        heap.total_size / 1024,
+        heap.used_bytes / 1024,
+        heap.free_bytes / 1024
+    );
+    let _ = writeln!(
+        writer,
+        "  allocs: {}  deallocs: {}",
+        heap.alloc_count, heap.dealloc_count
+    );
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Frames (4 KiB pages):");
+    let _ = writeln!(
+        writer,
+        "  total: {}  free: {}  allocated: {}",
+        frames.total_frames, frames.free_frames, frames.allocated_frames
+    );
+    let _ = writeln!(
+        writer,
+        "  memory: {} MiB total, {} MiB free",
+        frames.total_frames * 4 / 1024,
+        frames.free_frames * 4 / 1024
+    );
+    let _ = write!(writer, "  buddy orders:");
+    for (order, &count) in frames.free_by_order.iter().enumerate() {
+        if count > 0 {
+            let _ = write!(writer, " o{}={}", order, count);
+        }
+    }
+    let _ = writeln!(writer);
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Slab Caches:");
+    fn fmt_slab(w: &mut BufWriter<'_>, name: &str, s: &kernel_core::slab::SlabStats) {
+        let _ = writeln!(
+            w,
+            "  {}: slabs={} active={} free={}",
+            name, s.total_slabs, s.active_objects, s.free_slots
+        );
+    }
+    fmt_slab(&mut writer, "task(512B) ", &slabs.task);
+    fmt_slab(&mut writer, "fd(64B)   ", &slabs.fd);
+    fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
+    fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
+    fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
+
+    let written = writer.pos;
+
+    // Copy to user buffer
+    let copy_len = written.min(buf_len as usize);
+    if crate::mm::user_mem::copy_to_user(buf_addr, &tmp[..copy_len]).is_err() {
+        return 0;
+    }
+
+    copy_len as u64
+}
+
+/// Tiny stack buffer writer for formatting meminfo output.
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl core::fmt::Write for BufWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let len = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
+        self.pos += len;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

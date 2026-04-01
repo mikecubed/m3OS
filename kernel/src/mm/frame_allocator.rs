@@ -347,6 +347,31 @@ pub fn total_frames() -> usize {
     FRAME_ALLOCATOR.0.lock().total_frames
 }
 
+/// Frame allocator statistics snapshot.
+pub struct FrameStats {
+    pub total_frames: usize,
+    pub free_frames: usize,
+    pub allocated_frames: usize,
+    pub free_by_order: [usize; kernel_core::buddy::MAX_ORDER + 1],
+}
+
+/// Returns a snapshot of frame allocator statistics.
+pub fn frame_stats() -> FrameStats {
+    let alloc = FRAME_ALLOCATOR.0.lock();
+    let total = alloc.total_frames;
+    let (free, by_order) = if let Some(ref buddy) = alloc.buddy {
+        (buddy.free_count(), buddy.free_count_by_order())
+    } else {
+        (alloc.free_count, [0; kernel_core::buddy::MAX_ORDER + 1])
+    };
+    FrameStats {
+        total_frames: total,
+        free_frames: free,
+        allocated_frames: total.saturating_sub(free),
+        free_by_order: by_order,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-frame reference counting (P17-T009 through P17-T015)
 // ---------------------------------------------------------------------------
