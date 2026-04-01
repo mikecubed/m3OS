@@ -158,30 +158,23 @@ unsafe impl GlobalAlloc for BrkAllocator {
                 cur = (*cur).next;
             }
 
-            // Can we merge with the previous free block?
-            let merge_prev = if !prev_block.is_null() {
-                let prev_end = prev_block as usize + header_size + (*prev_block).size;
-                prev_end == block_start
-            } else {
-                false
-            };
-
-            // Can we merge with the next free block?
-            let merge_next = if !cur.is_null() {
-                block_end == cur as usize
-            } else {
-                false
-            };
-
-            if merge_prev && merge_next {
-                // Absorb both this block and the next block into prev.
+            // Merge with adjacent free blocks when contiguous in memory.
+            // Check previous block directly (null guard before each deref).
+            if !prev_block.is_null()
+                && !cur.is_null()
+                && (prev_block as usize + header_size + (*prev_block).size) == block_start
+                && block_end == cur as usize
+            {
+                // Three-way merge: prev + this + next.
                 (*prev_block).size += header_size + (*header).size + header_size + (*cur).size;
                 (*prev_block).next = (*cur).next;
-            } else if merge_prev {
-                // Absorb this block into prev.
+            } else if !prev_block.is_null()
+                && (prev_block as usize + header_size + (*prev_block).size) == block_start
+            {
+                // Merge this block into prev.
                 (*prev_block).size += header_size + (*header).size;
-            } else if merge_next {
-                // Absorb the next block into this block.
+            } else if !cur.is_null() && block_end == cur as usize {
+                // Merge next block into this block.
                 (*header).size += header_size + (*cur).size;
                 (*header).next = (*cur).next;
                 *prev_ptr = header;
