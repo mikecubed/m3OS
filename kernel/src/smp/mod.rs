@@ -21,7 +21,7 @@ pub mod tlb;
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, collections::VecDeque};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use x86_64::{
@@ -93,6 +93,10 @@ pub struct PerCoreData {
     pub lapic_virt_base: u64,
     /// LAPIC timer ticks per millisecond (BSP-calibrated, shared by all cores).
     pub lapic_ticks_per_ms: u32,
+
+    // ----- Phase 35: per-core run queue -----
+    /// Per-core run queue of task indices into the global `SCHEDULER.tasks` vec.
+    pub run_queue: spin::Mutex<VecDeque<usize>>,
 
     // ----- Phase 35: per-core syscall state (accessed via gs-relative asm) -----
     /// Top of this core's kernel syscall stack for SYSCALL entry.
@@ -376,6 +380,7 @@ pub fn init_bsp_per_core() {
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
         lapic_virt_base,
         lapic_ticks_per_ms: lapic_tpm,
+        run_queue: spin::Mutex::new(VecDeque::new()),
         // Phase 35: per-core syscall state
         syscall_stack_top: bsp_stack_top,
         syscall_user_rsp: 0,
@@ -482,6 +487,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
             crate::mm::phys_offset() + phys
         },
         lapic_ticks_per_ms: crate::arch::x86_64::apic::lapic_ticks_per_ms(),
+        run_queue: spin::Mutex::new(VecDeque::new()),
         // Phase 35: per-core syscall state
         syscall_stack_top: kernel_stack_top,
         syscall_user_rsp: 0,

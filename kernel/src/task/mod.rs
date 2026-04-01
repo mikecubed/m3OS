@@ -116,6 +116,8 @@ pub struct Task {
     /// Endpoint this task is the "server" of (used by `reply_recv` to find
     /// the endpoint to block on after replying).
     pub server_endpoint: Option<crate::ipc::EndpointId>,
+    /// Core this task is assigned to for per-CPU run queue dispatch (Phase 35).
+    pub assigned_core: u8,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     _stack: Box<[u8]>,
 }
@@ -138,6 +140,7 @@ impl Task {
             caps: CapabilityTable::new(),
             pending_msg: None,
             server_endpoint: None,
+            assigned_core: 0,
             _stack: stack,
         }
     }

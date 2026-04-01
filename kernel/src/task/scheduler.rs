@@ -146,29 +146,39 @@ impl Scheduler {
 
     /// Pick the next task to run on the given core.
     ///
-    /// All cores participate in round-robin dispatch of non-idle `Ready` tasks.
-    /// Falls back to this core's idle task if no non-idle task is ready.
-    /// Task state is set to `Running` atomically under the scheduler lock,
-    /// preventing a task from being dispatched on two cores simultaneously.
+    /// First checks the per-core run queue for an O(1) dequeue. Falls back
+    /// to a global round-robin scan if the local queue is empty (handles
+    /// tasks that haven't been assigned to a queue yet). Finally, falls back
+    /// to this core's idle task.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
-        let n = self.tasks.len();
-        if n == 0 {
-            return None;
+        // Try per-core run queue first (O(1) dequeue).
+        if let Some(data) = crate::smp::get_core_data(core_id) {
+            let mut q = data.run_queue.lock();
+            while let Some(idx) = q.pop_front() {
+                if idx < self.tasks.len()
+                    && self.tasks[idx].state == TaskState::Ready
+                    && !self.idle_tasks.contains(&Some(idx))
+                {
+                    self.last_run = idx;
+                    return Some((self.tasks[idx].saved_rsp, idx));
+                }
+                // Stale entry (dead or already running) — discard.
+            }
         }
 
-        // Round-robin: scan from last_run+1 for a non-idle Ready task.
-        let start = (self.last_run + 1) % n;
-        for i in 0..n {
-            let idx = (start + i) % n;
-            if self.idle_tasks.contains(&Some(idx)) {
-                continue;
-            }
-            if self.tasks[idx].state == TaskState::Dead {
-                continue;
-            }
-            if self.tasks[idx].state == TaskState::Ready {
-                self.last_run = idx;
-                return Some((self.tasks[idx].saved_rsp, idx));
+        // Fallback: global round-robin scan for unqueued Ready tasks.
+        let n = self.tasks.len();
+        if n > 0 {
+            let start = (self.last_run + 1) % n;
+            for i in 0..n {
+                let idx = (start + i) % n;
+                if self.idle_tasks.contains(&Some(idx)) {
+                    continue;
+                }
+                if self.tasks[idx].state == TaskState::Ready {
+                    self.last_run = idx;
+                    return Some((self.tasks[idx].saved_rsp, idx));
+                }
             }
         }
 
@@ -213,12 +223,45 @@ fn signal_reschedule_all() {
     }
 }
 
-/// Spawn a new kernel task. The task is placed in the `Ready` state and
-/// will be picked up by any core's scheduler on the next tick.
+/// Find the core with the shortest run queue for task assignment.
+fn least_loaded_core() -> u8 {
+    let n = crate::smp::core_count();
+    if n <= 1 {
+        return 0;
+    }
+    let mut best_core = 0u8;
+    let mut best_len = usize::MAX;
+    for id in 0..n {
+        if let Some(data) = crate::smp::get_core_data(id) {
+            let len = data.run_queue.lock().len();
+            if len < best_len {
+                best_len = len;
+                best_core = id;
+            }
+        }
+    }
+    best_core
+}
+
+/// Enqueue a task index into a specific core's run queue and signal it.
+fn enqueue_to_core(core_id: u8, idx: usize) {
+    if let Some(data) = crate::smp::get_core_data(core_id) {
+        data.run_queue.lock().push_back(idx);
+        data.reschedule.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spawn a new kernel task. The task is assigned to the least-loaded core
+/// and enqueued to that core's run queue.
 pub fn spawn(entry: fn() -> !, name: &'static str) {
-    let task = Task::new(entry, name);
-    SCHEDULER.lock().tasks.push(task);
-    signal_reschedule_all();
+    let mut task = Task::new(entry, name);
+    let target = least_loaded_core();
+    task.assigned_core = target;
+    let mut sched = SCHEDULER.lock();
+    let idx = sched.tasks.len();
+    sched.tasks.push(task);
+    drop(sched);
+    enqueue_to_core(target, idx);
 }
 
 /// Register an idle task for a specific core.
@@ -227,7 +270,8 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
 /// is ready on that core.
 pub fn spawn_idle_for_core(entry: fn() -> !, core_id: u8) {
     assert!((core_id as usize) < crate::smp::MAX_CORES);
-    let task = Task::new(entry, "idle");
+    let mut task = Task::new(entry, "idle");
+    task.assigned_core = core_id;
     let mut sched = SCHEDULER.lock();
     let idx = sched.tasks.len();
     sched.tasks.push(task);
@@ -241,17 +285,23 @@ pub fn spawn_idle(entry: fn() -> !) {
 
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
-    let task_rsp_ptr: *mut u64 = {
+    let (task_rsp_ptr, core_id, idx) = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
         };
         sched.tasks[idx].state = TaskState::Ready;
+        let core = sched.tasks[idx].assigned_core;
         set_current_task_idx(None);
-        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+        (
+            core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp),
+            core,
+            idx,
+        )
     };
-    per_core_reschedule().store(true, Ordering::Relaxed);
+    // Re-enqueue to the local core's run queue.
+    enqueue_to_core(core_id, idx);
     let sched_rsp = per_core_scheduler_rsp();
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
@@ -324,21 +374,26 @@ pub fn mark_current_dead() -> ! {
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
 pub fn wake_task(id: TaskId) {
-    let mut sched = SCHEDULER.lock();
-    if let Some(idx) = sched.find(id) {
-        match sched.tasks[idx].state {
-            TaskState::BlockedOnRecv
-            | TaskState::BlockedOnSend
-            | TaskState::BlockedOnReply
-            | TaskState::BlockedOnNotif => {
-                sched.tasks[idx].state = TaskState::Ready;
+    let enqueue = {
+        let mut sched = SCHEDULER.lock();
+        if let Some(idx) = sched.find(id) {
+            match sched.tasks[idx].state {
+                TaskState::BlockedOnRecv
+                | TaskState::BlockedOnSend
+                | TaskState::BlockedOnReply
+                | TaskState::BlockedOnNotif => {
+                    sched.tasks[idx].state = TaskState::Ready;
+                    Some((sched.tasks[idx].assigned_core, idx))
+                }
+                _ => None,
             }
-            _ => {}
+        } else {
+            None
         }
+    };
+    if let Some((core, idx)) = enqueue {
+        enqueue_to_core(core, idx);
     }
-    // Signal reschedule on all online cores so any idle core can pick up
-    // the newly-ready task (Phase 35: multi-core dispatch).
-    signal_reschedule_all();
 }
 
 /// Store a [`Message`] in a task's pending slot.
