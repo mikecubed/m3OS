@@ -28,7 +28,10 @@ unsafe fn cmos_read(register: u8) -> u8 {
     let mut data_port = Port::<u8>::new(0x71);
     unsafe {
         addr_port.write(register | 0x80); // bit 7 = disable NMI during read
-        data_port.read()
+        let value = data_port.read();
+        // Re-enable NMI by writing the register index with bit 7 clear.
+        addr_port.write(register & 0x7F);
+        value
     }
 }
 

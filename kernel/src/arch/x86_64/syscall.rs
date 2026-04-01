@@ -7050,7 +7050,7 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// gettimeofday(tv, tz) — syscall 96
+// gettimeofday(tv) — syscall 96
 // ---------------------------------------------------------------------------
 
 /// LAPIC ticks per second (~100 Hz timer = 10ms per tick).
@@ -7059,7 +7059,7 @@ const TICKS_PER_SEC: u64 = 100;
 /// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
 fn sys_gettimeofday(tv_ptr: u64) -> u64 {
     if tv_ptr == 0 {
-        return 0;
+        return NEG_EFAULT;
     }
     let boot_epoch = crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
     let ticks = crate::arch::x86_64::interrupts::tick_count();
