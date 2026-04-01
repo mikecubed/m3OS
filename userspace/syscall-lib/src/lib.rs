@@ -1109,7 +1109,7 @@ pub fn utimensat(path: &[u8], atime_sec: i64, mtime_sec: i64) -> isize {
     unsafe {
         syscall4(
             SYS_UTIMENSAT,
-            u64::MAX, // AT_FDCWD
+            (-100_i64) as u64, // AT_FDCWD
             path.as_ptr() as u64,
             times.as_ptr() as u64,
             0,
@@ -1122,7 +1122,7 @@ pub fn utimensat_now(path: &[u8]) -> isize {
     unsafe {
         syscall4(
             SYS_UTIMENSAT,
-            u64::MAX, // AT_FDCWD
+            (-100_i64) as u64, // AT_FDCWD
             path.as_ptr() as u64,
             0, // NULL times = set to now
             0,

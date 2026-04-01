@@ -18,7 +18,7 @@ static void write_num(int fd, long long n) {
     write_str(fd, &buf[i]);
 }
 
-static void wc_fd(int fd, long long *tl, long long *tw, long long *tc) {
+static int wc_fd(int fd, long long *tl, long long *tw, long long *tc) {
     char buf[4096];
     long long lines = 0, words = 0, bytes = 0;
     int in_word = 0;
@@ -35,7 +35,9 @@ static void wc_fd(int fd, long long *tl, long long *tw, long long *tc) {
             }
         }
     }
+    if (n < 0) write_str(2, "wc: read error\n");
     *tl += lines; *tw += words; *tc += bytes;
+    return n < 0 ? -1 : 0;
 }
 
 int main(int argc, char **argv) {

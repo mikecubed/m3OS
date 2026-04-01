@@ -106,7 +106,14 @@ static int do_create(const char *archive, int file_argc, char **file_argv) {
         char buf[4096];
         ssize_t n;
         while ((n = read(src, buf, sizeof(buf))) > 0) {
-            write(fd, buf, n);
+            if (write(fd, buf, n) != n) {
+                write_str(2, "ar: write error\n");
+                close(src); close(fd); return 1;
+            }
+        }
+        if (n < 0) {
+            write_str(2, "ar: read error\n");
+            close(src); close(fd); return 1;
         }
         close(src);
 

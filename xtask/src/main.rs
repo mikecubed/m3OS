@@ -408,6 +408,7 @@ fn build_pdpmake() {
         }
     }
 
+    c_files.sort(); // deterministic build order across hosts/filesystems
     if c_files.is_empty() {
         eprintln!("warning: no .c files found in pdpmake source — creating empty placeholder");
         if !make_elf.exists() {
@@ -1845,7 +1846,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 7. ar — create a static library (using util.o from make build)
+    // 6. ar — create a static library (using util.o from make build)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
@@ -1876,7 +1877,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 9. make clean
+    // 7. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

@@ -38,6 +38,10 @@ static int copy_file(const char *src, const char *dst) {
     }
     close(in);
     close(out);
+    if (n < 0) {
+        write_str(2, "install: read error\n");
+        return 1;
+    }
     return 0;
 }
 
