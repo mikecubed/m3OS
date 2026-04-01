@@ -116,7 +116,7 @@ A minimal cron daemon:
 
 ## Companion Task List
 
-- [Phase 45 Task List](./tasks/45-system-services-tasks.md)
+- Phase 45 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

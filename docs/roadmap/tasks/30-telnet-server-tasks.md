@@ -166,7 +166,7 @@ Wire telnetd into the boot process and configure QEMU networking for host access
 
 These items are explicitly out of scope for Phase 30:
 
-- **Encryption** — that's SSH, Phase 35
+- **Encryption** — that's SSH, Phase 42
 - **inetd/xinetd super-server** — single-purpose daemon is simpler
 - **TCP wrappers or IP-based access control** — no firewall needed for QEMU
 - **Telnet LINEMODE option** — character-at-a-time with server echo is sufficient

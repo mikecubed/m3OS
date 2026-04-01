@@ -70,11 +70,59 @@ flowchart TD
     P4 --> P25
     P20 --> P26["Phase 26 Tasks"]
     P24 --> P26
-    P25 --> P33["Phase 33 Tasks"]
-    P17 --> P33
-    P33 --> P35["Phase 35 Tasks"]
-    P35 --> P36["Phase 36 Tasks"]
+
+    %% Productivity phases
+    P22 --> P26
+    P12 --> P27["Phase 27 Tasks"]
+    P24 --> P27
+    P27 --> P28["Phase 28 Tasks"]
+    P24 --> P28
+    P22 --> P29["Phase 29 Tasks"]
+    P27 --> P29
+    P23 --> P30["Phase 30 Tasks"]
+    P27 --> P30
+    P29 --> P30
+    P26 --> P31["Phase 31 Tasks"]
+    P14 --> P31
+    P31 --> P32["Phase 32 Tasks"]
+    P26 --> P32
+
+    %% Kernel infrastructure phases
+    P17 --> P33["Phase 33 Tasks"]
+    P25 --> P33
+    P15 --> P34["Phase 34 Tasks"]
+    P25 --> P35["Phase 35 Tasks"]
+    P33 --> P35
+    P23 --> P36["Phase 36 Tasks"]
+    P22 --> P36
+    P35 --> P36
+    P28 --> P37["Phase 37 Tasks"]
+    P27 --> P37
+    P23 --> P38["Phase 38 Tasks"]
+    P37 --> P38
+    P36 --> P38
     P35 --> P39["Phase 39 Tasks"]
+    P33 --> P39
+
+    %% Application phases
+    P14 --> P40["Phase 40 Tasks"]
+    P27 --> P40
+    P37 --> P40
+    P31 --> P41["Phase 41 Tasks"]
+    P41 --> P42["Phase 42 Tasks"]
+    P29 --> P42
+    P27 --> P42
+    P36 --> P42
+    P12 --> P43["Phase 43 Tasks"]
+    P24 --> P43
+    P31 --> P44["Phase 44 Tasks"]
+    P32 --> P44
+    P40 --> P44
+    P27 --> P45["Phase 45 Tasks"]
+    P30 --> P45
+    P24 --> P45
+    P34 --> P45
+    P38 --> P45
 ```
 
 ## Task Documents

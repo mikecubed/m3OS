@@ -167,7 +167,7 @@ Expose via `times()` syscall and future `/proc/stat`.
 
 ## Companion Task List
 
-- [Phase 35 Task List](./tasks/35-true-smp-multitasking-tasks.md)
+- Phase 35 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

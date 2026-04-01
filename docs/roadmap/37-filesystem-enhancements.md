@@ -22,7 +22,7 @@ assume exist.
 Implement symlinks in tmpfs and ext2:
 
 **Kernel changes:**
-- `symlink(target, linkpath)` syscall (87) — create a symlink.
+- `symlink(target, linkpath)` syscall (88) — create a symlink.
 - `readlink(path, buf, bufsize)` syscall (89) — read symlink target.
 - `readlinkat(dirfd, path, buf, bufsize)` syscall (267).
 - `lstat()` — stat without following symlinks (distinct from `stat()`).
@@ -150,7 +150,7 @@ Implement filesystem statistics syscalls:
 
 ## Companion Task List
 
-- [Phase 37 Task List](./tasks/37-filesystem-enhancements-tasks.md)
+- Phase 37 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

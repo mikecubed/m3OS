@@ -123,7 +123,7 @@ Unix domain sockets must work with `poll()`, `select()`, and `epoll()` from Phas
 
 ## Companion Task List
 
-- [Phase 38 Task List](./tasks/38-unix-domain-sockets-tasks.md)
+- Phase 38 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

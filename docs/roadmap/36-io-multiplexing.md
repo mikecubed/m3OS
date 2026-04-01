@@ -135,7 +135,7 @@ Extend `fcntl()` to support:
 
 ## Companion Task List
 
-- [Phase 36 Task List](./tasks/36-io-multiplexing-tasks.md)
+- Phase 36 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

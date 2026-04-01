@@ -154,7 +154,7 @@ Update signal handling for thread groups:
 
 ## Companion Task List
 
-- [Phase 39 Task List](./tasks/39-threading-primitives-tasks.md)
+- Phase 39 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

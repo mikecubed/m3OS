@@ -117,7 +117,7 @@ Expose via a debug syscall or `/proc/meminfo`-style interface.
 
 ## Companion Task List
 
-- [Phase 33 Task List](./tasks/33-kernel-memory-improvements-tasks.md)
+- Phase 33 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

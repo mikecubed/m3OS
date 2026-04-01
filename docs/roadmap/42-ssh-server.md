@@ -119,7 +119,7 @@ ssh -p 2222 user@localhost
 
 ## Companion Task List
 
-- [Phase 42 Task List](./tasks/42-ssh-server-tasks.md)
+- Phase 42 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 
