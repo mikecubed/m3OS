@@ -1653,7 +1653,7 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// where characters get consumed by ANSI escape sequence processing.
 fn cmd_then_prompt(input: &'static str, label: &'static str, timeout: u64) -> Vec<SmokeStep> {
     vec![
-        SmokeStep::Sleep { millis: 300 },
+        SmokeStep::Sleep { millis: 500 },
         SmokeStep::Send { input, label },
         SmokeStep::Wait {
             pattern: "# ",
@@ -1700,9 +1700,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 2. Basic coreutils sanity
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "echo SMOKE_OK\n",
+        input: "/bin/echo SMOKE_OK\n",
         label: "echo test",
     });
     steps.push(SmokeStep::Wait {
@@ -1719,7 +1719,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 3. TCC compiler (Phase 31 regression)
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/usr/bin/tcc --version\n",
         label: "tcc --version",
@@ -1735,9 +1735,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "prompt after tcc --version",
     });
 
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
+        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n",
         label: "compile hello.c with TCC",
     });
     steps.push(SmokeStep::Wait {
@@ -1745,7 +1745,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "wait for hello.c compilation",
     });
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/tmp/hello\n",
         label: "run compiled hello",
@@ -1767,15 +1767,15 @@ fn smoke_test_script() -> Vec<SmokeStep> {
 
     // touch — create a new file
     steps.extend(cmd_then_prompt(
-        "touch /tmp/smoke_file\n",
+        "/bin/touch /tmp/smoke_file\n",
         "touch: create file",
         10,
     ));
 
     // stat — verify the file exists and shows metadata
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "stat /tmp/smoke_file\n",
+        input: "/bin/stat /tmp/smoke_file\n",
         label: "stat: show file metadata",
     });
     steps.push(SmokeStep::Wait {
@@ -1790,9 +1790,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // wc — count words in a known file
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "wc /home/project/main.c\n",
+        input: "/bin/wc /home/project/main.c\n",
         label: "wc: count lines in main.c",
     });
     steps.push(SmokeStep::Wait {
@@ -1815,10 +1815,10 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         5,
     ));
 
-    // Full build
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    // Full build (use absolute path — bare 'make' loses 'm' to ANSI SGR)
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "make\n",
+        input: "/bin/make\n",
         label: "make: build demo project",
     });
     steps.push(SmokeStep::Wait {
@@ -1827,8 +1827,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for make to finish",
     });
 
-    // Run the built binary (use absolute path to avoid serial garbling of ".")
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    // Run the built binary
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/home/project/demo\n",
         label: "run demo binary",
@@ -1847,9 +1847,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 7. ar — create a static library (using util.o from make build)
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "ar rcs libutil.a util.o\n",
+        input: "/bin/ar rcs libutil.a util.o\n",
         label: "ar: create static library",
     });
     steps.push(SmokeStep::Wait {
@@ -1859,9 +1859,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // Verify archive was created
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "stat libutil.a\n",
+        input: "/bin/stat libutil.a\n",
         label: "stat: verify libutil.a exists",
     });
     steps.push(SmokeStep::Wait {
@@ -1878,9 +1878,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 9. make clean
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "make clean\n",
+        input: "/bin/make clean\n",
         label: "make clean",
     });
     steps.push(SmokeStep::Wait {
