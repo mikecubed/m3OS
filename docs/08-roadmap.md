@@ -108,6 +108,15 @@ flowchart TD
     P24 --> P45
     P34 --> P45
     P38 --> P45
+
+    %% Showcase phases
+    P12 --> P46["46. DOOM"]
+    P24 --> P46
+    P9 --> P46
+    P15 --> P47["47. Mouse Input"]
+    P46 -.->|optional| P47
+    P15 --> P48["48. Audio"]
+    P46 -.->|optional| P48
 ```
 
 ## Detailed Phase Pages
@@ -187,6 +196,14 @@ flowchart TD
 | 43 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/43-rust-cross-compilation.md) |
 | 44 | Source-based ports tree for building third-party software | [Ports System](./roadmap/44-ports-system.md) |
 | 45 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/45-system-services.md) |
+
+### Showcase Phases (planned — "it runs DOOM")
+
+| Phase | Focus | Link |
+|---|---|---|
+| 46 | DOOM runs inside the OS with framebuffer and keyboard | [DOOM](./roadmap/46-doom.md) |
+| 47 | PS/2 mouse driver for graphical programs | [Mouse Input](./roadmap/47-mouse-input.md) |
+| 48 | Sound card driver (HDA/AC97) for audio output | [Audio](./roadmap/48-audio.md) |
 
 ## Documentation Expectation Per Phase
 

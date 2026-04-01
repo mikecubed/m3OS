@@ -207,6 +207,14 @@ flowchart TD
 | 44 | Ports system (source-based package building) | *not yet created* |
 | 45 | System services (init, syslog, cron) | *not yet created* |
 
+### Showcase Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 46 | DOOM (framebuffer, raw input, doomgeneric port) | *not yet created* |
+| 47 | Mouse input (PS/2 mouse driver) | *not yet created* |
+| 48 | Audio output (HDA/AC97 sound card driver) | *not yet created* |
+
 ## Suggested Usage
 
 Start from the milestone page for context, then use the task page to drive execution.
