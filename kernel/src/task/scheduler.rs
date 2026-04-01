@@ -146,32 +146,17 @@ impl Scheduler {
 
     /// Pick the next task to run on the given core.
     ///
-    /// Prefers non-idle `Ready` tasks using round-robin. Falls back to this
-    /// core's idle task if no non-idle task is ready.
-    ///
-    /// **SMP restriction**: Only the BSP (core 0) dispatches non-idle tasks.
-    /// APs only run their idle tasks. This is because the syscall entry stub
-    /// uses global `static mut` variables (SYSCALL_STACK_TOP, SYSCALL_USER_*,
-    /// FORK_ENTRY_CTX) that are not yet per-core. Running userspace tasks on
-    /// APs would corrupt these statics. Making them per-core requires changing
-    /// the assembly syscall entry path to use gs-relative addressing.
+    /// All cores participate in round-robin dispatch of non-idle `Ready` tasks.
+    /// Falls back to this core's idle task if no non-idle task is ready.
+    /// Task state is set to `Running` atomically under the scheduler lock,
+    /// preventing a task from being dispatched on two cores simultaneously.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
-        // APs: only dispatch the idle task (SMP hardening — see doc above).
-        if core_id != 0 {
-            if let Some(idle_idx) = self.idle_tasks[core_id as usize]
-                && self.tasks[idle_idx].state == TaskState::Ready
-            {
-                return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
-            }
-            return None;
-        }
-
-        // BSP: normal round-robin dispatch.
         let n = self.tasks.len();
         if n == 0 {
             return None;
         }
 
+        // Round-robin: scan from last_run+1 for a non-idle Ready task.
         let start = (self.last_run + 1) % n;
         for i in 0..n {
             let idx = (start + i) % n;
@@ -187,8 +172,8 @@ impl Scheduler {
             }
         }
 
-        // BSP idle task.
-        if let Some(idle_idx) = self.idle_tasks[0]
+        // Fall back to this core's idle task.
+        if let Some(idle_idx) = self.idle_tasks[core_id as usize]
             && self.tasks[idle_idx].state == TaskState::Ready
         {
             return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
@@ -214,12 +199,26 @@ pub fn signal_reschedule() {
     }
 }
 
+/// Signal all online cores to reschedule (used when a task becomes Ready
+/// and any idle core could pick it up).
+fn signal_reschedule_all() {
+    if !crate::smp::is_per_core_ready() {
+        return;
+    }
+    let n = crate::smp::core_count();
+    for id in 0..n {
+        if let Some(data) = crate::smp::get_core_data(id) {
+            data.reschedule.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Spawn a new kernel task. The task is placed in the `Ready` state and
-/// will be picked up by the BSP's scheduler on the next tick (APs are
-/// idle-only until per-core syscall statics are implemented).
+/// will be picked up by any core's scheduler on the next tick.
 pub fn spawn(entry: fn() -> !, name: &'static str) {
     let task = Task::new(entry, name);
     SCHEDULER.lock().tasks.push(task);
+    signal_reschedule_all();
 }
 
 /// Register an idle task for a specific core.
@@ -337,8 +336,9 @@ pub fn wake_task(id: TaskId) {
             _ => {}
         }
     }
-    // Signal reschedule on the BSP (only the BSP dispatches non-idle tasks).
-    per_core_reschedule().store(true, Ordering::Relaxed);
+    // Signal reschedule on all online cores so any idle core can pick up
+    // the newly-ready task (Phase 35: multi-core dispatch).
+    signal_reschedule_all();
 }
 
 /// Store a [`Message`] in a task's pending slot.
@@ -429,16 +429,20 @@ pub fn run() -> ! {
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
                 sched.tasks[idx].state = TaskState::Running;
                 set_current_task_idx(Some(idx));
-                Some((rsp, idx))
+                let name = sched.tasks[idx].name;
+                let id = sched.tasks[idx].id;
+                Some((rsp, idx, name, id))
             } else {
                 None
             }
         };
 
-        let (task_rsp, _task_idx) = match next {
+        let (task_rsp, _task_idx, _name, _id) = match next {
             Some(t) => t,
             None => continue,
         };
+
+        log::debug!("[sched] core {} → task {}({})", core_id, _name, _id.0);
 
         // Switch to the task.
         unsafe {
