@@ -151,19 +151,44 @@ impl Scheduler {
     /// tasks that haven't been assigned to a queue yet). Finally, falls back
     /// to this core's idle task.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
-        // Try per-core run queue first (O(1) dequeue).
+        // Drain local run queue, pick the highest-priority (lowest numeric) Ready task.
+        let mut best: Option<usize> = None;
+        let mut requeue = alloc::vec::Vec::new();
+
         if let Some(data) = crate::smp::get_core_data(core_id) {
             let mut q = data.run_queue.lock();
             while let Some(idx) = q.pop_front() {
-                if idx < self.tasks.len()
-                    && self.tasks[idx].state == TaskState::Ready
-                    && !self.idle_tasks.contains(&Some(idx))
+                if idx >= self.tasks.len()
+                    || self.tasks[idx].state != TaskState::Ready
+                    || self.idle_tasks.contains(&Some(idx))
                 {
-                    self.last_run = idx;
-                    return Some((self.tasks[idx].saved_rsp, idx));
+                    // Stale entry — discard.
+                    continue;
                 }
-                // Stale entry (dead or already running) — discard.
+                match best {
+                    Some(b) if self.tasks[idx].priority < self.tasks[b].priority => {
+                        // idx has higher priority — put old best back in queue.
+                        requeue.push(b);
+                        best = Some(idx);
+                    }
+                    Some(_) => {
+                        // idx has equal or lower priority — keep it for later.
+                        requeue.push(idx);
+                    }
+                    None => {
+                        best = Some(idx);
+                    }
+                }
             }
+            // Put non-selected entries back.
+            for i in requeue {
+                q.push_back(i);
+            }
+        }
+
+        if let Some(idx) = best {
+            self.last_run = idx;
+            return Some((self.tasks[idx].saved_rsp, idx));
         }
 
         // Fallback: global round-robin scan for unqueued Ready tasks.
@@ -272,6 +297,7 @@ pub fn spawn_idle_for_core(entry: fn() -> !, core_id: u8) {
     assert!((core_id as usize) < crate::smp::MAX_CORES);
     let mut task = Task::new(entry, "idle");
     task.assigned_core = core_id;
+    task.priority = 30; // Idle priority
     let mut sched = SCHEDULER.lock();
     let idx = sched.tasks.len();
     sched.tasks.push(task);
@@ -504,4 +530,182 @@ pub fn run() -> ! {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Load balancing (Phase 35, Track E)
+// ---------------------------------------------------------------------------
+
+/// Periodic load balancer tick counter. BSP calls `maybe_load_balance()`
+/// from the timer interrupt path every tick; actual migration happens every
+/// 10 ticks (100ms at 100 Hz).
+static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Called from the BSP's timer path. Every 10 ticks, checks queue imbalance
+/// and migrates one task if the longest queue exceeds the shortest by >1.
+pub fn maybe_load_balance() {
+    let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if !cnt.is_multiple_of(10) {
+        return;
+    }
+    let cores = crate::smp::core_count();
+    if cores <= 1 {
+        return;
+    }
+    let mut longest_core = 0u8;
+    let mut longest_len = 0usize;
+    let mut shortest_core = 0u8;
+    let mut shortest_len = usize::MAX;
+    for id in 0..cores {
+        if let Some(data) = crate::smp::get_core_data(id) {
+            let len = data.run_queue.lock().len();
+            if len > longest_len {
+                longest_len = len;
+                longest_core = id;
+            }
+            if len < shortest_len {
+                shortest_len = len;
+                shortest_core = id;
+            }
+        }
+    }
+    if longest_len <= shortest_len + 1 {
+        return; // Balanced enough.
+    }
+    // Migrate one task from longest to shortest.
+    if let Some(src) = crate::smp::get_core_data(longest_core) {
+        let mut q = src.run_queue.lock();
+        // Find a migratable (non-pinned) task.
+        let mut found = None;
+        for i in 0..q.len() {
+            if let Some(&idx) = q.get(i) {
+                let sched = SCHEDULER.lock();
+                if idx < sched.tasks.len()
+                    && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
+                {
+                    found = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(pos) = found
+            && let Some(idx) = q.remove(pos)
+        {
+            drop(q);
+            // Update assigned_core.
+            {
+                let mut sched = SCHEDULER.lock();
+                if idx < sched.tasks.len() {
+                    sched.tasks[idx].assigned_core = shortest_core;
+                }
+            }
+            enqueue_to_core(shortest_core, idx);
+            log::debug!(
+                "[sched] load balance: task {} moved core {} → {}",
+                idx,
+                longest_core,
+                shortest_core
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Priority API (Phase 35, Track D)
+// ---------------------------------------------------------------------------
+
+/// Adjust the priority of the current task by `increment`.
+/// Returns the new priority, or -EPERM if trying to set real-time without root.
+pub fn sys_nice(increment: i32, uid: u32) -> i64 {
+    let mut sched = SCHEDULER.lock();
+    let idx = match get_current_task_idx() {
+        Some(i) => i,
+        None => return -1,
+    };
+    let old = sched.tasks[idx].priority as i32;
+    let mut new_prio = (old + increment).clamp(0, 30) as u8;
+    // Non-root cannot set real-time priorities (0-9).
+    if new_prio < 10 && uid != 0 {
+        new_prio = 10;
+    }
+    sched.tasks[idx].priority = new_prio;
+    new_prio as i64
+}
+
+// ---------------------------------------------------------------------------
+// CPU affinity API (Phase 35, Track F)
+// ---------------------------------------------------------------------------
+
+/// Set the CPU affinity mask for a task identified by PID.
+/// `pid == 0` means current task.
+pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
+    let cores = crate::smp::core_count() as u64;
+    let valid_mask = if cores >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << cores) - 1
+    };
+    let effective = mask & valid_mask;
+    if effective == 0 {
+        return -22; // -EINVAL
+    }
+    let mut sched = SCHEDULER.lock();
+    let idx = if pid == 0 {
+        match get_current_task_idx() {
+            Some(i) => i,
+            None => return -3, // -ESRCH
+        }
+    } else {
+        // Find task by scanning for matching PID in process table.
+        // For kernel tasks, this is a no-op (they don't have PIDs).
+        let mut found = None;
+        for (i, t) in sched.tasks.iter().enumerate() {
+            if t.id.0 as u32 == pid {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return -3, // -ESRCH
+        }
+    };
+    sched.tasks[idx].affinity_mask = effective;
+    // If currently assigned to a disallowed core, reassign.
+    let current_core = sched.tasks[idx].assigned_core;
+    if effective & (1u64 << current_core) == 0 {
+        // Find first allowed core.
+        for c in 0..64u8 {
+            if effective & (1u64 << c) != 0 {
+                sched.tasks[idx].assigned_core = c;
+                break;
+            }
+        }
+    }
+    0
+}
+
+/// Get the CPU affinity mask for a task identified by PID.
+/// `pid == 0` means current task.
+pub fn sys_sched_getaffinity(pid: u32) -> i64 {
+    let sched = SCHEDULER.lock();
+    let idx = if pid == 0 {
+        match get_current_task_idx() {
+            Some(i) => i,
+            None => return -3, // -ESRCH
+        }
+    } else {
+        let mut found = None;
+        for (i, t) in sched.tasks.iter().enumerate() {
+            if t.id.0 as u32 == pid {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => i,
+            None => return -3, // -ESRCH
+        }
+    };
+    sched.tasks[idx].affinity_mask as i64
 }

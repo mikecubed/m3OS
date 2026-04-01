@@ -379,6 +379,15 @@ pub extern "C" fn syscall_handler(
         22 => sys_pipe_with_flags(arg0, false),
         32 => sys_dup(arg0),
         33 => sys_dup2(arg0, arg1),
+        // Phase 35: nice(increment) — adjust task priority
+        34 => {
+            let uid = crate::process::current_pid();
+            let uid_val = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(uid).map(|p| p.uid).unwrap_or(0)
+            };
+            crate::task::sys_nice(arg0 as i32, uid_val) as u64
+        }
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
         // Phase 23: socket syscalls
@@ -483,6 +492,30 @@ pub extern "C" fn syscall_handler(
         200 => sys_kill(arg0, arg1),
         // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
         202 => sys_futex(arg0, arg1, arg2),
+        // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
+        203 => {
+            // sched_setaffinity: read mask from user memory
+            let mask = if arg2 != 0 && arg1 >= 8 {
+                let user_slice = unsafe { core::slice::from_raw_parts(arg2 as *const u8, 8) };
+                u64::from_ne_bytes(user_slice.try_into().unwrap_or([0xFF; 8]))
+            } else {
+                u64::MAX
+            };
+            crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
+        }
+        204 => {
+            // sched_getaffinity: write mask to user memory
+            let mask = crate::task::sys_sched_getaffinity(arg0 as u32);
+            if mask < 0 {
+                mask as u64
+            } else if arg2 != 0 && arg1 >= 8 {
+                let out = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, 8) };
+                out.copy_from_slice(&(mask as u64).to_ne_bytes());
+                8 // return bytes written
+            } else {
+                NEG_EINVAL
+            }
+        }
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks

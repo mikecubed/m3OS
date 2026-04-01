@@ -54,9 +54,10 @@ pub mod scheduler;
 #[allow(unused_imports)]
 pub use scheduler::{
     block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
-    current_task_id, deliver_message, insert_cap, mark_current_dead, remove_task_cap, run,
-    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle,
-    spawn_idle_for_core, take_message, task_cap, wake_task, yield_now,
+    current_task_id, deliver_message, insert_cap, mark_current_dead, maybe_load_balance,
+    remove_task_cap, run, server_endpoint, set_server_endpoint, signal_reschedule, spawn,
+    spawn_idle, spawn_idle_for_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity,
+    take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +119,12 @@ pub struct Task {
     pub server_endpoint: Option<crate::ipc::EndpointId>,
     /// Core this task is assigned to for per-CPU run queue dispatch (Phase 35).
     pub assigned_core: u8,
+    /// Task priority (Phase 35): 0-9 = real-time, 10-29 = normal, 30 = idle.
+    /// Lower numeric value = higher priority.
+    pub priority: u8,
+    /// CPU affinity mask (Phase 35): one bit per core (max 64 cores).
+    /// Default: all bits set (can run on any core).
+    pub affinity_mask: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     _stack: Box<[u8]>,
 }
@@ -141,6 +148,8 @@ impl Task {
             pending_msg: None,
             server_endpoint: None,
             assigned_core: 0,
+            priority: 20,            // Normal priority (middle of 10-29 range)
+            affinity_mask: u64::MAX, // Can run on any core
             _stack: stack,
         }
     }

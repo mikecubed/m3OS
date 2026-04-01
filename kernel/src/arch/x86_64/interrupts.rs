@@ -514,6 +514,10 @@ pub fn tick_count() -> u64 {
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::task::signal_reschedule();
+    // BSP runs the periodic load balancer (Phase 35).
+    if crate::smp::is_per_core_ready() && crate::smp::per_core().core_id == 0 {
+        crate::task::maybe_load_balance();
+    }
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     } else {
