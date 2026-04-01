@@ -94,6 +94,7 @@ static WC_ELF: &[u8] = include_bytes!("../../initrd/wc.elf");
 static AR_ELF: &[u8] = include_bytes!("../../initrd/ar.elf");
 static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
 static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
+static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test.elf");
 static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
 
 // ---------------------------------------------------------------------------
@@ -262,6 +263,19 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
+    // Phase 33: mmap/munmap leak test
+    (
+        "mmap-leak-test",
+        RamdiskNode::File {
+            content: MMAP_LEAK_TEST_ELF,
+        },
+    ),
+    (
+        "mmap-leak-test.elf",
+        RamdiskNode::File {
+            content: MMAP_LEAK_TEST_ELF,
+        },
+    ),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
