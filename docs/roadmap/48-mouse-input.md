@@ -1,4 +1,4 @@
-# Phase 47 - Mouse Input
+# Phase 48 - Mouse Input
 
 ## Milestone Goal
 
@@ -85,13 +85,13 @@ mouse packets are available.
 - Moving the mouse in QEMU generates events readable by userspace.
 - Button clicks (left, right, middle) are detected.
 - A test program prints continuous dx/dy values as the mouse moves.
-- DOOM can use mouse input for aiming (if Phase 46 is complete).
+- DOOM can use mouse input for aiming (if Phase 47 is complete).
 - Mouse input does not interfere with keyboard input.
 - All existing tests pass without regression.
 
 ## Companion Task List
 
-- Phase 47 Task List — *not yet created*
+- Phase 48 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

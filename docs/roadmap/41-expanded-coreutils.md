@@ -1,4 +1,4 @@
-# Phase 40 - Expanded Coreutils
+# Phase 41 - Expanded Coreutils
 
 ## Milestone Goal
 
@@ -118,7 +118,7 @@ syscalls as needed.
 
 ## Companion Task List
 
-- Phase 40 Task List — *not yet created*
+- Phase 41 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

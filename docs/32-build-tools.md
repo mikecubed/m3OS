@@ -137,7 +137,7 @@ cycle without `make`.
 | Binary tools | None | nm, objdump, readelf |
 | Libraries | Static only | Dynamic + static |
 
-Phase 44 (Ports System) will add package management capabilities.
+Phase 45 (Ports System) will add package management capabilities.
 
 ## Files Changed
 

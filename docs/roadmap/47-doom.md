@@ -1,4 +1,4 @@
-# Phase 46 - DOOM
+# Phase 47 - DOOM
 
 ## Milestone Goal
 
@@ -138,7 +138,7 @@ Nearest-neighbor is simplest and preserves the pixel art aesthetic.
 
 ## Companion Task List
 
-- Phase 46 Task List — *not yet created*
+- Phase 47 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

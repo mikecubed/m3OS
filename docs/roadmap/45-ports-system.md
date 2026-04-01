@@ -1,4 +1,4 @@
-# Phase 44 - Ports and Package System
+# Phase 45 - Ports and Package System
 
 ## Milestone Goal
 
@@ -77,7 +77,7 @@ once an HTTP client is ported.
 |---|---|
 | Phase 31 (Compiler) | TCC to compile port sources |
 | Phase 32 (Build Tools) | make for building ports |
-| Phase 40 (Coreutils) | patch, find, xargs for port infrastructure |
+| Phase 41 (Coreutils) | patch, find, xargs for port infrastructure |
 | Phase 24 (Persistent Storage) | Install to persistent storage |
 
 ## Implementation Outline
@@ -104,7 +104,7 @@ once an HTTP client is ported.
 
 ## Companion Task List
 
-- Phase 44 Task List — *not yet created*
+- Phase 45 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

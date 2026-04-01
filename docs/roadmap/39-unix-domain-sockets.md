@@ -1,4 +1,4 @@
-# Phase 38 - Unix Domain Sockets
+# Phase 39 - Unix Domain Sockets
 
 ## Milestone Goal
 
@@ -83,7 +83,7 @@ struct UnixSocket {
 
 ### Integration with I/O Multiplexing
 
-Unix domain sockets must work with `poll()`, `select()`, and `epoll()` from Phase 36:
+Unix domain sockets must work with `poll()`, `select()`, and `epoll()` from Phase 37:
 - `POLLIN` when data available or connection pending.
 - `POLLOUT` when send buffer has space.
 - `POLLHUP` when peer disconnected.
@@ -93,8 +93,8 @@ Unix domain sockets must work with `poll()`, `select()`, and `epoll()` from Phas
 | Phase | Why needed |
 |---|---|
 | Phase 23 (Socket API) | Socket syscall infrastructure |
-| Phase 37 (Filesystem) | Socket files in the filesystem namespace |
-| Phase 36 (I/O Multiplexing) | poll/epoll integration |
+| Phase 38 (Filesystem) | Socket files in the filesystem namespace |
+| Phase 37 (I/O Multiplexing) | poll/epoll integration |
 
 ## Implementation Outline
 
@@ -123,7 +123,7 @@ Unix domain sockets must work with `poll()`, `select()`, and `epoll()` from Phas
 
 ## Companion Task List
 
-- Phase 38 Task List — *not yet created*
+- Phase 39 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

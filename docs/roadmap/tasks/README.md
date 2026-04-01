@@ -93,36 +93,44 @@ flowchart TD
     P15 --> P34["Phase 34 Tasks"]
     P25 --> P35["Phase 35 Tasks"]
     P33 --> P35
-    P23 --> P36["Phase 36 Tasks"]
-    P22 --> P36
-    P35 --> P36
-    P28 --> P37["Phase 37 Tasks"]
-    P27 --> P37
-    P23 --> P38["Phase 38 Tasks"]
-    P37 --> P38
-    P36 --> P38
-    P35 --> P39["Phase 39 Tasks"]
-    P33 --> P39
+    P33 --> P36["Phase 36 Tasks"]
+    P23 --> P37["Phase 37 Tasks"]
+    P22 --> P37
+    P35 --> P37
+    P28 --> P38["Phase 38 Tasks"]
+    P27 --> P38
+    P23 --> P39["Phase 39 Tasks"]
+    P38 --> P39
+    P37 --> P39
+    P35 --> P40["Phase 40 Tasks"]
+    P33 --> P40
 
     %% Application phases
-    P14 --> P40["Phase 40 Tasks"]
-    P27 --> P40
-    P37 --> P40
-    P31 --> P41["Phase 41 Tasks"]
-    P41 --> P42["Phase 42 Tasks"]
-    P29 --> P42
-    P27 --> P42
-    P36 --> P42
-    P12 --> P43["Phase 43 Tasks"]
-    P24 --> P43
-    P31 --> P44["Phase 44 Tasks"]
-    P32 --> P44
-    P40 --> P44
-    P27 --> P45["Phase 45 Tasks"]
-    P30 --> P45
-    P24 --> P45
-    P34 --> P45
-    P38 --> P45
+    P14 --> P41["Phase 41 Tasks"]
+    P27 --> P41
+    P38 --> P41
+    P31 --> P42["Phase 42 Tasks"]
+    P42 --> P43["Phase 43 Tasks"]
+    P29 --> P43
+    P27 --> P43
+    P37 --> P43
+    P12 --> P44["Phase 44 Tasks"]
+    P24 --> P44
+    P31 --> P45["Phase 45 Tasks"]
+    P32 --> P45
+    P41 --> P45
+    P27 --> P46["Phase 46 Tasks"]
+    P30 --> P46
+    P24 --> P46
+    P34 --> P46
+    P39 --> P46
+
+    %% Cross-compiled runtimes
+    P36 --> P50["Phase 50 Tasks"]
+    P50 --> P51["Phase 51 Tasks"]
+    P42 --> P51
+    P51 --> P52["Phase 52 Tasks"]
+    P52 --> P53["Phase 53 Tasks"]
 ```
 
 ## Task Documents
@@ -188,32 +196,42 @@ flowchart TD
 
 | Phase | Focus | Task List |
 |---|---|---|
-| 33 | Kernel memory improvements (slab, OOM retry, munmap) | *not yet created* |
+| 33 | Kernel memory improvements (slab, OOM retry, munmap) | [Phase 33 Tasks](./33-kernel-memory-tasks.md) |
 | 34 | Real-time clock and timekeeping | *not yet created* |
 | 35 | True SMP multitasking (per-core dispatch, priorities) | *not yet created* |
-| 36 | I/O multiplexing (select, epoll, non-blocking) | *not yet created* |
-| 37 | Filesystem enhancements (symlinks, /proc, permissions) | *not yet created* |
-| 38 | Unix domain sockets (AF_UNIX) | *not yet created* |
-| 39 | Threading primitives (clone, futex, TLS) | *not yet created* |
+| 36 | Expanded memory (demand paging, mprotect, disk/RAM) | *not yet created* |
+| 37 | I/O multiplexing (select, epoll, non-blocking) | *not yet created* |
+| 38 | Filesystem enhancements (symlinks, /proc, permissions) | *not yet created* |
+| 39 | Unix domain sockets (AF_UNIX) | *not yet created* |
+| 40 | Threading primitives (clone, futex, TLS) | *not yet created* |
 
 ### Application Phases
 
 | Phase | Focus | Task List |
 |---|---|---|
-| 40 | Expanded coreutils (head, tail, sort, find, diff, ps) | *not yet created* |
-| 41 | Crypto primitives (SHA-256, Ed25519, ChaCha20) | *not yet created* |
-| 42 | SSH server (encrypted remote access) | *not yet created* |
-| 43 | Rust cross-compilation | *not yet created* |
-| 44 | Ports system (source-based package building) | *not yet created* |
-| 45 | System services (init, syslog, cron) | *not yet created* |
+| 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | *not yet created* |
+| 42 | Crypto and TLS (RustCrypto + rustls) | *not yet created* |
+| 43 | SSH (sunset or Dropbear) | *not yet created* |
+| 44 | Rust cross-compilation | *not yet created* |
+| 45 | Ports system (source-based package building) | *not yet created* |
+| 46 | System services (init, syslog, cron) | *not yet created* |
 
 ### Showcase Phases
 
 | Phase | Focus | Task List |
 |---|---|---|
-| 46 | DOOM (framebuffer, raw input, doomgeneric port) | *not yet created* |
-| 47 | Mouse input (PS/2 mouse driver) | *not yet created* |
-| 48 | Audio output (HDA/AC97 sound card driver) | *not yet created* |
+| 47 | DOOM (framebuffer, raw input, doomgeneric port) | *not yet created* |
+| 48 | Mouse input (PS/2 mouse driver) | *not yet created* |
+| 49 | Audio output (HDA/AC97 sound card driver) | *not yet created* |
+
+### Cross-Compiled Runtimes
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 50 | Cross-compiled toolchains (git, Python, Clang) | *not yet created* |
+| 51 | Networking and GitHub (gh, git HTTPS, DNS) | *not yet created* |
+| 52 | Node.js (V8 + libuv runtime) | *not yet created* |
+| 53 | Claude Code (AI agent on m3OS) | *not yet created* |
 
 ## Suggested Usage
 
