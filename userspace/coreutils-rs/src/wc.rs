@@ -8,7 +8,8 @@ use syscall_lib::{
 
 syscall_lib::entry_point!(main);
 
-fn wc_fd(fd: i32) -> (u64, u64, u64) {
+/// Returns `Ok((lines, words, bytes))` or `Err(())` on read error.
+fn wc_fd(fd: i32) -> Result<(u64, u64, u64), ()> {
     let mut buf = [0u8; 4096];
     let mut lines: u64 = 0;
     let mut words: u64 = 0;
@@ -17,7 +18,8 @@ fn wc_fd(fd: i32) -> (u64, u64, u64) {
     loop {
         let n = read(fd, &mut buf);
         if n < 0 {
-            return (lines, words, bytes);
+            write_str(STDERR_FILENO, "wc: read error\n");
+            return Err(());
         }
         if n == 0 {
             break;
@@ -36,7 +38,7 @@ fn wc_fd(fd: i32) -> (u64, u64, u64) {
             }
         }
     }
-    (lines, words, bytes)
+    Ok((lines, words, bytes))
 }
 
 fn main(args: &[&str]) -> i32 {
@@ -72,9 +74,15 @@ fn main(args: &[&str]) -> i32 {
     let mut total_l: u64 = 0;
     let mut total_w: u64 = 0;
     let mut total_c: u64 = 0;
+    let mut had_error = false;
 
     if files.is_empty() {
-        let (l, w, c) = wc_fd(0);
+        let (l, w, c) = match wc_fd(0) {
+            Ok(v) => v,
+            Err(()) => {
+                return 1;
+            }
+        };
         if show_lines {
             write_u64(STDOUT_FILENO, l);
             write_str(STDOUT_FILENO, " ");
@@ -94,6 +102,7 @@ fn main(args: &[&str]) -> i32 {
         let bytes = file.as_bytes();
         if bytes.len() > 254 {
             write_str(STDERR_FILENO, "wc: path too long\n");
+            had_error = true;
             continue;
         }
         let mut path = [0u8; 256];
@@ -105,9 +114,17 @@ fn main(args: &[&str]) -> i32 {
             write_str(STDERR_FILENO, "wc: cannot open: ");
             write_str(STDERR_FILENO, file);
             write_str(STDERR_FILENO, "\n");
+            had_error = true;
             continue;
         }
-        let (l, w, c) = wc_fd(fd as i32);
+        let (l, w, c) = match wc_fd(fd as i32) {
+            Ok(v) => v,
+            Err(()) => {
+                close(fd as i32);
+                had_error = true;
+                continue;
+            }
+        };
         close(fd as i32);
         total_l += l;
         total_w += w;
@@ -144,7 +161,7 @@ fn main(args: &[&str]) -> i32 {
         }
         write_str(STDOUT_FILENO, "total\n");
     }
-    0
+    if had_error { 1 } else { 0 }
 }
 
 #[panic_handler]

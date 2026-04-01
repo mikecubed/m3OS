@@ -4461,7 +4461,6 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         } => {
             // Phase 32: read inode to get timestamps and real metadata.
             let inode_num = *inode_num;
-            let file_size = *file_size as u64;
             let vol = crate::fs::ext2::EXT2_VOLUME.lock();
             if let Some(vol) = vol.as_ref()
                 && let Ok(inode) = vol.read_inode(inode_num)
@@ -4469,15 +4468,17 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 let mode = inode.mode as u32;
                 let uid = inode.uid as u32;
                 let gid = inode.gid as u32;
+                let size = inode.size as u64; // use inode size, not cached FD size
                 let nlink = inode.links_count as u64;
+                let blk = vol.block_size as u64;
                 let ino = inode_num as u64;
                 stat[8..16].copy_from_slice(&ino.to_ne_bytes());
                 stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
                 stat[24..28].copy_from_slice(&mode.to_ne_bytes());
                 stat[28..32].copy_from_slice(&uid.to_ne_bytes());
                 stat[32..36].copy_from_slice(&gid.to_ne_bytes());
-                stat[48..56].copy_from_slice(&file_size.to_ne_bytes());
-                stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                stat[48..56].copy_from_slice(&size.to_ne_bytes());
+                stat[56..64].copy_from_slice(&blk.to_ne_bytes());
                 let atime = inode.atime as i64;
                 let mtime = inode.mtime as i64;
                 let ctime = inode.ctime as i64;
@@ -4489,9 +4490,10 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 }
                 return 0;
             }
-            // Fallback if inode read fails
+            // Fallback if inode read fails — use cached FD size
+            let fallback_size = *file_size as u64;
             let (u, g, m) = (0u32, 0u32, 0o755u16);
-            (0x8000 | m as u32, u, g, file_size, 0)
+            (0x8000 | m as u32, u, g, fallback_size, 0)
         }
     };
 

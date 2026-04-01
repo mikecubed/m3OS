@@ -1652,14 +1652,22 @@ fn tail_lines(s: &str, n: usize) -> String {
 /// Helper: send a command and wait for the shell prompt to return.
 /// Includes a small sleep before sending to avoid serial input races
 /// where characters get consumed by ANSI escape sequence processing.
-fn cmd_then_prompt(input: &'static str, label: &'static str, timeout: u64) -> Vec<SmokeStep> {
+fn cmd_then_prompt(
+    input: &'static str,
+    send_label: &'static str,
+    wait_label: &'static str,
+    timeout: u64,
+) -> Vec<SmokeStep> {
     vec![
         SmokeStep::Sleep { millis: 500 },
-        SmokeStep::Send { input, label },
+        SmokeStep::Send {
+            input,
+            label: send_label,
+        },
         SmokeStep::Wait {
             pattern: "# ",
             timeout_secs: timeout,
-            label,
+            label: wait_label,
         },
     ]
 }
@@ -1769,7 +1777,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // touch — create a new file
     steps.extend(cmd_then_prompt(
         "/bin/touch /tmp/smoke_file\n",
-        "touch: create file",
+        "send: touch /tmp/smoke_file",
+        "wait: prompt after touch",
         10,
     ));
 
@@ -1812,7 +1821,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     steps.extend(cmd_then_prompt(
         "cd /home/project\n",
-        "cd to demo project",
+        "send: cd /home/project",
+        "wait: prompt after cd",
         5,
     ));
 
