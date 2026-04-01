@@ -683,46 +683,16 @@ fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
 }
 
-/// Allocate `count` physically contiguous 4 KiB frames.
+/// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
 ///
-/// Returns the physical base address of the first frame, or `None` if
-/// allocation fails. Uses the bump allocator which already allocates
-/// sequentially from contiguous regions.
+/// Rounds up to the next power-of-two order and delegates to
+/// `frame_allocator::allocate_contiguous()`.
 fn alloc_contiguous_frames(count: usize) -> Option<u64> {
-    use alloc::vec::Vec;
-
-    // Allocate all requested frames, sort by address, and verify contiguity.
-    // This works regardless of allocator ordering (LIFO free-list returns
-    // descending addresses after init).
-    let mut frames: Vec<u64> = Vec::with_capacity(count);
-    for _ in 0..count {
-        match frame_allocator::allocate_frame() {
-            Some(f) => frames.push(f.start_address().as_u64()),
-            None => {
-                for &phys in &frames {
-                    frame_allocator::free_frame(phys);
-                }
-                return None;
-            }
-        }
-    }
-
-    frames.sort_unstable();
-    let base = frames[0];
-    for (i, &phys) in frames.iter().enumerate() {
-        if phys != base + (i as u64) * 4096 {
-            log::error!(
-                "[virtio-net] frames not contiguous: frame {} at {:#x}, expected {:#x}",
-                i,
-                phys,
-                base + (i as u64) * 4096
-            );
-            for &p in &frames {
-                frame_allocator::free_frame(p);
-            }
-            return None;
-        }
-    }
-
-    Some(base)
+    let order = if count <= 1 {
+        0
+    } else {
+        (usize::BITS - (count - 1).leading_zeros()) as usize
+    };
+    let frame = frame_allocator::allocate_contiguous(order)?;
+    Some(frame.start_address().as_u64())
 }
