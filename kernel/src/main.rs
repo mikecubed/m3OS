@@ -925,7 +925,7 @@ fn idle_task() -> ! {
 /// Unlike the keyboard feeder, serial input bypasses cooked-mode line
 /// buffering (the host terminal handles line editing). Bytes are pushed
 /// directly to stdin, with ECHO written back to COM1 and ISIG checked
-/// for ^C/^Z/^\.
+/// for ^C, ^Z, and ^\.
 fn serial_stdin_feeder_task() -> ! {
     use kernel_core::tty::*;
 

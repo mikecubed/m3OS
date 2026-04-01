@@ -25,7 +25,8 @@ const FREE_MAGIC: u64 = 0xDEAD_F4EE_F4EE_DEAD;
 /// 4 KiB frame stores a next-pointer and magic sentinel in its first 16 bytes.
 ///
 /// **Phase 2 (after heap):** A buddy allocator (`kernel_core::buddy::BuddyAllocator`)
-/// that enables O(1) allocation, buddy-merging on free, and multi-page contiguous
+/// that supports O(log n) allocation and free (bounded by MAX_ORDER + 1 levels),
+/// with buddy-merging on free and multi-page contiguous
 /// allocations.  The free-list frames are drained into the buddy allocator during
 /// `init_buddy()`.
 struct FrameAllocator {
