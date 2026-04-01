@@ -15,10 +15,10 @@ flowchart TD
     end
 
     subgraph KERNEL ["Kernel Infrastructure"]
-        P36["Phase 36: epoll"]
-        P37["Phase 37: Filesystem"]
-        P39["Phase 39: Threading"]
-        P41["Phase 41: Crypto"]
+        P37["Phase 37: epoll"]
+        P38["Phase 38: Filesystem"]
+        P40["Phase 40: Threading"]
+        P42["Phase 42: Crypto"]
     end
 
     subgraph RUNTIMES ["Language Runtimes"]
@@ -36,15 +36,15 @@ flowchart TD
         CC(["Claude Code<br/><i>AI agent running on m3OS</i>"])
     end
 
-    EM --> P36
     EM --> P37
-    EM --> P39
+    EM --> P38
+    EM --> P40
     EM --> PY
 
-    P36 --> NODE
     P37 --> NODE
-    P39 --> NODE
-    P41 --> TLS
+    P38 --> NODE
+    P40 --> NODE
+    P42 --> TLS
     TLS --> HTTPS
     DNS --> HTTPS
     NODE --> CC
@@ -102,7 +102,7 @@ flowchart LR
 | Requirement | Component | Status |
 |---|---|---|
 | **Node.js runtime** | V8 + libuv | See [Node.js roadmap](./nodejs-roadmap.md) |
-| **HTTPS client** | TLS + TCP sockets | Phase 41 + TLS library |
+| **HTTPS client** | TLS + TCP sockets | Phase 42 + TLS library |
 | **DNS resolution** | Resolve `api.anthropic.com` | New (stub resolver or c-ares) |
 | **File I/O** | Read/write source files | Working (Phase 24) |
 | **Process spawning** | Run shell commands | Working (fork/exec, Phase 11) |
@@ -110,8 +110,8 @@ flowchart LR
 | **Environment variables** | `ANTHROPIC_API_KEY` | Working |
 | **Terminal (PTY)** | Interactive UI, colors, cursor | Working (Phase 29) |
 | **git** | Status, diff, log, commit | **Not available** |
-| **Symlinks** | `node_modules/.bin/` | Phase 37 (planned) |
-| **`/dev/null`** | Subprocess stdio | Phase 37 (planned) |
+| **Symlinks** | `node_modules/.bin/` | Phase 38 (planned) |
+| **`/dev/null`** | Subprocess stdio | Phase 38 (planned) |
 | **Disk space** | Node.js + npm + Claude Code | ~500 MB minimum |
 | **RAM** | V8 + Claude Code + child processes | ~1 GB minimum |
 
@@ -268,10 +268,10 @@ $ claude "what files are in this directory?"
 flowchart TD
     P33["Phase 33: Kernel Memory<br/><i>IN PROGRESS</i>"]
     EM["NEW: Expanded Memory<br/><i>demand paging, mprotect</i>"]
-    P36["Phase 36: I/O Multiplexing<br/><i>epoll</i>"]
-    P37["Phase 37: Filesystem<br/><i>symlinks, /dev/null, /proc</i>"]
-    P39["Phase 39: Threading<br/><i>clone, futex, TLS</i>"]
-    P41["Phase 41: Crypto"]
+    P37["Phase 37: I/O Multiplexing<br/><i>epoll</i>"]
+    P38["Phase 38: Filesystem<br/><i>symlinks, /dev/null, /proc</i>"]
+    P40["Phase 40: Threading<br/><i>clone, futex, TLS</i>"]
+    P42["Phase 42: Crypto"]
 
     PY(["Python works<br/><i>(optional milestone)</i>"])
     NODE["Node.js Stage 1<br/><i>REPL + fs</i>"]
@@ -288,16 +288,16 @@ flowchart TD
     P33 --> EM
 
     EM --> PY
-    EM --> P36
     EM --> P37
-    EM --> P39
+    EM --> P38
+    EM --> P40
 
-    P36 --> NODE
     P37 --> NODE
-    P39 --> NODE
+    P38 --> NODE
+    P40 --> NODE
     EM --> NODE
 
-    P41 --> TLS
+    P42 --> TLS
     TLS --> NODE2
     DNS --> NODE2
     NODE --> NODE2
@@ -311,10 +311,10 @@ flowchart TD
 
     style P33 fill:#f9e79f,stroke:#f39c12,color:#000
     style EM fill:#fadbd8,stroke:#e74c3c,color:#000
-    style P36 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P39 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P41 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P38 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P40 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P42 fill:#d6eaf8,stroke:#2980b9,color:#000
     style PY fill:#e8daef,stroke:#8e44ad,color:#000
     style NODE fill:#aed6f1,stroke:#2471a3,color:#000
     style TLS fill:#fadbd8,stroke:#e74c3c,color:#000
@@ -337,16 +337,16 @@ gantt
     section Kernel
     Phase 33 - Kernel Memory (in progress)     :active, p33, 0, 1
     NEW - Expanded Memory + mprotect           :crit, em, after p33, 1
-    Phase 36 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
-    Phase 37 - Filesystem Enhancements         :p37, after em, 1
-    Phase 39 - Threading Primitives            :crit, p39, after p36, 1
+    Phase 37 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
+    Phase 38 - Filesystem Enhancements         :p37, after em, 1
+    Phase 40 - Threading Primitives            :crit, p39, after p36, 1
 
     section Runtimes
     Python (optional milestone)                :py, after em, 1
     Node.js Stage 1 (REPL + fs)               :crit, node1, after p39, 1
 
     section Networking
-    Phase 41 - Crypto Primitives               :p41, after node1, 1
+    Phase 42 - Crypto Primitives               :p41, after node1, 1
     NEW - TLS Library                          :crit, tls, after p41, 1
     NEW - DNS Resolution                       :dns, after tls, 1
     Node.js Stage 2 (HTTPS + npm)             :crit, node2, after dns, 1
@@ -361,7 +361,7 @@ gantt
 |---|---|---|
 | **Python runs** | Phase 33 + Expanded Memory | Moderate |
 | **Node.js REPL works** | + Phases 36, 37, 39 | Very high |
-| **Node.js has HTTPS** | + Phase 41, TLS, DNS | High |
+| **Node.js has HTTPS** | + Phase 42, TLS, DNS | High |
 | **git works** | + cross-compile git | Low |
 | **Claude Code runs** | All of the above + npm + disk | Moderate (integration) |
 

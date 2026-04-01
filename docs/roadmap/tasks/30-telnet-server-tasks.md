@@ -157,7 +157,7 @@ Wire telnetd into the boot process and configure QEMU networking for host access
 | Task | Description | Status |
 |---|---|---|
 | P30-T038 | Create `docs/30-telnet-server.md`: document the telnet server implementation. Cover: architecture (accept → fork → PTY → login), IAC parsing, option negotiation, data relay, connection lifecycle, CR/LF translation, and QEMU port forwarding setup. Include a diagram of the data flow: host telnet client → QEMU port forward → guest TCP socket → telnetd relay → PTY master → PTY slave → login/shell. | ✅ |
-| P30-T039 | Document how the implementation differs from production telnet servers: no inetd super-server, no TCP wrappers, no Kerberos, no LINEMODE, no environment passing, no idle timeout, no encryption (plaintext only). Reference Phase 42 (SSH) as the secure replacement. | ✅ |
+| P30-T039 | Document how the implementation differs from production telnet servers: no inetd super-server, no TCP wrappers, no Kerberos, no LINEMODE, no environment passing, no idle timeout, no encryption (plaintext only). Reference Phase 43 (SSH) as the secure replacement. | ✅ |
 | P30-T040 | Update `docs/08-roadmap.md` to mark Phase 30 as complete (when done). Update `docs/roadmap/README.md` to reflect Phase 30 task list status. | Deferred (mark when manual tests pass) |
 
 ---
@@ -166,7 +166,7 @@ Wire telnetd into the boot process and configure QEMU networking for host access
 
 These items are explicitly out of scope for Phase 30:
 
-- **Encryption** — that's SSH, Phase 42
+- **Encryption** — that's SSH, Phase 43
 - **inetd/xinetd super-server** — single-purpose daemon is simpler
 - **TCP wrappers or IP-based access control** — no firewall needed for QEMU
 - **Telnet LINEMODE option** — character-at-a-time with server echo is sufficient

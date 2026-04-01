@@ -159,4 +159,4 @@ To regenerate it (required after first Phase 31 build), delete this file.
 - **Multi-stage bootstrap** -- removing host-compiled binaries from the trust chain
 - **C++ support** -- TCC is C-only
 - **Make/build tools** -- Phase 32
-- **Package manager** -- Phase 37
+- **Package manager** -- Phase 38

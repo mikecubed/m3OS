@@ -96,45 +96,56 @@ flowchart TD
     P15 --> P34["Phase 34<br/>Real-Time Clock"]
     P25 --> P35["Phase 35<br/>True SMP"]
     P33 --> P35
-    P23 --> P36["Phase 36<br/>I/O Multiplexing"]
-    P22 --> P36
-    P35 --> P36
-    P28 --> P37["Phase 37<br/>Filesystem Enhancements"]
-    P27 --> P37
-    P23 --> P38["Phase 38<br/>Unix Domain Sockets"]
-    P37 --> P38
-    P36 --> P38
-    P35 --> P39["Phase 39<br/>Threading"]
-    P33 --> P39
+    P33 --> P36["Phase 36<br/>Expanded Memory"]
+    P23 --> P37["Phase 37<br/>I/O Multiplexing"]
+    P22 --> P37
+    P35 --> P37
+    P28 --> P38["Phase 38<br/>Filesystem Enhancements"]
+    P27 --> P38
+    P23 --> P39["Phase 39<br/>Unix Domain Sockets"]
+    P38 --> P39
+    P37 --> P39
+    P35 --> P40["Phase 40<br/>Threading"]
+    P33 --> P40
 
     %% Application phases
-    P14 --> P40["Phase 40<br/>Expanded Coreutils"]
-    P27 --> P40
-    P37 --> P40
-    P31 --> P41["Phase 41<br/>Crypto Primitives"]
-    P41 --> P42["Phase 42<br/>SSH Server"]
-    P29 --> P42
-    P27 --> P42
-    P36 --> P42
-    P12 --> P43["Phase 43<br/>Rust Cross-Compilation"]
-    P24 --> P43
-    P31 --> P44["Phase 44<br/>Ports System"]
-    P32 --> P44
-    P40 --> P44
-    P27 --> P45["Phase 45<br/>System Services"]
-    P30 --> P45
-    P24 --> P45
-    P34 --> P45
-    P38 --> P45
+    P14 --> P41["Phase 41<br/>Expanded Coreutils"]
+    P27 --> P41
+    P38 --> P41
+    P31 --> P42["Phase 42<br/>Crypto and TLS"]
+    P42 --> P43["Phase 43<br/>SSH"]
+    P29 --> P43
+    P27 --> P43
+    P37 --> P43
+    P12 --> P44["Phase 44<br/>Rust Cross-Compilation"]
+    P24 --> P44
+    P31 --> P45["Phase 45<br/>Ports System"]
+    P32 --> P45
+    P41 --> P45
+    P27 --> P46["Phase 46<br/>System Services"]
+    P30 --> P46
+    P24 --> P46
+    P34 --> P46
+    P39 --> P46
 
     %% Showcase phases
-    P12 --> P46["Phase 46<br/>DOOM"]
-    P24 --> P46
-    P9 --> P46
-    P15 --> P47["Phase 47<br/>Mouse Input"]
-    P46 -.->|optional| P47
-    P15 --> P48["Phase 48<br/>Audio"]
-    P46 -.->|optional| P48
+    P12 --> P47["Phase 47<br/>DOOM"]
+    P24 --> P47
+    P9 --> P47
+    P15 --> P48["Phase 48<br/>Mouse Input"]
+    P47 -.->|optional| P48
+    P15 --> P49["Phase 49<br/>Audio"]
+    P47 -.->|optional| P49
+
+    %% Cross-compiled runtimes
+    P36 --> P50["Phase 50<br/>Cross-Compiled Toolchains"]
+    P50 --> P51["Phase 51<br/>Networking and GitHub"]
+    P42 --> P51
+    P37 --> P51
+    P40 --> P51
+    P51 --> P52["Phase 52<br/>Node.js"]
+    P52 --> P53["Phase 53<br/>Claude Code"]
+    P50 --> P53
 ```
 
 ## Milestone Summary
@@ -196,32 +207,42 @@ flowchart TD
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
-| 33 | Kernel Memory | Slab allocator, OOM retry, working munmap | [Phase 33](./33-kernel-memory-improvements.md) | *not yet created* |
+| 33 | Kernel Memory | Slab allocator, OOM retry, working munmap | [Phase 33](./33-kernel-memory-improvements.md) | [Tasks](./tasks/33-kernel-memory-tasks.md) |
 | 34 | Real-Time Clock | CMOS RTC, wall-clock time, CLOCK_REALTIME | [Phase 34](./34-real-time-clock.md) | *not yet created* |
 | 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | [Phase 35](./35-true-smp-multitasking.md) | *not yet created* |
-| 36 | I/O Multiplexing | select, epoll, non-blocking I/O | [Phase 36](./36-io-multiplexing.md) | *not yet created* |
-| 37 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | [Phase 37](./37-filesystem-enhancements.md) | *not yet created* |
-| 38 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | [Phase 38](./38-unix-domain-sockets.md) | *not yet created* |
-| 39 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | [Phase 39](./39-threading-primitives.md) | *not yet created* |
+| 36 | Expanded Memory | Demand paging, mprotect, large mmap, disk/RAM expansion | [Phase 36](./36-expanded-memory.md) | *not yet created* |
+| 37 | I/O Multiplexing | select, epoll, non-blocking I/O | [Phase 37](./37-io-multiplexing.md) | *not yet created* |
+| 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | [Phase 38](./38-filesystem-enhancements.md) | *not yet created* |
+| 39 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | [Phase 39](./39-unix-domain-sockets.md) | *not yet created* |
+| 40 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | [Phase 40](./40-threading-primitives.md) | *not yet created* |
 
-### Application Phases (planned — "ecosystem and services")
-
-| Phase | Theme | Primary Outcome | Milestone | Tasks |
-|---|---|---|---|---|
-| 40 | Expanded Coreutils | head, tail, sort, find, diff, ps, less | [Phase 40](./40-expanded-coreutils.md) | *not yet created* |
-| 41 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 41](./41-crypto-primitives.md) | *not yet created* |
-| 42 | SSH Server | Encrypted remote shell access | [Phase 42](./42-ssh-server.md) | *not yet created* |
-| 43 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 43](./43-rust-cross-compilation.md) | *not yet created* |
-| 44 | Ports System | Source-based package building and installation | [Phase 44](./44-ports-system.md) | *not yet created* |
-| 45 | System Services | Service manager, syslog, cron, shutdown | [Phase 45](./45-system-services.md) | *not yet created* |
-
-### Showcase Phases (planned — "it runs DOOM")
+### Application Phases (planned -- "ecosystem and services")
 
 | Phase | Theme | Primary Outcome | Milestone | Tasks |
 |---|---|---|---|---|
-| 46 | DOOM | DOOM runs with framebuffer rendering and keyboard input | [Phase 46](./46-doom.md) | *not yet created* |
-| 47 | Mouse Input | PS/2 mouse driver for graphical programs | [Phase 47](./47-mouse-input.md) | *not yet created* |
-| 48 | Audio | Sound card driver (HDA/AC97) for audio output | [Phase 48](./48-audio.md) | *not yet created* |
+| 41 | Expanded Coreutils | head, tail, sort, find, diff, ps, less | [Phase 41](./41-expanded-coreutils.md) | *not yet created* |
+| 42 | Crypto and TLS | RustCrypto + rustls + TLS 1.3 | [Phase 42](./42-crypto-primitives.md) | *not yet created* |
+| 43 | SSH | SSH client and server (sunset or Dropbear) | [Phase 43](./43-ssh-server.md) | *not yet created* |
+| 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 44](./44-rust-cross-compilation.md) | *not yet created* |
+| 45 | Ports System | Source-based package building and installation | [Phase 45](./45-ports-system.md) | *not yet created* |
+| 46 | System Services | Service manager, syslog, cron, shutdown | [Phase 46](./46-system-services.md) | *not yet created* |
+
+### Showcase Phases (planned -- "it runs DOOM")
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 47 | DOOM | DOOM runs with framebuffer rendering and keyboard input | [Phase 47](./47-doom.md) | *not yet created* |
+| 48 | Mouse Input | PS/2 mouse driver for graphical programs | [Phase 48](./48-mouse-input.md) | *not yet created* |
+| 49 | Audio | Sound card driver (HDA/AC97) for audio output | [Phase 49](./49-audio.md) | *not yet created* |
+
+### Cross-Compiled Runtimes (planned -- "real tools and AI agents")
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 50 | Cross-Compiled Toolchains | git, Python, Clang bundled on disk | [Phase 50](./50-cross-compiled-toolchains.md) | *not yet created* |
+| 51 | Networking and GitHub | gh CLI, git HTTPS, DNS resolution | [Phase 51](./51-networking-and-github.md) | *not yet created* |
+| 52 | Node.js | V8 + libuv runtime for JavaScript | [Phase 52](./52-nodejs.md) | *not yet created* |
+| 53 | Claude Code | AI coding agent on m3OS | [Phase 53](./53-claude-code.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
@@ -280,23 +301,30 @@ gantt
     Kernel Memory        :p33, after p25, 1
     Real-Time Clock      :p34, after p15, 1
     True SMP             :p35, after p33, 1
-    I/O Multiplexing     :p36, after p35, 1
-    Filesystem Enhance   :p37, after p28, 1
-    Unix Domain Sockets  :p38, after p37, 1
-    Threading            :p39, after p35, 1
+    Expanded Memory      :p36, after p33, 1
+    I/O Multiplexing     :p37, after p35, 1
+    Filesystem Enhance   :p38, after p28, 1
+    Unix Domain Sockets  :p39, after p38, 1
+    Threading            :p40, after p35, 1
 
     section Applications (planned)
-    Expanded Coreutils   :p40, after p37, 1
-    Crypto Primitives    :p41, after p31, 1
-    SSH Server           :p42, after p41, 1
-    Rust Cross-Compile   :p43, after p24, 1
-    Ports System         :p44, after p40, 1
-    System Services      :p45, after p38, 1
+    Expanded Coreutils   :p41, after p38, 1
+    Crypto and TLS       :p42, after p31, 1
+    SSH                  :p43, after p42, 1
+    Rust Cross-Compile   :p44, after p24, 1
+    Ports System         :p45, after p41, 1
+    System Services      :p46, after p39, 1
 
     section Showcase (planned)
-    DOOM                 :p46, after p24, 1
-    Mouse Input          :p47, after p46, 1
-    Audio                :p48, after p46, 1
+    DOOM                 :p47, after p24, 1
+    Mouse Input          :p48, after p47, 1
+    Audio                :p49, after p47, 1
+
+    section Cross-Compiled Runtimes (planned)
+    Toolchains           :p50, after p36, 1
+    Networking + GitHub  :p51, after p50, 1
+    Node.js              :p52, after p51, 1
+    Claude Code          :p53, after p52, 1
 ```
 
 ## Required Documentation for Every Phase

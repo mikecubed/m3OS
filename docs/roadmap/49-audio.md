@@ -1,4 +1,4 @@
-# Phase 48 - Audio Output
+# Phase 49 - Audio Output
 
 ## Milestone Goal
 
@@ -106,7 +106,7 @@ DOOM's audio system:
 
 ## Companion Task List
 
-- Phase 48 Task List — *not yet created*
+- Phase 49 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

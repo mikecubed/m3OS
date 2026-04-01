@@ -1,4 +1,4 @@
-# Phase 45 - System Services
+# Phase 46 - System Services
 
 ## Milestone Goal
 
@@ -83,7 +83,7 @@ A minimal cron daemon:
 |---|---|
 | Phase 27 (User Accounts) | Service ownership, user crontabs |
 | Phase 29 (PTY) | who/w reads PTY session info |
-| Phase 30 (Telnet) / Phase 42 (SSH) | Remote services to manage |
+| Phase 30 (Telnet) / Phase 43 (SSH) | Remote services to manage |
 | Phase 24 (Persistent Storage) | Log files, crontabs persist |
 | Phase 19 (Signals) | SIGTERM/SIGKILL for service management |
 
@@ -116,7 +116,7 @@ A minimal cron daemon:
 
 ## Companion Task List
 
-- Phase 45 Task List — *not yet created*
+- Phase 46 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

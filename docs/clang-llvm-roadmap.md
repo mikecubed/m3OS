@@ -123,7 +123,7 @@ strip build/bin/lld
 ```
 
 Key decisions:
-- **`LLVM_ENABLE_THREADS=OFF`** -- avoids pthreads dependency until Phase 39
+- **`LLVM_ENABLE_THREADS=OFF`** -- avoids pthreads dependency until Phase 40
 - **`LLVM_TARGETS_TO_BUILD="X86"`** -- only x86_64 backend, saves ~80% size
 - **`MinSizeRel`** -- optimize for binary size
 - **Static musl linkage** -- no dynamic linker needed on m3OS
@@ -214,7 +214,7 @@ non-trivial panics the kernel.
 
 ---
 
-### Phase 37 -- Filesystem Enhancements (planned)
+### Phase 38 -- Filesystem Enhancements (planned)
 
 **What it delivers:**
 - Symlinks (`symlink`, `readlink`, path resolution follows symlinks)
@@ -338,29 +338,29 @@ flowchart TD
     CC["Cross-Compile Clang on Host<br/><i>xtask build_clang()</i>"]
     DONE(["Clang runs inside m3OS!<br/>C and C++ compilation works"])
 
-    P37["Phase 37: Filesystem<br/><i>symlinks, /dev/null,<br/>/proc/self/exe</i>"]
+    P38["Phase 38: Filesystem<br/><i>symlinks, /dev/null,<br/>/proc/self/exe</i>"]
 
     P33 -->|"munmap, OOM retry,<br/>slab/buddy allocators"| EM
     EM --> DI
     DI --> CC
     CC --> DONE
 
-    P37 -.->|"optional but<br/>recommended"| DONE
+    P38 -.->|"optional but<br/>recommended"| DONE
 
     style P33 fill:#f9e79f,stroke:#f39c12,color:#000
     style EM fill:#fadbd8,stroke:#e74c3c,color:#000
     style DI fill:#d5f5e3,stroke:#27ae60,color:#000
     style CC fill:#d6eaf8,stroke:#2980b9,color:#000
     style DONE fill:#27ae60,stroke:#1e8449,color:#fff
-    style P37 fill:#e8daef,stroke:#8e44ad,color:#000
+    style P38 fill:#e8daef,stroke:#8e44ad,color:#000
 ```
 
 **Not required for Stage 1:**
 - Phase 34 (RTC) -- Clang doesn't need wall-clock time to compile
 - Phase 35 (True SMP) -- Clang runs single-threaded
-- Phase 36 (I/O Multiplexing) -- Clang doesn't use select/epoll
-- Phase 38 (Unix Domain Sockets) -- not needed
-- Phase 39 (Threading) -- built with `LLVM_ENABLE_THREADS=OFF`
+- Phase 37 (I/O Multiplexing) -- Clang doesn't use select/epoll
+- Phase 39 (Unix Domain Sockets) -- not needed
+- Phase 40 (Threading) -- built with `LLVM_ENABLE_THREADS=OFF`
 
 ## Stage 1 Acceptance Criteria
 
@@ -433,7 +433,7 @@ actually use multiple cores.
 
 ---
 
-### Phase 36 -- I/O Multiplexing (planned)
+### Phase 37 -- I/O Multiplexing (planned)
 
 **Delivers:** `select()`, `epoll`, non-blocking I/O, `O_NONBLOCK`.
 
@@ -443,7 +443,7 @@ are strictly sequential even if threading is available.
 
 ---
 
-### Phase 37 -- Filesystem Enhancements (planned)
+### Phase 38 -- Filesystem Enhancements (planned)
 
 **Delivers:** Symlinks, hard links, `/proc`, permission enforcement, device
 nodes.
@@ -457,7 +457,7 @@ nodes.
 
 ---
 
-### Phase 39 -- Threading Primitives (planned)
+### Phase 40 -- Threading Primitives (planned)
 
 **Delivers:** `clone(CLONE_THREAD)`, `futex()`, TLS, thread groups,
 pthreads via musl.
@@ -524,9 +524,9 @@ flowchart TD
 
     P34["Phase 34: Real-Time Clock<br/><i>timestamps for make</i>"]
     P35["Phase 35: True SMP<br/><i>multi-core scheduling</i>"]
-    P36["Phase 36: I/O Multiplexing<br/><i>select, epoll, O_NONBLOCK</i>"]
-    P37["Phase 37: Filesystem<br/><i>symlinks, /proc, /dev/null</i>"]
-    P39["Phase 39: Threading<br/><i>clone, futex, TLS, pthreads</i>"]
+    P37["Phase 37: I/O Multiplexing<br/><i>select, epoll, O_NONBLOCK</i>"]
+    P38["Phase 38: Filesystem<br/><i>symlinks, /proc, /dev/null</i>"]
+    P40["Phase 40: Threading<br/><i>clone, futex, TLS, pthreads</i>"]
 
     BI["NEW: Build Infrastructure<br/><i>CMake, Ninja, 4 GB disk</i>"]
     EH["NEW: C++ Exception Handling<br/><i>libunwind, .eh_frame, libcxxabi</i>"]
@@ -535,15 +535,15 @@ flowchart TD
 
     S1 --> P34
     S1 --> P35
-    S1 --> P36
     S1 --> P37
-    S1 --> P39
+    S1 --> P38
+    S1 --> P40
 
     P34 --> BI
     P35 --> BI
-    P36 --> BI
     P37 --> BI
-    P39 --> BI
+    P38 --> BI
+    P40 --> BI
 
     BI --> EH
     EH --> DONE
@@ -552,9 +552,9 @@ flowchart TD
     style S1 fill:#27ae60,stroke:#1e8449,color:#fff
     style P34 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P35 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P36 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P39 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P38 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P40 fill:#d6eaf8,stroke:#2980b9,color:#000
     style BI fill:#fadbd8,stroke:#e74c3c,color:#000
     style EH fill:#fadbd8,stroke:#e74c3c,color:#000
     style DL fill:#e8daef,stroke:#8e44ad,color:#000
@@ -578,9 +578,9 @@ gantt
     section Stage 2
     Phase 34 - Real-Time Clock                 :p34, after cc, 1
     Phase 35 - True SMP                        :p35, after cc, 1
-    Phase 36 - I/O Multiplexing                :p36, after p35, 1
-    Phase 37 - Filesystem Enhancements         :p37, after cc, 1
-    Phase 39 - Threading Primitives            :p39, after p35, 1
+    Phase 37 - I/O Multiplexing                :p36, after p35, 1
+    Phase 38 - Filesystem Enhancements         :p37, after cc, 1
+    Phase 40 - Threading Primitives            :p39, after p35, 1
     NEW - Build Infrastructure                 :crit, bi, after p39, 1
     NEW - C++ Exception Handling               :crit, eh, after bi, 1
     NEW - Dynamic Linking (optional)           :done, dl, after eh, 1

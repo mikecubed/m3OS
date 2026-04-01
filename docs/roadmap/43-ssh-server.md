@@ -1,4 +1,4 @@
-# Phase 42 - SSH Server
+# Phase 43 - SSH Server
 
 ## Milestone Goal
 
@@ -21,7 +21,7 @@ milestone: the OS is now a secure, networked, multi-user system.
 
 **Transport Layer**
 - SSH-2 protocol only (SSH-1 is obsolete and insecure).
-- Key exchange: `curve25519-sha256` (using crypto from Phase 41).
+- Key exchange: `curve25519-sha256` (using crypto from Phase 42).
 - Host key: Ed25519 (generated on first boot, stored at `/etc/ssh/ssh_host_ed25519_key`).
 - Encryption: `chacha20-poly1305@openssh.com` or `aes256-ctr`.
 - MAC: `hmac-sha2-256` (if not using authenticated encryption).
@@ -41,7 +41,18 @@ milestone: the OS is now a secure, networked, multi-user system.
 
 ### Implementation Strategy
 
-**Option A: Port Dropbear SSH (recommended)**
+**Option A: sunset — Pure Rust SSH library (recommended)**
+
+[sunset](https://github.com/mkj/sunset) is a pure Rust SSH library with an IO-less,
+`no_std`, no-alloc core. Created by Matt Johnston (the same author as Dropbear).
+It provides both client and server support, uses RustCrypto crates internally
+(same as Phase 42), and has been tested on embedded devices (RPi Pico W, ~13 KB per
+session). The IO-less design means we feed it bytes and it gives us bytes back —
+perfect for integration with m3OS sockets and PTY pairs.
+
+See [Rust Crate Acceleration](../rust-crate-acceleration.md) for details.
+
+**Option B: Port Dropbear SSH**
 
 [Dropbear](https://matt.ucc.asn.au/dropbear/dropbear.html) is a lightweight SSH
 server designed for embedded systems. It is:
@@ -50,13 +61,11 @@ server designed for embedded systems. It is:
 - Supports all essential SSH features
 - Widely deployed on routers, IoT devices, embedded Linux
 
-Cross-compile Dropbear with musl. It can optionally use an external crypto library
-or its built-in one. If we use the Phase 41 crypto library, we learn more; if we use
-Dropbear's built-in crypto, we get a working server faster.
+Cross-compile Dropbear with musl. This is the fallback if sunset proves too immature.
 
-**Option B: Write minimal SSH server from scratch**
+**Option C: Write minimal SSH server from scratch**
 
-Using the Phase 41 crypto primitives, implement the SSH-2 protocol directly. This is
+Using the Phase 42 crypto primitives, implement the SSH-2 protocol directly. This is
 the maximum learning path but is significantly more work. The SSH protocol has many
 subtle requirements around packet framing, key re-exchange, and channel multiplexing.
 
@@ -89,7 +98,7 @@ ssh -p 2222 user@localhost
 | Phase 23 (Socket API) | TCP server sockets |
 | Phase 27 (User Accounts) | Authentication, UID/GID |
 | Phase 29 (PTY) | Terminal sessions |
-| Phase 41 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
+| Phase 42 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
 
 ## Implementation Outline
 
@@ -119,7 +128,7 @@ ssh -p 2222 user@localhost
 
 ## Companion Task List
 
-- Phase 42 Task List — *not yet created*
+- Phase 43 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

@@ -11,28 +11,28 @@ integration with the kernel-core crate, and no C cross-compilation headaches.
 ```mermaid
 flowchart TD
     subgraph HIGH ["High Impact — Replace Entire Phases"]
-        CRYPTO["Phase 41: Crypto<br/><b>RustCrypto crates</b><br/><i>replaces BearSSL entirely</i>"]
-        SSH["Phase 42: SSH<br/><b>sunset / russh</b><br/><i>replaces Dropbear</i>"]
+        CRYPTO["Phase 42: Crypto<br/><b>RustCrypto crates</b><br/><i>replaces BearSSL entirely</i>"]
+        SSH["Phase 43: SSH<br/><b>sunset / russh</b><br/><i>replaces Dropbear</i>"]
         TLS["TLS (cross-cutting)<br/><b>rustls + webpki-roots</b><br/><i>replaces OpenSSL/mbedTLS</i>"]
         HTTP["HTTP (cross-cutting)<br/><b>ureq</b><br/><i>replaces libcurl</i>"]
     end
 
     subgraph MEDIUM ["Medium Impact — Accelerate Parts"]
-        COREUTILS["Phase 40: Coreutils<br/><b>uutils/coreutils</b><br/><i>extract individual tools</i>"]
-        UTILS["Phase 43: Rust tools<br/><b>ripgrep, fd, bat, etc.</b><br/><i>cross-compile existing CLIs</i>"]
+        COREUTILS["Phase 41: Coreutils<br/><b>uutils/coreutils</b><br/><i>extract individual tools</i>"]
+        UTILS["Phase 44: Rust tools<br/><b>ripgrep, fd, bat, etc.</b><br/><i>cross-compile existing CLIs</i>"]
     end
 
     subgraph LOW ["Low Impact — No Good Crate Fit"]
         RTC["Phase 34: RTC"]
         SMP["Phase 35: SMP"]
-        IO["Phase 36: I/O Mux"]
-        FS["Phase 37: Filesystem"]
-        UNIX["Phase 38: Unix Sockets"]
-        THREAD["Phase 39: Threading"]
-        SVC["Phase 45: Services"]
-        DOOM["Phase 46: DOOM"]
-        MOUSE["Phase 47: Mouse"]
-        AUDIO["Phase 48: Audio"]
+        IO["Phase 37: I/O Mux"]
+        FS["Phase 38: Filesystem"]
+        UNIX["Phase 39: Unix Sockets"]
+        THREAD["Phase 40: Threading"]
+        SVC["Phase 46: Services"]
+        DOOM["Phase 47: DOOM"]
+        MOUSE["Phase 48: Mouse"]
+        AUDIO["Phase 49: Audio"]
     end
 
     style HIGH fill:#d5f5e3,stroke:#27ae60,color:#000
@@ -44,15 +44,15 @@ flowchart TD
 
 ## High Impact: Replace Entire Implementation Plans
 
-### Phase 41 -- Cryptography: RustCrypto Crates
+### Phase 42 -- Cryptography: RustCrypto Crates
 
 **Current plan:** Port BearSSL (C library, ~200 KB) or TweetNaCl (C, ~4 KB).
 
 **Better plan:** Use the **RustCrypto** project's individual crates. They are
 pure Rust, `no_std` compatible, actively maintained, and provide exactly the
-primitives Phase 41 specifies.
+primitives Phase 42 specifies.
 
-| Phase 41 requirement | RustCrypto crate | `no_std` | Notes |
+| Phase 42 requirement | RustCrypto crate | `no_std` | Notes |
 |---|---|---|---|
 | SHA-256 | `sha2` | Yes | `default-features = false` for no alloc |
 | HMAC-SHA-256 | `hmac` | Yes | Generic over any hash, pairs with `sha2` |
@@ -88,7 +88,7 @@ hkdf = { version = "0.12", default-features = false }
 ```
 
 **Effort reduction:** Eliminates the entire BearSSL cross-compilation pipeline.
-No `build_bearssl()` in xtask. No C code. Phase 41 becomes "add crate
+No `build_bearssl()` in xtask. No C code. Phase 42 becomes "add crate
 dependencies and write a thin API wrapper."
 
 ```mermaid
@@ -109,7 +109,7 @@ flowchart LR
 
 ---
 
-### Phase 42 -- SSH: sunset (Pure Rust, no_std SSH)
+### Phase 43 -- SSH: sunset (Pure Rust, no_std SSH)
 
 **Current plan:** Port Dropbear SSH (C, ~110 KB static binary).
 
@@ -132,7 +132,7 @@ flowchart LR
 - **IO-less core** -- the SSH protocol logic has no I/O dependencies. You
   feed it bytes, it gives you bytes back. Perfect for integration into m3OS's
   existing socket/PTY infrastructure.
-- **Uses RustCrypto** -- if we adopt RustCrypto for Phase 41, sunset reuses
+- **Uses RustCrypto** -- if we adopt RustCrypto for Phase 42, sunset reuses
   the same crates (chacha20poly1305, ed25519-dalek, x25519-dalek, sha2)
 - **Client AND server** -- get SSH client for free (needed for `git push`
   over SSH, an alternative to HTTPS)
@@ -154,7 +154,7 @@ flowchart TD
     subgraph SUNSET ["sunset SSH library"]
         CORE["IO-less core<br/><i>no_std, no alloc</i>"]
         PROTO["SSH-2 protocol<br/><i>key exchange, auth,<br/>channels, pty</i>"]
-        CRYPTO_INT["Uses RustCrypto<br/><i>same crates as Phase 41</i>"]
+        CRYPTO_INT["Uses RustCrypto<br/><i>same crates as Phase 42</i>"]
     end
 
     subgraph ADAPTER ["m3OS adapter (thin layer)"]
@@ -220,7 +220,7 @@ BearSSL for git HTTPS, pip, npm, and Claude Code.
   fetching packages.
 
 **Note:** rustls requires `std` -- it's userspace only. The kernel crypto
-(Phase 41) uses the `no_std` RustCrypto crates directly.
+(Phase 42) uses the `no_std` RustCrypto crates directly.
 
 ---
 
@@ -250,13 +250,13 @@ BearSSL for git HTTPS, pip, npm, and Claude Code.
 - A Rust-native `fetch` or `download` tool for fetching tarballs
 - A git credential helper that does HTTPS
 - API client for the Anthropic API (Claude Code alternative path)
-- Package fetching for a ports system (Phase 44)
+- Package fetching for a ports system (Phase 45)
 
 ---
 
 ## Medium Impact: Accelerate Parts of Phases
 
-### Phase 40 -- Coreutils: uutils/coreutils
+### Phase 41 -- Coreutils: uutils/coreutils
 
 **Current plan:** Port sbase (suckless C utils, ~30-300 lines each) or write
 minimal C versions.
@@ -283,11 +283,11 @@ Rust rewrite of GNU coreutils.
   `sed`) where the algorithm matters. Write simple tools (`head`, `tail`,
   `tee`, `cut`, `tr`) by hand -- they're 30-100 lines each.
 
-This requires Phase 43 (Rust cross-compilation) to be complete first.
+This requires Phase 44 (Rust cross-compilation) to be complete first.
 
 ---
 
-### Phase 43 -- Rust Cross-Compilation: Existing Rust CLI Tools
+### Phase 44 -- Rust Cross-Compilation: Existing Rust CLI Tools
 
 **Current plan:** Document the `x86_64-unknown-linux-musl` target for Rust
 programs.
@@ -334,7 +334,7 @@ lines of inline assembly and bit manipulation. No crate needed.
 management are deeply tied to the kernel's task model. This is custom
 architecture work.
 
-### Phase 36 -- I/O Multiplexing
+### Phase 37 -- I/O Multiplexing
 **Why no crate:** You are implementing `epoll` and `select` as kernel
 syscalls. Crates like `mio` and `tokio` are *consumers* of epoll, not
 implementations of it. There is no "epoll implementation crate" because
@@ -342,33 +342,33 @@ epoll is an OS primitive. One exception worth noting: **`embassy-executor`**
 is a `no_std` async executor that could theoretically inform the design of
 an in-kernel event dispatch system, but it's not a drop-in.
 
-### Phase 37 -- Filesystem Enhancements
+### Phase 38 -- Filesystem Enhancements
 **Why no crate:** Symlinks, `/proc`, device nodes, and permission enforcement
 are VFS-layer kernel code. No crate implements these.
 
-### Phase 38 -- Unix Domain Sockets
+### Phase 39 -- Unix Domain Sockets
 **Why no crate:** AF_UNIX sockets are kernel IPC primitives. No crate
 implements them.
 
-### Phase 39 -- Threading Primitives
+### Phase 40 -- Threading Primitives
 **Why no crate:** `clone(CLONE_THREAD)`, `futex()`, and TLS are kernel
 syscall implementations. No crate provides these.
 
-### Phase 45 -- System Services
+### Phase 46 -- System Services
 **Why no crate:** No mature Rust service manager exists for embedded/toy OS
 use. Write your own -- it's straightforward init/fork/waitpid/setsid code.
 Model after runit (~2000 lines C) for simplicity.
 
-### Phase 46 -- DOOM
+### Phase 47 -- DOOM
 **Why no crate:** Uses doomgeneric (C), which requires implementing 4
 platform functions. The Rust ecosystem has no DOOM port that would be easier.
 The current plan (cross-compile doomgeneric with musl) is the right approach.
 
-### Phase 47 -- Mouse Input
+### Phase 48 -- Mouse Input
 **Why no crate:** PS/2 mouse is hardware register programming (IRQ 12,
 3-byte packets). ~100 lines of driver code. No crate needed.
 
-### Phase 48 -- Audio
+### Phase 49 -- Audio
 **Why no crate:** `cpal` and `rodio` talk to host OS audio APIs (ALSA,
 PulseAudio), not hardware. You need to program HDA or AC97 registers
 directly -- PCI BARs, DMA buffer descriptor lists, codec verbs. This is
@@ -426,7 +426,7 @@ flowchart TD
 - git (C codebase, but could use Rust transport helper for HTTPS)
 - pdpmake (already done, Phase 32)
 - ion shell (already done, Phase 21)
-- doomgeneric (Phase 46)
+- doomgeneric (Phase 47)
 
 ---
 
@@ -440,11 +440,11 @@ gantt
     dateFormat X
     axisFormat %s
 
-    section Phase 41 (Crypto)
+    section Phase 42 (Crypto)
     Add RustCrypto to kernel-core        :crit, rc, 0, 1
     CSPRNG via rand_chacha + RDRAND      :rng, after rc, 1
 
-    section Phase 42 (SSH)
+    section Phase 43 (SSH)
     Evaluate sunset feasibility          :eval, after rc, 1
     Implement sshd with sunset           :sshd, after eval, 1
     Implement ssh client with sunset     :sshc, after sshd, 1
@@ -454,7 +454,7 @@ gantt
     Add ureq HTTP client                 :http, after tls, 1
     Build fetch/download tool            :fetch, after http, 1
 
-    section Phase 43 (Rust tools)
+    section Phase 44 (Rust tools)
     Cross-compile ripgrep, fd            :tools, after tls, 1
     Extract uutils sort, find, diff      :uu, after tools, 1
 ```

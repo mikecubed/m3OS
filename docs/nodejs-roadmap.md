@@ -98,20 +98,20 @@ flowchart TD
 | `mmap(PROT_EXEC)` | Working (Phase 31) | V8 JIT code emission |
 | `mprotect()` | Not implemented | V8 JIT (RW -> RX page transitions) |
 | C++ runtime (libc++) | Not available | All of Node.js and V8 |
-| `epoll_create/ctl/wait` | Phase 36 (planned) | libuv event loop |
-| `clone(CLONE_THREAD)` | Phase 39 (planned) | libuv thread pool |
-| `futex()` | Phase 39 (planned) | libuv synchronization |
-| Thread-local storage | Phase 39 (planned) | V8 isolates |
+| `epoll_create/ctl/wait` | Phase 37 (planned) | libuv event loop |
+| `clone(CLONE_THREAD)` | Phase 40 (planned) | libuv thread pool |
+| `futex()` | Phase 40 (planned) | libuv synchronization |
+| Thread-local storage | Phase 40 (planned) | V8 isolates |
 | `/dev/urandom` / `getrandom()` | Not implemented | crypto module, V8 |
 | `eventfd()` | Not implemented | libuv async handles |
 | `timerfd_create()` | Not implemented | libuv timers |
 | `signalfd()` | Not implemented | libuv signal handling |
 | `pipe2(O_NONBLOCK)` | Partially (no O_NONBLOCK) | libuv IPC |
-| Symlinks | Phase 37 (planned) | npm, node_modules |
-| `/proc/self/exe` | Phase 37 (planned) | Node.js binary location |
-| `/dev/null` | Phase 37 (planned) | subprocess, testing |
+| Symlinks | Phase 38 (planned) | npm, node_modules |
+| `/proc/self/exe` | Phase 38 (planned) | Node.js binary location |
+| `/dev/null` | Phase 38 (planned) | subprocess, testing |
 | DNS resolution | Not implemented | `dns` module, `net.connect()` |
-| TLS/SSL | Phase 41 + new | `https`, `tls` modules |
+| TLS/SSL | Phase 42 + new | `https`, `tls` modules |
 
 ---
 
@@ -235,7 +235,7 @@ Without it, V8 cannot even initialize.
 
 ---
 
-### Phase 36 -- I/O Multiplexing (planned)
+### Phase 37 -- I/O Multiplexing (planned)
 
 **Why:** libuv's event loop is built on `epoll` (Linux). Without `epoll`,
 libuv cannot function. There is no `select()` fallback -- libuv assumes
@@ -246,7 +246,7 @@ libuv cannot function. There is no `select()` fallback -- libuv assumes
 
 ---
 
-### Phase 37 -- Filesystem Enhancements (planned)
+### Phase 38 -- Filesystem Enhancements (planned)
 
 **Why:**
 - `/proc/self/exe` -- Node.js uses this to find its own binary path
@@ -255,7 +255,7 @@ libuv cannot function. There is no `select()` fallback -- libuv assumes
 
 ---
 
-### Phase 39 -- Threading Primitives (planned)
+### Phase 40 -- Threading Primitives (planned)
 
 **Why:** libuv creates a thread pool (default 4 threads) for file system
 operations. All `fs.readFile()`, `fs.writeFile()`, `fs.stat()`, DNS lookups,
@@ -287,26 +287,26 @@ would need the OS to support C++ exceptions -- not needed for Stage 1.
 flowchart TD
     P33["Phase 33: Kernel Memory<br/><i>IN PROGRESS</i>"]
     EM["NEW: Expanded Memory<br/><i>demand paging, mprotect(),<br/>large mmap, eventfd</i>"]
-    P36["Phase 36: I/O Multiplexing<br/><i>epoll (HARD BLOCKER)</i>"]
-    P37["Phase 37: Filesystem<br/><i>/proc/self/exe, /dev/null,<br/>/dev/urandom</i>"]
-    P39["Phase 39: Threading<br/><i>clone, futex, TLS</i>"]
+    P37["Phase 37: I/O Multiplexing<br/><i>epoll (HARD BLOCKER)</i>"]
+    P38["Phase 38: Filesystem<br/><i>/proc/self/exe, /dev/null,<br/>/dev/urandom</i>"]
+    P40["Phase 40: Threading<br/><i>clone, futex, TLS</i>"]
     DI["Disk Image Expansion<br/><i>ext2 → 1 GB+</i>"]
     CC["Cross-Compile Node.js<br/><i>xtask build_node()</i>"]
     DONE(["Node.js runs inside m3OS!<br/>REPL + scripts + fs"])
 
     P33 --> EM
     EM --> CC
-    P36 -->|"REQUIRED"| CC
-    P37 --> CC
-    P39 --> CC
+    P37 -->|"REQUIRED"| CC
+    P38 --> CC
+    P40 --> CC
     DI --> CC
     CC --> DONE
 
     style P33 fill:#f9e79f,stroke:#f39c12,color:#000
     style EM fill:#fadbd8,stroke:#e74c3c,color:#000
-    style P36 fill:#fadbd8,stroke:#e74c3c,color:#000
-    style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P39 fill:#fadbd8,stroke:#e74c3c,color:#000
+    style P37 fill:#fadbd8,stroke:#e74c3c,color:#000
+    style P38 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P40 fill:#fadbd8,stroke:#e74c3c,color:#000
     style DI fill:#d5f5e3,stroke:#27ae60,color:#000
     style CC fill:#d6eaf8,stroke:#2980b9,color:#000
     style DONE fill:#27ae60,stroke:#1e8449,color:#fff
@@ -359,7 +359,7 @@ ecosystem. This is the final prerequisite for Claude Code.
 
 ## Additional Prerequisites
 
-### Phase 41 -- Crypto Primitives + TLS Library
+### Phase 42 -- Crypto Primitives + TLS Library
 
 **Why:** Node.js uses OpenSSL for all crypto operations. Options for m3OS:
 
@@ -391,7 +391,7 @@ Options:
 
 npm requirements:
 - Node.js with networking (https, dns)
-- Symlinks (Phase 37) for `node_modules/.bin/` links
+- Symlinks (Phase 38) for `node_modules/.bin/` links
 - ~50 MB disk space for npm itself
 - Write access to `/usr/lib/node_modules/` or user directory
 
@@ -401,20 +401,20 @@ npm requirements:
 flowchart TD
     S1(["Stage 1 complete<br/><i>Node.js REPL + fs works</i>"])
 
-    P41["Phase 41: Crypto<br/><i>crypto primitives</i>"]
+    P42["Phase 42: Crypto<br/><i>crypto primitives</i>"]
     TLS["NEW: TLS for Node.js<br/><i>rebuild with OpenSSL/BoringSSL</i>"]
     DNS["NEW: DNS Resolution<br/><i>c-ares or musl resolver</i>"]
     NPM["NEW: npm<br/><i>bundled on disk image</i>"]
     DONE(["Full Node.js<br/><i>npm, https, TLS,<br/>ready for Claude Code</i>"])
 
-    S1 --> P41
-    P41 --> TLS
+    S1 --> P42
+    P42 --> TLS
     TLS --> DNS
     DNS --> NPM
     NPM --> DONE
 
     style S1 fill:#27ae60,stroke:#1e8449,color:#fff
-    style P41 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P42 fill:#d6eaf8,stroke:#2980b9,color:#000
     style TLS fill:#fadbd8,stroke:#e74c3c,color:#000
     style DNS fill:#fadbd8,stroke:#e74c3c,color:#000
     style NPM fill:#fadbd8,stroke:#e74c3c,color:#000
@@ -432,14 +432,14 @@ gantt
     section Stage 1
     Phase 33 - Kernel Memory (in progress)     :active, p33, 0, 1
     NEW - Expanded Memory + mprotect           :crit, em, after p33, 1
-    Phase 36 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
-    Phase 37 - Filesystem Enhancements         :p37, after em, 1
-    Phase 39 - Threading Primitives            :crit, p39, after p36, 1
+    Phase 37 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
+    Phase 38 - Filesystem Enhancements         :p37, after em, 1
+    Phase 40 - Threading Primitives            :crit, p39, after p36, 1
     Disk Image Expansion                       :di, after p39, 1
     Cross-Compile Node.js                      :cc, after di, 1
 
     section Stage 2
-    Phase 41 - Crypto Primitives               :p41, after cc, 1
+    Phase 42 - Crypto Primitives               :p41, after cc, 1
     NEW - TLS (OpenSSL/BoringSSL)              :crit, tls, after p41, 1
     NEW - DNS Resolution (c-ares)              :dns, after tls, 1
     NEW - npm bundled                          :npm, after dns, 1
@@ -448,7 +448,7 @@ gantt
 | Stage | Phases Required | Complexity |
 |---|---|---|
 | **Stage 1: Minimal Node.js** | Phase 33, Expanded Memory, Phases 36+37+39, disk | Very high |
-| **Stage 2: Full Node.js** | Phase 41, TLS, DNS, npm | High |
+| **Stage 2: Full Node.js** | Phase 42, TLS, DNS, npm | High |
 
 **Node.js is the hardest runtime to port.** It requires almost every planned
 kernel infrastructure phase (33, 36, 37, 39) plus the new Expanded Memory

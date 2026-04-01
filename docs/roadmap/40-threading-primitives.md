@@ -1,4 +1,4 @@
-# Phase 39 - Threading Primitives
+# Phase 40 - Threading Primitives
 
 ## Milestone Goal
 
@@ -154,7 +154,7 @@ Update signal handling for thread groups:
 
 ## Companion Task List
 
-- Phase 39 Task List — *not yet created*
+- Phase 40 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

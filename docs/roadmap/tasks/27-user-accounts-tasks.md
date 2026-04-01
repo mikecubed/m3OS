@@ -228,7 +228,7 @@ Modify the boot sequence so users must log in before accessing the shell.
 | P27-T062 | Acceptance: `adduser testuser` (as root) creates a new account; logging out and logging in as `testuser` works. |
 | P27-T063 | Acceptance: `cargo xtask check` passes (clippy + fmt) with all new code. |
 | P27-T064 | Acceptance: QEMU boot validation — full login cycle works without panics or regressions. Test with both `cargo xtask run` and `cargo xtask run-gui`. |
-| P27-T065 | Write `docs/27-user-accounts.md` (design doc): kernel UID/GID model, VFS permission enforcement architecture, password hashing scheme, login flow diagram, FAT32 metadata overlay design, and how this foundation enables Phase 30 (Telnet) and Phase 42 (SSH). |
+| P27-T065 | Write `docs/27-user-accounts.md` (design doc): kernel UID/GID model, VFS permission enforcement architecture, password hashing scheme, login flow diagram, FAT32 metadata overlay design, and how this foundation enables Phase 30 (Telnet) and Phase 43 (SSH). |
 
 ---
 

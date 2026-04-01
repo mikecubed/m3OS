@@ -252,7 +252,7 @@ stdlib alongside TCC and other tools.
 
 ---
 
-### `/dev/urandom` (Phase 37 or standalone)
+### `/dev/urandom` (Phase 38 or standalone)
 
 Python's `os.urandom()` reads from `/dev/urandom` or calls `getrandom()`.
 Without either, `import random` works (uses Mersenne Twister with time seed)
@@ -291,9 +291,9 @@ flowchart TD
 ```
 
 **Notably, Stage 1 Python does NOT require:**
-- Threading (Phase 39) -- CPython has the GIL, works single-threaded
-- epoll (Phase 36) -- Python falls back to `select()` or blocking I/O
-- Symlinks (Phase 37) -- only needed for venv/pip
+- Threading (Phase 40) -- CPython has the GIL, works single-threaded
+- epoll (Phase 37) -- Python falls back to `select()` or blocking I/O
+- Symlinks (Phase 38) -- only needed for venv/pip
 - C++ runtime -- CPython is pure C
 - TLS/crypto -- only needed for pip/https
 
@@ -344,34 +344,34 @@ m3OS.
 
 | Module | Requires | Phase |
 |---|---|---|
-| `threading` | `clone(CLONE_THREAD)`, `futex()`, TLS | Phase 39 |
-| `asyncio` | `epoll` or `select` | Phase 36 |
-| `selectors` | `epoll` or `select` | Phase 36 |
+| `threading` | `clone(CLONE_THREAD)`, `futex()`, TLS | Phase 40 |
+| `asyncio` | `epoll` or `select` | Phase 37 |
+| `selectors` | `epoll` or `select` | Phase 37 |
 | `socket` (DNS) | DNS resolver (stub or full) | New |
-| `ssl` | TLS library (BearSSL or mbedTLS) | Phase 41 + new |
-| `http.client` | `socket` + `ssl` | Phase 41 + new |
-| `urllib` | `http.client` + `ssl` | Phase 41 + new |
-| `pip` | `urllib` + `ssl` + symlinks + `/tmp` | Phase 37 + 41 + new |
-| `venv` | symlinks | Phase 37 |
-| `subprocess` | `/dev/null`, robust pipe handling | Phase 37 |
-| `multiprocessing` | Unix domain sockets, `fork` | Phase 38 |
+| `ssl` | TLS library (BearSSL or mbedTLS) | Phase 42 + new |
+| `http.client` | `socket` + `ssl` | Phase 42 + new |
+| `urllib` | `http.client` + `ssl` | Phase 42 + new |
+| `pip` | `urllib` + `ssl` + symlinks + `/tmp` | Phase 38 + 41 + new |
+| `venv` | symlinks | Phase 38 |
+| `subprocess` | `/dev/null`, robust pipe handling | Phase 38 |
+| `multiprocessing` | Unix domain sockets, `fork` | Phase 39 |
 
 ## Additional Prerequisites
 
-### Phase 36 -- I/O Multiplexing
+### Phase 37 -- I/O Multiplexing
 
 **Why:** Python's `asyncio` module uses `epoll` on Linux (with `select` as
 fallback). Without `epoll`, asyncio works but performs poorly. More
 importantly, any async networking (HTTP servers, concurrent downloads) needs
 multiplexed I/O.
 
-### Phase 37 -- Filesystem Enhancements
+### Phase 38 -- Filesystem Enhancements
 
 **Why:** `pip` creates virtualenvs using symlinks. `subprocess` needs
 `/dev/null`. Many Python tools expect `/proc/self/fd/` for file descriptor
 introspection.
 
-### Phase 39 -- Threading Primitives
+### Phase 40 -- Threading Primitives
 
 **Why:** `import threading` calls `clone(CLONE_THREAD)`. Python's GIL means
 only one thread runs Python code at a time, but threads are used for:
@@ -380,12 +380,12 @@ only one thread runs Python code at a time, but threads are used for:
 - `threading.Timer`
 - Libraries that release the GIL during C calls
 
-### Phase 41 + NEW: TLS Support
+### Phase 42 + NEW: TLS Support
 
 **Why:** `pip install` requires HTTPS. Python's `ssl` module wraps a TLS
 library (usually OpenSSL). Options:
 
-1. **BearSSL** -- ~200 KB, minimal, portable. Already recommended in Phase 41.
+1. **BearSSL** -- ~200 KB, minimal, portable. Already recommended in Phase 42.
    Build a Python `_ssl` extension module against BearSSL.
 2. **mbedTLS** -- ~500 KB, more complete. Better compatibility with Python's
    `ssl` module expectations.
@@ -407,36 +407,36 @@ library (usually OpenSSL). Options:
 flowchart TD
     S1(["Stage 1 complete<br/><i>basic Python works</i>"])
 
-    P36["Phase 36: I/O Multiplexing<br/><i>epoll, select, O_NONBLOCK</i>"]
-    P37["Phase 37: Filesystem<br/><i>symlinks, /dev/null, /proc</i>"]
-    P38["Phase 38: Unix Domain Sockets<br/><i>AF_UNIX, socketpair</i>"]
-    P39["Phase 39: Threading<br/><i>clone, futex, TLS, pthreads</i>"]
-    P41["Phase 41: Crypto<br/><i>BearSSL, SHA-256, AES</i>"]
+    P37["Phase 37: I/O Multiplexing<br/><i>epoll, select, O_NONBLOCK</i>"]
+    P38["Phase 38: Filesystem<br/><i>symlinks, /dev/null, /proc</i>"]
+    P39["Phase 39: Unix Domain Sockets<br/><i>AF_UNIX, socketpair</i>"]
+    P40["Phase 40: Threading<br/><i>clone, futex, TLS, pthreads</i>"]
+    P42["Phase 42: Crypto<br/><i>BearSSL, SHA-256, AES</i>"]
 
     TLS["NEW: TLS for Python<br/><i>_ssl module + BearSSL/mbedTLS</i>"]
     DNS["NEW: DNS Resolution<br/><i>stub resolver or musl resolv</i>"]
     DONE(["Full Python<br/><i>threading, asyncio, pip,<br/>ssl, networking</i>"])
 
-    S1 --> P36
     S1 --> P37
     S1 --> P38
     S1 --> P39
-    S1 --> P41
+    S1 --> P40
+    S1 --> P42
 
-    P41 --> TLS
-    P36 --> DONE
+    P42 --> TLS
     P37 --> DONE
     P38 --> DONE
     P39 --> DONE
+    P40 --> DONE
     TLS --> DONE
     DNS --> DONE
 
     style S1 fill:#27ae60,stroke:#1e8449,color:#fff
-    style P36 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P38 fill:#d6eaf8,stroke:#2980b9,color:#000
     style P39 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P41 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P40 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P42 fill:#d6eaf8,stroke:#2980b9,color:#000
     style TLS fill:#fadbd8,stroke:#e74c3c,color:#000
     style DNS fill:#fadbd8,stroke:#e74c3c,color:#000
     style DONE fill:#27ae60,stroke:#1e8449,color:#fff
@@ -457,11 +457,11 @@ gantt
     Cross-Compile CPython (xtask)              :cc, after di, 1
 
     section Stage 2
-    Phase 36 - I/O Multiplexing                :p36, after cc, 1
-    Phase 37 - Filesystem Enhancements         :p37, after cc, 1
-    Phase 38 - Unix Domain Sockets             :p38, after p37, 1
-    Phase 39 - Threading Primitives            :p39, after cc, 1
-    Phase 41 - Crypto Primitives               :p41, after cc, 1
+    Phase 37 - I/O Multiplexing                :p36, after cc, 1
+    Phase 38 - Filesystem Enhancements         :p37, after cc, 1
+    Phase 39 - Unix Domain Sockets             :p38, after p37, 1
+    Phase 40 - Threading Primitives            :p39, after cc, 1
+    Phase 42 - Crypto Primitives               :p41, after cc, 1
     NEW - TLS for Python                       :crit, tls, after p41, 1
     NEW - DNS Resolution                       :crit, dns, after tls, 1
 ```

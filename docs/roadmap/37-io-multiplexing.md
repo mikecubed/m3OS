@@ -1,4 +1,4 @@
-# Phase 36 - I/O Multiplexing
+# Phase 37 - I/O Multiplexing
 
 ## Milestone Goal
 
@@ -135,7 +135,7 @@ Extend `fcntl()` to support:
 
 ## Companion Task List
 
-- Phase 36 Task List — *not yet created*
+- Phase 37 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

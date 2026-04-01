@@ -78,45 +78,56 @@ flowchart TD
     P15 --> P34["34. Real-Time Clock"]
     P25 --> P35["35. True SMP"]
     P33 --> P35
-    P23 --> P36["36. I/O Multiplexing"]
-    P22 --> P36
-    P35 --> P36
-    P28 --> P37["37. Filesystem Enhancements"]
-    P27 --> P37
-    P23 --> P38["38. Unix Domain Sockets"]
-    P37 --> P38
-    P36 --> P38
-    P35 --> P39["39. Threading"]
-    P33 --> P39
+    P33 --> P36["36. Expanded Memory"]
+    P23 --> P37["37. I/O Multiplexing"]
+    P22 --> P37
+    P35 --> P37
+    P28 --> P38["38. Filesystem Enhancements"]
+    P27 --> P38
+    P23 --> P39["39. Unix Domain Sockets"]
+    P38 --> P39
+    P37 --> P39
+    P35 --> P40["40. Threading"]
+    P33 --> P40
 
     %% Application phases
-    P14 --> P40["40. Expanded Coreutils"]
-    P27 --> P40
-    P37 --> P40
-    P31 --> P41["41. Crypto Primitives"]
-    P41 --> P42["42. SSH Server"]
-    P29 --> P42
-    P27 --> P42
-    P36 --> P42
-    P12 --> P43["43. Rust Cross-Compilation"]
-    P24 --> P43
-    P31 --> P44["44. Ports System"]
-    P32 --> P44
-    P40 --> P44
-    P27 --> P45["45. System Services"]
-    P30 --> P45
-    P24 --> P45
-    P34 --> P45
-    P38 --> P45
+    P14 --> P41["41. Expanded Coreutils"]
+    P27 --> P41
+    P38 --> P41
+    P31 --> P42["42. Crypto and TLS"]
+    P42 --> P43["43. SSH"]
+    P29 --> P43
+    P27 --> P43
+    P37 --> P43
+    P12 --> P44["44. Rust Cross-Compilation"]
+    P24 --> P44
+    P31 --> P45["45. Ports System"]
+    P32 --> P45
+    P41 --> P45
+    P27 --> P46["46. System Services"]
+    P30 --> P46
+    P24 --> P46
+    P34 --> P46
+    P39 --> P46
 
     %% Showcase phases
-    P12 --> P46["46. DOOM"]
-    P24 --> P46
-    P9 --> P46
-    P15 --> P47["47. Mouse Input"]
-    P46 -.->|optional| P47
-    P15 --> P48["48. Audio"]
-    P46 -.->|optional| P48
+    P12 --> P47["47. DOOM"]
+    P24 --> P47
+    P9 --> P47
+    P15 --> P48["48. Mouse Input"]
+    P47 -.->|optional| P48
+    P15 --> P49["49. Audio"]
+    P47 -.->|optional| P49
+
+    %% Cross-compiled toolchains and runtimes
+    P36 --> P50["50. Cross-Compiled Toolchains"]
+    P50 --> P51["51. Networking and GitHub"]
+    P42 --> P51
+    P37 --> P51
+    P40 --> P51
+    P51 --> P52["52. Node.js"]
+    P52 --> P53["53. Claude Code"]
+    P50 --> P53
 ```
 
 ## Detailed Phase Pages
@@ -162,7 +173,7 @@ flowchart TD
 | 24 | virtio-blk driver, FAT32 read/write, persistent `/data` | [Persistent Storage](./roadmap/24-persistent-storage.md) |
 | 25 | AP startup, per-core scheduler, TLB shootdown | [SMP](./roadmap/25-smp.md) |
 
-### Productivity Phases (planned — "do real work inside the OS")
+### Productivity Phases (planned -- "do real work inside the OS")
 
 | Phase | Focus | Link |
 |---|---|---|
@@ -174,36 +185,46 @@ flowchart TD
 | 31 | TCC compiles C programs and itself inside the OS | [Compiler Bootstrap](./roadmap/31-compiler-bootstrap.md) |
 | 32 | make, ar, and scripting for multi-file projects | [Build Tools](./roadmap/32-build-tools.md) |
 
-### Kernel Infrastructure Phases (planned — "Linux/Unix compatibility and performance")
+### Kernel Infrastructure Phases (planned -- "Linux/Unix compatibility and performance")
 
 | Phase | Focus | Link |
 |---|---|---|
 | 33 | Slab allocator, OOM retry, working munmap, heap coalescing | [Kernel Memory Improvements](./roadmap/33-kernel-memory-improvements.md) |
 | 34 | CMOS RTC driver, wall-clock time, CLOCK_REALTIME | [Real-Time Clock](./roadmap/34-real-time-clock.md) |
 | 35 | Per-core syscall stacks, multi-core dispatch, priorities, load balancing | [True SMP Multitasking](./roadmap/35-true-smp-multitasking.md) |
-| 36 | select, epoll, non-blocking I/O | [I/O Multiplexing](./roadmap/36-io-multiplexing.md) |
-| 37 | Symlinks, hard links, /proc, permission enforcement, device nodes | [Filesystem Enhancements](./roadmap/37-filesystem-enhancements.md) |
-| 38 | AF_UNIX stream and datagram sockets, socketpair | [Unix Domain Sockets](./roadmap/38-unix-domain-sockets.md) |
-| 39 | clone CLONE_THREAD, futex, TLS, thread groups | [Threading Primitives](./roadmap/39-threading-primitives.md) |
+| 36 | Demand paging, mprotect, large mmap, disk/RAM expansion | [Expanded Memory](./roadmap/36-expanded-memory.md) |
+| 37 | select, epoll, non-blocking I/O | [I/O Multiplexing](./roadmap/37-io-multiplexing.md) |
+| 38 | Symlinks, hard links, /proc, permission enforcement, device nodes | [Filesystem Enhancements](./roadmap/38-filesystem-enhancements.md) |
+| 39 | AF_UNIX stream and datagram sockets, socketpair | [Unix Domain Sockets](./roadmap/39-unix-domain-sockets.md) |
+| 40 | clone CLONE_THREAD, futex, TLS, thread groups | [Threading Primitives](./roadmap/40-threading-primitives.md) |
 
-### Application Phases (planned — "ecosystem and services")
-
-| Phase | Focus | Link |
-|---|---|---|
-| 40 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/40-expanded-coreutils.md) |
-| 41 | SHA-256, Ed25519, X25519, ChaCha20 crypto library | [Crypto Primitives](./roadmap/41-crypto-primitives.md) |
-| 42 | SSH server for encrypted remote access | [SSH Server](./roadmap/42-ssh-server.md) |
-| 43 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/43-rust-cross-compilation.md) |
-| 44 | Source-based ports tree for building third-party software | [Ports System](./roadmap/44-ports-system.md) |
-| 45 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/45-system-services.md) |
-
-### Showcase Phases (planned — "it runs DOOM")
+### Application Phases (planned -- "ecosystem and services")
 
 | Phase | Focus | Link |
 |---|---|---|
-| 46 | DOOM runs inside the OS with framebuffer and keyboard | [DOOM](./roadmap/46-doom.md) |
-| 47 | PS/2 mouse driver for graphical programs | [Mouse Input](./roadmap/47-mouse-input.md) |
-| 48 | Sound card driver (HDA/AC97) for audio output | [Audio](./roadmap/48-audio.md) |
+| 41 | head, tail, sort, find, diff, ps, less, and more | [Expanded Coreutils](./roadmap/41-expanded-coreutils.md) |
+| 42 | RustCrypto + rustls + TLS 1.3 | [Crypto and TLS](./roadmap/42-crypto-primitives.md) |
+| 43 | SSH client and server (sunset or Dropbear) | [SSH](./roadmap/43-ssh-server.md) |
+| 44 | Rust programs cross-compiled on host run in the OS | [Rust Cross-Compilation](./roadmap/44-rust-cross-compilation.md) |
+| 45 | Source-based ports tree for building third-party software | [Ports System](./roadmap/45-ports-system.md) |
+| 46 | Service manager, syslog, cron, shutdown/reboot | [System Services](./roadmap/46-system-services.md) |
+
+### Showcase Phases (planned -- "it runs DOOM")
+
+| Phase | Focus | Link |
+|---|---|---|
+| 47 | DOOM runs inside the OS with framebuffer and keyboard | [DOOM](./roadmap/47-doom.md) |
+| 48 | PS/2 mouse driver for graphical programs | [Mouse Input](./roadmap/48-mouse-input.md) |
+| 49 | Sound card driver (HDA/AC97) for audio output | [Audio](./roadmap/49-audio.md) |
+
+### Cross-Compiled Runtimes (planned -- "real tools and AI agents")
+
+| Phase | Focus | Link |
+|---|---|---|
+| 50 | git, Python, Clang cross-compiled and bundled on disk | [Cross-Compiled Toolchains](./roadmap/50-cross-compiled-toolchains.md) |
+| 51 | GitHub CLI (gh), git HTTPS, DNS resolution | [Networking and GitHub](./roadmap/51-networking-and-github.md) |
+| 52 | Node.js with V8 and libuv | [Node.js](./roadmap/52-nodejs.md) |
+| 53 | Claude Code AI agent running on m3OS | [Claude Code](./roadmap/53-claude-code.md) |
 
 ## Documentation Expectation Per Phase
 
@@ -223,3 +244,10 @@ Each phase should produce documentation that explains:
 - [Userspace & Syscalls](./07-userspace.md)
 - [Testing](./09-testing.md)
 - [OS State Analysis](./17-os-state-analysis.md)
+- [Clang/LLVM Roadmap](./clang-llvm-roadmap.md)
+- [Python Roadmap](./python-roadmap.md)
+- [Node.js Roadmap](./nodejs-roadmap.md)
+- [git Roadmap](./git-roadmap.md)
+- [GitHub CLI Roadmap](./github-cli-roadmap.md)
+- [Claude Code Roadmap](./claude-code-roadmap.md)
+- [Rust Crate Acceleration](./rust-crate-acceleration.md)

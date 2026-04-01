@@ -111,15 +111,15 @@ blocking):
 
 | Requirement | Go runtime component | Status in m3OS |
 |---|---|---|
-| `clone(CLONE_THREAD)` | Goroutine scheduler (M:N threading) | Phase 39 (planned) |
-| `futex()` | Goroutine synchronization | Phase 39 (planned) |
-| `epoll_create/ctl/wait` | Network poller (netpoll) | Phase 36 (planned) |
+| `clone(CLONE_THREAD)` | Goroutine scheduler (M:N threading) | Phase 40 (planned) |
+| `futex()` | Goroutine synchronization | Phase 40 (planned) |
+| `epoll_create/ctl/wait` | Network poller (netpoll) | Phase 37 (planned) |
 | `mmap()` / `munmap()` | Heap, stack allocation | Phase 33 (in progress) |
 | `mprotect()` | Stack guard pages | Expanded Memory (new) |
 | `sigaction` / signals | Goroutine preemption (SIGURG) | Working (Phase 19) |
 | `pipe2()` | Internal communication | Working |
 | `getrandom()` | Crypto/rand | Needs implementation |
-| Thread-local storage | Per-M state | Phase 39 (planned) |
+| Thread-local storage | Per-M state | Phase 40 (planned) |
 
 **Key difference from Node.js:** Go does NOT need a JIT or `mmap(PROT_EXEC)`.
 The Go runtime is ahead-of-time compiled. This means `gh` avoids V8's
@@ -246,7 +246,7 @@ gh needs the same kernel infrastructure as Node.js minus the JIT:
 for its heap and goroutine stacks. `mprotect()` is used for stack guard
 pages (not JIT -- Go is AOT compiled).
 
-### Phase 36 -- I/O Multiplexing (planned)
+### Phase 37 -- I/O Multiplexing (planned)
 
 **Why:** Go's network poller (`netpoll`) uses `epoll` on Linux. All network
 I/O (HTTP requests to GitHub API) goes through the netpoller. Unlike
@@ -255,14 +255,14 @@ but it's not used on Linux and may not work reliably.
 
 **This is a hard blocker** for any network operation.
 
-### Phase 37 -- Filesystem Enhancements (planned)
+### Phase 38 -- Filesystem Enhancements (planned)
 
 **Why:**
 - `/dev/null` -- Go's `os/exec` uses it for suppressed stdio
 - `/proc/self/exe` -- Go reads this during initialization
 - Symlinks -- used by git (gh wraps git operations)
 
-### Phase 39 -- Threading Primitives (planned)
+### Phase 40 -- Threading Primitives (planned)
 
 **Why:** Go's runtime creates OS threads (called "M"s in Go terminology)
 for its goroutine scheduler. The scheduler is M:N -- many goroutines
@@ -303,9 +303,9 @@ curl, no CA bundle needed.** Everything is in the binary.
 flowchart TD
     P33["Phase 33: Kernel Memory<br/><i>IN PROGRESS</i>"]
     EM["NEW: Expanded Memory<br/><i>demand paging, mprotect</i>"]
-    P36["Phase 36: I/O Multiplexing<br/><i>epoll (HARD BLOCKER)</i>"]
-    P37["Phase 37: Filesystem<br/><i>/proc/self/exe, /dev/null</i>"]
-    P39["Phase 39: Threading<br/><i>clone, futex, TLS</i>"]
+    P37["Phase 37: I/O Multiplexing<br/><i>epoll (HARD BLOCKER)</i>"]
+    P38["Phase 38: Filesystem<br/><i>/proc/self/exe, /dev/null</i>"]
+    P40["Phase 40: Threading<br/><i>clone, futex, TLS</i>"]
     DI["Disk Image Expansion<br/><i>ext2 → 512 MB+</i>"]
     RESOLV["/etc/resolv.conf<br/><i>nameserver 10.0.2.3</i>"]
     CC["Cross-Compile gh<br/><i>one Go command</i>"]
@@ -314,12 +314,12 @@ flowchart TD
     GIT["git (Stage 2)<br/><i>for clone/push/pull</i>"]
 
     P33 --> EM
-    EM --> P36
     EM --> P37
-    EM --> P39
-    P36 --> CC
+    EM --> P38
+    EM --> P40
     P37 --> CC
-    P39 --> CC
+    P38 --> CC
+    P40 --> CC
     DI --> CC
     RESOLV --> CC
     CC --> DONE
@@ -327,9 +327,9 @@ flowchart TD
 
     style P33 fill:#f9e79f,stroke:#f39c12,color:#000
     style EM fill:#fadbd8,stroke:#e74c3c,color:#000
-    style P36 fill:#fadbd8,stroke:#e74c3c,color:#000
-    style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
-    style P39 fill:#fadbd8,stroke:#e74c3c,color:#000
+    style P37 fill:#fadbd8,stroke:#e74c3c,color:#000
+    style P38 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P40 fill:#fadbd8,stroke:#e74c3c,color:#000
     style DI fill:#d5f5e3,stroke:#27ae60,color:#000
     style RESOLV fill:#d5f5e3,stroke:#27ae60,color:#000
     style CC fill:#d6eaf8,stroke:#2980b9,color:#000
@@ -422,12 +422,12 @@ gantt
     Disk Expansion + Cross-Compile git         :git1, after em, 1
 
     section Network Infrastructure
-    Phase 36 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
-    Phase 37 - Filesystem Enhancements         :p37, after em, 1
-    Phase 39 - Threading Primitives            :crit, p39, after p36, 1
+    Phase 37 - I/O Multiplexing (epoll)        :crit, p36, after em, 1
+    Phase 38 - Filesystem Enhancements         :p37, after em, 1
+    Phase 40 - Threading Primitives            :crit, p39, after p36, 1
 
     section Remote git (Stage 2)
-    Phase 41 - Crypto Primitives               :p41, after p39, 1
+    Phase 42 - Crypto Primitives               :p41, after p39, 1
     TLS + DNS + curl + CA certs                :crit, tls, after p41, 1
     Rebuild git with HTTPS                     :git2, after tls, 1
 
@@ -439,7 +439,7 @@ gantt
 | Component | Prerequisites | Complexity |
 |---|---|---|
 | **git (local)** | Phase 33 + Expanded Memory + disk | Low-moderate |
-| **git (HTTPS)** | + Phase 41, TLS, DNS, curl, CA | High |
+| **git (HTTPS)** | + Phase 42, TLS, DNS, curl, CA | High |
 | **gh** | Phase 33 + Expanded Memory + Phases 36, 37, 39 | Moderate |
 
 **Ordering recommendation:**

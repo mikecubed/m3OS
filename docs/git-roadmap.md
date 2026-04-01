@@ -25,7 +25,7 @@ flowchart LR
     end
 
     TODAY -->|"Phase 33 +<br/>Expanded Memory +<br/>disk expansion"| STAGE1
-    STAGE1 -->|"Phase 41 + TLS +<br/>DNS"| STAGE2
+    STAGE1 -->|"Phase 42 + TLS +<br/>DNS"| STAGE2
 
     style TODAY fill:#f9e79f,stroke:#f39c12,color:#000
     style STAGE1 fill:#d6eaf8,stroke:#2980b9,color:#000
@@ -61,14 +61,14 @@ requirements:
 | `/tmp` directory | Temporary files during merge | Working (tmpfs) |
 | `rename()` | Atomic file updates | Working |
 | `chmod()` | Executable bit tracking | Working (ext2) |
-| `readlink()` | Symlink resolution | Phase 37 (planned) |
+| `readlink()` | Symlink resolution | Phase 38 (planned) |
 | `mkstemp()` | Temporary file creation | Should work via musl |
 | SHA-1 / SHA-256 | Object hashing | Built-in (no external lib needed) |
 | `zlib` | Object compression, pack files | Must be statically linked |
 | Regex | `git grep`, `.gitignore` | Built-in or musl regex |
-| `select()` / `poll()` | Pager, interactive commands | Phase 36 (planned) |
+| `select()` / `poll()` | Pager, interactive commands | Phase 37 (planned) |
 | POSIX shell (`/bin/sh`) | git scripts, hooks | Working (sh0/ion) |
-| `less` / pager | `git log`, `git diff` output | Phase 40 (planned) |
+| `less` / pager | `git log`, `git diff` output | Phase 41 (planned) |
 
 **Key insight:** Local git operations (init, add, commit, log, diff, status,
 branch, merge) need almost nothing beyond what m3OS already has. The main
@@ -287,21 +287,21 @@ flowchart TD
     CC["Cross-Compile git<br/><i>xtask build_git()</i>"]
     DONE(["Local git works!<br/>init, add, commit, log,<br/>diff, branch, merge"])
 
-    P37["Phase 37: Filesystem<br/><i>symlinks, /dev/null</i>"]
+    P38["Phase 38: Filesystem<br/><i>symlinks, /dev/null</i>"]
 
     P33 --> EM
     EM --> DI
     DI --> CC
     CC --> DONE
 
-    P37 -.->|"optional:<br/>symlinks for<br/>worktrees"| DONE
+    P38 -.->|"optional:<br/>symlinks for<br/>worktrees"| DONE
 
     style P33 fill:#f9e79f,stroke:#f39c12,color:#000
     style EM fill:#fadbd8,stroke:#e74c3c,color:#000
     style DI fill:#d5f5e3,stroke:#27ae60,color:#000
     style CC fill:#d6eaf8,stroke:#2980b9,color:#000
     style DONE fill:#27ae60,stroke:#1e8449,color:#fff
-    style P37 fill:#e8daef,stroke:#8e44ad,color:#000
+    style P38 fill:#e8daef,stroke:#8e44ad,color:#000
 ```
 
 **Stage 1 has the same prerequisites as Stage 1 Python** -- just Phase 33 +
@@ -427,7 +427,7 @@ make -j$(nproc) \
 This requires cross-compiled static libraries:
 - **libcurl** (~1 MB static) -- HTTP/HTTPS client
 - **A TLS library** -- one of:
-  - BearSSL (~200 KB) -- minimal, recommended by Phase 41
+  - BearSSL (~200 KB) -- minimal, recommended by Phase 42
   - mbedTLS (~500 KB) -- more complete
   - OpenSSL/LibreSSL (~3 MB) -- most compatible with curl
 - **zlib** (~100 KB) -- already needed by git itself
@@ -480,9 +480,9 @@ TLS requires a CA certificate bundle to verify server certificates.
 The Mozilla CA bundle can be downloaded and bundled on the disk image.
 git reads `GIT_SSL_CAINFO` or `/etc/ssl/certs/ca-certificates.crt`.
 
-### Phase 41 -- Crypto Primitives (planned)
+### Phase 42 -- Crypto Primitives (planned)
 
-**Why:** Foundation for the TLS library. Phase 41 delivers the low-level
+**Why:** Foundation for the TLS library. Phase 42 delivers the low-level
 crypto (AES, ChaCha20, SHA-256, key exchange) that TLS builds on.
 
 ---
@@ -508,7 +508,7 @@ For `git push`, the user needs to authenticate. Options:
 flowchart TD
     S1(["Stage 1 complete<br/><i>local git works</i>"])
 
-    P41["Phase 41: Crypto<br/><i>primitives</i>"]
+    P42["Phase 42: Crypto<br/><i>primitives</i>"]
     TLS["NEW: TLS Library<br/><i>mbedTLS or OpenSSL</i>"]
     DNS["NEW: DNS Resolution<br/><i>musl resolver +<br/>/etc/resolv.conf</i>"]
     CURL["NEW: libcurl<br/><i>HTTPS client</i>"]
@@ -516,8 +516,8 @@ flowchart TD
     REBUILD["Rebuild git with<br/>curl + TLS"]
     DONE(["Remote git works!<br/>clone, push, pull<br/>over HTTPS"])
 
-    S1 --> P41
-    P41 --> TLS
+    S1 --> P42
+    P42 --> TLS
     TLS --> CURL
     CURL --> REBUILD
     DNS --> REBUILD
@@ -525,7 +525,7 @@ flowchart TD
     REBUILD --> DONE
 
     style S1 fill:#27ae60,stroke:#1e8449,color:#fff
-    style P41 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P42 fill:#d6eaf8,stroke:#2980b9,color:#000
     style TLS fill:#fadbd8,stroke:#e74c3c,color:#000
     style DNS fill:#fadbd8,stroke:#e74c3c,color:#000
     style CURL fill:#fadbd8,stroke:#e74c3c,color:#000
@@ -576,7 +576,7 @@ gantt
     Cross-Compile git (local only)             :git1, after di, 1
 
     section Stage 2 - Remote
-    Phase 41 - Crypto Primitives               :p41, after git1, 1
+    Phase 42 - Crypto Primitives               :p41, after git1, 1
     NEW - TLS Library (mbedTLS/OpenSSL)        :crit, tls, after p41, 1
     NEW - DNS + /etc/resolv.conf               :dns, after tls, 1
     NEW - libcurl + CA certs                   :curl, after dns, 1
@@ -586,7 +586,7 @@ gantt
 | Stage | Phases Required | Complexity |
 |---|---|---|
 | **Stage 1: Local git** | Phase 33 + Expanded Memory + disk | Low-moderate |
-| **Stage 2: Remote git** | Phase 41 + TLS + DNS + curl + CA | High |
+| **Stage 2: Remote git** | Phase 42 + TLS + DNS + curl + CA | High |
 
 **Stage 1 is very achievable** -- git is pure C, works single-threaded,
 and local operations have minimal OS requirements. It shares prerequisites
@@ -602,6 +602,6 @@ and Claude Code.
 - **git-lfs** -- large file storage; not needed
 - **Perl/Python git extensions** -- `git svn`, `git p4`, etc.
 - **gitweb** -- web interface
-- **SSH transport** -- HTTPS is sufficient (SSH requires Phase 42)
+- **SSH transport** -- HTTPS is sufficient (SSH requires Phase 43)
 - **git gui / gitk** -- no GUI
 - **git-send-email** -- no SMTP support

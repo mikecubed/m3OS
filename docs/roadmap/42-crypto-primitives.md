@@ -1,9 +1,9 @@
-# Phase 41 - Cryptography Primitives
+# Phase 42 - Cryptography Primitives
 
 ## Milestone Goal
 
 The OS has a cryptography library providing hash functions, symmetric encryption, and
-asymmetric key operations. This is the foundation layer that SSH (Phase 42) and future
+asymmetric key operations. This is the foundation layer that SSH (Phase 43) and future
 security features build upon.
 
 ## Learning Goals
@@ -47,17 +47,32 @@ userspace programs can link against:
 
 ### Implementation Strategy
 
-**Option A: Port BearSSL (recommended)**
+**Option A: RustCrypto crates (recommended)**
+
+Use the RustCrypto project's individual crates. They are pure Rust, `no_std`
+compatible, actively maintained, and provide exactly the primitives this phase needs.
+No C cross-compilation required. See [Rust Crate Acceleration](../rust-crate-acceleration.md).
+
+| Primitive | Crate | `no_std` |
+|---|---|---|
+| SHA-256 | `sha2` | Yes |
+| HMAC-SHA-256 | `hmac` | Yes |
+| HKDF | `hkdf` | Yes |
+| ChaCha20-Poly1305 | `chacha20poly1305` | Yes |
+| AES-128/256 | `aes` + `ctr` | Yes |
+| Ed25519 | `ed25519-dalek` | Yes (with `alloc`) |
+| X25519 | `x25519-dalek` | Yes |
+| CSPRNG | `rand_chacha` | Yes |
+
+For TLS (userspace), add `rustls` + `webpki-roots` which embeds Mozilla CA
+certificates directly in the binary — no cert files on disk needed.
+
+**Option B: Port BearSSL**
 
 [BearSSL](https://bearssl.org/) is a minimal, portable TLS library in C with no
 dependencies beyond libc. It includes all the primitives listed above and is designed
-for constrained environments. Cross-compile with musl.
-
-**Option B: Port TweetNaCl + minimal additions**
-
-[TweetNaCl](https://tweetnacl.cr.yp.to/) is a complete crypto library in 100 tweets
-(~4KB of C). It provides X25519, Ed25519, Salsa20, and Poly1305. Add SHA-256 and
-AES from a minimal implementation.
+for constrained environments. Cross-compile with musl. This is the fallback if
+RustCrypto integration proves problematic.
 
 **Option C: Write from scratch (maximum learning)**
 
@@ -86,7 +101,7 @@ most but takes the longest. Reserve for stretch goals.
 5. Verify X25519 key exchange with test vectors.
 6. Verify AES or ChaCha20 with test vectors.
 7. Build `sha256sum` and `genkey` utilities.
-8. Document the library's API for use by the SSH server in Phase 42.
+8. Document the library's API for use by the SSH server in Phase 43.
 
 ## Acceptance Criteria
 
@@ -100,7 +115,7 @@ most but takes the longest. Reserve for stretch goals.
 
 ## Companion Task List
 
-- Phase 41 Task List — *not yet created*
+- Phase 42 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 
