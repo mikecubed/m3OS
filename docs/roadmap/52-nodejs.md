@@ -62,8 +62,8 @@ architecture diagrams and OS requirement comparisons.
 - **Phase 37** (I/O Multiplexing) — `epoll` for libuv event loop (**hard blocker**)
 - **Phase 38** (Filesystem Enhancements) — `/proc/self/exe`, `/dev/null`, `/dev/urandom`
 - **Phase 40** (Threading Primitives) — `clone(CLONE_THREAD)`, `futex` for libuv thread pool
-- **Phase 42** (Crypto and TLS) — for Stage 2 (OpenSSL/BoringSSL rebuild)
-- **Phase 51** (Networking and GitHub) — DNS resolution, `getrandom()` for Stage 2
+- **Phase 42** (Crypto and TLS) — core crypto primitives + rustls-based TLS; Node's OpenSSL/BoringSSL stack in Stage 2 is built on top of this within Phase 52
+- **Phase 51** (Networking and GitHub) — DNS resolution and `getrandom()` seeding support used by Stage 2 networking
 
 ## Acceptance Criteria
 

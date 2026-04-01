@@ -61,7 +61,7 @@ primitives Phase 42 specifies.
 | AES-128/256 | `aes` + `ctr` or `cbc` | Yes | Block cipher + mode crates |
 | Ed25519 signatures | `ed25519-dalek` | Yes | `features = ["alloc"]` for no_std |
 | X25519 key exchange | `x25519-dalek` | Yes | Built on `curve25519-dalek` |
-| CSPRNG | `rand_chacha` | Yes | ChaCha20-based, seed from RDRAND |
+| CSPRNG | `rand_chacha` | Yes | ChaCha20-based, seed from `getrandom()` syscall (upgrade to RDRAND-backed planned) |
 
 **Why this is better than BearSSL:**
 - **Pure Rust** -- no C cross-compilation, no musl dependency for kernel use
@@ -463,10 +463,10 @@ gantt
 
 | Phase | Current Plan | Rust Crate Alternative | Impact | Effort Saved |
 |---|---|---|---|---|
-| **41 (Crypto)** | Port BearSSL (C) | RustCrypto crates (no_std) | **High** | Eliminates C cross-compile |
-| **42 (SSH)** | Port Dropbear (C) | sunset (no_std Rust SSH) | **High** | Eliminates C cross-compile, get client+server |
+| **42 (Crypto)** | Port BearSSL (C) | RustCrypto crates (no_std) | **High** | Eliminates C cross-compile |
+| **43 (SSH)** | Port Dropbear (C) | sunset (no_std Rust SSH) | **High** | Eliminates C cross-compile, get client+server |
 | **TLS** | Port OpenSSL/mbedTLS (C) | rustls + webpki-roots | **High** | Eliminates C cross-compile, no CA files |
 | **HTTP** | Port libcurl (C) | ureq | **High** | Eliminates C cross-compile |
-| **40 (Coreutils)** | Port sbase (C) | uutils (selective) | **Medium** | Better for complex tools (sort, find, diff) |
-| **43 (Rust tools)** | Document pipeline | Cross-compile existing CLIs | **Medium** | Free tools once pipeline works |
-| **34-39, 45-48** | Implement from scratch | No good fit | **None** | Kernel work, must be custom |
+| **41 (Coreutils)** | Port sbase (C) | uutils (selective) | **Medium** | Better for complex tools (sort, find, diff) |
+| **44 (Rust tools)** | Document pipeline | Cross-compile existing CLIs | **Medium** | Free tools once pipeline works |
+| **34-40, 46-49** | Implement from scratch | No good fit | **None** | Kernel work, must be custom |

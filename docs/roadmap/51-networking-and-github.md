@@ -45,9 +45,10 @@ QEMU's user-mode networking (SLIRP) provides a DNS forwarder at the gateway IP
 (`10.0.2.3`). musl's built-in resolver reads this file and sends UDP DNS queries.
 Go's resolver also reads this file.
 
-**Additional kernel requirement:** `getrandom()` syscall (318) for DNS transaction
-IDs. Seed from RDRAND/RDSEED (available on all modern x86_64 CPUs). This is also
-needed by Go's `crypto/rand`.
+**Kernel RNG upgrade:** The existing `getrandom()` syscall (318) is currently
+backed by a PRNG seeded from `_rdtsc()`. For this phase, upgrade it to a CSPRNG
+seeded from RDRAND/RDSEED (available on all modern x86_64 CPUs) so DNS transaction
+IDs and Go's `crypto/rand` have real entropy.
 
 ### git HTTPS (Remote Operations)
 

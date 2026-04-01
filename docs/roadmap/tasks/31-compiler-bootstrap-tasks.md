@@ -178,7 +178,7 @@ These items are explicitly out of scope for Phase 31:
 - **Multi-stage bootstrap** — removing host-compiled binaries from the trust chain entirely
 - **C++ support** — TCC is C-only; C++ requires a different compiler
 - **Cross-compilation from within the OS** — TCC targets the host architecture only
-- **Package manager** — that's Phase 38
+- **Package manager** — that's Phase 45
 - **Make / build tools** — that's Phase 32
 
 ---

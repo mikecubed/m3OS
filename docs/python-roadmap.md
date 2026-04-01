@@ -24,7 +24,7 @@ flowchart LR
     end
 
     TODAY -->|"Phase 33 +<br/>Expanded Memory +<br/>disk expansion"| STAGE1
-    STAGE1 -->|"Phases 36, 39, 41 +<br/>DNS + TLS"| STAGE2
+    STAGE1 -->|"Phases 37, 38, 40, 42 +<br/>DNS + TLS"| STAGE2
 
     style TODAY fill:#f9e79f,stroke:#f39c12,color:#000
     style STAGE1 fill:#d6eaf8,stroke:#2980b9,color:#000
@@ -259,9 +259,11 @@ Without either, `import random` works (uses Mersenne Twister with time seed)
 but `import secrets` fails. This is a prerequisite for any crypto-related
 Python code.
 
-**Minimal implementation:** A `getrandom()` syscall (318) backed by a
-ChaCha20 CSPRNG seeded from RDRAND/RDSEED (available on all modern x86_64
-CPUs). This is simpler than a full `/dev/urandom` device node.
+**Current state:** The kernel already implements `getrandom()` (syscall 318)
+but currently seeds it from `_rdtsc()` via a simple xorshift PRNG. For
+crypto-quality randomness, this needs upgrading to a ChaCha20 CSPRNG seeded
+from RDRAND/RDSEED (planned for Phase 51). For non-crypto use (`import random`),
+the current implementation is sufficient.
 
 ---
 
@@ -385,11 +387,14 @@ only one thread runs Python code at a time, but threads are used for:
 **Why:** `pip install` requires HTTPS. Python's `ssl` module wraps a TLS
 library (usually OpenSSL). Options:
 
-1. **BearSSL** -- ~200 KB, minimal, portable. Already recommended in Phase 42.
+1. **RustCrypto + rustls** -- primary TLS stack per Phase 42. A Rust-native
+   HTTP download tool using `ureq` + `rustls` could replace pip for fetching
+   packages, avoiding the need to patch Python's `_ssl` module entirely.
+2. **BearSSL** -- ~200 KB, minimal, portable. Phase 42 fallback option.
    Build a Python `_ssl` extension module against BearSSL.
-2. **mbedTLS** -- ~500 KB, more complete. Better compatibility with Python's
+3. **mbedTLS** -- ~500 KB, more complete. Better compatibility with Python's
    `ssl` module expectations.
-3. **LibreSSL** -- OpenSSL fork, ~2 MB. Most compatible but largest.
+4. **LibreSSL** -- OpenSSL fork, ~2 MB. Most compatible but largest.
 
 ### NEW: DNS Resolution
 

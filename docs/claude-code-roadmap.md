@@ -155,10 +155,10 @@ need, plus a few Claude Code-specific items.
 | Phase | What it provides | Why Claude Code needs it |
 |---|---|---|
 | **33** | Slab/buddy allocator, munmap, OOM retry | V8 GC, large memory management |
-| **36** | epoll, non-blocking I/O | libuv event loop (Node.js) |
-| **37** | Symlinks, /dev/null, /proc | node_modules, subprocess, self-location |
-| **39** | Threads, futex, TLS | libuv thread pool, V8 isolates |
-| **41** | Crypto primitives | Foundation for TLS |
+| **37** | epoll, non-blocking I/O | libuv event loop (Node.js) |
+| **38** | Symlinks, /dev/null, /proc | node_modules, subprocess, self-location |
+| **40** | Threads, futex, TLS | libuv thread pool, V8 isolates |
+| **42** | Crypto and TLS | Foundation for TLS |
 
 ### New Phases Required
 

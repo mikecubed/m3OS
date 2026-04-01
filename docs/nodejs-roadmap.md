@@ -312,7 +312,7 @@ flowchart TD
     style DONE fill:#27ae60,stroke:#1e8449,color:#fff
 ```
 
-**Unlike Python, Stage 1 Node.js requires Phases 36, 37, AND 39.** There are
+**Unlike Python, Stage 1 Node.js requires Phases 37, 38, AND 40.** There are
 no viable workarounds -- libuv's architecture fundamentally depends on epoll
 and threads.
 
