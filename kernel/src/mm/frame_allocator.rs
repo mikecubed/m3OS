@@ -164,22 +164,22 @@ impl FrameAllocator {
     ///
     /// Panics on double-free when using the free-list path.
     fn free_to_pool(&mut self, phys: u64) {
+        debug_assert!(
+            phys >= ALLOC_MIN_ADDR,
+            "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
+            phys
+        );
+        debug_assert!(
+            phys.is_multiple_of(PAGE_SIZE),
+            "free_frame: address {:#x} is not page-aligned",
+            phys
+        );
+
         if let Some(ref mut buddy) = self.buddy {
             let pfn = (phys / PAGE_SIZE) as usize;
             buddy.free(pfn, 0);
         } else {
             // Free-list path (before buddy init).
-            debug_assert!(
-                phys >= ALLOC_MIN_ADDR,
-                "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
-                phys
-            );
-            debug_assert!(
-                phys.is_multiple_of(PAGE_SIZE),
-                "free_frame: address {:#x} is not page-aligned",
-                phys
-            );
-
             // Double-free detection via magic sentinel.
             let virt = (self.phys_offset + phys) as *const u64;
             let magic = unsafe { virt.add(1).read() };

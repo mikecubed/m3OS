@@ -21,8 +21,10 @@ pub const PAGE_SIZE: usize = 4096;
 /// - A bitmap where bit *i* is set when block *i* at that order is free.
 /// - A free list (Vec used as a stack) of free block start PFNs.
 ///
-/// The free list gives O(1) allocate/free; the bitmap enables O(1) buddy-merge
-/// checks without scanning the free list.
+/// Free list push/pop within a single order is O(1). Overall allocation and
+/// free may traverse/split/merge across orders up to MAX_ORDER, giving
+/// O(log n) behavior bounded by MAX_ORDER + 1 levels. The bitmap enables
+/// O(1) buddy-merge checks without scanning the free list.
 pub struct BuddyAllocator {
     /// Per-order free lists: each entry is a PFN of a free block at that order.
     free_lists: [Vec<usize>; MAX_ORDER + 1],

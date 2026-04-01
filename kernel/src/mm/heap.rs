@@ -125,18 +125,35 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     let page_size: usize = 4096;
     let additional_bytes = (additional_bytes + page_size - 1) & !(page_size - 1);
 
-    let current_mapped = HEAP_MAPPED.load(Ordering::Acquire);
-    let new_mapped = current_mapped.checked_add(additional_bytes).ok_or(())?;
+    // Atomically reserve the heap range to prevent SMP races: two CPUs
+    // hitting OOM at the same time must not map the same address range.
+    let current_mapped = loop {
+        let current = HEAP_MAPPED.load(Ordering::Acquire);
+        let new_mapped = current.checked_add(additional_bytes).ok_or(())?;
 
-    // P17-T026: safety cap — refuse to exceed HEAP_MAX_SIZE.
-    if new_mapped > HEAP_MAX_SIZE {
-        log::error!(
-            "[mm] heap growth refused: requested total {}KiB exceeds max {}MiB",
-            new_mapped / 1024,
-            HEAP_MAX_SIZE / (1024 * 1024),
-        );
-        return Err(());
-    }
+        // P17-T026: safety cap — refuse to exceed HEAP_MAX_SIZE.
+        if new_mapped > HEAP_MAX_SIZE {
+            log::error!(
+                "[mm] heap growth refused: requested total {}KiB exceeds max {}MiB",
+                new_mapped / 1024,
+                HEAP_MAX_SIZE / (1024 * 1024),
+            );
+            return Err(());
+        }
+
+        // CAS to reserve [current..new_mapped). Loser retries with the
+        // updated value (which may now be large enough to skip growth).
+        match HEAP_MAPPED.compare_exchange_weak(
+            current,
+            new_mapped,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break current,
+            Err(_) => continue,
+        }
+    };
+    let new_mapped = current_mapped + additional_bytes;
 
     let mut mapper = unsafe { get_mapper() };
     let mut frame_alloc = GlobalFrameAlloc;
@@ -184,7 +201,11 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
         ALLOCATOR.inner.lock().extend(bytes_mapped);
     }
 
-    HEAP_MAPPED.store(current_mapped + bytes_mapped, Ordering::Release);
+    // If we mapped fewer pages than reserved, adjust HEAP_MAPPED back down.
+    let wasted = additional_bytes - bytes_mapped;
+    if wasted > 0 {
+        HEAP_MAPPED.fetch_sub(wasted, Ordering::Release);
+    }
 
     log::info!(
         "[mm] heap grown by {}KiB → total {}KiB",
