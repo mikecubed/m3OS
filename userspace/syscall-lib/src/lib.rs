@@ -296,10 +296,14 @@ pub const SO_RCVBUF: u64 = 8;
 pub const SO_SNDBUF: u64 = 7;
 pub const TCP_NODELAY: u64 = 1;
 
-// Shutdown modes
 // Clock IDs
+pub const CLOCK_REALTIME: u64 = 0;
 pub const CLOCK_MONOTONIC: u64 = 1;
 
+// Syscall numbers for time
+pub const SYS_GETTIMEOFDAY: u64 = 96;
+
+// Shutdown modes
 pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
@@ -1154,4 +1158,176 @@ pub fn write_u64(fd: i32, mut n: u64) {
         n /= 10;
     }
     let _ = write(fd, &buf[pos..]);
+}
+
+// ===========================================================================
+// Time functions (Phase 34)
+// ===========================================================================
+
+/// Call clock_gettime(clk_id). Returns (tv_sec, tv_nsec) or (-1, 0) on error.
+pub fn clock_gettime(clk_id: u64) -> (i64, i64) {
+    let mut ts = [0u8; 16];
+    let ret = unsafe { syscall2(SYS_CLOCK_GETTIME, clk_id, ts.as_mut_ptr() as u64) } as i64;
+    if ret < 0 {
+        return (-1, 0);
+    }
+    let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+    let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+    (sec, nsec)
+}
+
+/// Call gettimeofday(). Returns (tv_sec, tv_usec) or (-1, 0) on error.
+pub fn gettimeofday() -> (i64, i64) {
+    let mut tv = [0u8; 16];
+    let ret = unsafe { syscall1(SYS_GETTIMEOFDAY, tv.as_mut_ptr() as u64) } as i64;
+    if ret < 0 {
+        return (-1, 0);
+    }
+    let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+    let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+    (sec, usec)
+}
+
+/// Broken-down date/time (UTC).
+pub struct DateTime {
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    pub weekday: u32,
+}
+
+/// Convert Unix epoch seconds to broken-down UTC date/time.
+pub fn gmtime(epoch_secs: u64) -> DateTime {
+    let total_days = epoch_secs / 86400;
+    let remaining = epoch_secs % 86400;
+    let weekday = ((total_days + 4) % 7) as u32;
+    let hour = (remaining / 3600) as u32;
+    let minute = ((remaining % 3600) / 60) as u32;
+    let second = (remaining % 60) as u32;
+
+    let mut year = 1970u32;
+    let mut days_left = total_days;
+    loop {
+        let dy: u64 =
+            if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) {
+                366
+            } else {
+                365
+            };
+        if days_left < dy {
+            break;
+        }
+        days_left -= dy;
+        year += 1;
+    }
+
+    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let mut month = 1u32;
+    for (i, &dm) in days_in_month.iter().enumerate() {
+        let d = if i == 1 && is_leap { 29u64 } else { dm };
+        if days_left < d {
+            break;
+        }
+        days_left -= d;
+        month += 1;
+    }
+    let day = days_left as u32 + 1;
+
+    DateTime {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        weekday,
+    }
+}
+
+const WEEKDAYS: [&[u8]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+const MONTHS: [&[u8]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+];
+
+/// Format a DateTime as "Wed Apr  1 12:30:00 UTC 2026" into the provided buffer.
+/// Returns the number of bytes written.
+pub fn format_datetime(dt: &DateTime, buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+
+    let append = |buf: &mut [u8], pos: &mut usize, s: &[u8]| {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    };
+    let append_u32_pad2 = |buf: &mut [u8], pos: &mut usize, v: u32| {
+        if *pos + 1 < buf.len() {
+            buf[*pos] = b'0' + (v / 10) as u8;
+            buf[*pos + 1] = b'0' + (v % 10) as u8;
+            *pos += 2;
+        }
+    };
+
+    // "Wed "
+    let wd = WEEKDAYS[dt.weekday as usize % 7];
+    append(buf, &mut pos, wd);
+    append(buf, &mut pos, b" ");
+
+    // "Apr "
+    let mn = MONTHS[(dt.month.wrapping_sub(1)) as usize % 12];
+    append(buf, &mut pos, mn);
+    append(buf, &mut pos, b" ");
+
+    // " 1 " or "12 "
+    if dt.day < 10 {
+        append(buf, &mut pos, b" ");
+    }
+    // day as decimal
+    if dt.day >= 10 && pos < buf.len() {
+        buf[pos] = b'0' + (dt.day / 10) as u8;
+        pos += 1;
+    }
+    if pos < buf.len() {
+        buf[pos] = b'0' + (dt.day % 10) as u8;
+        pos += 1;
+    }
+    append(buf, &mut pos, b" ");
+
+    // "12:30:00"
+    append_u32_pad2(buf, &mut pos, dt.hour);
+    append(buf, &mut pos, b":");
+    append_u32_pad2(buf, &mut pos, dt.minute);
+    append(buf, &mut pos, b":");
+    append_u32_pad2(buf, &mut pos, dt.second);
+
+    // " UTC "
+    append(buf, &mut pos, b" UTC ");
+
+    // year — write up to 4 digits
+    let y = dt.year;
+    if y >= 1000 && pos < buf.len() {
+        buf[pos] = b'0' + (y / 1000) as u8;
+        pos += 1;
+    }
+    if y >= 100 && pos < buf.len() {
+        buf[pos] = b'0' + ((y / 100) % 10) as u8;
+        pos += 1;
+    }
+    if y >= 10 && pos < buf.len() {
+        buf[pos] = b'0' + ((y / 10) % 10) as u8;
+        pos += 1;
+    }
+    if pos < buf.len() {
+        buf[pos] = b'0' + (y % 10) as u8;
+        pos += 1;
+    }
+
+    append(buf, &mut pos, b"\n");
+    pos
 }

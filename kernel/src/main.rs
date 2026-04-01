@@ -20,6 +20,7 @@ mod pci;
 mod pipe;
 mod process;
 mod pty;
+mod rtc;
 mod serial;
 mod signal;
 mod smp;
@@ -97,6 +98,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
     acpi::init(rsdp_addr);
+
+    // Phase 34: Read RTC and establish boot wall-clock time.
+    rtc::init_rtc();
 
     // Smoke-test heap allocations (P2-T007)
     let boxed = Box::new(42u64);

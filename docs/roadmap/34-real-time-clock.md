@@ -126,7 +126,7 @@ musl provides these, but the kernel needs its own conversion for `boot_epoch` ca
 
 ## Companion Task List
 
-- Phase 34 Task List — *not yet created*
+- [Phase 34 Task List](tasks/34-real-time-clock-tasks.md)
 
 ## How Real OS Implementations Differ
 

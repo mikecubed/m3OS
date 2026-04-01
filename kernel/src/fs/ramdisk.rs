@@ -96,6 +96,9 @@ static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
 static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
 static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test.elf");
 static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
+// Phase 34: timekeeping utilities
+static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
+static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -274,6 +277,21 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "mmap-leak-test.elf",
         RamdiskNode::File {
             content: MMAP_LEAK_TEST_ELF,
+        },
+    ),
+    // Phase 34: timekeeping utilities
+    ("date", RamdiskNode::File { content: DATE_ELF }),
+    ("date.elf", RamdiskNode::File { content: DATE_ELF }),
+    (
+        "uptime",
+        RamdiskNode::File {
+            content: UPTIME_ELF,
+        },
+    ),
+    (
+        "uptime.elf",
+        RamdiskNode::File {
+            content: UPTIME_ELF,
         },
     ),
 ];
