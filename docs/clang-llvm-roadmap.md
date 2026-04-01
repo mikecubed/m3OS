@@ -1,9 +1,9 @@
 # Road to Clang/LLVM on m3OS
 
-This document details the phases and work required to run Clang/LLVM natively
-inside m3OS. Clang is an enormous C/C++ compiler frontend (~30M lines of C++)
-backed by the LLVM optimizer and code generator. For comparison, TCC (our
-current compiler) is ~100K lines of C.
+This document details the path to running Clang/LLVM on m3OS. The strategy is
+two stages: first cross-compile Clang on the host and run it inside the OS
+(like we did with TCC in Phase 31), then eventually build LLVM from source
+natively. Getting Clang running is the priority -- self-hosting comes later.
 
 ## Current State (Phase 32 complete)
 
@@ -19,50 +19,343 @@ What we have today:
 - **No dynamic linking** -- everything is statically linked
 - **No C++ support** -- TCC is C-only, no C++ runtime/stdlib
 
-## What Clang/LLVM Requires
+---
 
-| Requirement | Why | Current Status |
+# Stage 1: Cross-Compiled Clang
+
+The goal: build a static Clang binary on the host, bundle it on the disk
+image, and compile C programs inside m3OS with a real production compiler.
+This follows the same pattern as TCC (Phase 31) -- cross-compile on host,
+run inside the OS.
+
+## What Cross-Compiled Clang Gives Us
+
+Compared to TCC, a cross-compiled Clang provides:
+
+| Capability | TCC (today) | Clang (cross-compiled) |
 |---|---|---|
-| C++ runtime (libc++/libstdc++) | Clang is written in C++ | Not available |
-| Exception handling + RTTI | C++ features used throughout LLVM | Not available |
-| Threading (pthreads) | LLVM uses threads for parallel compilation passes | Not available |
-| Real `mmap`/`munmap` | LLVM's allocator relies on mmap for large regions | `munmap` is a stub |
-| ~500 MB+ RAM for compilation | LLVM's IR and symbol tables are memory-hungry | Kernel heap caps at 64 MiB |
-| ~2 GB disk space | LLVM installed size with headers/libraries | ext2 partition is 128 MB |
-| Dynamic linking (optional) | Clang/LLVM is modular with shared libraries | Not available |
-| A real linker (lld or GNU ld) | TCC's built-in linker cannot handle LLVM's output | Not available |
-| Symlinks | LLVM build system expects symlinks for tool aliases | Not available |
-| `/proc` filesystem | Some LLVM features read `/proc/self/exe` | Not available |
-| `select`/`poll`/`epoll` | Build parallelism and I/O multiplexing | Not available |
-| Wall-clock time | Build timestamps, profiling | Not available |
+| Optimization | None (`-O0` only) | Full (`-O0` through `-O3`, `-Os`, `-Oz`) |
+| C standard | C99/partial C11 | Full C17, partial C23 |
+| C++ compilation | Not supported | Full C++17, C++20, partial C++23 |
+| Warnings/diagnostics | Basic | Industry-leading diagnostics |
+| Static analysis | None | `-Weverything`, scan-build, `-fsanitize` |
+| Code generation | Simple x86_64 | LLVM backend: vectorization, instruction scheduling |
+| Link-time optimization | None | ThinLTO, full LTO |
+| Cross-compilation | x86_64 only | Any LLVM target (if backends enabled) |
+| Self-hosting | Yes (C only) | No (needs C++ runtime to build LLVM) |
+| Binary size | ~300 KB | ~100-150 MB (static, stripped, minimal backends) |
+| Compilation speed | Very fast | Slower (optimizing compiler) |
+| Standard conformance | Loose | Strict, well-tested |
 
-## Phase-by-Phase Path
+**What this unlocks:**
+- Compile optimized C programs inside the OS (real `-O2` with vectorization)
+- Compile C++ programs (with statically-linked libc++)
+- Better error messages for development inside the OS
+- A stepping stone toward self-hosting: Clang can compile C/C++ code that
+  TCC cannot handle
 
-### Phase 33 -- Kernel Memory Improvements (in progress)
+## Host-Side Cross-Compilation
 
-**Status:** Almost complete. Assumed ready for the rest of this plan.
+### Building the Clang Binary
 
-**Delivers:**
+Build a minimal static Clang on the host, targeting musl libc. This produces
+a single `clang` binary with the C++ runtime statically linked in.
+
+```bash
+# Clone LLVM
+git clone --depth 1 https://github.com/llvm/llvm-project.git
+cd llvm-project
+
+# Minimal CMake configuration for a static, musl-linked Clang
+cmake -S llvm -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=MinSizeRel \
+  -DCMAKE_C_COMPILER=x86_64-linux-musl-gcc \
+  -DCMAKE_CXX_COMPILER=x86_64-linux-musl-g++ \
+  -DCMAKE_EXE_LINKER_FLAGS="-static" \
+  -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_TARGETS_TO_BUILD="X86" \
+  -DLLVM_ENABLE_THREADS=OFF \
+  -DLLVM_ENABLE_ZLIB=OFF \
+  -DLLVM_ENABLE_ZSTD=OFF \
+  -DLLVM_ENABLE_TERMINFO=OFF \
+  -DLLVM_ENABLE_LIBXML2=OFF \
+  -DLLVM_BUILD_DOCS=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+  -DCLANG_ENABLE_ARCMT=OFF \
+  -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+  -DLLVM_BUILD_STATIC=ON
+
+ninja -C build clang lld
+strip build/bin/clang
+strip build/bin/lld
+```
+
+Key decisions:
+- **`LLVM_ENABLE_THREADS=OFF`** -- avoids pthreads dependency until Phase 39
+- **`LLVM_TARGETS_TO_BUILD="X86"`** -- only x86_64 backend, saves ~80% size
+- **`MinSizeRel`** -- optimize for binary size
+- **Static musl linkage** -- no dynamic linker needed on m3OS
+- **lld included** -- LLVM's linker replaces TCC's built-in linker
+
+### Expected Binary Sizes
+
+| Binary | Approximate size (stripped) |
+|---|---|
+| `clang` | ~100 MB (static, X86 only, MinSizeRel) |
+| `lld` | ~40 MB (static, stripped) |
+| `libc.a` + `libc++.a` | ~15 MB |
+| musl + libc++ headers | ~20 MB |
+| **Total disk footprint** | **~175 MB** |
+
+### What Gets Bundled on the Disk Image
+
+```
+/usr/
+  bin/
+    tcc               -- existing TCC (~300 KB)
+    clang             -- Clang compiler (~100 MB)
+    ld.lld            -- LLD linker (~40 MB)
+  lib/
+    libc.a            -- musl static C library (existing)
+    libc++.a          -- LLVM C++ standard library (~8 MB)
+    libc++abi.a       -- C++ ABI library (~1 MB)
+    libunwind.a       -- Stack unwinding for C++ exceptions (~500 KB)
+    libclang_rt.builtins.a  -- compiler-rt builtins (~2 MB)
+    crt1.o, crti.o, crtn.o  -- CRT startup objects (existing)
+    clang/
+      <version>/
+        include/      -- Clang built-in headers (stdarg.h, etc.)
+  include/
+    stdio.h, ...      -- musl system headers (existing)
+    c++/
+      v1/             -- libc++ headers (~5 MB)
+  src/
+    hello.c           -- existing test program
+    hello.cpp         -- C++ test program (new)
+```
+
+### xtask Integration
+
+Add a `build_clang()` function to xtask following the TCC pattern:
+
+```
+Host (build time)                       Guest (m3OS, run time)
++----------------------------------+    +------------------------------------------+
+| cargo xtask image                |    |  C compilation:                          |
+|   build_clang()                  |    |    $ clang /tmp/prog.c -o /tmp/prog      |
+|     cmake + ninja (LLVM)         |    |    $ /tmp/prog                           |
+|     static musl linkage          |    |                                          |
+|   populate_clang_files()         |    |  C++ compilation:                        |
+|     /usr/bin/clang               |    |    $ clang++ /tmp/app.cpp -o /tmp/app    |
+|     /usr/bin/ld.lld              |    |    $ /tmp/app                            |
+|     /usr/lib/libc++.a, etc.      |    |                                          |
+|     /usr/include/c++/v1/*        |    |  Optimized build:                        |
+|     clang built-in headers       |    |    $ clang -O2 /tmp/fast.c -o /tmp/fast  |
++----------------------------------+    +------------------------------------------+
+```
+
+## Kernel/OS Prerequisites for Stage 1
+
+Cross-compiled Clang still needs kernel features beyond what TCC requires.
+Clang is a much larger binary that makes heavier use of the OS.
+
+### Phase 33 -- Kernel Memory Improvements (in progress, assumed ready)
+
+**What it delivers:**
 - Slab allocator for O(1) fixed-size kernel object allocation
 - Buddy allocator for page-granularity allocations (4 KiB to 2 MiB)
 - OOM retry -- grows heap on demand instead of panicking
 - Working `munmap()` -- actually reclaims physical frames
 - Userspace heap coalescing to reduce fragmentation
-- Heap diagnostics
 
-**Clang relevance:** Foundation for all subsequent memory work. Without
-working `munmap()` and OOM recovery, no large compiler can run.
+**Why Clang needs it:** Clang allocates and frees memory aggressively during
+compilation (AST nodes, IR, codegen buffers). Without working `munmap()`,
+every compilation leaks all memory. Without OOM retry, compiling anything
+non-trivial panics the kernel.
 
 ---
+
+### Phase 37 -- Filesystem Enhancements (planned)
+
+**What it delivers:**
+- Symlinks (`symlink`, `readlink`, path resolution follows symlinks)
+- `/dev/null`, `/dev/zero` device nodes
+- `/proc/self/exe` for binary self-location
+
+**Why Clang needs it:**
+- Clang uses `/proc/self/exe` to find its resource directory (headers,
+  libraries) relative to the binary path. Without this, Clang cannot locate
+  its own built-in headers. **Workaround:** set `--sysroot` and
+  `-resource-dir` explicitly, or patch Clang's driver to use a hardcoded
+  path like `/usr`.
+- `/dev/null` is used by Clang for syntax-only checks (`clang -fsyntax-only`)
+  and discarding output. **Workaround:** redirect to a tmpfs file.
+- Tool aliases (`clang++` -> `clang`) normally use symlinks.
+  **Workaround:** use `clang -x c++` or copy the binary (wastes 100 MB).
+
+**Verdict:** Not strictly blocking for Stage 1. Workarounds exist for all
+three. But symlinks and `/dev/null` are high-value quality-of-life features.
+
+---
+
+### NEW: Expanded Memory Phase (not yet on roadmap)
+
+**Suggested placement:** After Phase 33, before or alongside Phase 35.
+
+This is the single biggest kernel requirement for running Clang. TCC needs
+~10 MB to compile a program. Clang needs ~200-500 MB.
+
+**What it delivers:**
+
+1. **Demand paging (lazy allocation)** -- `mmap()` maps virtual pages without
+   immediately allocating physical frames. The page fault handler allocates
+   frames on first access. This is how every real OS works, and it is
+   critical: Clang's allocator calls `mmap()` for large regions and expects
+   only the touched pages to consume physical memory.
+
+2. **Large `mmap()` regions** -- support allocations of 256+ MB contiguous
+   virtual address space. The current `mmap` implementation may not handle
+   regions this large.
+
+3. **`mprotect()`** -- change page permissions on mapped regions. LLVM's JIT
+   (`lli`) and sanitizers need to transition pages from `RW` to `RX`. Not
+   needed for basic `clang` compilation, but needed for `-fsanitize` and
+   any future JIT work.
+
+4. **QEMU RAM increase** -- raise default QEMU memory from 256 MB to 1+ GB.
+   Clang's working set during compilation of a non-trivial file can reach
+   500 MB. This is a one-line change in xtask (`-m 1G`).
+
+5. **Optional: overcommit** -- allow `mmap()` to promise more virtual memory
+   than physical RAM available, relying on demand paging. Linux does this by
+   default. Conservative approach: only overcommit up to 2x physical RAM.
+
+**What it does NOT include (deferred to self-hosting stage):**
+- Swap to disk
+- `setrlimit()` per-process limits
+- OOM killer (kernel still panics on true physical memory exhaustion)
+
+**Implementation complexity:** Demand paging is a significant kernel feature.
+The page fault handler must distinguish between:
+- Lazy allocation faults (allocate a frame, map it, resume)
+- Stack growth faults (extend stack, map frame, resume)
+- True invalid accesses (segfault the process)
+- Copy-on-write faults (already implemented in Phase 17)
+
+Estimate: comparable to Phase 17 (Memory Reclamation) in scope.
+
+---
+
+### Disk Image Expansion
+
+The ext2 data partition must grow from 128 MB to at least 512 MB (ideally
+1 GB) to hold Clang, lld, libc++, and their headers alongside TCC.
+
+**Changes needed:**
+- xtask: increase ext2 partition size in `create_disk_image()`
+- xtask: increase raw disk image size accordingly
+- QEMU: adjust `-drive` size if needed
+
+This is a straightforward xtask change, not a kernel feature.
+
+---
+
+## Stage 1 Dependency Graph
+
+```
+Phase 33 (Kernel Memory)         -- IN PROGRESS
+    |
+    +--- munmap works, OOM retry, slab/buddy allocators
+    |
+    v
+NEW: Expanded Memory             -- NOT YET ON ROADMAP
+    |
+    +--- demand paging, large mmap, QEMU RAM increase
+    |
+    v
+Disk Image Expansion             -- xtask change only
+    |
+    +--- ext2 partition grows to 512 MB - 1 GB
+    |
+    v
+Cross-Compile Clang on Host      -- xtask build_clang()
+    |
+    +--- static clang + lld + libc++ + headers
+    |
+    v
+    Clang runs inside m3OS!       C and C++ compilation works
+```
+
+**Optional but recommended (can be done in parallel or after):**
+- Phase 37 (Filesystem Enhancements) -- symlinks, /dev/null, /proc/self/exe
+
+**Not required for Stage 1:**
+- Phase 34 (RTC) -- Clang doesn't need wall-clock time to compile
+- Phase 35 (True SMP) -- Clang runs single-threaded
+- Phase 36 (I/O Multiplexing) -- Clang doesn't use select/epoll
+- Phase 38 (Unix Domain Sockets) -- not needed
+- Phase 39 (Threading) -- built with `LLVM_ENABLE_THREADS=OFF`
+
+## Stage 1 Acceptance Criteria
+
+```bash
+# C compilation with optimization
+$ clang -O2 /usr/src/hello.c -o /tmp/hello
+$ /tmp/hello
+hello, world
+
+# C++ compilation
+$ clang++ /usr/src/hello.cpp -o /tmp/hello_cpp
+$ /tmp/hello_cpp
+hello from C++
+
+# Clang compiles TCC (proving it can handle real C codebases)
+$ clang -O2 /usr/src/tcc/tcc.c -o /tmp/tcc-opt
+$ /tmp/tcc-opt --version
+tcc version 0.9.28rc ...
+
+# LLD works as the linker
+$ clang -fuse-ld=lld /usr/src/hello.c -o /tmp/hello-lld
+$ /tmp/hello-lld
+hello, world
+
+# Optimized binary is faster than TCC-compiled version
+$ time /tmp/tcc-opt /usr/src/hello.c -o /dev/null    # should be measurably faster
+```
+
+## What Stage 1 Does NOT Give Us
+
+- **Self-hosting** -- Clang cannot compile itself inside m3OS (needs CMake,
+  Python, 2+ GB disk space, hours of compute time)
+- **Multi-threaded compilation** -- threads are disabled in the cross-compiled
+  binary
+- **Dynamic linking** -- everything remains statically linked
+- **Sanitizers at runtime** -- AddressSanitizer/UBSan need runtime support
+  that m3OS doesn't provide yet
+- **Incremental compilation** -- no `clang-scan-deps`, no modules, no PCH
+  (these require filesystem features we don't have yet)
+
+---
+
+# Stage 2: Self-Hosting (Building LLVM Inside m3OS)
+
+This is the long-term goal. Once Clang runs via cross-compilation, the next
+frontier is building LLVM from source inside the OS.
+
+## Additional Prerequisites Beyond Stage 1
 
 ### Phase 34 -- Real-Time Clock (planned)
 
 **Delivers:** CMOS RTC driver, wall-clock time, `CLOCK_REALTIME`,
 `gettimeofday()`.
 
-**Clang relevance:** Build systems (make, CMake) depend on file timestamps
-for incremental builds. LLVM's `__DATE__`/`__TIME__` macros need wall-clock
-time. Profiling and build timing require real timestamps.
+**Why self-hosting needs it:** CMake and make depend on file timestamps for
+incremental builds. Without real timestamps, every `make` invocation
+rebuilds everything. LLVM has ~3000 source files -- full rebuilds are not
+viable.
 
 ---
 
@@ -71,9 +364,9 @@ time. Profiling and build timing require real timestamps.
 **Delivers:** Per-core syscall stacks, SMP-aware scheduling with load
 balancing, priority levels.
 
-**Clang relevance:** LLVM compilation is CPU-intensive. Spreading work
-across cores matters for build times, but is not strictly required -- Clang
-can compile single-threaded, just slowly.
+**Why self-hosting needs it:** Building LLVM is CPU-intensive. Single-core
+builds take hours on fast hardware. With SMP scheduling, `make -j4` can
+actually use multiple cores.
 
 ---
 
@@ -81,233 +374,131 @@ can compile single-threaded, just slowly.
 
 **Delivers:** `select()`, `epoll`, non-blocking I/O, `O_NONBLOCK`.
 
-**Clang relevance:** Parallel build systems (`make -j`, `ninja`) use
+**Why self-hosting needs it:** Parallel build tools (make -j, ninja) use
 non-blocking I/O to manage multiple compiler processes. Without this, builds
-are strictly sequential.
+are strictly sequential even if threading is available.
 
 ---
 
 ### Phase 37 -- Filesystem Enhancements (planned)
 
-**Delivers:** Symlinks, hard links, `/proc` filesystem, permission
-enforcement on all paths, device nodes (`/dev/null`, `/dev/zero`).
+**Delivers:** Symlinks, hard links, `/proc`, permission enforcement, device
+nodes.
 
-**Clang relevance:**
-- LLVM's build system creates symlinks for tool aliases (`clang++` -> `clang`)
-- `/proc/self/exe` is used by Clang to locate its own resource directory
-- `/dev/null` is needed for discarding output during builds
-- Without symlinks, the entire LLVM tool naming convention breaks
-
----
-
-### Phase 38 -- Unix Domain Sockets (planned)
-
-**Delivers:** `AF_UNIX` stream and datagram sockets, `socketpair()`.
-
-**Clang relevance:** Minor direct relevance. Some build tools and test
-harnesses use Unix domain sockets for IPC, but Clang itself does not require
-them. Useful for running LLVM's test suite (lit) which communicates between
-test processes.
+**Why self-hosting needs it (beyond Stage 1 workarounds):**
+- LLVM's build creates hundreds of symlinks for tool aliases
+- CMake uses symlinks extensively during the build
+- `/proc` is needed for various build system introspection
+- `/dev/null` is needed throughout the build process
+- At the self-hosting scale, workarounds from Stage 1 are no longer viable
 
 ---
 
 ### Phase 39 -- Threading Primitives (planned)
 
-**Delivers:** `clone(CLONE_THREAD)`, `futex()`, thread-local storage (TLS),
-thread groups, `pthread_create`/`join`/`mutex`/`cond` via musl.
+**Delivers:** `clone(CLONE_THREAD)`, `futex()`, TLS, thread groups,
+pthreads via musl.
 
-**Clang relevance:** **Critical.** LLVM uses threads for:
-- Parallel code generation (splitting work across ThinLTO threads)
-- Parallel header parsing
-- Thread-safe data structures throughout the codebase
-- pthreads mutexes for concurrent access to shared state
-
-LLVM can technically be built with `-DLLVM_ENABLE_THREADS=OFF`, but this
-disables major functionality and is not the normal mode of operation.
+**Why self-hosting needs it:** A threaded Clang is dramatically faster.
+Rebuilding LLVM is already slow; single-threaded Clang makes it impractical.
+The self-hosted Clang should be built with `LLVM_ENABLE_THREADS=ON`.
 
 ---
 
-### NEW PHASE: Expanded Memory (not yet on roadmap)
-
-**Suggested phase number:** 49 or insert between 39 and 40.
+### NEW: Build Infrastructure Phase (not yet on roadmap)
 
 **What it delivers:**
-- **Demand paging / lazy allocation** -- map virtual pages without backing
-  physical frames until first access (page fault handler allocates on demand)
-- **Kernel heap ceiling raised** to 256 MiB+ or made fully dynamic
-- **Per-process address space limits** enforced via `setrlimit()`
-- **Large `mmap()` support** -- allocations up to hundreds of megabytes for
-  LLVM's IR buffers, symbol tables, and JIT memory
-- **`mprotect()`** -- change page permissions (needed for JIT: `RW` -> `RX`)
-- **Optional: swap to disk** -- page out cold memory to virtio-blk when
-  physical RAM is exhausted
-
-**Clang relevance:** **Critical.** A real Clang compilation of even a modest
-source file allocates hundreds of megabytes via `mmap()`. Without demand
-paging and large virtual allocations, LLVM will OOM immediately. This is
-arguably the single biggest blocker.
-
----
-
-### NEW PHASE: C++ Toolchain (not yet on roadmap)
-
-**Suggested phase number:** 50 or wherever it fits after threading.
-
-**What it delivers:**
-- **Cross-compile a C++ compiler** -- either GCC's C++ frontend (`g++`) or
-  a minimal Clang built on the host, statically linked against musl and
-  a C++ standard library
-- **C++ standard library** -- port `libc++` (LLVM's) or `libstdc++` (GNU),
-  statically linked. Must support:
-  - Exceptions (`__cxa_throw`, personality routines, `.eh_frame` unwinding)
-  - RTTI (`typeid`, `dynamic_cast`)
-  - STL containers, `<algorithm>`, `<iostream>`, `<string>`, `<memory>`
-  - `<thread>`, `<mutex>`, `<atomic>` (requires Phase 39 threading)
-- **`libunwind`** -- stack unwinding library for C++ exception handling
-- **ELF `.eh_frame` support** -- the ELF loader must parse and preserve
-  exception handling metadata
-- **C++ ABI** -- Itanium C++ ABI (used by both GCC and Clang on x86_64)
-
-**Clang relevance:** **Absolute prerequisite.** Clang/LLVM is written in
-C++17. Without a working C++ runtime, Clang cannot even load, let alone
-compile anything.
-
-**Approach options:**
-1. **Cross-compile Clang on host** -- build a static `clang` binary on
-   Linux using `musl-gcc`/`musl-clang` and copy it to the disk image. This
-   avoids needing to bootstrap a C++ compiler inside the OS, but still
-   requires the C++ runtime and exception handling support.
-2. **Port GCC first** -- GCC's C frontend is written in C (self-hosting),
-   so TCC could potentially compile it. Then use GCC to build its own C++
-   frontend. Then use G++ to build LLVM. This is the traditional bootstrap
-   path but extremely laborious.
-3. **Use a simpler C++ compiler** -- `cxx` (a minimal C++ to C translator)
-   or `cfront`-style approaches as stepping stones.
-
----
-
-### NEW PHASE: Dynamic Linking (not yet on roadmap)
-
-**Suggested phase number:** 51 or wherever appropriate.
-
-**What it delivers:**
-- **ELF dynamic linker** (`ld.so` / `ld-musl-x86_64.so.1`)
-- **Shared library loading** -- `dlopen()`, `dlsym()`, `dlclose()`
-- **PLT/GOT** -- procedure linkage table and global offset table support
-  in the ELF loader
-- **`RPATH`/`RUNPATH`** -- library search paths
-- **Position-independent code** -- `mmap()` shared libraries at arbitrary
-  addresses
-
-**Clang relevance:** Not strictly required (Clang can be built fully
-static), but LLVM's plugin architecture and Clang's `-load` flag for
-analysis plugins require dynamic linking. The installed size is also much
-smaller with shared libraries (~400 MB vs ~2 GB static).
-
----
-
-### NEW PHASE: Expanded Disk and Build Infrastructure (not yet on roadmap)
-
-**Suggested phase number:** 52 or wherever appropriate.
-
-**What it delivers:**
-- **Larger disk images** -- ext2 partition expanded to 4+ GB
-- **CMake or Ninja** -- LLVM's build system requires CMake; bare-minimum
-  Ninja support would also work
-- **Python or a CMake interpreter** -- CMake generates build files; either
-  port Python 3 (CMake uses it for LLVM's build) or implement a minimal
-  CMake-to-Makefile converter
+- **CMake** -- LLVM's build system requires it. Cross-compile CMake (it's
+  a single static C++ binary, ~30 MB) and bundle on disk.
+- **Ninja** (alternative) -- lighter than make, LLVM's preferred generator.
+  Cross-compile and bundle (~2 MB static).
+- **Python 3** (optional) -- LLVM's test suite (lit) needs Python. Not
+  required for building, only for running tests.
 - **GNU binutils or llvm-tools** -- `nm`, `objdump`, `readelf`, `ranlib`,
-  `strip` for inspecting and managing object files
-- **A real linker** -- GNU `ld` or LLVM's `lld`; TCC's linker cannot handle
-  LLVM's large object files and link-time requirements
-
-**Clang relevance:** You cannot build LLVM without CMake. The build produces
-thousands of object files and requires a production-grade linker. The final
-linked binary alone exceeds 100 MB.
+  `strip` for inspecting and managing object files during the build.
+- **4+ GB disk partition** -- LLVM source (~200 MB) + build artifacts
+  (~2 GB) + installed toolchain (~500 MB).
 
 ---
 
-## Dependency Graph
+### NEW: C++ Exception Handling (not yet on roadmap)
+
+For the self-hosted Clang to be fully functional (not just the cross-compiled
+one), the OS needs C++ exception handling support:
+
+- **`libunwind`** -- stack unwinding library
+- **`.eh_frame` ELF section** -- the ELF loader must preserve exception
+  handling metadata in loaded binaries
+- **`libcxxabi`** -- C++ ABI runtime (exception throwing, RTTI)
+- **`sigaltstack`** -- alternate signal stack for stack overflow handling
+
+The cross-compiled Clang avoids this because exceptions are statically linked
+into the binary itself. But programs *compiled by* Clang that use C++
+exceptions need this OS-level support.
+
+---
+
+### NEW: Dynamic Linking Phase (not yet on roadmap, optional)
+
+**What it delivers:**
+- ELF dynamic linker (`ld-musl-x86_64.so.1`)
+- `dlopen()`, `dlsym()`, `dlclose()`
+- PLT/GOT support in the ELF loader
+- Position-independent code loading
+
+**Why it helps but isn't required:** Clang can be built fully static. But
+with dynamic linking, the installed size drops from ~2 GB to ~400 MB, and
+LLVM plugin support (`-load`) works. This is a quality-of-life improvement,
+not a hard requirement.
+
+---
+
+## Stage 2 Dependency Graph
 
 ```
-Phase 33 (Kernel Memory)          -- IN PROGRESS
+Stage 1 complete (cross-compiled Clang works)
     |
-    v
-Phase 34 (Real-Time Clock)        -- planned
-    |
-    v
-Phase 35 (True SMP)               -- planned
-    |
-    v
-Phase 36 (I/O Multiplexing)       -- planned
-    |
-    v
-Phase 37 (Filesystem Enhancements) -- planned
-    |
-    v
-Phase 38 (Unix Domain Sockets)    -- planned
-    |
-    v
-Phase 39 (Threading Primitives)   -- planned, CRITICAL for LLVM
-    |
-    +-----+-----+
-    |           |
-    v           v
-NEW: Expanded   NEW: C++ Toolchain
-Memory          (cross-compiled C++ compiler,
-(demand paging,  libc++, libunwind,
-mprotect, large  exception handling)
-mmap, optional       |
-swap)                |
-    |                |
-    +-------+--------+
+    +---+---+---+---+
+    |   |   |   |   |
+    v   v   v   v   v
+   P34 P35 P36 P37 P39
+   RTC SMP I/O  FS  Threading
+    |   |   |   |   |
+    +---+---+---+---+
+            |
+            v
+    NEW: Build Infrastructure
+    (CMake, Ninja, 4 GB disk)
+            |
+            v
+    NEW: C++ Exception Handling
+    (libunwind, .eh_frame, libcxxabi)
             |
             v
     NEW: Dynamic Linking (optional)
             |
             v
-    NEW: Expanded Disk and
-         Build Infrastructure
-         (CMake, 4 GB disk,
-          real linker, binutils)
-            |
-            v
-      Clang/LLVM runs natively
+    Self-hosted LLVM build inside m3OS
 ```
 
-## Effort Estimate
+## Full Effort Summary
 
-| Category | Phases | Rough Complexity |
+| Stage | Phases Required | Complexity |
 |---|---|---|
-| Already planned (33-39) | 7 phases | Significant but scoped |
-| Expanded memory | 1 new phase | Very high -- demand paging is one of the hardest kernel features |
-| C++ toolchain | 1 new phase | Very high -- exception handling and ABI are deeply complex |
-| Dynamic linking | 1 new phase (optional) | High -- ELF dynamic linker is non-trivial |
-| Build infrastructure | 1 new phase | Moderate -- mostly porting existing tools |
+| **Stage 1: Cross-compiled Clang** | Phase 33 (done), Expanded Memory (new), disk expansion (xtask) | Moderate-high |
+| **Stage 2: Self-hosting** | Phases 34-39, Build Infra (new), C++ EH (new), Dynamic Linking (optional) | Very high |
 
-**Total new phases needed beyond current roadmap: 3-4.**
-**Total phases before Clang runs: ~11** (33 through 39, plus 3-4 new ones).
+**Stage 1 is achievable after ~2 phases of kernel work** (Phase 33 + Expanded
+Memory) plus xtask changes. This is the near-term target.
 
-## Alternative: Cross-Compiled Clang (Shortcut)
+**Stage 2 requires ~8-9 more phases** on top of Stage 1. This is a long-term
+aspiration.
 
-If the goal is "Clang binary runs inside m3OS" rather than "m3OS can build
-Clang from source", the path is shorter:
+## What We Explicitly Do Not Need (Either Stage)
 
-1. Complete Phases 33-39 (memory, threading, filesystem, I/O)
-2. Complete Expanded Memory phase (demand paging, large mmap)
-3. Cross-compile a static Clang binary on the host with musl + static libc++
-4. Bundle it on the disk image (like we do with TCC today)
-5. Expand the ext2 partition to hold Clang + headers + libraries
-
-This skips the C++ bootstrap, dynamic linking, and CMake phases entirely.
-You still need the runtime support (threading, memory, filesystem), but you
-avoid the hardest problem: building LLVM inside the OS.
-
-## What We Explicitly Do Not Need
-
-- **GPU support** -- LLVM's GPU backends (AMDGPU, NVPTX) can be disabled
-- **libffi** -- only needed for LLVM's interpreter, not the compiler
+- **GPU backends** -- LLVM's AMDGPU, NVPTX, etc. can be disabled
+- **libffi** -- only needed for LLVM's interpreter (`lli`), not the compiler
 - **zlib/zstd** -- compression for debug info; can be disabled
 - **XML/JSON parsers** -- only for LLVM's tooling, not core compilation
 - **Curses/readline** -- only for interactive LLDB debugger
+- **libedit** -- only for LLDB and optional Clang REPL
