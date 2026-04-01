@@ -7053,21 +7053,22 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
 // gettimeofday(tv, tz) — syscall 96
 // ---------------------------------------------------------------------------
 
-/// Return an approximate time based on the LAPIC timer tick count.
-/// Since we don't have a real RTC, we return a monotonically increasing
-/// value derived from the kernel's tick counter.
+/// LAPIC ticks per second (~100 Hz timer = 10ms per tick).
+const TICKS_PER_SEC: u64 = 100;
+
+/// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
 fn sys_gettimeofday(tv_ptr: u64) -> u64 {
     if tv_ptr == 0 {
         return 0;
     }
+    let boot_epoch = crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
     let ticks = crate::arch::x86_64::interrupts::tick_count();
-    // Assume ~100 ticks/second (10ms per tick from LAPIC timer).
-    let secs = ticks / 100;
-    let usecs = (ticks % 100) * 10_000;
+    let tv_sec = boot_epoch + ticks / TICKS_PER_SEC;
+    let tv_usec = (ticks % TICKS_PER_SEC) * (1_000_000 / TICKS_PER_SEC);
     // struct timeval: tv_sec (i64) + tv_usec (i64) = 16 bytes
     let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&(secs as i64).to_ne_bytes());
-    buf[8..16].copy_from_slice(&(usecs as i64).to_ne_bytes());
+    buf[0..8].copy_from_slice(&(tv_sec as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(tv_usec as i64).to_ne_bytes());
     if crate::mm::user_mem::copy_to_user(tv_ptr, &buf).is_err() {
         return NEG_EFAULT;
     }
@@ -7078,14 +7079,34 @@ fn sys_gettimeofday(tv_ptr: u64) -> u64 {
 // clock_gettime(clk_id, tp) — syscall 228
 // ---------------------------------------------------------------------------
 
-/// Return monotonic time based on the LAPIC tick counter.
-fn sys_clock_gettime(_clk_id: u64, tp_ptr: u64) -> u64 {
+/// Clock IDs (Linux ABI).
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
+
+/// Return time as struct timespec, dispatching on clock ID.
+fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
     if tp_ptr == 0 {
         return NEG_EFAULT;
     }
     let ticks = crate::arch::x86_64::interrupts::tick_count();
-    let secs = ticks / 100;
-    let nsecs = (ticks % 100) * 10_000_000;
+    let (secs, nsecs) = match clk_id {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
+            let boot_epoch =
+                crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
+            let s = boot_epoch + ticks / TICKS_PER_SEC;
+            let ns = (ticks % TICKS_PER_SEC) * (1_000_000_000 / TICKS_PER_SEC);
+            (s, ns)
+        }
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+            let s = ticks / TICKS_PER_SEC;
+            let ns = (ticks % TICKS_PER_SEC) * (1_000_000_000 / TICKS_PER_SEC);
+            (s, ns)
+        }
+        _ => return NEG_EINVAL,
+    };
     // struct timespec: tv_sec (i64) + tv_nsec (i64) = 16 bytes
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&(secs as i64).to_ne_bytes());
