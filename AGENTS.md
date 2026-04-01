@@ -99,7 +99,7 @@ userspace/
   pty-test/               # PTY subsystem test (Phase 29)
   telnetd/                # Telnet server daemon (Phase 30)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
-  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install
+  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo
   demo-project/           # Multi-file C demo project for make testing (Phase 32)
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -125,7 +125,7 @@ kernel/src/
   fb/                  # framebuffer console driver
   fs/                  # VFS layer, FAT32, tmpfs, ramdisk, protocol
   ipc/                 # endpoints, capabilities, messages, notifications, registry
-  mm/                  # frame allocator, paging, heap, user_space, ELF loader, memory_map
+  mm/                  # buddy frame allocator, paging, heap, slab caches, user_space, ELF loader
   net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, VirtIO-net, dispatch
   pci/                 # PCI device enumeration
   process/             # process management (fork, exec, exit, wait)
@@ -140,6 +140,8 @@ kernel/initrd/           # pre-built ELF binaries embedded as initial ramdisk
 kernel-core/src/
   lib.rs               # module declarations
   types.rs             # shared types
+  buddy.rs             # buddy frame allocator (Phase 33)
+  slab.rs              # slab cache allocator (Phase 33)
   fb.rs                # framebuffer abstractions
   pipe.rs              # pipe abstractions
   pty.rs               # PTY pair state, ring buffers (Phase 29)
@@ -251,6 +253,7 @@ Read before making significant changes:
 | `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
 | `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
 | `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
+| `docs/33-kernel-memory.md` | Before touching buddy allocator, slab caches, munmap, or meminfo |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.

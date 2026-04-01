@@ -38,13 +38,13 @@ Needs to be added:
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | OOM retry: wrap global allocator to retry after heap growth | — | Not started |
-| B | Buddy frame allocator: replace free-list with buddy system | — | Not started |
-| C | Slab allocator: fixed-size caches for kernel objects | B | Not started |
-| D | Working `munmap()`: frame reclamation + TLB shootdown | B | Not started |
-| E | Userspace heap coalescing in `BrkAllocator` | — | Not started |
-| F | Kernel heap statistics and reporting | A, C | Not started |
-| G | Integration testing and documentation | All | Not started |
+| A | OOM retry: wrap global allocator to retry after heap growth | — | Done (A.4 QEMU test deferred) |
+| B | Buddy frame allocator: replace free-list with buddy system | — | Done |
+| C | Slab allocator: fixed-size caches for kernel objects | B | Done (C.4 migration deferred) |
+| D | Working `munmap()`: frame reclamation + TLB shootdown | B | Done (D.4 test binary deferred) |
+| E | Userspace heap coalescing in `BrkAllocator` | — | Done (E.3 test binary deferred) |
+| F | Kernel heap statistics and reporting | A, C | Done |
+| G | Integration testing and documentation | All | Done (G.2 stress test deferred) |
 
 ### Implementation Notes
 

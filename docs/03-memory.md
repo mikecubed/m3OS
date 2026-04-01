@@ -30,15 +30,23 @@ graph TD
 
 ## Physical Frame Allocator
 
-### Phase 17 implementation: free-list allocator with reference counting
+### Phase 33 implementation: buddy allocator with reference counting
 
-The frame allocator is an **intrusive free-list** — each free 4 KiB frame stores a
-next pointer (bytes 0..8) and a magic sentinel (bytes 8..16) in its own memory, accessed
-through the bootloader's physical-memory offset mapping.
+The frame allocator uses a **buddy allocator** (`kernel-core/src/buddy.rs`) with 10 order
+levels (order 0 = 4 KiB up to order 9 = 2 MiB). It supports O(log n) allocation and
+automatic coalescing of adjacent free blocks.
 
-- `allocate_frame()` pops from the head of the free list
-- `free_frame(phys)` pushes back to the head; panics on double-free (magic check)
-- `free_count()` / `total_frames()` for diagnostics
+**Two-phase initialization:**
+1. Bootstrap phase (before heap): a simple free-list collects frames during boot
+2. After `init_heap()`, `init_buddy()` drains the free-list into a `BuddyAllocator`
+   which coalesces frames into the largest possible power-of-two blocks
+
+**API:**
+- `allocate_frame()` — allocates a single 4 KiB frame (order 0)
+- `allocate_contiguous(order)` — allocates `1 << order` contiguous pages
+- `free_frame(phys)` — frees a single frame after refcount check
+- `free_contiguous(phys, order)` — frees a multi-page block
+- `free_count()` / `total_frames()` / `frame_stats()` for diagnostics
 - Frames below 1 MiB are never allocated (`ALLOC_MIN_ADDR = 0x0010_0000`)
 
 **Per-frame reference counting** is layered on top:
@@ -46,8 +54,12 @@ through the bootloader's physical-memory offset mapping.
 - Initialized after heap init; frames allocated before refcounting starts are tracked
   with refcount 0 and freed directly
 - `allocate_frame()` sets refcount to 1
-- `free_frame()` decrements refcount; only pushes to free list when count reaches 0
+- `free_frame()` decrements refcount; only frees to buddy when count reaches 0
 - `refcount_inc(phys)` / `refcount_dec(phys)` / `refcount_get(phys)` for CoW support
+
+**Slab allocator** (`kernel-core/src/slab.rs`) provides fixed-size caches on top of the
+buddy allocator for common kernel objects (task/fd/endpoint/pipe/socket). Each slab is
+a page divided into equal-size slots with a bitmap tracking free slots.
 
 ### Concepts: physical frames vs virtual pages vs kernel heap
 
@@ -78,10 +90,9 @@ The frame allocator works in *physical* space. The page mapper works across the 
 
 Mature kernels add further refinements:
 
-1. **Buddy allocator** — splits/merges power-of-two frame blocks; O(log n) alloc/free
-2. **SLAB/SLUB allocator** — small-object caching on top of buddy
-3. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries
-4. **Demand paging** — don't map physical frames until first access
+1. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries
+2. **Demand paging** — don't map physical frames until first access
+3. **SLUB allocator** — more sophisticated slab variant with per-CPU caches
 
 ```
 Physical Memory
@@ -167,17 +178,20 @@ let page_table = unsafe { &mut *(virt_addr.as_mut_ptr::<PageTable>()) };
 ## Kernel Heap
 
 The kernel heap starts at `HEAP_START = 0xFFFF_8000_0000_0000` with an initial size of
-1 MiB. It uses `linked_list_allocator::LockedHeap` as the `#[global_allocator]`.
+4 MiB. It uses a `RetryAllocator` wrapper around `linked_list_allocator::LockedHeap` as
+the `#[global_allocator]`.
 
 **Growable heap (Phase 17):** The heap can grow up to `HEAP_MAX_SIZE = 64 MiB`.
-`grow_heap(bytes)` maps fresh frames and calls `ALLOCATOR.lock().extend()`. On partial
-failure (mid-growth OOM), only successfully mapped pages are extended — no leaked frames.
+`grow_heap(bytes)` maps fresh frames and calls `ALLOCATOR.inner.lock().extend()`. On
+partial failure (mid-growth OOM), only successfully mapped pages are extended.
 
-The `#[alloc_error_handler]` attempts `try_grow_on_oom()` before panicking, but because
-the handler's signature is `-> !` it cannot retry the failed allocation. In practice,
-`extend()` adds the new memory to the free list so the *next* allocation succeeds; the
-current allocation still panics. A custom allocator wrapper could retry transparently
-but is deferred.
+**OOM retry (Phase 33):** The `RetryAllocator` wrapper intercepts allocation failures
+at the `GlobalAlloc::alloc()` level. On failure, it tries growing the heap with
+escalating sizes (layout-proportional, 1 MiB, 2 MiB, 4 MiB) and retries the allocation.
+This is more effective than the old `alloc_error_handler` approach which could not retry.
+
+**Statistics:** `heap_stats()` returns total/used/free bytes and alloc/dealloc counts.
+Counters are tracked via atomics in the `RetryAllocator`.
 
 After `init_heap`, `alloc` types (`Vec`, `Box`, `Arc`, `String`, etc.) work in the kernel.
 
@@ -232,8 +246,26 @@ When a process exits (`sys_exit` or fault kill):
 4. `mark_current_dead()` — scheduler removes the task; `Task::_stack` `Box<[u8]>` drops,
    freeing the kernel stack back to the heap
 
+## munmap (Phase 33)
+
+`sys_linux_munmap(addr, len)` reclaims physical memory for unmapped pages:
+1. Validates page-aligned addr, positive len, userspace range
+2. Walks the process page table via `OffsetPageTable::unmap()`
+3. Frees physical frames via buddy allocator (refcount-aware)
+4. Flushes local TLB via `MapperFlush` and sends SMP TLB shootdown IPIs
+5. Removes entries from the per-process mapping list
+
+Per-process `MemoryMapping` tracking records mmap allocations and validates munmap ranges.
+
+## meminfo (Phase 33)
+
+The `meminfo` command (syscall 0x1001) reports:
+- Kernel heap: total/used/free bytes, allocation counts
+- Frame allocator: total/free/allocated frames, per-order buddy breakdown
+- Slab caches: per-cache slab count, active objects, free slots
+
 ## Open Questions
 
-- **Buddy allocator** — would give O(log n) allocation and coalescing for large allocations
 - **Kernel stack guard pages** — unmapped page below each stack to catch overflow
 - **Per-process memory limits** — tracking and capping process RSS
+- **Migrate kernel objects to slab caches** — Task, FD, Endpoint allocations
