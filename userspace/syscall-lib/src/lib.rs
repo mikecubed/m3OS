@@ -303,6 +303,7 @@ pub const CLOCK_MONOTONIC: u64 = 1;
 // Syscall numbers for time
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 
+// Shutdown modes
 pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;

@@ -17,8 +17,8 @@ fn main(_args: &[&str]) -> i32 {
     let minutes = (total % 3600) / 60;
     let seconds = total % 60;
 
-    // Format as "up H:MM:SS\n" or "up Xd H:MM:SS\n"
-    // Max: "up 18446744073709551615d 23:59:59\n" = 38 chars — 48 bytes is safe.
+    // Format as "up H:MM:SS\n" or "up Xd H:MM:SS\n" where X is days and H is hours < 24.
+    // Even for u64::MAX seconds, the formatted string is < 48 bytes, so this buffer is safe.
     let mut buf = [0u8; 48];
     let mut pos = 0;
 
