@@ -1,4 +1,10 @@
-# Phase 2 - Memory Basics
+# Phase 02 — Memory Basics
+
+**Status:** Complete
+**Source Ref:** phase-02
+**Depends on:** Phase 1 (Boot Foundation) ✅
+**Builds on:** Phase 1's boot path and serial logging to add memory management
+**Primary Components:** frame allocator, page-table management, kernel heap, global allocator
 
 ## Milestone Goal
 
@@ -13,6 +19,14 @@ flowchart TD
     Heap --> Alloc["Box / Vec / String work"]
 ```
 
+## Why This Phase Exists
+
+Phase 1 proved the kernel can boot and print, but everything was statically allocated.
+Without dynamic memory, the kernel cannot create data structures of unknown size — no
+task lists, no buffers, no driver state. This phase introduces the memory subsystem that
+every later phase depends on: a frame allocator to hand out physical memory, page-table
+helpers to map it, and a heap so Rust's `alloc` types (`Box`, `Vec`, `String`) work.
+
 ## Learning Goals
 
 - Understand the memory map provided by the bootloader.
@@ -26,6 +40,32 @@ flowchart TD
 - page mapping helpers
 - fixed kernel heap region
 - `#[global_allocator]` integration
+
+## Important Components and How They Work
+
+### Frame Allocator
+
+The bootloader provides a memory map describing which physical regions are usable. The
+frame allocator walks this map and hands out 4 KiB physical frames, tracking which frames
+are already claimed to prevent double-allocation.
+
+### Page-Table Management
+
+Safe wrappers around the `x86_64` crate's page-table operations allow the kernel to map
+virtual addresses to physical frames. These wrappers contain the `unsafe` boundary so
+callers can map pages without writing unsafe code directly.
+
+### Kernel Heap
+
+A fixed-size virtual region is mapped and handed to a `linked_list_allocator`, which is
+installed as the `#[global_allocator]`. After heap init, standard `alloc` types work
+throughout the kernel.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 1's boot path by parsing `BootInfo` memory regions during `kernel_main` init.
+- Reuses Phase 1's serial logging for memory subsystem diagnostics and debugging.
+- Requires Phase 1's panic handler to catch early memory bugs visibly.
 
 ## Implementation Outline
 
@@ -46,12 +86,6 @@ flowchart TD
 ## Companion Task List
 
 - [Phase 2 Task List](./tasks/02-memory-basics-tasks.md)
-
-## Documentation Deliverables
-
-- explain how usable frames are selected from the boot memory map
-- explain the heap layout and why it is fixed-size at first
-- document which parts of paging require `unsafe` and why
 
 ## How Real OS Implementations Differ
 

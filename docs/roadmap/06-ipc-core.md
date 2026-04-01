@@ -1,4 +1,10 @@
-# Phase 6 - IPC Core
+# Phase 06 — IPC Core
+
+**Status:** Complete
+**Source Ref:** phase-06
+**Depends on:** Phase 5 ✅
+**Builds on:** Extends the userspace process model from Phase 5 with inter-process communication primitives
+**Primary Components:** kernel/src/ipc/, capability table, endpoint objects, notification objects
 
 ## Milestone Goal
 
@@ -16,6 +22,14 @@ sequenceDiagram
     K->>C: wake with reply
 ```
 
+## Why This Phase Exists
+
+A microkernel moves services out of ring 0, but those services need a way to talk to each
+other and to the kernel. Without an explicit IPC mechanism, the only communication path is
+shared memory with ad hoc synchronization, which undermines the isolation guarantees that
+motivated the microkernel architecture. This phase introduces the fundamental communication
+primitives that all subsequent server-based phases depend on.
+
 ## Learning Goals
 
 - Understand why microkernels move services out of ring 0.
@@ -24,11 +38,37 @@ sequenceDiagram
 
 ## Feature Scope
 
-- endpoint kernel objects
-- capability handles and validation
+- Endpoint kernel objects
+- Capability handles and validation
 - `send`, `recv`, `call`, `reply`, `reply_recv`
-- notification objects for asynchronous events
+- Notification objects for asynchronous events
 - IRQ registration through capabilities
+
+## Important Components and How They Work
+
+### Endpoint Objects
+
+Endpoints are kernel-managed rendezvous points. A client calls into an endpoint and blocks
+until the server replies. The kernel transfers the message inline without copying to an
+intermediate buffer.
+
+### Capability Table
+
+Each process holds a per-process capability table. Every IPC handle is an index into this
+table. The kernel validates the index on every syscall, preventing forged or out-of-range
+references.
+
+### Notification Objects
+
+Notification objects provide a lightweight asynchronous signaling mechanism. They hold a
+word-sized bitfield that can be signaled from interrupt handlers without blocking. This is
+the path used for IRQ delivery to userspace.
+
+## How This Builds on Earlier Phases
+
+- **Extends** the scheduler and task model from Phase 5 with IPC-specific wait states
+- **Reuses** the syscall gate from Phase 5 for new IPC syscall numbers
+- **Introduces** capability tables as the security primitive that replaces direct kernel object access
 
 ## Implementation Outline
 
@@ -49,21 +89,16 @@ sequenceDiagram
 
 - [Phase 6 Task List](./tasks/06-ipc-core-tasks.md)
 
-## Documentation Deliverables
-
-- explain the rendezvous model and why it was chosen
-- document the capability table model
-- describe the difference between call/reply and notifications
-
 ## How Real OS Implementations Differ
 
-Real microkernels often include more message registers, stronger formal models,
-priority-aware scheduling interactions, and carefully tuned fast paths. This project
-should keep the IPC contract small and explicit so the reader can trace every state
-change during a message exchange.
+- Real microkernels often include more message registers, stronger formal models,
+  priority-aware scheduling interactions, and carefully tuned fast paths.
+- Production systems like seL4 use formal verification to prove IPC correctness.
+- This project keeps the IPC contract small and explicit so the reader can trace every state
+  change during a message exchange.
 
 ## Deferred Until Later
 
-- large page-grant transfers
+- Large page-grant transfers
 - IPC timeouts and cancellation
-- advanced scheduling policies around IPC
+- Advanced scheduling policies around IPC

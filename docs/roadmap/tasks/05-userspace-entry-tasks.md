@@ -1,33 +1,104 @@
-# Phase 5 Tasks - Userspace Entry
+# Phase 05 — Userspace Entry: Task List
 
-**Depends on:** Phase 4
+**Status:** Complete
+**Source Ref:** phase-05
+**Depends on:** Phase 4 ✅
+**Goal:** Define a process abstraction, build a user address space with ring-3 mappings, implement the ring-0 to ring-3 transition, install the syscall gate, and run the first userspace program.
 
-```mermaid
-flowchart LR
-    A["process model"] --> B["user address space"]
-    B --> C["ring 3 entry"]
-    C --> D["syscall gate"]
-    D --> E["hello userspace program"]
-    E --> F["docs + validation"]
-```
+## Track Layout
 
-## Implementation Tasks
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Process model + user address space | Phase 4 | ✅ Done |
+| B | Ring 3 entry + syscall gate | A | ✅ Done |
+| C | First userspace binary + validation + docs | B | ✅ Done |
 
-- [x] P5-T001 Define a minimal process abstraction separate from kernel-only task state where needed.
-- [x] P5-T002 Build a user address space with code, stack, and kernel-protected mappings.
-- [x] P5-T003 Implement the transition into ring 3 using the project's chosen entry path.
-- [x] P5-T004 Install the syscall entry point and dispatcher using the documented ABI.
-- [x] P5-T005 Implement at least `debug_print` and `exit` syscalls for the first user program.
-- [x] P5-T006 Create one tiny userspace binary that exercises the syscall and exit path.
+---
 
-## Validation Tasks
+## Track A — Process Model + User Address Space
 
-- [x] P5-T007 Verify a userspace program can print and exit cleanly.
-- [x] P5-T008 Verify invalid userspace access to kernel memory faults cleanly.
-- [x] P5-T009 Verify the syscall path returns to the correct userspace location.
+### A.1 — Define a minimal process abstraction
 
-## Documentation Tasks
+**File:** `kernel/src/process/mod.rs`
+**Symbols:** `Process`, `ProcessState`
+**Why it matters:** Processes need their own page tables, file descriptors, and lifecycle state — separate from the kernel task that executes them.
 
-- [x] P5-T010 Document the syscall ABI and ring transition at a high level.
-- [x] P5-T011 Document the first userspace memory layout and process assumptions.
-- [x] P5-T012 Add a short note explaining how mature kernels support richer executable loading, memory permissions, and process models.
+**Acceptance:**
+- [x] `Process` struct holds entry point, stack pointer, state, and per-process metadata
+- [x] `ProcessState` enum tracks `Ready`, `Running`, `Zombie`, etc.
+- [x] `Process::new()` initializes a process descriptor
+
+### A.2 — Build a user address space
+
+**File:** `kernel/src/mm/user_space.rs`
+**Symbol:** `copy_to_user`
+**Why it matters:** Userspace code must execute in its own virtual address space with code, stack, and kernel-protected mappings to enforce isolation.
+
+**Acceptance:**
+- [x] User code and stack are mapped into a separate address space region
+- [x] Kernel memory is protected from userspace access
+
+---
+
+## Track B — Ring 3 Entry + Syscall Gate
+
+### B.1 — Implement the transition into ring 3
+
+**File:** `kernel/src/arch/x86_64/mod.rs`
+**Symbol:** `enter_userspace`
+**Why it matters:** The ring transition is the security boundary — it drops privilege from ring 0 to ring 3 using `iretq` with the correct segment selectors.
+
+**Acceptance:**
+- [x] `enter_userspace(entry, user_stack_top)` performs `iretq` to ring 3
+- [x] Segment selectors use the user code/data GDT entries (RPL=3)
+
+### B.2 — Install the syscall entry point and dispatcher
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbols:** `syscall_entry`, `syscall_handler`
+**Why it matters:** The syscall gate is the only controlled path from ring 3 back to ring 0 — it must save user state, switch to the kernel stack, and dispatch to the correct handler.
+
+**Acceptance:**
+- [x] `syscall_entry` assembly stub saves user registers and switches to the kernel stack
+- [x] `syscall_handler` dispatches based on the syscall number in `rax`
+- [x] Syscall ABI follows the documented register convention (rdi, rsi, rdx, r10, r8, r9)
+
+---
+
+## Track C — First Userspace Binary + Validation + Docs
+
+### C.1 — Implement debug_print and exit syscalls
+
+**Component:** Syscall dispatcher in `kernel/src/arch/x86_64/syscall.rs`
+**Why it matters:** The first userspace program needs at minimum a way to produce output and a way to terminate cleanly.
+
+**Acceptance:**
+- [x] `debug_print` syscall writes user-provided data to serial
+- [x] `exit` syscall terminates the process and reclaims resources
+
+### C.2 — Create the first userspace binary
+
+**Component:** Userspace test binary (e.g., `userspace/exit0/`)
+**Why it matters:** A working userspace binary proves the entire pipeline — ELF loading, address space setup, ring transition, syscall, and exit.
+
+**Acceptance:**
+- [x] Tiny userspace binary exercises the syscall and exit path
+- [x] Userspace program prints and exits cleanly
+
+### C.3 — Validate isolation and document the model
+
+**Why it matters:** Ring 3 isolation must be verified, and the syscall ABI must be documented for all future userspace development.
+
+**Acceptance:**
+- [x] Invalid userspace access to kernel memory faults cleanly
+- [x] Syscall path returns to the correct userspace location
+- [x] Syscall ABI and ring transition are documented at a high level
+- [x] First userspace memory layout and process assumptions are documented
+- [x] A note explains how mature kernels support richer executable loading, memory permissions, and process models
+
+---
+
+## Documentation Notes
+
+- Adds `kernel/src/process/mod.rs`, `kernel/src/arch/x86_64/syscall.rs`, and the first userspace binary.
+- Builds on the scheduler from Phase 4 to run userspace processes as scheduled tasks.

@@ -1,4 +1,10 @@
-# Phase 12 - POSIX Compatibility Layer
+# Phase 12 — POSIX Compatibility Layer
+
+**Status:** Complete
+**Source Ref:** phase-12
+**Depends on:** Phase 11 ✅
+**Builds on:** ELF loader and process model from Phase 11, adding Linux-compatible syscall numbers so musl-linked C binaries can run unmodified
+**Primary Components:** kernel/src/arch/x86_64/ (syscall gate), userspace/syscall-lib/, userspace/coreutils/
 
 ## Milestone Goal
 
@@ -15,6 +21,14 @@ flowchart LR
     Gate --> IO["console_server"]
 ```
 
+## Why This Phase Exists
+
+The custom syscall ABI from earlier phases works for native Rust userspace code, but
+the OS cannot run standard C programs without a POSIX-compatible syscall interface.
+By implementing the Linux syscall numbers that musl libc requires, the OS gains access
+to the entire ecosystem of portable C programs — compilers, utilities, and libraries —
+without requiring each to be ported to a custom ABI.
+
 ## Learning Goals
 
 - Understand what a syscall ABI compatibility layer actually involves.
@@ -30,6 +44,37 @@ flowchart LR
 - musl libc compiled on the host against this ABI, bundled in the disk image
 - C runtime stub (`crt0`) that calls `main` and passes the exit code to `exit`
 - userspace `malloc`/`free` backed by `brk`/`mmap`
+
+## Important Components and How They Work
+
+### Syscall Dispatch Table
+
+A second dispatch table in the syscall gate maps Linux syscall numbers to internal
+kernel functions. The existing custom ABI remains untouched — both dispatch paths
+coexist, selected by convention or entry mechanism.
+
+### musl libc Integration
+
+musl is compiled on the host with syscall wrapper stubs patched to use `syscall` with
+Linux numbers. The compiled `libc.a` and headers are bundled in the disk image so
+userspace C programs can link against them.
+
+### C Runtime Entry (crt0)
+
+A minimal `crt0.s` satisfies the System V entry convention: it sets up the stack
+frame, calls `__libc_start_main`, which in turn calls `main` and passes the return
+value to `exit`.
+
+### Userspace Memory Allocation
+
+`malloc`/`free` in musl are backed by `brk` and `mmap` syscalls, which the kernel
+implements to grow the process heap or map anonymous pages.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 11 (Process Model):** adds Linux-compatible syscall numbers alongside the existing custom ABI in the syscall gate
+- **Reuses Phase 11 (ELF Loader):** musl-linked ELF binaries are loaded by the same ELF loader
+- **Reuses Phase 8 (VFS):** file-oriented syscalls (`open`, `read`, `write`, `close`) route to the existing VFS layer
 
 ## Implementation Outline
 
@@ -53,13 +98,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 12 Task List](./tasks/12-posix-compat-tasks.md)
-
-## Documentation Deliverables
-
-- document the Linux syscall number mapping table and dispatch strategy
-- explain what musl needs vs. what glibc needs and why musl is the right choice
-- document the C runtime entry sequence (`_start` → `__libc_start_main` → `main`)
-- explain which syscalls are stubbed, which are real, and what the gaps mean
 
 ## How Real OS Implementations Differ
 

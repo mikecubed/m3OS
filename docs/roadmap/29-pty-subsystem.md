@@ -1,4 +1,10 @@
-# Phase 29 - PTY Subsystem
+# Phase 29 — PTY Subsystem
+
+**Status:** Complete
+**Source Ref:** phase-29
+**Depends on:** Phase 22 (TTY) ✅, Phase 27 (User Accounts) ✅
+**Builds on:** Extends the TTY/termios infrastructure from Phase 22 with master/slave PTY pairs; uses user ownership from Phase 27 for PTY permissions
+**Primary Components:** kernel/src/pty.rs, kernel-core/src/pty.rs, userspace/pty-test/
 
 ## Milestone Goal
 
@@ -6,6 +12,15 @@ Implement real pseudo-terminal (PTY) pairs so that multiple independent terminal
 sessions can run simultaneously. A PTY master/slave pair connects a terminal emulator
 (or network server) to a shell process, enabling remote access (telnet, SSH) and local
 terminal multiplexing.
+
+## Why This Phase Exists
+
+The OS has a single console TTY from Phase 22, which means only one interactive session
+can run at a time. To support remote login (telnet/SSH), terminal multiplexers, or
+multiple local terminals, the kernel needs a way to dynamically create virtual terminal
+pairs. PTYs are the Unix mechanism for this: a master side driven by an application
+(e.g., a telnet server) and a slave side that looks like a real terminal to the shell.
+Without PTYs, the OS cannot be a multi-session, networked system.
 
 ## Learning Goals
 
@@ -37,13 +52,31 @@ terminal multiplexing.
   real terminal and the PTY, proving the plumbing works.
 - Or: spawn a second shell on a PTY and switch between them.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 22 (TTY) | termios, line discipline, cooked/raw mode |
-| Phase 19 (Signals) | SIGHUP, job control signals through PTY |
-| Phase 27 (Users) | PTY ownership and permissions |
+### PTY Allocator
+
+A kernel-side table of PTY pairs, each with a ring buffer connecting master and slave.
+Opening `/dev/ptmx` allocates a new entry from the table and returns the master fd.
+The corresponding slave is accessible as `/dev/pts/N`.
+
+### Ring Buffers
+
+Each PTY pair uses ring buffers (implemented in `kernel-core/src/pty.rs`) to pass data
+between master and slave sides. Writing to the master enqueues bytes that the slave
+reads, and vice versa.
+
+### Session Management
+
+`setsid()` creates a new session, and `TIOCSCTTY` assigns the PTY slave as the
+controlling terminal for that session. This ensures signals like `SIGHUP` are delivered
+correctly when the master side closes.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 22 (TTY):** Reuses the termios line discipline and cooked/raw mode processing for the PTY slave side.
+- **Extends Phase 19 (Signals):** Uses SIGHUP and job control signals delivered through the PTY controlling terminal.
+- **Extends Phase 27 (User Accounts):** PTY ownership and permissions are tied to the logged-in user.
 
 ## Implementation Outline
 

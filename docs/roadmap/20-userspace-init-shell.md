@@ -1,5 +1,11 @@
 # Phase 20 — Userspace Init and Shell
 
+**Status:** Complete
+**Source Ref:** phase-20
+**Depends on:** Phase 19 ✅
+**Builds on:** Uses signal handling from Phase 19; moves the ring-0 init/shell from earlier phases into ring-3 userspace
+**Primary Components:** userspace/init/, userspace/shell/, kernel/src/main.rs
+
 ## Milestone Goal
 
 Replace the kernel-resident `init_task` and `shell_task` ring-0 functions with real
@@ -18,6 +24,16 @@ flowchart TD
     Shell -->|"SIGCHLD / orphan reap"| Init
     Init -->|"waitpid(-1)"| Init
 ```
+
+## Why This Phase Exists
+
+Up to this point, command parsing and the interactive session run inside the kernel
+at ring 0. This is both a security risk (a bug in the shell could corrupt kernel
+memory) and an architectural dead end (kernel code cannot be replaced or upgraded
+without rebooting). Moving init and the shell to ring 3 enforces proper privilege
+separation, exercises the full syscall interface end-to-end, and establishes the
+standard Unix process hierarchy where PID 1 is the ancestor of all userspace
+processes and is responsible for orphan reaping.
 
 ## Learning Goals
 
@@ -54,6 +70,49 @@ flowchart TD
   stdin fd
 - **`Cargo.toml` / xtask**: uncomment the `userspace/init` and `userspace/shell`
   workspace members; add them to the ramdisk image build step
+
+## Important Components and How They Work
+
+### Userspace Init (PID 1)
+
+A `no_std` Rust binary that opens `/dev/console` as fds 0, 1, 2, then forks and execs
+`/bin/sh`. It enters an infinite `waitpid(-1, WNOHANG)` + `pause` loop to reap orphaned
+children. Init must never exit; if the shell dies, it re-spawns or waits gracefully.
+
+### Userspace Shell (sh0)
+
+An interactive `no_std` Rust shell that reads one byte at a time from fd 0, accumulates
+a line buffer (max 256 bytes), tokenizes on whitespace (respecting single-quoted strings),
+and dispatches commands. Builtins (`cd`, `exit`) are handled directly. External commands
+use `fork` + `execve` with `waitpid` for foreground execution. Pipe support uses `pipe`
++ `dup2` for two-stage `cmd1 | cmd2` pipelines. I/O redirection (`>`, `<`) uses `open`
++ `dup2` in the child before exec.
+
+### Syscall Shim Layer
+
+Inline-asm wrappers shared by both binaries for `read`, `write`, `fork`, `execve`,
+`waitpid`, `exit`, `pipe`, `dup2`, `open`, `close`, `chdir`, `kill`, `getpid`. These
+follow the System V AMD64 ABI syscall convention.
+
+### Kernel Boot Transition
+
+In `kernel_main`, after all kernel-task servers are started, the kernel loads `/sbin/init`
+from the ramdisk via the ELF loader, allocates a new address space, and transfers to
+ring-3 as PID 1. The `init_task()` and `shell_task()` functions are removed from
+`kernel/src/main.rs`.
+
+## How This Builds on Earlier Phases
+
+- **Replaces Phase 9**: the ring-0 kernel shell from Phase 9 is replaced by a ring-3
+  userspace shell
+- **Extends Phase 11**: uses the ELF loader and process model to load init and the
+  shell as userspace binaries
+- **Extends Phase 14**: exercises `fork`, `execve`, `waitpid`, `pipe`, and `dup2`
+  syscalls as the primary execution model
+- **Extends Phase 19**: uses signal handling for `SIGINT` delivery to foreground
+  children and `SIGCHLD` for child exit notification
+- **Reuses Phase 18**: relies on directory navigation (`chdir`, `getcwd`) and path
+  resolution for the `cd` builtin
 
 ## Implementation Outline
 
@@ -111,27 +170,17 @@ flowchart TD
 
 - [Phase 20 Task List](./tasks/20-userspace-init-shell-tasks.md)
 
-## Documentation Deliverables
-
-- Document the PID 1 contract: what happens if init exits, why orphan reaping matters
-- Explain the `_start` to `main` entry sequence for `no_std` Rust userspace binaries
-- Document the inline syscall ABI wrapper pattern used across both binaries
-- Describe the shell's fork-exec-wait loop and how pipe fd plumbing works
-- Diagram the fd table state before and after `fork` + `dup2` in a pipe: which fds are
-  open in the parent, the left child, and the right child, and which must be closed where
-- Note which kernel-task servers remain in ring-0 and why (capability-grant phase deferred)
-- Document the `execve` argument layout: the `argv` and `envp` pointer arrays on the
-  user stack, null-terminated, as required by the System V AMD64 ABI
-
 ## How Real OS Implementations Differ
 
-Production init systems (systemd, OpenRC, s6) handle service supervision, dependency
-ordering, socket activation, cgroups, and logging. Even BusyBox's `init` handles
-`/etc/inittab` respawn entries, runlevels, and `sysvinit` compatibility. Real shells
-(dash, bash) implement full POSIX parameter expansion, here-documents, arithmetic,
-function definitions, and complex job control. This phase targets only the subset
-needed to run interactive commands and pipelines — enough to feel like a real shell
-without the decades of accumulated specification compliance.
+- Production init systems (systemd, OpenRC, s6) handle service supervision, dependency
+  ordering, socket activation, cgroups, and logging.
+- Even BusyBox's `init` handles `/etc/inittab` respawn entries, runlevels, and
+  `sysvinit` compatibility.
+- Real shells (dash, bash) implement full POSIX parameter expansion, here-documents,
+  arithmetic, function definitions, and complex job control.
+- This phase targets only the subset needed to run interactive commands and pipelines --
+  enough to feel like a real shell without the decades of accumulated specification
+  compliance.
 
 ## Deferred Until Later
 

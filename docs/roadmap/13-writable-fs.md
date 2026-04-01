@@ -1,4 +1,10 @@
-# Phase 13 - Writable Filesystem
+# Phase 13 — Writable Filesystem
+
+**Status:** Complete
+**Source Ref:** phase-13
+**Depends on:** Phase 8 ✅
+**Builds on:** Read-only VFS and FAT32 driver from Phase 8, adding write paths and an in-memory tmpfs
+**Primary Components:** kernel/src/fs/ (VFS, FAT32, tmpfs), kernel-core/src/fs/
 
 ## Milestone Goal
 
@@ -15,6 +21,14 @@ flowchart LR
     TmpFS --> RAM["physical pages\n(frame allocator)"]
 ```
 
+## Why This Phase Exists
+
+A read-only filesystem is insufficient for any real work — programs need to create
+temporary files, store configuration, and persist data across reboots. Without write
+support the OS cannot build software, save user work, or even create log files. This
+phase adds the write path to FAT32 for persistence and introduces tmpfs for fast
+ephemeral storage, completing the basic storage story.
+
 ## Learning Goals
 
 - Understand the difference between a page-backed in-memory filesystem and a
@@ -25,16 +39,49 @@ flowchart LR
 
 ## Feature Scope
 
-- `tmpfs`: in-memory filesystem backed by kernel-allocated pages
-  - `mkdir`, `create`, `write`, `read`, `unlink`, `rmdir`
-  - mounted at `/tmp` by default
-- FAT32 write path:
-  - file create (new directory entry + cluster allocation)
-  - append and overwrite writes
-  - file delete (mark entry free, return clusters to FAT)
-  - directory create and remove
+### tmpfs
+
+In-memory filesystem backed by kernel-allocated pages:
+- `mkdir`, `create`, `write`, `read`, `unlink`, `rmdir`
+- mounted at `/tmp` by default
+
+### FAT32 Write Path
+
+- file create (new directory entry + cluster allocation)
+- append and overwrite writes
+- file delete (mark entry free, return clusters to FAT)
+- directory create and remove
+
+### VFS and Syscall Integration
+
 - VFS dispatch updated to route write calls to the correct backend
 - Syscalls: `write`, `creat`, `mkdir`, `unlink`, `rmdir`, `rename`, `truncate`
+
+## Important Components and How They Work
+
+### tmpfs
+
+Stores file data as kernel page lists with no disk involvement. Implemented as a hash
+map from path to page list. Mounted at `/tmp` during init. `fsync` is a no-op since
+all data is in RAM.
+
+### FAT32 Write Path
+
+Extends the read-only FAT32 driver to support writes. Creating a file allocates
+clusters from the FAT free list, creates a new directory entry, and writes data to
+the allocated clusters. Deleting a file marks the directory entry as free and returns
+clusters to the FAT. `fsync` flushes dirty sectors to the block device.
+
+### VFS Dispatch
+
+The VFS layer gains a `WriteableFs` trait alongside the existing `ReadableFs`. Write
+calls are dispatched to the correct backend (tmpfs or FAT32) based on the mount point.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 8 (VFS/Storage):** adds write paths to the existing read-only VFS and FAT32 driver
+- **Reuses Phase 8 (Block Device):** FAT32 writes go through the same block device layer used for reads
+- **Reuses Phase 3 (Memory Management):** tmpfs allocates physical frames from the frame allocator for file data
 
 ## Implementation Outline
 
@@ -58,15 +105,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 13 Task List](./tasks/13-writable-fs-tasks.md)
-
-## Documentation Deliverables
-
-- explain how tmpfs stores file data as kernel page lists with no disk involvement
-- document the FAT32 write path: cluster allocation, FAT table update, directory entry
-  creation
-- explain what `fsync` means and why tmpfs can ignore it
-- note the crash-safety gap: why a power loss during a FAT32 write may corrupt the
-  filesystem
 
 ## How Real OS Implementations Differ
 

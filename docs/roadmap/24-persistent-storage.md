@@ -1,8 +1,14 @@
-# Phase 24 - Persistent Storage
+# Phase 24 — Persistent Storage
+
+**Status:** Complete
+**Source Ref:** phase-24
+**Depends on:** Phase 15 (ACPI/PCI) ✅, Phase 18 (Ramdisk/Initrd) ✅
+**Builds on:** Uses PCI enumeration from Phase 15 to discover virtio-blk; extends the VFS from Phase 8 with a persistent FAT32 backend
+**Primary Components:** kernel/src/blk/, kernel/src/fs/fat32, xtask disk image builder
 
 ## Milestone Goal
 
-Give m³OS a persistent block device so that files written during one boot session
+Give m3OS a persistent block device so that files written during one boot session
 survive into the next. A virtio-blk driver (the simplest PCI virtio device in QEMU)
 handles raw sector I/O; a partition parser finds the FAT32 data partition; the
 existing `fat_server` gains a write path that flushes directly to disk. After this
@@ -19,6 +25,16 @@ flowchart TD
 
     xtask["cargo xtask image"] -->|"creates"| Disk
 ```
+
+## Why This Phase Exists
+
+Until this phase, all files live in a ramdisk that is discarded on every reboot.
+Users cannot save work, configuration changes are lost, and the OS cannot
+accumulate state across sessions. Persistent storage is a prerequisite for user
+accounts (passwords must survive reboots), build tools (source files must persist),
+and any workflow that involves editing and saving files. The virtio-blk driver is
+the simplest path to real disk I/O in QEMU, and FAT32 provides a well-understood
+writable filesystem that is also readable from the host.
 
 ## Learning Goals
 
@@ -57,6 +73,43 @@ flowchart TD
   - create `disk.img` alongside the UEFI boot image: MBR + ESP partition (FAT32,
     copied from the existing UEFI image) + data partition (FAT32, empty)
   - pass the image to QEMU via `-drive file=disk.img,format=raw,if=virtio`
+
+## Important Components and How They Work
+
+### virtio-blk Driver
+
+The driver discovers the device via PCI bus scan (VID=0x1AF4, DID=0x1001), maps
+the I/O BAR, and initializes the device through the legacy virtio status byte
+sequence (reset, acknowledge, DRIVER, feature negotiation, DRIVER_OK). A single
+request virtqueue handles all I/O: each request is a three-descriptor chain
+(header + data buffer + status byte). The driver kicks the queue and spin-polls
+the used ring for completion.
+
+### MBR Partition Parsing
+
+Reads sector 0, scans the four partition entries, and identifies the FAT32 data
+partition by type byte (0x0B or 0x0C). Returns the LBA offset and sector count
+for the data partition.
+
+### FAT32 Write Path
+
+Cluster allocation from free FAT entries, chain extension for multi-cluster files,
+directory entry creation, and FAT table flush after each mutation. Synchronous
+write-through ensures data reaches disk immediately (no writeback cache).
+
+### sys_mount Integration
+
+On first call with `fstype="vfat"`, triggers `blk_server` initialization, runs
+MBR parsing, and registers the FAT32 backend with `vfs_server` at the requested
+mount point. Init calls `mount("/dev/blk0p1", "/data", "vfat", 0, "")` after
+all servers are running.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 15 (ACPI/PCI):** uses PCI device enumeration to discover the virtio-blk device
+- **Extends Phase 18 (Ramdisk/Initrd):** complements the read-only initrd with a persistent read-write filesystem
+- **Extends Phase 8 (VFS):** adds a new mount point and filesystem backend to the VFS dispatch table
+- **Extends Phase 6 (IPC):** blk_server and fat_server communicate via IPC messages
 
 ## Implementation Outline
 
@@ -108,33 +161,20 @@ flowchart TD
 
 - [Phase 24 Task List](./tasks/24-persistent-storage-tasks.md)
 
-## Documentation Deliverables
-
-- explain the virtio PCI legacy device model: status byte negotiation, virtqueue
-  layout (descriptor ring, available ring, used ring), and the queue kick mechanism
-- document the MBR partition table format: entry offsets, type bytes, LBA addressing
-- explain the FAT32 on-disk layout: BPB fields that locate the FAT region and data
-  region, how cluster numbers map to byte offsets, and what the FAT entry values mean
-- document the write path step by step: allocating a free cluster, updating the FAT
-  chain, writing the directory entry, and why the FAT must be flushed before the
-  directory entry is flushed
-- explain why synchronous write-through is safe here but would be unacceptable in a
-  production kernel (throughput, write amplification)
-- document the `sys_mount` ABI and the hard-wired mapping from `"vfat"` to
-  virtio-blk + FAT32
-
 ## How Real OS Implementations Differ
 
-Production block I/O stacks are built around asynchronous submission queues (Linux
-`io_uring`, NVMe submission/completion queues, Windows I/O completion ports) so that
-a thread is never stalled waiting for a single sector. The page cache decouples the
-filesystem from disk latency: writes land in RAM first and are flushed in batches by
-writeback threads. FAT32 itself is rarely used for root filesystems; production systems
-use journaling filesystems (ext4, XFS, APFS, NTFS) or log-structured designs (F2FS,
-btrfs) that survive power loss without corruption. The virtio 1.0 split-driver model
-(and its modern PCIe variant with packed virtqueues) replaces the legacy BAR-based
-interface used here. This phase deliberately keeps every layer synchronous and
-stateless to make the control flow auditable in a single read-through.
+- Production block I/O stacks are built around asynchronous submission queues (Linux
+  `io_uring`, NVMe submission/completion queues, Windows I/O completion ports) so that
+  a thread is never stalled waiting for a single sector.
+- The page cache decouples the filesystem from disk latency: writes land in RAM first
+  and are flushed in batches by writeback threads.
+- FAT32 itself is rarely used for root filesystems; production systems use journaling
+  filesystems (ext4, XFS, APFS, NTFS) or log-structured designs (F2FS, btrfs) that
+  survive power loss without corruption.
+- The virtio 1.0 split-driver model (and its modern PCIe variant with packed
+  virtqueues) replaces the legacy BAR-based interface used here.
+- This phase deliberately keeps every layer synchronous and stateless to make the
+  control flow auditable in a single read-through.
 
 ## Deferred Until Later
 

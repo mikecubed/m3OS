@@ -1,4 +1,10 @@
-# Phase 11 - ELF Loader and Process Model
+# Phase 11 — ELF Loader and Process Model
+
+**Status:** Complete
+**Source Ref:** phase-11
+**Depends on:** Phase 8 ✅, Phase 9 ✅
+**Builds on:** VFS and disk I/O from Phase 8 to load ELF binaries; shell from Phase 9 as the parent process that spawns children
+**Primary Components:** kernel/src/mm/ (ELF loader, address space), kernel/src/process/, userspace/syscall-lib/
 
 ## Milestone Goal
 
@@ -13,6 +19,15 @@ flowchart LR
     Ring3 -->|"execve / exit"| Kernel["kernel\nprocess table"]
     Kernel -->|"wait / reap"| Parent["parent process"]
 ```
+
+## Why This Phase Exists
+
+Up to this point the kernel can only run a single hardcoded userspace binary. To become
+a real operating system it must be able to load arbitrary programs from the filesystem,
+give each its own isolated address space, and manage their full lifecycle — creation,
+execution, termination, and cleanup. Without a proper process model there is no way to
+run multiple independent programs or build higher-level features like a shell, pipes, or
+job control.
 
 ## Learning Goals
 
@@ -29,6 +44,39 @@ flowchart LR
 - `wait` / `waitpid` syscalls: block parent until child exits, collect exit code
 - per-process kernel stack and saved register state
 - process table in the kernel tracking pid, state, parent, exit code
+
+## Important Components and How They Work
+
+### ELF64 Parser
+
+Reads an ELF binary from the VFS, validates the ELF header and program headers, then
+iterates over `PT_LOAD` segments to determine which virtual addresses need mapping and
+what data to copy from the file.
+
+### Address Space Setup
+
+For each `PT_LOAD` segment the kernel allocates physical frames, creates page table
+mappings at the segment's requested virtual address, and copies the segment data.
+A userspace stack is allocated and mapped at a high address, with `argc`/`argv`/`envp`
+pushed in the System V ABI layout.
+
+### Process Table
+
+A kernel-side table tracking each process's PID, state (running, ready, zombie),
+parent PID, exit code, page table root, and saved register state. Supports the
+lifecycle transitions: spawn -> running -> zombie -> reaped.
+
+### Fork and Exec
+
+`fork` copies the parent's page tables and kernel state into a new process entry.
+`execve` replaces the calling process's address space with a freshly loaded ELF image.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 8 (VFS/Storage):** uses the VFS read path to load ELF binaries from disk
+- **Extends Phase 9 (Shell):** the shell becomes the parent process that spawns children via fork+exec
+- **Extends Phase 3 (Memory Management):** allocates fresh page tables and frames for each new process address space
+- **Reuses Phase 6 (IPC):** process exit notifications and wait/reap use kernel-internal signaling
 
 ## Implementation Outline
 
@@ -51,13 +99,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 11 Task List](./tasks/11-process-model-tasks.md)
-
-## Documentation Deliverables
-
-- explain the ELF loading sequence: parse → allocate → map → stack → enter
-- document the process table structure and lifecycle states
-- explain what `fork` does to page tables and why copy-on-write is deferred
-- note what the System V AMD64 ABI requires at process entry
 
 ## How Real OS Implementations Differ
 

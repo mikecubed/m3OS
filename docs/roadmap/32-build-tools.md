@@ -1,10 +1,26 @@
-# Phase 32 - Build Tools and Scripting
+# Phase 32 — Build Tools and Scripting
+
+**Status:** Complete
+**Source Ref:** phase-32
+**Depends on:** Phase 26 (Text Editor) ✅, Phase 31 (Compiler Bootstrap) ✅
+**Builds on:** Extends the compiler from Phase 31 with a build system (make) and utility programs so that multi-file C projects can be developed entirely inside the OS
+**Primary Components:** userspace/coreutils/ (ar, install, touch, stat, wc), userspace/coreutils-rs/ (ar, install, touch, stat, wc), userspace/demo-project/
 
 ## Milestone Goal
 
 Multi-file C projects can be built inside the OS using a `make`-compatible build tool
 and shell scripts. This transforms the OS from a "compile one file" environment into
 one where real software projects can be developed.
+
+## Why This Phase Exists
+
+Phase 31 delivered a working C compiler, but compiling one file at a time is impractical
+for real projects. Any non-trivial C program has multiple source files, header
+dependencies, and a build process that should be automated. Without a build tool,
+developers must manually track which files changed and re-run the compiler for each one.
+`make` solves this with dependency graphs and timestamp-based incremental builds. The
+additional coreutils (`ar`, `touch`, `stat`, `wc`) fill gaps that `make` and general
+development workflows depend on.
 
 ## Learning Goals
 
@@ -62,13 +78,33 @@ project/
 `make` compiles both `.c` files and links them. `make clean` removes object files.
 Editing one file and re-running `make` only recompiles the changed file.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 26 (Text Editor) | Edit Makefiles and source files |
-| Phase 31 (Compiler) | TCC for compilation |
-| Phase 24 (Persistent Storage) | File timestamps for make |
+### pdpmake
+
+The chosen `make` implementation is pdpmake (Public Domain POSIX make), a ~3000-line C
+program that implements the POSIX make specification. It is cross-compiled with musl
+and placed in the disk image at `/usr/bin/make`. It parses Makefiles, builds a
+dependency graph, compares file timestamps, and executes shell commands for out-of-date
+targets.
+
+### ar (Archive Tool)
+
+`ar` creates and manipulates static library archives (`.a` files). It reads `.o` object
+files and packs them into an archive with a symbol table. TCC's built-in linker can
+then link against these archives. Both C and Rust implementations are provided.
+
+### Demo Project
+
+A multi-file C project (`userspace/demo-project/`) is included in the disk image to
+demonstrate and test the full build workflow: editing, compiling, linking, incremental
+rebuilds, and `make clean`.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 31 (Compiler Bootstrap):** Adds build automation on top of the TCC compiler; `make` invokes `tcc` to compile and link.
+- **Extends Phase 26 (Text Editor):** Developers use the editor to modify Makefiles and source files before running `make`.
+- **Reuses Phase 24 (Persistent Storage):** File timestamps stored on the FAT32 filesystem are used by `make` for incremental build decisions.
 
 ## Implementation Outline
 

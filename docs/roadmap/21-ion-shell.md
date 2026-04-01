@@ -1,9 +1,15 @@
 # Phase 21 — Ion Shell Integration
 
+**Status:** Complete
+**Source Ref:** phase-21
+**Depends on:** Phase 20 ✅
+**Builds on:** Replaces the minimal sh0 shell from Phase 20 with the Ion shell; reuses the init binary and syscall infrastructure from Phase 20
+**Primary Components:** userspace/init/, xtask/
+
 ## Milestone Goal
 
 Replace the minimal `no_std` shell from Phase 20 with
-[ion](https://github.com/redox-os/ion) — the shell built for Redox OS, another custom
+[ion](https://github.com/redox-os/ion) -- the shell built for Redox OS, another custom
 Rust OS. After this phase `/bin/ion` is the interactive shell that userspace init
 spawns. The kernel-level and custom-shell scaffolding from Phase 20 remains as a
 regression harness; the user-facing shell gains a real scripting language, job control,
@@ -22,29 +28,15 @@ flowchart TD
     Ion -->|"script mode\n(-c flag)"| Scripts["ion scripts\nfrom ramdisk"]
 ```
 
-## Why Ion?
+## Why This Phase Exists
 
-Ion was designed from scratch for Redox OS — a microkernel Rust OS that also provides
-its own syscall layer. It has already been adapted to run on a non-Linux, non-POSIX OS
-by its original authors. m3OS targets the Linux x86_64 ABI, which is the *same* ABI
-ion was originally written for, making the port even more direct.
-
-Crucially, ion uses **no tokio, no async/await, no threading, no epoll**. Its only
-non-trivial OS requirements are:
-
-| ion Requirement | m3OS Status After Phase 20 |
-|---|---|
-| Rust `std` + musl libc | ✅ Phase 12 complete |
-| `fork` / `execve` / `waitpid` | ✅ Phase 11 complete |
-| `pipe` / `dup2` / `open` / `read` / `write` | ✅ Phase 13/14 complete |
-| `sigaction` / `kill` / `sigprocmask` | ✅ Phase 19 complete |
-| `tcgetattr` / `tcsetattr` (interactive mode) | ❌ Phase 22 |
-
-Ion's interactive mode (line editing, history, raw terminal) depends on `termios` and
-is unlocked in Phase 22. This phase targets **script mode and cooked-input interactive
-mode** — the user types at a line-buffered prompt and ion processes it. That is
-sufficient to use ion as a real shell: variable expansion, pipelines, functions, loops,
-and all builtins work without raw terminal mode.
+The minimal sh0 shell from Phase 20 proves that userspace process management works,
+but it lacks variable expansion, loops, functions, scripting, and all the features
+expected of a real interactive shell. Rather than building these features from scratch,
+this phase integrates Ion -- a shell already designed for a custom Rust OS (Redox) that
+targets the same Linux ABI m3OS implements. This validates that the kernel's syscall
+surface is complete enough to run a real-world Rust application compiled against musl
+libc, and it gives users a capable shell without months of shell language development.
 
 ## Learning Goals
 
@@ -74,14 +66,38 @@ and all builtins work without raw terminal mode.
 - **xtask integration**: the `cargo xtask image` build step cross-compiles ion if a
   pre-built binary is not found in `xtask/vendor/`
 
-## Ion Dependency Map
+## Important Components and How They Work
+
+### Why Ion?
+
+Ion was designed from scratch for Redox OS -- a microkernel Rust OS that also provides
+its own syscall layer. It has already been adapted to run on a non-Linux, non-POSIX OS
+by its original authors. m3OS targets the Linux x86_64 ABI, which is the *same* ABI
+ion was originally written for, making the port even more direct.
+
+Crucially, ion uses **no tokio, no async/await, no threading, no epoll**. Its only
+non-trivial OS requirements are:
+
+| ion Requirement | m3OS Status After Phase 20 |
+|---|---|
+| Rust `std` + musl libc | Phase 12 complete |
+| `fork` / `execve` / `waitpid` | Phase 11 complete |
+| `pipe` / `dup2` / `open` / `read` / `write` | Phase 13/14 complete |
+| `sigaction` / `kill` / `sigprocmask` | Phase 19 complete |
+| `tcgetattr` / `tcsetattr` (interactive mode) | Phase 22 |
+
+Ion's interactive mode (line editing, history, raw terminal) depends on `termios` and
+is unlocked in Phase 22. This phase targets **script mode and cooked-input interactive
+mode** -- the user types at a line-buffered prompt and ion processes it.
+
+### Ion Dependency Map
 
 ```mermaid
 flowchart LR
     ion["ion binary"]
     core["ion-shell (lib)"]
     liner["redox_liner\n(line editor)"]
-    termion["termion\n→ tcgetattr/tcsetattr"]
+    termion["termion\n-> tcgetattr/tcsetattr"]
     nix["nix crate\n(fs, process, signal)"]
     musl["musl libc\n(statically linked)"]
 
@@ -101,6 +117,30 @@ flowchart LR
 
 The dashed edge shows the one remaining gap. All solid edges are unblocked after Phase
 19 + musl (Phase 12).
+
+### What Changes Relative to Phase 20
+
+| Aspect | Phase 20 | Phase 21 |
+|---|---|---|
+| Shell binary | `/bin/sh` (custom `no_std`) | `/bin/ion` (ion, musl-static) |
+| Shell language | Whitespace tokenizer, `cd`/`exit` | Full ion: variables, loops, functions, pipelines |
+| Line editing | Byte-by-byte cooked read | Cooked mode (raw mode in Phase 22) |
+| Job control | Basic `SIGINT` to foreground | ion's built-in `fg`/`bg`/`jobs` |
+| Scripting | None | `.ion` script files, `source`, functions |
+| Validation harness | The shell itself | `/bin/sh0` (the Phase 20 shell, kept for regression) |
+
+## How This Builds on Earlier Phases
+
+- **Replaces Phase 20 shell**: the minimal sh0 shell from Phase 20 is replaced as
+  the default interactive shell by Ion, though sh0 is kept as a fallback
+- **Reuses Phase 20 init**: the `userspace/init` binary from Phase 20 is updated to
+  exec Ion instead of sh0
+- **Depends on Phase 19**: Ion requires `sigaction`, `kill`, and `sigprocmask` for
+  signal handling
+- **Depends on Phase 12**: Ion is compiled against musl libc, which was made
+  functional in Phase 12
+- **Depends on Phase 11/14**: Ion exercises `fork`, `execve`, `waitpid`, `pipe`,
+  and `dup2` from earlier phases
 
 ## Implementation Outline
 
@@ -161,47 +201,26 @@ The dashed edge shows the one remaining gap. All solid edges are unblocked after
   statically linked with no `PT_INTERP` segment.
 - The Phase 20 acceptance criteria still pass when using `/bin/sh0`.
 
-## What Changes Relative to Phase 20
-
-| Aspect | Phase 20 | Phase 21 |
-|---|---|---|
-| Shell binary | `/bin/sh` (custom `no_std`) | `/bin/ion` (ion, musl-static) |
-| Shell language | Whitespace tokenizer, `cd`/`exit` | Full ion: variables, loops, functions, pipelines |
-| Line editing | Byte-by-byte cooked read | Cooked mode (raw mode in Phase 22) |
-| Job control | Basic `SIGINT` to foreground | ion's built-in `fg`/`bg`/`jobs` |
-| Scripting | None | `.ion` script files, `source`, functions |
-| Validation harness | The shell itself | `/bin/sh0` (the Phase 20 shell, kept for regression) |
-
 ## Companion Task List
 
 - [Phase 21 Task List](./tasks/21-ion-shell-tasks.md)
 
-## Documentation Deliverables
-
-- Document the `x86_64-unknown-linux-musl` target: what it means, why static linking
-  matters, how it differs from the `no_std` binaries in Phase 20
-- Explain the xtask vendoring / cross-compilation step for ion
-- Note the difference between cooked-mode and raw-mode interactive shells and why ion's
-  interactive line editing is deferred to Phase 22
-- Describe ion's syntax briefly: how it differs from bash (no `$()` subshell syntax,
-  uses `@()` instead; `let` for assignment; array syntax)
-- Reference the Redox OS precedent and why targeting the Linux ABI makes the port
-  easier
-
 ## How Real OS Implementations Differ
 
-Production Linux distributions ship bash, dash, zsh, or fish as `/bin/sh` or the
-default interactive shell. These are either C programs linked against glibc or
-statically linked against musl (Alpine Linux uses busybox ash linked with musl). The
-key difference is that real distributions have package managers that download pre-built
-shell binaries; m3OS builds everything from source or vendors binaries directly into
-the ramdisk during the image build step. The educational insight here is that a shell
-is just a program — as long as the kernel provides the right syscalls, any shell binary
-built for the same ABI will run unmodified.
+- Production Linux distributions ship bash, dash, zsh, or fish as `/bin/sh` or the
+  default interactive shell.
+- These are either C programs linked against glibc or statically linked against musl
+  (Alpine Linux uses busybox ash linked with musl).
+- The key difference is that real distributions have package managers that download
+  pre-built shell binaries; m3OS builds everything from source or vendors binaries
+  directly into the ramdisk during the image build step.
+- The educational insight here is that a shell is just a program -- as long as the
+  kernel provides the right syscalls, any shell binary built for the same ABI will run
+  unmodified.
 
-## Deferred Until Phase 22
+## Deferred Until Later
 
-- ion's interactive raw-mode line editor (requires `tcgetattr`/`tcsetattr`)
+- Ion's interactive raw-mode line editor (requires `tcgetattr`/`tcsetattr`)
 - History persistence (requires a writable filesystem path for `~/.local/share/ion/history`)
 - Tab completion with reedline-style highlighting
 - `SIGWINCH` / window size changes

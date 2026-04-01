@@ -1,4 +1,10 @@
-# Phase 4 - Tasking
+# Phase 04 — Tasking
+
+**Status:** Complete
+**Source Ref:** phase-04
+**Depends on:** Phase 2 (Memory Basics) ✅, Phase 3 (Interrupts) ✅
+**Builds on:** Phase 3's timer interrupt to drive preemptive scheduling
+**Primary Components:** task struct, context-switch stub, ready queue, round-robin scheduler, idle task
 
 ## Milestone Goal
 
@@ -14,6 +20,14 @@ flowchart LR
     Restore --> Run["task resumes"]
 ```
 
+## Why This Phase Exists
+
+Up to this point the kernel runs a single thread of execution. To support multiple
+processes, drivers, or any form of concurrency, the kernel needs the ability to save one
+execution context and restore another. Timer-driven preemption ensures no single task can
+monopolize the CPU. This phase introduces the core scheduling loop that Phase 5's
+userspace processes and all later phases rely on.
+
 ## Learning Goals
 
 - Understand what a task context actually contains.
@@ -27,6 +41,38 @@ flowchart LR
 - context-switch assembly stub
 - idle task
 - round-robin scheduler
+
+## Important Components and How They Work
+
+### Task Struct and Kernel Stacks
+
+Each task has a struct holding its saved register state, stack pointer, task ID, and
+scheduling state (ready, running, blocked). Each task gets its own kernel stack allocated
+from the frame allocator.
+
+### Context-Switch Assembly Stub
+
+The `switch_context(current, next)` function saves callee-saved registers (`rbx`, `rbp`,
+`r12`-`r15`, `rsp`, `rip`) of the current task and restores them from the next task. This
+is a narrow, carefully audited assembly boundary.
+
+### Ready Queue and Scheduler
+
+Tasks in the ready state sit in a FIFO queue. On each timer tick, the scheduler saves the
+current task, picks the next ready task from the queue, and restores it. Round-robin
+ensures fairness without complexity.
+
+### Idle Task
+
+When no tasks are ready, the idle task runs a `hlt` loop, yielding the CPU until the next
+interrupt. This prevents busy-waiting and provides a clean base case for the scheduler.
+
+## How This Builds on Earlier Phases
+
+- Uses Phase 2's frame allocator to allocate per-task kernel stacks.
+- Uses Phase 2's heap for task structs and the ready queue.
+- Extends Phase 3's timer interrupt handler to trigger scheduler ticks.
+- Reuses Phase 1's serial logging to make task interleaving visible.
 
 ## Implementation Outline
 
@@ -46,12 +92,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 4 Task List](./tasks/04-tasking-tasks.md)
-
-## Documentation Deliverables
-
-- explain the saved register set and stack layout
-- document the task state machine
-- explain how timer interrupts trigger preemption
 
 ## How Real OS Implementations Differ
 

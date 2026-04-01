@@ -1,4 +1,10 @@
-# Phase 3 - Interrupts
+# Phase 03 — Interrupts
+
+**Status:** Complete
+**Source Ref:** phase-03
+**Depends on:** Phase 1 (Boot Foundation) ✅, Phase 2 (Memory Basics) ✅
+**Builds on:** Phase 2's memory management to set up interrupt descriptor tables and stacks
+**Primary Components:** IDT, GDT/TSS, PIC, timer IRQ handler, keyboard IRQ handler
 
 ## Milestone Goal
 
@@ -14,6 +20,15 @@ flowchart LR
     Handler --> Buffer["timer tick or scancode buffer"]
 ```
 
+## Why This Phase Exists
+
+Without interrupts the kernel can only poll for events, which wastes CPU and cannot
+respond to hardware in a timely manner. Exceptions (page faults, double faults) need
+handlers to produce diagnostics instead of silent crashes. Timer interrupts are the
+prerequisite for preemptive scheduling in Phase 4, and keyboard interrupts are the
+prerequisite for interactive input. This phase builds the interrupt infrastructure that
+nearly every later phase depends on.
+
 ## Learning Goals
 
 - Understand the IDT, PIC, and interrupt stacks.
@@ -27,6 +42,39 @@ flowchart LR
 - PIC remap and EOI handling
 - timer interrupt
 - keyboard interrupt with scancode buffering
+
+## Important Components and How They Work
+
+### GDT and TSS
+
+The Global Descriptor Table defines kernel and user code/data segments. The Task State
+Segment provides Interrupt Stack Table (IST) entries so that critical exceptions like
+double faults run on a known-good stack, preventing triple faults.
+
+### IDT
+
+The Interrupt Descriptor Table maps each interrupt vector to a handler function. Core
+exceptions (breakpoint, page fault, double fault) get dedicated handlers that log
+diagnostics. Hardware IRQ vectors are remapped above exception vectors to avoid conflicts.
+
+### PIC
+
+The 8259 PIC is remapped so IRQ 0-15 do not collide with CPU exception vectors. Each IRQ
+handler must send an End-Of-Interrupt (EOI) signal to the PIC before returning. Handlers
+are kept minimal: read the device register, buffer the data, send EOI, return.
+
+### Timer and Keyboard Handlers
+
+The timer handler increments a tick counter (used by Phase 4's scheduler). The keyboard
+handler reads the scancode from the PS/2 port and pushes it into a ring buffer for later
+consumption. Neither handler allocates memory or blocks.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 1's boot sequence by adding GDT, TSS, and IDT initialization.
+- Uses Phase 2's frame allocator to allocate IST stacks for double-fault safety.
+- Uses Phase 2's heap for dynamic data structures like interrupt handler registrations.
+- Reuses Phase 1's serial logging for exception and IRQ diagnostics.
 
 ## Implementation Outline
 
@@ -46,12 +94,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 3 Task List](./tasks/03-interrupts-tasks.md)
-
-## Documentation Deliverables
-
-- explain the interrupt path and stack usage
-- document why IRQ handlers must stay minimal
-- document the vector layout and PIC configuration
 
 ## How Real OS Implementations Differ
 

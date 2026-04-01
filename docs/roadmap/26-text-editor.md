@@ -1,4 +1,10 @@
-# Phase 26 - Text Editor
+# Phase 26 — Text Editor
+
+**Status:** Complete
+**Source Ref:** phase-26
+**Depends on:** Phase 22 (TTY/Terminal) ✅, Phase 24 (Persistent Storage) ✅
+**Builds on:** Uses raw terminal mode and ANSI escape sequences from Phase 22; saves files to persistent storage from Phase 24
+**Primary Components:** userspace/edit/, userspace/syscall-lib/
 
 ## Milestone Goal
 
@@ -6,6 +12,16 @@ A usable text editor runs inside the OS. Users can create, edit, and save files 
 the shell. This is the foundational tool that makes all subsequent "do real work inside
 the OS" phases possible — you cannot write code, configuration files, or documents
 without an editor.
+
+## Why This Phase Exists
+
+Without an in-OS text editor, users must create and modify files from outside the
+system (e.g., on the host and then rebuild the disk image). This makes the OS
+unusable for any self-hosted development or configuration workflow. A text editor
+is the minimum tool required for the OS to become a productive environment rather
+than a demonstration. Building it also exercises the terminal subsystem, file I/O,
+and signal handling together in a real application, validating that those subsystems
+work correctly in concert.
 
 ## Learning Goals
 
@@ -39,7 +55,7 @@ Required OS features (all already implemented):
 - Signal handling (`SIGWINCH` for terminal resize) — Phase 19
 - `ioctl(TIOCGWINSZ)` for terminal size — Phase 22
 
-The editor will support:
+The editor supports:
 - Open, edit, and save files
 - Line-by-line scrolling and cursor movement
 - Search (find text) with incremental matching
@@ -52,13 +68,32 @@ If the kibi port proves too complex, a line editor (`ed` clone) provides basic
 file editing with much simpler terminal requirements. This is historically accurate —
 early Unix development was done entirely in `ed`.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 22 (TTY) | Raw mode, termios, TIOCGWINSZ |
-| Phase 22b (ANSI) | Cursor positioning, screen erase, colors |
-| Phase 24 (Persistent Storage) | Save files that survive reboot |
+### m3OS Platform Backend
+
+An `m3os.rs` backend (~60-80 lines) replaces kibi's `libc` dependency with
+direct syscall-lib calls. It implements terminal I/O (raw mode enable/disable,
+read/write, window size query) using the m3OS syscall ABI.
+
+### Userspace Heap Allocator
+
+Kibi uses `Vec`/`String` via `alloc`, so this phase establishes a userspace heap
+allocator pattern. The allocator built here is reusable by future phases (compiler
+bootstrap, build tools, etc.).
+
+### syscall-lib Extensions
+
+The syscall wrapper library gains ioctl, lseek, termios, and winsize wrappers to
+support the editor's terminal interaction needs.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 22 (TTY/Terminal):** uses raw mode, termios, TIOCGWINSZ, and ANSI escape sequences
+- **Extends Phase 24 (Persistent Storage):** saves and loads files from the persistent filesystem
+- **Extends Phase 12 (POSIX Compat):** exercises file I/O syscalls (open, read, write, close) in a real application
+- **Extends Phase 19 (Signals):** handles SIGWINCH for terminal resize events
+- **Establishes:** the userspace heap allocator pattern reused by later phases
 
 ## Implementation Outline
 
@@ -87,16 +122,16 @@ early Unix development was done entirely in `ed`.
 
 ## How Real OS Implementations Differ
 
-Real systems ship with multiple editors (vi, nano, emacs) and editor infrastructure
-like terminfo/termcap databases that abstract terminal capabilities. Our approach
-hardcodes VT100 escape sequences, which is fine because QEMU's serial console and
-virtually all modern terminal emulators support VT100. A production OS would also
-provide shared libraries for TUI development (ncurses), which we defer.
-
-A notable side effect of this phase is establishing the pattern for Rust userspace
-programs that need heap allocation (`Vec`, `String`, `format!`). The userspace heap
-allocator built here will be reusable by future phases (compiler bootstrap, build
-tools, etc.).
+- Real systems ship with multiple editors (vi, nano, emacs) and editor infrastructure
+  like terminfo/termcap databases that abstract terminal capabilities. Our approach
+  hardcodes VT100 escape sequences, which is fine because QEMU's serial console and
+  virtually all modern terminal emulators support VT100.
+- A production OS would also provide shared libraries for TUI development (ncurses),
+  which we defer.
+- A notable side effect of this phase is establishing the pattern for Rust userspace
+  programs that need heap allocation (`Vec`, `String`, `format!`). The userspace heap
+  allocator built here is reusable by future phases (compiler bootstrap, build
+  tools, etc.).
 
 ## Deferred Until Later
 

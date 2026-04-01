@@ -1,5 +1,11 @@
 # Phase 23 — Socket API
 
+**Status:** Complete
+**Source Ref:** phase-23
+**Depends on:** Phase 16 (Networking) ✅, Phase 22 (TTY/Terminal) ✅
+**Builds on:** Exposes the kernel TCP/IP stack from Phase 16 to userspace via standard socket syscalls; extends the fd table from Phase 12 to unify files, pipes, and sockets
+**Primary Components:** kernel/src/net/, userspace/ping/, syscall gate, net_server
+
 ## Milestone Goal
 
 Expose the kernel's existing TCP/IP stack to userspace via standard Linux socket
@@ -23,6 +29,15 @@ flowchart TD
     Driver --> QEMU["QEMU virtio-net"]
     App2["ping ELF<br/>(ring 3)"] -->|"SOCK_DGRAM ICMP"| Gate
 ```
+
+## Why This Phase Exists
+
+Before this phase, all network I/O lived inside the kernel. Every new network
+program required kernel modifications — an unsustainable model that violates the
+microkernel philosophy. By exposing socket syscalls, userspace programs gain
+direct access to the network stack through the same fd abstraction used for files
+and pipes, enabling arbitrary network applications without kernel changes. Moving
+`ping` out of the kernel proves the socket layer is genuinely complete.
 
 ## Learning Goals
 
@@ -56,6 +71,41 @@ flowchart TD
   ping can be implemented without raw sockets
 - **`ping` userspace ELF**: rewrite the kernel builtin as a standalone ring-3 binary
   using the new ICMP socket; remove the kernel builtin
+
+## Important Components and How They Work
+
+### SocketHandle and fd Table Integration
+
+A `SocketHandle` type in the kernel occupies a slot in the per-process fd table
+alongside file and pipe slots. A socket fd is indistinguishable from a file fd
+from userspace; `close`, `read`, and `write` all work on it via the existing fd
+dispatch path.
+
+### Syscall-to-IPC Routing
+
+Each socket syscall is a thin stub that validates arguments, copies user-provided
+`sockaddr_in` structures from userspace, forwards the request to `net_server` via
+IPC, and blocks the calling task until the operation completes or returns an error
+code. Data transfer uses shared page capabilities to avoid copying through IPC
+message payloads.
+
+### poll Extension for Sockets
+
+`net_server` tracks per-socket readiness state and sends a notification to the
+kernel when a socket becomes readable or writable, waking any blocked `poll` call.
+
+### ICMP DGRAM Sockets
+
+`SOCK_DGRAM` / `IPPROTO_ICMP` support in `net_server` constructs ICMP echo
+requests on send and delivers matching echo replies on receive. No raw socket
+privilege check is required for ICMP DGRAM in this phase.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 16 (Networking):** exposes the kernel TCP/IP stack to userspace through syscalls rather than kernel-internal calls
+- **Extends Phase 12 (POSIX Compat):** unifies sockets into the same fd table as files and pipes
+- **Extends Phase 6 (IPC):** uses IPC messages between the syscall gate and `net_server` for all socket operations
+- **Extends Phase 22 (TTY):** the `poll` extension generalizes readiness notification across fd types including sockets
 
 ## Implementation Outline
 
@@ -118,30 +168,18 @@ flowchart TD
 
 - [Phase 23 Task List](./tasks/23-socket-api-tasks.md)
 
-## Documentation Deliverables
-
-- document the socket syscall table: Linux numbers, parameter layouts, and how each
-  routes to `net_server` via IPC
-- explain how sockets integrate with the fd table alongside files and pipes
-- document the IPC protocol between the syscall gate and `net_server` for each
-  socket operation
-- explain how `poll` is extended to cover socket fds: how `net_server` signals
-  readiness back to the blocked kernel task
-- explain why `SOCK_DGRAM ICMP` is used for `ping` instead of raw sockets, and what
-  the kernel-side privilege check looks like
-- document the before/after for the `ping` builtin removal
-
 ## How Real OS Implementations Differ
 
-Linux's socket layer (`net/socket.c`) handles dozens of address families (AF_INET6,
-AF_UNIX, AF_NETLINK, AF_PACKET, AF_VSOCK, and more), non-blocking I/O through
-`epoll`, zero-copy sends via `sendfile` and `splice`, multicast group membership,
-`SO_REUSEPORT` for multi-process listeners, `io_uring` for async socket I/O, and
-a full `netfilter` hook chain for firewalling and NAT. The socket buffer (`sk_buff`)
-is a carefully optimized structure that avoids copies across protocol layers. This
-phase implements a single address family with blocking I/O and a simple `poll`
-extension — enough to run real network programs but with none of the performance or
-scalability mechanisms of a production stack.
+- Linux's socket layer (`net/socket.c`) handles dozens of address families (AF_INET6,
+  AF_UNIX, AF_NETLINK, AF_PACKET, AF_VSOCK, and more), non-blocking I/O through
+  `epoll`, zero-copy sends via `sendfile` and `splice`, multicast group membership,
+  `SO_REUSEPORT` for multi-process listeners, `io_uring` for async socket I/O, and
+  a full `netfilter` hook chain for firewalling and NAT.
+- The socket buffer (`sk_buff`) is a carefully optimized structure that avoids copies
+  across protocol layers.
+- This phase implements a single address family with blocking I/O and a simple `poll`
+  extension — enough to run real network programs but with none of the performance or
+  scalability mechanisms of a production stack.
 
 ## Deferred Until Later
 

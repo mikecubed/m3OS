@@ -1,4 +1,10 @@
-# Phase 33 - Kernel Memory Improvements
+# Phase 33 — Kernel Memory Improvements
+
+**Status:** Complete
+**Source Ref:** phase-33
+**Depends on:** Phase 17 (Memory Reclamation) ✅, Phase 25 (SMP) ✅
+**Builds on:** Replaces the bump frame allocator from Phase 17 with a buddy allocator; adds a slab allocator layer for kernel objects; fixes the stub munmap from Phase 17; adds SMP-aware TLB shootdown from Phase 25 to munmap
+**Primary Components:** kernel-core/src/buddy.rs, kernel-core/src/slab.rs, kernel/src/mm/, userspace/coreutils-rs/ (meminfo)
 
 ## Milestone Goal
 
@@ -6,6 +12,16 @@ The kernel heap allocator is robust, efficient, and recoverable. Out-of-memory c
 no longer panic the kernel — the allocator grows on demand and retries failed allocations.
 A slab allocator handles fixed-size kernel objects with O(1) performance. Userspace
 `munmap()` actually reclaims memory, and the userspace heap coalesces free blocks.
+
+## Why This Phase Exists
+
+The kernel's original memory allocator was a simple bump allocator that could never
+reclaim freed frames, and the heap's OOM handler panicked unconditionally. As the OS
+grew to support multiple processes, networking, and a compiler, memory pressure became
+a real problem. This phase replaces the allocator stack with production-quality
+components: a buddy allocator for efficient frame management, a slab allocator for
+fast fixed-size kernel object allocation, working `munmap()` for virtual memory
+reclamation, and an OOM retry path so the kernel does not crash under load.
 
 ## Learning Goals
 
@@ -85,12 +101,39 @@ Add a `heap_stats()` function that reports:
 
 Expose via a debug syscall or `/proc/meminfo`-style interface.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 17 (Memory Reclamation) | Existing frame allocator and CoW infrastructure |
-| Phase 25 (SMP) | TLB shootdown needed for munmap on multi-core |
+### Buddy Allocator (`kernel-core/src/buddy.rs`)
+
+Implements a binary buddy system for physical frame allocation. Free lists are
+maintained per order (0 = 4 KiB through 9 = 2 MiB). On allocation, the smallest
+sufficient block is split; on deallocation, adjacent buddies are coalesced. The
+allocator is host-testable via `kernel-core`.
+
+### Slab Allocator (`kernel-core/src/slab.rs`)
+
+Provides O(1) allocation for fixed-size kernel objects. Each slab cache manages pages
+divided into equal-sized slots with a free-list. When the free-list is exhausted, a new
+page is requested from the buddy allocator. Empty pages can be returned to reduce
+memory pressure.
+
+### munmap Implementation
+
+Walks the process page table for the specified virtual range, unmaps each page, frees
+the physical frame to the buddy allocator, and performs TLB invalidation. On SMP
+systems, a TLB shootdown IPI is sent to other cores that may have cached the mapping.
+
+### meminfo Utility
+
+A Rust userspace utility (`coreutils-rs`) that reads kernel heap statistics via a
+debug syscall and displays memory usage information, similar to `/proc/meminfo` on
+Linux.
+
+## How This Builds on Earlier Phases
+
+- **Replaces Phase 17 (Memory Reclamation):** The bump frame allocator is replaced by a buddy allocator; the stub `munmap()` is replaced with a working implementation.
+- **Extends Phase 25 (SMP):** Uses IPI-based TLB shootdown from Phase 25 when `munmap()` invalidates mappings on multi-core systems.
+- **Extends Phase 17 (CoW):** The buddy allocator properly supports CoW page duplication and reclamation.
 
 ## Implementation Outline
 
