@@ -91,3 +91,12 @@ path = "src/install.rs"
 [[bin]]
 name = "meminfo"
 path = "src/meminfo.rs"
+
+# Phase 34: timekeeping utilities
+[[bin]]
+name = "date"
+path = "src/date.rs"
+
+[[bin]]
+name = "uptime"
+path = "src/uptime.rs"
