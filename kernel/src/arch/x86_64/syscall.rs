@@ -5744,6 +5744,9 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
         } else if a_nsec == UTIME_OMIT {
             u32::MAX // sentinel: don't change
         } else {
+            if a_sec < 0 {
+                return NEG_EINVAL;
+            }
             a_sec as u32
         };
         let mtime = if m_nsec == UTIME_NOW {
@@ -5751,6 +5754,9 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
         } else if m_nsec == UTIME_OMIT {
             u32::MAX // sentinel: don't change
         } else {
+            if m_sec < 0 {
+                return NEG_EINVAL;
+            }
             m_sec as u32
         };
         (atime, mtime)
@@ -6678,8 +6684,11 @@ fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
     // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
     // combination used by musl's posix_spawn/system() — treat all as fork.
-    let dominated = flags & !(SIGCHLD | CLONE_VM | CLONE_VFORK);
-    if dominated == 0 {
+    if flags == 0
+        || flags == SIGCHLD
+        || flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+        || flags == (CLONE_VM | CLONE_VFORK)
+    {
         sys_fork(user_rip, user_rsp)
     } else {
         log::warn!("sys_clone: unsupported flags {flags:#x}");

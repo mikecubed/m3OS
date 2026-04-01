@@ -1700,7 +1700,21 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 2. Basic coreutils sanity
     // -----------------------------------------------------------------------
-    steps.extend(cmd_then_prompt("echo SMOKE_OK\n", "echo test", 5));
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "echo SMOKE_OK\n",
+        label: "echo test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE_OK",
+        timeout_secs: 5,
+        label: "verify echo output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after echo",
+    });
 
     // -----------------------------------------------------------------------
     // 3. TCC compiler (Phase 31 regression)

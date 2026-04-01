@@ -4,6 +4,7 @@
  */
 #include <unistd.h>
 #include <sys/wait.h>
+#include <errno.h>
 
 int system(const char *cmd) {
     if (cmd == (void *)0) return 1; /* shell available */
@@ -20,7 +21,8 @@ int system(const char *cmd) {
     /* parent */
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
-        /* retry on EINTR */
+        if (errno != EINTR)
+            return -1;
     }
     return status;
 }
