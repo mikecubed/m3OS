@@ -496,6 +496,11 @@ pub extern "C" fn syscall_handler(
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
+        // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
+        280 => {
+            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            sys_utimensat(arg0, arg1, arg2, flags)
+        }
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
         _ => {
@@ -2914,6 +2919,10 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             if let Some(vol) = vol.as_mut() {
                 match vol.read_inode(inode_num) {
                     Ok(mut inode) => {
+                        // Phase 32: update mtime/ctime on write
+                        let now = current_unix_time();
+                        inode.mtime = now;
+                        inode.ctime = now;
                         match vol.write_file_data(inode_num, &mut inode, offset as u64, data) {
                             Ok(n) => {
                                 let new_offset = offset + n;
@@ -4446,10 +4455,45 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             (0x8000 | m as u32, u, g, *file_size as u64, 0)
         }
         FdBackend::Ext2Disk {
-            path, file_size, ..
+            inode_num,
+            file_size,
+            ..
         } => {
-            let (u, g, m) = data_file_metadata(path).unwrap_or((0, 0, 0o755));
-            (0x8000 | m as u32, u, g, *file_size as u64, 0)
+            // Phase 32: read inode to get timestamps and real metadata.
+            let inode_num = *inode_num;
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && let Ok(inode) = vol.read_inode(inode_num)
+            {
+                let mode = inode.mode as u32;
+                let uid = inode.uid as u32;
+                let gid = inode.gid as u32;
+                let size = inode.size as u64; // use inode size, not cached FD size
+                let nlink = inode.links_count as u64;
+                let blk = vol.block_size as u64;
+                let ino = inode_num as u64;
+                stat[8..16].copy_from_slice(&ino.to_ne_bytes());
+                stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
+                stat[24..28].copy_from_slice(&mode.to_ne_bytes());
+                stat[28..32].copy_from_slice(&uid.to_ne_bytes());
+                stat[32..36].copy_from_slice(&gid.to_ne_bytes());
+                stat[48..56].copy_from_slice(&size.to_ne_bytes());
+                stat[56..64].copy_from_slice(&blk.to_ne_bytes());
+                let atime = inode.atime as i64;
+                let mtime = inode.mtime as i64;
+                let ctime = inode.ctime as i64;
+                stat[72..80].copy_from_slice(&atime.to_ne_bytes());
+                stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
+                stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
+                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                    return NEG_EFAULT;
+                }
+                return 0;
+            }
+            // Fallback if inode read fails — use cached FD size
+            let fallback_size = *file_size as u64;
+            let (u, g, m) = (0u32, 0u32, 0o755u16);
+            (0x8000 | m as u32, u, g, fallback_size, 0)
         }
     };
 
@@ -5604,7 +5648,9 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
                     let size = inode.size as u64;
                     let nlink = inode.links_count as u64;
                     let blksize = vol.block_size as u64;
+                    let ino = ino as u64;
                     let mut stat = [0u8; 144];
+                    stat[8..16].copy_from_slice(&ino.to_ne_bytes());
                     // st_nlink at offset 16 (u64 on x86_64 stat)
                     stat[16..24].copy_from_slice(&nlink.to_ne_bytes());
                     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -5612,6 +5658,13 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
                     stat[32..36].copy_from_slice(&gid.to_ne_bytes());
                     stat[48..56].copy_from_slice(&size.to_ne_bytes());
                     stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+                    // Phase 32: populate timestamps from ext2 inode
+                    let atime = inode.atime as i64;
+                    let mtime = inode.mtime as i64;
+                    let ctime = inode.ctime as i64;
+                    stat[72..80].copy_from_slice(&atime.to_ne_bytes());
+                    stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
+                    stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
                     if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
                         return NEG_EFAULT;
                     }
@@ -5643,6 +5696,109 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             NEG_ENOENT
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 32: utimensat(dirfd, path, times, flags) — syscall 280
+// ---------------------------------------------------------------------------
+
+/// Get approximate current Unix timestamp from LAPIC tick counter.
+fn current_unix_time() -> u32 {
+    let ticks = crate::arch::x86_64::interrupts::tick_count();
+    // ~100 ticks/second from LAPIC timer.
+    (ticks / 100) as u32
+}
+
+fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    let cwd = current_cwd();
+    let resolved = resolve_path(&cwd, raw_name);
+    let name: &str = &resolved;
+
+    // Read the times array if provided.
+    // struct timespec { tv_sec: i64, tv_nsec: i64 } × 2 = 32 bytes
+    // times[0] = atime, times[1] = mtime
+    // UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE
+    const UTIME_NOW: i64 = 0x3FFFFFFF;
+    const UTIME_OMIT: i64 = 0x3FFFFFFE;
+
+    let now = current_unix_time();
+    let (new_atime, new_mtime) = if times_ptr == 0 {
+        // NULL times → set both to current time
+        (now, now)
+    } else {
+        let mut tbuf = [0u8; 32];
+        if crate::mm::user_mem::copy_from_user(&mut tbuf, times_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let a_sec = i64::from_ne_bytes(tbuf[0..8].try_into().unwrap());
+        let a_nsec = i64::from_ne_bytes(tbuf[8..16].try_into().unwrap());
+        let m_sec = i64::from_ne_bytes(tbuf[16..24].try_into().unwrap());
+        let m_nsec = i64::from_ne_bytes(tbuf[24..32].try_into().unwrap());
+
+        let atime = if a_nsec == UTIME_NOW {
+            now
+        } else if a_nsec == UTIME_OMIT {
+            u32::MAX // sentinel: don't change
+        } else {
+            // Validate timespec: tv_sec >= 0, tv_sec fits u32, tv_nsec in [0, 1e9)
+            // Reject u32::MAX (collides with internal OMIT sentinel)
+            if a_sec < 0 || a_sec >= u32::MAX as i64 || !(0..1_000_000_000).contains(&a_nsec) {
+                return NEG_EINVAL;
+            }
+            a_sec as u32
+        };
+        let mtime = if m_nsec == UTIME_NOW {
+            now
+        } else if m_nsec == UTIME_OMIT {
+            u32::MAX // sentinel: don't change
+        } else {
+            if m_sec < 0 || m_sec >= u32::MAX as i64 || !(0..1_000_000_000).contains(&m_nsec) {
+                return NEG_EINVAL;
+            }
+            m_sec as u32
+        };
+        (atime, mtime)
+    };
+
+    // ext2 root filesystem
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(name)
+    {
+        let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_mut()
+            && let Ok(ino) = vol.resolve_path(rel)
+            && let Ok(mut inode) = vol.read_inode(ino)
+        {
+            if new_atime != u32::MAX {
+                inode.atime = new_atime;
+            }
+            if new_mtime != u32::MAX {
+                inode.mtime = new_mtime;
+            }
+            if new_atime != u32::MAX || new_mtime != u32::MAX {
+                inode.ctime = now; // ctime always updated when any timestamp changes
+            }
+            if vol.write_inode(ino, &inode).is_err() {
+                return NEG_EIO;
+            }
+            return 0;
+        }
+        return NEG_ENOENT;
+    }
+
+    // tmpfs
+    if tmpfs_relative_path(name).is_some() {
+        // tmpfs doesn't track timestamps yet — return ENOSYS
+        return NEG_ENOSYS;
+    }
+
+    NEG_ENOENT
 }
 
 // ---------------------------------------------------------------------------
@@ -6527,13 +6683,19 @@ fn sys_access(path_ptr: u64) -> u64 {
 /// delegate to sys_fork. Otherwise return -ENOSYS.
 fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
     const SIGCHLD: u64 = 17;
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
-    // Accept only flags == SIGCHLD or flags == 0 (bare fork semantics).
-    // Reject any additional CLONE_* bits to avoid silently mis-handling
-    // real thread creation requests.
-    if flags == SIGCHLD || flags == 0 {
+    // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
+    // combination used by musl's posix_spawn/system() — treat all as fork.
+    if flags == 0
+        || flags == SIGCHLD
+        || flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+        || flags == (CLONE_VM | CLONE_VFORK)
+    {
         sys_fork(user_rip, user_rsp)
     } else {
+        log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS
     }
 }

@@ -98,7 +98,9 @@ userspace/
   adduser/                # create user account (Phase 27)
   pty-test/               # PTY subsystem test (Phase 29)
   telnetd/                # Telnet server daemon (Phase 30)
-  coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami
+  coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
+  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install
+  demo-project/           # Multi-file C demo project for make testing (Phase 32)
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
   stdin-test/             # C stdin test
@@ -248,6 +250,7 @@ Read before making significant changes:
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
 | `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
 | `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
+| `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–45) with corresponding `docs/roadmap/tasks/` breakdowns.

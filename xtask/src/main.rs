@@ -177,7 +177,8 @@ fn build_userspace_bins() {
     // Rust coreutils — build all binaries in one cargo invocation.
     let coreutils_bins: &[&str] = &[
         "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
-        "env", "PROMPT", "ls",
+        "env", "PROMPT", "ls", // Phase 32: build tool utilities
+        "touch", "stat", "wc", "ar", "install",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -352,6 +353,115 @@ fn build_ion() {
         }
     }
     println!("ion: {} → kernel/initrd/ion.elf", built.display());
+}
+
+/// Phase 32: Cross-compile pdpmake (POSIX make) for the OS.
+///
+/// Strategy: clone pdpmake from GitHub (or use cached clone in target/pdpmake-src/),
+/// build with `musl-gcc -static -O2`, and place the resulting binary in
+/// kernel/initrd/make.elf.
+fn build_pdpmake() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    let make_elf = initrd.join("make.elf");
+
+    // Check cache.
+    if make_elf.exists() && make_elf.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("pdpmake: using cached {}", make_elf.display());
+        return;
+    }
+
+    // Clone pdpmake source.
+    let pdpmake_src = root.join("target/pdpmake-src");
+    if !pdpmake_src.join("main.c").exists() {
+        println!("pdpmake: cloning from GitHub...");
+        let _ = fs::remove_dir_all(&pdpmake_src);
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "2.0.4",
+                "https://github.com/rmyorston/pdpmake.git",
+                pdpmake_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for pdpmake");
+        if !status.success() {
+            eprintln!("warning: failed to clone pdpmake — creating empty placeholder");
+            if !make_elf.exists() {
+                fs::write(&make_elf, b"").unwrap();
+            }
+            return;
+        }
+    }
+
+    // Collect all .c files in the pdpmake source directory.
+    let mut c_files: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&pdpmake_src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "c") {
+                c_files.push(path.to_str().unwrap().to_string());
+            }
+        }
+    }
+
+    c_files.sort(); // deterministic build order across hosts/filesystems
+    if c_files.is_empty() {
+        eprintln!("warning: no .c files found in pdpmake source — creating empty placeholder");
+        if !make_elf.exists() {
+            fs::write(&make_elf, b"").unwrap();
+        }
+        return;
+    }
+
+    // Build with musl-gcc.
+    // Include m3os_system.c to replace musl's system() which uses posix_spawn
+    // (CLONE_VM|CLONE_VFORK) — our kernel treats clone as plain fork, so we
+    // need a system() that uses fork+exec directly.
+    let system_override = root.join("userspace/coreutils/m3os_system.c");
+    let mut args = vec!["-static".to_string(), "-O2".to_string()];
+    args.extend(c_files);
+    if system_override.exists() {
+        args.push(system_override.to_str().unwrap().to_string());
+    }
+    args.push("-o".to_string());
+    args.push(make_elf.to_str().unwrap().to_string());
+
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else {
+        "musl-gcc"
+    };
+
+    let status = match Command::new(cc).args(&args).status() {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found — skipping pdpmake build");
+            if !make_elf.exists() {
+                fs::write(&make_elf, b"").unwrap();
+            }
+            return;
+        }
+        Err(e) => panic!("failed to run {cc} for pdpmake: {e}"),
+    };
+    if !status.success() {
+        eprintln!("warning: pdpmake build failed");
+        if !make_elf.exists() {
+            fs::write(&make_elf, b"").unwrap();
+        }
+        return;
+    }
+
+    println!("pdpmake: built → kernel/initrd/make.elf");
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
@@ -702,6 +812,8 @@ fn build_kernel() -> PathBuf {
     // Phase 31: cross-compile TCC (result used during disk image creation).
     build_tcc();
     build_ion();
+    // Phase 32: cross-compile pdpmake (POSIX make).
+    build_pdpmake();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -875,6 +987,7 @@ fn cmd_check() {
     build_userspace_bins();
     build_musl_bins();
     build_ion();
+    build_pdpmake();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1536,65 +1649,258 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Phase 31 smoke test script: login, run TCC, compile and run hello.c.
-fn smoke_test_phase31() -> Vec<SmokeStep> {
+/// Helper: send a command and wait for the shell prompt to return.
+/// Includes a small sleep before sending to avoid serial input races
+/// where characters get consumed by ANSI escape sequence processing.
+fn cmd_then_prompt(
+    input: &'static str,
+    send_label: &'static str,
+    wait_label: &'static str,
+    timeout: u64,
+) -> Vec<SmokeStep> {
     vec![
-        SmokeStep::Wait {
-            pattern: "login:",
-            timeout_secs: 60,
-            label: "wait for login prompt",
-        },
+        SmokeStep::Sleep { millis: 500 },
         SmokeStep::Send {
-            input: "root\n",
-            label: "enter username",
-        },
-        SmokeStep::Wait {
-            pattern: "Password:",
-            timeout_secs: 10,
-            label: "wait for password prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "enter password",
+            input,
+            label: send_label,
         },
         SmokeStep::Wait {
             pattern: "# ",
-            timeout_secs: 10,
-            label: "wait for shell prompt",
-        },
-        SmokeStep::Send {
-            input: "/usr/bin/tcc --version\n",
-            label: "run tcc --version",
-        },
-        SmokeStep::Wait {
-            pattern: "tcc version",
-            timeout_secs: 15,
-            label: "verify TCC version output",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 5,
-            label: "wait for shell prompt after tcc --version",
-        },
-        SmokeStep::Send {
-            input: "tcc -static /usr/src/hello.c -o /tmp/hello\n",
-            label: "compile hello.c",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for compilation to finish",
-        },
-        SmokeStep::Send {
-            input: "/tmp/hello\n",
-            label: "run compiled hello",
-        },
-        SmokeStep::Wait {
-            pattern: "hello, world",
-            timeout_secs: 15,
-            label: "verify hello world output",
+            timeout_secs: timeout,
+            label: wait_label,
         },
     ]
+}
+
+/// Comprehensive smoke test: login, coreutils, TCC, Phase 32 build tools.
+///
+/// Replaces the Phase 31 smoke test with a more thorough script that validates
+/// the full userspace stack including new utilities and the make build tool.
+fn smoke_test_script() -> Vec<SmokeStep> {
+    let mut steps = Vec::new();
+
+    // -----------------------------------------------------------------------
+    // 1. Boot and login
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Wait {
+        pattern: "login:",
+        timeout_secs: 60,
+        label: "wait for login prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "enter username",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Password:",
+        timeout_secs: 10,
+        label: "wait for password prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "enter password",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "wait for shell prompt",
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. Basic coreutils sanity
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo SMOKE_OK\n",
+        label: "echo test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE_OK",
+        timeout_secs: 5,
+        label: "verify echo output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after echo",
+    });
+
+    // -----------------------------------------------------------------------
+    // 3. TCC compiler (Phase 31 regression)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/tcc --version\n",
+        label: "tcc --version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "tcc version",
+        timeout_secs: 15,
+        label: "verify TCC version",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tcc --version",
+    });
+
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n",
+        label: "compile hello.c with TCC",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "wait for hello.c compilation",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/tmp/hello\n",
+        label: "run compiled hello",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "hello, world",
+        timeout_secs: 15,
+        label: "verify hello world output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hello",
+    });
+
+    // -----------------------------------------------------------------------
+    // 4. Phase 32 utilities: touch, stat, wc
+    // -----------------------------------------------------------------------
+
+    // touch — create a new file
+    steps.extend(cmd_then_prompt(
+        "/bin/touch /tmp/smoke_file\n",
+        "send: touch /tmp/smoke_file",
+        "wait: prompt after touch",
+        10,
+    ));
+
+    // stat — verify the file exists and shows metadata
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /tmp/smoke_file\n",
+        label: "stat: show file metadata",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "File:",
+        timeout_secs: 10,
+        label: "verify stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after stat",
+    });
+
+    // wc — count words in a known file
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/wc /home/project/main.c\n",
+        label: "wc: count lines in main.c",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main.c",
+        timeout_secs: 10,
+        label: "verify wc output contains filename",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after wc",
+    });
+
+    // -----------------------------------------------------------------------
+    // 5. Demo project: build with make
+    // -----------------------------------------------------------------------
+    steps.extend(cmd_then_prompt(
+        "cd /home/project\n",
+        "send: cd /home/project",
+        "wait: prompt after cd",
+        5,
+    ));
+
+    // Full build (use absolute path — bare 'make' loses 'm' to ANSI SGR)
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/make\n",
+        label: "make: build demo project",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "wait for make to finish",
+    });
+
+    // Run the built binary
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/home/project/demo\n",
+        label: "run demo binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Demo project running!",
+        timeout_secs: 15,
+        label: "verify demo output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after demo",
+    });
+
+    // -----------------------------------------------------------------------
+    // 6. ar — create a static library (using util.o from make build)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ar rcs libutil.a util.o\n",
+        label: "ar: create static library",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "wait for ar to finish",
+    });
+
+    // Verify archive was created
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat libutil.a\n",
+        label: "stat: verify libutil.a exists",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "File:",
+        timeout_secs: 10,
+        label: "verify libutil.a stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ar stat",
+    });
+
+    // -----------------------------------------------------------------------
+    // 7. make clean
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/make clean\n",
+        label: "make clean",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "wait for make clean",
+    });
+
+    steps
 }
 
 fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
@@ -1607,13 +1913,18 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if !tcc_staging_bin.exists() {
         eprintln!(
             "error: TCC binary not found at {}\n\
-             The Phase 31 smoke test requires TCC. Install musl-tools and retry.",
+             The smoke test requires TCC. Install musl-tools and retry.",
             tcc_staging_bin.display()
         );
         std::process::exit(1);
     }
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    // Always rebuild the data disk so the demo project is freshly populated.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
     create_data_disk(uefi_image.parent().unwrap());
 
     let ovmf = find_ovmf();
@@ -1639,7 +1950,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         .spawn()
         .expect("failed to launch QEMU");
 
-    let steps = smoke_test_phase31();
+    let steps = smoke_test_script();
     let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
     let start = std::time::Instant::now();
 
@@ -1955,6 +2266,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         populate_tcc_files(&part_tmp, &tcc_staging);
     }
 
+    // Phase 32: populate demo project for make/build-tools testing.
+    populate_demo_project(&part_tmp, &root);
+
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
         .args(["-n", "-f"])
@@ -2196,6 +2510,72 @@ fn collect_staging_entries(
         } else {
             files.push((child_prefix, path));
         }
+    }
+}
+
+/// Phase 32: Populate the demo multi-file C project into `/home/project/`
+/// on the ext2 partition for `make` testing.
+fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
+    let demo_dir = workspace_root.join("userspace/demo-project");
+    if !demo_dir.is_dir() {
+        return;
+    }
+
+    let demo_files: &[(&str, &str)] = &[
+        ("Makefile", "home/project/Makefile"),
+        ("main.c", "home/project/main.c"),
+        ("util.c", "home/project/util.c"),
+        ("util.h", "home/project/util.h"),
+        ("build.sh", "home/project/build.sh"),
+    ];
+
+    let mut cmds = String::new();
+    cmds.push_str("mkdir home/project\n");
+
+    for (src_name, ext2_path) in demo_files {
+        let host_path = demo_dir.join(src_name);
+        if host_path.exists() {
+            cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+        }
+    }
+
+    // Set permissions: directory 0755, files 0644, build.sh 0755.
+    cmds.push_str("sif home/project mode 0x41ED\n");
+    for (src_name, ext2_path) in demo_files {
+        if demo_dir.join(src_name).exists() {
+            if *src_name == "build.sh" {
+                cmds.push_str(&format!("sif {ext2_path} mode 0x81ED\n")); // executable
+            } else {
+                cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n")); // 0644
+            }
+        }
+    }
+
+    cmds.push_str("q\n");
+
+    println!("demo: populating ext2 with demo project in /home/project/");
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for demo project");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write demo debugfs commands");
+    }
+    let output = debugfs.wait_with_output().expect("debugfs wait");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "Warning: debugfs (demo) exited with {}: {}",
+            output.status, stderr
+        );
     }
 }
 

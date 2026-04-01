@@ -87,6 +87,13 @@ static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser.elf");
 static ID_ELF: &[u8] = include_bytes!("../../initrd/id.elf");
 static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami.elf");
 static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd.elf");
+// Phase 32: build tools and utilities
+static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch.elf");
+static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat.elf");
+static WC_ELF: &[u8] = include_bytes!("../../initrd/wc.elf");
+static AR_ELF: &[u8] = include_bytes!("../../initrd/ar.elf");
+static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
+static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -161,6 +168,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("sh0.elf", RamdiskNode::File { content: SH0_ELF }),
     ("ion", RamdiskNode::File { content: ION_ELF }),
     ("ion.elf", RamdiskNode::File { content: ION_ELF }),
+    // Phase 32: /bin/sh alias for ion (pdpmake and scripts expect /bin/sh)
+    ("sh", RamdiskNode::File { content: ION_ELF }),
     ("edit", RamdiskNode::File { content: EDIT_ELF }),
     ("edit.elf", RamdiskNode::File { content: EDIT_ELF }),
     ("login", RamdiskNode::File { content: LOGIN_ELF }),
@@ -217,6 +226,29 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: TELNETD_ELF,
         },
     ),
+    // Phase 32: build tools and utilities
+    ("touch", RamdiskNode::File { content: TOUCH_ELF }),
+    ("touch.elf", RamdiskNode::File { content: TOUCH_ELF }),
+    ("stat", RamdiskNode::File { content: STAT_ELF }),
+    ("stat.elf", RamdiskNode::File { content: STAT_ELF }),
+    ("wc", RamdiskNode::File { content: WC_ELF }),
+    ("wc.elf", RamdiskNode::File { content: WC_ELF }),
+    ("ar", RamdiskNode::File { content: AR_ELF }),
+    ("ar.elf", RamdiskNode::File { content: AR_ELF }),
+    (
+        "install",
+        RamdiskNode::File {
+            content: INSTALL_ELF,
+        },
+    ),
+    (
+        "install.elf",
+        RamdiskNode::File {
+            content: INSTALL_ELF,
+        },
+    ),
+    ("make", RamdiskNode::File { content: MAKE_ELF }),
+    ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
