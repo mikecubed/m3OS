@@ -15,6 +15,9 @@ const CENTURY_REGISTER: u8 = 0x32;
 /// Maximum number of consistent-read retries before giving up.
 const MAX_RETRIES: usize = 5;
 
+/// Maximum spins waiting for update-in-progress to clear (~10ms at worst).
+const MAX_UIP_SPINS: usize = 100_000;
+
 /// Read a single CMOS register.
 ///
 /// Port 0x70 is the address/NMI-disable port (bit 7 disables NMI).
@@ -81,9 +84,11 @@ pub fn read_rtc() -> (u32, u32, u32, u32, u32, u32) {
     let snap = {
         let mut result = None;
         for _ in 0..MAX_RETRIES {
-            // Wait for any in-progress update to finish.
-            while update_in_progress() {
+            // Wait for any in-progress update to finish (bounded).
+            let mut spins = 0;
+            while update_in_progress() && spins < MAX_UIP_SPINS {
                 core::hint::spin_loop();
+                spins += 1;
             }
 
             let first = RtcSnapshot::read();
@@ -158,10 +163,38 @@ pub fn read_rtc() -> (u32, u32, u32, u32, u32, u32) {
     (full_year, month, day, hour, minute, second)
 }
 
+/// Returns `true` if the decoded RTC fields form a valid date/time that
+/// `date_to_unix_timestamp` can handle without panicking or underflowing.
+fn is_valid_datetime(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> bool {
+    if year < 1970
+        || month == 0
+        || month > 12
+        || day == 0
+        || hour >= 24
+        || minute >= 60
+        || second >= 60
+    {
+        return false;
+    }
+    day <= kernel_core::time::days_in_month(year, month)
+}
+
 /// Initialise the RTC: read the hardware clock, compute the boot epoch, and
 /// store it in [`BOOT_EPOCH_SECS`].
 pub fn init_rtc() {
     let (year, month, day, hour, minute, second) = read_rtc();
+    if !is_valid_datetime(year, month, day, hour, minute, second) {
+        log::warn!(
+            "RTC: invalid datetime {}-{:02}-{:02} {:02}:{:02}:{:02}, leaving BOOT_EPOCH_SECS = 0",
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second
+        );
+        return;
+    }
     let epoch = kernel_core::time::date_to_unix_timestamp(year, month, day, hour, minute, second);
     BOOT_EPOCH_SECS.store(epoch, Ordering::Relaxed);
     log::info!(
