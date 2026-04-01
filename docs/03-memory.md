@@ -252,10 +252,10 @@ When a process exits (`sys_exit` or fault kill):
 1. Validates page-aligned addr, positive len, userspace range
 2. Walks the process page table via `OffsetPageTable::unmap()`
 3. Frees physical frames via buddy allocator (refcount-aware)
-4. Flushes local TLB via `MapperFlush` and sends SMP TLB shootdown IPIs
-5. Removes entries from the per-process mapping list
+4. Sends SMP TLB shootdown IPIs (batched, only for actually-unmapped pages)
+5. Updates the per-process mapping list (shrink, split, or remove entries)
 
-Per-process `MemoryMapping` tracking records mmap allocations and validates munmap ranges.
+Per-process `MemoryMapping` tracking records mmap allocations for accounting and cleanup on process exit. `munmap` operates directly on page tables and does not reject requests that fall outside tracked mappings — it unmaps whatever portion of the range is currently mapped (POSIX-permissive semantics).
 
 ## meminfo (Phase 33)
 

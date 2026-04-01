@@ -5016,7 +5016,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     // same approach used by sys_linux_mmap.
     let mut mapper = unsafe { crate::mm::paging::get_mapper() };
 
-    let mut freed_count = 0usize;
+    let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for i in 0..pages {
         let page_addr = addr + (i as u64 * 4096);
         let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
@@ -5024,22 +5024,22 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
         match mapper.unmap(page) {
             Ok((frame, flush)) => {
-                flush.flush();
+                // Skip the local TLB flush here — we batch a single shootdown
+                // (which includes a local invlpg) after the loop.
+                flush.ignore();
                 crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
-                freed_count += 1;
+                unmapped_addrs.push(page_addr);
             }
             Err(_) => {
                 // Page wasn't mapped — skip silently.
             }
         }
     }
+    let freed_count = unmapped_addrs.len();
 
-    // SMP TLB shootdown: notify other cores about the invalidated pages.
-    if freed_count > 0 {
-        for i in 0..pages {
-            let page_addr = addr + (i as u64 * 4096);
-            crate::smp::tlb::tlb_shootdown(page_addr);
-        }
+    // SMP TLB shootdown: invalidate only pages that were actually unmapped.
+    for &page_addr in &unmapped_addrs {
+        crate::smp::tlb::tlb_shootdown(page_addr);
     }
 
     // Update mapping tracking list: handle full removal, shrink, and split.

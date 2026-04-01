@@ -58,9 +58,29 @@ impl Slab {
 
     /// Free a slot by index. Returns true if the slab is now completely empty.
     fn free(&mut self, slot_index: usize) -> bool {
+        if slot_index >= self.total_slots {
+            debug_assert!(
+                false,
+                "Slab::free: slot_index {} out of bounds (total_slots = {})",
+                slot_index, self.total_slots,
+            );
+            return false;
+        }
         let word_idx = slot_index / 64;
         let bit = slot_index % 64;
-        self.free_bitmap[word_idx] |= 1u64 << bit;
+        let mask = 1u64 << bit;
+
+        // Double-free guard: bit already set means the slot is free.
+        if (self.free_bitmap[word_idx] & mask) != 0 {
+            debug_assert!(
+                false,
+                "Slab::free: double-free of slot_index {}",
+                slot_index,
+            );
+            return self.free_count == self.total_slots;
+        }
+
+        self.free_bitmap[word_idx] |= mask;
         self.free_count += 1;
         self.free_count == self.total_slots
     }
@@ -131,7 +151,14 @@ impl SlabCache {
     pub fn free(&mut self, addr: usize) -> bool {
         for slab in &mut self.slabs {
             if addr >= slab.base && addr < slab.base + self.page_size {
-                let slot_index = (addr - slab.base) / self.object_size;
+                let offset = addr - slab.base;
+                debug_assert!(
+                    offset.is_multiple_of(self.object_size),
+                    "SlabCache::free: addr {:#x} not aligned to object_size {}",
+                    addr,
+                    self.object_size,
+                );
+                let slot_index = offset / self.object_size;
                 return slab.free(slot_index);
             }
         }
