@@ -26,7 +26,7 @@ QEMU supports several audio backends. The best targets:
 - Supports 16-bit stereo 44.1/48 kHz — CD quality.
 
 **Option B: AC'97 (Intel ICH)**
-- QEMU flag: `-device AC97` or `-device ich9-intel-hda`.
+- QEMU flag: `-device AC97`.
 - Simpler than HDA but same DMA model.
 - Well-documented, widely ported in hobby OS projects.
 
