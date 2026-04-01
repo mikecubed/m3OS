@@ -178,7 +178,7 @@ fn build_userspace_bins() {
     let coreutils_bins: &[&str] = &[
         "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
         "env", "PROMPT", "ls", // Phase 32: build tool utilities
-        "touch", "stat", "wc", "ar", "install",
+        "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -235,6 +235,11 @@ fn build_musl_bins() {
         ("userspace/stdin-test/stdin-test.c", "stdin-test"),
         // Phase 30: telnet server
         ("userspace/telnetd/telnetd.c", "telnetd"),
+        // Phase 33: mmap/munmap leak test
+        (
+            "userspace/mmap-leak-test/mmap-leak-test.c",
+            "mmap-leak-test",
+        ),
     ];
 
     for (src_rel, name) in bins {
@@ -1887,7 +1892,26 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 7. make clean
+    // 7. Phase 33: mmap/munmap leak test
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/mmap-leak-test\n",
+        label: "mmap/munmap leak test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS",
+        timeout_secs: 30,
+        label: "verify no frame leak",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after leak test",
+    });
+
+    // -----------------------------------------------------------------------
+    // 8. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

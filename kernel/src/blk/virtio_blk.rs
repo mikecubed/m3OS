@@ -134,6 +134,9 @@ struct Virtqueue {
     phys_base: u64,
     #[allow(dead_code)]
     virt_base: usize,
+    /// Buddy order used for the contiguous allocation (for correct cleanup).
+    #[allow(dead_code)]
+    alloc_order: usize,
     #[allow(dead_code)]
     alloc_size: usize,
 
@@ -183,8 +186,7 @@ impl Virtqueue {
         let alloc_size = Self::calc_size(queue_size);
         let pages_needed = alloc_size.div_ceil(4096);
 
-        let first_frame = alloc_contiguous_frames(pages_needed)?;
-        let phys_base = first_frame;
+        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
         let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
 
         // Zero the allocation.
@@ -207,10 +209,8 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
-            // Free the allocated queue frames to avoid leaking them.
-            for i in 0..pages_needed {
-                frame_allocator::free_frame(phys_base + (i as u64) * 4096);
-            }
+            // Free the contiguous allocation to avoid leaking pages.
+            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -234,6 +234,7 @@ impl Virtqueue {
             used_base,
             phys_base,
             virt_base,
+            alloc_order,
             alloc_size,
             last_used_idx: 0,
         })
@@ -709,46 +710,17 @@ fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
 }
 
-/// Allocate `count` physically contiguous 4 KiB frames.
+/// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
 ///
-/// Allocates all frames, sorts by physical address, and checks for
-/// contiguity. This works regardless of allocator ordering (LIFO,
-/// ascending, etc.). Returns the base physical address on success.
-fn alloc_contiguous_frames(count: usize) -> Option<u64> {
-    use alloc::vec::Vec;
-
-    // Allocate all requested frames.
-    let mut frames: Vec<u64> = Vec::with_capacity(count);
-    for _ in 0..count {
-        match frame_allocator::allocate_frame() {
-            Some(f) => frames.push(f.start_address().as_u64()),
-            None => {
-                // OOM: free everything we allocated so far.
-                for &phys in &frames {
-                    frame_allocator::free_frame(phys);
-                }
-                return None;
-            }
-        }
-    }
-
-    // Sort by physical address and check contiguity.
-    frames.sort_unstable();
-    let base = frames[0];
-    for (i, &phys) in frames.iter().enumerate() {
-        if phys != base + (i as u64) * 4096 {
-            log::error!(
-                "[virtio-blk] frames not contiguous: frame {} at {:#x}, expected {:#x}",
-                i,
-                phys,
-                base + (i as u64) * 4096
-            );
-            for &p in &frames {
-                frame_allocator::free_frame(p);
-            }
-            return None;
-        }
-    }
-
-    Some(base)
+/// Rounds up to the next power-of-two order and delegates to
+/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
+/// callers can correctly free via `free_contiguous(base, order)`.
+fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
+    let order = if count <= 1 {
+        0
+    } else {
+        (usize::BITS - (count - 1).leading_zeros()) as usize
+    };
+    let frame = frame_allocator::allocate_contiguous(order)?;
+    Some((frame.start_address().as_u64(), order))
 }

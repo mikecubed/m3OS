@@ -86,3 +86,8 @@ path = "src/ar.rs"
 [[bin]]
 name = "install"
 path = "src/install.rs"
+
+# Phase 33: memory diagnostics
+[[bin]]
+name = "meminfo"
+path = "src/meminfo.rs"

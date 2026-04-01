@@ -920,20 +920,97 @@ fn idle_task() -> ! {
 // ---------------------------------------------------------------------------
 
 /// Poll the serial port (COM1) for incoming bytes and feed them into the
-/// kernel stdin buffer. This allows testing ion interactively via piped
-/// input to QEMU's `-serial stdio`.
+/// kernel stdin buffer with echo and signal support.
+///
+/// Unlike the keyboard feeder, serial input bypasses cooked-mode line
+/// buffering (the host terminal handles line editing). Bytes are pushed
+/// directly to stdin, with ECHO written back to COM1 and ISIG checked
+/// for ^C, ^Z, and ^\.
 fn serial_stdin_feeder_task() -> ! {
+    use kernel_core::tty::*;
+
+    log::info!("[serial-stdin] feeder ready (echo + signals)");
+
     loop {
         // Read from COM1 data port (0x3F8) if data is available.
         // Line Status Register (0x3FD) bit 0 = data ready.
         let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FD).read() };
-        if lsr & 1 != 0 {
-            let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8).read() };
-            // Map \r to \n for terminals that send \r on Enter.
-            let ch = if byte == b'\r' { b'\n' } else { byte };
-            stdin::push_char(ch);
-        } else {
+        if lsr & 1 == 0 {
             task::yield_now();
+            continue;
+        }
+        let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8).read() };
+
+        // Read termios flags under lock.
+        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = {
+            let t = tty::TTY0.lock();
+            (
+                t.termios.c_lflag,
+                t.termios.c_iflag,
+                t.termios.c_oflag,
+                t.termios.c_cc,
+            )
+        };
+
+        let echo_on = c_lflag & ECHO != 0;
+        let isig = c_lflag & ISIG != 0;
+
+        // ICRNL: translate CR to NL on input.
+        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
+            b'\n'
+        } else {
+            byte
+        };
+
+        // ISIG: check signal characters.
+        if isig {
+            let signal = if byte == c_cc_arr[VINTR] {
+                Some((process::SIGINT, "^C"))
+            } else if byte == c_cc_arr[VSUSP] {
+                Some((process::SIGTSTP, "^Z"))
+            } else if byte == c_cc_arr[VQUIT] {
+                Some((process::SIGQUIT, "^\\"))
+            } else {
+                None
+            };
+
+            if let Some((sig, name)) = signal {
+                let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+                if fg != 0 {
+                    serial_echo(name);
+                    serial_echo("\n");
+                    process::send_signal_to_group(fg, sig);
+                } else {
+                    stdin::push_char(byte);
+                }
+                continue;
+            }
+        }
+
+        // Push byte directly to stdin (no cooked-mode buffering).
+        stdin::push_char(byte);
+
+        // Echo back to serial port.
+        if echo_on {
+            if c_oflag & ONLCR != 0 && byte == b'\n' {
+                serial_echo("\r\n");
+            } else {
+                let echo_buf = [byte];
+                if let Ok(s) = core::str::from_utf8(&echo_buf) {
+                    serial_echo(s);
+                }
+            }
+        }
+    }
+}
+
+/// Echo a string back to the serial port (COM1).
+fn serial_echo(s: &str) {
+    for &b in s.as_bytes() {
+        unsafe {
+            // Wait for transmit holding register to be empty.
+            while x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20 == 0 {}
+            x86_64::instructions::port::Port::new(0x3F8).write(b);
         }
     }
 }
@@ -1028,16 +1105,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    // Attempt to grow the heap so that *future* allocations have a better
-    // chance of succeeding. This handler must diverge (-> !) and cannot retry
-    // the allocation that triggered OOM.
-    if mm::heap::try_grow_on_oom() {
-        panic!(
-            "allocation error for {:?} — heap was grown, but alloc_error_handler cannot retry",
-            layout
-        );
-    }
-    panic!("allocation error: {:?} (heap growth failed)", layout)
+    // The RetryAllocator already attempted heap growth and retry before this
+    // handler is reached. If we get here, all growth attempts failed.
+    panic!(
+        "kernel OOM: failed to allocate {:?} after heap growth retry",
+        layout
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,5 +1129,212 @@ mod tests {
     #[test_case]
     fn serial_output_works() {
         serial_println!("serial output from test");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 33 — Memory subsystem tests
+    // -----------------------------------------------------------------------
+
+    /// A.4: Verify the kernel heap grows automatically via the RetryAllocator
+    /// when the initial 4 MiB is exhausted.
+    #[test_case]
+    fn heap_grows_on_oom() {
+        use crate::mm::heap::{HEAP_INITIAL_SIZE, heap_stats};
+        use alloc::vec::Vec;
+
+        let before = heap_stats();
+        assert!(before.total_size >= HEAP_INITIAL_SIZE);
+
+        // Allocate a series of 256 KiB blocks to push past initial heap.
+        let block_size = 256 * 1024;
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        // Allocate enough to exceed the initial 4 MiB.
+        let target = HEAP_INITIAL_SIZE + (1024 * 1024); // 5 MiB
+        let mut total_allocated = 0usize;
+        while total_allocated < target {
+            let mut block = Vec::with_capacity(block_size);
+            // Touch the memory to ensure it's actually mapped.
+            block.resize(block_size, 0xAB);
+            assert_eq!(block[0], 0xAB);
+            assert_eq!(block[block_size - 1], 0xAB);
+            blocks.push(block);
+            total_allocated += block_size;
+        }
+
+        let after = heap_stats();
+        // Heap must have grown beyond initial size.
+        assert!(
+            after.total_size > HEAP_INITIAL_SIZE,
+            "heap did not grow: total_size={} initial={}",
+            after.total_size,
+            HEAP_INITIAL_SIZE
+        );
+        serial_println!(
+            "heap grew: {} KiB → {} KiB ({} allocs)",
+            before.total_size / 1024,
+            after.total_size / 1024,
+            after.alloc_count - before.alloc_count
+        );
+
+        // Drop all blocks — heap should have free space again.
+        drop(blocks);
+        let final_stats = heap_stats();
+        assert!(final_stats.free_bytes > 0);
+    }
+
+    /// B: Verify buddy allocator manages frames correctly — alloc and free
+    /// cycle doesn't leak.
+    #[test_case]
+    fn buddy_alloc_free_no_leak() {
+        use crate::mm::frame_allocator;
+
+        let before = frame_allocator::free_count();
+
+        // Allocate 16 frames.
+        let mut frames = alloc::vec::Vec::new();
+        for _ in 0..16 {
+            let frame = frame_allocator::allocate_frame().expect("frame alloc failed");
+            frames.push(frame.start_address().as_u64());
+        }
+
+        let during = frame_allocator::free_count();
+        assert!(
+            during <= before - 16,
+            "free count should have dropped by at least 16: before={} during={}",
+            before,
+            during
+        );
+
+        // Free all frames.
+        for phys in frames {
+            frame_allocator::free_frame(phys);
+        }
+
+        let after = frame_allocator::free_count();
+        assert_eq!(
+            after, before,
+            "frame leak: before={} after={}",
+            before, after
+        );
+    }
+
+    /// B.4: Verify contiguous multi-page allocation works.
+    #[test_case]
+    fn contiguous_alloc_works() {
+        use crate::mm::frame_allocator;
+
+        let before = frame_allocator::free_count();
+
+        // Allocate 4 contiguous pages (order 2).
+        let frame = frame_allocator::allocate_contiguous(2).expect("contiguous alloc failed");
+        let base = frame.start_address().as_u64();
+
+        // Verify alignment: base must be 16 KiB aligned (4 pages).
+        assert_eq!(
+            base % (4096 * 4),
+            0,
+            "contiguous block not properly aligned"
+        );
+
+        // Free and verify no leak.
+        frame_allocator::free_contiguous(base, 2);
+        let after = frame_allocator::free_count();
+        assert_eq!(
+            after, before,
+            "contiguous frame leak: before={} after={}",
+            before, after
+        );
+    }
+
+    /// C: Verify slab cache allocation and deallocation.
+    #[test_case]
+    fn slab_cache_alloc_free() {
+        let caches = crate::mm::slab::caches();
+        let mut fd_cache = caches.fd_cache.lock();
+
+        let stats_before = fd_cache.stats();
+        let mut page_counter = 0usize;
+
+        // Allocate 10 objects from the FD cache (64-byte slots).
+        let mut addrs = alloc::vec::Vec::new();
+        for _ in 0..10 {
+            let addr = fd_cache
+                .allocate(&mut || {
+                    // Page allocator callback: use frame allocator.
+                    let frame = crate::mm::frame_allocator::allocate_frame()?;
+                    page_counter += 1;
+                    Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
+                })
+                .expect("slab alloc failed");
+            addrs.push(addr);
+        }
+
+        let stats_during = fd_cache.stats();
+        assert_eq!(
+            stats_during.active_objects,
+            stats_before.active_objects + 10
+        );
+
+        // Free all objects.
+        for addr in addrs {
+            fd_cache.free(addr as usize);
+        }
+
+        let stats_after = fd_cache.stats();
+        assert_eq!(stats_after.active_objects, stats_before.active_objects);
+        serial_println!(
+            "slab test: allocated {} objects using {} page(s)",
+            10,
+            page_counter
+        );
+    }
+
+    /// F: Verify frame statistics are consistent.
+    #[test_case]
+    fn frame_stats_consistent() {
+        let stats = crate::mm::frame_allocator::frame_stats();
+
+        assert!(stats.total_frames > 0, "no frames reported");
+        assert_eq!(
+            stats.total_frames,
+            stats.free_frames + stats.allocated_frames,
+            "frame count mismatch: total={} free={} alloc={}",
+            stats.total_frames,
+            stats.free_frames,
+            stats.allocated_frames
+        );
+
+        // Per-order free counts should sum to the total free count.
+        let order_sum: usize = stats
+            .free_by_order
+            .iter()
+            .enumerate()
+            .map(|(order, &count)| count * (1 << order))
+            .sum();
+        assert_eq!(
+            order_sum, stats.free_frames,
+            "buddy order sum ({}) != free_frames ({})",
+            order_sum, stats.free_frames
+        );
+        serial_println!(
+            "frame stats: total={} free={} allocated={}",
+            stats.total_frames,
+            stats.free_frames,
+            stats.allocated_frames
+        );
+    }
+
+    /// F: Verify meminfo syscall returns non-empty data (heap stats).
+    #[test_case]
+    fn heap_stats_nonzero() {
+        let stats = crate::mm::heap::heap_stats();
+        assert!(stats.total_size > 0, "heap total_size is 0");
+        assert!(stats.alloc_count > 0, "no allocations recorded");
+        assert!(
+            stats.total_size >= stats.free_bytes,
+            "free > total: free={} total={}",
+            stats.free_bytes,
+            stats.total_size
+        );
     }
 }

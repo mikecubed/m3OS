@@ -455,6 +455,17 @@ pub struct Process {
     pub session_id: u32,
     /// Controlling terminal (Phase 29).
     pub controlling_tty: Option<ControllingTty>,
+    /// Tracked anonymous mmap regions (Phase 33).
+    pub mappings: Vec<MemoryMapping>,
+}
+
+/// Describes a contiguous anonymous memory mapping created by `mmap`.
+#[derive(Clone, Debug)]
+pub struct MemoryMapping {
+    /// Starting virtual address (page-aligned).
+    pub start: u64,
+    /// Length in bytes (page-aligned, as recorded by `sys_linux_mmap`).
+    pub len: u64,
 }
 
 /// Identifies the controlling terminal for a process.
@@ -503,6 +514,7 @@ impl Process {
             egid: 0,
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
+            mappings: Vec::new(),
         }
     }
 }
@@ -627,6 +639,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         egid: 0,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
+        mappings: Vec::new(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -677,6 +690,7 @@ pub fn spawn_process_with_cr3(
         egid: 0,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
+        mappings: Vec::new(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -731,6 +745,7 @@ pub fn spawn_process_with_cr3_and_fds(
         egid: 0,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
+        mappings: Vec::new(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

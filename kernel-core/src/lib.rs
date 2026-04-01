@@ -2,11 +2,13 @@
 
 extern crate alloc;
 
+pub mod buddy;
 pub mod fb;
 pub mod fs;
 pub mod ipc;
 pub mod net;
 pub mod pipe;
 pub mod pty;
+pub mod slab;
 pub mod tty;
 pub mod types;

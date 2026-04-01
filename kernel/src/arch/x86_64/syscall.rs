@@ -503,6 +503,8 @@ pub extern "C" fn syscall_handler(
         }
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
+        // Custom kernel meminfo (Phase 33 Track F)
+        0x1001 => sys_meminfo(arg0, arg1),
         _ => {
             // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -1664,6 +1666,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_ids,
         parent_session_id,
         parent_ctty,
+        parent_mappings,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1680,6 +1683,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (p.uid, p.gid, p.euid, p.egid),
                 p.session_id,
                 p.controlling_tty.clone(),
+                p.mappings.clone(),
             ),
             None => (
                 0,
@@ -1697,6 +1701,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (0u32, 0u32, 0u32, 0u32),
                 0,
                 Some(crate::process::ControllingTty::Console),
+                alloc::vec::Vec::new(),
             ),
         }
     };
@@ -1734,6 +1739,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.egid = parent_ids.3;
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
+            child.mappings = parent_mappings;
         }
     }
 
@@ -4963,18 +4969,241 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
+    // Record the mapping in the process's tracking list (Phase 33).
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.mappings.push(crate::process::MemoryMapping {
+                start: base,
+                len: total_size,
+            });
+        }
+    }
+
     log::info!("[mmap] anon {}×4K @ {:#x}", pages, base);
     base
 }
 
 // ---------------------------------------------------------------------------
-// T019: munmap(addr, len) — stub (bump allocator; no reclamation in Phase 12)
+// T019: munmap(addr, len) — Phase 33: reclaim frames + TLB shootdown
 // ---------------------------------------------------------------------------
 
-fn sys_linux_munmap(_addr: u64, _len: u64) -> u64 {
-    // Frames are not reclaimed (bump allocator).  Return success so programs
-    // that call munmap (e.g. musl free for large chunks) do not fail.
+fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
+    // Validate: page-aligned address and non-zero length.
+    if addr & 0xFFF != 0 || len == 0 {
+        return NEG_EINVAL;
+    }
+
+    // Must be in userspace canonical range.
+    if addr >= 0x0000_8000_0000_0000 {
+        return NEG_EINVAL;
+    }
+
+    let pages = len.div_ceil(4096) as usize;
+
+    // Validate range doesn't overflow.
+    let total_size = match (pages as u64).checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+    if addr.checked_add(total_size).is_none() {
+        return NEG_EINVAL;
+    }
+
+    use x86_64::structures::paging::{Mapper, Page, Size4KiB};
+
+    // SAFETY: current CR3 is the calling process's page table; this is the
+    // same approach used by sys_linux_mmap.
+    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+
+    let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for i in 0..pages {
+        let page_addr = addr + (i as u64 * 4096);
+        let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
+
+        // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
+        match mapper.unmap(page) {
+            Ok((frame, flush)) => {
+                // Skip the local TLB flush here — we batch a single shootdown
+                // (which includes a local invlpg) after the loop.
+                flush.ignore();
+                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                unmapped_addrs.push(page_addr);
+            }
+            Err(_) => {
+                // Page wasn't mapped — skip silently.
+            }
+        }
+    }
+    let freed_count = unmapped_addrs.len();
+
+    // SMP TLB shootdown: invalidate only pages that were actually unmapped.
+    for &page_addr in &unmapped_addrs {
+        crate::smp::tlb::tlb_shootdown(page_addr);
+    }
+
+    // Update mapping tracking list: handle full removal, shrink, and split.
+    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            let unmap_start = addr;
+            let unmap_end = addr + total_size;
+            let mut new_mappings = alloc::vec::Vec::new();
+            proc.mappings.retain_mut(|m| {
+                let m_end = m.start + m.len;
+                if m.start >= unmap_end || m_end <= unmap_start {
+                    // No overlap — keep as-is.
+                    return true;
+                }
+                if m.start >= unmap_start && m_end <= unmap_end {
+                    // Fully contained — remove.
+                    return false;
+                }
+                if m.start < unmap_start && m_end > unmap_end {
+                    // Hole punch: split into two mappings.
+                    // Keep the head portion in place.
+                    let tail = crate::process::MemoryMapping {
+                        start: unmap_end,
+                        len: m_end - unmap_end,
+                    };
+                    new_mappings.push(tail);
+                    m.len = unmap_start - m.start;
+                    return true;
+                }
+                if m.start < unmap_start {
+                    // Overlap at tail — shrink.
+                    m.len = unmap_start - m.start;
+                } else {
+                    // Overlap at head — shrink.
+                    let new_start = unmap_end;
+                    m.len = m_end - new_start;
+                    m.start = new_start;
+                }
+                true
+            });
+            proc.mappings.extend(new_mappings);
+        }
+    }
+
+    if freed_count > 0 {
+        log::info!(
+            "[munmap] freed {} pages @ {:#x} (len={:#x})",
+            freed_count,
+            addr,
+            len
+        );
+    }
+
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 33 Track F: meminfo syscall (0x1001)
+//
+// Writes a text summary of kernel memory statistics into a user buffer.
+// arg0 = user buffer address, arg1 = buffer length.
+// Returns number of bytes written, or 0 on error.
+// ---------------------------------------------------------------------------
+
+fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
+    use core::fmt::Write;
+
+    if buf_addr == 0 || buf_len == 0 {
+        return 0;
+    }
+
+    // Gather stats
+    let heap = crate::mm::heap::heap_stats();
+    let frames = crate::mm::frame_allocator::frame_stats();
+    let slabs = crate::mm::slab::all_slab_stats();
+
+    // Format into a stack buffer
+    let mut tmp = [0u8; 2048];
+    let mut writer = BufWriter::new(&mut tmp);
+
+    let _ = writeln!(writer, "=== Kernel Memory Info ===");
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Heap:");
+    let _ = writeln!(
+        writer,
+        "  total: {} KiB  used: {} KiB  free: {} KiB",
+        heap.total_size / 1024,
+        heap.used_bytes / 1024,
+        heap.free_bytes / 1024
+    );
+    let _ = writeln!(
+        writer,
+        "  allocs: {}  deallocs: {}",
+        heap.alloc_count, heap.dealloc_count
+    );
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Frames (4 KiB pages):");
+    let _ = writeln!(
+        writer,
+        "  total: {}  free: {}  allocated: {}",
+        frames.total_frames, frames.free_frames, frames.allocated_frames
+    );
+    let _ = writeln!(
+        writer,
+        "  memory: {} MiB total, {} MiB free",
+        frames.total_frames * 4 / 1024,
+        frames.free_frames * 4 / 1024
+    );
+    let _ = write!(writer, "  buddy orders:");
+    for (order, &count) in frames.free_by_order.iter().enumerate() {
+        if count > 0 {
+            let _ = write!(writer, " o{}={}", order, count);
+        }
+    }
+    let _ = writeln!(writer);
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Slab Caches:");
+    fn fmt_slab(w: &mut BufWriter<'_>, name: &str, s: &kernel_core::slab::SlabStats) {
+        let _ = writeln!(
+            w,
+            "  {}: slabs={} active={} free={}",
+            name, s.total_slabs, s.active_objects, s.free_slots
+        );
+    }
+    fmt_slab(&mut writer, "task(512B) ", &slabs.task);
+    fmt_slab(&mut writer, "fd(64B)   ", &slabs.fd);
+    fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
+    fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
+    fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
+
+    let written = writer.pos;
+
+    // Copy to user buffer
+    let copy_len = written.min(buf_len as usize);
+    if crate::mm::user_mem::copy_to_user(buf_addr, &tmp[..copy_len]).is_err() {
+        return 0;
+    }
+
+    copy_len as u64
+}
+
+/// Tiny stack buffer writer for formatting meminfo output.
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl core::fmt::Write for BufWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let remaining = self.buf.len() - self.pos;
+        let len = bytes.len().min(remaining);
+        self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
+        self.pos += len;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
