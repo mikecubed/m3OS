@@ -101,6 +101,9 @@ pub fn init(boot_info: &'static mut BootInfo) {
         heap::init_heap(&mut mapper, &mut paging::GlobalFrameAlloc);
     }
 
+    // Upgrade from bootstrap free-list to buddy allocator (requires heap).
+    frame_allocator::init_buddy();
+
     // P17-T010: initialize per-frame refcount table (requires heap).
     frame_allocator::init_refcounts();
 

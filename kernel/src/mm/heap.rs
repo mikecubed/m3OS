@@ -1,4 +1,5 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
@@ -9,8 +10,51 @@ pub const HEAP_INITIAL_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 /// Maximum heap size the kernel may grow to (64 MiB).
 pub const HEAP_MAX_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Tracks total successful allocations (for Track F diagnostics).
+static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tracks total deallocations (for Track F diagnostics).
+static DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// OOM-retrying allocator wrapper around `LockedHeap`.
+///
+/// On allocation failure, attempts to grow the kernel heap with escalating
+/// sizes before retrying. This avoids the limitations of `alloc_error_handler`
+/// which cannot retry the failed allocation.
+struct RetryAllocator {
+    inner: LockedHeap,
+}
+
+unsafe impl Sync for RetryAllocator {}
+
+unsafe impl GlobalAlloc for RetryAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { self.inner.alloc(layout) };
+        if !ptr.is_null() {
+            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            return ptr;
+        }
+        // Try growing the heap and retry the allocation.
+        if try_grow_on_oom_for_layout(layout) {
+            let ptr = unsafe { self.inner.alloc(layout) };
+            if !ptr.is_null() {
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            ptr
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { self.inner.dealloc(ptr, layout) };
+        DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: RetryAllocator = RetryAllocator {
+    inner: LockedHeap::empty(),
+};
 
 static HEAP_INIT: AtomicBool = AtomicBool::new(false);
 
@@ -53,6 +97,7 @@ pub fn init_heap(
 
     unsafe {
         ALLOCATOR
+            .inner
             .lock()
             .init(HEAP_START as *mut u8, HEAP_INITIAL_SIZE);
     }
@@ -136,7 +181,7 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     // Extend the allocator for however many pages were actually mapped.
     let bytes_mapped = pages_mapped * 4096;
     unsafe {
-        ALLOCATOR.lock().extend(bytes_mapped);
+        ALLOCATOR.inner.lock().extend(bytes_mapped);
     }
 
     HEAP_MAPPED.store(current_mapped + bytes_mapped, Ordering::Release);
@@ -150,10 +195,41 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     Ok(())
 }
 
-/// Attempt to grow the heap on OOM. Called from the alloc error handler.
+/// Attempt to grow the heap enough to satisfy `layout`, trying escalating sizes.
 ///
-/// Returns `true` if growth succeeded and the caller should retry.
+/// Returns `true` if at least one growth succeeded and the caller should retry
+/// the allocation.
+fn try_grow_on_oom_for_layout(layout: Layout) -> bool {
+    // Round the requested size up to at least one page.
+    let requested = (layout.size() + 4095) & !4095;
+    let requested = requested.max(4096);
+
+    // Try escalating growth sizes.
+    for &size in &[requested, 1 << 20, 2 << 20, 4 << 20] {
+        if grow_heap(size).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Attempt to grow the heap on OOM (simple 1 MiB attempt).
+///
+/// Kept for backward compatibility; the `RetryAllocator` uses the more
+/// sophisticated `try_grow_on_oom_for_layout` instead.
+#[expect(dead_code)]
 pub fn try_grow_on_oom() -> bool {
-    // Try to grow by 1 MiB.
     grow_heap(1024 * 1024).is_ok()
+}
+
+/// Returns the number of successful allocations since boot.
+#[expect(dead_code)]
+pub fn alloc_count() -> u64 {
+    ALLOC_COUNT.load(Ordering::Relaxed)
+}
+
+/// Returns the number of deallocations since boot.
+#[expect(dead_code)]
+pub fn dealloc_count() -> u64 {
+    DEALLOC_COUNT.load(Ordering::Relaxed)
 }

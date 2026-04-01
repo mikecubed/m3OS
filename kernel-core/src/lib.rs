@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod buddy;
 pub mod fb;
 pub mod fs;
 pub mod ipc;

@@ -1,6 +1,7 @@
 //! Simple userspace heap allocator using brk syscall.
 //!
-//! Uses a linked-list free list with first-fit allocation.
+//! Uses a linked-list free list with first-fit allocation and
+//! address-ordered coalescing on dealloc to reduce fragmentation.
 //! Enable with the `alloc` feature flag.
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -138,13 +139,57 @@ unsafe impl GlobalAlloc for BrkAllocator {
                 return;
             }
 
-            // Read back the header just before the pointer.
             let header = (ptr as *mut BlockHeader).sub(1);
+            let header_size = core::mem::size_of::<BlockHeader>();
+            let block_start = header as usize;
+            let block_end = block_start + header_size + (*header).size;
 
-            // Add to front of free list.
             let free_list = &mut *self.free_list.get();
-            (*header).next = *free_list;
-            *free_list = header;
+
+            // Walk the address-sorted free list to find the insertion point,
+            // keeping track of the previous free block for coalescing.
+            let mut prev_ptr: *mut *mut BlockHeader = free_list;
+            let mut prev_block: *mut BlockHeader = core::ptr::null_mut();
+            let mut cur = *prev_ptr;
+
+            while !cur.is_null() && (cur as usize) < block_start {
+                prev_block = cur;
+                prev_ptr = &mut (*cur).next;
+                cur = (*cur).next;
+            }
+
+            // Can we merge with the previous free block?
+            let merge_prev = if !prev_block.is_null() {
+                let prev_end = prev_block as usize + header_size + (*prev_block).size;
+                prev_end == block_start
+            } else {
+                false
+            };
+
+            // Can we merge with the next free block?
+            let merge_next = if !cur.is_null() {
+                block_end == cur as usize
+            } else {
+                false
+            };
+
+            if merge_prev && merge_next {
+                // Absorb both this block and the next block into prev.
+                (*prev_block).size += header_size + (*header).size + header_size + (*cur).size;
+                (*prev_block).next = (*cur).next;
+            } else if merge_prev {
+                // Absorb this block into prev.
+                (*prev_block).size += header_size + (*header).size;
+            } else if merge_next {
+                // Absorb the next block into this block.
+                (*header).size += header_size + (*cur).size;
+                (*header).next = (*cur).next;
+                *prev_ptr = header;
+            } else {
+                // No merge possible — insert in sorted position.
+                (*header).next = cur;
+                *prev_ptr = header;
+            }
         }
     }
 }

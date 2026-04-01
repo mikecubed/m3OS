@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use kernel_core::buddy::BuddyAllocator;
 use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
@@ -18,28 +19,31 @@ pub(crate) const ALLOC_MIN_ADDR: u64 = 0x0010_0000; // 1 MiB
 /// Magic value written to bytes 8..16 of each free frame for double-free detection.
 const FREE_MAGIC: u64 = 0xDEAD_F4EE_F4EE_DEAD;
 
-/// Free-list frame allocator.
+/// Frame allocator with two phases:
 ///
-/// Each free 4 KiB frame stores:
-///   - bytes 0..8: physical address of the next free frame (0 = end of list)
-///   - bytes 8..16: `FREE_MAGIC` sentinel for double-free detection
+/// **Phase 1 (before heap):** A simple intrusive free-list allocator.  Each free
+/// 4 KiB frame stores a next-pointer and magic sentinel in its first 16 bytes.
 ///
-/// The allocator accesses frame memory through the bootloader's physical-memory
-/// offset mapping (physical address P is at virtual address `phys_offset + P`).
-struct FreeListAllocator {
+/// **Phase 2 (after heap):** A buddy allocator (`kernel_core::buddy::BuddyAllocator`)
+/// that enables O(1) allocation, buddy-merging on free, and multi-page contiguous
+/// allocations.  The free-list frames are drained into the buddy allocator during
+/// `init_buddy()`.
+struct FrameAllocator {
     /// Physical address of the first free frame, or 0 if the list is empty.
     head: u64,
-    /// Number of frames currently on the free list.
+    /// Number of frames currently free (free-list or buddy).
     free_count: usize,
     /// Total number of usable frames discovered at init (>= 1 MiB).
     total_frames: usize,
     /// Virtual base of the physical-memory offset mapping.
     phys_offset: u64,
-    /// Highest physical frame number from the memory map (P17-T009).
+    /// Highest physical frame number from the memory map.
     max_frame_number: u64,
+    /// Buddy allocator, initialized after heap is available.
+    buddy: Option<BuddyAllocator>,
 }
 
-impl FreeListAllocator {
+impl FrameAllocator {
     const fn new() -> Self {
         Self {
             head: 0,
@@ -47,6 +51,7 @@ impl FreeListAllocator {
             total_frames: 0,
             phys_offset: 0,
             max_frame_number: 0,
+            buddy: None,
         }
     }
 
@@ -59,9 +64,7 @@ impl FreeListAllocator {
         self.free_count = 0;
         self.total_frames = 0;
 
-        // P17-T009: determine highest physical frame number from usable regions.
-        // Only Usable regions produce allocatable frames; reserved/MMIO regions
-        // at high addresses (e.g., PCI hole at 4 GiB) must not inflate the table.
+        // Determine highest physical frame number from usable regions.
         let max_phys_addr = regions
             .iter()
             .filter(|r| r.kind == MemoryRegionKind::Usable)
@@ -101,19 +104,13 @@ impl FreeListAllocator {
     }
 
     /// Push a frame onto the head of the free list.
-    ///
-    /// Writes the current head pointer and magic sentinel into the frame's
-    /// first 16 bytes via the physical-memory offset mapping.
     fn push_frame(&mut self, phys: u64) {
         let virt = (self.phys_offset + phys) as *mut u64;
         // SAFETY: `phys` is a valid, page-aligned physical address within a
         // Usable memory region.  The physical-memory offset mapping guarantees
-        // `virt` is a valid kernel virtual address.  We have exclusive ownership
-        // of the frame (it is not mapped anywhere else).
+        // `virt` is a valid kernel virtual address.
         unsafe {
-            // bytes 0..8: next pointer
             virt.write(self.head);
-            // bytes 8..16: magic sentinel
             virt.add(1).write(FREE_MAGIC);
         }
         self.head = phys;
@@ -131,9 +128,7 @@ impl FreeListAllocator {
         // SAFETY: `phys` is a frame on our free list; the physical-memory offset
         // mapping makes `virt` a valid kernel virtual address.
         unsafe {
-            // Read next pointer and advance head.
             self.head = virt.read();
-            // Clear the magic sentinel so double-free detection works.
             virt.add(1).write(0);
         }
         self.free_count -= 1;
@@ -142,46 +137,93 @@ impl FreeListAllocator {
 
     /// Allocate a single 4 KiB frame.
     fn allocate(&mut self) -> Option<PhysFrame<Size4KiB>> {
-        let phys = self.pop_frame()?;
+        let phys = if let Some(ref mut buddy) = self.buddy {
+            let pfn = buddy.allocate(0)?;
+            (pfn as u64) * PAGE_SIZE
+        } else {
+            self.pop_frame()?
+        };
         let addr = PhysAddr::new(phys);
         Some(PhysFrame::containing_address(addr))
     }
 
-    /// Push a frame back onto the free list (unconditionally).
+    /// Allocate a contiguous block of `1 << order` pages.
     ///
-    /// Panics if the frame is already on the free list (double-free).
-    fn free_to_list(&mut self, phys: u64) {
-        debug_assert!(
-            phys >= ALLOC_MIN_ADDR,
-            "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
-            phys
-        );
-        debug_assert!(
-            phys.is_multiple_of(PAGE_SIZE),
-            "free_frame: address {:#x} is not page-aligned",
-            phys
-        );
+    /// Returns the base physical frame, or `None` if no block is available.
+    /// Only works after buddy allocator is initialized.
+    #[allow(dead_code)]
+    fn allocate_contiguous(&mut self, order: usize) -> Option<PhysFrame<Size4KiB>> {
+        let buddy = self.buddy.as_mut()?;
+        let pfn = buddy.allocate(order)?;
+        let phys = (pfn as u64) * PAGE_SIZE;
+        Some(PhysFrame::containing_address(PhysAddr::new(phys)))
+    }
 
-        // Double-free detection: check if the magic sentinel is present.
-        let virt = (self.phys_offset + phys) as *const u64;
-        // SAFETY: phys is a page-aligned address that was previously allocated;
-        // the offset mapping makes virt valid.
-        let magic = unsafe { virt.add(1).read() };
-        if magic == FREE_MAGIC {
-            panic!(
-                "double-free detected: frame {:#x} is already on the free list",
+    /// Return a frame to the allocator.
+    ///
+    /// Panics on double-free when using the free-list path.
+    fn free_to_pool(&mut self, phys: u64) {
+        if let Some(ref mut buddy) = self.buddy {
+            let pfn = (phys / PAGE_SIZE) as usize;
+            buddy.free(pfn, 0);
+        } else {
+            // Free-list path (before buddy init).
+            debug_assert!(
+                phys >= ALLOC_MIN_ADDR,
+                "free_frame: address {:#x} is below ALLOC_MIN_ADDR",
                 phys
             );
-        }
+            debug_assert!(
+                phys.is_multiple_of(PAGE_SIZE),
+                "free_frame: address {:#x} is not page-aligned",
+                phys
+            );
 
-        self.push_frame(phys);
+            // Double-free detection via magic sentinel.
+            let virt = (self.phys_offset + phys) as *const u64;
+            let magic = unsafe { virt.add(1).read() };
+            if magic == FREE_MAGIC {
+                panic!(
+                    "double-free detected: frame {:#x} is already on the free list",
+                    phys
+                );
+            }
+
+            self.push_frame(phys);
+        }
+    }
+
+    /// Free a contiguous block of `1 << order` pages.
+    ///
+    /// Only works after buddy allocator is initialized.
+    #[allow(dead_code)]
+    fn free_contiguous(&mut self, phys: u64, order: usize) {
+        if let Some(ref mut buddy) = self.buddy {
+            let pfn = (phys / PAGE_SIZE) as usize;
+            buddy.free(pfn, order);
+        } else {
+            // Before buddy init, free each page individually.
+            let count = 1u64 << order;
+            for i in 0..count {
+                self.free_to_pool(phys + i * PAGE_SIZE);
+            }
+        }
+    }
+
+    /// Current free page count.
+    fn current_free_count(&self) -> usize {
+        if let Some(ref buddy) = self.buddy {
+            buddy.free_count()
+        } else {
+            self.free_count
+        }
     }
 }
 
-struct LockedFrameAllocator(Mutex<FreeListAllocator>);
+struct LockedFrameAllocator(Mutex<FrameAllocator>);
 
 static FRAME_ALLOCATOR: LockedFrameAllocator =
-    LockedFrameAllocator(Mutex::new(FreeListAllocator::new()));
+    LockedFrameAllocator(Mutex::new(FrameAllocator::new()));
 
 static FRAME_ALLOC_INIT: AtomicBool = AtomicBool::new(false);
 
@@ -193,9 +235,58 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     FRAME_ALLOCATOR.0.lock().init(regions, phys_offset);
 }
 
+/// Upgrade from the bootstrap free-list to the buddy allocator.
+///
+/// Must be called **after** `heap::init_heap` (since `BuddyAllocator` uses `Vec`).
+/// Drains all frames from the free list into the buddy allocator, which
+/// coalesces them into the largest possible blocks.
+pub fn init_buddy() {
+    let mut alloc = FRAME_ALLOCATOR.0.lock();
+
+    // Drain all frames from the free list.
+    let mut frames = Vec::new();
+    while let Some(phys) = alloc.pop_frame() {
+        frames.push(phys);
+    }
+
+    let total_pfns = (alloc.max_frame_number as usize) + 1;
+    let mut buddy = BuddyAllocator::new(total_pfns);
+
+    // Sort frames so contiguous runs are added in order for better coalescing.
+    frames.sort_unstable();
+
+    // Feed each frame into the buddy allocator (it will coalesce buddies).
+    for phys in &frames {
+        let pfn = (*phys / PAGE_SIZE) as usize;
+        buddy.free(pfn, 0);
+    }
+
+    let buddy_free = buddy.free_count();
+    alloc.buddy = Some(buddy);
+
+    log::info!(
+        "[mm] buddy allocator: {} free pages across {} orders",
+        buddy_free,
+        kernel_core::buddy::MAX_ORDER + 1
+    );
+}
+
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
     let frame = FRAME_ALLOCATOR.0.lock().allocate()?;
-    // P17-T014: set refcount to 1 for freshly allocated frames.
+    // Set refcount to 1 for freshly allocated frames.
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        refcount_inc(frame.start_address().as_u64());
+    }
+    Some(frame)
+}
+
+/// Allocate a contiguous block of `1 << order` pages.
+///
+/// Returns the base frame. Sets refcount for the base frame only.
+/// Only available after buddy allocator initialization.
+#[allow(dead_code)]
+pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
+    let frame = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order)?;
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         refcount_inc(frame.start_address().as_u64());
     }
@@ -210,7 +301,7 @@ pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
 /// directly without decrementing.
 /// Panics on double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
-    // P17-T015: use refcounting when available.
+    // Use refcounting when available.
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         let current = refcount_get(phys);
         if current == 0 {
@@ -223,12 +314,32 @@ pub fn free_frame(phys: u64) {
             }
         }
     }
-    FRAME_ALLOCATOR.0.lock().free_to_list(phys);
+    FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
 
-/// Returns the number of frames currently on the free list.
+/// Free a contiguous block of `1 << order` pages.
+///
+/// Decrements refcount for the base frame. Frees the entire block when the
+/// count reaches zero.
+#[allow(dead_code)]
+pub fn free_contiguous(phys: u64, order: usize) {
+    if REFCOUNT_INIT.load(Ordering::Acquire) {
+        let current = refcount_get(phys);
+        if current == 0 {
+            // Pre-refcount frame — free directly.
+        } else {
+            let new_count = refcount_dec(phys);
+            if new_count > 0 {
+                return;
+            }
+        }
+    }
+    FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
+}
+
+/// Returns the number of frames currently free.
 pub fn free_count() -> usize {
-    FRAME_ALLOCATOR.0.lock().free_count
+    FRAME_ALLOCATOR.0.lock().current_free_count()
 }
 
 /// Returns the total number of usable frames discovered at boot.
