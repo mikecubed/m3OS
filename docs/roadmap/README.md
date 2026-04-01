@@ -126,6 +126,15 @@ flowchart TD
     P24 --> P45
     P34 --> P45
     P38 --> P45
+
+    %% Showcase phases
+    P12 --> P46["Phase 46<br/>DOOM"]
+    P24 --> P46
+    P9 --> P46
+    P15 --> P47["Phase 47<br/>Mouse Input"]
+    P46 -.->|optional| P47
+    P15 --> P48["Phase 48<br/>Audio"]
+    P46 -.->|optional| P48
 ```
 
 ## Milestone Summary
@@ -206,6 +215,14 @@ flowchart TD
 | 44 | Ports System | Source-based package building and installation | [Phase 44](./44-ports-system.md) | *not yet created* |
 | 45 | System Services | Service manager, syslog, cron, shutdown | [Phase 45](./45-system-services.md) | *not yet created* |
 
+### Showcase Phases (planned — "it runs DOOM")
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 46 | DOOM | DOOM runs with framebuffer rendering and keyboard input | [Phase 46](./46-doom.md) | *not yet created* |
+| 47 | Mouse Input | PS/2 mouse driver for graphical programs | [Phase 47](./47-mouse-input.md) | *not yet created* |
+| 48 | Audio | Sound card driver (HDA/AC97) for audio output | [Phase 48](./48-audio.md) | *not yet created* |
+
 ## Suggested Delivery Rhythm
 
 ```mermaid
@@ -275,6 +292,11 @@ gantt
     Rust Cross-Compile   :p43, after p24, 1
     Ports System         :p44, after p40, 1
     System Services      :p45, after p38, 1
+
+    section Showcase (planned)
+    DOOM                 :p46, after p24, 1
+    Mouse Input          :p47, after p46, 1
+    Audio                :p48, after p46, 1
 ```
 
 ## Required Documentation for Every Phase
