@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.33.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, and a robust memory subsystem with buddy allocator, slab caches, and working munmap.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.34.0 with a functional userspace including init, login, shell, coreutils, networking, SMP, persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, and working munmap, and real-time clock with wall-clock timekeeping.
 
 ## Build & Run
 
@@ -99,7 +99,7 @@ userspace/
   pty-test/               # PTY subsystem test (Phase 29)
   telnetd/                # Telnet server daemon (Phase 30)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
-  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo
+  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime
   demo-project/           # Multi-file C demo project for make testing (Phase 32)
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -115,6 +115,7 @@ kernel/src/
   serial.rs            # serial I/O + log backend
   pipe.rs              # inter-process pipes
   pty.rs               # PTY pair table and lifecycle (Phase 29)
+  rtc.rs               # CMOS real-time clock driver (Phase 34)
   signal.rs            # POSIX-style signal handling
   stdin.rs             # stdin abstraction
   tty.rs               # TTY/terminal subsystem
@@ -142,6 +143,7 @@ kernel-core/src/
   types.rs             # shared types
   buddy.rs             # buddy frame allocator (Phase 33)
   slab.rs              # slab cache allocator (Phase 33)
+  time.rs              # time conversion library (Phase 34)
   fb.rs                # framebuffer abstractions
   pipe.rs              # pipe abstractions
   pty.rs               # PTY pair state, ring buffers (Phase 29)
@@ -254,6 +256,7 @@ Read before making significant changes:
 | `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
 | `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
 | `docs/33-kernel-memory.md` | Before touching buddy allocator, slab caches, munmap, or meminfo |
+| `docs/34-timekeeping.md` | Before touching RTC, clock_gettime, gettimeofday, or time conversion |
 | `docs/08-roadmap.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
