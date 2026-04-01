@@ -464,7 +464,7 @@ pub struct Process {
 pub struct MemoryMapping {
     /// Starting virtual address (page-aligned).
     pub start: u64,
-    /// Length in bytes (may not be page-aligned; rounded up for page ops).
+    /// Length in bytes (page-aligned, as recorded by `sys_linux_mmap`).
     pub len: u64,
 }
 

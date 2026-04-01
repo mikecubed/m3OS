@@ -201,10 +201,18 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
         ALLOCATOR.inner.lock().extend(bytes_mapped);
     }
 
-    // If we mapped fewer pages than reserved, adjust HEAP_MAPPED back down.
+    // If we mapped fewer pages than reserved, try to roll back HEAP_MAPPED.
+    // Use CAS to avoid racing with a concurrent growth that reserved beyond us.
     let wasted = additional_bytes - bytes_mapped;
     if wasted > 0 {
-        HEAP_MAPPED.fetch_sub(wasted, Ordering::Release);
+        let reserved_end = current_mapped + additional_bytes;
+        let mapped_end = current_mapped + bytes_mapped;
+        let _ = HEAP_MAPPED.compare_exchange(
+            reserved_end,
+            mapped_end,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
     }
 
     log::info!(
