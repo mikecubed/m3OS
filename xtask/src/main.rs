@@ -1909,6 +1909,11 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     }
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    // Always rebuild the data disk so the demo project is freshly populated.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
     create_data_disk(uefi_image.parent().unwrap());
 
     let ovmf = find_ovmf();

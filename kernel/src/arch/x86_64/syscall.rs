@@ -496,10 +496,10 @@ pub extern "C" fn syscall_handler(
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
-        // Phase 32: utimensat — update file timestamps
+        // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
-            let times_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            sys_utimensat(arg0, arg1, arg2, times_ptr)
+            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            sys_utimensat(arg0, arg1, arg2, flags)
         }
         // Custom kernel debug print (moved from 12, Phase 12 T010)
         0x1000 => sys_debug_print(arg0, arg1),
@@ -5744,7 +5744,8 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
         } else if a_nsec == UTIME_OMIT {
             u32::MAX // sentinel: don't change
         } else {
-            if a_sec < 0 {
+            // Validate timespec: tv_sec >= 0, tv_sec fits u32, tv_nsec in [0, 1e9)
+            if a_sec < 0 || a_sec > u32::MAX as i64 || !(0..1_000_000_000).contains(&a_nsec) {
                 return NEG_EINVAL;
             }
             a_sec as u32
@@ -5754,7 +5755,7 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
         } else if m_nsec == UTIME_OMIT {
             u32::MAX // sentinel: don't change
         } else {
-            if m_sec < 0 {
+            if m_sec < 0 || m_sec > u32::MAX as i64 || !(0..1_000_000_000).contains(&m_nsec) {
                 return NEG_EINVAL;
             }
             m_sec as u32
