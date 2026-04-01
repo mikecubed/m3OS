@@ -5,6 +5,35 @@ two stages: first cross-compile Clang on the host and run it inside the OS
 (like we did with TCC in Phase 31), then eventually build LLVM from source
 natively. Getting Clang running is the priority -- self-hosting comes later.
 
+## Overview
+
+```mermaid
+flowchart LR
+    subgraph TODAY ["Today (Phase 32)"]
+        TCC["TCC<br/><i>C compiler, ~300 KB</i>"]
+    end
+
+    subgraph STAGE1 ["Stage 1: Cross-Compiled"]
+        direction TB
+        CLANG["Clang + LLD<br/><i>C/C++ compiler, ~150 MB</i>"]
+    end
+
+    subgraph STAGE2 ["Stage 2: Self-Hosting"]
+        direction TB
+        SELF["LLVM built from source<br/><i>inside m3OS</i>"]
+    end
+
+    TODAY -->|"Phase 33 +<br/>Expanded Memory +<br/>disk expansion"| STAGE1
+    STAGE1 -->|"Phases 34-39 +<br/>build infra +<br/>C++ EH"| STAGE2
+
+    style TODAY fill:#f9e79f,stroke:#f39c12,color:#000
+    style STAGE1 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style STAGE2 fill:#d5f5e3,stroke:#27ae60,color:#000
+    style TCC fill:#fdebd0,stroke:#e67e22,color:#000
+    style CLANG fill:#aed6f1,stroke:#2471a3,color:#000
+    style SELF fill:#a9dfbf,stroke:#1e8449,color:#000
+```
+
 ## Current State (Phase 32 complete)
 
 What we have today:
@@ -141,20 +170,27 @@ Key decisions:
 
 Add a `build_clang()` function to xtask following the TCC pattern:
 
-```
-Host (build time)                       Guest (m3OS, run time)
-+----------------------------------+    +------------------------------------------+
-| cargo xtask image                |    |  C compilation:                          |
-|   build_clang()                  |    |    $ clang /tmp/prog.c -o /tmp/prog      |
-|     cmake + ninja (LLVM)         |    |    $ /tmp/prog                           |
-|     static musl linkage          |    |                                          |
-|   populate_clang_files()         |    |  C++ compilation:                        |
-|     /usr/bin/clang               |    |    $ clang++ /tmp/app.cpp -o /tmp/app    |
-|     /usr/bin/ld.lld              |    |    $ /tmp/app                            |
-|     /usr/lib/libc++.a, etc.      |    |                                          |
-|     /usr/include/c++/v1/*        |    |  Optimized build:                        |
-|     clang built-in headers       |    |    $ clang -O2 /tmp/fast.c -o /tmp/fast  |
-+----------------------------------+    +------------------------------------------+
+```mermaid
+flowchart LR
+    subgraph HOST ["Host (build time)"]
+        direction TB
+        XTASK["cargo xtask image"]
+        BUILD["build_clang()<br/><i>cmake + ninja</i><br/><i>static musl linkage</i>"]
+        POP["populate_clang_files()<br/><i>/usr/bin/clang</i><br/><i>/usr/bin/ld.lld</i><br/><i>/usr/lib/libc++.a</i><br/><i>/usr/include/c++/v1/*</i><br/><i>clang built-in headers</i>"]
+        XTASK --> BUILD --> POP
+    end
+
+    subgraph GUEST ["Guest (m3OS, run time)"]
+        direction TB
+        C_COMP["C compilation<br/><code>$ clang prog.c -o prog</code>"]
+        CPP_COMP["C++ compilation<br/><code>$ clang++ app.cpp -o app</code>"]
+        OPT["Optimized build<br/><code>$ clang -O2 fast.c -o fast</code>"]
+    end
+
+    POP -->|"bundled on<br/>disk image"| C_COMP
+
+    style HOST fill:#fef9e7,stroke:#f39c12,color:#000
+    style GUEST fill:#eaf2f8,stroke:#2980b9,color:#000
 ```
 
 ## Kernel/OS Prerequisites for Stage 1
@@ -239,11 +275,40 @@ This is the single biggest kernel requirement for running Clang. TCC needs
 - OOM killer (kernel still panics on true physical memory exhaustion)
 
 **Implementation complexity:** Demand paging is a significant kernel feature.
-The page fault handler must distinguish between:
-- Lazy allocation faults (allocate a frame, map it, resume)
-- Stack growth faults (extend stack, map frame, resume)
-- True invalid accesses (segfault the process)
-- Copy-on-write faults (already implemented in Phase 17)
+The page fault handler must distinguish between several fault types:
+
+```mermaid
+flowchart TD
+    PF["Page Fault<br/><i>#PF exception</i>"]
+    CHECK{"Address in a<br/>valid VMA?"}
+    COW{"Copy-on-Write<br/>page?"}
+    LAZY{"Lazy-mapped<br/>(demand paging)?"}
+    STACK{"Below stack<br/>guard page?"}
+
+    ALLOC_COW["Copy frame,<br/>map writable,<br/>resume"]
+    ALLOC_LAZY["Allocate frame,<br/>zero-fill,<br/>map, resume"]
+    ALLOC_STACK["Extend stack,<br/>map frame,<br/>resume"]
+    SEGV["SIGSEGV<br/><i>kill process</i>"]
+
+    PF --> CHECK
+    CHECK -->|"No"| STACK
+    CHECK -->|"Yes"| COW
+    COW -->|"Yes"| ALLOC_COW
+    COW -->|"No"| LAZY
+    LAZY -->|"Yes"| ALLOC_LAZY
+    LAZY -->|"No"| SEGV
+    STACK -->|"Yes"| ALLOC_STACK
+    STACK -->|"No"| SEGV
+
+    style PF fill:#fadbd8,stroke:#e74c3c,color:#000
+    style ALLOC_COW fill:#d5f5e3,stroke:#27ae60,color:#000
+    style ALLOC_LAZY fill:#d5f5e3,stroke:#27ae60,color:#000
+    style ALLOC_STACK fill:#d5f5e3,stroke:#27ae60,color:#000
+    style SEGV fill:#e74c3c,stroke:#c0392b,color:#fff
+```
+
+CoW faults are already implemented in Phase 17. Demand paging adds the lazy
+allocation path.
 
 Estimate: comparable to Phase 17 (Memory Reclamation) in scope.
 
@@ -265,32 +330,30 @@ This is a straightforward xtask change, not a kernel feature.
 
 ## Stage 1 Dependency Graph
 
-```
-Phase 33 (Kernel Memory)         -- IN PROGRESS
-    |
-    +--- munmap works, OOM retry, slab/buddy allocators
-    |
-    v
-NEW: Expanded Memory             -- NOT YET ON ROADMAP
-    |
-    +--- demand paging, large mmap, QEMU RAM increase
-    |
-    v
-Disk Image Expansion             -- xtask change only
-    |
-    +--- ext2 partition grows to 512 MB - 1 GB
-    |
-    v
-Cross-Compile Clang on Host      -- xtask build_clang()
-    |
-    +--- static clang + lld + libc++ + headers
-    |
-    v
-    Clang runs inside m3OS!       C and C++ compilation works
-```
+```mermaid
+flowchart TD
+    P33["Phase 33: Kernel Memory<br/><i>IN PROGRESS</i>"]
+    EM["NEW: Expanded Memory<br/><i>demand paging, large mmap,<br/>QEMU RAM increase</i>"]
+    DI["Disk Image Expansion<br/><i>ext2 → 512 MB - 1 GB<br/>(xtask change only)</i>"]
+    CC["Cross-Compile Clang on Host<br/><i>xtask build_clang()</i>"]
+    DONE(["Clang runs inside m3OS!<br/>C and C++ compilation works"])
 
-**Optional but recommended (can be done in parallel or after):**
-- Phase 37 (Filesystem Enhancements) -- symlinks, /dev/null, /proc/self/exe
+    P37["Phase 37: Filesystem<br/><i>symlinks, /dev/null,<br/>/proc/self/exe</i>"]
+
+    P33 -->|"munmap, OOM retry,<br/>slab/buddy allocators"| EM
+    EM --> DI
+    DI --> CC
+    CC --> DONE
+
+    P37 -.->|"optional but<br/>recommended"| DONE
+
+    style P33 fill:#f9e79f,stroke:#f39c12,color:#000
+    style EM fill:#fadbd8,stroke:#e74c3c,color:#000
+    style DI fill:#d5f5e3,stroke:#27ae60,color:#000
+    style CC fill:#d6eaf8,stroke:#2980b9,color:#000
+    style DONE fill:#27ae60,stroke:#1e8449,color:#fff
+    style P37 fill:#e8daef,stroke:#8e44ad,color:#000
+```
 
 **Not required for Stage 1:**
 - Phase 34 (RTC) -- Clang doesn't need wall-clock time to compile
@@ -455,33 +518,73 @@ not a hard requirement.
 
 ## Stage 2 Dependency Graph
 
-```
-Stage 1 complete (cross-compiled Clang works)
-    |
-    +---+---+---+---+
-    |   |   |   |   |
-    v   v   v   v   v
-   P34 P35 P36 P37 P39
-   RTC SMP I/O  FS  Threading
-    |   |   |   |   |
-    +---+---+---+---+
-            |
-            v
-    NEW: Build Infrastructure
-    (CMake, Ninja, 4 GB disk)
-            |
-            v
-    NEW: C++ Exception Handling
-    (libunwind, .eh_frame, libcxxabi)
-            |
-            v
-    NEW: Dynamic Linking (optional)
-            |
-            v
-    Self-hosted LLVM build inside m3OS
+```mermaid
+flowchart TD
+    S1(["Stage 1 complete<br/><i>cross-compiled Clang works</i>"])
+
+    P34["Phase 34: Real-Time Clock<br/><i>timestamps for make</i>"]
+    P35["Phase 35: True SMP<br/><i>multi-core scheduling</i>"]
+    P36["Phase 36: I/O Multiplexing<br/><i>select, epoll, O_NONBLOCK</i>"]
+    P37["Phase 37: Filesystem<br/><i>symlinks, /proc, /dev/null</i>"]
+    P39["Phase 39: Threading<br/><i>clone, futex, TLS, pthreads</i>"]
+
+    BI["NEW: Build Infrastructure<br/><i>CMake, Ninja, 4 GB disk</i>"]
+    EH["NEW: C++ Exception Handling<br/><i>libunwind, .eh_frame, libcxxabi</i>"]
+    DL["NEW: Dynamic Linking<br/><i>dlopen, PLT/GOT, ld.so</i>"]
+    DONE(["Self-hosted LLVM build<br/>inside m3OS"])
+
+    S1 --> P34
+    S1 --> P35
+    S1 --> P36
+    S1 --> P37
+    S1 --> P39
+
+    P34 --> BI
+    P35 --> BI
+    P36 --> BI
+    P37 --> BI
+    P39 --> BI
+
+    BI --> EH
+    EH --> DONE
+    DL -.->|"optional"| DONE
+
+    style S1 fill:#27ae60,stroke:#1e8449,color:#fff
+    style P34 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P35 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P36 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P37 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style P39 fill:#d6eaf8,stroke:#2980b9,color:#000
+    style BI fill:#fadbd8,stroke:#e74c3c,color:#000
+    style EH fill:#fadbd8,stroke:#e74c3c,color:#000
+    style DL fill:#e8daef,stroke:#8e44ad,color:#000
+    style DONE fill:#27ae60,stroke:#1e8449,color:#fff
 ```
 
 ## Full Effort Summary
+
+```mermaid
+gantt
+    title Road to Clang/LLVM on m3OS
+    dateFormat X
+    axisFormat %s
+
+    section Stage 1
+    Phase 33 - Kernel Memory (in progress)     :active, p33, 0, 1
+    NEW - Expanded Memory                      :crit, em, after p33, 1
+    Disk Image Expansion (xtask)               :di, after em, 1
+    Cross-Compile Clang (xtask)                :cc, after di, 1
+
+    section Stage 2
+    Phase 34 - Real-Time Clock                 :p34, after cc, 1
+    Phase 35 - True SMP                        :p35, after cc, 1
+    Phase 36 - I/O Multiplexing                :p36, after p35, 1
+    Phase 37 - Filesystem Enhancements         :p37, after cc, 1
+    Phase 39 - Threading Primitives            :p39, after p35, 1
+    NEW - Build Infrastructure                 :crit, bi, after p39, 1
+    NEW - C++ Exception Handling               :crit, eh, after bi, 1
+    NEW - Dynamic Linking (optional)           :done, dl, after eh, 1
+```
 
 | Stage | Phases Required | Complexity |
 |---|---|---|
