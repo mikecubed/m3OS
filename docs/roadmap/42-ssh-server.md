@@ -1,4 +1,4 @@
-# Phase 35 - SSH Server
+# Phase 42 - SSH Server
 
 ## Milestone Goal
 
@@ -21,7 +21,7 @@ milestone: the OS is now a secure, networked, multi-user system.
 
 **Transport Layer**
 - SSH-2 protocol only (SSH-1 is obsolete and insecure).
-- Key exchange: `curve25519-sha256` (using crypto from Phase 34).
+- Key exchange: `curve25519-sha256` (using crypto from Phase 41).
 - Host key: Ed25519 (generated on first boot, stored at `/etc/ssh/ssh_host_ed25519_key`).
 - Encryption: `chacha20-poly1305@openssh.com` or `aes256-ctr`.
 - MAC: `hmac-sha2-256` (if not using authenticated encryption).
@@ -51,12 +51,12 @@ server designed for embedded systems. It is:
 - Widely deployed on routers, IoT devices, embedded Linux
 
 Cross-compile Dropbear with musl. It can optionally use an external crypto library
-or its built-in one. If we use the Phase 33 crypto library, we learn more; if we use
+or its built-in one. If we use the Phase 41 crypto library, we learn more; if we use
 Dropbear's built-in crypto, we get a working server faster.
 
 **Option B: Write minimal SSH server from scratch**
 
-Using the Phase 33 crypto primitives, implement the SSH-2 protocol directly. This is
+Using the Phase 41 crypto primitives, implement the SSH-2 protocol directly. This is
 the maximum learning path but is significantly more work. The SSH protocol has many
 subtle requirements around packet framing, key re-exchange, and channel multiplexing.
 
@@ -89,7 +89,7 @@ ssh -p 2222 user@localhost
 | Phase 23 (Socket API) | TCP server sockets |
 | Phase 27 (User Accounts) | Authentication, UID/GID |
 | Phase 29 (PTY) | Terminal sessions |
-| Phase 34 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
+| Phase 41 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
 
 ## Implementation Outline
 
@@ -119,7 +119,7 @@ ssh -p 2222 user@localhost
 
 ## Companion Task List
 
-- [Phase 35 Task List](./tasks/35-ssh-server-tasks.md)
+- Phase 42 Task List — *not yet created*
 
 ## How Real OS Implementations Differ
 

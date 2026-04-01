@@ -89,20 +89,43 @@ flowchart TD
     P14 --> P31
     P31 --> P32["Phase 32<br/>Build Tools"]
     P26 --> P32
-    P14 --> P33["Phase 33<br/>Expanded Coreutils"]
-    P27 --> P33
-    P31 --> P34["Phase 34<br/>Crypto Primitives"]
-    P34 --> P35["Phase 35<br/>SSH Server"]
-    P29 --> P35
-    P27 --> P35
-    P12 --> P36["Phase 36<br/>Rust Cross-Compilation"]
-    P24 --> P36
-    P31 --> P37["Phase 37<br/>Ports System"]
-    P32 --> P37
-    P33 --> P37
-    P27 --> P38["Phase 38<br/>System Services"]
-    P30 --> P38
-    P24 --> P38
+
+    %% Kernel infrastructure phases
+    P17 --> P33["Phase 33<br/>Kernel Memory"]
+    P25 --> P33
+    P15 --> P34["Phase 34<br/>Real-Time Clock"]
+    P25 --> P35["Phase 35<br/>True SMP"]
+    P33 --> P35
+    P23 --> P36["Phase 36<br/>I/O Multiplexing"]
+    P22 --> P36
+    P35 --> P36
+    P28 --> P37["Phase 37<br/>Filesystem Enhancements"]
+    P27 --> P37
+    P23 --> P38["Phase 38<br/>Unix Domain Sockets"]
+    P37 --> P38
+    P36 --> P38
+    P35 --> P39["Phase 39<br/>Threading"]
+    P33 --> P39
+
+    %% Application phases
+    P14 --> P40["Phase 40<br/>Expanded Coreutils"]
+    P27 --> P40
+    P37 --> P40
+    P31 --> P41["Phase 41<br/>Crypto Primitives"]
+    P41 --> P42["Phase 42<br/>SSH Server"]
+    P29 --> P42
+    P27 --> P42
+    P36 --> P42
+    P12 --> P43["Phase 43<br/>Rust Cross-Compilation"]
+    P24 --> P43
+    P31 --> P44["Phase 44<br/>Ports System"]
+    P32 --> P44
+    P40 --> P44
+    P27 --> P45["Phase 45<br/>System Services"]
+    P30 --> P45
+    P24 --> P45
+    P34 --> P45
+    P38 --> P45
 ```
 
 ## Milestone Summary
@@ -154,17 +177,34 @@ flowchart TD
 |---|---|---|---|---|
 | 26 | Text Editor | Full-screen editor for creating and modifying files | [Phase 26](./26-text-editor.md) | [Tasks](./tasks/26-text-editor-tasks.md) |
 | 27 | User Accounts | Login, UID/GID, file permissions, passwd/shadow | [Phase 27](./27-user-accounts.md) | [Tasks](./tasks/27-user-accounts-tasks.md) |
-| 28 | ext2 Filesystem | Native Unix permissions, replaces FAT32 | [Phase 28](./28-ext2-filesystem.md) | *not yet created* |
-| 29 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 29](./29-pty-subsystem.md) | *not yet created* |
-| 30 | Telnet Server | Remote shell access over the network | [Phase 30](./30-telnet-server.md) | [Phase 30 Tasks](./tasks/30-telnet-server-tasks.md) |
-| 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 31](./31-compiler-bootstrap.md) | *not yet created* |
-| 32 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 32](./32-build-tools.md) | *not yet created* |
-| 33 | Expanded Coreutils | head, tail, sort, find, diff, ps, less, and more | [Phase 33](./33-expanded-coreutils.md) | *not yet created* |
-| 34 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 34](./34-crypto-primitives.md) | *not yet created* |
-| 35 | SSH Server | Encrypted remote shell access | [Phase 35](./35-ssh-server.md) | *not yet created* |
-| 36 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 36](./36-rust-cross-compilation.md) | *not yet created* |
-| 37 | Ports System | Source-based package building and installation | [Phase 37](./37-ports-system.md) | *not yet created* |
-| 38 | System Services | Service manager, syslog, cron, shutdown | [Phase 38](./38-system-services.md) | *not yet created* |
+| 28 | ext2 Filesystem | Native Unix permissions, replaces FAT32 | [Phase 28](./28-ext2-filesystem.md) | [Tasks](./tasks/28-ext2-filesystem-tasks.md) |
+| 29 | PTY Subsystem | Pseudo-terminal pairs for remote sessions | [Phase 29](./29-pty-subsystem.md) | [Tasks](./tasks/29-pty-subsystem-tasks.md) |
+| 30 | Telnet Server | Remote shell access over the network | [Phase 30](./30-telnet-server.md) | [Tasks](./tasks/30-telnet-server-tasks.md) |
+| 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | [Phase 31](./31-compiler-bootstrap.md) | [Tasks](./tasks/31-compiler-bootstrap-tasks.md) |
+| 32 | Build Tools | make, ar, shell scripting for multi-file projects | [Phase 32](./32-build-tools.md) | [Tasks](./tasks/32-build-tools-tasks.md) |
+
+### Kernel Infrastructure Phases (planned — "Linux/Unix compatibility and performance")
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 33 | Kernel Memory | Slab allocator, OOM retry, working munmap | [Phase 33](./33-kernel-memory-improvements.md) | *not yet created* |
+| 34 | Real-Time Clock | CMOS RTC, wall-clock time, CLOCK_REALTIME | [Phase 34](./34-real-time-clock.md) | *not yet created* |
+| 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | [Phase 35](./35-true-smp-multitasking.md) | *not yet created* |
+| 36 | I/O Multiplexing | select, epoll, non-blocking I/O | [Phase 36](./36-io-multiplexing.md) | *not yet created* |
+| 37 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | [Phase 37](./37-filesystem-enhancements.md) | *not yet created* |
+| 38 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | [Phase 38](./38-unix-domain-sockets.md) | *not yet created* |
+| 39 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | [Phase 39](./39-threading-primitives.md) | *not yet created* |
+
+### Application Phases (planned — "ecosystem and services")
+
+| Phase | Theme | Primary Outcome | Milestone | Tasks |
+|---|---|---|---|---|
+| 40 | Expanded Coreutils | head, tail, sort, find, diff, ps, less | [Phase 40](./40-expanded-coreutils.md) | *not yet created* |
+| 41 | Crypto Primitives | SHA-256, Ed25519, X25519, ChaCha20 | [Phase 41](./41-crypto-primitives.md) | *not yet created* |
+| 42 | SSH Server | Encrypted remote shell access | [Phase 42](./42-ssh-server.md) | *not yet created* |
+| 43 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | [Phase 43](./43-rust-cross-compilation.md) | *not yet created* |
+| 44 | Ports System | Source-based package building and installation | [Phase 44](./44-ports-system.md) | *not yet created* |
+| 45 | System Services | Service manager, syslog, cron, shutdown | [Phase 45](./45-system-services.md) | *not yet created* |
 
 ## Suggested Delivery Rhythm
 
@@ -218,12 +258,23 @@ gantt
     Telnet Server        :p30, after p29, 1
     Compiler Bootstrap   :p31, after p26, 1
     Build Tools          :p32, after p31, 1
-    Expanded Coreutils   :p33, after p27, 1
-    Crypto Primitives    :p34, after p31, 1
-    SSH Server           :p35, after p34, 1
-    Rust Cross-Compile   :p36, after p24, 1
-    Ports System         :p37, after p32, 1
-    System Services      :p38, after p30, 1
+
+    section Kernel Infrastructure (planned)
+    Kernel Memory        :p33, after p25, 1
+    Real-Time Clock      :p34, after p15, 1
+    True SMP             :p35, after p33, 1
+    I/O Multiplexing     :p36, after p35, 1
+    Filesystem Enhance   :p37, after p28, 1
+    Unix Domain Sockets  :p38, after p37, 1
+    Threading            :p39, after p35, 1
+
+    section Applications (planned)
+    Expanded Coreutils   :p40, after p37, 1
+    Crypto Primitives    :p41, after p31, 1
+    SSH Server           :p42, after p41, 1
+    Rust Cross-Compile   :p43, after p24, 1
+    Ports System         :p44, after p40, 1
+    System Services      :p45, after p38, 1
 ```
 
 ## Required Documentation for Every Phase

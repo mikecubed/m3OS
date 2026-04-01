@@ -70,6 +70,59 @@ flowchart TD
     P4 --> P25
     P20 --> P26["Phase 26 Tasks"]
     P24 --> P26
+
+    %% Productivity phases
+    P22 --> P26
+    P12 --> P27["Phase 27 Tasks"]
+    P24 --> P27
+    P27 --> P28["Phase 28 Tasks"]
+    P24 --> P28
+    P22 --> P29["Phase 29 Tasks"]
+    P27 --> P29
+    P23 --> P30["Phase 30 Tasks"]
+    P27 --> P30
+    P29 --> P30
+    P26 --> P31["Phase 31 Tasks"]
+    P14 --> P31
+    P31 --> P32["Phase 32 Tasks"]
+    P26 --> P32
+
+    %% Kernel infrastructure phases
+    P17 --> P33["Phase 33 Tasks"]
+    P25 --> P33
+    P15 --> P34["Phase 34 Tasks"]
+    P25 --> P35["Phase 35 Tasks"]
+    P33 --> P35
+    P23 --> P36["Phase 36 Tasks"]
+    P22 --> P36
+    P35 --> P36
+    P28 --> P37["Phase 37 Tasks"]
+    P27 --> P37
+    P23 --> P38["Phase 38 Tasks"]
+    P37 --> P38
+    P36 --> P38
+    P35 --> P39["Phase 39 Tasks"]
+    P33 --> P39
+
+    %% Application phases
+    P14 --> P40["Phase 40 Tasks"]
+    P27 --> P40
+    P37 --> P40
+    P31 --> P41["Phase 41 Tasks"]
+    P41 --> P42["Phase 42 Tasks"]
+    P29 --> P42
+    P27 --> P42
+    P36 --> P42
+    P12 --> P43["Phase 43 Tasks"]
+    P24 --> P43
+    P31 --> P44["Phase 44 Tasks"]
+    P32 --> P44
+    P40 --> P44
+    P27 --> P45["Phase 45 Tasks"]
+    P30 --> P45
+    P24 --> P45
+    P34 --> P45
+    P38 --> P45
 ```
 
 ## Task Documents
@@ -89,7 +142,7 @@ flowchart TD
 | 9 | Framebuffer and shell | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
 | 10 *(optional)* | Secure Boot signing | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
 
-### POSIX and Userspace Phases
+### POSIX and Userspace Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -100,7 +153,7 @@ flowchart TD
 | 15 | Hardware discovery (ACPI + PCI) | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
 | 16 | Network stack | [Phase 16 Tasks](./16-network-tasks.md) |
 
-### Usability Phases
+### Usability Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -113,7 +166,7 @@ flowchart TD
 | 23 | Socket API (BSD sockets over TCP/UDP stack) | [Phase 23 Tasks](./23-socket-api-tasks.md) |
 | 24 | Persistent storage (virtio-blk, FAT32 r/w) | [Phase 24 Tasks](./24-persistent-storage-tasks.md) |
 
-### Advanced Phases
+### Advanced Phases (complete)
 
 | Phase | Focus | Task List |
 |---|---|---|
@@ -128,6 +181,31 @@ flowchart TD
 | Phase | Focus | Task List |
 |---|---|---|
 | 30 | Telnet server (remote shell access) | [Phase 30 Tasks](./30-telnet-server-tasks.md) |
+| 31 | Compiler bootstrap (TCC) | [Phase 31 Tasks](./31-compiler-bootstrap-tasks.md) |
+| 32 | Build tools (make, ar) | [Phase 32 Tasks](./32-build-tools-tasks.md) |
+
+### Kernel Infrastructure Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 33 | Kernel memory improvements (slab, OOM retry, munmap) | *not yet created* |
+| 34 | Real-time clock and timekeeping | *not yet created* |
+| 35 | True SMP multitasking (per-core dispatch, priorities) | *not yet created* |
+| 36 | I/O multiplexing (select, epoll, non-blocking) | *not yet created* |
+| 37 | Filesystem enhancements (symlinks, /proc, permissions) | *not yet created* |
+| 38 | Unix domain sockets (AF_UNIX) | *not yet created* |
+| 39 | Threading primitives (clone, futex, TLS) | *not yet created* |
+
+### Application Phases
+
+| Phase | Focus | Task List |
+|---|---|---|
+| 40 | Expanded coreutils (head, tail, sort, find, diff, ps) | *not yet created* |
+| 41 | Crypto primitives (SHA-256, Ed25519, ChaCha20) | *not yet created* |
+| 42 | SSH server (encrypted remote access) | *not yet created* |
+| 43 | Rust cross-compilation | *not yet created* |
+| 44 | Ports system (source-based package building) | *not yet created* |
+| 45 | System services (init, syslog, cron) | *not yet created* |
 
 ## Suggested Usage
 

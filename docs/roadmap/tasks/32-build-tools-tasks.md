@@ -154,7 +154,7 @@ Create and validate a multi-file C project that exercises `make` and the toolcha
 | Task | Description | Status |
 |---|---|---|
 | P32-T040 | Create `docs/32-build-tools.md`: document the build tools implementation. Cover: pdpmake porting process, how `make` uses file timestamps for incremental builds, the ar archive format, new utilities added, and shell scripting capabilities. Include the demo project as a worked example. | |
-| P32-T041 | Document how the implementation differs from production build systems: no GNU make extensions, no CMake/Meson/Ninja, no autoconf, no package manager, no dynamic linking, no `ld` standalone linker, no `nm`/`objdump` binary tools. Reference Phase 37 (Ports System) as the next step toward a full build ecosystem. | |
+| P32-T041 | Document how the implementation differs from production build systems: no GNU make extensions, no CMake/Meson/Ninja, no autoconf, no package manager, no dynamic linking, no `ld` standalone linker, no `nm`/`objdump` binary tools. Reference Phase 44 (Ports System) as the next step toward a full build ecosystem. | |
 | P32-T042 | Update `docs/08-roadmap.md` to mark Phase 32 as complete (when done). | |
 
 ---
@@ -169,7 +169,7 @@ These items are explicitly out of scope for Phase 32:
 - **`ld` as a standalone linker** — TCC has a built-in linker
 - **`nm`, `objdump`, `readelf`** — binary inspection tools, useful but not essential yet
 - **Dynamic linking and shared libraries** — all binaries are statically linked
-- **Package manager integration** — that's Phase 37 (Ports System)
+- **Package manager integration** — that's Phase 44 (Ports System)
 - **`ranlib`** — `ar s` can create the symbol index; ranlib is redundant with `ar rcs`
 
 ---
