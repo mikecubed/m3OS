@@ -1053,4 +1053,211 @@ mod tests {
     fn serial_output_works() {
         serial_println!("serial output from test");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 33 — Memory subsystem tests
+    // -----------------------------------------------------------------------
+
+    /// A.4: Verify the kernel heap grows automatically via the RetryAllocator
+    /// when the initial 4 MiB is exhausted.
+    #[test_case]
+    fn heap_grows_on_oom() {
+        use crate::mm::heap::{HEAP_INITIAL_SIZE, heap_stats};
+        use alloc::vec::Vec;
+
+        let before = heap_stats();
+        assert!(before.total_size >= HEAP_INITIAL_SIZE);
+
+        // Allocate a series of 256 KiB blocks to push past initial heap.
+        let block_size = 256 * 1024;
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        // Allocate enough to exceed the initial 4 MiB.
+        let target = HEAP_INITIAL_SIZE + (1024 * 1024); // 5 MiB
+        let mut total_allocated = 0usize;
+        while total_allocated < target {
+            let mut block = Vec::with_capacity(block_size);
+            // Touch the memory to ensure it's actually mapped.
+            block.resize(block_size, 0xAB);
+            assert_eq!(block[0], 0xAB);
+            assert_eq!(block[block_size - 1], 0xAB);
+            blocks.push(block);
+            total_allocated += block_size;
+        }
+
+        let after = heap_stats();
+        // Heap must have grown beyond initial size.
+        assert!(
+            after.total_size > HEAP_INITIAL_SIZE,
+            "heap did not grow: total_size={} initial={}",
+            after.total_size,
+            HEAP_INITIAL_SIZE
+        );
+        serial_println!(
+            "heap grew: {} KiB → {} KiB ({} allocs)",
+            before.total_size / 1024,
+            after.total_size / 1024,
+            after.alloc_count - before.alloc_count
+        );
+
+        // Drop all blocks — heap should have free space again.
+        drop(blocks);
+        let final_stats = heap_stats();
+        assert!(final_stats.free_bytes > 0);
+    }
+
+    /// B: Verify buddy allocator manages frames correctly — alloc and free
+    /// cycle doesn't leak.
+    #[test_case]
+    fn buddy_alloc_free_no_leak() {
+        use crate::mm::frame_allocator;
+
+        let before = frame_allocator::free_count();
+
+        // Allocate 16 frames.
+        let mut frames = alloc::vec::Vec::new();
+        for _ in 0..16 {
+            let frame = frame_allocator::allocate_frame().expect("frame alloc failed");
+            frames.push(frame.start_address().as_u64());
+        }
+
+        let during = frame_allocator::free_count();
+        assert!(
+            during <= before - 16,
+            "free count should have dropped by at least 16: before={} during={}",
+            before,
+            during
+        );
+
+        // Free all frames.
+        for phys in frames {
+            frame_allocator::free_frame(phys);
+        }
+
+        let after = frame_allocator::free_count();
+        assert_eq!(
+            after, before,
+            "frame leak: before={} after={}",
+            before, after
+        );
+    }
+
+    /// B.4: Verify contiguous multi-page allocation works.
+    #[test_case]
+    fn contiguous_alloc_works() {
+        use crate::mm::frame_allocator;
+
+        let before = frame_allocator::free_count();
+
+        // Allocate 4 contiguous pages (order 2).
+        let frame = frame_allocator::allocate_contiguous(2).expect("contiguous alloc failed");
+        let base = frame.start_address().as_u64();
+
+        // Verify alignment: base must be 16 KiB aligned (4 pages).
+        assert_eq!(
+            base % (4096 * 4),
+            0,
+            "contiguous block not properly aligned"
+        );
+
+        // Free and verify no leak.
+        frame_allocator::free_contiguous(base, 2);
+        let after = frame_allocator::free_count();
+        assert_eq!(
+            after, before,
+            "contiguous frame leak: before={} after={}",
+            before, after
+        );
+    }
+
+    /// C: Verify slab cache allocation and deallocation.
+    #[test_case]
+    fn slab_cache_alloc_free() {
+        let caches = crate::mm::slab::caches();
+        let mut fd_cache = caches.fd_cache.lock();
+
+        let stats_before = fd_cache.stats();
+        let mut page_counter = 0usize;
+
+        // Allocate 10 objects from the FD cache (64-byte slots).
+        let mut addrs = alloc::vec::Vec::new();
+        for _ in 0..10 {
+            let addr = fd_cache
+                .allocate(&mut || {
+                    // Page allocator callback: use frame allocator.
+                    let frame = crate::mm::frame_allocator::allocate_frame()?;
+                    page_counter += 1;
+                    Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
+                })
+                .expect("slab alloc failed");
+            addrs.push(addr);
+        }
+
+        let stats_during = fd_cache.stats();
+        assert_eq!(
+            stats_during.active_objects,
+            stats_before.active_objects + 10
+        );
+
+        // Free all objects.
+        for addr in addrs {
+            fd_cache.free(addr as usize);
+        }
+
+        let stats_after = fd_cache.stats();
+        assert_eq!(stats_after.active_objects, stats_before.active_objects);
+        serial_println!(
+            "slab test: allocated {} objects using {} page(s)",
+            10,
+            page_counter
+        );
+    }
+
+    /// F: Verify frame statistics are consistent.
+    #[test_case]
+    fn frame_stats_consistent() {
+        let stats = crate::mm::frame_allocator::frame_stats();
+
+        assert!(stats.total_frames > 0, "no frames reported");
+        assert_eq!(
+            stats.total_frames,
+            stats.free_frames + stats.allocated_frames,
+            "frame count mismatch: total={} free={} alloc={}",
+            stats.total_frames,
+            stats.free_frames,
+            stats.allocated_frames
+        );
+
+        // Per-order free counts should sum to the total free count.
+        let order_sum: usize = stats
+            .free_by_order
+            .iter()
+            .enumerate()
+            .map(|(order, &count)| count * (1 << order))
+            .sum();
+        assert_eq!(
+            order_sum, stats.free_frames,
+            "buddy order sum ({}) != free_frames ({})",
+            order_sum, stats.free_frames
+        );
+        serial_println!(
+            "frame stats: total={} free={} allocated={}",
+            stats.total_frames,
+            stats.free_frames,
+            stats.allocated_frames
+        );
+    }
+
+    /// F: Verify meminfo syscall returns non-empty data (heap stats).
+    #[test_case]
+    fn heap_stats_nonzero() {
+        let stats = crate::mm::heap::heap_stats();
+        assert!(stats.total_size > 0, "heap total_size is 0");
+        assert!(stats.alloc_count > 0, "no allocations recorded");
+        assert!(
+            stats.total_size >= stats.free_bytes,
+            "free > total: free={} total={}",
+            stats.free_bytes,
+            stats.total_size
+        );
+    }
 }
