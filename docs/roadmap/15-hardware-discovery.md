@@ -1,4 +1,10 @@
-# Phase 15 - Hardware Discovery
+# Phase 15 — Hardware Discovery
+
+**Status:** Complete
+**Source Ref:** phase-15
+**Depends on:** Phase 3 ✅
+**Builds on:** Interrupt handling and memory management from Phase 3, replacing the legacy PIC with APIC and adding ACPI/PCI hardware enumeration
+**Primary Components:** kernel/src/acpi/, kernel/src/pci/, kernel/src/arch/x86_64/ (APIC, IDT)
 
 ## Milestone Goal
 
@@ -21,6 +27,15 @@ flowchart TD
     Devices --> AHCI["future: AHCI/SATA"]
 ```
 
+## Why This Phase Exists
+
+The legacy 8259 PIC is a single-core interrupt controller that cannot route interrupts
+to multiple processors. To support SMP (symmetric multiprocessing) and to discover
+devices like network cards and disk controllers dynamically, the kernel must parse ACPI
+tables for hardware topology and switch to the APIC interrupt model. PCI enumeration
+is the standard mechanism for discovering what hardware is present, and it is required
+before any device driver (network, storage, GPU) can be initialized.
+
 ## Learning Goals
 
 - Understand how ACPI tables describe the hardware topology to the OS.
@@ -29,21 +44,62 @@ flowchart TD
 
 ## Feature Scope
 
-- **ACPI parsing**:
-  - walk RSDP → RSDT/XSDT → iterate SDTs
-  - parse MADT: extract Local APIC base, I/O APIC base, IRQ source overrides
-  - parse FADT: detect whether legacy PIC is present
-- **Local APIC initialization**:
-  - map the LAPIC MMIO registers
-  - configure the LAPIC timer for periodic preemption (replaces PIT-driven timer)
-  - send end-of-interrupt (EOI) through LAPIC instead of PIC
-- **I/O APIC initialization**:
-  - program IRQ redirection table entries for keyboard and serial
-  - disable legacy 8259 PIC
-- **PCI bus enumeration**:
-  - scan bus 0–255, device 0–31, function 0–7 via config space reads
-  - record vendor ID, device ID, class, BAR addresses, and IRQ line for each device
-  - expose the device list through a simple read-only kernel API
+### ACPI Parsing
+
+- walk RSDP → RSDT/XSDT → iterate SDTs
+- parse MADT: extract Local APIC base, I/O APIC base, IRQ source overrides
+- parse FADT: detect whether legacy PIC is present
+
+### Local APIC Initialization
+
+- map the LAPIC MMIO registers
+- configure the LAPIC timer for periodic preemption (replaces PIT-driven timer)
+- send end-of-interrupt (EOI) through LAPIC instead of PIC
+
+### I/O APIC Initialization
+
+- program IRQ redirection table entries for keyboard and serial
+- disable legacy 8259 PIC
+
+### PCI Bus Enumeration
+
+- scan bus 0-255, device 0-31, function 0-7 via config space reads
+- record vendor ID, device ID, class, BAR addresses, and IRQ line for each device
+- expose the device list through a simple read-only kernel API
+
+## Important Components and How They Work
+
+### ACPI Table Chain
+
+The UEFI firmware provides a pointer to the RSDP (Root System Description Pointer).
+The RSDP points to the RSDT or XSDT, which contains pointers to individual System
+Description Tables (SDTs). The MADT describes CPU and APIC topology; the FADT
+describes legacy hardware presence.
+
+### Local APIC
+
+Each CPU core has a Local APIC mapped at a fixed MMIO address. It provides a per-core
+timer (used for preemptive scheduling) and inter-processor interrupts (IPIs). EOI is
+acknowledged by writing to the LAPIC EOI register rather than the legacy PIC.
+
+### I/O APIC
+
+The I/O APIC replaces the 8259 PIC for routing external interrupts (keyboard, serial,
+disk) to specific CPU cores. Its redirection table entries specify which core receives
+each interrupt and with what vector number.
+
+### PCI Configuration Space
+
+Each PCI device exposes a 256-byte configuration space accessible via port I/O
+(address port 0xCF8, data port 0xCFC). The scan loop iterates all bus/device/function
+combinations, reading vendor ID to detect present devices, then recording class code,
+BAR addresses, and interrupt line for later use by device drivers.
+
+## How This Builds on Earlier Phases
+
+- **Replaces Phase 3 (Interrupts):** switches from the legacy 8259 PIC to the APIC interrupt model
+- **Extends Phase 3 (Memory Management):** LAPIC MMIO pages must be identity-mapped using the page table infrastructure
+- **Enables future phases:** PCI device list is consumed by Phase 16 (Network) for virtio-net and by Phase 8's block driver for virtio-blk
 
 ## Implementation Outline
 
@@ -68,14 +124,6 @@ flowchart TD
 ## Companion Task List
 
 - [Phase 15 Task List](./tasks/15-hardware-discovery-tasks.md)
-
-## Documentation Deliverables
-
-- explain the ACPI table chain: RSDP → RSDT/XSDT → individual SDTs
-- document the MADT structure and what each entry type means
-- explain the Local APIC vs. I/O APIC split and which handles what
-- document PCI config space layout and how the scan loop works
-- explain why the legacy PIC cannot be used on multi-core systems
 
 ## How Real OS Implementations Differ
 

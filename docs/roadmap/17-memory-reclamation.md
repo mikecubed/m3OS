@@ -1,4 +1,10 @@
-# Phase 17 - Memory Reclamation
+# Phase 17 — Memory Reclamation
+
+**Status:** Complete
+**Source Ref:** phase-17
+**Depends on:** Phase 11 ✅, Phase 14 ✅
+**Builds on:** Replaces the bump frame allocator from Phase 2; extends the page table and process model from Phases 11/14
+**Primary Components:** kernel/src/mm/frame_allocator.rs, kernel/src/mm/mod.rs, kernel/src/task/, kernel/src/process/
 
 ## Milestone Goal
 
@@ -27,6 +33,17 @@ flowchart TD
 
     classDef fixed fill:#d4edda,stroke:#28a745
 ```
+
+## Why This Phase Exists
+
+Since Phase 2, the bump frame allocator has been unable to reclaim freed frames,
+causing a steady leak of physical memory every time a process exits. Kernel stacks
+accumulate indefinitely, the heap cannot grow past its initial 1 MiB, and every
+`fork` duplicates all physical pages even when neither process writes to them. These
+problems compound as process churn increases: without reclamation, the system
+eventually exhausts physical memory. This phase replaces the leaking allocator with
+one that can give frames back, adds reference counting for copy-on-write sharing, and
+ensures that all process-associated memory is properly freed on exit.
 
 ## Learning Goals
 
@@ -57,6 +74,49 @@ flowchart TD
 - **Frame reference counting**: a global `RefCount` table indexed by physical frame
   number; incremented on CoW fork, decremented on unmap; frame is freed only when
   the count reaches zero
+
+## Important Components and How They Work
+
+### Free-List Frame Allocator
+
+Each free frame stores a pointer to the next free frame in its first 8 bytes, forming
+an intrusive linked list. The list is initialized by walking the bootloader memory map
+and pushing every usable frame. A free count is tracked for diagnostics. The allocator
+is `Send + Sync` behind a `spin::Mutex` and exposes the same `FrameAllocator` trait
+interface as the old bump allocator.
+
+### Frame Reference Counting
+
+A `RefCount` table (`Vec<AtomicU16>` or equivalent) sized to the highest physical
+frame number. Incremented on `alloc_frame`, incremented again on CoW clone, decremented
+on `free_frame`. Frames are only reclaimed when the count reaches zero. Double-free
+detection uses a poisoned magic value written to the first 8 bytes of each free frame.
+
+### Copy-on-Write Fork
+
+On `fork`, every user PTE in both parent and child is marked read-only and the frame's
+reference count is incremented. A page fault on a CoW page (present, not writable,
+refcount > 1) allocates a fresh frame, copies the 4 KiB contents, and maps the new
+frame writable. If refcount is exactly 1, the page is simply remapped writable without
+copying.
+
+### Growable Kernel Heap
+
+A large virtual region (e.g., 64 MiB starting at `HEAP_START`) is reserved but only
+the initial 1 MiB is mapped. When the linked-list allocator returns `None`, the next
+1 MiB chunk is mapped, `allocator.extend()` is called, and the allocation retried.
+Growth is capped at the reserved region size.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 2**: replaces the bump frame allocator with a free-list allocator
+  that supports reclamation
+- **Extends Phase 11**: adds page table teardown and kernel stack freeing to the
+  process exit path introduced in Phase 11
+- **Extends Phase 14**: converts the eager full-copy fork from Phase 14 into
+  copy-on-write fork with reference counting
+- **Reuses Phase 3**: the kernel heap from Phase 3 is made growable rather than
+  fixed-size
 
 ## Implementation Outline
 
@@ -119,35 +179,26 @@ flowchart TD
 
 - [Phase 17 Task List](./tasks/17-memory-reclamation-tasks.md)
 
-## Documentation Deliverables
-
-- explain the free-list frame allocator: data structure, alloc path, free path,
-  initialization from the memory map
-- document the frame reference counting scheme and how it interacts with CoW
-- explain copy-on-write fork step by step: marking pages, handling the fault, copying
-  the frame
-- document the heap growth strategy: reserved virtual region, incremental mapping,
-  allocator extension
-- explain what kernel stack leaking looked like and how `drain_dead()` fixes it
-
 ## How Real OS Implementations Differ
 
-Production kernels use buddy allocators (Linux's page allocator splits and coalesces
-power-of-two blocks) or slab allocators on top of page allocators for small objects.
-Reference counting in Linux is done with `struct page` metadata rather than a
-separate table. CoW is also used for `mmap(MAP_PRIVATE)` and file-backed pages, not
-just fork. The kernel heap in Linux is not a single contiguous region; `vmalloc`
-allocates from a scattered virtual range while `kmalloc` uses slab caches backed by
-physically contiguous pages. This phase keeps things simple: one free list, one
-reference count table, one contiguous heap region.
+- Production kernels use buddy allocators (Linux's page allocator splits and coalesces
+  power-of-two blocks) or slab allocators on top of page allocators for small objects.
+- Reference counting in Linux is done with `struct page` metadata rather than a
+  separate table.
+- CoW is also used for `mmap(MAP_PRIVATE)` and file-backed pages, not just fork.
+- The kernel heap in Linux is not a single contiguous region; `vmalloc` allocates from
+  a scattered virtual range while `kmalloc` uses slab caches backed by physically
+  contiguous pages.
+- This phase keeps things simple: one free list, one reference count table, one
+  contiguous heap region.
 
 ## Deferred Until Later
 
-- buddy allocator with power-of-two coalescing
-- slab or SLUB allocator for small kernel objects
-- demand paging from disk (swap)
-- huge page (2 MiB / 1 GiB) support
+- Buddy allocator with power-of-two coalescing
+- Slab or SLUB allocator for small kernel objects
+- Demand paging from disk (swap)
+- Huge page (2 MiB / 1 GiB) support
 - NUMA-aware frame allocation
 - `mmap(MAP_PRIVATE)` with CoW semantics for file-backed pages
-- kernel stack guard pages
-- memory pressure notifications and OOM killer
+- Kernel stack guard pages
+- Memory pressure notifications and OOM killer

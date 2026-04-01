@@ -1,4 +1,10 @@
-# Phase 14 - Shell and Userspace Tools
+# Phase 14 — Shell and Userspace Tools
+
+**Status:** Complete
+**Source Ref:** phase-14
+**Depends on:** Phase 12 ✅, Phase 13 ✅
+**Builds on:** POSIX compatibility layer from Phase 12 and writable filesystem from Phase 13, enabling a full interactive shell with pipes, redirection, and compiled C utilities
+**Primary Components:** userspace/shell/, userspace/coreutils/, kernel/src/pipe.rs, kernel/src/signal.rs, kernel/src/process/
 
 ## Milestone Goal
 
@@ -16,6 +22,14 @@ flowchart LR
     Shell -->|"fork+exec"| Utils["ls / cat / cp\necho / rm / mkdir"]
 ```
 
+## Why This Phase Exists
+
+A bare process model and syscall layer are not useful without an interactive way to
+launch programs, compose them, and inspect results. Pipes and I/O redirection are the
+fundamental composition mechanisms of Unix — they turn individual utilities into a
+programmable system. Without them, each program is an island. This phase bridges the
+gap between "the kernel can run programs" and "a user can do real work."
+
 ## Learning Goals
 
 - Understand how a shell implements pipes using file descriptors and `fork`.
@@ -24,17 +38,64 @@ flowchart LR
 
 ## Feature Scope
 
-- **Pipes**: `cmd1 | cmd2` — connect stdout of one child to stdin of the next
-- **I/O redirection**: `cmd > file`, `cmd < file`, `cmd >> file`
-- **Job control**:
-  - `Ctrl-C` sends SIGINT to the foreground job
-  - `Ctrl-Z` suspends it (SIGTSTP)
-  - `fg` and `bg` built-ins
-- **Environment variables**: `export KEY=val`, `$KEY` expansion, passed to children
-  via `execve` `envp`
-- **Core utilities** (compiled as separate ELF binaries):
-  `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `echo`, `pwd`, `cd`, `env`, `true`, `false`
-- Shell built-ins: `exit`, `cd`, `export`, `unset`, `help`
+### Pipes
+
+`cmd1 | cmd2` — connect stdout of one child to stdin of the next.
+
+### I/O Redirection
+
+`cmd > file`, `cmd < file`, `cmd >> file`.
+
+### Job Control
+
+- `Ctrl-C` sends SIGINT to the foreground job
+- `Ctrl-Z` suspends it (SIGTSTP)
+- `fg` and `bg` built-ins
+
+### Environment Variables
+
+`export KEY=val`, `$KEY` expansion, passed to children via `execve` `envp`.
+
+### Core Utilities
+
+Compiled as separate ELF binaries:
+`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `echo`, `pwd`, `cd`, `env`, `true`, `false`
+
+### Shell Built-ins
+
+`exit`, `cd`, `export`, `unset`, `help`
+
+## Important Components and How They Work
+
+### File Descriptor Table
+
+Each process has a file descriptor table: integers mapping to open file descriptions.
+This is the foundation for pipes and redirection — `dup2` redirects one fd to another
+before `execve`.
+
+### Kernel Pipe Buffer
+
+The `pipe` syscall allocates a kernel-side buffer and returns two file descriptors
+(read end and write end). Data written to the write end is buffered until read from
+the read end, implementing producer/consumer communication between processes.
+
+### Signal Infrastructure
+
+`SIGINT`, `SIGTSTP`, `SIGCONT`, and `SIGCHLD` are implemented at minimum. The keyboard
+server delivers `Ctrl-C` and `Ctrl-Z` to the foreground process group. Process groups
+allow the shell to address foreground and background jobs separately.
+
+### Shell Parser
+
+Extended to handle `|`, `>`, `<`, `>>`, `&`, and variable expansion. The shell uses
+`fork` + `dup2` + `execve` to set up each pipeline stage.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 9 (Shell):** upgrades the minimal shell with pipes, redirection, job control, and environment variables
+- **Extends Phase 12 (POSIX Compat):** utilities are compiled C programs that run through the POSIX syscall layer
+- **Extends Phase 13 (Writable FS):** redirection creates and writes files; utilities operate on the writable filesystem
+- **Extends Phase 11 (Process Model):** pipes and job control build on fork, exec, wait, and the process table
 
 ## Implementation Outline
 
@@ -61,13 +122,6 @@ flowchart LR
 ## Companion Task List
 
 - [Phase 14 Task List](./tasks/14-shell-and-tools-tasks.md)
-
-## Documentation Deliverables
-
-- explain how pipes work: kernel buffer, two file descriptors, producer/consumer
-- document how the shell uses `fork` + `dup2` + `execve` to set up a pipeline stage
-- explain process groups and how the terminal's foreground group determines signal delivery
-- document the `execve` `envp` layout and how environment variables propagate
 
 ## How Real OS Implementations Differ
 

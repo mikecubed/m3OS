@@ -1,4 +1,10 @@
-# Phase 18 - Directory and VFS
+# Phase 18 — Directory and VFS
+
+**Status:** Complete
+**Source Ref:** phase-18
+**Depends on:** Phase 13 ✅, Phase 17 ✅
+**Builds on:** Extends the flat ramdisk and tmpfs from Phase 13; uses the reclaiming frame allocator from Phase 17
+**Primary Components:** kernel/src/fs/, kernel/src/process/mod.rs, xtask/
 
 ## Milestone Goal
 
@@ -26,6 +32,16 @@ flowchart TD
     Shell -->|"openat(dirfd, name, ...)"| OpenAt["sys_openat"]
     OpenAt --> Resolve
 ```
+
+## Why This Phase Exists
+
+Without directory support, the filesystem is a flat list of files with no hierarchy.
+Every process believes its working directory is `/`, relative paths cannot work, and
+there is no way to list directory contents programmatically. This makes it impossible
+to organize binaries under `/bin`, configuration under `/etc`, or temporary files
+under `/tmp` in a way that userspace can discover and navigate. A working VFS with
+directories, per-process `cwd`, and `getdents64` is a prerequisite for any realistic
+shell experience and for the POSIX filesystem semantics that later phases depend on.
 
 ## Learning Goals
 
@@ -57,6 +73,52 @@ flowchart TD
   performing the filesystem lookup
 - **`openat`**: accept a directory fd as the base for relative path resolution; the
   special value `AT_FDCWD` uses the process `cwd`
+
+## Important Components and How They Work
+
+### Per-Process Working Directory
+
+Each `Process` struct contains a `cwd: String` field initialized to `"/"` for the
+init process. On `fork`, the child inherits a copy. `sys_chdir` validates that the
+target path exists and is a directory before storing the resolved absolute path.
+`sys_getcwd` copies the string into the userspace buffer.
+
+### Path Resolution
+
+A `resolve_path(cwd, relative)` function joins a relative path against the current
+working directory, normalizes `.` and `..` components, and returns an absolute path.
+This function is called at the top of every path-accepting syscall (`open`, `stat`,
+`unlink`, `mkdir`, `chdir`).
+
+### Directory File Descriptors
+
+When `sys_open` targets a directory (or `O_DIRECTORY` is set), an fd is allocated
+whose backing object is a directory handle rather than a file handle. `ENOTDIR` is
+returned if `O_DIRECTORY` is set but the target is not a directory.
+
+### `getdents64` Serialization
+
+Directory entries are serialized into the userspace buffer in the `linux_dirent64`
+layout (inode number, offset, record length, type, name). Partial reads are handled
+when the buffer is too small, resuming on the next call using an offset stored in the
+fd.
+
+### Ramdisk Tree Structure
+
+The flat `Vec<(name, data)>` ramdisk is replaced with a tree of directory and file
+nodes. Each directory node holds a `Vec` of children. The xtask image builder places
+files under their directory paths (e.g., `/bin/shell`, `/etc/motd`).
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 13**: transforms the flat ramdisk and tmpfs from Phase 13 into
+  hierarchical directory trees with proper `getdents64` support
+- **Extends Phase 14**: adds per-process `cwd` to the process struct, inherited on
+  `fork`
+- **Reuses Phase 17**: benefits from the reclaiming frame allocator for page table
+  and directory node allocations
+- **Extends xtask**: the image builder is updated to produce a directory tree layout
+  in the ramdisk
 
 ## Implementation Outline
 
@@ -114,37 +176,27 @@ flowchart TD
 
 - [Phase 18 Task List](./tasks/18-directory-vfs-tasks.md)
 
-## Documentation Deliverables
-
-- explain the per-process `cwd` field: where it is stored, how `fork` copies it, how
-  `chdir` updates it
-- document the path resolution algorithm: joining, normalization of `.` and `..`,
-  absolute vs. relative
-- explain the `linux_dirent64` layout and how `getdents64` serializes entries into a
-  userspace buffer
-- document the ramdisk tree structure and how the xtask image builder populates it
-- explain the difference between a directory fd and a regular file fd in the fd table
-- document `openat` and `AT_FDCWD` semantics
-
 ## How Real OS Implementations Differ
 
-Production kernels represent directories as in-kernel dentry caches backed by inodes
-on disk. Path resolution walks a dentry tree with mount-point crossing, symlink
-following (with loop detection), and permission checks at every component. The VFS
-layer in Linux is a ~30,000-line abstraction that lets dozens of filesystem drivers
-plug in behind the same interface. `getdents64` in Linux reads from the page cache
-and handles concurrent modification via sequence locks. This phase does the simplest
-correct thing: a `cwd` string, string-based path joins, and direct iteration over
-in-memory data structures with no caching layer.
+- Production kernels represent directories as in-kernel dentry caches backed by inodes
+  on disk.
+- Path resolution walks a dentry tree with mount-point crossing, symlink following
+  (with loop detection), and permission checks at every component.
+- The VFS layer in Linux is a ~30,000-line abstraction that lets dozens of filesystem
+  drivers plug in behind the same interface.
+- `getdents64` in Linux reads from the page cache and handles concurrent modification
+  via sequence locks.
+- This phase does the simplest correct thing: a `cwd` string, string-based path joins,
+  and direct iteration over in-memory data structures with no caching layer.
 
 ## Deferred Until Later
 
-- full VFS abstraction layer with pluggable filesystem drivers
-- mount points and `mount` / `umount` syscalls
-- symbolic links and `readlink`
-- hard links and link counts
-- inode numbers (currently synthesized or zero)
-- permission bits and `chmod` / `chown`
+- Full VFS abstraction layer with pluggable filesystem drivers
+- Mount points and `mount` / `umount` syscalls
+- Symbolic links and `readlink`
+- Hard links and link counts
+- Inode numbers (currently synthesized or zero)
+- Permission bits and `chmod` / `chown`
 - `..` across mount boundaries
 - `fstat` / `fstatat` for directory fds
 - `renameat2` and cross-directory rename

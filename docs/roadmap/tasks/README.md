@@ -68,11 +68,10 @@ flowchart TD
     P15 --> P24
     P17 --> P25["Phase 25 Tasks"]
     P4 --> P25
-    P20 --> P26["Phase 26 Tasks"]
-    P24 --> P26
 
     %% Productivity phases
-    P22 --> P26
+    P22 --> P26["Phase 26 Tasks"]
+    P24 --> P26
     P12 --> P27["Phase 27 Tasks"]
     P24 --> P27
     P27 --> P28["Phase 28 Tasks"]
@@ -137,101 +136,97 @@ flowchart TD
 
 ### Foundation Phases (complete)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 1 | Boot foundation | [Phase 1 Tasks](./01-boot-foundation-tasks.md) |
-| 2 | Memory basics | [Phase 2 Tasks](./02-memory-basics-tasks.md) |
-| 3 | Interrupts | [Phase 3 Tasks](./03-interrupts-tasks.md) |
-| 4 | Tasking | [Phase 4 Tasks](./04-tasking-tasks.md) |
-| 5 | Userspace entry | [Phase 5 Tasks](./05-userspace-entry-tasks.md) |
-| 6 | IPC core | [Phase 6 Tasks](./06-ipc-core-tasks.md) |
-| 7 | Core servers | [Phase 7 Tasks](./07-core-servers-tasks.md) |
-| 8 | Storage and VFS | [Phase 8 Tasks](./08-storage-and-vfs-tasks.md) |
-| 9 | Framebuffer and shell | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
-| 10 *(optional)* | Secure Boot signing | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 1 | Boot foundation | Complete | `phase-01` | [Phase 1 Tasks](./01-boot-foundation-tasks.md) |
+| 2 | Memory basics | Complete | `phase-02` | [Phase 2 Tasks](./02-memory-basics-tasks.md) |
+| 3 | Interrupts | Complete | `phase-03` | [Phase 3 Tasks](./03-interrupts-tasks.md) |
+| 4 | Tasking | Complete | `phase-04` | [Phase 4 Tasks](./04-tasking-tasks.md) |
+| 5 | Userspace entry | Complete | `phase-05` | [Phase 5 Tasks](./05-userspace-entry-tasks.md) |
+| 6 | IPC core | Complete | `phase-06` | [Phase 6 Tasks](./06-ipc-core-tasks.md) |
+| 7 | Core servers | Complete | `phase-07` | [Phase 7 Tasks](./07-core-servers-tasks.md) |
+| 8 | Storage and VFS | Complete | `phase-08` | [Phase 8 Tasks](./08-storage-and-vfs-tasks.md) |
+| 9 | Framebuffer and shell | Complete | `phase-09` | [Phase 9 Tasks](./09-framebuffer-and-shell-tasks.md) |
+| 10 *(optional)* | Secure Boot signing | Complete | `phase-10` | [Phase 10 Tasks](./10-secure-boot-tasks.md) |
 
 ### POSIX and Userspace Phases (complete)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 11 | ELF loader and process model | [Phase 11 Tasks](./11-process-model-tasks.md) |
-| 12 | POSIX compatibility layer | [Phase 12 Tasks](./12-posix-compat-tasks.md) |
-| 13 | Writable filesystem | [Phase 13 Tasks](./13-writable-fs-tasks.md) |
-| 14 | Shell and userspace tools | [Phase 14 Tasks](./14-shell-and-tools-tasks.md) |
-| 15 | Hardware discovery (ACPI + PCI) | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
-| 16 | Network stack | [Phase 16 Tasks](./16-network-tasks.md) |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 11 | ELF loader and process model | Complete | `phase-11` | [Phase 11 Tasks](./11-process-model-tasks.md) |
+| 12 | POSIX compatibility layer | Complete | `phase-12` | [Phase 12 Tasks](./12-posix-compat-tasks.md) |
+| 13 | Writable filesystem | Complete | `phase-13` | [Phase 13 Tasks](./13-writable-fs-tasks.md) |
+| 14 | Shell and userspace tools | Complete | `phase-14` | [Phase 14 Tasks](./14-shell-and-tools-tasks.md) |
+| 15 | Hardware discovery (ACPI + PCI) | Complete | `phase-15` | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
+| 16 | Network stack | Complete | `phase-16` | [Phase 16 Tasks](./16-network-tasks.md) |
 
 ### Usability Phases (complete)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 17 | Memory reclamation (free-list, CoW fork, heap growth) | [Phase 17 Tasks](./17-memory-reclamation-tasks.md) |
-| 18 | Directory and VFS (`getdents64`, real cwd) | [Phase 18 Tasks](./18-directory-vfs-tasks.md) |
-| 19 | Signal handlers (trampolines, `sigreturn`) | [Phase 19 Tasks](./19-signal-handlers-tasks.md) |
-| 20 | Userspace init and shell (ring-3 PID 1) | [Phase 20 Tasks](./20-userspace-init-shell-tasks.md) |
-| 21 | Ion shell integration (ion replaces custom shell) | [Phase 21 Tasks](./21-ion-shell-tasks.md) |
-| 22 | TTY and terminal control (termios, PTY) | [Phase 22 Tasks](./22-tty-pty-tasks.md) |
-| 23 | Socket API (BSD sockets over TCP/UDP stack) | [Phase 23 Tasks](./23-socket-api-tasks.md) |
-| 24 | Persistent storage (virtio-blk, FAT32 r/w) | [Phase 24 Tasks](./24-persistent-storage-tasks.md) |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 17 | Memory reclamation (free-list, CoW fork, heap growth) | Complete | `phase-17` | [Phase 17 Tasks](./17-memory-reclamation-tasks.md) |
+| 18 | Directory and VFS (`getdents64`, real cwd) | Complete | `phase-18` | [Phase 18 Tasks](./18-directory-vfs-tasks.md) |
+| 19 | Signal handlers (trampolines, `sigreturn`) | Complete | `phase-19` | [Phase 19 Tasks](./19-signal-handlers-tasks.md) |
+| 20 | Userspace init and shell (ring-3 PID 1) | Complete | `phase-20` | [Phase 20 Tasks](./20-userspace-init-shell-tasks.md) |
+| 21 | Ion shell integration (ion replaces custom shell) | Complete | `phase-21` | [Phase 21 Tasks](./21-ion-shell-tasks.md) |
+| 22 | TTY and terminal control (termios, PTY) | Complete | `phase-22` | [Phase 22 Tasks](./22-tty-pty-tasks.md) |
+| 22b | ANSI escape sequences | Complete | `phase-22b` | [Phase 22b Tasks](./22b-ansi-escape-tasks.md) |
+| 23 | Socket API (BSD sockets over TCP/UDP stack) | Complete | `phase-23` | [Phase 23 Tasks](./23-socket-api-tasks.md) |
+| 24 | Persistent storage (virtio-blk, FAT32 r/w) | Complete | `phase-24` | [Phase 24 Tasks](./24-persistent-storage-tasks.md) |
+| 25 | SMP (AP startup, per-core scheduler, TLB shootdown) | Complete | `phase-25` | [Phase 25 Tasks](./25-smp-tasks.md) |
 
-### Advanced Phases (complete)
+### Productivity Phases (complete)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 25 | SMP (AP startup, per-core scheduler, TLB shootdown) | [Phase 25 Tasks](./25-smp-tasks.md) |
-| 26 | Text editor (kibi-style full-screen editor) | [Phase 26 Tasks](./26-text-editor-tasks.md) |
-| 27 | User accounts (login, passwd, multi-user) | [Phase 27 Tasks](./27-user-accounts-tasks.md) |
-| 28 | ext2 filesystem (persistent storage) | [Phase 28 Tasks](./28-ext2-filesystem-tasks.md) |
-| 29 | PTY subsystem (pseudo-terminal pairs) | [Phase 29 Tasks](./29-pty-subsystem-tasks.md) |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 26 | Text editor (kibi-style full-screen editor) | Complete | `phase-26` | [Phase 26 Tasks](./26-text-editor-tasks.md) |
+| 27 | User accounts (login, passwd, multi-user) | Complete | `phase-27` | [Phase 27 Tasks](./27-user-accounts-tasks.md) |
+| 28 | ext2 filesystem (persistent storage) | Complete | `phase-28` | [Phase 28 Tasks](./28-ext2-filesystem-tasks.md) |
+| 29 | PTY subsystem (pseudo-terminal pairs) | Complete | `phase-29` | [Phase 29 Tasks](./29-pty-subsystem-tasks.md) |
+| 30 | Telnet server (remote shell access) | Complete | `phase-30` | [Phase 30 Tasks](./30-telnet-server-tasks.md) |
+| 31 | Compiler bootstrap (TCC) | Complete | `phase-31` | [Phase 31 Tasks](./31-compiler-bootstrap-tasks.md) |
+| 32 | Build tools (make, ar) | Complete | `phase-32` | [Phase 32 Tasks](./32-build-tools-tasks.md) |
 
-### Productivity Phases
+### Kernel Infrastructure Phases (phases 33-34 complete)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 30 | Telnet server (remote shell access) | [Phase 30 Tasks](./30-telnet-server-tasks.md) |
-| 31 | Compiler bootstrap (TCC) | [Phase 31 Tasks](./31-compiler-bootstrap-tasks.md) |
-| 32 | Build tools (make, ar) | [Phase 32 Tasks](./32-build-tools-tasks.md) |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 33 | Kernel memory improvements (slab, OOM retry, munmap) | Complete | `phase-33` | [Phase 33 Tasks](./33-kernel-memory-tasks.md) |
+| 34 | Real-time clock and timekeeping | Complete | `phase-34` | [Phase 34 Tasks](./34-real-time-clock-tasks.md) |
+| 35 | True SMP multitasking (per-core dispatch, priorities) | Planned | `phase-35` | *not yet created* |
+| 36 | Expanded memory (demand paging, mprotect, disk/RAM) | Planned | `phase-36` | *not yet created* |
+| 37 | I/O multiplexing (select, epoll, non-blocking) | Planned | `phase-37` | *not yet created* |
+| 38 | Filesystem enhancements (symlinks, /proc, permissions) | Planned | `phase-38` | *not yet created* |
+| 39 | Unix domain sockets (AF_UNIX) | Planned | `phase-39` | *not yet created* |
+| 40 | Threading primitives (clone, futex, TLS) | Planned | `phase-40` | *not yet created* |
 
-### Kernel Infrastructure Phases
+### Application Phases (planned)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 33 | Kernel memory improvements (slab, OOM retry, munmap) | [Phase 33 Tasks](./33-kernel-memory-tasks.md) |
-| 34 | Real-time clock and timekeeping | *not yet created* |
-| 35 | True SMP multitasking (per-core dispatch, priorities) | *not yet created* |
-| 36 | Expanded memory (demand paging, mprotect, disk/RAM) | *not yet created* |
-| 37 | I/O multiplexing (select, epoll, non-blocking) | *not yet created* |
-| 38 | Filesystem enhancements (symlinks, /proc, permissions) | *not yet created* |
-| 39 | Unix domain sockets (AF_UNIX) | *not yet created* |
-| 40 | Threading primitives (clone, futex, TLS) | *not yet created* |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | Planned | `phase-41` | *not yet created* |
+| 42 | Crypto and TLS (RustCrypto + rustls) | Planned | `phase-42` | *not yet created* |
+| 43 | SSH (sunset or Dropbear) | Planned | `phase-43` | *not yet created* |
+| 44 | Rust cross-compilation | Planned | `phase-44` | *not yet created* |
+| 45 | Ports system (source-based package building) | Planned | `phase-45` | *not yet created* |
+| 46 | System services (init, syslog, cron) | Planned | `phase-46` | *not yet created* |
 
-### Application Phases
+### Showcase Phases (planned)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | *not yet created* |
-| 42 | Crypto and TLS (RustCrypto + rustls) | *not yet created* |
-| 43 | SSH (sunset or Dropbear) | *not yet created* |
-| 44 | Rust cross-compilation | *not yet created* |
-| 45 | Ports system (source-based package building) | *not yet created* |
-| 46 | System services (init, syslog, cron) | *not yet created* |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 47 | DOOM (framebuffer, raw input, doomgeneric port) | Planned | `phase-47` | *not yet created* |
+| 48 | Mouse input (PS/2 mouse driver) | Planned | `phase-48` | *not yet created* |
+| 49 | Audio output (HDA/AC97 sound card driver) | Planned | `phase-49` | *not yet created* |
 
-### Showcase Phases
+### Cross-Compiled Runtimes (planned)
 
-| Phase | Focus | Task List |
-|---|---|---|
-| 47 | DOOM (framebuffer, raw input, doomgeneric port) | *not yet created* |
-| 48 | Mouse input (PS/2 mouse driver) | *not yet created* |
-| 49 | Audio output (HDA/AC97 sound card driver) | *not yet created* |
-
-### Cross-Compiled Runtimes
-
-| Phase | Focus | Task List |
-|---|---|---|
-| 50 | Cross-compiled toolchains (git, Python, Clang) | *not yet created* |
-| 51 | Networking and GitHub (gh, git HTTPS, DNS) | *not yet created* |
-| 52 | Node.js (V8 + libuv runtime) | *not yet created* |
-| 53 | Claude Code (AI agent on m3OS) | *not yet created* |
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 50 | Cross-compiled toolchains (git, Python, Clang) | Planned | `phase-50` | *not yet created* |
+| 51 | Networking and GitHub (gh, git HTTPS, DNS) | Planned | `phase-51` | *not yet created* |
+| 52 | Node.js (V8 + libuv runtime) | Planned | `phase-52` | *not yet created* |
+| 53 | Claude Code (AI agent on m3OS) | Planned | `phase-53` | *not yet created* |
 
 ## Suggested Usage
 

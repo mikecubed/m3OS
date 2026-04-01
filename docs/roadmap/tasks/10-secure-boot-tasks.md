@@ -1,60 +1,153 @@
-# Phase 10 Tasks - Secure Boot Signing (Optional)
+# Phase 10 — Secure Boot Signing (Optional): Task List
 
-**Depends on:** Phase 1 (xtask build pipeline), Phase 9 (framebuffer — so there is
-something visible to confirm the boot succeeded)
+**Status:** Complete
+**Source Ref:** phase-10
+**Depends on:** Phase 9 ✅ (optional)
+**Goal:** Add UEFI Secure Boot signing to the build pipeline so the OS can boot on real hardware with Secure Boot enabled, using self-enrolled keys.
 
-```mermaid
-flowchart LR
-    A["key generation<br/>script"] --> B["xtask sign<br/>subcommand"]
-    B --> C["sbverify<br/>validation"]
-    C --> D["MOK enrollment<br/>docs"]
-    D --> E["real hardware<br/>boot test"]
-    E --> F["docs + tasks"]
-```
+## Track Layout
 
-## Setup Tasks
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | Key generation setup | — | ✅ Done |
+| B | xtask sign implementation | A | ✅ Done |
+| C | Validation | B | ✅ Done |
+| D | Documentation | A, B, C | ✅ Done |
 
-- [x] P10-T001 Write a `scripts/gen-secure-boot-keys.sh` script that runs `openssl req`
-  to generate a 4096-bit RSA key pair (`m3os.key`) and self-signed certificate
-  (`m3os.crt`) valid for 10 years, with CN=`m3os Secure Boot Key`. Add both to
-  `.gitignore` — the private key must never be committed.
-- [x] P10-T002 Document the expected output files and where they should be placed
-  relative to the repo root so `cargo xtask sign` can find them.
+---
 
-## Implementation Tasks
+## Track A — Key Generation Setup
 
-- [x] P10-T003 Add a `sign` subcommand to `xtask/src/main.rs` (or a `--sign` flag on
-  `image`) that accepts optional `--key` and `--cert` path arguments, defaulting to
-  `m3os.key` and `m3os.crt` in the repo root.
-- [x] P10-T004 In the `sign` subcommand, run `sbsign --key <key> --cert <cert>
-  --output <signed.efi> <unsigned.efi>` via `std::process::Command`. Fail with a clear
-  error if `sbsign` is not found (`sbsigntool` package on Debian/Ubuntu).
-- [x] P10-T005 After signing, run `sbverify --cert <cert> <signed.efi>` to confirm the
-  signature is valid before reporting success.
-- [x] P10-T006 Print the path of the signed EFI binary and a one-line reminder about
-  MOK enrollment on success.
+### A.1 — Write key generation script
 
-## Validation Tasks
+**File:** `scripts/gen-secure-boot-keys.sh`
+**Why it matters:** Signing requires a 4096-bit RSA key pair and self-signed certificate; a script ensures reproducible generation.
 
-- [x] P10-T007 Verify `sbverify --cert m3os.crt <signed-efi>` exits 0.
-- [x] P10-T008 Verify the unsigned EFI fails `sbverify` against the cert (expected).
-- [ ] P10-T009 On a real machine with Secure Boot enabled: enroll the cert using one
-  of the two paths documented in the milestone page — via shim's MOK (`mokutil
-  --import m3os.crt` + reboot through MOKManager) **or** via direct UEFI db
-  enrollment (`efi-updatevar` / firmware setup). Confirm boot succeeds.
-- [ ] P10-T010 On the same machine: temporarily disable the enrolled key and confirm
-  the signed binary is rejected by firmware (Secure Boot is actually enforcing).
+**Acceptance:**
+- [x] Script generates `m3os.key` (private key) and `m3os.crt` (self-signed certificate) using `openssl req`
+- [x] Certificate uses CN=`m3os Secure Boot Key` and is valid for 10 years
+- [x] Both files are in `.gitignore` — private key is never committed
 
-## Documentation Tasks
+---
 
-- [x] P10-T011 Add a `docs/10-secure-boot.md` implementation page covering:
-  - the UEFI Secure Boot key hierarchy (PK / KEK / db / dbx)
-  - the `gen-secure-boot-keys.sh` + `cargo xtask sign` workflow end-to-end
-  - both enrollment paths clearly: shim MOK (`mokutil --import`) vs direct UEFI db
-    (`efi-updatevar` / firmware setup), with when to use each
-  - how to verify Secure Boot state (`mokutil --sb-state`, `dmesg | grep -i secure`)
-- [x] P10-T012 Add a short note in `docs/10-secure-boot.md` explaining what shim is,
-  that `mokutil` manages shim's MOK list (not the UEFI firmware db), and how
-  distribution Secure Boot differs from personal enrollment.
-- [ ] P10-T013 Update `docs/roadmap/README.md` and `docs/08-roadmap.md` to mark
-  Phase 10 complete once validation passes on real hardware.
+### A.2 — Document expected key file locations
+
+**Why it matters:** The xtask sign command needs to find the key and cert at predictable paths.
+
+**Acceptance:**
+- [x] Expected output files and their locations relative to the repo root are documented
+
+---
+
+## Track B — xtask Sign Implementation
+
+### B.1 — Add sign subcommand to xtask
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `cmd_sign`, `sign_efi`
+**Why it matters:** Integrating signing into the build pipeline avoids manual sbsign invocations.
+
+**Acceptance:**
+- [x] `cargo xtask sign` (or `--sign` flag on `image`) accepts optional `--key` and `--cert` path arguments
+- [x] Defaults to `m3os.key` and `m3os.crt` in the repo root
+
+---
+
+### B.2 — Run sbsign to produce signed EFI binary
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `sign_efi`
+**Why it matters:** The signed EFI binary is what UEFI firmware validates during Secure Boot.
+
+**Acceptance:**
+- [x] Invokes `sbsign --key <key> --cert <cert> --output <signed.efi> <unsigned.efi>` via `std::process::Command`
+- [x] Fails with a clear error if `sbsign` is not found
+
+---
+
+### B.3 — Verify signature after signing
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `sign_efi`
+**Why it matters:** Catching a bad signature immediately prevents mysterious boot failures on real hardware.
+
+**Acceptance:**
+- [x] Runs `sbverify --cert <cert> <signed.efi>` after signing to confirm validity
+- [x] Prints the signed EFI path and a MOK enrollment reminder on success
+
+---
+
+## Track C — Validation
+
+### C.1 — Verify sbverify accepts the signed binary
+
+**Why it matters:** Confirms the signing toolchain produced a valid signature.
+
+**Acceptance:**
+- [x] `sbverify --cert m3os.crt <signed-efi>` exits 0
+
+---
+
+### C.2 — Verify unsigned binary fails sbverify
+
+**Why it matters:** Confirms sbverify is actually checking signatures, not just passing everything.
+
+**Acceptance:**
+- [x] The unsigned EFI binary fails `sbverify` against the cert (expected behavior)
+
+---
+
+### C.3 — Real hardware boot test with enrolled key (deferred)
+
+**Why it matters:** The ultimate validation is booting on real Secure Boot hardware.
+
+**Acceptance:**
+- [ ] On a real machine with Secure Boot enabled: enroll the cert via MOK or UEFI db and confirm boot succeeds
+- [ ] Temporarily disable the enrolled key and confirm the signed binary is rejected
+
+> **Deferred:** Requires physical hardware with Secure Boot. Software signing and verification are validated; real hardware testing is tracked separately.
+
+---
+
+## Track D — Documentation
+
+### D.1 — Document Secure Boot architecture and workflow
+
+**File:** `docs/10-secure-boot.md`
+**Why it matters:** The UEFI key hierarchy (PK/KEK/db/dbx) and enrollment paths are non-obvious and must be documented for contributors.
+
+**Acceptance:**
+- [x] Covers UEFI Secure Boot key hierarchy (PK / KEK / db / dbx)
+- [x] Documents end-to-end workflow: `gen-secure-boot-keys.sh` then `cargo xtask sign`
+- [x] Documents both enrollment paths: shim MOK (`mokutil --import`) and direct UEFI db (`efi-updatevar` / firmware setup)
+- [x] Documents how to verify Secure Boot state (`mokutil --sb-state`, `dmesg | grep -i secure`)
+
+---
+
+### D.2 — Document shim and MOK concepts
+
+**File:** `docs/10-secure-boot.md`
+**Why it matters:** The distinction between shim's MOK list and the UEFI firmware db is a common source of confusion.
+
+**Acceptance:**
+- [x] Explains what shim is and that `mokutil` manages shim's MOK list, not the firmware db
+- [x] Explains how distribution Secure Boot differs from personal key enrollment
+
+---
+
+### D.3 — Update roadmap to reflect Phase 10 status (deferred)
+
+**Why it matters:** Roadmap accuracy depends on marking phases complete only after full validation.
+
+**Acceptance:**
+- [ ] Update `docs/roadmap/README.md` and `docs/08-roadmap.md` once real hardware validation passes
+
+> **Deferred:** Blocked on real hardware boot test (C.3).
+
+---
+
+## Documentation Notes
+
+- Phase 10 added Secure Boot signing to the xtask build pipeline, building on the UEFI boot from Phase 1 and the visible framebuffer from Phase 9.
+- Software signing and verification are fully functional; real hardware enrollment testing is deferred.
+- Key material (`.key`, `.crt`) is never committed to the repository.

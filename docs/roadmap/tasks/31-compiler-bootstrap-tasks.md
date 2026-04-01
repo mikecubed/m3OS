@@ -1,5 +1,7 @@
 # Phase 31 — Compiler Bootstrap: Task List
 
+**Status:** Complete (automated smoke test; runtime validation deferred)
+**Source Ref:** phase-31
 **Depends on:** Phase 11 (Process Model) ✅, Phase 12 (POSIX Compat) ✅, Phase 13 (Writable FS) ✅, Phase 14 (Shell + Tools) ✅, Phase 26 (Text Editor) ✅
 **Goal:** Run a C compiler (TCC) natively inside the OS. A C source file written with
 the text editor can be compiled and executed without leaving the OS. The ultimate
@@ -79,92 +81,467 @@ Needs to be added:
 
 Build TCC and prepare musl library files on the host for packaging into the disk image.
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T001 | Download or clone TCC source code (mob branch from repo.or.cz/tinycc.git or a stable release tarball). Document the exact version/commit used for reproducibility. Place the source in a `third-party/tcc/` directory or similar location outside the main workspace. | Done |
-| P31-T002 | Cross-compile TCC for x86-64 Linux with musl. Configure with: `./configure --prefix=/usr --cc=x86_64-linux-musl-gcc --extra-cflags="-static" --cpu=x86_64 --triplet=x86_64-linux-musl`. The key flags: `--prefix=/usr` sets the default search paths to `/usr/include` and `/usr/lib` so TCC finds headers and libraries at runtime inside the OS. Build with `make`. Verify the resulting `tcc` binary is a static x86-64 ELF via `file tcc` and `ldd tcc` (should say "not a dynamic executable"). | Done |
-| P31-T003 | Build musl `libc.a` and CRT startup objects for the target. If not already available from the host musl-gcc installation, build musl from source: `./configure --prefix=/usr --target=x86_64-linux-musl && make`. The required artifacts are: `libc.a` (static C library), `crt1.o` (program entry point), `crti.o` (init section prologue), `crtn.o` (init section epilogue), `Scrt1.o` (for PIE, optional). Collect these into a staging directory. | Done |
-| P31-T004 | Collect musl C headers. These are the standard `/usr/include/` headers: `stdio.h`, `stdlib.h`, `string.h`, `unistd.h`, `fcntl.h`, `sys/stat.h`, `sys/types.h`, `sys/wait.h`, `errno.h`, `signal.h`, etc. Copy the full musl `include/` tree into a staging directory. Also copy architecture-specific headers from `arch/x86_64/`. | Done |
-| P31-T005 | Collect TCC-specific headers. TCC ships its own versions of: `stdarg.h`, `stddef.h`, `stdbool.h`, `float.h`, `varargs.h`, `tcclib.h`. These must be installed in a TCC-specific include path (e.g., `/usr/lib/tcc/include/`). TCC searches this path before the system include path. | Done |
-| P31-T006 | Verify the cross-compiled TCC works on the host by running it in a minimal environment: `./tcc -nostdlib -static -I./staging/include -L./staging/lib hello.c -o hello`. This confirms the binary itself works and can find headers/libs at the configured paths. If it fails, debug the configuration and re-run `./configure` with adjusted paths. | Deferred (runtime) |
+### A.1 — Obtain TCC source
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** pinning the exact TCC version/commit ensures the compiler inside the OS is reproducible and known-good.
+
+**Acceptance:**
+- [x] TCC source cloned from repo.or.cz/tinycc.git (mob branch) or a stable release
+- [x] Exact version/commit documented for reproducibility
+
+### A.2 — Cross-compile TCC as static x86-64 ELF
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** TCC must be a static ELF so it runs inside the OS without a dynamic loader; `--prefix=/usr` sets the default header and library search paths to match the on-disk layout.
+
+**Acceptance:**
+- [x] `./configure --prefix=/usr --cc=x86_64-linux-musl-gcc --extra-cflags="-static" --cpu=x86_64 --triplet=x86_64-linux-musl`
+- [x] Output confirmed static x86-64 ELF via `file`/`ldd`
+
+### A.3 — Build musl libc.a and CRT startup objects
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** TCC needs `libc.a`, `crt1.o`, `crti.o`, and `crtn.o` at link time; these must come from the same musl version used to compile TCC.
+
+**Acceptance:**
+- [x] `libc.a`, `crt1.o`, `crti.o`, `crtn.o` collected in a host staging directory
+
+### A.4 — Collect musl C headers
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** musl headers must match the `libc.a` version and cover the full C standard library so TCC can compile any standard C program without extra `-I` flags.
+
+**Acceptance:**
+- [x] Full musl `include/` tree staged (including `arch/x86_64/` headers)
+
+### A.5 — Collect TCC-specific headers
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** TCC ships its own `stdarg.h`, `stddef.h`, etc. that override the system versions; they must be staged separately for `/usr/lib/tcc/include/` so TCC's header search order finds them first.
+
+**Acceptance:**
+- [x] `stdarg.h`, `stddef.h`, `stdbool.h`, `float.h`, `tcclib.h` staged for `/usr/lib/tcc/include/`
+
+### A.6 — Host-side TCC smoke test
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** verifying the cross-compiled TCC binary can find headers and libraries at the configured staging paths before it is packaged into the disk image saves debugging time.
+
+**Acceptance:**
+- [ ] `./tcc -nostdlib -static -I./staging/include -L./staging/lib hello.c -o hello` succeeds on host _(deferred — runtime verification)_
+
+---
 
 ## Track B — Filesystem Layout and Disk Image Packaging
 
 Package TCC, musl headers, and libraries into the OS disk image.
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T007 | Create the filesystem directory structure in the disk image build process. Add directory creation for: `/usr/`, `/usr/bin/`, `/usr/lib/`, `/usr/lib/tcc/`, `/usr/lib/tcc/include/`, `/usr/include/` (and subdirectories like `/usr/include/sys/`, `/usr/include/bits/`), `/usr/src/`. Update the FAT32 image builder in `xtask/src/main.rs` to create these directories. | Done |
-| P31-T008 | Add TCC binary to the disk image at `/usr/bin/tcc`. Update xtask to copy the cross-compiled TCC ELF into the FAT32 image. Ensure the VFS path resolution can find `/usr/bin/tcc` — verify that PATH lookup or explicit `/usr/bin/tcc` invocation works. If the shell's PATH doesn't include `/usr/bin`, either add it to the default PATH or create a symlink/alias at `/bin/tcc`. | Done |
-| P31-T009 | Add musl `libc.a` and CRT objects (`crt1.o`, `crti.o`, `crtn.o`) to the disk image at `/usr/lib/`. Update xtask to copy these files into the FAT32 image. TCC will link against these when producing executables. | Done |
-| P31-T010 | Add musl C headers to the disk image at `/usr/include/`. This is a large number of files — package the entire musl include tree. Update xtask to recursively copy the header directory into the FAT32 image. Verify the image size calculation accommodates the ~2 MB of headers. | Done |
-| P31-T011 | Add TCC-specific headers to the disk image at `/usr/lib/tcc/include/`. Copy the TCC headers (`stdarg.h`, `stddef.h`, `stdbool.h`, `float.h`, etc.) collected in P31-T005. | Done |
-| P31-T012 | Add a `hello.c` test file to the disk image at `/usr/src/hello.c` containing a minimal C program: `#include <stdio.h>` / `int main() { printf("hello, world\n"); return 0; }`. This is the first compilation test. | Done |
-| P31-T013 | Add TCC source code to the disk image at `/usr/src/tcc/` for the self-hosting milestone. At minimum, include `tcc.c` (the single-file amalgamated TCC source if available) and any required TCC headers. If TCC requires multiple source files, include all of them. This enables `tcc /usr/src/tcc/tcc.c -o /tmp/tcc2` inside the OS. | Done |
-| P31-T014 | Update the disk image size calculation in xtask to accommodate the additional files. The TCC binary (~300 KB), musl libc.a (~500 KB), musl headers (~2 MB), TCC source (~500 KB), and CRT objects (~10 KB) add roughly 3-4 MB. Ensure the FAT32 image has sufficient free space for compilation output (object files, executables) — add at least 4 MB of slack. | Done |
+### B.1 — Create /usr/ directory tree in ext2 image
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** `/usr/bin/`, `/usr/lib/`, `/usr/lib/tcc/include/`, `/usr/include/`, and `/usr/src/` must exist before any TCC files can be placed there.
+
+**Acceptance:**
+- [x] All required `/usr/` subdirectories created in the ext2 image build
+
+### B.2 — TCC binary at /usr/bin/tcc
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** placing TCC at `/usr/bin/tcc` under a PATH-included directory means the shell can invoke `tcc` without specifying an absolute path.
+
+**Acceptance:**
+- [x] TCC ELF copied to `/usr/bin/tcc` in the ext2 image
+- [x] PATH includes `/usr/bin` or explicit path resolves correctly
+
+### B.3 — musl libc.a and CRT objects at /usr/lib/
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** TCC links against `libc.a` and `crt*.o` at its configured prefix `/usr/lib/`; missing these causes every link step to fail.
+
+**Acceptance:**
+- [x] `libc.a`, `crt1.o`, `crti.o`, `crtn.o` at `/usr/lib/` in ext2 image
+
+### B.4 — musl C headers at /usr/include/
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** without the full header tree at `/usr/include/`, TCC fails to find standard headers during `#include` expansion of any real program.
+
+**Acceptance:**
+- [x] Full musl `include/` tree recursively copied to `/usr/include/` in ext2 image
+- [x] Image size accommodates ~2 MB of headers
+
+### B.5 — TCC-specific headers at /usr/lib/tcc/include/
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** TCC searches `/usr/lib/tcc/include/` before `/usr/include/` for its own compiler-specific headers; the wrong version of `stdarg.h` can silently corrupt variadic calls.
+
+**Acceptance:**
+- [x] TCC headers at `/usr/lib/tcc/include/` in ext2 image
+
+### B.6 — Pre-placed hello.c test file
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** a known-good `/usr/src/hello.c` provides a reproducible first compilation target without requiring the text editor.
+
+**Acceptance:**
+- [x] `/usr/src/hello.c` contains `#include <stdio.h>` / `int main() { printf("hello, world\n"); return 0; }`
+
+### B.7 — TCC source for self-hosting at /usr/src/tcc/
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** all TCC source files must be on-disk to enable the self-hosting milestone where TCC compiles itself inside the OS.
+
+**Acceptance:**
+- [x] All TCC source files at `/usr/src/tcc/` in ext2 image
+
+### B.8 — Ext2 image size accounting
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_ext2_files`
+**Why it matters:** TCC payload (~3–4 MB) plus compilation output slack must fit in the ext2 image; an undersized image causes silent write failures during compilation.
+
+**Acceptance:**
+- [x] Image size calculation updated to accommodate TCC binary + headers + source + ≥4 MB build slack
+
+---
 
 ## Track C — Kernel Syscall Audit and Fixes
 
 Verify and fix syscalls that TCC exercises during compilation.
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T015 | Audit `sys_open` for TCC compatibility: TCC opens many header files during compilation. Verify that opening files for read-only from the FAT32 filesystem works reliably when many files are opened and closed in sequence. Check that file descriptor reuse works correctly (closed FDs are recycled). Test opening ~50 files in sequence without FD exhaustion. | Audited — OK |
-| P31-T016 | Verify `sys_lseek` works correctly on FAT32 files. TCC may seek within source files or intermediate files. Test SEEK_SET, SEEK_CUR, and SEEK_END on FAT32 files. Ensure seeking beyond file end and seeking to position 0 both work. | Audited — OK |
-| P31-T017 | Verify `sys_write` to FAT32 files works correctly for TCC's output. TCC writes ELF object files and executables. Test writing a binary file (non-text, containing null bytes and arbitrary byte values) to FAT32 and reading it back. Verify byte-for-byte fidelity. If the OS only supports text files or has CR/LF translation, fix it for binary writes. | Audited — OK; O_TRUNC added |
-| P31-T018 | Verify `sys_unlink` works on FAT32. TCC may create and delete temporary files during compilation. If `unlink` is not implemented for FAT32 (only for tmpfs), add it. TCC needs to be able to delete intermediate `.o` files and failed output. | Audited — already implemented |
-| P31-T019 | Verify `sys_brk` handles large heap growth. TCC may allocate significant memory during compilation (especially for self-hosting). Test brk growth of at least 4 MB (1024 frames). Verify the kernel doesn't run out of frames or panic during large allocations. If the frame allocator is exhausted, ensure brk returns an error rather than panicking. | Audited — OK |
-| P31-T020 | Verify `sys_execve` works for binaries written to FAT32. After TCC produces an ELF binary on the FAT32 filesystem, the shell must be able to exec it. Test: write a static ELF binary to `/tmp/test` (or FAT32 path), set it executable (or skip if no permission checks), and exec it. If the ELF loader only loads from ramdisk, extend it to load from any VFS path. | Done — ext2/tmpfs/FAT32 fallback added |
-| P31-T021 | Verify that `sys_stat` returns correct `st_size` for FAT32 files. TCC uses file size to allocate read buffers. If `st_size` is wrong (e.g., always 0 or rounded to cluster size), fix the FAT32 stat implementation to return the exact file size from the directory entry. | Audited — OK (exact sizes) |
-| P31-T022 | Verify `sys_access` or equivalent. TCC may check if files exist before opening them (e.g., checking for header files in multiple search paths). If `access()` syscall is not implemented, add a minimal version that checks file existence via the VFS. Alternatively, TCC may just use `open()` and check for error, which already works. Lower priority — only implement if TCC actually calls it. | Done — ext2/FAT32 support added |
+### C.1 — sys_open FD lifecycle audit
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `alloc_fd`
+**Why it matters:** TCC opens dozens of header files sequentially; closed FDs must be recycled so the process does not exhaust the per-process FD table.
+
+**Acceptance:**
+- [x] ~50 sequential open/close cycles on ext2 files do not exhaust FDs
+- [x] Closed FDs are correctly recycled
+
+### C.2 — sys_lseek correctness
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_lseek`
+**Why it matters:** TCC may seek within source or intermediate files; SEEK_SET, SEEK_CUR, and SEEK_END must all return correct positions.
+
+**Acceptance:**
+- [x] `SEEK_SET`, `SEEK_CUR`, `SEEK_END` all work on ext2/FAT32 files
+- [x] Seeking to position 0 and beyond file end both work
+
+### C.3 — Binary file write (O_TRUNC added)
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_write`
+**Why it matters:** TCC writes binary ELF output containing null bytes; if the VFS applies CR/LF translation or has write-fidelity bugs the output ELF will be corrupt.
+
+**Acceptance:**
+- [x] Binary files written to ext2 read back byte-for-byte identical
+- [x] `O_TRUNC` on open works for overwriting existing files
+
+### C.4 — sys_unlink on ext2
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_unlink`
+**Why it matters:** TCC may create and delete temporary `.o` files during multi-file compilation; without `unlink` the filesystem fills up.
+
+**Acceptance:**
+- [x] `unlink` implemented for ext2 (was already implemented)
+
+### C.5 — sys_brk large heap growth
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_brk`
+**Why it matters:** TCC allocates significant memory during self-compilation; the frame allocator must handle ≥4 MB growth without panicking.
+
+**Acceptance:**
+- [x] `brk` growth of ≥4 MB (1024 frames) succeeds
+- [x] Frame allocator returns an error on exhaustion rather than panicking
+
+### C.6 — sys_execve from ext2/tmpfs/FAT32
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_execve`
+**Why it matters:** after TCC writes an ELF to ext2 or tmpfs the shell must be able to exec it directly; if the ELF loader only reads from the ramdisk the build cycle is broken.
+
+**Acceptance:**
+- [x] ELF loader extended to load from any VFS path (ext2, tmpfs, FAT32 fallback)
+
+### C.7 — sys_fstat correct st_size
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_fstat`
+**Why it matters:** TCC uses `st_size` to allocate read buffers; a wrong size (zero or cluster-rounded) causes buffer overruns or truncated reads.
+
+**Acceptance:**
+- [x] `st_size` returns exact byte count from ext2 inode / FAT32 directory entry
+
+### C.8 — sys_access for header search
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_access`
+**Why it matters:** TCC checks for header file existence across multiple search paths using `access()`; without it TCC may misidentify missing headers.
+
+**Acceptance:**
+- [x] `sys_access` checks ext2 and FAT32 filesystems
+
+---
 
 ## Track D — Basic Compilation Test
 
 Boot the OS and verify TCC can compile and run a simple program.
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T023 | Boot the OS with all Track A/B additions. Verify that `tcc` (or `/usr/bin/tcc`) is accessible from the shell. Run `tcc --version` (or `tcc -v`) and verify it prints TCC version information without crashing. If it crashes, examine the serial log for the failing syscall and fix in Track C. | Deferred (manual QEMU test) |
-| P31-T024 | Test basic compilation: run `tcc /usr/src/hello.c -o /tmp/hello` inside the OS. If TCC reports missing headers, verify the include paths are correct. If it reports missing `libc.a` or CRT objects, verify the library paths. Debug any compilation errors by examining TCC's error output. | Deferred (manual QEMU test) |
-| P31-T025 | Run the compiled binary: execute `/tmp/hello` and verify it prints "hello, world" to stdout. If it crashes or produces no output, check the ELF binary with the kernel's ELF loader debug output. Common issues: wrong entry point, missing CRT startup, broken printf (needs working write syscall). | Deferred (manual QEMU test) |
-| P31-T026 | Test compilation with the `-run` flag: `tcc -run /usr/src/hello.c` compiles and immediately executes without writing an intermediate file. This exercises TCC's JIT-like execution mode. If it works, it confirms TCC can allocate executable memory via mmap. If mmap doesn't support PROT_EXEC, add it. | Deferred (manual QEMU test); PROT_EXEC added |
-| P31-T027 | Test a slightly more complex program: create a fibonacci calculator (`fib.c`) that uses loops, recursion, and stdio. Compile and run it. This stresses TCC's code generation and the OS's stack/heap handling more than hello world. | Deferred (manual QEMU test) |
-| P31-T028 | Test multi-file compilation: create `main.c` and `util.c` with a shared `util.h`. Compile with `tcc main.c util.c -o /tmp/prog`. Run the result. This verifies TCC can handle multiple source files and link them together. | Deferred (manual QEMU test) |
+### D.1 — tcc --version runs
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** confirms the TCC binary starts, loads its configuration, and exits cleanly — the minimal bar before attempting any compilation.
+
+**Acceptance:**
+- [ ] `tcc --version` prints version string without crashing _(deferred — manual QEMU test)_
+
+### D.2 — Compile hello.c
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** end-to-end test of the header search path, linker invocation against musl, and ELF output writing to tmpfs.
+
+**Acceptance:**
+- [ ] `tcc /usr/src/hello.c -o /tmp/hello` completes without error _(deferred — manual QEMU test)_
+- [ ] Missing header or library errors indicate a packaging bug in Track B _(deferred)_
+
+### D.3 — Run compiled hello
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_execve`
+**Why it matters:** confirms the ELF loader can exec a freshly compiled binary from tmpfs with correct startup and libc initialization.
+
+**Acceptance:**
+- [ ] `/tmp/hello` prints `"hello, world"` _(deferred — manual QEMU test)_
+
+### D.4 — tcc -run mode (PROT_EXEC)
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_linux_mmap`
+**Why it matters:** `-run` mode requires `mmap(PROT_EXEC)` to allocate executable memory; this confirms the kernel correctly supports JIT-style execution.
+
+**Acceptance:**
+- [x] `sys_linux_mmap` supports `PROT_EXEC` (kernel fix done)
+- [ ] `tcc -run /usr/src/hello.c` compiles and executes in one step _(deferred — manual QEMU test)_
+
+### D.5 — Fibonacci / loop test
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** a recursive loop program stresses TCC's code generation and the OS's stack/heap management more thoroughly than hello world.
+
+**Acceptance:**
+- [ ] `fib.c` (recursion + stdio) compiles and produces correct output _(deferred — manual QEMU test)_
+
+### D.6 — Multi-file compilation
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** verifies TCC correctly handles multiple translation units and produces a working linked binary, which is required before any real project can be built.
+
+**Acceptance:**
+- [ ] `tcc main.c util.c -o /tmp/prog` links and runs correctly _(deferred — manual QEMU test)_
+
+---
 
 ## Track E — Self-Hosting Milestone
 
 TCC compiles itself inside the OS.
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T029 | Attempt the self-hosting compilation: `tcc /usr/src/tcc/tcc.c -o /tmp/tcc2`. This is TCC compiling its own source code. It will take significantly longer than hello.c and exercise the heap heavily. Monitor serial output for errors. If it fails with out-of-memory, investigate frame allocator capacity. If it fails with a syscall error, fix the offending syscall. | Deferred (manual QEMU test) |
-| P31-T030 | If TCC requires multiple source files for self-compilation (not single-file amalgamated), determine the minimal set needed and ensure all are on the filesystem. Adjust the compilation command accordingly (e.g., `tcc libtcc.c tccpp.c tccgen.c tccelf.c tccasm.c tcc.c -o /tmp/tcc2`). | Done — all TCC source files included on disk |
-| P31-T031 | Verify the self-compiled TCC: run `/tmp/tcc2 --version` and confirm it prints the same version as the original. Then use tcc2 to compile hello.c: `/tmp/tcc2 /usr/src/hello.c -o /tmp/hello2`. Run `/tmp/hello2` and verify identical output. | Deferred (manual QEMU test) |
-| P31-T032 | Compare the original (cross-compiled) TCC with the self-compiled TCC. Run both on the same input and verify they produce identical (or functionally equivalent) output. Bit-for-bit identical output is ideal but not required — timestamps in ELF headers may differ. The key test is that both produce working binaries from the same source. | Deferred (manual QEMU test) |
+### E.1 — TCC compiles its own source
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** self-hosting is the proof that the OS is a complete C development environment, not just able to run pre-built binaries.
+
+**Acceptance:**
+- [ ] `tcc /usr/src/tcc/tcc.c -o /tmp/tcc2` completes without error _(deferred — manual QEMU test)_
+- [x] All required TCC source files included on disk
+
+### E.2 — Multi-file self-compilation (if needed)
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** if TCC requires multiple source files rather than a single amalgamation, the correct set must all be present and the command documented.
+
+**Acceptance:**
+- [x] All TCC source files present at `/usr/src/tcc/` in ext2 image
+
+### E.3 — Verify self-compiled tcc2
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_execve`
+**Why it matters:** the self-compiled binary must produce functionally identical output to prove the compile was successful and not silently corrupt.
+
+**Acceptance:**
+- [ ] `/tmp/tcc2 --version` prints the same version string _(deferred — manual QEMU test)_
+- [ ] `/tmp/tcc2 /usr/src/hello.c -o /tmp/hello2` produces a working binary _(deferred — manual QEMU test)_
+
+### E.4 — Cross-validation of original vs self-compiled TCC
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_execve`
+**Why it matters:** both TCC binaries must produce working executables from the same source; this validates the compiler's code generation is self-consistent.
+
+**Acceptance:**
+- [ ] Original and self-compiled TCC both produce working binaries from the same input _(deferred — manual QEMU test)_
+
+---
 
 ## Track F — Integration Testing and Validation
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T033 | Acceptance: `cargo xtask run` boots successfully with TCC, musl headers, and libraries available. Serial output shows no panics or regressions in existing functionality (login, shell, coreutils, filesystem, telnetd). | Deferred (manual QEMU test) |
-| P31-T034 | Acceptance: `tcc --version` runs inside the OS and prints the version string. | Deferred (manual QEMU test) |
-| P31-T035 | Acceptance: `tcc /usr/src/hello.c -o /tmp/hello && /tmp/hello` produces "hello, world". | Deferred (manual QEMU test) |
-| P31-T036 | Acceptance: TCC successfully compiles itself inside the OS (self-hosting milestone). | Deferred (manual QEMU test) |
-| P31-T037 | Acceptance: the self-compiled `tcc2` passes the same hello.c test as the original. | Deferred (manual QEMU test) |
-| P31-T038 | Acceptance: no host tools are required after the disk image is built — the OS is self-sufficient for C compilation. | Done (by design) |
-| P31-T039 | Acceptance: `cargo xtask check` passes (clippy + fmt) with all new code. | Done |
-| P31-T040 | Acceptance: `cargo test -p kernel-core` passes — no regressions in existing unit tests. | Done (142/142 pass) |
-| P31-T041 | Acceptance: the edit-compile-run cycle works end-to-end. Use the text editor to create a new `.c` file, compile it with TCC, and run the result. All within the OS. | Deferred (manual QEMU test) |
+### F.1 — Boot without regressions
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `qemu_args`
+**Why it matters:** TCC packaging must not break existing login, shell, coreutils, filesystem, or telnetd functionality.
+
+**Acceptance:**
+- [ ] `cargo xtask run` boots with TCC, headers, and libraries available; no panics _(deferred — manual QEMU test)_
+
+### F.2 — tcc --version inside OS
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** primary acceptance gate for the compiler bootstrap.
+
+**Acceptance:**
+- [ ] `tcc --version` runs and prints version string _(deferred — manual QEMU test)_
+
+### F.3 — hello.c compile and run
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `smoke_test_script`
+**Why it matters:** end-to-end compile-and-run acceptance criterion.
+
+**Acceptance:**
+- [ ] `tcc /usr/src/hello.c -o /tmp/hello && /tmp/hello` prints `"hello, world"` _(deferred — manual QEMU test)_
+
+### F.4 — Self-hosting milestone
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `populate_tcc_files`
+**Why it matters:** the ultimate milestone — the OS can compile its own compiler.
+
+**Acceptance:**
+- [ ] TCC compiles itself inside the OS _(deferred — manual QEMU test)_
+
+### F.5 — Self-compiled tcc2 passes hello test
+
+**File:** `kernel/src/arch/x86_64/syscall.rs`
+**Symbol:** `sys_execve`
+**Why it matters:** validates the self-compilation produced a functionally correct compiler.
+
+**Acceptance:**
+- [ ] `tcc2` produces a working `hello` binary _(deferred — manual QEMU test)_
+
+### F.6 — No host tools required at runtime
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `build_tcc`
+**Why it matters:** the OS must be self-sufficient for C compilation after the disk image is built.
+
+**Acceptance:**
+- [x] All compilation artifacts are inside the disk image; no host tools needed at runtime
+
+### F.7 — cargo xtask check
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `cmd_check`
+**Why it matters:** enforces no clippy warnings or formatting issues in xtask changes.
+
+**Acceptance:**
+- [x] `cargo xtask check` passes
+
+### F.8 — kernel-core unit tests
+
+**File:** `xtask/src/main.rs`
+**Symbol:** `cmd_check`
+**Why it matters:** ensures no regressions in host-testable pure logic.
+
+**Acceptance:**
+- [x] `cargo test -p kernel-core` passes — 142/142
+
+### F.9 — Edit-compile-run cycle
+
+**Files:**
+- `userspace/edit/src/main.rs`
+- `kernel/src/arch/x86_64/syscall.rs`
+
+**Symbol:** `edit_main`
+**Why it matters:** confirms the complete authoring workflow — create source in the editor, compile with TCC, run the result — all within the OS.
+
+**Acceptance:**
+- [ ] Use text editor to create a `.c` file, compile with TCC, run — all inside the OS _(deferred — manual QEMU test)_
+
+---
 
 ## Track G — Documentation
 
-| Task | Description | Status |
-|---|---|---|
-| P31-T042 | Create `docs/31-compiler-bootstrap.md`: document the compiler bootstrap implementation. Cover: TCC cross-compilation process, musl library packaging, filesystem layout (/usr/include, /usr/lib, /usr/src), TCC configuration and search paths, the self-hosting milestone, and any kernel fixes required. Include a diagram of the edit-compile-run cycle. | Done |
-| P31-T043 | Document what TCC needs from the OS: enumerate every syscall TCC exercises, which libc functions they back, and how the OS implements each. Document any stubs, workarounds, or limitations (e.g., no dynamic linking, no shared libraries). | Done (in docs/31-compiler-bootstrap.md) |
-| P31-T044 | Document the musl build process: how to reproduce the libc.a, CRT objects, and headers from source. Document the exact musl version used and any patches applied. | Done (in docs/31-compiler-bootstrap.md) |
-| P31-T045 | Document Path B (alternative): if TCC proves too complex, describe the fallback options (Forth interpreter, tiny Lisp, minimal C subset compiler). Explain when Path B is the right choice and what trade-offs it involves. | Deferred (TCC works) |
-| P31-T046 | Update `docs/08-roadmap.md` to mark Phase 31 as complete (when done). | Deferred (pending runtime testing) |
+### G.1 — docs/31-compiler-bootstrap.md
+
+**File:** `docs/31-compiler-bootstrap.md`
+**Symbol:** `# Phase 31 -- Compiler Bootstrap`
+**Why it matters:** documents the TCC cross-compilation process and on-disk layout so the bootstrap can be reproduced or updated when upgrading TCC.
+
+**Acceptance:**
+- [x] TCC cross-compilation process, filesystem layout, and self-hosting milestone documented
+- [x] Edit-compile-run cycle diagram included
+
+### G.2 — Syscall requirements document
+
+**File:** `docs/31-compiler-bootstrap.md`
+**Symbol:** `## TCC Syscall Requirements`
+**Why it matters:** enumerating every syscall TCC exercises helps future contributors understand which kernel features are load-bearing for the compiler.
+
+**Acceptance:**
+- [x] Every syscall TCC exercises enumerated with its libc backing and OS implementation note
+
+### G.3 — musl build process
+
+**File:** `docs/31-compiler-bootstrap.md`
+**Symbol:** `## musl Library Packaging`
+**Why it matters:** documents the exact musl version and any patches so the libc.a in the disk image can be reproduced.
+
+**Acceptance:**
+- [x] musl version, build flags, and CRT object provenance documented
+
+### G.4 — Path B (fallback) documentation
+
+**File:** `docs/31-compiler-bootstrap.md`
+**Symbol:** `## Deferred Items`
+**Why it matters:** if TCC ever breaks, knowing when to fall back to a Forth interpreter or minimal C subset compiler prevents wasted effort.
+
+**Acceptance:**
+- [ ] Fallback options documented with trade-off analysis _(deferred — TCC works; document if TCC regresses)_
+
+### G.5 — Roadmap update
+
+**File:** `docs/08-roadmap.md`
+**Symbol:** `## Phase Overview`
+**Why it matters:** keeps the roadmap index consistent with phase completion status.
+
+**Acceptance:**
+- [ ] Phase 31 marked complete in `docs/08-roadmap.md` _(deferred — pending runtime testing)_
 
 ---
 

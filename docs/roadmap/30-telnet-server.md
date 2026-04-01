@@ -1,4 +1,10 @@
-# Phase 30 - Telnet Server
+# Phase 30 — Telnet Server
+
+**Status:** Complete
+**Source Ref:** phase-30
+**Depends on:** Phase 23 (Socket API) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY Subsystem) ✅
+**Builds on:** Combines TCP sockets from Phase 23, PTY pairs from Phase 29, and login authentication from Phase 27 into the first networked multi-user service
+**Primary Components:** userspace/telnetd/
 
 ## Milestone Goal
 
@@ -6,6 +12,15 @@ A telnet server runs inside the OS, allowing remote users to log in over the net
 and get an interactive shell session. This is the first demonstration of the OS as a
 networked, multi-user system — a machine you can connect to from another computer (or
 another terminal on the host) and do real work.
+
+## Why This Phase Exists
+
+Phases 23, 27, and 29 each built independent capabilities: TCP sockets, user
+authentication, and virtual terminals. Individually, none of them delivers the experience
+of a real multi-user networked OS. A telnet server is the simplest protocol that ties
+all three together — it accepts a TCP connection, allocates a PTY, authenticates the
+user, and provides a full interactive shell. Building this proves the OS subsystems
+integrate correctly and gives a tangible remote-access demonstration.
 
 ## Learning Goals
 
@@ -47,13 +62,32 @@ QEMU's network setup (user-mode or tap) should allow `telnet localhost <port>` f
 the host machine to connect to the OS's telnet server. Document the QEMU port
 forwarding configuration.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 23 (Socket API) | TCP server sockets |
-| Phase 27 (User Accounts) | login authentication |
-| Phase 29 (PTY) | Terminal sessions for remote users |
+### IAC Parser
+
+The telnet protocol uses IAC (0xFF) as an escape byte. The server must parse incoming
+data to distinguish telnet commands from user input. IAC sequences include option
+negotiation (`WILL`/`WONT`/`DO`/`DONT`) and sub-negotiation for options like NAWS.
+
+### Per-Connection Architecture
+
+Each accepted connection forks a child process. The parent relays data between the TCP
+socket and the PTY master fd using `poll()`. The child calls `setsid()`, opens the PTY
+slave as its controlling terminal, and execs `/bin/login` to authenticate the user.
+
+### Connection Lifecycle
+
+When the TCP connection closes or the remote client disconnects, the server sends
+`SIGHUP` to the session (via PTY master close), cleans up the PTY pair, and reaps the
+child process.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 23 (Socket API):** Uses TCP server sockets (`bind`, `listen`, `accept`) for network connections.
+- **Extends Phase 27 (User Accounts):** Delegates authentication to the `login` binary from Phase 27.
+- **Extends Phase 29 (PTY Subsystem):** Allocates PTY pairs for each remote session; relies on `setsid()` and `TIOCSCTTY`.
+- **Reuses Phase 26 (Text Editor):** The text editor works over telnet connections, proving full terminal compatibility.
 
 ## Implementation Outline
 
@@ -95,7 +129,7 @@ Modern systems have largely replaced telnet with SSH. We implement telnet first 
 2. It demonstrates all the same OS concepts (sockets + PTY + login + fork).
 3. It provides a working remote access prototype that SSH will later replace.
 
-## Security Note
+### Security Note
 
 Telnet transmits everything in plaintext, including passwords. This is acceptable for:
 - QEMU virtual networking (never leaves the host)

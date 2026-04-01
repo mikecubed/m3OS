@@ -1,4 +1,10 @@
-# Phase 28 - ext2 Filesystem
+# Phase 28 — ext2 Filesystem
+
+**Status:** Complete
+**Source Ref:** phase-28
+**Depends on:** Phase 24 (Persistent Storage) ✅, Phase 27 (User Accounts) ✅
+**Builds on:** Replaces the FAT32 backend from Phase 24 with ext2; implements the VfsMetadata trait from Phase 27 natively via ext2 inodes
+**Primary Components:** kernel/src/fs/ext2, kernel-core/src/fs/, xtask image builder
 
 ## Milestone Goal
 
@@ -6,6 +12,16 @@ Replace FAT32 as the primary persistent filesystem with ext2, which natively
 stores Unix ownership (uid/gid), permission modes, and timestamps in every inode.
 After this phase, file permissions set via `chmod`/`chown` survive reboots and the
 FAT32 permissions index file workaround from Phase 27 is no longer needed.
+
+## Why This Phase Exists
+
+FAT32 has no concept of Unix file ownership or permissions. Phase 27 worked around
+this with a `.m3os_permissions` overlay file, but that approach is fragile and
+non-standard. ext2 stores uid, gid, mode, and timestamps directly in each inode,
+making permission persistence a natural property of the filesystem rather than a
+bolted-on workaround. Implementing ext2 also teaches the canonical Unix filesystem
+layout (superblock, block groups, inode tables, bitmaps) which underpins ext3,
+ext4, and many other modern filesystems.
 
 ## Learning Goals
 
@@ -69,12 +85,47 @@ FAT32 permissions index file workaround from Phase 27 is no longer needed.
   block group descriptor, inode, directory entry. These are host-testable.
 - Add parsing and serialization functions with unit tests.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 24 (Persistent Storage) | virtio-blk driver and block device abstraction |
-| Phase 27 (User Accounts) | VfsMetadata trait that ext2 implements natively |
+### ext2 On-Disk Layout
+
+The filesystem is divided into block groups, each containing a copy of the
+superblock (in group 0), a block group descriptor table, block and inode bitmaps,
+an inode table, and data blocks. The superblock at group 0 holds global metadata:
+block size, inode size, inodes per group, blocks per group, and free counts.
+
+### Inode Structure
+
+Each inode stores uid, gid, mode, size, timestamps (mtime), and block pointers.
+Direct blocks (0-11) point to data blocks directly. Block 12 is a single-indirect
+pointer (points to a block of block pointers). Block 13 is a double-indirect
+pointer. This supports files up to ~64 MB with 4K blocks.
+
+### Directory Entries
+
+Directories are stored as linked lists of variable-length entries within data
+blocks. Each entry contains an inode number, entry length, name length, file
+type, and name. Path resolution walks these entries to map names to inode numbers.
+
+### Block/Inode Bitmap Management
+
+In-memory copies of the block and inode bitmaps track allocation state. On file
+creation, free bits are located and set; on deletion, bits are cleared. The
+superblock's free counts are updated on each allocation/deallocation and written
+back on sync/unmount.
+
+### VfsMetadata Trait Implementation
+
+ext2 implements the `VfsMetadata` trait by returning native inode fields directly
+(uid, gid, mode, size, mtime), eliminating the need for the FAT32 permissions
+overlay file.
+
+## How This Builds on Earlier Phases
+
+- **Replaces Phase 24 (Persistent Storage):** swaps the FAT32 filesystem backend for ext2 on the same virtio-blk device
+- **Extends Phase 27 (User Accounts):** implements the VfsMetadata trait natively, replacing the FAT32 permissions index file workaround
+- **Reuses Phase 24 (Persistent Storage):** continues to use the virtio-blk driver and MBR partition parsing
+- **Extends kernel-core:** adds host-testable ext2 data structure definitions and parsing
 
 ## Implementation Outline
 
@@ -111,7 +162,6 @@ FAT32 permissions index file workaround from Phase 27 is no longer needed.
 
 ## How Real OS Implementations Differ
 
-Real ext2/3/4 implementations have:
 - **ext3/ext4 journaling**: crash recovery via a write-ahead log. ext2 has no
   journal — an unclean shutdown requires `e2fsck` to repair.
 - **Extent trees** (ext4): replace block pointer lists for better large-file
@@ -127,9 +177,8 @@ Real ext2/3/4 implementations have:
 - **Delayed allocation** (ext4): allocate blocks at writeback time, not at
   write time, for better layout.
 - **Online resize and defragmentation**.
-
-Our implementation covers the core ext2 specification (revision 0) which is
-sufficient for persistent Unix-style file storage with native permissions.
+- Our implementation covers the core ext2 specification (revision 0) which is
+  sufficient for persistent Unix-style file storage with native permissions.
 
 ## Deferred Until Later
 

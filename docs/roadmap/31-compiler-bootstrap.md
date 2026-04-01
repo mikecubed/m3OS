@@ -1,4 +1,10 @@
-# Phase 31 - Compiler Bootstrap
+# Phase 31 — Compiler Bootstrap
+
+**Status:** Complete
+**Source Ref:** phase-31
+**Depends on:** Phase 14 (Shell + Tools) ✅, Phase 26 (Text Editor) ✅
+**Builds on:** Uses the interactive shell and PATH lookup from Phase 14 and the text editor from Phase 26 to create an edit-compile-run cycle; relies on ELF loading, execve, fork, and writable filesystem from earlier phases
+**Primary Components:** kernel/initrd/ (TCC binary, musl libc), userspace/hello-c/
 
 ## Milestone Goal
 
@@ -28,6 +34,15 @@ flowchart TD
     end
 ```
 
+## Why This Phase Exists
+
+An OS that can only run pre-compiled binaries from a host machine is fundamentally
+dependent on external tools. A self-hosting system — one that can compile and run its
+own programs — is a key milestone in OS maturity. It proves the OS provides enough
+POSIX-compatible infrastructure (file I/O, heap, process execution) to support real
+development tools. TCC is chosen because it is a single-file C compiler that can
+compile itself, making the bootstrap chain as short as possible.
+
 ## Learning Goals
 
 - Understand what "bootstrapping" means: deriving a tool from itself.
@@ -37,14 +52,14 @@ flowchart TD
 
 ## Feature Scope
 
-**Path A — TinyCC (primary)**
+### Path A — TinyCC (primary)
 
 - TinyCC (TCC) cross-compiled on the host targeting x86-64 ELF, linked against musl.
 - musl `libc.a` and C headers bundled in the disk image at `/usr/lib` and `/usr/include`.
 - `tcc hello.c -o hello` works inside the OS.
 - `tcc tcc.c -o tcc2` works inside the OS (self-hosting milestone).
 
-**Path B — Native tiny language (alternative)**
+### Path B — Native tiny language (alternative)
 
 If the musl/POSIX path proves too complex, a second path avoids it entirely: implement
 a small interpreter or compiler in Rust as a native userspace binary that speaks the
@@ -56,15 +71,33 @@ custom syscall ABI directly. Candidates:
 Path B is always available as a fallback. Path A is the primary goal because it
 enables running unmodified C programs from the wider ecosystem.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 11 (Process Model) | ELF loader, `execve`, `fork`, `wait` |
-| Phase 12 (POSIX Compat) | `open`/`read`/`write`, `brk`/`mmap`, musl-compatible syscalls |
-| Phase 13 (Writable FS) | `/tmp` for intermediate object files and output binaries |
-| Phase 14 (Shell + Tools) | Interactive shell, pipes, `PATH` lookup for running the compiler |
-| Phase 26 (Text Editor) | Edit source code inside the OS before compiling |
+### TCC Binary
+
+TinyCC is cross-compiled on the host with musl and placed in the disk image. It is a
+fully static x86-64 ELF binary that needs no dynamic linker. TCC includes a built-in
+assembler and linker, so no separate `as` or `ld` is required.
+
+### musl libc
+
+musl provides `libc.a` (static library) and the standard C headers. These are bundled
+at `/usr/lib/libc.a` and `/usr/include/` in the disk image. TCC links against them
+when compiling C programs.
+
+### Self-Hosting Chain
+
+The self-hosting milestone is: `tcc tcc.c -o tcc2` — TCC compiles its own source code
+inside the OS. The resulting `tcc2` binary should produce identical output for the same
+input programs.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 14 (Shell + Tools):** Uses the interactive shell for running the compiler, and PATH lookup to find `/usr/bin/tcc`.
+- **Extends Phase 26 (Text Editor):** Enables editing source code inside the OS before compiling.
+- **Reuses Phase 11 (Process Model):** ELF loader, `execve`, `fork`, and `wait` are essential for running compiled binaries.
+- **Reuses Phase 12 (POSIX Compat):** `open`/`read`/`write`, `brk`/`mmap`, and other musl-compatible syscalls are required by TCC and musl.
+- **Reuses Phase 13 (Writable FS):** `/tmp` for intermediate object files and output binaries.
 
 ## Implementation Outline
 

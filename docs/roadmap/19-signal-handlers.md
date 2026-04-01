@@ -1,5 +1,11 @@
 # Phase 19 — Signal Handlers
 
+**Status:** Complete
+**Source Ref:** phase-19
+**Depends on:** Phase 18 ✅
+**Builds on:** Extends the process model and syscall gate from Phase 18; adds signal delivery infrastructure for userspace handler execution
+**Primary Components:** kernel/src/signal.rs, kernel/src/arch/x86_64/, kernel/src/process/
+
 ## Milestone Goal
 
 Enable userspace programs to install and execute signal handlers. Implement the
@@ -19,6 +25,16 @@ flowchart TD
     Ring3 -->|"sigreturn (syscall 15)"| Restore["kernel: restore ucontext<br/>from sigframe"]
     Restore --> Resume["resume interrupted<br/>instruction"]
 ```
+
+## Why This Phase Exists
+
+Without signal handlers, userspace programs have no way to respond to asynchronous
+events like `Ctrl-C`, segmentation faults, or child process termination. The kernel
+can only apply default actions (terminate or ignore). Real programs need to install
+custom handlers for graceful shutdown, error recovery, and child process management.
+The signal trampoline mechanism -- pushing a frame onto the user stack and returning
+to a handler via `IRET` -- is one of the most intricate kernel-userspace interfaces
+and a key piece of POSIX compatibility required by musl libc and the Ion shell.
 
 ## Learning Goals
 
@@ -52,6 +68,50 @@ flowchart TD
   used for `SIGSEGV` handlers when the main stack has overflowed
 - **musl compatibility**: validate that `rt_sigaction` with `SA_RESTORER` stores the
   restorer pointer and that the kernel uses it as the return address in the frame
+
+## Important Components and How They Work
+
+### Sigframe Layout
+
+The `sigframe` struct matches the Linux `ucontext_t` + `siginfo_t` layout that musl
+expects: general-purpose registers, `rflags`, `rip`, `rsp`, the old signal mask, and
+the restorer address. The frame must be 16-byte aligned per the System V AMD64 ABI.
+
+### Signal Delivery Path
+
+`check_pending_signals()` runs on every return to ring-3 (including from blocking
+syscalls). It selects a pending, unblocked signal and either applies the default action
+or calls `setup_signal_frame()` if a user handler is registered.
+
+### `setup_signal_frame()`
+
+Reads the current user `RSP` (or alt-stack base if `SS_ONSTACK` and `SA_ONSTACK` is
+set), subtracts the frame size, writes the `sigframe` struct to user memory, then
+mutates the saved trap frame so that `IRET`/`SYSRET` returns to the handler address
+with `RSP` pointing at the sigframe.
+
+### `sys_sigreturn`
+
+Reads the `sigframe` pointer from the user stack, validates it is in user-space, copies
+saved registers back into the trap frame, and restores the old signal mask. This is the
+only safe way to restore the interrupted execution context.
+
+### Signal Masking
+
+`sys_rt_sigprocmask` updates `task.blocked_signals` per the `how` argument. `SIGKILL`
+and `SIGSTOP` can never be blocked. During handler execution, `sa_mask | delivered_signal`
+is automatically added to the blocked set and restored by `sigreturn`.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 11**: builds on the process model and trap frame infrastructure from
+  the ELF loader and process lifecycle phase
+- **Extends Phase 14**: uses the `fork`/`exec`/`waitpid` syscall infrastructure to
+  deliver signals to child processes
+- **Extends Phase 18**: signal checks integrate with the syscall return path established
+  in the directory/VFS phase
+- **Reuses Phase 17**: CoW page handling must interact correctly with signal frame
+  writes to user stack pages
 
 ## Implementation Outline
 
@@ -116,34 +176,22 @@ flowchart TD
 
 - [Phase 19 Task List](./tasks/19-signal-handlers-tasks.md)
 
-## Documentation Deliverables
-
-- Diagram the `sigframe` layout and explain which fields musl's `__restore_rt` reads
-- Document the delivery decision tree: pending vs. blocked, default vs. handler,
-  alt-stack selection
-- Explain why `sigreturn` is a syscall and not a normal function return
-- Document the signal mask lifecycle: saved in `sigframe`, restored by `sigreturn`
-- Note which signals are unblockable (`SIGKILL`, `SIGSTOP`) and why
-- Show the stack layout before and after `setup_signal_frame()`: original RSP,
-  alignment padding, sigframe struct, restorer return address
-- Explain the `SA_RESTORER` flag and the contract between the kernel and musl: the
-  kernel writes the restorer address as the handler's return address; musl's `__restore_rt`
-  executes `syscall` with `rax = 15` to invoke `sigreturn`
-
 ## How Real OS Implementations Differ
 
-Linux maintains a full `sigcontext` embedded inside `ucontext_t` for every supported
-architecture, including FPU / SSE / AVX state (managed via `XSAVE`). The in-kernel
-`copy_siginfo_to_user` and related helpers handle dozens of signal sources with
-different `siginfo` payloads. Linux also supports real-time signals (`SIGRTMIN` through
-`SIGRTMAX`) with a queued delivery model and `sigqueue` for passing an integer or
-pointer payload alongside the signal. This phase implements only the standard-signal
-subset with no FPU state save and no real-time signal queue.
+- Linux maintains a full `sigcontext` embedded inside `ucontext_t` for every supported
+  architecture, including FPU / SSE / AVX state (managed via `XSAVE`).
+- The in-kernel `copy_siginfo_to_user` and related helpers handle dozens of signal
+  sources with different `siginfo` payloads.
+- Linux also supports real-time signals (`SIGRTMIN` through `SIGRTMAX`) with a queued
+  delivery model and `sigqueue` for passing an integer or pointer payload alongside
+  the signal.
+- This phase implements only the standard-signal subset with no FPU state save and no
+  real-time signal queue.
 
 ## Deferred Until Later
 
 - Real-time signals (`SIGRTMIN` through `SIGRTMAX`) and the `sigqueue` API
-- `signalfd` — receiving signals as readable file descriptors
+- `signalfd` -- receiving signals as readable file descriptors
 - FPU / SSE / AVX state save and restore in the `sigframe`
 - Per-thread signal masks and thread-directed signal delivery (requires `clone`)
 - `SA_NODEFER`, `SA_RESETHAND` flag semantics

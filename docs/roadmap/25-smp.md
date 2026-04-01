@@ -1,4 +1,10 @@
-# Phase 25 - Symmetric Multiprocessing
+# Phase 25 — Symmetric Multiprocessing
+
+**Status:** Complete
+**Source Ref:** phase-25
+**Depends on:** Phase 4 (Interrupts/APIC) ✅, Phase 17 (Scheduler) ✅
+**Builds on:** Uses APIC infrastructure from Phase 4 and MADT parsing from Phase 15; extends the single-core scheduler from Phase 17 to run across all cores
+**Primary Components:** kernel/src/smp/, kernel/src/task/, kernel/src/arch/x86_64/
 
 ## Milestone Goal
 
@@ -27,6 +33,16 @@ flowchart TD
     Task1 <-->|"spinlock / IPC"| Task2
 ```
 
+## Why This Phase Exists
+
+A single-core OS cannot exploit modern multi-core hardware, and many real-world
+concurrency bugs only manifest when code truly runs in parallel. Enabling SMP
+forces an audit of every global data structure for thread safety, exposes race
+conditions that are invisible on a single core, and teaches the fundamentals of
+AP startup, per-core state, and cross-core coordination (IPI, TLB shootdown).
+Without SMP, the scheduler, locking, and IPC subsystems are only tested in a
+serialized environment that hides correctness issues.
+
 ## Learning Goals
 
 - Understand the AP startup sequence: why a 16-bit real-mode trampoline is needed.
@@ -36,7 +52,7 @@ flowchart TD
 ## Feature Scope
 
 - **AP startup**: write a 16-bit trampoline page, send INIT + SIPI IPIs to each AP,
-  bring APs through real mode → protected mode → long mode → kernel entry
+  bring APs through real mode -> protected mode -> long mode -> kernel entry
 - **Per-core data**: each core gets its own GDT, TSS, kernel stack, `gs_base`
   pointer, and Local APIC mapping
 - **Per-core run queues**: the scheduler maintains one queue per core; idle cores
@@ -47,6 +63,40 @@ flowchart TD
   request TLB shootdowns
 - **TLB shootdown**: when a page mapping is removed, the kernel sends a shootdown IPI
   to every core that might have cached the entry
+
+## Important Components and How They Work
+
+### AP Startup Sequence
+
+A 4 KB trampoline page is allocated at a sub-1 MB physical address containing a
+16-bit startup stub. For each AP: the BSP sends an INIT IPI, waits 10 ms, then
+sends two SIPI IPIs with the trampoline physical page number. The trampoline
+enables protected mode, sets up a temporary GDT, enables long mode, and jumps to
+a Rust `ap_entry` function.
+
+### Per-Core State
+
+Each core initializes its own GDT, TSS, LAPIC, and kernel stack in `ap_entry`.
+Per-core data is addressed via `gs_base`. Each core signals the BSP when alive and
+then enters the scheduler idle loop.
+
+### SMP-Aware Scheduler
+
+The global run queue is split into per-core queues. When a core's queue is empty,
+it steals work from the busiest core's queue (simple work stealing).
+
+### TLB Shootdown
+
+When a page mapping is removed (e.g., via `munmap`), the kernel sends a shootdown
+IPI to every core that might have cached the stale TLB entry. The IPI handler
+invalidates the relevant TLB entries on the receiving core.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 4 (Interrupts/APIC):** uses Local APIC for per-core timers and IPI delivery
+- **Extends Phase 15 (ACPI):** reads AP count and APIC IDs from the MADT table
+- **Extends Phase 17 (Scheduler):** splits the single-core run queue into per-core queues with work stealing
+- **Reuses Phase 3 (Memory):** allocates per-core kernel stacks and trampoline pages from the frame allocator
 
 ## Implementation Outline
 
@@ -76,22 +126,15 @@ flowchart TD
 
 - [Phase 25 Task List](./tasks/25-smp-tasks.md)
 
-## Documentation Deliverables
-
-- explain the AP startup sequence step by step: INIT IPI → SIPI → real mode → long mode
-- document the per-core data layout and how `gs_base` is used to address it
-- explain TLB shootdowns: why they are needed and what happens without them
-- document the spinlock audit process and what makes a lock SMP-safe
-- explain work stealing at a high level
-
 ## How Real OS Implementations Differ
 
-Production kernels use NUMA-aware memory allocation (allocating from the NUMA node
-local to each core), per-core page allocators to avoid cross-core lock contention,
-and sophisticated load-balancing heuristics. Linux's scheduler (CFS) tracks CPU
-utilization, task affinity, cache topology, and energy efficiency. This phase uses
-the simplest correct implementation: equal-weight round-robin with naive work
-stealing.
+- Production kernels use NUMA-aware memory allocation (allocating from the NUMA node
+  local to each core), per-core page allocators to avoid cross-core lock contention,
+  and sophisticated load-balancing heuristics.
+- Linux's scheduler (CFS) tracks CPU utilization, task affinity, cache topology, and
+  energy efficiency.
+- This phase uses the simplest correct implementation: equal-weight round-robin with
+  naive work stealing.
 
 ## Deferred Until Later
 

@@ -1,4 +1,10 @@
-# Phase 7 - Core Servers
+# Phase 07 — Core Servers
+
+**Status:** Complete
+**Source Ref:** phase-07
+**Depends on:** Phase 6 ✅
+**Builds on:** Uses the IPC primitives and capability model from Phase 6 to build the first userspace services
+**Primary Components:** init_task, console_server, kbd_server, service registry
 
 ## Milestone Goal
 
@@ -16,6 +22,14 @@ flowchart LR
     IPC --> Kernel["microkernel"]
 ```
 
+## Why This Phase Exists
+
+The IPC subsystem from Phase 6 needs to be exercised end-to-end before building more
+complex services. Without concrete servers, the IPC model remains untested theory. This
+phase proves that the endpoint, capability, and notification primitives work together in
+practice by building the minimal set of servers needed for a functioning system: an init
+process, a console server, and a keyboard server.
+
 ## Learning Goals
 
 - Understand service-oriented bootstrapping in a microkernel.
@@ -25,10 +39,42 @@ flowchart LR
 ## Feature Scope
 
 - `init` as the first userspace process
-- service registration or simple nameserver
+- Service registration or simple nameserver
 - `console_server`
 - `kbd_server`
-- enough bootstrap logic to start and connect services
+- Enough bootstrap logic to start and connect services
+
+## Important Components and How They Work
+
+### init_task
+
+Runs as the first task after kernel initialization. It creates endpoints, populates the
+service registry, and spawns the console and keyboard server tasks before yielding to the
+scheduler.
+
+### console_server
+
+Loops on `recv`, writes strings to serial, and replies with an acknowledgement. Clients
+discover it through the service registry via `lookup("console")` and communicate using
+`call(console_ep, WRITE)`.
+
+### kbd_server
+
+Waits on the IRQ1 notification object and logs the notification bits. Scancode reading
+and forwarding key events to clients are deferred to Phase 8+.
+
+### Service Registry
+
+A static array of 8 entries with 32-byte names. No heap allocation. Provides name-based
+lookup so clients can discover server endpoints without hardcoded IDs. Registry syscalls
+9 and 10 are wired but unused in this phase (no ring-3 callers yet).
+
+## How This Builds on Earlier Phases
+
+- **Exercises** the IPC endpoint and notification objects introduced in Phase 6
+- **Uses** the capability table model from Phase 6 for server endpoint access
+- **Extends** the scheduler from Phase 5 with server task spawning from init
+- **Reuses** the serial output path, now wrapped behind a console server interface
 
 ## Implementation Outline
 
@@ -49,23 +95,21 @@ flowchart LR
 
 - [Phase 7 Task List](./tasks/07-core-servers-tasks.md)
 
-## Documentation Deliverables
-
-- explain the server startup sequence
-- explain service discovery at a high level
-- explain why console and keyboard are split into separate services
-
 ## How Real OS Implementations Differ
 
-Production microkernels often have richer process managers, supervision trees, restart
-policies, and dynamic service discovery. The toy design should use a very small service
-set and a transparent bootstrap flow so the architecture is easier to learn.
+- Production microkernels often have richer process managers, supervision trees, restart
+  policies, and dynamic service discovery.
+- The toy design uses a very small service set and a transparent bootstrap flow so the
+  architecture is easier to learn.
 
 ## Deferred Until Later
 
-- automatic service restart policies
-- complex capability delegation tooling
-- dynamic driver loading
+- Automatic service restart policies
+- Complex capability delegation tooling
+- Dynamic driver loading
+- Servers running in ring 3 (requires ELF loader from Phase 8+)
+- String pointers via page grants for ring-3 IPC payloads
+- Service deregistration
 
 ---
 

@@ -1,4 +1,10 @@
-# Phase 27 - User Accounts and Login
+# Phase 27 — User Accounts and Login
+
+**Status:** Complete
+**Source Ref:** phase-27
+**Depends on:** Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅
+**Builds on:** Adds UID/GID identity and permission enforcement to the process model from Phase 12; persists user accounts on the FAT32 storage from Phase 24
+**Primary Components:** kernel process control block, kernel VFS permission checks, userspace/login/, userspace/su/, userspace/passwd/, userspace/adduser/
 
 ## Milestone Goal
 
@@ -6,6 +12,16 @@ The OS supports multiple user accounts with login authentication, file ownership
 permission enforcement. A `login` program prompts for username and password before
 granting shell access. This is the foundation for multi-user operation and secure remote
 access.
+
+## Why This Phase Exists
+
+Without user accounts, every process runs with full system privileges and there is
+no concept of file ownership or access control. This makes the OS unsuitable for
+multi-user scenarios (including remote access via telnet) and prevents any
+meaningful security boundary between processes. Adding UID/GID identity and
+permission checks brings the OS in line with the fundamental Unix security model
+and is a prerequisite for multi-user login, remote shells, and privilege
+separation.
 
 ## Learning Goals
 
@@ -52,14 +68,34 @@ Use a simple but real hash: SHA-256 with salt, or bcrypt if a small C implementa
 is available. For the initial phase, SHA-256 with a fixed salt prefix is sufficient.
 The point is to never store plaintext passwords.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 12 (POSIX Compat) | Syscall ABI for getuid/setuid family |
-| Phase 13 (Writable FS) | Writable /etc for passwd/shadow files |
-| Phase 14 (Shell and Tools) | Shell to log into |
-| Phase 24 (Persistent Storage) | User accounts persist across reboots |
+### Kernel UID/GID Enforcement
+
+The process control block gains `uid` and `gid` fields, defaulting to 0 (root)
+for init. Every VFS operation (`open`, `unlink`, `mkdir`, `rmdir`, `rename`,
+`exec`) checks the caller's UID/GID against the file's owner and permission
+mode bits. UID 0 bypasses all permission checks.
+
+### Login Flow
+
+Init spawns `login` instead of directly spawning the shell. `login` reads
+`/etc/passwd` to look up the user, verifies the password hash from `/etc/shadow`,
+then calls `setuid`/`setgid` and `exec`s the user's configured shell.
+
+### Permissions Index File
+
+Because FAT32 has no native Unix permissions, Phase 27 uses a `.m3os_permissions`
+index file to persist ownership and modes on the FAT32 partition. This workaround
+is replaced by ext2 in Phase 28.
+
+## How This Builds on Earlier Phases
+
+- **Extends Phase 12 (POSIX Compat):** adds getuid/setuid family syscalls to the POSIX syscall ABI
+- **Extends Phase 24 (Persistent Storage):** persists /etc/passwd, /etc/shadow, and /etc/group on the FAT32 partition
+- **Extends Phase 13 (Writable FS):** requires writable /etc for password and account files
+- **Extends Phase 14 (Shell and Tools):** login spawns the shell after successful authentication
+- **Replaced by Phase 28:** the FAT32 permissions workaround is eliminated when ext2 provides native inode metadata
 
 ## Implementation Outline
 
@@ -91,25 +127,14 @@ The point is to never store plaintext passwords.
 
 ## How Real OS Implementations Differ
 
-Real Unix systems have:
-- PAM (Pluggable Authentication Modules) for flexible auth backends
-- NSS (Name Service Switch) for looking up users from LDAP, NIS, etc.
-- Supplementary groups (a user can belong to multiple groups)
-- setuid/setgid binaries for controlled privilege escalation
-- Fine-grained capabilities (Linux capabilities, not just root vs. non-root)
-- SELinux/AppArmor for mandatory access control
-
-Our implementation uses the classic Unix permission model (user/group/other with
-rwx bits), which is simple to understand and sufficient for learning.
-
-## Follow-Up: Phase 28 — ext2 Filesystem
-
-FAT32 has no native Unix permissions, so Phase 27 uses a permissions index file
-(`.m3os_permissions`) to persist ownership and modes on the FAT32 partition.
-**Phase 28** replaces FAT32 entirely with an ext2 filesystem that stores
-uid/gid/mode/timestamps natively in inodes.
-
-See [Phase 28 — ext2 Filesystem](./28-ext2-filesystem.md) for full scope.
+- Real Unix systems use PAM (Pluggable Authentication Modules) for flexible auth backends.
+- NSS (Name Service Switch) enables looking up users from LDAP, NIS, etc.
+- Supplementary groups allow a user to belong to multiple groups.
+- setuid/setgid binaries provide controlled privilege escalation.
+- Fine-grained capabilities (Linux capabilities) replace the binary root vs. non-root model.
+- SELinux/AppArmor provide mandatory access control beyond discretionary Unix permissions.
+- Our implementation uses the classic Unix permission model (user/group/other with
+  rwx bits), which is simple to understand and sufficient for learning.
 
 ## Deferred Until Later
 

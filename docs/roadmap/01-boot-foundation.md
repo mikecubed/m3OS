@@ -1,4 +1,10 @@
-# Phase 1 - Boot Foundation
+# Phase 01 — Boot Foundation
+
+**Status:** Complete
+**Source Ref:** phase-01
+**Depends on:** None (first phase)
+**Builds on:** N/A — this is the initial foundation
+**Primary Components:** kernel crate, xtask build system, serial output, panic handler
 
 ## Milestone Goal
 
@@ -17,6 +23,13 @@ flowchart LR
     Panic --> Outcome
 ```
 
+## Why This Phase Exists
+
+Every OS project needs a trustworthy boot path before anything else can be built. Without
+serial logging and a panic handler, debugging later phases would be guesswork. This phase
+establishes the minimum viable kernel — one that boots, proves it is running, and fails
+visibly when something goes wrong.
+
 ## Learning Goals
 
 - Understand `#![no_std]` and `#![no_main]`.
@@ -31,6 +44,30 @@ flowchart LR
 - serial output macros and logger integration
 - basic panic handler with readable output
 - `cargo xtask run` and `cargo xtask image`
+
+## Important Components and How They Work
+
+### Serial Output
+
+COM1 serial is initialized early in boot. Print macros (`serial_print!`, `serial_println!`)
+write directly to the UART. A logger backend is installed so the `log` crate facade routes
+through serial, giving all later phases structured log output for free.
+
+### Panic Handler
+
+The panic handler captures the panic location and message, emits them over serial, and
+halts the CPU in a loop. This ensures that any early failure produces visible diagnostics
+rather than a silent hang.
+
+### xtask Build System
+
+The `xtask` crate is a host-side Rust binary that orchestrates image generation and QEMU
+launch. `cargo xtask run` builds the kernel, produces a UEFI disk image, and boots it in
+QEMU with OVMF firmware.
+
+## How This Builds on Earlier Phases
+
+- N/A — this is the first phase and establishes the foundation for all subsequent work.
 
 ## Implementation Outline
 
@@ -55,12 +92,6 @@ flowchart LR
 ## Implementation Document
 
 - [Boot Process](../02-boot.md)
-
-## Documentation Deliverables
-
-- explain the boot path from `xtask` to `kernel_main`
-- document early logging and panic behavior
-- record build prerequisites such as QEMU and OVMF
 
 ## How Real OS Implementations Differ
 

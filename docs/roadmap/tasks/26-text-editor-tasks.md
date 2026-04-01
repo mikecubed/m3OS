@@ -1,8 +1,40 @@
 # Phase 26 — Text Editor: Task List
 
-**Depends on:** Phase 22 (TTY) ✅, Phase 22b (ANSI Escape Sequences) ✅, Phase 24 (Persistent Storage) ✅
+**Status:** Complete
+**Source Ref:** phase-26
+**Depends on:** Phase 22 (TTY) ✅, Phase 24 (Persistent Storage) ✅
 **Goal:** A usable full-screen text editor (`edit`) runs inside the OS, enabling
-users to create, edit, search, and save files from the shell.
+users to create, edit, search, and save files from the shell. Ported from kibi
+(a Rust kilo clone) with an m3OS platform backend.
+
+## Track Layout
+
+| Track | Scope | Dependencies | Status |
+|---|---|---|---|
+| A | syscall-lib extensions + heap allocator | — | ✅ Done |
+| B | Terminal raw mode verification | A | ✅ Done |
+| C | Port kibi core (editor logic) | A | ✅ Done |
+| D | m3OS platform backend | A | ✅ Done |
+| E | File I/O and search | C, D | ✅ Done |
+| F | Build system and shell integration | C | ✅ Done |
+| G | Validation and documentation | E, F | ✅ Done |
+
+### Implementation Notes
+
+- **Binary name**: `/bin/edit` — short, easy to type, no conflict with existing
+  utilities.
+- **Crate name**: `edit` (package) / `edit` (binary), following the init/shell
+  pattern.
+- **Terminal model**: Hardcode VT100 escape sequences. No terminfo/termcap
+  needed — QEMU serial console and the framebuffer console both support VT100.
+- **Text buffer**: Kibi uses a `Vec<Row>` line array — adequate for the file
+  sizes we expect. Gap buffer / rope is deferred.
+- **Heap**: The editor needs dynamic allocation (`Vec`, `String`). Add a
+  simple global allocator to userspace that uses `brk` or `mmap` under the hood.
+  This allocator will be reusable by future Rust userspace programs.
+- **no_std + alloc**: The editor crate uses `#![no_std]` with `extern crate alloc`
+  for `Vec`, `String`, `format!`. The allocator is set up before entering the
+  editor main loop.
 
 ## Prerequisite Analysis
 
@@ -72,35 +104,6 @@ Porting strategy:
 5. Write an `m3os.rs` platform backend implementing kibi's terminal interface
 6. Build via xtask alongside init, sh0, ping
 
-## Track Layout
-
-| Track | Scope | Dependencies | Status |
-|---|---|---|---|
-| A | syscall-lib extensions + heap allocator | — | Done |
-| B | Terminal raw mode verification | A | Done |
-| C | Port kibi core (editor logic) | A | Done |
-| D | m3OS platform backend | A | Done |
-| E | File I/O and search | C, D | Done |
-| F | Build system and shell integration | C | Done |
-| G | Validation and documentation | E, F | Done |
-
-### Implementation Notes
-
-- **Binary name**: `/bin/edit` — short, easy to type, no conflict with existing
-  utilities.
-- **Crate name**: `edit` (package) / `edit` (binary), following the init/shell
-  pattern.
-- **Terminal model**: Hardcode VT100 escape sequences. No terminfo/termcap
-  needed — QEMU serial console and the framebuffer console both support VT100.
-- **Text buffer**: Kibi uses a `Vec<Row>` line array — adequate for the file
-  sizes we expect. Gap buffer / rope is deferred.
-- **Heap**: The editor needs dynamic allocation (`Vec`, `String`). Add a
-  simple global allocator to userspace that uses `brk` or `mmap` under the hood.
-  This allocator will be reusable by future Rust userspace programs.
-- **no_std + alloc**: The editor crate uses `#![no_std]` with `extern crate alloc`
-  for `Vec`, `String`, `format!`. The allocator is set up before entering the
-  editor main loop.
-
 ---
 
 ## Track A — syscall-lib Extensions and Heap Allocator
@@ -108,103 +111,473 @@ Porting strategy:
 Extend `syscall-lib` with the system call wrappers kibi needs, and provide a
 global allocator for userspace Rust binaries that need heap allocation.
 
-| Task | Description |
-|---|---|
-| P26-T001 | Add `ioctl(fd: usize, request: usize, arg: usize) -> isize` wrapper to `syscall-lib` using `syscall3(SYS_IOCTL, fd, request, arg)`. |
-| P26-T002 | Add `lseek(fd: usize, offset: i64, whence: usize) -> isize` wrapper to `syscall-lib` using `syscall3(SYS_LSEEK, ...)`. Define `SEEK_SET`, `SEEK_CUR`, `SEEK_END` constants. |
-| P26-T003 | Add termios type definitions to `syscall-lib`: `struct Termios` (matching the kernel's 36-byte layout: `c_iflag`, `c_oflag`, `c_cflag`, `c_lflag`, `c_cc[19]`), plus flag constants (`ICANON`, `ECHO`, `ISIG`, `ICRNL`, `OPOST`, `BRKINT`, `CS8`, etc.) and `TCGETS`/`TCSETS`/`TCSETSF` ioctl numbers. |
-| P26-T004 | Add `tcgetattr(fd: usize) -> Result<Termios, isize>` and `tcsetattr(fd: usize, termios: &Termios) -> Result<(), isize>` convenience functions to `syscall-lib`, built on the `ioctl` wrapper. |
-| P26-T005 | Add `struct Winsize` (matching kernel layout: `ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`) and `get_window_size(fd: usize) -> Result<(u16, u16), isize>` using `ioctl(fd, TIOCGWINSZ, &winsize)`. |
-| P26-T006 | Create a userspace heap allocator crate or module: implement `GlobalAlloc` using `brk` (syscall 12) or `mmap` (syscall 9) to grow the heap. A simple bump allocator with a free list is sufficient. Provide it as either a module in `syscall-lib` (behind a feature flag) or a separate `userspace/alloc/` crate. |
-| P26-T007 | Verify the allocator works: write a minimal test in the edit crate's `_start` that allocates a `Vec<u8>`, pushes bytes, and prints the length. Confirm no panic or OOM on a small allocation. |
-| P26-T008 | Add `rt_sigaction(signum: usize, act: *const SigAction, oldact: *mut SigAction) -> isize` wrapper to `syscall-lib` if not already present. Define `SIGWINCH` (28) constant. |
+### A.1 — Add `ioctl()` wrapper
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `ioctl`
+**Why it matters:** All terminal control operations (termios, window size) go through the ioctl syscall interface.
+
+**Acceptance:**
+- [x] `ioctl(fd, request, arg)` wrapper calls `syscall3(SYS_IOCTL, fd, request, arg)`
+
+### A.2 — Add `lseek()` wrapper
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `lseek`
+**Why it matters:** File seeking is needed for random-access file I/O during editor save operations.
+
+**Acceptance:**
+- [x] `lseek(fd, offset, whence)` wrapper works with `SEEK_SET`, `SEEK_CUR`, `SEEK_END` constants
+
+### A.3 — Add termios type definitions
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `Termios`
+**Why it matters:** The editor must switch the terminal to raw mode, which requires the termios structure and flag constants.
+
+**Acceptance:**
+- [x] `struct Termios` matches kernel 36-byte layout (`c_iflag`, `c_oflag`, `c_cflag`, `c_lflag`, `c_cc[19]`)
+- [x] Flag constants defined: `ICANON`, `ECHO`, `ISIG`, `ICRNL`, `OPOST`, `BRKINT`, `CS8`, etc.
+- [x] `TCGETS`/`TCSETS`/`TCSETSF` ioctl numbers defined
+
+### A.4 — Add `tcgetattr`/`tcsetattr` convenience functions
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `tcgetattr`, `tcsetattr`
+**Why it matters:** These provide a safe, ergonomic API for reading and writing terminal settings.
+
+**Acceptance:**
+- [x] `tcgetattr(fd)` returns `Result<Termios, isize>` via ioctl
+- [x] `tcsetattr(fd, termios)` returns `Result<(), isize>` via ioctl
+
+### A.5 — Add `Winsize` struct and `get_window_size` helper
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `Winsize`, `get_window_size`
+**Why it matters:** The editor needs terminal dimensions to lay out the screen correctly.
+
+**Acceptance:**
+- [x] `struct Winsize` matches kernel layout (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`)
+- [x] `get_window_size(fd)` uses `ioctl(fd, TIOCGWINSZ, &winsize)`
+
+### A.6 — Create userspace heap allocator
+
+**File:** `userspace/syscall-lib/src/heap.rs`
+**Symbol:** `BrkAllocator`
+**Why it matters:** The editor uses `Vec`, `String`, and `format!` which all require a global allocator in no_std.
+
+**Acceptance:**
+- [x] `GlobalAlloc` implementation using `brk` syscall
+- [x] Reusable by future Rust userspace programs
+
+### A.7 — Verify allocator works
+
+**Files:** `userspace/edit/src/main.rs`
+**Why it matters:** A broken allocator would cause silent corruption or panics in the editor.
+
+**Acceptance:**
+- [x] `Vec<u8>` push/len works without panic or OOM on small allocation
+
+### A.8 — Add `rt_sigaction` wrapper and `SIGWINCH` constant
+
+**File:** `userspace/syscall-lib/src/lib.rs`
+**Symbol:** `rt_sigaction`, `SIGWINCH`
+**Why it matters:** The editor needs to handle terminal resize events via SIGWINCH signals.
+
+**Acceptance:**
+- [x] `rt_sigaction` wrapper present
+- [x] `SIGWINCH` (28) constant defined
+
+---
 
 ## Track B — Terminal Raw Mode Verification
 
 Verify that the kernel's TTY layer supports the terminal operations a
 full-screen editor needs before porting kibi.
 
-| Task | Description |
-|---|---|
-| P26-T009 | Write a small Rust test binary (`userspace/raw-test/`) that: switches to raw mode using the new `tcgetattr`/`tcsetattr` wrappers (clear `ICANON`, `ECHO`, `IEXTEN`, `ISIG`, `ICRNL`, `OPOST`; set `CS8`), reads one byte at a time, prints the byte value in hex, quits on `q`. Verify each keypress is returned immediately without echo. |
-| P26-T010 | Verify `TIOCGWINSZ` ioctl returns correct terminal dimensions (rows, cols) using the new `get_window_size` wrapper. |
-| P26-T011 | Verify ANSI escape sequences work in raw mode: write `\x1b[2J` (clear screen), `\x1b[H` (cursor home), `\x1b[6n` (cursor position report). Check if the kernel echoes back a cursor position response `\x1b[<row>;<col>R` to stdin. If not, ensure the `TIOCGWINSZ` fallback path works. |
-| P26-T012 | Verify arrow keys are received correctly in raw mode: Up=`\x1b[A`, Down=`\x1b[B`, Right=`\x1b[C`, Left=`\x1b[D`, Home=`\x1b[1~` or `\x1b[H`, End=`\x1b[4~` or `\x1b[F`, Page Up=`\x1b[5~`, Page Down=`\x1b[6~`, Delete=`\x1b[3~`. Fix any missing key translations in the keyboard/TTY layer. |
-| P26-T013 | If `SIGWINCH` is not delivered when terminal size changes, add support: when `TIOCSWINSZ` ioctl updates the window size, send `SIGWINCH` to the foreground process group of that TTY. |
+### B.1 — Raw mode test binary
+
+**Component:** `userspace/raw-test/` (test binary)
+**Why it matters:** Validates that the kernel correctly implements immediate-character delivery and echo suppression.
+
+**Acceptance:**
+- [x] Switching to raw mode works (clear `ICANON`, `ECHO`, `IEXTEN`, `ISIG`, `ICRNL`, `OPOST`; set `CS8`)
+- [x] Each keypress returned immediately without echo
+
+### B.2 — Verify `TIOCGWINSZ` returns correct dimensions
+
+**Component:** Kernel TTY / ioctl layer
+**Why it matters:** Incorrect terminal dimensions would cause corrupted screen layout.
+
+**Acceptance:**
+- [x] `get_window_size(0)` returns (rows, cols) matching the terminal
+
+### B.3 — Verify ANSI escape sequences in raw mode
+
+**Component:** Kernel framebuffer console
+**Why it matters:** Screen clear, cursor home, and cursor position report are essential for full-screen TUI rendering.
+
+**Acceptance:**
+- [x] `\x1b[2J` (clear screen), `\x1b[H` (cursor home) work in raw mode
+- [x] `TIOCGWINSZ` fallback path works if `\x1b[6n` response is not supported
+
+### B.4 — Verify arrow key escape sequences
+
+**Component:** Kernel keyboard/TTY layer
+**Why it matters:** Without correct key translation, cursor movement in the editor would be broken.
+
+**Acceptance:**
+- [x] Arrow keys, Home, End, Page Up/Down, Delete received correctly in raw mode
+
+### B.5 — Verify or add SIGWINCH delivery
+
+**Component:** Kernel TTY subsystem (`kernel/src/tty.rs`)
+**Why it matters:** Terminal resize must notify the editor so it can redraw at the new dimensions.
+
+**Acceptance:**
+- [x] `TIOCSWINSZ` ioctl sends `SIGWINCH` to the foreground process group
+
+---
 
 ## Track C — Port Kibi Core
 
 Port kibi's editor logic into a no_std Rust crate. Replace `std` types with
 `alloc` equivalents and syscall-lib calls.
 
-| Task | Description |
-|---|---|
-| P26-T014 | Create `userspace/edit/` crate: `Cargo.toml` (depends on `syscall-lib`, `unicode-width`), `src/main.rs` with `#![no_std]`, `#![no_main]`, `extern crate alloc`, global allocator setup, `_start` entry point. Verify it compiles and runs (empty screen, immediate exit). |
-| P26-T015 | Port kibi's `Row` struct: `chars: Vec<u8>`, `render: Vec<u8>` (tabs expanded to spaces). Implement `update_render()` to regenerate the render string when chars change. Port `cx_to_rx()` (cursor x to render x, accounting for tab width). |
-| P26-T016 | Port kibi's key reading: `read_key()` function that reads one byte from stdin via `syscall_lib::read(0, ...)`, then handles multi-byte escape sequences (`\x1b[A`, `\x1b[5~`, etc.) by reading additional bytes with a short timeout or non-blocking read. Return a `Key` enum (`ArrowUp`, `ArrowDown`, `PageUp`, `Home`, `Del`, `Char(u8)`, `Ctrl(u8)`, etc.). |
-| P26-T017 | Port the append buffer: `struct ABuf { buf: Vec<u8> }` with `push_str(&mut self, s: &[u8])` and `flush(&self)` (single `write(1, ...)` call). Used to batch all screen output per refresh cycle. |
-| P26-T018 | Port `refresh_screen()`: hide cursor (`\x1b[?25l`), cursor home (`\x1b[H`), draw each visible row with `\x1b[K` (clear to EOL), draw status bar and message bar, reposition cursor (`\x1b[<r>;<c>H`), show cursor (`\x1b[?25h`). Flush the append buffer. |
-| P26-T019 | Port cursor movement: arrow keys move `cx`/`cy`, snap to end of line on vertical movement past shorter lines, wrap at line boundaries. Implement Page Up/Down (move by screen height), Home/End (move to start/end of line). |
-| P26-T020 | Port vertical scrolling: maintain `row_offset`. Scroll when cursor moves above or below the visible window. Only render rows `row_offset..row_offset+screen_rows`. |
-| P26-T021 | Port horizontal scrolling: maintain `col_offset`. Scroll when cursor moves past the right edge. Render only `col_offset..col_offset+screen_cols` of each row. |
-| P26-T022 | Port text insertion: `insert_char(c: u8)` at cursor position, updating the row's `chars` and `render`. Handle inserting at end of file (append new row). |
-| P26-T023 | Port newline insertion: `insert_newline()` splits the current row at `cx`, creating a new row below. Handle beginning-of-line (empty row above) and end-of-line (empty row below) cases. |
-| P26-T024 | Port character deletion: `delete_char()` removes the character left of cursor. At beginning of a line, merge with the previous line and remove the current row. |
-| P26-T025 | Port `process_keypress()`: main input dispatch — printable chars → insert, `Ctrl+Q` → quit, `Ctrl+S` → save, `Ctrl+F` → find, arrows/page/home/end → movement, Backspace/Delete → delete, `Ctrl+H` → backspace alias. |
+### C.1 — Create `userspace/edit/` crate
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** This is the foundation for the entire editor binary.
+
+**Acceptance:**
+- [x] `Cargo.toml` depends on `syscall-lib` and `unicode-width`
+- [x] `#![no_std]`, `#![no_main]`, global allocator setup, `_start` entry point
+- [x] Compiles and runs (empty screen, immediate exit)
+
+### C.2 — Port `Row` struct
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `Row`
+**Why it matters:** The row model is the core data structure for text storage and rendering.
+
+**Acceptance:**
+- [x] `chars: Vec<u8>`, `render: Vec<u8>` (tabs expanded to spaces)
+- [x] `update_render()` regenerates render string
+- [x] `cx_to_rx()` converts cursor x to render x accounting for tab width
+
+### C.3 — Port key reading
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `read_key`
+**Why it matters:** The editor's entire input model depends on correctly parsing raw keystrokes and escape sequences.
+
+**Acceptance:**
+- [x] `read_key()` reads one byte from stdin, handles multi-byte escape sequences
+- [x] Returns `Key` enum (`ArrowUp`, `ArrowDown`, `PageUp`, `Home`, `Del`, `Char(u8)`, `Ctrl(u8)`, etc.)
+
+### C.4 — Port append buffer
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `ABuf`
+**Why it matters:** Batching screen output into a single write call prevents visible flicker during refresh.
+
+**Acceptance:**
+- [x] `struct ABuf { buf: Vec<u8> }` with `push_str` and `flush` (single `write(1, ...)` call)
+
+### C.5 — Port `refresh_screen()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `refresh_screen`
+**Why it matters:** This is the core rendering loop that draws every visible element each frame.
+
+**Acceptance:**
+- [x] Hide/show cursor, draw rows with `\x1b[K`, status bar, message bar, reposition cursor
+- [x] Flush append buffer in single write
+
+### C.6 — Port cursor movement
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Correct cursor movement with line-length snapping and wrapping is essential for usability.
+
+**Acceptance:**
+- [x] Arrow keys move `cx`/`cy` with line-boundary wrapping
+- [x] Page Up/Down, Home/End implemented
+
+### C.7 — Port vertical scrolling
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Without scrolling, the editor cannot display files larger than the screen.
+
+**Acceptance:**
+- [x] `row_offset` maintained; only visible rows rendered
+
+### C.8 — Port horizontal scrolling
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Without horizontal scrolling, long lines would be truncated or overflow the screen.
+
+**Acceptance:**
+- [x] `col_offset` maintained; only visible columns rendered
+
+### C.9 — Port text insertion
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `insert_char`
+**Why it matters:** Character insertion is the most basic editing operation.
+
+**Acceptance:**
+- [x] `insert_char(c)` at cursor position; handles inserting at end of file
+
+### C.10 — Port newline insertion
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `insert_newline`
+**Why it matters:** Newline handling correctly splits lines, which is fundamental to multi-line editing.
+
+**Acceptance:**
+- [x] `insert_newline()` splits row at `cx`; handles beginning/end of line cases
+
+### C.11 — Port character deletion
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `delete_char`
+**Why it matters:** Backspace/delete must correctly handle line merging at line boundaries.
+
+**Acceptance:**
+- [x] `delete_char()` removes char left of cursor; merges lines at line beginning
+
+### C.12 — Port `process_keypress()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `process_keypress`
+**Why it matters:** This is the main input dispatch that maps all key bindings to editor actions.
+
+**Acceptance:**
+- [x] Printable chars insert, `Ctrl+Q` quits, `Ctrl+S` saves, `Ctrl+F` finds, arrows move, Backspace/Delete delete
+
+---
 
 ## Track D — m3OS Platform Backend
 
 Write the platform-specific glue that connects kibi's terminal interface to
 m3OS syscalls.
 
-| Task | Description |
-|---|---|
-| P26-T026 | Implement `enable_raw_mode() -> Termios`: call `tcgetattr(0)` to save original termios, then `tcsetattr(0, &raw_termios)` with `ICANON`, `ECHO`, `IEXTEN`, `ISIG`, `ICRNL`, `IXON`, `OPOST`, `BRKINT`, `INPCK`, `ISTRIP` cleared and `CS8` set. Return the original termios for later restoration. |
-| P26-T027 | Implement `disable_raw_mode(original: &Termios)`: restore the saved termios via `tcsetattr`. Call this on normal exit and on panic (set a panic hook or use a static to store the original state). |
-| P26-T028 | Implement `get_window_size() -> (usize, usize)`: call `syscall_lib::get_window_size(0)` and return `(rows, cols)`. Fallback: write `\x1b[999C\x1b[999B\x1b[6n` and parse the `\x1b[<r>;<c>R` response from stdin. |
-| P26-T029 | Implement stdin reading: a `read_byte() -> Option<u8>` function that calls `read(0, &mut buf, 1)`. Return `None` on timeout/EOF. Kibi's key reader calls this in a loop to assemble escape sequences. |
-| P26-T030 | Implement `register_sigwinch_handler()`: use `rt_sigaction` to register a handler for `SIGWINCH` that sets a global `AtomicBool` flag. The main loop checks this flag and calls `get_window_size()` to update dimensions. |
+### D.1 — Implement `enable_raw_mode()`
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** The editor cannot function without raw mode -- cooked mode buffers input by line.
+
+**Acceptance:**
+- [x] Saves original termios, clears `ICANON`, `ECHO`, `IEXTEN`, `ISIG`, `ICRNL`, `IXON`, `OPOST`, `BRKINT`, `INPCK`, `ISTRIP`; sets `CS8`
+
+### D.2 — Implement `disable_raw_mode()`
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Failing to restore terminal mode would leave the shell unusable after the editor exits.
+
+**Acceptance:**
+- [x] Restores saved termios on normal exit and on panic
+
+### D.3 — Implement `get_window_size()`
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** The editor needs to know the terminal dimensions for screen layout.
+
+**Acceptance:**
+- [x] Returns `(rows, cols)` via `syscall_lib::get_window_size(0)`
+- [x] Fallback via escape sequence if needed
+
+### D.4 — Implement stdin reading
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `read_byte`
+**Why it matters:** Single-byte reads are the foundation of the key reader for escape sequence assembly.
+
+**Acceptance:**
+- [x] `read_byte() -> Option<u8>` reads from stdin via `read(0, &mut buf, 1)`
+
+### D.5 — Implement `register_sigwinch_handler()`
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Terminal resize events must be detected so the editor can redraw at the correct dimensions.
+
+**Acceptance:**
+- [x] `rt_sigaction` registers a handler for `SIGWINCH` that sets a global `AtomicBool` flag
+
+---
 
 ## Track E — File I/O and Search
 
 Port kibi's file loading, saving, and search functionality.
 
-| Task | Description |
-|---|---|
-| P26-T031 | Port `open_file(filename: &str)`: open with `syscall_lib::open(path, O_RDONLY, 0)`, read the entire file into a buffer, split on `\n` (handle `\r\n`), populate `Vec<Row>`. Handle nonexistent files (start with empty buffer). |
-| P26-T032 | Port `save_file()`: serialize all rows to a `\n`-joined byte buffer, open with `O_WRONLY | O_CREAT | O_TRUNC`, `write` the buffer, `close`. Show bytes written in the status message. If no filename, prompt for one (see T034). |
-| P26-T033 | Port dirty-file tracking: set a `modified: bool` flag on any text edit, clear on save. On `Ctrl+Q` with unsaved changes, require 3 consecutive `Ctrl+Q` presses to force quit (show warning in message bar). |
-| P26-T034 | Port `prompt(msg: &str) -> Option<String>`: mini input line in the message bar. Read keystrokes, build input string, Enter confirms, Escape cancels, Backspace deletes. Used for search query and save-as filename. Accept an optional per-keystroke callback for incremental search. |
-| P26-T035 | Port `find()`: prompt for search text, scan rows for substring match, move cursor to first match. Implement incremental search (update match on each keystroke). Arrow keys navigate forward/backward through matches. Highlight current match with reverse video (`\x1b[7m`). Restore cursor position on cancel. |
+### E.1 — Port `open_file()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `open_file`
+**Why it matters:** Loading files from disk is a core editor capability.
+
+**Acceptance:**
+- [x] Opens file via `syscall_lib::open`, splits on `\n` (handles `\r\n`), populates `Vec<Row>`
+- [x] Handles nonexistent files (start with empty buffer)
+
+### E.2 — Port `save_file()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `save_file`
+**Why it matters:** Saving files to persistent storage is the primary output operation of the editor.
+
+**Acceptance:**
+- [x] Serializes rows to `\n`-joined buffer, writes with `O_WRONLY | O_CREAT | O_TRUNC`
+- [x] Prompts for filename if none set
+
+### E.3 — Port dirty-file tracking
+
+**File:** `userspace/edit/src/main.rs`
+**Why it matters:** Prevents accidental data loss by warning before quitting with unsaved changes.
+
+**Acceptance:**
+- [x] `modified` flag set on edits, cleared on save
+- [x] `Ctrl+Q` requires 3 consecutive presses to force quit with unsaved changes
+
+### E.4 — Port `prompt()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `prompt`
+**Why it matters:** The prompt mini-line is used for search queries and save-as filename entry.
+
+**Acceptance:**
+- [x] Mini input line in message bar with Enter/Escape/Backspace handling
+- [x] Optional per-keystroke callback for incremental search
+
+### E.5 — Port `find()`
+
+**File:** `userspace/edit/src/main.rs`
+**Symbol:** `find`
+**Why it matters:** In-file search is a critical editor feature for navigating large files.
+
+**Acceptance:**
+- [x] Incremental search with arrow-key match navigation
+- [x] Reverse video highlight on current match; cursor restored on cancel
+
+---
 
 ## Track F — Build System and Shell Integration
 
-| Task | Description |
-|---|---|
-| P26-T036 | Add `edit` to the xtask build: extend `build_userspace_bins()` to include `("edit", "edit")` in the Rust binary list. The binary is built with `cargo build --release --package edit --target x86_64-unknown-none -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem`. Note: add `alloc` to `-Zbuild-std` since the editor uses `extern crate alloc`. |
-| P26-T037 | Register the `edit` binary in the kernel's initrd loader so it is available at `/bin/edit` at boot. Add an `include_bytes!("../initrd/edit.elf")` entry and an initrd file table entry, following the pattern of existing binaries. |
-| P26-T038 | Verify the shell can exec `/bin/edit <filename>` — the editor receives the filename as an argument via the process's argv. Parse argv in `_start` and pass the filename to the editor init. |
-| P26-T039 | Set the `EDITOR` environment variable to `/bin/edit` in the init process environment, so future phases can use `$EDITOR` generically. |
+### F.1 — Add `edit` to xtask build
+
+**File:** `xtask/src/main.rs`
+**Why it matters:** Without build system integration, the editor binary cannot be included in the OS image.
+
+**Acceptance:**
+- [x] `edit` built with `-Zbuild-std=core,compiler_builtins,alloc` and included in userspace builds
+
+### F.2 — Register `edit` in initrd
+
+**File:** `kernel/src/fs/ramdisk.rs`
+**Why it matters:** The binary must be available in the filesystem for the shell to execute it.
+
+**Acceptance:**
+- [x] `include_bytes!("../initrd/edit.elf")` added; available at `/bin/edit` at boot
+
+### F.3 — Verify shell exec
+
+**Component:** Shell + exec integration
+**Why it matters:** Users invoke the editor from the shell, so argument passing must work.
+
+**Acceptance:**
+- [x] `edit <filename>` works from shell; filename passed via argv
+
+### F.4 — Set `EDITOR` environment variable
+
+**File:** `userspace/init/src/main.rs`
+**Why it matters:** Allows future programs to discover the default editor via `$EDITOR`.
+
+**Acceptance:**
+- [x] `EDITOR=/bin/edit` set in init environment
+
+---
 
 ## Track G — Validation and Documentation
 
-| Task | Description |
-|---|---|
-| P26-T040 | Acceptance: `edit` launches from the shell and displays a full-screen TUI with a welcome message or tilde-prefixed empty lines. |
-| P26-T041 | Acceptance: arrow keys, Page Up/Down, Home/End move the cursor correctly. |
-| P26-T042 | Acceptance: typing characters inserts text; Backspace and Delete remove characters. |
-| P26-T043 | Acceptance: `Ctrl+S` saves the file to persistent storage (FAT32). Reopen the file with `cat` and verify contents. |
-| P26-T044 | Acceptance: `Ctrl+Q` quits the editor; dirty-file warning works (requires 3 presses to force quit). |
-| P26-T045 | Acceptance: `Ctrl+F` searches for text; incremental search updates live; arrow keys navigate between matches. |
-| P26-T046 | Acceptance: opening a nonexistent filename creates an empty buffer; saving creates the file on disk. |
-| P26-T047 | Acceptance: scrolling works for files larger than the terminal height (test with a 100+ line file). |
-| P26-T048 | Acceptance: horizontal scrolling works for lines wider than the terminal width. |
-| P26-T049 | Acceptance: status bar shows filename, line count, cursor position, and modified indicator. |
-| P26-T050 | Acceptance: the editor restores the terminal to cooked mode on exit (no garbled shell prompt after quitting). |
-| P26-T051 | Acceptance: the editor works correctly under SMP (no corruption when other processes run concurrently). |
-| P26-T052 | `cargo xtask check` passes (clippy + fmt). |
-| P26-T053 | QEMU boot validation — editor launches, edits, saves, and quits without panics or regressions. Test with both serial console and framebuffer GUI (`cargo xtask run` and `cargo xtask run-gui`). |
-| P26-T054 | Write `docs/26-text-editor.md`: editor architecture (kibi port rationale, raw mode setup, append buffer, row model, screen refresh loop), m3OS platform backend design, key mapping, file I/O flow, heap allocator design, and how to extend with syntax highlighting. |
+### G.1 — Editor launch acceptance
+
+**Why it matters:** Confirms the editor binary loads and renders correctly.
+
+**Acceptance:**
+- [x] `edit` launches from shell with full-screen TUI, welcome message or tilde-prefixed empty lines
+
+### G.2 — Cursor movement acceptance
+
+**Acceptance:**
+- [x] Arrow keys, Page Up/Down, Home/End move cursor correctly
+
+### G.3 — Text editing acceptance
+
+**Acceptance:**
+- [x] Typing inserts text; Backspace and Delete remove characters
+
+### G.4 — File save acceptance
+
+**Acceptance:**
+- [x] `Ctrl+S` saves to persistent FAT32 storage; verified with `cat`
+
+### G.5 — Quit acceptance
+
+**Acceptance:**
+- [x] `Ctrl+Q` quits; dirty-file warning requires 3 presses to force quit
+
+### G.6 — Search acceptance
+
+**Acceptance:**
+- [x] `Ctrl+F` searches with incremental updates; arrow keys navigate matches
+
+### G.7 — New file acceptance
+
+**Acceptance:**
+- [x] Opening nonexistent filename creates empty buffer; saving creates file on disk
+
+### G.8 — Vertical scrolling acceptance
+
+**Acceptance:**
+- [x] Scrolling works for files larger than terminal height (100+ lines)
+
+### G.9 — Horizontal scrolling acceptance
+
+**Acceptance:**
+- [x] Horizontal scrolling works for lines wider than terminal width
+
+### G.10 — Status bar acceptance
+
+**Acceptance:**
+- [x] Status bar shows filename, line count, cursor position, modified indicator
+
+### G.11 — Terminal restoration acceptance
+
+**Acceptance:**
+- [x] Terminal restored to cooked mode on exit (no garbled shell prompt)
+
+### G.12 — SMP acceptance
+
+**Acceptance:**
+- [x] Editor works correctly under SMP (no corruption with concurrent processes)
+
+### G.13 — Lint and format
+
+**Acceptance:**
+- [x] `cargo xtask check` passes (clippy + fmt)
+
+### G.14 — QEMU boot validation
+
+**Acceptance:**
+- [x] Editor launches, edits, saves, and quits without panics in both serial and framebuffer modes
+
+### G.15 — Documentation
+
+**File:** `docs/26-text-editor.md`
+**Why it matters:** Documents the editor architecture for future maintainers and extension work.
+
+**Acceptance:**
+- [x] Covers kibi port rationale, raw mode setup, append buffer, row model, screen refresh loop, m3OS backend, key mapping, file I/O, heap allocator
 
 ---
 
@@ -229,31 +602,10 @@ These items are explicitly out of scope for Phase 26:
 
 ---
 
-## Dependency Graph
+## Documentation Notes
 
-```mermaid
-flowchart TD
-    A["Track A<br/>syscall-lib extensions<br/>+ heap allocator"] --> B["Track B<br/>Raw mode verification"]
-    A --> C["Track C<br/>Port kibi core"]
-    A --> D["Track D<br/>m3OS platform backend"]
-    C --> E["Track E<br/>File I/O + search"]
-    D --> E
-    C --> F["Track F<br/>Build system + shell"]
-    E --> G["Track G<br/>Validation + docs"]
-    F --> G
-```
-
-## Parallelization Strategy
-
-**Wave 1:** Track A — extend `syscall-lib` with ioctl/termios/lseek wrappers
-and build the userspace heap allocator. This is the foundation everything else
-depends on.
-**Wave 2 (after A):** Tracks B, C, and D can proceed in parallel:
-- B: terminal raw mode verification (small test binary, quick validation)
-- C: port kibi's editor core logic (largest track, pure editor code)
-- D: write the m3OS platform backend (terminal glue, ~60-80 lines)
-**Wave 3 (after C + D):** Tracks E and F can proceed in parallel:
-- E: file I/O and search (connects editor core to the filesystem and search)
-- F: build system integration (add to xtask, initrd, shell)
-**Wave 4:** Track G — validation after all features are integrated. Test both
-serial and framebuffer modes.
+- Phase 26 adds the first userspace heap allocator (`BrkAllocator`), which is
+  reusable by all future Rust userspace programs.
+- The `ioctl`, `tcgetattr`, `tcsetattr`, `lseek`, and `get_window_size` wrappers
+  added to `syscall-lib` are general-purpose and used by later phases (29, 30).
+- The text editor is the first program to use raw terminal mode in the OS.
