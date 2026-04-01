@@ -128,6 +128,9 @@ struct Virtqueue {
     phys_base: u64,
     /// Virtual base address.
     virt_base: usize,
+    /// Buddy order used for the contiguous allocation (for correct cleanup).
+    #[allow(dead_code)]
+    alloc_order: usize,
     /// Total size of the allocation in bytes.
     #[allow(dead_code)]
     alloc_size: usize,
@@ -192,8 +195,7 @@ impl Virtqueue {
         let pages_needed = alloc_size.div_ceil(4096);
 
         // Allocate physically contiguous pages.
-        let first_frame = alloc_contiguous_frames(pages_needed)?;
-        let phys_base = first_frame;
+        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
         let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
 
         // Zero the allocation.
@@ -218,6 +220,8 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
+            // Free the contiguous allocation to avoid leaking pages.
+            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -252,6 +256,7 @@ impl Virtqueue {
             used_base,
             phys_base,
             virt_base,
+            alloc_order,
             alloc_size,
             buffers,
             buf_phys,
@@ -686,13 +691,14 @@ fn align_up(val: usize, alignment: usize) -> usize {
 /// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
 ///
 /// Rounds up to the next power-of-two order and delegates to
-/// `frame_allocator::allocate_contiguous()`.
-fn alloc_contiguous_frames(count: usize) -> Option<u64> {
+/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
+/// callers can correctly free via `free_contiguous(base, order)`.
+fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
     let order = if count <= 1 {
         0
     } else {
         (usize::BITS - (count - 1).leading_zeros()) as usize
     };
     let frame = frame_allocator::allocate_contiguous(order)?;
-    Some(frame.start_address().as_u64())
+    Some((frame.start_address().as_u64(), order))
 }

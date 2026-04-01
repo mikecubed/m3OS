@@ -134,6 +134,9 @@ struct Virtqueue {
     phys_base: u64,
     #[allow(dead_code)]
     virt_base: usize,
+    /// Buddy order used for the contiguous allocation (for correct cleanup).
+    #[allow(dead_code)]
+    alloc_order: usize,
     #[allow(dead_code)]
     alloc_size: usize,
 
@@ -183,8 +186,7 @@ impl Virtqueue {
         let alloc_size = Self::calc_size(queue_size);
         let pages_needed = alloc_size.div_ceil(4096);
 
-        let first_frame = alloc_contiguous_frames(pages_needed)?;
-        let phys_base = first_frame;
+        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
         let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
 
         // Zero the allocation.
@@ -207,10 +209,8 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
-            // Free the allocated queue frames to avoid leaking them.
-            for i in 0..pages_needed {
-                frame_allocator::free_frame(phys_base + (i as u64) * 4096);
-            }
+            // Free the contiguous allocation to avoid leaking pages.
+            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -234,6 +234,7 @@ impl Virtqueue {
             used_base,
             phys_base,
             virt_base,
+            alloc_order,
             alloc_size,
             last_used_idx: 0,
         })
@@ -712,14 +713,14 @@ fn align_up(val: usize, alignment: usize) -> usize {
 /// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
 ///
 /// Rounds up to the next power-of-two order and delegates to
-/// `frame_allocator::allocate_contiguous()`.
-fn alloc_contiguous_frames(count: usize) -> Option<u64> {
-    // Round up to next power of two to get the buddy order.
+/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
+/// callers can correctly free via `free_contiguous(base, order)`.
+fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
     let order = if count <= 1 {
         0
     } else {
         (usize::BITS - (count - 1).leading_zeros()) as usize
     };
     let frame = frame_allocator::allocate_contiguous(order)?;
-    Some(frame.start_address().as_u64())
+    Some((frame.start_address().as_u64(), order))
 }

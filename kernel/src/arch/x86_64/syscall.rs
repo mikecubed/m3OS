@@ -5042,18 +5042,47 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         }
     }
 
-    // Remove matching mappings from the process tracking list.
+    // Update mapping tracking list: handle full removal, shrink, and split.
     let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
             let unmap_start = addr;
             let unmap_end = addr + total_size;
-            proc.mappings.retain(|m| {
+            let mut new_mappings = alloc::vec::Vec::new();
+            proc.mappings.retain_mut(|m| {
                 let m_end = m.start + m.len;
-                // Remove mappings fully contained within the unmapped range.
-                !(m.start >= unmap_start && m_end <= unmap_end)
+                if m.start >= unmap_end || m_end <= unmap_start {
+                    // No overlap — keep as-is.
+                    return true;
+                }
+                if m.start >= unmap_start && m_end <= unmap_end {
+                    // Fully contained — remove.
+                    return false;
+                }
+                if m.start < unmap_start && m_end > unmap_end {
+                    // Hole punch: split into two mappings.
+                    // Keep the head portion in place.
+                    let tail = crate::process::MemoryMapping {
+                        start: unmap_end,
+                        len: m_end - unmap_end,
+                    };
+                    new_mappings.push(tail);
+                    m.len = unmap_start - m.start;
+                    return true;
+                }
+                if m.start < unmap_start {
+                    // Overlap at tail — shrink.
+                    m.len = unmap_start - m.start;
+                } else {
+                    // Overlap at head — shrink.
+                    let new_start = unmap_end;
+                    m.len = m_end - new_start;
+                    m.start = new_start;
+                }
+                true
             });
+            proc.mappings.extend(new_mappings);
         }
     }
 

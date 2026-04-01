@@ -112,6 +112,23 @@ impl BuddyAllocator {
         if order > MAX_ORDER {
             return;
         }
+        // Alignment check: PFN must be aligned to block size.
+        debug_assert!(
+            pfn.is_multiple_of(1 << order),
+            "BuddyAllocator::free: pfn {} not aligned to order {} (expected alignment {})",
+            pfn,
+            order,
+            1usize << order,
+        );
+        // Double-free guard: if already marked free at this order, bail out.
+        if self.is_free(order, pfn) {
+            debug_assert!(
+                false,
+                "BuddyAllocator::free: double-free of pfn {} at order {}",
+                pfn, order,
+            );
+            return;
+        }
         // Bounds check: the block must fit within managed pages.
         let block_pages = 1usize << order;
         if pfn.saturating_add(block_pages) > self.total_pages {
@@ -209,10 +226,16 @@ impl BuddyAllocator {
     /// This is O(n) in the free list length, but buddy merges are infrequent
     /// relative to the list size.
     fn remove_free(&mut self, order: usize, pfn: usize) {
-        self.clear_free(order, pfn);
         if let Some(pos) = self.free_lists[order].iter().position(|&p| p == pfn) {
+            self.clear_free(order, pfn);
             self.free_lists[order].swap_remove(pos);
             self.free_counts[order] -= 1;
+        } else {
+            debug_assert!(
+                false,
+                "BuddyAllocator::remove_free: pfn {} not found in free list for order {}",
+                pfn, order,
+            );
         }
     }
 }
