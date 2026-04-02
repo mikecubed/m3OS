@@ -146,12 +146,12 @@ update PTE permission bits in place. This is the core implementation.
 - [x] `mprotect(addr, len, PROT_NONE)` makes pages inaccessible (guard pages)
 - [x] Handles pages that are not yet demand-mapped (updates VMA prot only, no PTE to change)
 - [x] Returns `-EINVAL` for unaligned addresses or zero length
-- [x] Returns `-ENOMEM` for addresses not in any VMA
+- [x] Permissive for addresses outside tracked VMAs (stack, brk, ELF segments not tracked)
 
 ### C.2 — VMA splitting on mprotect boundaries
 
 **File:** `kernel/src/process/mod.rs`
-**Symbol:** `Process::split_vma`
+**Symbol:** `sys_mprotect` (VMA splitting implemented inline)
 **Why it matters:** If mprotect covers only part of a VMA, the VMA must be split
 into separate regions with different protection bits.
 

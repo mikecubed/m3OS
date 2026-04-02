@@ -2000,6 +2000,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
             proc.mmap_next = 0;
+            proc.mappings.clear(); // Phase 36: clear stale VMAs from old address space.
         }
     }
 
@@ -5233,16 +5234,23 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
             }
 
             if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
-                // Preserve CoW marker (BIT_9) if present.
                 let old_flags = pt[p1_idx].flags();
                 let old_addr = pt[p1_idx].addr();
-                let cow_bit = old_flags & PageTableFlags::BIT_9;
+                let is_cow = old_flags.contains(PageTableFlags::BIT_9);
                 let final_flags = if is_prot_none {
                     // Clear PRESENT to make the page trap on any access.
                     (old_flags & !PageTableFlags::PRESENT & !PageTableFlags::WRITABLE)
                         | PageTableFlags::BIT_10 // mark as guard page
                 } else {
-                    new_flags | cow_bit
+                    // Preserve CoW marker. If the page is CoW, keep it
+                    // non-writable — the CoW fault handler will make it
+                    // writable after copying.
+                    let mut f = new_flags;
+                    if is_cow {
+                        f |= PageTableFlags::BIT_9;
+                        f &= !PageTableFlags::WRITABLE;
+                    }
+                    f
                 };
                 pt[p1_idx].set_addr(old_addr, final_flags);
                 changed_addrs.push(page_addr);

@@ -409,12 +409,14 @@ extern "x86-interrupt" fn page_fault_handler(
                     .map(|m| m.prot)
             };
             if let Some(prot) = vma_prot {
-                // Check access permission: a write fault to a read-only VMA
-                // is a genuine protection violation, not a demand fault.
+                const PROT_READ: u64 = 0x1;
                 const PROT_WRITE: u64 = 0x2;
-                if (!is_write || prot & PROT_WRITE != 0)
-                    && demand_map_user_page(fault_addr_u64, prot)
-                {
+                const PROT_EXEC: u64 = 0x4;
+                // PROT_NONE pages must trap — never demand-map them.
+                let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+                // A write fault to a read-only VMA is a genuine violation.
+                let write_ok = !is_write || prot & PROT_WRITE != 0;
+                if any_access && write_ok && demand_map_user_page(fault_addr_u64, prot) {
                     return;
                 }
             }

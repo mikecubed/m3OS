@@ -105,7 +105,7 @@ The page fault handler walks this list to validate lazy faults.
 
 In `kernel/src/arch/x86_64/interrupts.rs`. Currently handles CoW faults (Phase 17)
 and stack demand-paging. Phase 36 extends it to check the VMA list for any faulting
-address. The decision chain becomes: CoW -> VMA lazy fault -> stack growth -> SIGSEGV.
+address. The decision chain becomes: CoW -> stack growth -> VMA lazy fault -> SIGSEGV.
 
 ### `demand_map_user_page()`
 
