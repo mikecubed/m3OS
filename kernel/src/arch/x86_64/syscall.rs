@@ -144,6 +144,291 @@ fn current_cwd() -> alloc::string::String {
     }
 }
 
+enum PathNodeKind {
+    File,
+    Dir,
+    Symlink(alloc::string::String),
+}
+
+fn parent_path(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/proc" || abs_path == "/dev" {
+        return Ok(PathNodeKind::Dir);
+    }
+    if abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/ptmx"
+    {
+        return Ok(PathNodeKind::File);
+    }
+    if abs_path.starts_with("/dev/pts/") {
+        return if dev_pts_path_exists(abs_path) {
+            Ok(PathNodeKind::File)
+        } else {
+            Err(NEG_ENOENT)
+        };
+    }
+
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        if rel.is_empty() {
+            return Ok(PathNodeKind::Dir);
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return match tmpfs.stat(rel) {
+            Ok(stat) if stat.is_symlink => tmpfs
+                .read_symlink(rel)
+                .map(|target| PathNodeKind::Symlink(alloc::string::String::from(target)))
+                .map_err(|_| NEG_EIO),
+            Ok(stat) if stat.is_dir => Ok(PathNodeKind::Dir),
+            Ok(_) => Ok(PathNodeKind::File),
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => Err(NEG_ENOENT),
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => Err(NEG_ENOTDIR),
+            Err(_) => Err(NEG_EIO),
+        };
+    }
+
+    if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(abs_path) {
+        return if node.is_dir() {
+            Ok(PathNodeKind::Dir)
+        } else {
+            Ok(PathNodeKind::File)
+        };
+    }
+
+    if abs_path == "/data" {
+        return Ok(PathNodeKind::Dir);
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && let Ok(ino) = vol.resolve_path(rel)
+                && let Ok(inode) = vol.read_inode(ino)
+            {
+                return if inode.is_symlink() {
+                    vol.read_symlink(ino)
+                        .map(PathNodeKind::Symlink)
+                        .map_err(|_| NEG_EIO)
+                } else if inode.is_dir() {
+                    Ok(PathNodeKind::Dir)
+                } else {
+                    Ok(PathNodeKind::File)
+                };
+            }
+        }
+        if rel.is_empty() {
+            return if data_is_mounted() {
+                Ok(PathNodeKind::Dir)
+            } else {
+                Err(NEG_ENOENT)
+            };
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return match vol.lookup(rel) {
+                    Ok(entry) if entry.is_dir() => Ok(PathNodeKind::Dir),
+                    Ok(_) => Ok(PathNodeKind::File),
+                    Err(_) => Err(NEG_ENOENT),
+                };
+            }
+        }
+    }
+
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            return match vol.resolve_path(rel) {
+                Ok(ino) => match vol.read_inode(ino) {
+                    Ok(inode) if inode.is_symlink() => vol
+                        .read_symlink(ino)
+                        .map(PathNodeKind::Symlink)
+                        .map_err(|_| NEG_EIO),
+                    Ok(inode) if inode.is_dir() => Ok(PathNodeKind::Dir),
+                    Ok(_) => Ok(PathNodeKind::File),
+                    Err(_) => Err(NEG_EIO),
+                },
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) => Err(NEG_ENOENT),
+                Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => Err(NEG_ENOTDIR),
+                Err(_) => Err(NEG_EIO),
+            };
+        }
+    }
+
+    Err(NEG_ENOENT)
+}
+
+fn resolve_existing_fs_path(
+    abs_path: &str,
+    follow_final: bool,
+) -> Result<alloc::string::String, u64> {
+    let mut current = resolve_path("/", abs_path);
+    let mut hops = 0usize;
+
+    'restart: loop {
+        let parts: alloc::vec::Vec<&str> = current
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Ok(alloc::string::String::from("/"));
+        }
+
+        let mut prefix = alloc::string::String::from("/");
+        for (index, part) in parts.iter().enumerate() {
+            require_search_permission(&prefix)?;
+            let candidate = if prefix == "/" {
+                alloc::format!("/{}", part)
+            } else {
+                alloc::format!("{}/{}", prefix, part)
+            };
+            let is_final = index + 1 == parts.len();
+            match path_node_nofollow(&candidate)? {
+                PathNodeKind::Symlink(target) if !is_final || follow_final => {
+                    if hops >= 40 {
+                        return Err(NEG_ELOOP);
+                    }
+                    hops += 1;
+                    let remaining = if is_final {
+                        alloc::string::String::new()
+                    } else {
+                        parts[index + 1..].join("/")
+                    };
+                    let base = if target.starts_with('/') {
+                        target
+                    } else {
+                        resolve_path(parent_path(&candidate), &target)
+                    };
+                    current = if remaining.is_empty() {
+                        base
+                    } else {
+                        resolve_path(&base, &remaining)
+                    };
+                    continue 'restart;
+                }
+                PathNodeKind::Dir if !is_final => prefix = candidate,
+                PathNodeKind::File | PathNodeKind::Symlink(_) if !is_final => {
+                    return Err(NEG_ENOTDIR);
+                }
+                _ => prefix = candidate,
+            }
+        }
+
+        return Ok(prefix);
+    }
+}
+
+fn resolve_parent_components(abs_path: &str) -> Result<alloc::string::String, u64> {
+    let normalized = resolve_path("/", abs_path);
+    let name = basename(&normalized);
+    let parent = parent_path(&normalized);
+    let resolved_parent = resolve_existing_fs_path(parent, true)?;
+    if resolved_parent == "/" {
+        Ok(alloc::format!("/{}", name))
+    } else {
+        Ok(alloc::format!("{}/{}", resolved_parent, name))
+    }
+}
+
+fn resolve_path_from_dirfd(dirfd: u64, raw_path: &str) -> Result<alloc::string::String, u64> {
+    if raw_path.is_empty() {
+        return Err(NEG_ENOENT);
+    }
+    if raw_path.starts_with('/') {
+        return Ok(resolve_path("/", raw_path));
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(resolve_path(&current_cwd(), raw_path));
+    }
+
+    let dirfd_idx = dirfd as usize;
+    if dirfd_idx >= MAX_FDS {
+        return Err(NEG_EBADF);
+    }
+    let dir_entry = current_fd_entry(dirfd_idx).ok_or(NEG_EBADF)?;
+    let base = match &dir_entry.backend {
+        FdBackend::Dir { path } => path.clone(),
+        _ => return Err(NEG_ENOTDIR),
+    };
+    Ok(resolve_path(&base, raw_path))
+}
+
+fn require_search_permission(abs_path: &str) -> Result<(), u64> {
+    if let Some((uid, gid, mode)) = path_metadata(abs_path) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(uid, gid, mode, euid, egid, 1) {
+            return Err(NEG_EACCES);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_create_path(lexical: &str, follow_final: bool) -> Result<alloc::string::String, u64> {
+    if follow_final && let Ok(PathNodeKind::Symlink(target)) = path_node_nofollow(lexical) {
+        let target_path = if target.starts_with('/') {
+            resolve_path("/", &target)
+        } else {
+            resolve_path(parent_path(lexical), &target)
+        };
+        return match resolve_existing_fs_path(&target_path, true) {
+            Ok(path) => Ok(path),
+            Err(NEG_ENOENT) => resolve_parent_components(&target_path),
+            Err(err) => Err(err),
+        };
+    }
+
+    resolve_parent_components(lexical)
+}
+
+fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 {
+    if raw_path.is_empty() {
+        return NEG_ENOENT;
+    }
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let follow_final = flags & O_NOFOLLOW == 0;
+    let resolved = if flags & O_CREAT != 0 {
+        match resolve_existing_fs_path(&lexical, follow_final) {
+            Ok(path) => path,
+            Err(NEG_ENOENT) => match resolve_create_path(&lexical, follow_final) {
+                Ok(path) => path,
+                Err(err) => return err,
+            },
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_existing_fs_path(&lexical, follow_final) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    };
+
+    if flags & O_NOFOLLOW != 0
+        && matches!(path_node_nofollow(&resolved), Ok(PathNodeKind::Symlink(_)))
+    {
+        return NEG_ELOOP;
+    }
+
+    open_resolved_path(&resolved, flags, mode_arg)
+}
+
 fn make_statfs(
     f_type: i64,
     f_blocks: u64,
@@ -645,11 +930,13 @@ pub extern "C" fn syscall_handler(
         1 => sys_linux_write(arg0, arg1, arg2),
         2 => sys_linux_open(arg0, arg1, arg2),
         3 => sys_linux_close(arg0),
-        // stat(path, buf) and lstat(path, buf) — no symlinks, both delegate to fstatat.
-        4 => sys_linux_fstatat(u64::MAX, arg0, arg1),
+        // stat(path, buf) follows the final symlink.
+        4 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
         5 => sys_linux_fstat(arg0, arg1),
-        6 => sys_linux_fstatat(u64::MAX, arg0, arg1),
-        // Phase 37: poll — wait-queue-driven I/O multiplexing.
+        // lstat(path, buf) inspects the final symlink itself.
+        6 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, AT_SYMLINK_NOFOLLOW),
+        // Phase 22: poll stub — report all requested fds as ready.
+        // Ion uses poll() to multiplex between signal pipe and stdin.
         7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 36: mprotect(addr, len, prot) — change page permissions.
@@ -658,6 +945,8 @@ pub extern "C" fn syscall_handler(
         9 => sys_linux_mmap(arg0, arg1, arg2),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
+        88 => sys_symlink(arg0, arg1),
+        89 => sys_readlink(arg0, arg1, arg2),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
         13 => sys_rt_sigaction(arg0, arg1, arg2),
         14 => sys_rt_sigprocmask(arg0, arg1, arg2),
@@ -855,7 +1144,7 @@ pub extern "C" fn syscall_handler(
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
-        262 => sys_linux_fstatat(arg0, arg1, arg2),
+        262 => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
         // Phase 37: epoll_wait(epfd, events, maxevents, timeout)
         232 => {
             let timeout = per_core_syscall_arg3();
@@ -873,6 +1162,15 @@ pub extern "C" fn syscall_handler(
             // 6th arg (sigmask) is in r9 — ignored for now.
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
+        265 => sys_linkat(
+            arg0,
+            arg1,
+            arg2,
+            per_core_syscall_arg3(),
+            crate::smp::per_core().syscall_user_r8,
+        ),
+        266 => sys_symlinkat(arg0, arg1, arg2),
+        267 => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
         // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
             let flags = per_core_syscall_arg3();
@@ -3750,9 +4048,12 @@ const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
+#[allow(dead_code)]
+const O_NOFOLLOW: u64 = 0o400000;
 
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
 const AT_FDCWD: u64 = (-100_i64) as u64;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
 /// Check if a resolved absolute path is a directory across all filesystems.
 fn is_directory(path: &str) -> bool {
@@ -3957,18 +4258,7 @@ fn ext2_root_path(path: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
-    let mut buf = [0u8; 512];
-    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
-        Some(n) => n,
-        None => return NEG_EFAULT,
-    };
-
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
-    let name: &str = &resolved;
-
+fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),     // O_RDONLY
@@ -4451,6 +4741,16 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     }
 }
 
+fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    open_user_path(AT_FDCWD, raw_name, flags, mode_arg)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 18: openat(dirfd, path, flags, mode) — syscall 257
 // ---------------------------------------------------------------------------
@@ -4458,228 +4758,13 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
     let mode_arg = per_core_syscall_arg3();
-    if dirfd == AT_FDCWD {
-        // Resolve relative to process cwd — same as sys_linux_open.
-        return sys_linux_open(path_ptr, flags, mode_arg);
-    }
-
-    // dirfd is a directory fd — resolve path relative to it.
-    let dirfd_idx = dirfd as usize;
-    if dirfd_idx >= MAX_FDS {
-        return NEG_EBADF;
-    }
-    let dir_entry = match current_fd_entry(dirfd_idx) {
-        Some(e) => e,
-        None => return NEG_EBADF,
-    };
-    let base_path = match &dir_entry.backend {
-        FdBackend::Dir { path } => path.clone(),
-        _ => return NEG_ENOTDIR,
-    };
-
-    // Read the relative path from userspace.
     let mut buf = [0u8; 512];
     let rel_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Resolve relative to the directory fd's path.
-    let resolved = resolve_path(&base_path, rel_name);
-    let name: &str = &resolved;
-
-    // Decode flags and delegate to the same open logic.
-    let (readable, writable) = match flags & 0o3 {
-        0 => (true, false),
-        1 => (false, true),
-        2 => (true, true),
-        _ => return NEG_EINVAL,
-    };
-
-    // /dev/null, /dev/zero, /dev/urandom, /dev/full — placed after flags decode.
-    let dev_backend = match name {
-        "/dev/null" => Some(FdBackend::DevNull),
-        "/dev/zero" => Some(FdBackend::DevZero),
-        "/dev/urandom" | "/dev/random" => Some(FdBackend::DevUrandom),
-        "/dev/full" => Some(FdBackend::DevFull),
-        _ => None,
-    };
-    if let Some(backend) = dev_backend {
-        let entry = FdEntry {
-            backend,
-            offset: 0,
-            readable,
-            writable,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Phase 29: /dev/ptmx — allocate a PTY pair and return the master fd.
-    if name == "/dev/ptmx" {
-        let pty_id = match crate::pty::alloc_pty() {
-            Ok(id) => id,
-            Err(()) => return NEG_ENOSPC,
-        };
-        log::info!("[pty] allocated PTY pair {}", pty_id);
-        let entry = FdEntry {
-            backend: FdBackend::PtyMaster { pty_id },
-            offset: 0,
-            readable: true,
-            writable: true,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => {
-                crate::pty::close_master(pty_id);
-                NEG_EMFILE
-            }
-        };
-    }
-
-    // Phase 29: /dev/pts/N — open the slave side of PTY N.
-    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
-        if let Ok(pty_id) = suffix.parse::<u32>() {
-            // Check + increment refcount under the same lock to prevent
-            // a race where the PTY is freed between check and alloc_fd.
-            {
-                let mut table = crate::pty::PTY_TABLE.lock();
-                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
-                    None => return NEG_ENOENT,
-                    Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => {
-                        pair.slave_refcount += 1;
-                        pair.slave_opened = true;
-                    }
-                }
-            }
-            let entry = FdEntry {
-                backend: FdBackend::PtySlave { pty_id },
-                offset: 0,
-                readable: true,
-                writable: true,
-                cloexec: false,
-                nonblock: false,
-            };
-            return match alloc_fd(3, entry) {
-                Some(i) => i as u64,
-                None => {
-                    crate::pty::close_slave(pty_id);
-                    NEG_EMFILE
-                }
-            };
-        }
-        return NEG_ENOENT;
-    }
-
-    let create = flags & O_CREAT != 0;
-    let truncate = flags & O_TRUNC != 0;
-    let append = flags & O_APPEND != 0;
-    let o_directory = flags & O_DIRECTORY != 0;
-    let path_is_dir = is_directory(name);
-
-    if o_directory && !path_is_dir {
-        if let Some(rel) = tmpfs_relative_path(name) {
-            if !rel.is_empty() {
-                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                if tmpfs.stat(rel).is_ok() {
-                    return NEG_ENOTDIR;
-                }
-            }
-        } else if crate::fs::ramdisk::get_file(name).is_some() {
-            return NEG_ENOTDIR;
-        }
-    }
-
-    if path_is_dir {
-        if writable || create || truncate {
-            return NEG_EISDIR;
-        }
-        let entry = FdEntry {
-            backend: FdBackend::Dir {
-                path: alloc::string::String::from(name),
-            },
-            offset: 0,
-            readable: true,
-            writable: false,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Tmpfs file open.
-    if let Some(rel) = tmpfs_relative_path(name) {
-        if rel.is_empty() {
-            return NEG_EISDIR;
-        }
-        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        let create_mode = (mode_arg as u16) & 0o7777;
-        let (_, _, caller_euid2, caller_egid2) = current_process_ids();
-        match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, create_mode) {
-            Ok(_) => {}
-            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
-            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
-            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => return NEG_ENOTDIR,
-            Err(_) => return NEG_EINVAL,
-        }
-        if truncate && writable {
-            let _ = tmpfs.truncate(rel, 0);
-        }
-        let initial_offset = if append {
-            tmpfs.file_size(rel).unwrap_or(0)
-        } else {
-            0
-        };
-        drop(tmpfs);
-        let entry = FdEntry {
-            backend: FdBackend::Tmpfs {
-                path: alloc::string::String::from(rel),
-            },
-            offset: initial_offset,
-            readable,
-            writable,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Ramdisk fallback — read-only.
-    if writable || create {
-        return NEG_EROFS;
-    }
-    let content = match crate::fs::ramdisk::get_file(name) {
-        Some(c) => c,
-        None => return NEG_ENOENT,
-    };
-    let entry = FdEntry {
-        backend: FdBackend::Ramdisk {
-            content_addr: content.as_ptr() as usize,
-            content_len: content.len(),
-        },
-        offset: 0,
-        readable: true,
-        writable: false,
-        cloexec: false,
-        nonblock: false,
-    };
-    match alloc_fd(3, entry) {
-        Some(i) => i as u64,
-        None => NEG_EMFILE,
-    }
+    open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
 // ---------------------------------------------------------------------------
@@ -6543,16 +6628,21 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
 // T026 (via path): newfstatat(dirfd, path, stat_ptr, flags)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
+fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     // Check tmpfs first.
@@ -6568,6 +6658,8 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         };
         let mode: u32 = if st.is_dir {
             0x4000 | st.mode as u32
+        } else if st.is_symlink {
+            0xA000 | 0o777
         } else {
             0x8000 | st.mode as u32
         };
@@ -6683,6 +6775,124 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
             NEG_ENOENT
         }
     }
+}
+
+fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> u64 {
+    sys_symlinkat(target_ptr, AT_FDCWD, linkpath_ptr)
+}
+
+fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
+    let mut target_buf = [0u8; 512];
+    let target = match read_user_cstr(target_ptr, &mut target_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let mut link_buf = [0u8; 512];
+    let raw_link = match read_user_cstr(linkpath_ptr, &mut link_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_link) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if path_node_nofollow(&resolved).is_ok() {
+        return NEG_EEXIST;
+    }
+
+    if let Some((pu, pg, pm)) = parent_dir_metadata(&resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
+
+    match resolve_fs_target(&resolved) {
+        FsTarget::Tmpfs(rel) => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            let (_, _, euid, egid) = current_process_ids();
+            match tmpfs.create_symlink_with_meta(&rel, target, euid, egid) {
+                Ok(()) => 0,
+                Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+                Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => NEG_ENOTDIR,
+                Err(_) => NEG_EIO,
+            }
+        }
+        FsTarget::DiskData(rel) => {
+            if !crate::fs::ext2::is_mounted() {
+                return NEG_EROFS;
+            }
+            let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return NEG_EIO;
+            };
+            let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                return NEG_EINVAL;
+            }
+            let (parent_ino, link_name) = if parts.len() == 1 {
+                (kernel_core::fs::ext2::EXT2_ROOT_INO, parts[0])
+            } else {
+                let parent_rel = parts[..parts.len() - 1].join("/");
+                match vol.resolve_path(&parent_rel) {
+                    Ok(ino) => (ino, parts[parts.len() - 1]),
+                    Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+                    Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+                    Err(_) => return NEG_EIO,
+                }
+            };
+            let (_, _, euid, egid) = current_process_ids();
+            match vol.create_symlink(parent_ino, link_name, target, euid, egid) {
+                Ok(_) => 0,
+                Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
+                Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => NEG_ENOTDIR,
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+                Err(kernel_core::fs::ext2::Ext2Error::OutOfSpace) => NEG_ENOSPC,
+                Err(_) => NEG_EIO,
+            }
+        }
+        FsTarget::Ramdisk => NEG_EROFS,
+    }
+}
+
+fn sys_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    sys_readlinkat(AT_FDCWD, path_ptr, buf_ptr, buf_len)
+}
+
+fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let mut path_buf = [0u8; 512];
+    let raw_path = match read_user_cstr(path_ptr, &mut path_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, false) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let target = match path_node_nofollow(&resolved) {
+        Ok(PathNodeKind::Symlink(target)) => target,
+        Ok(_) => return NEG_EINVAL,
+        Err(err) => return err,
+    };
+
+    let to_copy = core::cmp::min(target.len(), buf_len as usize);
+    if crate::mm::user_mem::copy_to_user(buf_ptr, &target.as_bytes()[..to_copy]).is_err() {
+        return NEG_EFAULT;
+    }
+    to_copy as u64
 }
 
 // ---------------------------------------------------------------------------

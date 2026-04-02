@@ -208,7 +208,10 @@ pub const SYS_CHDIR: u64 = 80;
 pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
+pub const SYS_LINK: u64 = 86;
 pub const SYS_UNLINK: u64 = 87;
+pub const SYS_SYMLINK: u64 = 88;
+pub const SYS_READLINK: u64 = 89;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_SETPGID: u64 = 109;
@@ -232,6 +235,9 @@ pub const SYS_SETREGID: u64 = 114;
 // Directory listing and stat
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_LINKAT: u64 = 265;
+pub const SYS_SYMLINKAT: u64 = 266;
+pub const SYS_READLINKAT: u64 = 267;
 
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
@@ -755,6 +761,60 @@ pub fn newfstatat_flags(path: &[u8], stat_buf: &mut [u8; 144], flags: u64) -> is
             path.as_ptr() as u64,
             stat_buf.as_mut_ptr() as u64,
             flags,
+        ) as isize
+    }
+}
+
+/// `lstat(path, buf)` — get metadata without following the final symlink.
+pub fn lstat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    newfstatat_flags(path, stat_buf, AT_SYMLINK_NOFOLLOW)
+}
+
+/// `symlink(target, linkpath)` — create a symbolic link.
+pub fn symlink(target: &[u8], linkpath: &[u8]) -> isize {
+    unsafe {
+        syscall2(
+            SYS_SYMLINK,
+            target.as_ptr() as u64,
+            linkpath.as_ptr() as u64,
+        ) as isize
+    }
+}
+
+/// `readlink(path, buf)` — read a symbolic link target without NUL termination.
+pub fn readlink(path: &[u8], buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_READLINK,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// `symlinkat(target, dirfd, linkpath)` — create a symbolic link relative to a directory fd.
+pub fn symlinkat(target: &[u8], dirfd: i32, linkpath: &[u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_SYMLINKAT,
+            target.as_ptr() as u64,
+            dirfd as u64,
+            linkpath.as_ptr() as u64,
+        ) as isize
+    }
+}
+
+/// `readlinkat(dirfd, path, buf)` — read a symbolic link target relative to a directory fd.
+pub fn readlinkat(dirfd: i32, path: &[u8], buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall4(
+            SYS_READLINKAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
         ) as isize
     }
 }

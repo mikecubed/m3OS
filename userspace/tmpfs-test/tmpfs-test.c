@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -201,12 +202,100 @@ static void test_sequential_write(void) {
     pass("sequential write");
 }
 
+/* Test 6: symlink creation, readlink, and stat/lstat semantics */
+static void test_symlink_semantics(void) {
+    const char *target_path = "/tmp/target.txt";
+    const char *link_path = "/tmp/link.txt";
+    const char *target_text = "through symlink";
+    char link_buf[128];
+    struct stat st;
+
+    int fd = open(target_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fail("symlink: create target", "open returned < 0");
+        return;
+    }
+    if (write(fd, target_text, strlen(target_text)) != (ssize_t)strlen(target_text)) {
+        fail("symlink: write target", "short write");
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    if (symlink(target_path, link_path) != 0) {
+        fail("symlink: create", "symlink returned non-zero");
+        return;
+    }
+
+    ssize_t n = readlink(link_path, link_buf, sizeof(link_buf));
+    if (n < 0) {
+        fail("symlink: readlink", "readlink returned < 0");
+        return;
+    }
+    if ((size_t)n != strlen(target_path)) {
+        fail("symlink: readlink length", "wrong target length");
+        return;
+    }
+    link_buf[n] = '\0';
+    if (strcmp(link_buf, target_path) != 0) {
+        fail("symlink: readlink content", "target mismatch");
+        return;
+    }
+
+    if (lstat(link_path, &st) != 0) {
+        fail("symlink: lstat", "lstat returned non-zero");
+        return;
+    }
+    if (!S_ISLNK(st.st_mode)) {
+        fail("symlink: lstat mode", "path is not reported as a symlink");
+        return;
+    }
+    if ((size_t)st.st_size != strlen(target_path)) {
+        fail("symlink: lstat size", "symlink size is not target length");
+        return;
+    }
+
+    if (stat(link_path, &st) != 0) {
+        fail("symlink: stat", "stat returned non-zero");
+        return;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fail("symlink: stat mode", "stat did not follow symlink to file");
+        return;
+    }
+    if ((size_t)st.st_size != strlen(target_text)) {
+        fail("symlink: stat size", "stat did not report target file size");
+        return;
+    }
+
+    fd = open(link_path, O_RDONLY);
+    if (fd < 0) {
+        fail("symlink: open link", "open through symlink returned < 0");
+        return;
+    }
+    memset(link_buf, 0, sizeof(link_buf));
+    n = read(fd, link_buf, sizeof(link_buf));
+    close(fd);
+    if (n != (ssize_t)strlen(target_text)) {
+        fail("symlink: open link length", "wrong byte count");
+        return;
+    }
+    if (memcmp(link_buf, target_text, strlen(target_text)) != 0) {
+        fail("symlink: open link content", "did not read target file data");
+        return;
+    }
+
+    pass("symlink create + readlink + stat");
+}
+
 /* Clean up test files */
 static void cleanup(void) {
     unlink("/tmp/test.txt");
     unlink("/tmp/todelete.txt");
     unlink("/tmp/trunc.txt");
     unlink("/tmp/append.txt");
+    unlink("/tmp/link.txt");
+    unlink("/tmp/target.txt");
 }
 
 int main(void) {
@@ -217,6 +306,7 @@ int main(void) {
     test_unlink();
     test_truncate();
     test_sequential_write();
+    test_symlink_semantics();
     cleanup();
 
     printf("[tmpfs-test] results: %d passed, %d failed\n", /* DevSkim: ignore DS154189 — format string is a literal */
