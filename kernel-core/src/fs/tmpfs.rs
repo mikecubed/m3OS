@@ -376,6 +376,7 @@ impl Tmpfs {
     }
 
     /// Change the permission mode of a file or directory.
+    /// Symlinks are silently ignored (POSIX: lchmod is a no-op on most systems).
     pub fn chmod(&mut self, path: &str, mode: u16) -> Result<(), TmpfsError> {
         let node = self.get_node_mut(path)?;
         match node {
@@ -386,7 +387,7 @@ impl Tmpfs {
         Ok(())
     }
 
-    /// Change the owner uid/gid of a file or directory.
+    /// Change the owner uid/gid of a file, directory, or symlink.
     pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), TmpfsError> {
         let node = self.get_node_mut(path)?;
         match node {
@@ -452,10 +453,12 @@ impl Tmpfs {
         }
     }
 
+    /// Create a symbolic link at `path` pointing to `target`.
     pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), TmpfsError> {
         self.create_symlink_with_meta(path, target, 0, 0)
     }
 
+    /// Create a symbolic link with specific ownership.
     pub fn create_symlink_with_meta(
         &mut self,
         path: &str,
@@ -478,6 +481,7 @@ impl Tmpfs {
         Ok(())
     }
 
+    /// Read the target of a symbolic link at `path`.
     pub fn read_symlink(&self, path: &str) -> Result<&str, TmpfsError> {
         let node = self.get_node(path)?;
         match node {
@@ -648,8 +652,10 @@ mod tests {
         let mut fs = Tmpfs::new();
         fs.create_symlink("/link", "/some/target").unwrap();
 
+        // read_symlink returns the target
         assert_eq!(fs.read_symlink("/link").unwrap(), "/some/target");
 
+        // stat reports is_symlink and target length as size
         let st = fs.stat("/link").unwrap();
         assert!(st.is_symlink);
         assert!(!st.is_dir);
@@ -672,5 +678,37 @@ mod tests {
         fs.create_symlink("/link", "/target").unwrap();
         fs.unlink("/link").unwrap();
         assert_eq!(fs.stat("/link"), Err(TmpfsError::NotFound));
+    }
+    #[test]
+    fn symlink_already_exists() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/a").unwrap();
+        assert_eq!(
+            fs.create_symlink("/link", "/b"),
+            Err(TmpfsError::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn stat_symlink_not_dir() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/target").unwrap();
+        let st = fs.stat("/link").unwrap();
+        assert!(!st.is_dir);
+        assert!(st.is_symlink);
+    }
+
+    #[test]
+    fn stat_file_not_symlink() {
+        let mut fs = Tmpfs::new();
+        fs.create_file("/f").unwrap();
+        let st = fs.stat("/f").unwrap();
+        assert!(!st.is_symlink);
+    }
+
+    #[test]
+    fn stat_dir_not_symlink() {
+        let st = Tmpfs::new().stat("/").unwrap();
+        assert!(!st.is_symlink);
     }
 }
