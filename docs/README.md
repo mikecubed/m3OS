@@ -33,6 +33,7 @@ userspace shell and programs.
 | [Ion Shell Integration](./21-ion-shell.md) | 21 | Redox OS ion shell, cross-compilation |
 | [TTY and Terminal Control](./22-tty-terminal.md) | 22 | termios, line discipline, cooked/raw mode |
 | [ANSI Escape Sequences](./22b-ansi-escape.md) | 22b | VT100 CSI parser, cursor, SGR colors |
+| [Socket API](./23-socket-api.md) | 23 | BSD socket syscalls, userspace ping, poll for sockets |
 | [Persistent Storage](./24-persistent-storage.md) | 24 | virtio-blk, FAT32 read/write, /data mount |
 | [SMP](./25-smp.md) | 25 | AP startup, per-core scheduler, TLB shootdown |
 | [Text Editor](./26-text-editor.md) | 26 | Full-screen editor (kibi-style) |
