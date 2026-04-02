@@ -12,9 +12,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::ext2::{
-    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS,
-    EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock,
-    S_IFDIR, S_IFREG,
+    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
+    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
+    Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG,
 };
 use spin::Mutex;
 
@@ -896,6 +896,103 @@ impl Ext2Volume {
         self.flush_metadata()?;
 
         Ok(new_ino)
+    }
+
+    pub fn create_symlink(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, Ext2Error> {
+        const INLINE_SYMLINK_MAX: usize = 60;
+
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+
+        let parent_group = kernel_core::fs::ext2::inode_block_group(
+            parent_inode_num,
+            self.superblock.inodes_per_group,
+        );
+        let new_ino = self.allocate_inode(parent_group)?;
+
+        let target_bytes = target.as_bytes();
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFLNK | 0o777;
+        inode.uid = uid as u16;
+        inode.gid = gid as u16;
+        inode.links_count = 1;
+        inode.size = target_bytes.len() as u32;
+
+        if target_bytes.len() <= INLINE_SYMLINK_MAX {
+            let mut raw = [0u8; INLINE_SYMLINK_MAX];
+            raw[..target_bytes.len()].copy_from_slice(target_bytes);
+            for (i, slot) in inode.block.iter_mut().enumerate() {
+                let offset = i * 4;
+                *slot = u32::from_le_bytes([
+                    raw[offset],
+                    raw[offset + 1],
+                    raw[offset + 2],
+                    raw[offset + 3],
+                ]);
+            }
+        } else {
+            let block_capacity = self.block_size as usize;
+            if target_bytes.len() > block_capacity {
+                return Err(Ext2Error::OutOfSpace);
+            }
+            let data_block = self.allocate_block(parent_group)?;
+            let mut block_data = vec![0u8; block_capacity];
+            block_data[..target_bytes.len()].copy_from_slice(target_bytes);
+            self.write_block(data_block, &block_data)?;
+            inode.block[0] = data_block;
+            inode.blocks = self.block_size / 512;
+        }
+
+        self.write_inode(new_ino, &inode)?;
+
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            new_ino,
+            EXT2_FT_SYMLINK,
+        )?;
+
+        Ok(new_ino)
+    }
+
+    pub fn read_symlink(&self, inode_num: u32) -> Result<String, Ext2Error> {
+        const INLINE_SYMLINK_MAX: usize = 60;
+
+        let inode = self.read_inode(inode_num)?;
+        if !inode.is_symlink() {
+            return Err(Ext2Error::CorruptedEntry);
+        }
+
+        let target_len = inode.size as usize;
+        if inode.blocks == 0 && target_len <= INLINE_SYMLINK_MAX {
+            let mut raw = [0u8; INLINE_SYMLINK_MAX];
+            for (i, slot) in inode.block.iter().enumerate() {
+                let offset = i * 4;
+                raw[offset..offset + 4].copy_from_slice(&slot.to_le_bytes());
+            }
+            String::from_utf8(raw[..target_len].to_vec()).map_err(|_| Ext2Error::CorruptedEntry)
+        } else {
+            let mut buf = vec![0u8; target_len];
+            let read = self.read_file_data(&inode, 0, &mut buf)?;
+            if read != target_len {
+                return Err(Ext2Error::CorruptedEntry);
+            }
+            String::from_utf8(buf).map_err(|_| Ext2Error::CorruptedEntry)
+        }
     }
 
     /// Truncate a file: free all data blocks (P28-T039).

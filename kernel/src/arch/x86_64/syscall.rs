@@ -47,6 +47,10 @@ const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
 const NEG_ENOMEM: u64 = (-12_i64) as u64;
+#[allow(dead_code)]
+const NEG_ELOOP: u64 = (-40_i64) as u64;
+#[allow(dead_code)]
+const NEG_EXDEV: u64 = (-18_i64) as u64;
 
 /// linux_dirent64 type constants.
 #[allow(dead_code)]
