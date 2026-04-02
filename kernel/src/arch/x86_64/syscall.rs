@@ -4334,6 +4334,8 @@ fn sys_linux_close(fd: u64) -> u64 {
             _ => {}
         }
     }
+    // Remove this FD from all epoll interest lists to prevent stale references.
+    epoll_remove_fd(fd);
     let mut found = false;
     with_current_fd_mut(fd, |slot| {
         if slot.is_some() {
@@ -7341,13 +7343,20 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
         }
         F_GETFL => {
             const O_NONBLOCK: u64 = 0x800;
+            const O_RDONLY: u64 = 0;
+            const O_WRONLY: u64 = 1;
+            const O_RDWR: u64 = 2;
             match current_fd_entry(fd as usize) {
                 Some(e) => {
+                    let mut flags = match (e.readable, e.writable) {
+                        (true, true) => O_RDWR,
+                        (false, true) => O_WRONLY,
+                        _ => O_RDONLY,
+                    };
                     if e.nonblock {
-                        O_NONBLOCK
-                    } else {
-                        0
+                        flags |= O_NONBLOCK;
                     }
+                    flags
                 }
                 None => NEG_EBADF,
             }
@@ -7939,6 +7948,9 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return NEG_EINVAL;
+    }
     let result = sys_accept(fd, addr_ptr, addr_len_ptr);
     // If accept failed (negative), return the error.
     if result as i64 >= 0 {
@@ -9233,6 +9245,14 @@ fn epoll_free(instance_id: usize) {
     let mut table = EPOLL_TABLE.lock();
     if instance_id < MAX_EPOLL_INSTANCES {
         table[instance_id] = None;
+    }
+}
+
+/// Remove an FD from all epoll interest lists (called on close).
+fn epoll_remove_fd(fd: usize) {
+    let mut table = EPOLL_TABLE.lock();
+    for inst in table.iter_mut().flatten() {
+        inst.interests.retain(|i| i.fd != fd);
     }
 }
 

@@ -132,7 +132,7 @@ pub fn close_slave(id: u32) {
         }
     }
     drop(table);
-    // Wake master side — master pollers see HUP when slave closes.
+    // Wake both sides — master pollers see HUP, slave waiters see close.
     wake_master(id);
     wake_slave(id);
 }
