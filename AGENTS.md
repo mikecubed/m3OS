@@ -260,3 +260,20 @@ Read before making significant changes:
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
+
+### Documentation templates — all docs must conform
+
+All roadmap docs must follow the templates in `docs/appendix/doc-templates.md`. When creating or updating docs, use the matching template:
+
+| Doc type | Template section | Required fields |
+|---|---|---|
+| Phase design doc | `docs/roadmap/NN-slug.md` | Status, Source Ref, Depends on, Builds on, Primary Components, Milestone Goal, Why This Phase Exists, Learning Goals, Feature Scope, Important Components and How They Work, How This Builds on Earlier Phases, Implementation Outline, Acceptance Criteria, Companion Task List, How Real OS Implementations Differ, Deferred Until Later |
+| Phase task doc | `docs/roadmap/tasks/NN-slug-tasks.md` | Status, Source Ref, Depends on, Goal, Track Layout table, per-track sections with tasks containing File/Symbol/Why it matters/Acceptance, Documentation Notes |
+| Roadmap README row | `docs/roadmap/README.md` | Phase, Theme, Primary Outcome, Status, Source Ref, Milestone link, Tasks link |
+
+Rules:
+- Never create a task doc without all template sections populated.
+- Never create a design doc missing Status, Source Ref, Depends on, or Builds on.
+- Task acceptance items must be concrete and measurable — no vague "works correctly".
+- Each task must have File, Symbol, and Why it matters fields.
+- Update the roadmap README row when creating or completing a phase.
