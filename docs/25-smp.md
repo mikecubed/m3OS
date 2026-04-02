@@ -127,8 +127,10 @@ All global locks audited for SMP safety:
 ### SMP-Unsafe Statics (deferred)
 
 **Phase 35 resolved this**: All syscall state is now per-core in `PerCoreData`,
-accessed via `gs:[OFFSET]` in the assembly entry stub with `swapgs` on
-entry/exit. Fields moved to per-core storage:
+accessed via `gs:[OFFSET]` in the assembly entry stub. The kernel sets each
+core's `gs_base` to its `PerCoreData` pointer during init and leaves it
+fixed — no `swapgs` is needed on syscall entry or return. Fields moved to
+per-core storage:
 
 - `syscall_stack_top` — kernel stack for ring-3 → ring-0 transitions
 - `syscall_user_rsp`, `syscall_user_rbx`, ..., `syscall_user_rflags`
@@ -139,8 +141,11 @@ entry/exit. Fields moved to per-core storage:
 All cores now dispatch userspace tasks. Per-CPU run queues assign tasks
 to the least-loaded core. Priority scheduling (0-9 real-time, 10-29
 normal, 30 idle) selects the highest-priority ready task. A periodic
-load balancer (every 100ms) migrates tasks between imbalanced cores,
-respecting CPU affinity masks. New syscalls: `nice(34)`,
+load balancer exists (`maybe_load_balance()`, gated on every 50 ticks —
+500ms at 100 Hz) but is **currently disabled** in the scheduler loop to
+avoid task migration thrashing with short-lived processes; it will be
+re-enabled once per-task cooldown or work-stealing is implemented.
+CPU affinity masks are respected. New syscalls: `nice(34)`,
 `sched_setaffinity(203)`, `sched_getaffinity(204)`, `times(100)`.
 
 ## QEMU Configuration

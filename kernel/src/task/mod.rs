@@ -136,7 +136,9 @@ pub struct Task {
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
-    _stack: Box<[u8]>,
+    /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
+    /// free stack memory for dead tasks without removing them from the vec.
+    _stack: Option<Box<[u8]>>,
 }
 
 impl Task {
@@ -164,7 +166,7 @@ impl Task {
             user_ticks: 0,
             system_ticks: 0,
             start_tick: 0,
-            _stack: stack,
+            _stack: Some(stack),
         }
     }
 }

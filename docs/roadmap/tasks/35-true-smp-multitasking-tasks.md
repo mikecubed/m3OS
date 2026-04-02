@@ -55,7 +55,7 @@ track replaces those shared statics with per-core storage reached through `gs_ba
 **Why it matters:** This is the core replacement step that swaps the earlier shared syscall statics for per-core register save slots.
 **Acceptance:**
 - [x] No `static mut` globals remain for syscall user state
-- [x] `swapgs` is used correctly on entry and return
+- [x] Syscall entry and return agree with the chosen gs_base/PerCoreData model (no swapgs required in the current implementation)
 - [x] BSP still handles syscalls correctly as a single-core regression check
 
 ### A.4 — Verify dual-core syscall safety

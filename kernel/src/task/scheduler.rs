@@ -121,6 +121,8 @@ impl Scheduler {
         // Their stack memory is released here to avoid leaks.
         for task in &mut self.tasks {
             if task.state == TaskState::Dead && task.saved_rsp != 0 {
+                // Drop the stack allocation to free memory.
+                let _ = task._stack.take();
                 // Mark as drained so we don't try to free again.
                 task.saved_rsp = 0;
             }
@@ -134,44 +136,40 @@ impl Scheduler {
     /// tasks that haven't been assigned to a queue yet). Finally, falls back
     /// to this core's idle task.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
-        // Drain local run queue, pick the highest-priority (lowest numeric) Ready task.
-        let mut best: Option<usize> = None;
-        let mut requeue = alloc::vec::Vec::new();
+        let core_bit = 1u64 << core_id;
 
+        // Scan local run queue: find the highest-priority (lowest numeric) Ready
+        // task in a single pass, then remove only that entry. No heap allocation.
         if let Some(data) = crate::smp::get_core_data(core_id) {
             let mut q = data.run_queue.lock();
-            while let Some(idx) = q.pop_front() {
+            let mut best_pos: Option<usize> = None;
+            let mut best_prio: u8 = u8::MAX;
+
+            // First pass: discard stale entries from the front while scanning.
+            let mut i = 0;
+            while i < q.len() {
+                let idx = q[i];
                 if idx >= self.tasks.len()
                     || self.tasks[idx].state != TaskState::Ready
                     || self.idle_tasks.contains(&Some(idx))
+                    || self.tasks[idx].affinity_mask & core_bit == 0
                 {
-                    // Stale entry — discard.
+                    // Stale or ineligible entry — discard.
+                    q.remove(i);
                     continue;
                 }
-                match best {
-                    Some(b) if self.tasks[idx].priority < self.tasks[b].priority => {
-                        // idx has higher priority — put old best back in queue.
-                        requeue.push(b);
-                        best = Some(idx);
-                    }
-                    Some(_) => {
-                        // idx has equal or lower priority — keep it for later.
-                        requeue.push(idx);
-                    }
-                    None => {
-                        best = Some(idx);
-                    }
+                if self.tasks[idx].priority < best_prio {
+                    best_prio = self.tasks[idx].priority;
+                    best_pos = Some(i);
                 }
+                i += 1;
             }
-            // Put non-selected entries back.
-            for i in requeue {
-                q.push_back(i);
-            }
-        }
 
-        if let Some(idx) = best {
-            self.last_run = idx;
-            return Some((self.tasks[idx].saved_rsp, idx));
+            if let Some(pos) = best_pos {
+                let idx = q.remove(pos).unwrap();
+                self.last_run = idx;
+                return Some((self.tasks[idx].saved_rsp, idx));
+            }
         }
 
         // Fallback: global round-robin scan for unqueued Ready tasks.
@@ -185,7 +183,9 @@ impl Scheduler {
                 if self.idle_tasks.contains(&Some(idx)) {
                     continue;
                 }
-                if self.tasks[idx].state == TaskState::Ready {
+                if self.tasks[idx].state == TaskState::Ready
+                    && self.tasks[idx].affinity_mask & core_bit != 0
+                {
                     self.last_run = idx;
                     return Some((self.tasks[idx].saved_rsp, idx));
                 }
@@ -309,7 +309,11 @@ pub fn spawn_idle(entry: fn() -> !) {
     spawn_idle_for_core(entry, 0);
 }
 
-/// Accumulate elapsed ticks for the current task (user_ticks for simplicity).
+/// Accumulate elapsed ticks for the current task.
+///
+/// Currently all ticks are attributed to `user_ticks`. Splitting ticks into
+/// user vs system (ring 3 vs ring 0) requires tracking the syscall-entry
+/// boundary and is deferred to a future phase.
 fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
     let now = crate::arch::x86_64::interrupts::tick_count();
     let elapsed = now.saturating_sub(sched.tasks[idx].start_tick);
@@ -635,11 +639,12 @@ pub fn run() -> ! {
 
 /// Periodic load balancer tick counter. BSP calls `maybe_load_balance()`
 /// from the timer interrupt path every tick; actual migration happens every
-/// 10 ticks (100ms at 100 Hz).
+/// 50 ticks (~500ms at 100 Hz). Note: load balancing is currently disabled
+/// in the scheduler loop due to task migration thrashing (see `run()`).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Called from the BSP's timer path. Every 10 ticks, checks queue imbalance
-/// and migrates one task if the longest queue exceeds the shortest by >1.
+/// Called from the BSP's timer path. Every 50 ticks (~500ms), checks queue
+/// imbalance and migrates one task if the longest queue exceeds the shortest by >2.
 pub fn maybe_load_balance() {
     let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if !cnt.is_multiple_of(50) {
@@ -754,11 +759,10 @@ pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
             None => return -3, // -ESRCH
         }
     } else {
-        // Find task by scanning for matching PID in process table.
-        // For kernel tasks, this is a no-op (they don't have PIDs).
+        // Find task by scanning for matching PID.
         let mut found = None;
         for (i, t) in sched.tasks.iter().enumerate() {
-            if t.id.0 as u32 == pid {
+            if t.pid == pid {
                 found = Some(i);
                 break;
             }
@@ -795,7 +799,7 @@ pub fn sys_sched_getaffinity(pid: u32) -> i64 {
     } else {
         let mut found = None;
         for (i, t) in sched.tasks.iter().enumerate() {
-            if t.id.0 as u32 == pid {
+            if t.pid == pid {
                 found = Some(i);
                 break;
             }

@@ -3,17 +3,29 @@
 //! A `WaitQueue` holds a list of tasks waiting for some event. Tasks call
 //! `sleep()` to block; other code calls `wake_one()` or `wake_all()` to
 //! unblock them.
+//!
+//! Each waiter carries an atomic `woken` flag so that a `wake_one()` or
+//! `wake_all()` that races with the window between enqueue and block does
+//! not lose the wakeup.
 
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use super::{TaskId, scheduler};
 
+/// An entry in the wait queue: task id + atomic woken token.
+struct WaitEntry {
+    id: TaskId,
+    woken: Arc<AtomicBool>,
+}
+
 /// A queue of tasks waiting for an event.
 pub struct WaitQueue {
-    waiters: Mutex<VecDeque<TaskId>>,
+    waiters: Mutex<VecDeque<WaitEntry>>,
 }
 
 impl WaitQueue {
@@ -27,28 +39,41 @@ impl WaitQueue {
     ///
     /// The task is set to `BlockedOnRecv` state and will be woken when
     /// `wake_one()` or `wake_all()` is called.
+    ///
+    /// Uses an atomic `woken` flag to prevent lost wakeups: if a waker
+    /// sets the flag between enqueue and the blocking call, the task
+    /// skips blocking entirely.
     pub fn sleep(&self) {
         if let Some(id) = scheduler::current_task_id() {
-            self.waiters.lock().push_back(id);
-            scheduler::block_current_on_recv();
+            let woken = Arc::new(AtomicBool::new(false));
+            self.waiters.lock().push_back(WaitEntry {
+                id,
+                woken: Arc::clone(&woken),
+            });
+            // If a waker already ran between enqueue and here, skip blocking.
+            if !woken.load(Ordering::Acquire) {
+                scheduler::block_current_on_recv();
+            }
         }
     }
 
     /// Wake the first waiting task, if any.
     pub fn wake_one(&self) {
-        if let Some(id) = self.waiters.lock().pop_front() {
-            scheduler::wake_task(id);
+        if let Some(entry) = self.waiters.lock().pop_front() {
+            entry.woken.store(true, Ordering::Release);
+            scheduler::wake_task(entry.id);
         }
     }
 
     /// Wake all waiting tasks.
     pub fn wake_all(&self) {
-        let waiters: VecDeque<TaskId> = {
+        let waiters: VecDeque<WaitEntry> = {
             let mut q = self.waiters.lock();
             core::mem::take(&mut *q)
         };
-        for id in waiters {
-            scheduler::wake_task(id);
+        for entry in waiters {
+            entry.woken.store(true, Ordering::Release);
+            scheduler::wake_task(entry.id);
         }
     }
 

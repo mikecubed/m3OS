@@ -34,7 +34,7 @@ impl<T> BlockingMutex<T> {
     pub fn lock(&self) -> BlockingMutexGuard<'_, T> {
         while self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             self.queue.sleep();

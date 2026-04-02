@@ -495,8 +495,11 @@ pub extern "C" fn syscall_handler(
         203 => {
             // sched_setaffinity: read mask from user memory
             let mask = if arg2 != 0 && arg1 >= 8 {
-                let user_slice = unsafe { core::slice::from_raw_parts(arg2 as *const u8, 8) };
-                u64::from_ne_bytes(user_slice.try_into().unwrap_or([0xFF; 8]))
+                let mut buf = [0u8; 8];
+                if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
+                    return NEG_EFAULT;
+                }
+                u64::from_ne_bytes(buf)
             } else {
                 u64::MAX
             };
@@ -508,8 +511,10 @@ pub extern "C" fn syscall_handler(
             if mask < 0 {
                 mask as u64
             } else if arg2 != 0 && arg1 >= 8 {
-                let out = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, 8) };
-                out.copy_from_slice(&(mask as u64).to_ne_bytes());
+                let bytes = (mask as u64).to_ne_bytes();
+                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
+                    return NEG_EFAULT;
+                }
                 8 // return bytes written
             } else {
                 NEG_EINVAL
@@ -1545,12 +1550,13 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 fn sys_times(buf_ptr: u64) -> u64 {
     let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
     if buf_ptr != 0 {
-        let buf = buf_ptr as *mut i64;
-        unsafe {
-            buf.write(user_ticks as i64); // tms_utime
-            buf.add(1).write(system_ticks as i64); // tms_stime
-            buf.add(2).write(0); // tms_cutime (children — not tracked yet)
-            buf.add(3).write(0); // tms_cstime
+        let mut bytes = [0u8; 32]; // 4 × i64
+        bytes[0..8].copy_from_slice(&(user_ticks as i64).to_ne_bytes()); // tms_utime
+        bytes[8..16].copy_from_slice(&(system_ticks as i64).to_ne_bytes()); // tms_stime
+        bytes[16..24].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cutime (children — not tracked yet)
+        bytes[24..32].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cstime
+        if crate::mm::user_mem::copy_to_user(buf_ptr, &bytes).is_err() {
+            return NEG_EFAULT;
         }
     }
     crate::arch::x86_64::interrupts::tick_count()
