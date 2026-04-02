@@ -272,22 +272,20 @@ fn write_statfs_to_user(buf_ptr: u64, stat: &Statfs) -> u64 {
     0
 }
 
+fn dev_pts_path_exists(abs_path: &str) -> bool {
+    let Some(suffix) = abs_path.strip_prefix("/dev/pts/") else {
+        return false;
+    };
+    let Ok(pty_id) = suffix.parse::<usize>() else {
+        return false;
+    };
+    let table = crate::pty::PTY_TABLE.lock();
+    table.get(pty_id).and_then(|slot| slot.as_ref()).is_some()
+}
+
 fn statfs_for_path(abs_path: &str) -> Statfs {
     if abs_path == "/proc" || abs_path.starts_with("/proc/") {
         return proc_statfs();
-    }
-    if let Some(rel) = fat32_relative_path(abs_path) {
-        if rel.is_empty() {
-            return fat32_statfs();
-        }
-        if crate::fs::fat32::is_mounted() {
-            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-            if let Some(vol) = vol.as_ref()
-                && vol.lookup(rel).is_ok()
-            {
-                return fat32_statfs();
-            }
-        }
     }
     if abs_path == "/tmp" || abs_path.starts_with("/tmp/") {
         return tmpfs_statfs();
@@ -315,11 +313,36 @@ fn statfs_for_path(abs_path: &str) -> Statfs {
             return ext2_statfs();
         }
     }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return ext2_statfs();
+            }
+        }
+        if rel.is_empty() {
+            return fat32_statfs();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.lookup(rel).is_ok()
+            {
+                return fat32_statfs();
+            }
+        }
+    }
     ramdisk_statfs()
 }
 
 fn statfs_path_exists(abs_path: &str) -> bool {
-    if abs_path == "/" || abs_path == "/tmp" {
+    if abs_path == "/"
+        || abs_path == "/tmp"
+        || abs_path == "/proc"
+        || abs_path.starts_with("/proc/")
+    {
         return true;
     }
     if abs_path == "/dev"
@@ -329,20 +352,11 @@ fn statfs_path_exists(abs_path: &str) -> bool {
         || abs_path == "/dev/random"
         || abs_path == "/dev/full"
         || abs_path == "/dev/ptmx"
-        || abs_path.starts_with("/dev/pts/")
     {
         return true;
     }
-    if let Some(rel) = fat32_relative_path(abs_path) {
-        if rel.is_empty() {
-            return data_is_mounted();
-        }
-        if crate::fs::fat32::is_mounted() {
-            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-            if let Some(vol) = vol.as_ref() {
-                return vol.lookup(rel).is_ok();
-            }
-        }
+    if abs_path.starts_with("/dev/pts/") {
+        return dev_pts_path_exists(abs_path);
     }
     if let Some(rel) = tmpfs_relative_path(abs_path) {
         if rel.is_empty() {
@@ -360,6 +374,25 @@ fn statfs_path_exists(abs_path: &str) -> bool {
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             return vol.exists(rel);
+        }
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return true;
+            }
+        }
+        if rel.is_empty() {
+            return data_is_mounted();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return vol.lookup(rel).is_ok();
+            }
         }
     }
     false
