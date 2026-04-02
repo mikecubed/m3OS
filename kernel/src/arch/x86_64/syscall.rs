@@ -144,6 +144,12 @@ fn current_cwd() -> alloc::string::String {
     }
 }
 
+fn current_umask() -> u16 {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table.find(pid).map(|proc| proc.umask).unwrap_or(0o022)
+}
+
 enum PathNodeKind {
     File,
     Dir,
@@ -1049,6 +1055,7 @@ pub extern "C" fn syscall_handler(
         91 => sys_linux_fchmod(arg0, arg1),
         92 => sys_linux_chown(arg0, arg1, arg2),
         93 => sys_linux_fchown(arg0, arg1, arg2),
+        95 => sys_umask(arg0),
         // Phase 35: times(buf) — fill struct tms with CPU time accounting
         100 => sys_times(arg0),
         // Phase 27: user/group identity syscalls
@@ -2440,6 +2447,7 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.gid = parent_ids.1;
             child.euid = parent_ids.2;
             child.egid = parent_ids.3;
+            child.umask = current_umask();
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
             child.mappings = parent_mappings;
@@ -4435,7 +4443,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
 
         // Open or create the file with caller's ownership.
-        let create_mode = (mode_arg as u16) & 0o7777;
+        let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
         let (_, _, caller_euid, caller_egid) = current_process_ids();
         match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, create_mode) {
             Ok(_created) => {}
@@ -4617,7 +4625,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                                 };
 
                                 // Set ownership and permissions on the newly created file.
-                                let create_mode = (mode_arg as u16) & 0o7777;
+                                let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
                                 let (_, _, caller_euid, caller_egid) = current_process_ids();
                                 crate::fs::fat32::set_fat32_meta(
                                     rel,
@@ -5035,7 +5043,7 @@ fn open_ext2_file(
                 (parent_ino, parts[parts.len() - 1])
             };
 
-            let create_mode = (mode_arg as u16) & 0o7777;
+            let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
             let (_, _, caller_euid, caller_egid) = current_process_ids();
 
             match vol.create_file(parent_ino, file_name, create_mode, caller_euid, caller_egid) {
@@ -7140,7 +7148,7 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
 // Phase 13: mkdir(pathname) — syscall 83
 // ---------------------------------------------------------------------------
 
-fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
+fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -7178,7 +7186,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                 }
             };
             let (_, _, mk_euid, mk_egid) = current_process_ids();
-            return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid) {
+            let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+            return match vol.create_directory(parent_ino, dir_name, create_mode, mk_euid, mk_egid) {
                 Ok(_) => {
                     log::info!("[mkdir] {} (ext2)", name);
                     0
@@ -7210,7 +7219,14 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                     }
                 };
                 let (_, _, mk_euid, mk_egid) = current_process_ids();
-                return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid) {
+                let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+                return match vol.create_directory(
+                    parent_ino,
+                    dir_name,
+                    create_mode,
+                    mk_euid,
+                    mk_egid,
+                ) {
                     Ok(_) => {
                         log::info!("[mkdir] {} (ext2)", name);
                         0
@@ -7240,7 +7256,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                     Ok(_) => {
                         log::info!("[mkdir] {} (fat32)", name);
                         let (_, _, mk_euid2, mk_egid2) = current_process_ids();
-                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, 0o755);
+                        let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, create_mode);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::AlreadyExists) => NEG_EEXIST,
@@ -7261,7 +7278,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
     let (_, _, mk_euid, mk_egid) = current_process_ids();
-    match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, 0o755) {
+    let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+    match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, create_mode) {
         Ok(()) => {
             log::info!("[mkdir] {}", name);
             0
@@ -7740,6 +7758,12 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Dir { path } => path.clone(),
         _ => return NEG_ENOTDIR,
     };
+    if let Some((uid, gid, mode)) = path_metadata(&dir_path) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(uid, gid, mode, euid, egid, 4) {
+            return NEG_EACCES;
+        }
+    }
 
     let offset = entry.offset;
     let max_bytes = (count as usize).min(64 * 1024);
@@ -7901,6 +7925,18 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     });
 
     out.len() as u64
+}
+
+fn sys_umask(mask: u64) -> u64 {
+    let new_mask = (mask as u16) & 0o777;
+    let pid = crate::process::current_pid();
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let Some(proc) = table.find_mut(pid) else {
+        return 0o022;
+    };
+    let old = proc.umask;
+    proc.umask = new_mask;
+    old as u64
 }
 
 // ---------------------------------------------------------------------------

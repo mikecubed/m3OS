@@ -527,6 +527,8 @@ pub struct Process {
     pub euid: u32,
     /// Effective group ID (Phase 27). Used for permission checks.
     pub egid: u32,
+    /// Per-process file creation mask (Phase 38). Defaults to 0o022.
+    pub umask: u16,
     /// Session ID (Phase 29). Equals the PID of the session leader.
     pub session_id: u32,
     /// Controlling terminal (Phase 29).
@@ -592,6 +594,7 @@ impl Process {
             gid: 0,
             euid: 0,
             egid: 0,
+            umask: 0o022,
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
             mappings: Vec::new(),
@@ -726,6 +729,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
@@ -777,6 +781,7 @@ pub fn spawn_process_with_cr3(
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
@@ -832,6 +837,7 @@ pub fn spawn_process_with_cr3_and_fds(
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),

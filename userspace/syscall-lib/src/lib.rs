@@ -223,6 +223,7 @@ pub const SYS_CHMOD: u64 = 90;
 pub const SYS_FCHMOD: u64 = 91;
 pub const SYS_CHOWN: u64 = 92;
 pub const SYS_FCHOWN: u64 = 93;
+pub const SYS_UMASK: u64 = 95;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
 pub const SYS_SETUID: u64 = 105;
@@ -836,6 +837,11 @@ pub fn linkat(olddirfd: i32, oldpath: &[u8], newdirfd: i32, newpath: &[u8], flag
             flags as u64,
         ) as isize
     }
+}
+
+/// `umask(mask)` — set file creation mask and return the previous mask.
+pub fn umask(mask: u32) -> isize {
+    unsafe { syscall1(SYS_UMASK, mask as u64) as isize }
 }
 
 // ===========================================================================
