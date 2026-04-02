@@ -226,7 +226,7 @@ debugging ELF loading, filesystem corruption, and raw data formats.
 ## Track C — System Tools
 
 These tools read kernel state through `/proc` (implemented in Phase 38) or
-existing syscall wrappers.
+existing libc-visible syscalls.
 
 ### C.1 — `ps`: list running processes
 
@@ -245,14 +245,15 @@ existing syscall wrappers.
 
 **File:** `userspace/coreutils/kill.c`
 **Symbol:** `main` (new binary)
-**Why it matters:** The shell has a built-in `kill`, but a standalone binary
-allows scripts and `xargs` to use it. Wraps the existing `kill()` syscall.
+**Why it matters:** A standalone `kill` binary lets scripts and `xargs` send
+signals without depending on shell-specific builtins. It is a thin wrapper
+around the existing `kill(2)` syscall exposed through musl libc.
 
 **Acceptance:**
 - [ ] `kill -9 <pid>` sends SIGKILL
 - [ ] `kill <pid>` sends SIGTERM (default)
 - [ ] `kill -l` lists available signal names
-- [ ] Wraps `syscall-lib::kill()`
+- [ ] Uses the existing `kill(2)` interface available to C userspace
 
 ### C.3 — `free`: memory usage summary
 
@@ -269,7 +270,20 @@ available memory. The `meminfo` Rust coreutil already exists
 - [ ] `free -h` displays human-readable sizes
 - [ ] Reads from `/proc/meminfo`
 
-### C.4 — `dmesg`: display kernel log buffer
+### C.4 — `uptime`: show time since boot
+
+**File:** `userspace/coreutils-rs/src/uptime.rs`
+**Symbol:** `main`
+**Why it matters:** The OS already ships a Rust `uptime` utility from Phase 34.
+Phase 41 should either keep that binary as the canonical implementation or
+extend its output/options so it fits the broader expanded-coreutils milestone.
+
+**Acceptance:**
+- [ ] `uptime` prints time since boot using `CLOCK_MONOTONIC`
+- [ ] Output remains available by default from the shell without an absolute path
+- [ ] If Phase 41 changes the output format, the design doc records that choice explicitly
+
+### C.5 — `dmesg`: display kernel log buffer
 
 **Files:**
 - `kernel/src/serial.rs` (kernel-side ring buffer)
@@ -286,7 +300,7 @@ interface lets userspace inspect boot and runtime kernel messages.
 - [ ] New log lines appear in `dmesg` output after boot messages
 - [ ] Interface is either `/proc/kmsg` file or a custom syscall
 
-### C.5 — `mount` / `umount`: mount and unmount filesystems
+### C.6 — `mount` / `umount`: mount and unmount filesystems
 
 **Files:**
 - `userspace/coreutils/mount.c`
@@ -362,27 +376,27 @@ approach — no new syscall needed.
 
 **File:** `userspace/coreutils/chmod.c`
 **Symbol:** `main` (new binary)
-**Why it matters:** `chmod` wraps the existing `chmod()` syscall (already in
-`syscall-lib`). Needs octal mode parsing (`chmod 755 file`).
+**Why it matters:** `chmod` is a thin C userspace wrapper around the existing
+`chmod(2)` syscall and needs reliable octal mode parsing (`chmod 755 file`).
 
 **Acceptance:**
 - [ ] `chmod 755 file` sets rwxr-xr-x permissions
 - [ ] `chmod u+x file` adds execute for owner (symbolic mode, stretch goal)
 - [ ] Error on non-existent file or permission denied
-- [ ] Wraps `syscall-lib::chmod()`
+- [ ] Uses the existing `chmod(2)` interface available to C userspace
 
 ### E.2 — `chown`: change file ownership
 
 **File:** `userspace/coreutils/chown.c`
 **Symbol:** `main` (new binary)
-**Why it matters:** `chown` wraps the existing `chown()` syscall. Needs
-`user:group` parsing with `/etc/passwd` lookup.
+**Why it matters:** `chown` is a thin C userspace wrapper around the existing
+`chown(2)` syscall and needs `user:group` parsing with `/etc/passwd` lookup.
 
 **Acceptance:**
 - [ ] `chown root:root file` changes owner and group
 - [ ] `chown 0:0 file` accepts numeric UID:GID
 - [ ] Only root can change ownership (kernel enforces)
-- [ ] Wraps `syscall-lib::chown()`
+- [ ] Uses the existing `chown(2)` interface available to C userspace
 
 ---
 
@@ -485,8 +499,8 @@ init must copy the new ELFs to the correct directory.
 
 **Acceptance:**
 - [ ] All new tools are available by name from the shell prompt
-- [ ] Tab completion (if supported by ion/sh0) includes new tool names
-- [ ] `which head` (or equivalent) resolves to the correct path
+- [ ] `head`, `find`, `ps`, and `dmesg` run from the default shell PATH without absolute paths
+- [ ] Boot or startup packaging places each binary in the same location the shell already searches
 
 ### G.3 — Add new Rust binaries to `coreutils_bins` (if any)
 
@@ -549,15 +563,19 @@ implementation — which tools were ported vs. written, and any scope changes.
   and `/proc/{pid}/status` — tools like `ps`, `free`, and `mount` (no args) can
   read these directly without new kernel work.
 - The `uptime` and `meminfo` Rust coreutils already exist in
-  `userspace/coreutils-rs/`. Phase 41 C equivalents (`free`, `uptime` standalone)
-  provide the familiar output format expected by Unix users and scripts.
+  `userspace/coreutils-rs/`. Phase 41 can keep `uptime` in Rust while adding
+  `free` as the more familiar `/proc/meminfo` presentation for Unix users.
 - Syscalls for `chmod()`, `chown()`, `fchmod()`, `fchown()`, `mount()`, `kill()`,
   and `link()`/`symlink()` already exist in `syscall-lib`. Most Track C and E
-  tools are thin wrappers around these.
+  tasks rely on kernel support that is already present even when the final
+  binary is implemented in C via musl libc.
 - The main new kernel work is Track D: the dmesg ring buffer and `umount` syscall.
   All other tools build on existing infrastructure.
 - The C tools are preferred over Rust for this phase because sbase provides
   clean, portable reference implementations that can be cross-compiled with
   `musl-gcc -static` using the same pipeline as existing C coreutils.
+- `bc` is intentionally out of the Track F task list even though it appeared in
+  early Phase 41 brainstorming; it stays deferred until after the core text,
+  file, and system utilities are in place.
 - A `ln` C binary (Track B.5) may be redundant with the existing Rust `ln` — the
   decision depends on whether sbase tools expect a C-linked `ln` in their PATH.

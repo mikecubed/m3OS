@@ -65,8 +65,8 @@ than a usable environment. This phase closes that gap by porting or writing ~30 
 | Tool | Purpose | Source |
 |---|---|---|
 | `ps` | List running processes | Write (reads kernel proc info) |
-| `kill` | Send signals to processes | Already exists via shell builtin; add standalone |
-| `uptime` | System uptime | Write (~20 lines C) |
+| `kill` | Send signals to processes | Write (thin wrapper over `kill(2)`) |
+| `uptime` | System uptime | Extend existing Rust utility or add C equivalent |
 | `free` | Memory usage summary | Write (~30 lines C) |
 | `dmesg` | Kernel log buffer | Write (reads kernel ring buffer) |
 | `mount` / `umount` | Mount/unmount filesystems | Write (wraps mount syscall) |
@@ -80,7 +80,6 @@ than a usable environment. This phase closes that gap by porting or writing ~30 
 | `less` / `more` | Pager for viewing files | Port sbase more or write minimal pager |
 | `strings` | Extract printable strings from binaries | Write (~40 lines C) |
 | `cal` | Calendar display | Port from sbase (~60 lines C) |
-| `bc` | Calculator | Port sbase bc or write minimal version |
 
 ### Porting Strategy: sbase
 
@@ -144,8 +143,9 @@ argument-parsing wrappers around these existing syscalls.
 1. Set up sbase cross-compilation with musl on the host.
 2. Port text processing tools first (head, tail, sort, uniq — most immediately useful).
 3. Port file tools (find, xargs, tee).
-4. Write system tools (ps, free, uptime) — these need kernel info, so implement
-   a `/proc`-like interface or info syscalls.
+4. Build the system tools around existing procfs and syscall support: `ps`,
+   `free`, `mount`, and `uptime` read the Phase 38 `/proc` files, while new
+   kernel work stays limited to the `dmesg` ring buffer and `umount`.
 5. Port diff and patch — essential for development workflows.
 6. Port or write a pager (less/more).
 7. Port remaining tools.
@@ -158,6 +158,7 @@ argument-parsing wrappers around these existing syscalls.
 - `find . -name "*.c" | xargs grep "main"` works.
 - `ps` shows running processes with PID, name, and status.
 - `free` shows total and available memory.
+- `uptime` reports time since boot and is available from the default shell PATH.
 - `diff file1 file2` shows differences; `patch` can apply the diff.
 - `less` provides scrollable file viewing with search.
 
@@ -181,4 +182,4 @@ is simpler to implement.
 - Locale and internationalization support
 - BusyBox-style multicall binary
 - man pages
-- `bc` calculator (complex parser; lower priority than file and system tools)
+- `bc` calculator (complex parser; deferred to a later follow-up once the text and file toolchain lands)

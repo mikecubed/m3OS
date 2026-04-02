@@ -156,7 +156,7 @@ flowchart TD
 |---|---|---|---|---|
 | 11 | ELF loader and process model | Complete | `phase-11` | [Phase 11 Tasks](./11-process-model-tasks.md) |
 | 12 | POSIX compatibility layer | Complete | `phase-12` | [Phase 12 Tasks](./12-posix-compat-tasks.md) |
-| 13 | Writable filesystem | Complete | `phase-13` | [Phase 13 Tasks](./13-writable-fs-tasks.md) |
+| 13 | Writable filesystem | Complete | `phase-13` | *not yet created* |
 | 14 | Shell and userspace tools | Complete | `phase-14` | [Phase 14 Tasks](./14-shell-and-tools-tasks.md) |
 | 15 | Hardware discovery (ACPI + PCI) | Complete | `phase-15` | [Phase 15 Tasks](./15-hardware-discovery-tasks.md) |
 | 16 | Network stack | Complete | `phase-16` | [Phase 16 Tasks](./16-network-tasks.md) |

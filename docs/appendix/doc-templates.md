@@ -1,6 +1,6 @@
 # Upstream roadmap doc templates
 
-These are copyable templates for the main doc types in `mikecubed/m3os`.
+These are copyable templates for the main doc types in `mikecubed/m3OS`.
 
 ## Template: phase design doc
 
