@@ -1924,7 +1924,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "phase 38 integration test",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "0 failed",
+        pattern: ", 0 failed",
         timeout_secs: 30,
         label: "verify tmpfs-test passed",
     });

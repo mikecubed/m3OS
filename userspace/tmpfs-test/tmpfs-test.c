@@ -1,10 +1,11 @@
-/* tmpfs-test.c — Phase 13 tmpfs validation.
+/* tmpfs-test.c — Phase 38 filesystem validation.
  *
- * Exercises the writable tmpfs mounted at /tmp:
- *   - create + write + close + reopen + read back (round-trip)
- *   - mkdir + rmdir
- *   - unlink
- *   - truncate
+ * Exercises the writable tmpfs mounted at /tmp plus the broader Phase 38
+ * filesystem surface:
+ *   - tmpfs file/dir/symlink creation, rename, unlink, truncate, and metadata
+ *   - hard links and symlink semantics
+ *   - procfs and device node behavior
+ *   - DAC and umask enforcement paths
  *
  * Compiled with musl-gcc -static and run as a userspace ELF binary.
  * Exit code 0 = all tests passed; non-zero = failure.

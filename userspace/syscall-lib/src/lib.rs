@@ -757,8 +757,8 @@ pub fn newfstatat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
 /// `path` must be null-terminated. `stat_buf` must be 144 bytes.
 /// Uses `AT_FDCWD` (-100) as dirfd.
 ///
-/// Note: the m3OS kernel currently ignores the `flags` parameter.
-/// This wrapper passes it for forward compatibility with the Linux ABI.
+/// Supported flags currently include `AT_SYMLINK_NOFOLLOW` for `lstat`-style
+/// metadata lookups. Other Linux `newfstatat` flags are not implemented yet.
 pub fn newfstatat_flags(path: &[u8], stat_buf: &mut [u8; 144], flags: u64) -> isize {
     unsafe {
         syscall4(
