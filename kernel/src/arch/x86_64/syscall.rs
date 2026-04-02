@@ -540,6 +540,11 @@ pub extern "C" fn syscall_handler(
             let cloexec = arg1 & 0x80000 != 0;
             sys_pipe_with_flags(arg0, cloexec)
         }
+        // Phase 37: accept4(fd, addr, addrlen, flags) — syscall 288
+        288 => {
+            let flags = per_core_syscall_arg3();
+            sys_accept4(arg0, arg1, arg2, flags)
+        }
         // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
         302 => NEG_ENOSYS,
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
@@ -7888,6 +7893,33 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
             }
         }
     }
+}
+
+/// accept4(fd, addr, addrlen, flags) — syscall 288
+///
+/// Like accept() but applies SOCK_NONBLOCK and SOCK_CLOEXEC flags
+/// to the newly accepted socket FD.
+fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    let result = sys_accept(fd, addr_ptr, addr_len_ptr);
+    // If accept failed (negative), return the error.
+    if result as i64 >= 0 {
+        let new_fd = result as usize;
+        if flags & (SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+            with_current_fd_mut(new_fd, |slot| {
+                if let Some(e) = slot {
+                    if flags & SOCK_NONBLOCK != 0 {
+                        e.nonblock = true;
+                    }
+                    if flags & SOCK_CLOEXEC != 0 {
+                        e.cloexec = true;
+                    }
+                }
+            });
+        }
+    }
+    result
 }
 
 /// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
