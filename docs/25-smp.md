@@ -126,21 +126,27 @@ All global locks audited for SMP safety:
 
 ### SMP-Unsafe Statics (deferred)
 
-The syscall entry path has `static mut` variables that are NOT per-core:
+**Phase 35 resolved this**: All syscall state is now per-core in `PerCoreData`,
+accessed via `gs:[OFFSET]` in the assembly entry stub. The kernel sets each
+core's `gs_base` to its `PerCoreData` pointer during init and leaves it
+fixed — no `swapgs` is needed on syscall entry or return. Fields moved to
+per-core storage:
 
-- `SYSCALL_STACK_TOP` — kernel stack for ring-3 → ring-0 transitions
-- `SYSCALL_USER_RSP`, `SYSCALL_USER_RBX`, ..., `SYSCALL_USER_RFLAGS`
-- `SYSCALL_ARG3` — mmap flags
-- `FORK_ENTRY_CTX` — fork child register restore
-- `CURRENT_PID` — global AtomicU32
+- `syscall_stack_top` — kernel stack for ring-3 → ring-0 transitions
+- `syscall_user_rsp`, `syscall_user_rbx`, ..., `syscall_user_rflags`
+- `syscall_arg3` — mmap flags (R10)
+- `fork_entry_ctx` — fork child register restore
+- `current_pid` — per-core AtomicU32
 
-These are written by the assembly `syscall_entry` stub on every syscall.
-Making them per-core requires changing the assembly to use `gs`-relative
-addressing (reading from `PerCoreData` fields). This is deferred.
-
-**Mitigation**: Only the BSP dispatches non-idle tasks. APs run their idle
-tasks and handle timer interrupts. This prevents userspace from running on
-APs where the syscall statics would be corrupted.
+All cores now dispatch userspace tasks. Per-CPU run queues assign tasks
+to the least-loaded core. Priority scheduling (0-9 real-time, 10-29
+normal, 30 idle) selects the highest-priority ready task. A periodic
+load balancer exists (`maybe_load_balance()`, gated on every 50 ticks —
+500ms at 100 Hz) but is **currently disabled** in the scheduler loop to
+avoid task migration thrashing with short-lived processes; it will be
+re-enabled once per-task cooldown or work-stealing is implemented.
+CPU affinity masks are respected. New syscalls: `nice(34)`,
+`sched_setaffinity(203)`, `sched_getaffinity(204)`, `times(100)`.
 
 ## QEMU Configuration
 

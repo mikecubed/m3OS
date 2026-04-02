@@ -122,36 +122,38 @@ pub struct ForkEntryCtx {
     pub rflags: u64, // offset 128
 }
 
-/// Static storage for the fork child entry context.
-/// Single-CPU: only one fork child enters userspace at a time.
-#[unsafe(no_mangle)]
-pub static mut FORK_ENTRY_CTX: ForkEntryCtx = ForkEntryCtx {
-    rip: 0,
-    rsp: 0,
-    rbx: 0,
-    rbp: 0,
-    r12: 0,
-    r13: 0,
-    r14: 0,
-    r15: 0,
-    ss: 0,
-    cs: 0,
-    rdi: 0,
-    rsi: 0,
-    rdx: 0,
-    r8: 0,
-    r9: 0,
-    r10: 0,
-    rflags: 0,
-};
+impl ForkEntryCtx {
+    pub const ZERO: Self = Self {
+        rip: 0,
+        rsp: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        ss: 0,
+        cs: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        rflags: 0,
+    };
+}
 
-// Assembly trampoline: reads ForkEntryCtx, restores ALL registers, IRETs to ring 3.
+// FORK_ENTRY_CTX has moved to PerCoreData (Phase 35).
+// The fork_enter_userspace assembly reads it via gs-relative addressing.
+
+// Assembly trampoline: reads ForkEntryCtx from a pointer (rdi), restores ALL
+// registers, then IRETs to ring 3.
 global_asm!(
     ".global fork_enter_userspace",
     "fork_enter_userspace:",
-    // On entry: FORK_ENTRY_CTX is populated.
-    // Use rax as the base pointer (will be zeroed before IRETQ).
-    "lea rax, [rip + FORK_ENTRY_CTX]",
+    // On entry: rdi = pointer to ForkEntryCtx (SysV calling convention).
+    "mov rax, rdi",
     // Restore callee-saved registers.
     "mov rbx, [rax + 16]",
     "mov rbp, [rax + 24]",
@@ -185,7 +187,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    fn fork_enter_userspace() -> !;
+    fn fork_enter_userspace(ctx: *const ForkEntryCtx) -> !;
 }
 
 /// Enter ring 3 for a fork child with full register restore.
@@ -211,8 +213,11 @@ pub unsafe fn enter_userspace_fork(
     r10: u64,
     rflags: u64,
 ) -> ! {
+    // Write to per-core ForkEntryCtx and pass pointer to assembly trampoline.
+    let data =
+        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
     unsafe {
-        FORK_ENTRY_CTX = ForkEntryCtx {
+        (*data).fork_entry_ctx = ForkEntryCtx {
             rip,
             rsp,
             rbx,
@@ -231,6 +236,6 @@ pub unsafe fn enter_userspace_fork(
             r10,
             rflags,
         };
-        fork_enter_userspace()
+        fork_enter_userspace(core::ptr::addr_of!((*data).fork_entry_ctx))
     }
 }

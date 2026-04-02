@@ -380,7 +380,7 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
 
-        let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
+        let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace page fault: pid={} addr={:?} err={:?} rip={:#x} — process killed\n",
             pid,
@@ -428,7 +428,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ) {
     // Check if the fault came from ring 3.
     if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3 {
-        let pid = crate::process::CURRENT_PID.load(Ordering::Relaxed);
+        let pid = crate::process::current_pid();
         _panic_print(format_args!(
             "[int] userspace GPF: pid={} — process killed\n{:?}\n",
             pid, stack_frame

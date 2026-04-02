@@ -49,14 +49,17 @@ use crate::ipc::{CapabilityTable, Message};
 
 pub use kernel_core::types::TaskId;
 
+pub mod blocking_mutex;
 pub mod scheduler;
+pub mod wait_queue;
 
 #[allow(unused_imports)]
 pub use scheduler::{
     block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
-    current_task_id, deliver_message, insert_cap, mark_current_dead, remove_task_cap, run,
-    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle,
-    spawn_idle_for_core, take_message, task_cap, wake_task, yield_now,
+    block_current_unless_woken, current_task_id, deliver_message, insert_cap, mark_current_dead,
+    maybe_load_balance, remove_task_cap, run, server_endpoint, set_server_endpoint,
+    signal_reschedule, spawn, spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice,
+    sys_sched_getaffinity, sys_sched_setaffinity, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,8 +119,26 @@ pub struct Task {
     /// Endpoint this task is the "server" of (used by `reply_recv` to find
     /// the endpoint to block on after replying).
     pub server_endpoint: Option<crate::ipc::EndpointId>,
+    /// Core this task is assigned to for per-CPU run queue dispatch (Phase 35).
+    pub assigned_core: u8,
+    /// PID of the userspace process this task is associated with (0 = kernel task).
+    pub pid: u32,
+    /// Task priority (Phase 35): 0-9 = real-time, 10-29 = normal, 30 = idle.
+    /// Lower numeric value = higher priority.
+    pub priority: u8,
+    /// CPU affinity mask (Phase 35): one bit per core (max 64 cores).
+    /// Default: all bits set (can run on any core).
+    pub affinity_mask: u64,
+    /// Ticks spent in ring 3 (user mode). Updated on context switch.
+    pub user_ticks: u64,
+    /// Ticks spent in ring 0 (syscall handling). Updated on context switch.
+    pub system_ticks: u64,
+    /// Tick count when this task was last dispatched.
+    pub start_tick: u64,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
-    _stack: Box<[u8]>,
+    /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
+    /// free stack memory for dead tasks without removing them from the vec.
+    _stack: Option<Box<[u8]>>,
 }
 
 impl Task {
@@ -138,7 +159,14 @@ impl Task {
             caps: CapabilityTable::new(),
             pending_msg: None,
             server_endpoint: None,
-            _stack: stack,
+            assigned_core: 0,
+            pid: 0,                  // Set by fork_child_trampoline for userspace tasks
+            priority: 20,            // Normal priority (middle of 10-29 range)
+            affinity_mask: u64::MAX, // Can run on any core
+            user_ticks: 0,
+            system_ticks: 0,
+            start_tick: 0,
+            _stack: Some(stack),
         }
     }
 }

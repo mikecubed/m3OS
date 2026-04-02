@@ -1616,7 +1616,11 @@ fn run_smoke_script(
 
                     // Trim buffer to prevent unbounded growth (keep last 64 KB).
                     if serial_buf.len() > 64 * 1024 {
-                        let cut = serial_buf.len() - 48 * 1024;
+                        let mut cut = serial_buf.len() - 48 * 1024;
+                        // Advance to next char boundary to avoid splitting a multi-byte UTF-8 sequence.
+                        while cut < serial_buf.len() && !serial_buf.is_char_boundary(cut) {
+                            cut += 1;
+                        }
                         serial_buf.drain(..cut);
                     }
                 }

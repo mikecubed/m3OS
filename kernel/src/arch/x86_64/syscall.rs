@@ -98,7 +98,7 @@ fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
 
 /// Get the current process's working directory.
 fn current_cwd() -> alloc::string::String {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let table = crate::process::PROCESS_TABLE.lock();
     match table.find(pid) {
         Some(p) => p.cwd.clone(),
@@ -122,135 +122,128 @@ use super::gdt;
 // Statics accessed from assembly
 // ---------------------------------------------------------------------------
 
-/// Scratch space to save the user RSP during a syscall.
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RSP: u64 = 0;
+// ---------------------------------------------------------------------------
+// Per-core syscall state (Phase 35)
+// ---------------------------------------------------------------------------
+//
+// All syscall user-state storage has moved to `PerCoreData` (smp/mod.rs).
+// The assembly entry stub accesses them via `gs:[OFFSET]` (gs_base is always
+// PerCoreData — user code cannot change it: no FSGSBASE, no wrmsr in ring 3).
+// The Rust-side helpers below read from per-core data.
 
-/// Saved value of R10 at SYSCALL entry.
+/// Read the per-core `syscall_arg3` (R10 at SYSCALL entry).
+fn per_core_syscall_arg3() -> u64 {
+    crate::smp::per_core().syscall_arg3
+}
+
+/// Read the per-core `syscall_stack_top`.
+pub(crate) fn per_core_syscall_stack_top() -> u64 {
+    crate::smp::per_core().syscall_stack_top
+}
+
+/// Read the per-core `syscall_user_rsp`.
+pub(crate) fn per_core_syscall_user_rsp() -> u64 {
+    crate::smp::per_core().syscall_user_rsp
+}
+
+/// Update the per-core `syscall_stack_top` (e.g. on process switch).
 ///
-/// R10 carries syscall arg3 in the Linux ABI (e.g. mmap flags).  It is not
-/// a SysV argument-passing register, so the assembly entry stub saves it
-/// here before the register setup for `syscall_handler`.  Single-CPU: safe.
-#[unsafe(no_mangle)]
-static mut SYSCALL_ARG3: u64 = 0;
-
-/// Saved user callee-saved registers at syscall entry (for fork child restore).
-/// These are the registers that the SYSCALL instruction does NOT clobber,
-/// so they carry the user's values into the kernel. The fork child trampoline
-/// reads these to enter userspace with the correct register state.
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RBX: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RBP: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R12: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R13: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R14: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R15: u64 = 0;
-
-/// Saved user caller-saved registers at syscall entry (for fork child restore).
-/// The Linux syscall ABI preserves ALL registers except RAX (return value),
-/// RCX (return address), and R11 (RFLAGS). The fork child must restore these
-/// so the child resumes with the same register state as the parent.
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RDI: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RSI: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RDX: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R8: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R9: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_R10: u64 = 0;
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_USER_RFLAGS: u64 = 0;
-
-/// Virtual address of the top of the kernel syscall stack.
+/// # Safety
 ///
-/// Updated by the fork-child trampoline when switching to a per-process
-/// kernel stack, so that SYSCALL entry uses the correct stack.
-#[unsafe(no_mangle)]
-pub(crate) static mut SYSCALL_STACK_TOP: u64 = 0;
+/// Must only be called on the owning core.
+pub(crate) unsafe fn set_per_core_syscall_stack_top(val: u64) {
+    let data =
+        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+    unsafe {
+        (*data).syscall_stack_top = val;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Assembly entry stub
 // ---------------------------------------------------------------------------
 
 global_asm!(
+    // Per-core field offsets (computed at compile time via offset_of!).
+    ".equ OFF_STACK_TOP,   {off_stack_top}",
+    ".equ OFF_USER_RSP,    {off_user_rsp}",
+    ".equ OFF_ARG3,        {off_arg3}",
+    ".equ OFF_USER_RBX,    {off_user_rbx}",
+    ".equ OFF_USER_RBP,    {off_user_rbp}",
+    ".equ OFF_USER_R12,    {off_user_r12}",
+    ".equ OFF_USER_R13,    {off_user_r13}",
+    ".equ OFF_USER_R14,    {off_user_r14}",
+    ".equ OFF_USER_R15,    {off_user_r15}",
+    ".equ OFF_USER_RDI,    {off_user_rdi}",
+    ".equ OFF_USER_RSI,    {off_user_rsi}",
+    ".equ OFF_USER_RDX,    {off_user_rdx}",
+    ".equ OFF_USER_R8,     {off_user_r8}",
+    ".equ OFF_USER_R9,     {off_user_r9}",
+    ".equ OFF_USER_R10,    {off_user_r10}",
+    ".equ OFF_USER_RFLAGS, {off_user_rflags}",
+
     ".global syscall_entry",
     "syscall_entry:",
-    // At entry:
-    //   RSP  = user RSP       (saved to SYSCALL_USER_RSP)
+    // At entry (from ring 3 via SYSCALL):
+    //   RSP  = user RSP
     //   RCX  = user RIP       (return address for SYSRETQ)
     //   R11  = user RFLAGS
     //   RAX  = syscall number
     //   RDI/RSI/RDX = args 0-2
+    //   GS_BASE = PerCoreData (user cannot change it: no FSGSBASE, no wrmsr)
 
-    // --- Switch to kernel stack ---
-    "mov [rip + SYSCALL_USER_RSP], rsp",
-    "mov rsp, [rip + SYSCALL_STACK_TOP]",
+    // --- Switch to per-core kernel stack ---
+    "mov gs:[OFF_USER_RSP], rsp",
+    "mov rsp, gs:[OFF_STACK_TOP]",
     "cld",
-    // --- Save user callee-saved registers for fork child restore ---
-    "mov [rip + SYSCALL_USER_RBX], rbx",
-    "mov [rip + SYSCALL_USER_RBP], rbp",
-    "mov [rip + SYSCALL_USER_R12], r12",
-    "mov [rip + SYSCALL_USER_R13], r13",
-    "mov [rip + SYSCALL_USER_R14], r14",
-    "mov [rip + SYSCALL_USER_R15], r15",
-    // --- Save user caller-saved registers for fork child restore ---
-    // The Linux syscall ABI preserves all registers except RAX/RCX/R11.
-    // The fork child must restore these so the child resumes correctly.
-    "mov [rip + SYSCALL_USER_RDI], rdi",
-    "mov [rip + SYSCALL_USER_RSI], rsi",
-    "mov [rip + SYSCALL_USER_RDX], rdx",
-    "mov [rip + SYSCALL_USER_R8], r8",
-    "mov [rip + SYSCALL_USER_R9], r9",
-    "mov [rip + SYSCALL_USER_R10], r10",
-    // Save user RFLAGS (in R11) so fork child can inherit it.
-    "mov [rip + SYSCALL_USER_RFLAGS], r11",
-    // --- Save return address and user flags ---
-    "push rcx", // user RIP  (restored before SYSRETQ)  [rsp+56 after all pushes]
+
+    // --- Save user callee-saved registers to per-core data ---
+    "mov gs:[OFF_USER_RBX], rbx",
+    "mov gs:[OFF_USER_RBP], rbp",
+    "mov gs:[OFF_USER_R12], r12",
+    "mov gs:[OFF_USER_R13], r13",
+    "mov gs:[OFF_USER_R14], r14",
+    "mov gs:[OFF_USER_R15], r15",
+
+    // --- Save user caller-saved registers (Linux ABI preserves these) ---
+    "mov gs:[OFF_USER_RDI], rdi",
+    "mov gs:[OFF_USER_RSI], rsi",
+    "mov gs:[OFF_USER_RDX], rdx",
+    "mov gs:[OFF_USER_R8],  r8",
+    "mov gs:[OFF_USER_R9],  r9",
+    "mov gs:[OFF_USER_R10], r10",
+    "mov gs:[OFF_USER_RFLAGS], r11",
+
+    // --- Save return address and user flags on stack ---
+    "push rcx", // user RIP
     "push r11", // user RFLAGS
-    // --- Save callee-saved registers ---
+
+    // --- Save callee-saved registers on stack ---
     "push rbx",
     "push rbp",
     "push r12",
     "push r13",
     "push r14",
     "push r15",
-    // --- Save caller-saved registers that Linux preserves across syscalls ---
-    // The Linux ABI guarantees all registers except rax, rcx, r11 are preserved.
-    // Our SysV rearrangement clobbers rdi/rsi/rdx/r8/r9, and r10 is used for
-    // mmap flags, so we must save and restore them here.
+
+    // --- Save caller-saved registers on stack (Linux-preserved) ---
     "push rdi",
     "push rsi",
     "push rdx",
     "push r10",
     "push r8",
     "push r9",
+
     // --- Set up SysV arguments for syscall_handler ---
-    // Stack layout (14 pushes):
-    //   rsp+  0: r9     rsp+ 48: r15    rsp+ 96: r11 (user RFLAGS)
-    //   rsp+  8: r8     rsp+ 56: r14    rsp+104: rcx (user RIP)
-    //   rsp+ 16: r10    rsp+ 64: r13
-    //   rsp+ 24: rdx    rsp+ 72: r12
-    //   rsp+ 32: rsi    rsp+ 80: rbp
-    //   rsp+ 40: rdi    rsp+ 88: rbx
-    //
-    // Save r10 for kernel-side access (mmap flags, etc.)
-    "mov [rip + SYSCALL_ARG3], r10",
+    // Save r10 (arg3) to per-core data for kernel-side access.
+    "mov gs:[OFF_ARG3], r10",
     // Load r8 (user_rip) BEFORE overwriting rcx.
-    "mov r8, [rsp + 104]",              // user_rip (5th param)
-    "mov r9, [rip + SYSCALL_USER_RSP]", // user_rsp (6th param)
-    "mov rcx, rdx",                     // arg2
-    "mov rdx, rsi",                     // arg1
-    "mov rsi, rdi",                     // arg0
-    "mov rdi, rax",                     // syscall number
+    "mov r8, [rsp + 104]",         // user_rip (5th param)
+    "mov r9, gs:[OFF_USER_RSP]",   // user_rsp (6th param)
+    "mov rcx, rdx",                // arg2
+    "mov rdx, rsi",                // arg1
+    "mov rsi, rdi",                // arg0
+    "mov rdi, rax",                // syscall number
     "call syscall_handler",
     // Return value is in RAX.
 
@@ -271,9 +264,27 @@ global_asm!(
     // --- Restore return info ---
     "pop r11", // user RFLAGS
     "pop rcx", // user RIP
+
     // --- Restore user RSP and return ---
-    "mov rsp, [rip + SYSCALL_USER_RSP]",
+    "mov rsp, gs:[OFF_USER_RSP]",
     "sysretq",
+
+    off_stack_top   = const crate::smp::offsets::SYSCALL_STACK_TOP,
+    off_user_rsp    = const crate::smp::offsets::SYSCALL_USER_RSP,
+    off_arg3        = const crate::smp::offsets::SYSCALL_ARG3,
+    off_user_rbx    = const crate::smp::offsets::SYSCALL_USER_RBX,
+    off_user_rbp    = const crate::smp::offsets::SYSCALL_USER_RBP,
+    off_user_r12    = const crate::smp::offsets::SYSCALL_USER_R12,
+    off_user_r13    = const crate::smp::offsets::SYSCALL_USER_R13,
+    off_user_r14    = const crate::smp::offsets::SYSCALL_USER_R14,
+    off_user_r15    = const crate::smp::offsets::SYSCALL_USER_R15,
+    off_user_rdi    = const crate::smp::offsets::SYSCALL_USER_RDI,
+    off_user_rsi    = const crate::smp::offsets::SYSCALL_USER_RSI,
+    off_user_rdx    = const crate::smp::offsets::SYSCALL_USER_RDX,
+    off_user_r8     = const crate::smp::offsets::SYSCALL_USER_R8,
+    off_user_r9     = const crate::smp::offsets::SYSCALL_USER_R9,
+    off_user_r10    = const crate::smp::offsets::SYSCALL_USER_R10,
+    off_user_rflags = const crate::smp::offsets::SYSCALL_USER_RFLAGS,
 );
 
 // ---------------------------------------------------------------------------
@@ -365,6 +376,15 @@ pub extern "C" fn syscall_handler(
         22 => sys_pipe_with_flags(arg0, false),
         32 => sys_dup(arg0),
         33 => sys_dup2(arg0, arg1),
+        // Phase 35: nice(increment) — adjust task priority
+        34 => {
+            let pid = crate::process::current_pid();
+            let uid_val = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).map(|p| p.uid).unwrap_or(0)
+            };
+            crate::task::sys_nice(arg0 as i32, uid_val) as u64
+        }
         // Phase 14: nanosleep
         35 => sys_nanosleep(arg0),
         // Phase 23: socket syscalls
@@ -372,19 +392,15 @@ pub extern "C" fn syscall_handler(
         42 => sys_connect(arg0, arg1, arg2),
         43 => sys_accept(arg0, arg1, arg2),
         44 => {
-            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            let addr_ptr =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
-            let addr_len =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)) };
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len = crate::smp::per_core().syscall_user_r9;
             sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
         }
         45 => {
-            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            let addr_ptr =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
-            let addr_len_ptr =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R9)) };
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
             sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
         }
         48 => sys_shutdown_sock(arg0, arg1),
@@ -393,14 +409,13 @@ pub extern "C" fn syscall_handler(
         51 => sys_getsockname(arg0, arg1, arg2),
         52 => sys_getpeername(arg0, arg1, arg2),
         54 => {
-            let optval_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            let optlen = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen = crate::smp::per_core().syscall_user_r8;
             sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
         }
         55 => {
-            let optval_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
-            let optlen_ptr =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_USER_R8)) };
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
             sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
         }
         // IPC syscalls (Phase 6) — kernel-task only.
@@ -412,7 +427,7 @@ pub extern "C" fn syscall_handler(
         // Phase 21/22: socketpair — implement as pipe pair.
         // arg1 has type|flags (SOCK_CLOEXEC=0x80000).
         53 => {
-            let sv_ptr = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            let sv_ptr = per_core_syscall_arg3();
             let cloexec = arg1 & 0x80000 != 0;
             sys_pipe_with_flags(sv_ptr, cloexec)
         }
@@ -443,6 +458,8 @@ pub extern "C" fn syscall_handler(
         91 => sys_linux_fchmod(arg0, arg1),
         92 => sys_linux_chown(arg0, arg1, arg2),
         93 => sys_linux_fchown(arg0, arg1, arg2),
+        // Phase 35: times(buf) — fill struct tms with CPU time accounting
+        100 => sys_times(arg0),
         // Phase 27: user/group identity syscalls
         102 => sys_linux_getuid(),
         104 => sys_linux_getgid(),
@@ -474,6 +491,39 @@ pub extern "C" fn syscall_handler(
         200 => sys_kill(arg0, arg1),
         // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
         202 => sys_futex(arg0, arg1, arg2),
+        // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
+        203 => {
+            // sched_setaffinity: read mask from user memory
+            if arg2 == 0 {
+                return NEG_EFAULT;
+            }
+            if arg1 < 8 {
+                return NEG_EINVAL;
+            }
+            let mask = {
+                let mut buf = [0u8; 8];
+                if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
+                    return NEG_EFAULT;
+                }
+                u64::from_ne_bytes(buf)
+            };
+            crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
+        }
+        204 => {
+            // sched_getaffinity: write mask to user memory
+            let mask = crate::task::sys_sched_getaffinity(arg0 as u32);
+            if mask < 0 {
+                mask as u64
+            } else if arg2 != 0 && arg1 >= 8 {
+                let bytes = (mask as u64).to_ne_bytes();
+                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
+                    return NEG_EFAULT;
+                }
+                8 // return bytes written
+            } else {
+                NEG_EINVAL
+            }
+        }
         217 => sys_linux_getdents64(arg0, arg1, arg2),
         218 => sys_linux_set_tid_address(),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
@@ -498,7 +548,7 @@ pub extern "C" fn syscall_handler(
         262 => sys_linux_fstatat(arg0, arg1, arg2),
         // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
-            let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+            let flags = per_core_syscall_arg3();
             sys_utimensat(arg0, arg1, arg2, flags)
         }
         // Custom kernel debug print (moved from 12, Phase 12 T010)
@@ -528,7 +578,7 @@ pub extern "C" fn syscall_handler(
 /// sigframe on the user stack and enters ring 3 at the handler address.
 /// The normal syscall return path is never reached in that case.
 fn check_pending_signals(syscall_result: u64) {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     if pid == 0 {
         return; // kernel task, no signals
     }
@@ -555,7 +605,7 @@ fn check_pending_signals(syscall_result: u64) {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
-                        let sig_saved_rsp = unsafe { SYSCALL_USER_RSP };
+                        let sig_saved_rsp = per_core_syscall_user_rsp();
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -738,12 +788,12 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
 
 /// `getpid()` — return the calling process's PID.
 fn sys_getpid() -> u64 {
-    crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed) as u64
+    crate::process::current_pid() as u64
 }
 
 /// `getppid()` — return the calling process's parent PID.
 fn sys_getppid() -> u64 {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     crate::process::PROCESS_TABLE
         .lock()
         .find(pid)
@@ -757,7 +807,7 @@ fn sys_getppid() -> u64 {
 /// CR3 (so the next scheduled task has a consistent address space), then marks
 /// the kernel task as dead so it is never rescheduled.
 fn sys_exit(code: i32) -> ! {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     log::info!("[p{}] exit({})", pid, code);
     if pid != 0 {
         // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
@@ -827,7 +877,7 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
         0
     } else if target_pid == 0 {
         // Send to caller's process group.
-        let caller_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let caller_pid = crate::process::current_pid();
         let pgid = {
             let table = crate::process::PROCESS_TABLE.lock();
             table.find(caller_pid).map(|p| p.pgid).unwrap_or(0)
@@ -848,7 +898,7 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 /// restores all saved registers and the signal mask, and enters ring 3 at
 /// the interrupted instruction.  It never returns through the normal path.
 fn sys_sigreturn(user_rsp: u64) -> ! {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
 
     // Restore registers and signal mask from the sigframe.
     let (regs, saved_mask) = match crate::signal::restore_sigframe(user_rsp) {
@@ -974,7 +1024,7 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
         Some(p) => p,
@@ -1084,7 +1134,7 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 ///
 /// Reads/modifies the calling process's blocked-signal mask.
 fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
 
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
@@ -1144,7 +1194,7 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
 
 /// `sigaltstack(ss, old_ss)` — register/query alternate signal stack (syscall 131).
 fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
 
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
@@ -1374,7 +1424,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
 
 /// `setpgid(pid, pgid)` — set process group ID (syscall 109).
 fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
-    let caller = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let caller = crate::process::current_pid();
     let target = if pid == 0 {
         caller
     } else {
@@ -1399,7 +1449,7 @@ fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
 /// `getpgid(pid)` — get process group ID (syscall 121).
 fn sys_getpgid(pid: u64) -> u64 {
     let target = if pid == 0 {
-        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed)
+        crate::process::current_pid()
     } else {
         pid as crate::process::Pid
     };
@@ -1413,7 +1463,7 @@ fn sys_getpgid(pid: u64) -> u64 {
 
 /// `setsid()` — create a new session (syscall 112).
 fn sys_setsid() -> u64 {
-    let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let calling_pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
 
     // POSIX: fail if the caller is already a process-group leader (pgid == pid).
@@ -1436,7 +1486,7 @@ fn sys_setsid() -> u64 {
 /// `getsid(pid)` — get session ID (syscall 124).
 fn sys_getsid(pid: u64) -> u64 {
     let target = if pid == 0 {
-        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed)
+        crate::process::current_pid()
     } else {
         pid as crate::process::Pid
     };
@@ -1467,8 +1517,8 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     // Each PIT tick is ~10ms (100 Hz). Convert seconds+nsec to ticks.
     let ticks = (secs as u64).saturating_mul(100) + (nsecs as u64) / 10_000_000;
     let start = crate::arch::x86_64::interrupts::tick_count();
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
     while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
         crate::task::yield_now();
         restore_caller_context(pid, saved_user_rsp);
@@ -1485,12 +1535,35 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
 
 /// Helper: get the uid/gid/euid/egid of the current process.
 fn current_process_ids() -> (u32, u32, u32, u32) {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let table = crate::process::PROCESS_TABLE.lock();
     match table.find(pid) {
         Some(p) => (p.uid, p.gid, p.euid, p.egid),
         None => (0, 0, 0, 0),
     }
+}
+
+/// `times(buf)` — fill struct tms with CPU time accounting (syscall 100).
+///
+/// struct tms layout (Linux compatible, 4 x i64):
+///   offset 0: tms_utime  — user CPU time
+///   offset 8: tms_stime  — system CPU time
+///   offset 16: tms_cutime — children user CPU time
+///   offset 24: tms_cstime — children system CPU time
+/// Returns: clock ticks since boot.
+fn sys_times(buf_ptr: u64) -> u64 {
+    let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
+    if buf_ptr != 0 {
+        let mut bytes = [0u8; 32]; // 4 × i64
+        bytes[0..8].copy_from_slice(&(user_ticks as i64).to_ne_bytes()); // tms_utime
+        bytes[8..16].copy_from_slice(&(system_ticks as i64).to_ne_bytes()); // tms_stime
+        bytes[16..24].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cutime (children — not tracked yet)
+        bytes[24..32].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cstime
+        if crate::mm::user_mem::copy_to_user(buf_ptr, &bytes).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+    crate::arch::x86_64::interrupts::tick_count()
 }
 
 /// `getuid()` — return real user ID (syscall 102).
@@ -1521,7 +1594,7 @@ fn sys_linux_getegid() -> u64 {
 /// check in userspace provides the security boundary.
 fn sys_linux_setuid(uid_arg: u64) -> u64 {
     let new_uid = uid_arg as u32;
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
         Some(p) => p,
@@ -1537,7 +1610,7 @@ fn sys_linux_setuid(uid_arg: u64) -> u64 {
 /// Unconditional — see `sys_linux_setuid` comment.
 fn sys_linux_setgid(gid_arg: u64) -> u64 {
     let new_gid = gid_arg as u32;
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
         Some(p) => p,
@@ -1555,7 +1628,7 @@ fn sys_linux_setgid(gid_arg: u64) -> u64 {
 fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
     let ruid = ruid_arg as i32;
     let euid = euid_arg as i32;
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
         Some(p) => p,
@@ -1587,7 +1660,7 @@ fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
 fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
     let rgid = rgid_arg as i32;
     let egid = egid_arg as i32;
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
         Some(p) => p,
@@ -1623,7 +1696,7 @@ fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
 ///
 /// Returns the child PID to the parent.
 fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
-    let parent_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let parent_pid = crate::process::current_pid();
     log::info!("[p{}] fork()", parent_pid);
 
     // Allocate a new page table for the child, copying kernel entries.
@@ -1826,11 +1899,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let resolved = resolve_path(&cwd, name);
     let name: &str = &resolved;
 
-    log::info!(
-        "[p{}] execve({})",
-        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed),
-        name
-    );
+    log::info!("[p{}] execve({})", crate::process::current_pid(), name);
 
     // Parse argv and envp from user memory.
     let user_argv = match read_user_string_array(argv_ptr, 256) {
@@ -1918,7 +1987,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     // Close file descriptors with FD_CLOEXEC set.
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     crate::process::close_cloexec_fds(pid);
 
     // Update the process entry with the new CR3 and entry point.
@@ -1953,8 +2022,8 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             .map(|p| p.kernel_stack_top)
             .unwrap_or(0);
         if kstack_top != 0 {
-            gdt::set_kernel_stack(kstack_top);
-            SYSCALL_STACK_TOP = kstack_top;
+            crate::smp::set_current_core_kernel_stack(kstack_top);
+            set_per_core_syscall_stack_top(kstack_top);
         }
         crate::arch::x86_64::enter_userspace(loaded.entry, user_rsp)
     }
@@ -1971,8 +2040,8 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 /// WUNTRACED (0x2): also report stopped children.
 fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
-    let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    let calling_pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
     const WNOHANG: u64 = 0x1;
     const WUNTRACED: u64 = 0x2;
     let report_stopped = options & WUNTRACED != 0;
@@ -2100,8 +2169,8 @@ fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 /// Restore the caller's CR3, kernel stack, and user RSP after a yield.
 ///
 /// When a syscall handler calls `yield_now()` to block, another task may
-/// enter the kernel via syscall and overwrite the global `SYSCALL_USER_RSP`
-/// and `SYSCALL_STACK_TOP`. This function restores all per-process state
+/// enter the kernel via syscall and overwrite the per-core `syscall_user_rsp`
+/// and `syscall_stack_top`. This function restores all per-process state
 /// so that the `sysretq` return path uses the correct values.
 fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
     let (caller_cr3_phys, kstack_top, fs_base) = {
@@ -2124,15 +2193,17 @@ fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64)
             Cr3::write(frame, Cr3Flags::empty());
         }
     }
-    crate::process::CURRENT_PID.store(calling_pid, core::sync::atomic::Ordering::Relaxed);
+    crate::process::set_current_pid(calling_pid);
+    // Restore per-core syscall state.
+    let data =
+        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
     unsafe {
-        SYSCALL_USER_RSP = saved_user_rsp;
+        (*data).syscall_user_rsp = saved_user_rsp;
         if kstack_top != 0 {
-            SYSCALL_STACK_TOP = kstack_top;
-            gdt::set_kernel_stack(kstack_top);
+            (*data).syscall_stack_top = kstack_top;
+            crate::smp::set_current_core_kernel_stack(kstack_top);
         }
         // Restore FS.base (TLS pointer) for this process.
-        // Always write, even when 0, to avoid inheriting stale TLS from a previous task.
         x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
     }
 }
@@ -2146,7 +2217,7 @@ fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64)
 /// Only returns true for signals whose disposition is not Ignore (e.g.,
 /// SIGCHLD defaults to Ignore and should not cause EINTR).
 fn has_pending_signal() -> bool {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     if pid == 0 {
         return false;
     }
@@ -2330,9 +2401,8 @@ unsafe fn cow_clone_user_pages(
 
 pub fn init() {
     let stack_top = gdt::syscall_stack_top();
-    unsafe {
-        SYSCALL_STACK_TOP = stack_top;
-    }
+    // Per-core syscall_stack_top is already set in init_bsp_per_core().
+    // Set the legacy TSS RSP0 for interrupt stacks.
     unsafe {
         gdt::set_kernel_stack(stack_top);
     }
@@ -2344,6 +2414,31 @@ pub fn init() {
         gdt::kernel_data_selector(),
     )
     .expect("STAR MSR write failed: segment selector layout mismatch");
+
+    unsafe extern "C" {
+        fn syscall_entry();
+    }
+    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    unsafe {
+        Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+    }
+}
+
+/// Initialize SYSCALL MSRs on an AP core.
+///
+/// Sets STAR, LSTAR, SFMASK, and EFER.SCE so that userspace processes
+/// dispatched on this core can use the SYSCALL instruction.
+/// TSS.RSP0 and per-core syscall_stack_top are handled separately via
+/// `set_current_core_kernel_stack` and `set_per_core_syscall_stack_top`.
+pub fn init_ap() {
+    Star::write(
+        gdt::user_code_selector(),
+        gdt::user_data_selector(),
+        gdt::kernel_code_selector(),
+        gdt::kernel_data_selector(),
+    )
+    .expect("STAR MSR write failed on AP");
 
     unsafe extern "C" {
         fn syscall_entry();
@@ -2381,7 +2476,7 @@ use crate::process::{FdBackend, FdEntry, MAX_FDS};
 ///
 /// Returns `None` if no process is running or the FD slot is empty.
 fn current_fd_entry(fd: usize) -> Option<FdEntry> {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let table = crate::process::PROCESS_TABLE.lock();
     let proc = table.find(pid)?;
     proc.fd_table.get(fd)?.clone()
@@ -2389,7 +2484,7 @@ fn current_fd_entry(fd: usize) -> Option<FdEntry> {
 
 /// Mutate the FD entry at `fd` in the current process's FD table.
 fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     if let Some(proc) = table.find_mut(pid)
         && let Some(slot) = proc.fd_table.get_mut(fd)
@@ -2401,7 +2496,7 @@ fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
 /// Allocate the lowest available FD slot (starting from `min_fd`) in the
 /// current process's FD table. Returns the FD number or `None` if full.
 fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = table.find_mut(pid)?;
     for i in min_fd..MAX_FDS {
@@ -2437,8 +2532,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Read from kernel stdin buffer.
             // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 if crate::stdin::has_data() {
                     let mut tmp = [0u8; 4096];
@@ -2551,8 +2646,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
             let capped = (count as usize).min(4096);
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until data is available or writer closes.
             loop {
                 let mut tmp = [0u8; 4096];
@@ -2628,8 +2723,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -2664,8 +2759,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -2963,8 +3058,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
                 return NEG_EFAULT;
             }
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until space is available or reader closes.
             loop {
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
@@ -3918,7 +4013,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 
 fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
-    let mode_arg = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+    let mode_arg = per_core_syscall_arg3();
     if dirfd == AT_FDCWD {
         // Resolve relative to process cwd — same as sys_linux_open.
         return sys_linux_open(path_ptr, flags, mode_arg);
@@ -4862,7 +4957,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // Read flags from SYSCALL_ARG3 (r10 at syscall entry).
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
-    let flags = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SYSCALL_ARG3)) };
+    let flags = per_core_syscall_arg3();
 
     const MAP_ANONYMOUS: u64 = 0x20;
     if flags & MAP_ANONYMOUS == 0 {
@@ -4880,7 +4975,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     };
     let pages = len.div_ceil(4096);
 
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
 
     // Determine base address: use process mmap_next or default ANON_MMAP_BASE.
     let base = {
@@ -5043,7 +5138,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
 
     // Update mapping tracking list: handle full removal, shrink, and split.
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
@@ -5211,7 +5306,7 @@ impl core::fmt::Write for BufWriter<'_> {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_brk(addr: u64) -> u64 {
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
 
     // Always initialise brk_current to BRK_BASE if it is still 0, regardless
     // of the requested addr.  This ensures that even a first call with a
@@ -5462,7 +5557,7 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
         return NEG_ENOENT;
     }
 
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     if let Some(proc) = table.find_mut(pid) {
         proc.cwd = resolved;
@@ -5564,8 +5659,7 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     // TIOCSCTTY: set controlling terminal for the session.
     if req == TIOCSCTTY {
         if let Some(FdBackend::PtySlave { pty_id }) = &backend {
-            let calling_pid =
-                crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let calling_pid = crate::process::current_pid();
             let pty_id_val = *pty_id;
             let mut pt = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = pt.find_mut(calling_pid) {
@@ -5582,7 +5676,7 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
 
     // TIOCNOTTY: release controlling terminal.
     if req == TIOCNOTTY {
-        let calling_pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        let calling_pid = crate::process::current_pid();
         let mut pt = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = pt.find_mut(calling_pid) {
             proc.controlling_tty = None;
@@ -6809,7 +6903,7 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
             };
             x86_64::registers::model_specific::FsBase::write(vaddr);
             // Save FS.base to process table for context-switch restore.
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            let pid = crate::process::current_pid();
             let mut table = crate::process::PROCESS_TABLE.lock();
             if let Some(proc) = table.find_mut(pid) {
                 proc.fs_base = addr;
@@ -6828,7 +6922,7 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 /// our single-threaded model).  musl calls this during `__init_tls` to record
 /// the `clear_child_tid` pointer; we can safely ignore the pointer.
 fn sys_linux_set_tid_address() -> u64 {
-    crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed) as u64
+    crate::process::current_pid() as u64
 }
 
 // ===========================================================================
@@ -7364,8 +7458,8 @@ fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             });
 
             // Block until connected or error
-            let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = per_core_syscall_user_rsp();
             let start_tick = crate::arch::x86_64::interrupts::tick_count();
             loop {
                 let state = crate::net::tcp::state(tcp_idx);
@@ -7473,8 +7567,8 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     };
 
     // Block until an incoming connection is established
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
     loop {
         let state = crate::net::tcp::state(tcp_idx);
         match state {
@@ -7760,9 +7854,8 @@ fn sys_recvfrom_socket(
                         Some(idx) => idx,
                         None => return NEG_ENOTCONN,
                     };
-                    let pid =
-                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    let pid = crate::process::current_pid();
+                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         let mut tmp = [0u8; 4096];
                         let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..capped]);
@@ -7807,9 +7900,8 @@ fn sys_recvfrom_socket(
                     }
                 }
                 crate::net::SocketProtocol::Udp => {
-                    let pid =
-                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    let pid = crate::process::current_pid();
+                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         if let Some(dgram) = crate::net::udp::recv(local_port) {
                             let n = dgram.data.len().min(capped);
@@ -7848,9 +7940,8 @@ fn sys_recvfrom_socket(
                     // Wait for ICMP echo reply
                     use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
                     use core::sync::atomic::Ordering;
-                    let pid =
-                        crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-                    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                    let pid = crate::process::current_pid();
+                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         if PING_REPLY_RECEIVED.load(Ordering::Acquire) {
                             PING_REPLY_RECEIVED.store(false, Ordering::Release);
@@ -7906,8 +7997,8 @@ fn sys_recvfrom_socket(
                     Err(_) => NEG_EAGAIN,
                 }
             } else {
-                let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-                let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+                let pid = crate::process::current_pid();
+                let saved_user_rsp = per_core_syscall_user_rsp();
                 loop {
                     let mut tmp = [0u8; 4096];
                     match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
@@ -8164,8 +8255,8 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
-    let pid = crate::process::CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
-    let saved_user_rsp = unsafe { SYSCALL_USER_RSP };
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
 
     loop {
         let mut ready_count = 0u64;

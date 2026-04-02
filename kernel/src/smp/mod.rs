@@ -21,8 +21,8 @@ pub mod tlb;
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use alloc::{boxed::Box, collections::VecDeque};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use x86_64::{
     VirtAddr,
@@ -93,6 +93,41 @@ pub struct PerCoreData {
     pub lapic_virt_base: u64,
     /// LAPIC timer ticks per millisecond (BSP-calibrated, shared by all cores).
     pub lapic_ticks_per_ms: u32,
+
+    // ----- Phase 35: per-core run queue -----
+    /// Per-core run queue of task indices into the global `SCHEDULER.tasks` vec.
+    pub run_queue: spin::Mutex<VecDeque<usize>>,
+
+    // ----- Phase 35: per-core syscall state (accessed via gs-relative asm) -----
+    /// Top of this core's kernel syscall stack for SYSCALL entry.
+    pub syscall_stack_top: u64,
+    /// User RSP saved by `syscall_entry` assembly stub.
+    pub syscall_user_rsp: u64,
+    /// R10 (syscall arg3) saved by `syscall_entry` assembly stub.
+    pub syscall_arg3: u64,
+    /// Saved user callee-saved registers at syscall entry (for fork child restore).
+    pub syscall_user_rbx: u64,
+    pub syscall_user_rbp: u64,
+    pub syscall_user_r12: u64,
+    pub syscall_user_r13: u64,
+    pub syscall_user_r14: u64,
+    pub syscall_user_r15: u64,
+    /// Saved user caller-saved registers at syscall entry (Linux ABI preserves these).
+    pub syscall_user_rdi: u64,
+    pub syscall_user_rsi: u64,
+    pub syscall_user_rdx: u64,
+    pub syscall_user_r8: u64,
+    pub syscall_user_r9: u64,
+    pub syscall_user_r10: u64,
+    pub syscall_user_rflags: u64,
+
+    /// PID of the userspace process currently running on this core.
+    /// 0 = no userspace process (kernel task context).
+    pub current_pid: AtomicU32,
+
+    /// Fork child entry context — per-core so each core can handle `fork()`
+    /// independently without corrupting another core's saved context.
+    pub fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -211,6 +246,54 @@ fn write_gs_base(value: u64) {
     }
 }
 
+/// Write the IA32_KERNEL_GS_BASE MSR (0xC000_0102).
+///
+/// This MSR is swapped with GS_BASE on `swapgs`. Set to PerCoreData so that
+/// `swapgs` on syscall entry loads the correct per-core pointer.
+pub fn write_kernel_gs_base(value: u64) {
+    let lo = value as u32;
+    let hi = (value >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0102u32,
+            in("eax") lo,
+            in("edx") hi,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-core field offsets for assembly access (Phase 35)
+// ---------------------------------------------------------------------------
+
+/// Offset constants for `PerCoreData` fields accessed from assembly via `gs:[OFFSET]`.
+/// These are computed at compile time using `offset_of!` and passed to `global_asm!`
+/// as `const` operands.
+pub mod offsets {
+    use super::PerCoreData;
+
+    pub const SYSCALL_STACK_TOP: usize = core::mem::offset_of!(PerCoreData, syscall_stack_top);
+    pub const SYSCALL_USER_RSP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsp);
+    pub const SYSCALL_ARG3: usize = core::mem::offset_of!(PerCoreData, syscall_arg3);
+    pub const SYSCALL_USER_RBX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbx);
+    pub const SYSCALL_USER_RBP: usize = core::mem::offset_of!(PerCoreData, syscall_user_rbp);
+    pub const SYSCALL_USER_R12: usize = core::mem::offset_of!(PerCoreData, syscall_user_r12);
+    pub const SYSCALL_USER_R13: usize = core::mem::offset_of!(PerCoreData, syscall_user_r13);
+    pub const SYSCALL_USER_R14: usize = core::mem::offset_of!(PerCoreData, syscall_user_r14);
+    pub const SYSCALL_USER_R15: usize = core::mem::offset_of!(PerCoreData, syscall_user_r15);
+    pub const SYSCALL_USER_RDI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdi);
+    pub const SYSCALL_USER_RSI: usize = core::mem::offset_of!(PerCoreData, syscall_user_rsi);
+    pub const SYSCALL_USER_RDX: usize = core::mem::offset_of!(PerCoreData, syscall_user_rdx);
+    pub const SYSCALL_USER_R8: usize = core::mem::offset_of!(PerCoreData, syscall_user_r8);
+    pub const SYSCALL_USER_R9: usize = core::mem::offset_of!(PerCoreData, syscall_user_r9);
+    pub const SYSCALL_USER_R10: usize = core::mem::offset_of!(PerCoreData, syscall_user_r10);
+    pub const SYSCALL_USER_RFLAGS: usize = core::mem::offset_of!(PerCoreData, syscall_user_rflags);
+    pub const CURRENT_PID: usize = core::mem::offset_of!(PerCoreData, current_pid);
+    pub const FORK_ENTRY_CTX: usize = core::mem::offset_of!(PerCoreData, fork_entry_ctx);
+}
+
 // ---------------------------------------------------------------------------
 // BSP initialization (T002, T004)
 // ---------------------------------------------------------------------------
@@ -280,6 +363,7 @@ pub fn init_bsp_per_core() {
 
     // Allocate and initialize BSP's PerCoreData.
     // The BSP reuses the existing GDT/TSS/stacks from gdt.rs.
+    let bsp_stack_top = crate::arch::x86_64::gdt::syscall_stack_top();
     let bsp_data = Box::into_raw(Box::new(PerCoreData {
         self_ptr: core::ptr::null(), // filled below
         core_id: 0,
@@ -290,12 +374,32 @@ pub fn init_bsp_per_core() {
         gdt_code: SegmentSelector(0),
         gdt_data: SegmentSelector(0),
         gdt_tss: SegmentSelector(0),
-        kernel_stack_top: crate::arch::x86_64::gdt::syscall_stack_top(),
+        kernel_stack_top: bsp_stack_top,
         scheduler_rsp: core::cell::UnsafeCell::new(0), // set when scheduler loop starts
         reschedule: AtomicBool::new(false),
         current_task_idx: core::sync::atomic::AtomicI32::new(-1),
         lapic_virt_base,
         lapic_ticks_per_ms: lapic_tpm,
+        run_queue: spin::Mutex::new(VecDeque::new()),
+        // Phase 35: per-core syscall state
+        syscall_stack_top: bsp_stack_top,
+        syscall_user_rsp: 0,
+        syscall_arg3: 0,
+        syscall_user_rbx: 0,
+        syscall_user_rbp: 0,
+        syscall_user_r12: 0,
+        syscall_user_r13: 0,
+        syscall_user_r14: 0,
+        syscall_user_r15: 0,
+        syscall_user_rdi: 0,
+        syscall_user_rsi: 0,
+        syscall_user_rdx: 0,
+        syscall_user_r8: 0,
+        syscall_user_r9: 0,
+        syscall_user_r10: 0,
+        syscall_user_rflags: 0,
+        current_pid: AtomicU32::new(0),
+        fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
     }));
 
     // Fill self-pointer and store in global array.
@@ -304,8 +408,11 @@ pub fn init_bsp_per_core() {
         PER_CORE_DATA[0] = bsp_data;
     }
 
-    // Set gs_base to point to BSP's PerCoreData.
+    // Set gs_base to point to BSP's PerCoreData for gs-relative access.
+    // Also set kernel_gs_base for consistency (unused — swapgs is not used
+    // because user code cannot change gs_base: no FSGSBASE, no wrmsr in ring 3).
     write_gs_base(bsp_data as u64);
+    write_kernel_gs_base(bsp_data as u64);
 
     log::info!("[smp] BSP per-core data initialized, gs_base set");
 
@@ -380,6 +487,26 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
             crate::mm::phys_offset() + phys
         },
         lapic_ticks_per_ms: crate::arch::x86_64::apic::lapic_ticks_per_ms(),
+        run_queue: spin::Mutex::new(VecDeque::new()),
+        // Phase 35: per-core syscall state
+        syscall_stack_top: kernel_stack_top,
+        syscall_user_rsp: 0,
+        syscall_arg3: 0,
+        syscall_user_rbx: 0,
+        syscall_user_rbp: 0,
+        syscall_user_r12: 0,
+        syscall_user_r13: 0,
+        syscall_user_r14: 0,
+        syscall_user_r15: 0,
+        syscall_user_rdi: 0,
+        syscall_user_rsi: 0,
+        syscall_user_rdx: 0,
+        syscall_user_r8: 0,
+        syscall_user_r9: 0,
+        syscall_user_r10: 0,
+        syscall_user_rflags: 0,
+        current_pid: AtomicU32::new(0),
+        fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
     }));
 
     unsafe {
