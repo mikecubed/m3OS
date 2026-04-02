@@ -499,5 +499,6 @@ and the README must link to the completed task list.
   this with real Unix socket pair allocation when `AF_UNIX` is specified.
 - The `FdBackend::UnixSocket` variant is new; all existing pattern matches on
   `FdBackend` must be extended to handle it.
-- Named sockets create filesystem entries via the VFS; the VFS node type for sockets
-  is new and must be handled in tmpfs (and optionally ext2).
+- Named sockets create a regular file marker in tmpfs via `create_file_with_meta()`.
+  A dedicated socket node type in tmpfs/ext2 is deferred; the path map is the
+  authoritative binding between paths and socket handles.

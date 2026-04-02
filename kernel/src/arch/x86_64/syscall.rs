@@ -3597,6 +3597,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             sys_recvfrom_socket(fd as u64, buf_ptr, count, 0, 0, 0)
         }
         FdBackend::UnixSocket { handle } => {
+            if count == 0 {
+                return 0;
+            }
             let handle = *handle;
             let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
@@ -9054,11 +9057,11 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match sock_type {
         crate::net::unix::UnixSocketType::Stream => {
-            // Guard: reject if already connected or already pending (Bound = pending connect).
+            // Guard: reject if already connected or already pending connect.
             let cur_state = crate::net::unix::with_unix_socket(handle, |s| s.state);
             match cur_state {
                 Some(crate::net::unix::UnixSocketState::Connected) => return NEG_EISCONN,
-                Some(crate::net::unix::UnixSocketState::Bound) => return NEG_EALREADY,
+                Some(crate::net::unix::UnixSocketState::Connecting) => return NEG_EALREADY,
                 _ => {}
             }
 
@@ -9082,9 +9085,9 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             // if the client FD is closed before accept() processes the entry.
             crate::net::unix::add_unix_socket_ref(handle);
 
-            // Mark as Bound (connecting) to prevent duplicate backlog entries.
+            // Mark as Connecting to prevent duplicate backlog entries.
             crate::net::unix::with_unix_socket_mut(handle, |s| {
-                s.state = crate::net::unix::UnixSocketState::Bound;
+                s.state = crate::net::unix::UnixSocketState::Connecting;
             });
 
             // Add ourselves to the listener's backlog.

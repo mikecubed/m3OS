@@ -32,6 +32,7 @@ pub enum UnixSocketState {
     Unbound,
     Bound,
     Listening,
+    Connecting,
     Connected,
     #[allow(dead_code)]
     Closed,
@@ -149,6 +150,13 @@ pub fn free_unix_socket(handle: usize) {
                 peer_handle = entry.peer;
                 // Drain any pending backlog connections.
                 entry.backlog.clear();
+            }
+            // Clear the peer's reference to this handle to prevent stale pointers.
+            if let Some(ph) = peer_handle
+                && let Some(peer_entry) = table.entries.get_mut(ph).and_then(|s| s.as_mut())
+                && peer_entry.peer == Some(handle)
+            {
+                peer_entry.peer = None;
             }
             if let Some(slot) = table.entries.get_mut(handle) {
                 *slot = None;
