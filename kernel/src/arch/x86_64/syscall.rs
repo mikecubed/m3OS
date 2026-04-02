@@ -2775,7 +2775,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             let to_read = count.min(dst.len() as u64) as usize;
                             let n = pair.s2m.read(&mut dst[..to_read]);
                             drop(table);
-                            crate::pty::wake_master(pty_id);
+                            // Reading from s2m frees space for slave writers.
+                            crate::pty::wake_slave(pty_id);
                             if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                 return NEG_EFAULT;
                             }
@@ -2823,7 +2824,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     .copy_from_slice(&pair.edit_buf.as_slice()[..to_copy]);
                                 pair.edit_buf.drain(to_copy);
                                 drop(table);
-                                crate::pty::wake_slave(pty_id);
+                                // Draining edit_buf frees space for master writers.
+                                crate::pty::wake_master(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
                                     .is_err()
                                 {
@@ -2844,7 +2846,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 let to_read = count.min(dst.len() as u64) as usize;
                                 let n = pair.m2s.read(&mut dst[..to_read]);
                                 drop(table);
-                                crate::pty::wake_slave(pty_id);
+                                // Reading from m2s frees space for master writers.
+                                crate::pty::wake_master(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                     return NEG_EFAULT;
                                 }
@@ -8540,17 +8543,17 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => {
             // Side-effect-free readiness check.
-            match crate::pipe::pipe_read_ready(*pipe_id) {
-                Some(true) => {
-                    if crate::pipe::pipe_read_eof(*pipe_id) {
-                        POLLIN | POLLHUP // EOF — writer closed, buffer empty
-                    } else {
-                        POLLIN // data available
-                    }
-                }
-                Some(false) => 0, // would block
-                None => POLLHUP,  // pipe gone
+            let mut revents: i16 = 0;
+            // POLLHUP when writer has closed (even if data remains in buffer).
+            if crate::pipe::pipe_writer_closed(*pipe_id) {
+                revents |= POLLHUP;
             }
+            match crate::pipe::pipe_read_ready(*pipe_id) {
+                Some(true) => revents |= POLLIN,
+                Some(false) => {}
+                None => revents |= POLLHUP,
+            }
+            revents
         }
         FdBackend::PipeWrite { pipe_id } => {
             // Side-effect-free writability check.
@@ -8690,31 +8693,38 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
 ///
 /// Uses `WaitQueue::register()` to add the task without blocking, allowing
 /// registration on multiple queues before a single block call.
+/// Returns `true` if a wait queue was registered, `false` for non-pollable types.
 fn fd_register_waiter(
     entry: &FdEntry,
     task_id: crate::task::TaskId,
     woken: &alloc::sync::Arc<core::sync::atomic::AtomicBool>,
-) {
+) -> bool {
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } | FdBackend::PipeWrite { pipe_id } => {
             let wqs = crate::pipe::PIPE_WAITQUEUES.lock();
             if let Some(Some(wq)) = wqs.get(*pipe_id) {
                 wq.register(task_id, woken);
+                return true;
             }
+            false
         }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
             crate::stdin::STDIN_WAITQUEUE.register(task_id, woken);
+            true
         }
         FdBackend::Socket { handle } => {
             crate::net::SOCKET_WAITQUEUES[*handle as usize].register(task_id, woken);
+            true
         }
         FdBackend::PtyMaster { pty_id } => {
             crate::pty::PTY_MASTER_WQ[*pty_id as usize].register(task_id, woken);
+            true
         }
         FdBackend::PtySlave { pty_id } => {
             crate::pty::PTY_SLAVE_WQ[*pty_id as usize].register(task_id, woken);
+            true
         }
-        _ => {} // non-pollable types (ramdisk, tmpfs, etc.)
+        _ => false, // non-pollable types (ramdisk, tmpfs, etc.)
     }
 }
 
@@ -8841,10 +8851,21 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         };
         let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
+        let mut registered_any = false;
         for i in 0..nfds {
-            if let Some(entry) = &entries[i] {
-                fd_register_waiter(entry, task_id, &woken);
+            if let Some(entry) = &entries[i]
+                && fd_register_waiter(entry, task_id, &woken)
+            {
+                registered_any = true;
             }
+        }
+
+        // If no FDs could be registered (all non-pollable), yield to avoid
+        // blocking forever with no wake source.
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
         }
 
         // Re-check readiness after registration to close the TOCTOU window.
@@ -9064,12 +9085,20 @@ fn select_inner(
             None => return NEG_EINTR,
         };
         let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut registered_any = false;
         for fd in 0..nfds {
             if let Some(entry) = &entries[fd]
                 && combined & (1 << fd) != 0
+                && fd_register_waiter(entry, task_id, &woken)
             {
-                fd_register_waiter(entry, task_id, &woken);
+                registered_any = true;
             }
+        }
+
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
         }
 
         // Re-check readiness after registration to close the TOCTOU window.
@@ -9424,8 +9453,9 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
         let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let mut registered_any = false;
         for interest in &interests {
-            if let Some(entry) = current_fd_entry(interest.fd) {
-                fd_register_waiter(&entry, task_id, &woken);
+            if let Some(entry) = current_fd_entry(interest.fd)
+                && fd_register_waiter(&entry, task_id, &woken)
+            {
                 registered_any = true;
             }
         }

@@ -83,11 +83,11 @@ pub fn pipe_read_ready(pipe_id: usize) -> Option<bool> {
     }
 }
 
-/// Side-effect-free check: does the pipe read end see EOF (writer closed, buffer empty)?
-pub fn pipe_read_eof(pipe_id: usize) -> bool {
+/// Side-effect-free check: has the writer side of the pipe been closed?
+pub fn pipe_writer_closed(pipe_id: usize) -> bool {
     let table = PIPE_TABLE.lock();
     match table.get(pipe_id).and_then(|s| s.as_ref()) {
-        Some(pipe) => pipe.is_empty() && !pipe.has_writer(),
+        Some(pipe) => !pipe.has_writer(),
         None => true,
     }
 }
