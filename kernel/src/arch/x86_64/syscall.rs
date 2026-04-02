@@ -8872,14 +8872,26 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             continue;
         }
 
-        // Block — woken when any FD's wait queue fires.
-        crate::task::scheduler::block_current_unless_woken(&woken);
-        restore_caller_context(pid, saved_user_rsp);
-
-        // Deregister from all wait queues.
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i] {
-                fd_deregister_waiter(entry, task_id);
+        // Block until woken by an FD event. For positive timeouts, use
+        // yield instead of full block so the tick counter advances and the
+        // deadline check at the top of the loop can fire.
+        if deadline_tick.is_some() {
+            // Positive timeout: yield once to let timer ticks advance.
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (-1): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
             }
         }
 
@@ -8929,13 +8941,36 @@ fn write_fd_set(ptr: u64, mask: u32) -> Result<(), u64> {
 }
 
 /// select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
-#[allow(clippy::needless_range_loop)]
 fn sys_select(
     nfds: u64,
     readfds_ptr: u64,
     writefds_ptr: u64,
     exceptfds_ptr: u64,
     timeout_ptr: u64,
+) -> u64 {
+    // Parse timeval timeout: NULL = block indefinitely, {0,0} = non-blocking.
+    let timeout_ms: Option<u64> = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
+        if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+        let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+        Some((sec.max(0) as u64) * 1000 + (usec.max(0) as u64) / 1000)
+    };
+    select_inner(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ms)
+}
+
+/// Shared select implementation used by both select() and pselect6().
+#[allow(clippy::needless_range_loop)]
+fn select_inner(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ms: Option<u64>,
 ) -> u64 {
     let nfds = (nfds as usize).min(MAX_FDS);
 
@@ -8951,20 +8986,6 @@ fn sys_select(
     let except_mask = match read_fd_set(exceptfds_ptr, nfds) {
         Ok(m) => m,
         Err(e) => return e,
-    };
-
-    // Parse timeout: NULL = block indefinitely, {0,0} = non-blocking poll.
-    // timeout_ms: None = block indefinitely, Some(0) = non-blocking, Some(n) = ms deadline.
-    let timeout_ms: Option<u64> = if timeout_ptr == 0 {
-        None // block indefinitely
-    } else {
-        let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
-        if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
-            return NEG_EFAULT;
-        }
-        let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
-        let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-        Some((sec.max(0) as u64) * 1000 + (usec.max(0) as u64) / 1000)
     };
     let start_tick = crate::arch::x86_64::interrupts::tick_count();
     let deadline_tick = timeout_ms
@@ -9078,13 +9099,27 @@ fn sys_select(
             continue;
         }
 
-        crate::task::scheduler::block_current_unless_woken(&woken);
-        restore_caller_context(pid, saved_user_rsp);
-        for fd in 0..nfds {
-            if let Some(entry) = &entries[fd]
-                && combined & (1 << fd) != 0
-            {
-                fd_deregister_waiter(entry, task_id);
+        if deadline_tick.is_some() {
+            // Positive timeout: yield to let timer ticks advance.
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (NULL): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
             }
         }
     }
@@ -9101,26 +9136,20 @@ fn sys_pselect6(
     exceptfds_ptr: u64,
     timeout_ptr: u64,
 ) -> u64 {
-    // pselect6 uses timespec {tv_sec, tv_nsec}. Convert to timeval {tv_sec, tv_usec}
-    // in-place so select() can parse it with its existing timeval logic.
-    // The 6th arg (sigmask) is ignored (no signal masking yet).
-    if timeout_ptr != 0 {
+    // pselect6 uses timespec {tv_sec, tv_nsec}. Parse to timeout_ms without
+    // mutating user memory. The 6th arg (sigmask) is ignored.
+    let timeout_ms: Option<u64> = if timeout_ptr != 0 {
         let mut ts = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut ts, timeout_ptr).is_err() {
             return NEG_EFAULT;
         }
         let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
         let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-        // Convert timespec → timeval: usec = nsec / 1000
-        let usec = nsec / 1000;
-        let mut tv = [0u8; 16];
-        tv[0..8].copy_from_slice(&sec.to_ne_bytes());
-        tv[8..16].copy_from_slice(&usec.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(timeout_ptr, &tv).is_err() {
-            return NEG_EFAULT;
-        }
-    }
-    sys_select(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr)
+        Some((sec.max(0) as u64) * 1000 + (nsec.max(0) as u64) / 1_000_000)
+    } else {
+        None // block indefinitely
+    };
+    select_inner(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -9304,7 +9333,7 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
 
 /// epoll_wait(epfd, events, maxevents, timeout) — syscall 232
 fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
-    let maxevents = maxevents as usize;
+    let maxevents = (maxevents as usize).min(MAX_EPOLL_INTEREST);
     if maxevents == 0 {
         return NEG_EINVAL;
     }
@@ -9354,7 +9383,10 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
                 let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
                 if matched != 0 || unconditional != 0 {
                     // Write epoll_event to userspace: packed { events: u32, data: u64 } = 12 bytes
-                    let base = events_ptr + (out_count * 12) as u64;
+                    let base = match events_ptr.checked_add((out_count * 12) as u64) {
+                        Some(a) => a,
+                        None => return NEG_EFAULT,
+                    };
                     let ev_out = (matched | unconditional).to_ne_bytes();
                     let data_out = interest.data.to_ne_bytes();
                     let mut buf = [0u8; 12];
@@ -9426,11 +9458,23 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             continue;
         }
 
-        crate::task::scheduler::block_current_unless_woken(&woken);
-        restore_caller_context(pid, saved_user_rsp);
-        for interest in &interests {
-            if let Some(entry) = current_fd_entry(interest.fd) {
-                fd_deregister_waiter(&entry, task_id);
+        if deadline_tick.is_some() {
+            // Positive timeout: yield to let timer ticks advance.
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (-1): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
             }
         }
     }
