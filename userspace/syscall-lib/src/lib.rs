@@ -721,6 +721,11 @@ pub fn unlink(path: &[u8]) -> isize {
     unsafe { syscall1(SYS_UNLINK, path.as_ptr() as u64) as isize }
 }
 
+/// Create a hard link. Both paths must be null-terminated byte strings.
+pub fn link(oldpath: &[u8], newpath: &[u8]) -> isize {
+    unsafe { syscall2(SYS_LINK, oldpath.as_ptr() as u64, newpath.as_ptr() as u64) as isize }
+}
+
 /// Rename a file or directory. Both paths must be null-terminated byte strings.
 pub fn rename(old: &[u8], new: &[u8]) -> isize {
     unsafe { syscall2(SYS_RENAME, old.as_ptr() as u64, new.as_ptr() as u64) as isize }
@@ -815,6 +820,20 @@ pub fn readlinkat(dirfd: i32, path: &[u8], buf: &mut [u8]) -> isize {
             path.as_ptr() as u64,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — create a hard link relative to directory fds.
+pub fn linkat(olddirfd: i32, oldpath: &[u8], newdirfd: i32, newpath: &[u8], flags: i32) -> isize {
+    unsafe {
+        syscall5(
+            SYS_LINKAT,
+            olddirfd as u64,
+            oldpath.as_ptr() as u64,
+            newdirfd as u64,
+            newpath.as_ptr() as u64,
+            flags as u64,
         ) as isize
     }
 }

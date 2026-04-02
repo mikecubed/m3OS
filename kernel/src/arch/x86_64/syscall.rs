@@ -945,6 +945,7 @@ pub extern "C" fn syscall_handler(
         9 => sys_linux_mmap(arg0, arg1, arg2),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
+        86 => sys_link(arg0, arg1),
         88 => sys_symlink(arg0, arg1),
         89 => sys_readlink(arg0, arg1, arg2),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
@@ -4054,6 +4055,7 @@ const O_NOFOLLOW: u64 = 0o400000;
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
 const AT_FDCWD: u64 = (-100_i64) as u64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
 
 /// Check if a resolved absolute path is a directory across all filesystems.
 fn is_directory(path: &str) -> bool {
@@ -4767,6 +4769,24 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
+pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
+    if crate::process::ext2_inode_open_count(inode_num) != 0 {
+        return;
+    }
+    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+    let Some(vol) = vol.as_mut() else {
+        return;
+    };
+    let Ok(mut inode) = vol.read_inode(inode_num) else {
+        return;
+    };
+    if inode.links_count != 0 {
+        return;
+    }
+    let _ = vol.truncate_file(inode_num, &mut inode);
+    let _ = vol.free_inode(inode_num);
+}
+
 // ---------------------------------------------------------------------------
 // T015 (close) / T013 (close)
 // ---------------------------------------------------------------------------
@@ -4780,6 +4800,7 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
+    let mut ext2_inode = None;
     // Close-time cleanup for resource-backed FDs.
     if let Some(entry) = current_fd_entry(fd) {
         match &entry.backend {
@@ -4789,6 +4810,7 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
+            FdBackend::Ext2Disk { inode_num, .. } => ext2_inode = Some(*inode_num),
             _ => {}
         }
     }
@@ -4801,7 +4823,13 @@ fn sys_linux_close(fd: u64) -> u64 {
             found = true;
         }
     });
-    if found { 0 } else { NEG_EBADF }
+    if !found {
+        return NEG_EBADF;
+    }
+    if let Some(inode_num) = ext2_inode {
+        cleanup_ext2_inode_if_unused(inode_num);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -6893,6 +6921,116 @@ fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 
         return NEG_EFAULT;
     }
     to_copy as u64
+}
+
+fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> u64 {
+    sys_linkat(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
+}
+
+fn sys_linkat(olddirfd: u64, oldpath_ptr: u64, newdirfd: u64, newpath_ptr: u64, flags: u64) -> u64 {
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return NEG_EINVAL;
+    }
+    let mut old_buf = [0u8; 512];
+    let raw_old = match read_user_cstr(oldpath_ptr, &mut old_buf) {
+        Some(path) => path,
+        None => return NEG_EFAULT,
+    };
+    let mut new_buf = [0u8; 512];
+    let raw_new = match read_user_cstr(newpath_ptr, &mut new_buf) {
+        Some(path) => path,
+        None => return NEG_EFAULT,
+    };
+
+    let old_lexical = match resolve_path_from_dirfd(olddirfd, raw_old) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let follow_old = flags & AT_SYMLINK_FOLLOW != 0;
+    let old_resolved = match resolve_existing_fs_path(&old_lexical, follow_old) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_lexical = match resolve_path_from_dirfd(newdirfd, raw_new) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_resolved = match resolve_parent_components(&new_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if path_node_nofollow(&new_resolved).is_ok() {
+        return NEG_EEXIST;
+    }
+    if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
+
+    let old_target = resolve_fs_target(&old_resolved);
+    let new_target = resolve_fs_target(&new_resolved);
+    match (&old_target, &new_target) {
+        (FsTarget::DiskData(_), FsTarget::DiskData(_)) => {}
+        (FsTarget::DiskData(_), _) | (_, FsTarget::DiskData(_)) => return NEG_EXDEV,
+        _ => return NEG_EROFS,
+    }
+    if !crate::fs::ext2::is_mounted() {
+        return NEG_EROFS;
+    }
+
+    let FsTarget::DiskData(old_rel) = old_target else {
+        return NEG_EROFS;
+    };
+    let FsTarget::DiskData(new_rel) = new_target else {
+        return NEG_EROFS;
+    };
+
+    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+    let Some(vol) = vol.as_mut() else {
+        return NEG_EIO;
+    };
+    let old_ino = match vol.resolve_path(&old_rel) {
+        Ok(ino) => ino,
+        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+        Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+        Err(_) => return NEG_EIO,
+    };
+    let old_inode = match vol.read_inode(old_ino) {
+        Ok(inode) => inode,
+        Err(_) => return NEG_EIO,
+    };
+    if old_inode.is_dir() {
+        return NEG_EPERM;
+    }
+
+    let parts: alloc::vec::Vec<&str> = new_rel.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return NEG_EEXIST;
+    }
+    let (parent_ino, link_name) = if parts.len() == 1 {
+        (kernel_core::fs::ext2::EXT2_ROOT_INO, parts[0])
+    } else {
+        let parent_path = parts[..parts.len() - 1].join("/");
+        match vol.resolve_path(&parent_path) {
+            Ok(ino) => (ino, parts[parts.len() - 1]),
+            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+            Err(_) => return NEG_EIO,
+        }
+    };
+
+    match vol.create_hard_link(parent_ino, link_name, old_ino) {
+        Ok(()) => 0,
+        Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
+        Err(kernel_core::fs::ext2::Ext2Error::IsDirectory) => NEG_EPERM,
+        Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => NEG_ENOTDIR,
+        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+        Err(kernel_core::fs::ext2::Ext2Error::OutOfSpace) => NEG_ENOSPC,
+        Err(_) => NEG_EIO,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1044,14 +1044,63 @@ impl Ext2Volume {
         }
 
         child_inode.links_count = child_inode.links_count.saturating_sub(1);
-        if child_inode.links_count == 0 {
-            self.truncate_file(child_ino, &mut child_inode)?;
-            self.free_inode(child_ino)?;
-        } else {
+        let open_count = crate::process::ext2_inode_open_count(child_ino);
+        if child_inode.links_count != 0 || open_count != 0 {
             self.write_inode(child_ino, &child_inode)?;
         }
 
-        self.remove_directory_entry(&parent_inode, name)
+        self.remove_directory_entry(&parent_inode, name)?;
+
+        if child_inode.links_count == 0 && open_count == 0 {
+            self.truncate_file(child_ino, &mut child_inode)?;
+            self.free_inode(child_ino)?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a hard link to an existing non-directory inode.
+    pub fn create_hard_link(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target_ino: u32,
+    ) -> Result<(), Ext2Error> {
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+
+        let mut target_inode = self.read_inode(target_ino)?;
+        if target_inode.is_dir() {
+            return Err(Ext2Error::IsDirectory);
+        }
+
+        target_inode.links_count = target_inode.links_count.saturating_add(1);
+        self.write_inode(target_ino, &target_inode)?;
+
+        let file_type = if target_inode.is_symlink() {
+            EXT2_FT_SYMLINK
+        } else {
+            EXT2_FT_REG_FILE
+        };
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        if let Err(err) = self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            target_ino,
+            file_type,
+        ) {
+            target_inode.links_count = target_inode.links_count.saturating_sub(1);
+            let _ = self.write_inode(target_ino, &target_inode);
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// Delete an empty directory (P28-T042).

@@ -199,6 +199,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut ext2_inodes = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -216,6 +217,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
                 }
                 *slot = None;
@@ -240,6 +242,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
+    for inode_num in ext2_inodes {
+        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -257,6 +262,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut ext2_inodes = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -272,6 +278,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
                 }
             }
@@ -295,6 +302,29 @@ pub fn close_all_fds_for(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
+    for inode_num in ext2_inodes {
+        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    }
+}
+
+/// Count open ext2-backed file descriptors referencing `inode_num`.
+pub fn ext2_inode_open_count(inode_num: u32) -> usize {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .flat_map(|proc| proc.fd_table.iter())
+        .filter(|entry| {
+            matches!(
+                entry,
+                Some(FdEntry {
+                    backend: FdBackend::Ext2Disk {
+                        inode_num: fd_inode, ..
+                    },
+                    ..
+                }) if *fd_inode == inode_num
+            )
+        })
+        .count()
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
