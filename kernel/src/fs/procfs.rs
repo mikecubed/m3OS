@@ -276,6 +276,9 @@ fn fd_target(backend: &FdBackend) -> Option<String> {
         FdBackend::PtyMaster { pty_id } => Some(alloc::format!("/dev/ptmx:{pty_id}")),
         FdBackend::PtySlave { pty_id } => Some(alloc::format!("/dev/pts/{pty_id}")),
         FdBackend::Socket { handle } => Some(alloc::format!("socket:[{handle}]")),
+        FdBackend::Epoll { instance_id } => {
+            Some(alloc::format!("anon_inode:[eventpoll:{instance_id}]"))
+        }
     }
 }
 

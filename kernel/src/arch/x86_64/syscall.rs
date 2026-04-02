@@ -4512,6 +4512,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
             readable: true,
             writable: false,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -5341,7 +5342,8 @@ fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         | FdBackend::DevFull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
-        | FdBackend::PtySlave { .. } => ramdisk_statfs(),
+        | FdBackend::PtySlave { .. }
+        | FdBackend::Epoll { .. } => ramdisk_statfs(),
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
         FdBackend::Socket { .. } => sockfs_statfs(),
@@ -9722,7 +9724,11 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         }
         FdBackend::Stdout => POLLOUT,
         FdBackend::DevNull => POLLIN | POLLOUT,
-        FdBackend::Ramdisk { .. }
+        FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::Proc { .. }
+        | FdBackend::Ramdisk { .. }
         | FdBackend::Tmpfs { .. }
         | FdBackend::Fat32Disk { .. }
         | FdBackend::Ext2Disk { .. }
