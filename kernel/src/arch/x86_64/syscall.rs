@@ -8791,7 +8791,7 @@ fn sys_socket_unix(socktype: u64) -> u64 {
     let flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
     let raw_type = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let unix_type = match raw_type {
-        1 => crate::net::unix::UnixSocketType::Stream,
+        1 | 5 => crate::net::unix::UnixSocketType::Stream, // SOCK_STREAM or SOCK_SEQPACKET
         2 => crate::net::unix::UnixSocketType::Datagram,
         _ => return NEG_EINVAL,
     };
@@ -8831,7 +8831,7 @@ fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr: u64) -> u6
     let flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
     let raw_type = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let unix_type = match raw_type {
-        1 => crate::net::unix::UnixSocketType::Stream,
+        1 | 5 => crate::net::unix::UnixSocketType::Stream, // SOCK_STREAM or SOCK_SEQPACKET
         2 => crate::net::unix::UnixSocketType::Datagram,
         _ => return NEG_EINVAL,
     };
@@ -10461,53 +10461,77 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         | FdBackend::Dir { .. } => POLLIN | POLLOUT,
         FdBackend::UnixSocket { handle } => {
             let h = *handle;
-            crate::net::unix::with_unix_socket(h, |s| {
-                let mut revents: i16 = 0;
-                match s.socket_type {
-                    crate::net::unix::UnixSocketType::Stream => {
-                        if !s.recv_buf.is_empty() {
-                            revents |= POLLIN;
-                        }
-                        if matches!(s.state, crate::net::unix::UnixSocketState::Listening)
-                            && !s.backlog.is_empty()
-                        {
-                            revents |= POLLIN;
-                        }
-                        // Check peer has space for writes.
-                        if let Some(peer_h) = s.peer {
-                            let peer_has_space = crate::net::unix::with_unix_socket(peer_h, |ps| {
-                                ps.recv_buf.len() < crate::net::unix::UNIX_STREAM_BUF_SIZE
-                            });
-                            if peer_has_space.unwrap_or(false) {
-                                revents |= POLLOUT;
+            // Extract socket info under the lock, then check peer separately
+            // to avoid nested lock acquisition (deadlock).
+            let info = crate::net::unix::with_unix_socket(h, |s| {
+                (
+                    s.socket_type,
+                    s.state,
+                    s.peer,
+                    !s.recv_buf.is_empty(),
+                    !s.backlog.is_empty(),
+                    !s.dgram_queue.is_empty(),
+                    s.dgram_queue.len() < crate::net::unix::UNIX_DGRAM_QUEUE_MAX,
+                    s.shut_rd,
+                )
+            });
+            match info {
+                Some((
+                    sock_type,
+                    state,
+                    peer,
+                    has_data,
+                    has_backlog,
+                    has_dgram,
+                    dgram_space,
+                    shut_rd,
+                )) => {
+                    let mut revents: i16 = 0;
+                    match sock_type {
+                        crate::net::unix::UnixSocketType::Stream => {
+                            if has_data {
+                                revents |= POLLIN;
                             }
-                            // Check peer closed.
-                            let peer_alive = crate::net::unix::with_unix_socket(peer_h, |_| ());
-                            if peer_alive.is_none() {
+                            if matches!(state, crate::net::unix::UnixSocketState::Listening)
+                                && has_backlog
+                            {
+                                revents |= POLLIN;
+                            }
+                            if let Some(peer_h) = peer {
+                                let peer_has_space =
+                                    crate::net::unix::with_unix_socket(peer_h, |ps| {
+                                        ps.recv_buf.len() < crate::net::unix::UNIX_STREAM_BUF_SIZE
+                                    });
+                                if peer_has_space.unwrap_or(false) {
+                                    revents |= POLLOUT;
+                                }
+                                if peer_has_space.is_none() {
+                                    revents |= POLLHUP; // peer freed
+                                }
+                            } else if matches!(state, crate::net::unix::UnixSocketState::Connected)
+                            {
                                 revents |= POLLHUP;
                             }
-                        } else if matches!(s.state, crate::net::unix::UnixSocketState::Connected) {
-                            revents |= POLLHUP; // peer gone
+                        }
+                        crate::net::unix::UnixSocketType::Datagram => {
+                            if has_dgram {
+                                revents |= POLLIN;
+                            }
+                            if dgram_space {
+                                revents |= POLLOUT;
+                            }
                         }
                     }
-                    crate::net::unix::UnixSocketType::Datagram => {
-                        if !s.dgram_queue.is_empty() {
-                            revents |= POLLIN;
-                        }
-                        if s.dgram_queue.len() < crate::net::unix::UNIX_DGRAM_QUEUE_MAX {
-                            revents |= POLLOUT;
-                        }
+                    if shut_rd {
+                        revents |= POLLIN;
                     }
+                    if matches!(state, crate::net::unix::UnixSocketState::Closed) {
+                        revents |= POLLHUP;
+                    }
+                    revents
                 }
-                if s.shut_rd {
-                    revents |= POLLIN; // EOF readable
-                }
-                if matches!(s.state, crate::net::unix::UnixSocketState::Closed) {
-                    revents |= POLLHUP;
-                }
-                revents
-            })
-            .unwrap_or(POLLNVAL)
+                None => POLLNVAL,
+            }
         }
         FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
     }
