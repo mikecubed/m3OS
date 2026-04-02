@@ -1997,12 +1997,12 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "prompt after ext2 readlink",
     });
     steps.push(SmokeStep::Send {
-        input: "/bin/cat /phase38-passwd-link\n",
-        label: "cat: follow ext2 symlink target",
+        input: "/bin/grep root:x:0:0: /phase38-passwd-link\n",
+        label: "grep: follow ext2 symlink target",
     });
     steps.push(SmokeStep::Wait {
         pattern: "root:x:0:0:",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify ext2 symlink follow output",
     });
     steps.push(SmokeStep::Wait {

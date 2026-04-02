@@ -1044,14 +1044,16 @@ impl Ext2Volume {
         }
 
         child_inode.links_count = child_inode.links_count.saturating_sub(1);
-        let open_count = crate::process::ext2_inode_open_count(child_ino);
-        if child_inode.links_count != 0 || open_count != 0 {
-            self.write_inode(child_ino, &child_inode)?;
-        }
-
         self.remove_directory_entry(&parent_inode, name)?;
 
-        if child_inode.links_count == 0 && open_count == 0 {
+        if child_inode.links_count != 0 {
+            self.write_inode(child_ino, &child_inode)?;
+            return Ok(());
+        }
+
+        if crate::process::ext2_inode_open_count(child_ino) != 0 {
+            self.write_inode(child_ino, &child_inode)?;
+        } else {
             self.truncate_file(child_ino, &mut child_inode)?;
             self.free_inode(child_ino)?;
         }

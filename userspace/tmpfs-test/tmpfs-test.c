@@ -62,7 +62,7 @@ static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t 
 static void test_write_read_roundtrip(void) {
     const char *path = "/tmp/test.txt";
     const char *msg = "Hello from tmpfs!";
-    size_t msg_len = strlen(msg); /* DevSkim: ignore DS140021 — string literal */
+    size_t msg_len = sizeof("Hello from tmpfs!") - 1;
 
     /* Create and write */
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -850,7 +850,6 @@ static void cleanup(void) {
         snprintf(name, sizeof(name), "/tmp/hop-%02d", i);
         unlink(name);
     }
-    unlink("/tmp/umask-private");
     unlink("/tmp/root-owned/child.txt");
     rmdir("/tmp/umask-private");
     rmdir("/tmp/root-owned");

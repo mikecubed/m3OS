@@ -21,15 +21,14 @@ fn main(args: &[&str]) -> i32 {
     path[..bytes.len()].copy_from_slice(bytes);
     path[bytes.len()] = 0;
 
-    let mut target = [0u8; 256];
+    let mut target = [0u8; 4096];
     let n = sys_readlink(&path[..=bytes.len()], &mut target);
     if n < 0 {
         write_str(STDERR_FILENO, "readlink: cannot read link\n");
         return 1;
     }
     if n as usize == target.len() {
-        write_str(STDERR_FILENO, "readlink: target too long\n");
-        return 1;
+        write_str(STDERR_FILENO, "readlink: target may be truncated\n");
     }
     let _ = write(STDOUT_FILENO, &target[..n as usize]);
     let _ = write(STDOUT_FILENO, b"\n");

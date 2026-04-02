@@ -4865,9 +4865,6 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
 }
 
 pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
-    if crate::process::ext2_inode_open_count(inode_num) != 0 {
-        return;
-    }
     let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
     let Some(vol) = vol.as_mut() else {
         return;
@@ -4876,6 +4873,9 @@ pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
         return;
     };
     if inode.links_count != 0 {
+        return;
+    }
+    if crate::process::ext2_inode_open_count(inode_num) != 0 {
         return;
     }
     let _ = vol.truncate_file(inode_num, &mut inode);
