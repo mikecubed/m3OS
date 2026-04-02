@@ -238,7 +238,7 @@ and wakes only when an FD becomes ready or the timeout expires.
 
 **Acceptance:**
 - [x] First scan: if any FD is ready, return immediately (fast path preserved)
-- [x] No FDs ready: register on all wait queues and block via `WaitQueue::sleep()`
+- [x] No FDs ready: register on all wait queues via `WaitQueue::register()` and block via `scheduler::block_current_unless_woken()` (yield for positive timeouts)
 - [x] Wakeup: re-scan all FDs and return the ready count
 - [x] Timeout of 0: non-blocking scan only (existing behavior)
 - [x] Timeout of -1: block indefinitely

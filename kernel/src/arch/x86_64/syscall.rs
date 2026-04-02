@@ -1393,6 +1393,7 @@ fn sys_dup(oldfd: u64) -> u64 {
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+                FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
                 _ => {}
             }
             log::info!("[dup] fd {} → fd {}", oldfd, newfd);
@@ -1436,6 +1437,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+        FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
         _ => {}
     }
 
@@ -7311,6 +7313,9 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::Socket { handle } => {
                             crate::net::add_socket_ref(*handle);
                         }
+                        FdBackend::Epoll { instance_id } => {
+                            epoll_add_ref(*instance_id);
+                        }
                         _ => {}
                     }
                     new_fd as u64
@@ -9225,12 +9230,16 @@ struct EpollInterest {
 /// Blocking in epoll_wait is done by registering on monitored FDs' wait queues.
 struct EpollInstance {
     interests: alloc::vec::Vec<EpollInterest>,
+    refcount: u32,
+    owner_pid: crate::process::Pid,
 }
 
 impl EpollInstance {
-    fn new() -> Self {
+    fn new(pid: crate::process::Pid) -> Self {
         Self {
             interests: alloc::vec::Vec::new(),
+            refcount: 1,
+            owner_pid: pid,
         }
     }
 }
@@ -9240,33 +9249,62 @@ static EPOLL_TABLE: spin::Mutex<[Option<EpollInstance>; MAX_EPOLL_INSTANCES]> = 
     spin::Mutex::new([NONE; MAX_EPOLL_INSTANCES])
 };
 
-/// Free an epoll instance by ID.
+/// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).
+pub fn epoll_free_pub(instance_id: usize) {
+    epoll_free(instance_id);
+}
+
+/// Public entry point for epoll_add_ref (called from add_fd_refs on fork/dup).
+pub fn epoll_add_ref_pub(instance_id: usize) {
+    epoll_add_ref(instance_id);
+}
+
+/// Decrement epoll instance refcount; free when it reaches zero.
 fn epoll_free(instance_id: usize) {
     let mut table = EPOLL_TABLE.lock();
-    if instance_id < MAX_EPOLL_INSTANCES {
-        table[instance_id] = None;
+    if let Some(inst) = table.get_mut(instance_id).and_then(|slot| slot.as_mut()) {
+        inst.refcount = inst.refcount.saturating_sub(1);
+        if inst.refcount == 0 {
+            table[instance_id] = None;
+        }
     }
 }
 
-/// Remove an FD from all epoll interest lists (called on close).
+/// Increment epoll instance refcount (called on dup/fork).
+fn epoll_add_ref(instance_id: usize) {
+    let mut table = EPOLL_TABLE.lock();
+    if let Some(inst) = table.get_mut(instance_id).and_then(|slot| slot.as_mut()) {
+        inst.refcount += 1;
+    }
+}
+
+/// Remove an FD from epoll interest lists owned by the current process.
 fn epoll_remove_fd(fd: usize) {
+    let pid = crate::process::current_pid();
     let mut table = EPOLL_TABLE.lock();
     for inst in table.iter_mut().flatten() {
-        inst.interests.retain(|i| i.fd != fd);
+        if inst.owner_pid == pid {
+            inst.interests.retain(|i| i.fd != fd);
+        }
     }
 }
 
 /// epoll_create1(flags) — syscall 291
 fn sys_epoll_create1(flags: u64) -> u64 {
+    // Reject unknown flags.
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return NEG_EINVAL;
+    }
     let cloexec = flags & EPOLL_CLOEXEC != 0;
 
     // Allocate an instance.
+    let pid = crate::process::current_pid();
     let instance_id = {
         let mut table = EPOLL_TABLE.lock();
         let mut found = None;
         for (i, slot) in table.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(EpollInstance::new());
+                *slot = Some(EpollInstance::new(pid));
                 found = Some(i);
                 break;
             }
@@ -9316,9 +9354,14 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         None => return NEG_EBADF,
     };
 
-    // Verify target FD exists.
-    if current_fd_entry(fd_idx).is_none() {
-        return NEG_EBADF;
+    // Verify target FD exists and is not an epoll FD.
+    match current_fd_entry(fd_idx) {
+        Some(e) => {
+            if matches!(e.backend, FdBackend::Epoll { .. }) {
+                return NEG_EINVAL; // epoll FDs cannot be monitored
+            }
+        }
+        None => return NEG_EBADF,
     }
 
     // Read epoll_event from userspace: packed { events: u32, data: u64 } = 12 bytes

@@ -177,6 +177,9 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
             FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+            FdBackend::Epoll { instance_id } => {
+                crate::arch::x86_64::syscall::epoll_add_ref_pub(*instance_id)
+            }
             _ => {}
         }
     }
@@ -189,6 +192,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut epolls = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -205,6 +209,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     _ => {}
                 }
                 *slot = None;
@@ -226,6 +231,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for h in sockets {
         crate::net::free_socket(h);
     }
+    for id in epolls {
+        crate::arch::x86_64::syscall::epoll_free_pub(id);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -242,6 +250,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut epolls = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -256,6 +265,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     _ => {}
                 }
             }
@@ -275,6 +285,9 @@ pub fn close_all_fds_for(pid: Pid) {
     }
     for h in sockets {
         crate::net::free_socket(h);
+    }
+    for id in epolls {
+        crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
 }
 
