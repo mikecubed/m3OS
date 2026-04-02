@@ -956,9 +956,9 @@ static void cleanup(void) {
     }
     unlink("/tmp/root-owned/child.txt");
     rmdir("/tmp/parent-target/renamed-via-link");
-    rmdir("/tmp/parent-link");
+    unlink("/tmp/parent-link");
     rmdir("/tmp/parent-target");
-    rmdir("/tmp/chdir-link");
+    unlink("/tmp/chdir-link");
     rmdir("/tmp/chdir-target");
     rmdir("/tmp/umask-private");
     rmdir("/tmp/root-owned");

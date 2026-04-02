@@ -314,16 +314,16 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
     let table = PROCESS_TABLE.lock();
     table
         .iter()
-        .flat_map(|proc| proc.fd_table.iter())
+        .flat_map(|proc| proc.fd_table.iter().flatten())
         .filter(|entry| {
             matches!(
                 entry,
-                Some(FdEntry {
+                FdEntry {
                     backend: FdBackend::Ext2Disk {
                         inode_num: fd_inode, ..
                     },
                     ..
-                }) if *fd_inode == inode_num
+                } if *fd_inode == inode_num
             )
         })
         .count()
