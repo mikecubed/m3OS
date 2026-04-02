@@ -3601,10 +3601,11 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+            let capped = (count as usize).min(4096);
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
             match sock_type {
                 Some(crate::net::unix::UnixSocketType::Stream) => loop {
-                    let mut tmp = alloc::vec![0u8; count as usize];
+                    let mut tmp = alloc::vec![0u8; capped];
                     match crate::net::unix::unix_stream_read(handle, &mut tmp) {
                         Ok(0) => return 0,
                         Ok(n) => {
@@ -3626,7 +3627,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                 },
                 Some(crate::net::unix::UnixSocketType::Datagram) => loop {
-                    let mut tmp = alloc::vec![0u8; count as usize];
+                    let mut tmp = alloc::vec![0u8; capped];
                     match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
                         Ok((n, _sender)) => {
                             if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
@@ -4160,7 +4161,10 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     match peer {
                         Some(target) => {
                             match crate::net::unix::unix_dgram_send(sender_path, target, &data) {
-                                Ok(n) => n as u64,
+                                Ok(n) => {
+                                    crate::net::unix::wake_unix_socket(target);
+                                    n as u64
+                                }
                                 Err(_) => NEG_EAGAIN,
                             }
                         }
@@ -8994,8 +8998,19 @@ fn sys_bind_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
         };
         let mode = 0o777 & !umask;
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        // Create as a regular file (marker for socket).
-        let _ = tmpfs.create_file_with_meta(rel, uid, gid, mode);
+        match tmpfs.create_file_with_meta(rel, uid, gid, mode) {
+            Ok(_) => {}
+            Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => {
+                drop(tmpfs);
+                crate::net::unix::unbind_path(&path);
+                return NEG_EADDRINUSE;
+            }
+            Err(_) => {
+                drop(tmpfs);
+                crate::net::unix::unbind_path(&path);
+                return NEG_EIO;
+            }
+        }
     }
 
     // Update socket state.
@@ -9231,7 +9246,14 @@ fn sys_shutdown_unix(handle: usize, how: u64) -> u64 {
 }
 
 /// sendto() for Unix datagram sockets.
-fn sys_sendto_unix(handle: usize, buf_ptr: u64, len: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+fn sys_sendto_unix(
+    handle: usize,
+    buf_ptr: u64,
+    len: u64,
+    nonblock: bool,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> u64 {
     let capped = (len as usize).min(4096);
     let mut data = alloc::vec![0u8; capped];
     if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
@@ -9257,12 +9279,25 @@ fn sys_sendto_unix(handle: usize, buf_ptr: u64, len: u64, addr_ptr: u64, addr_le
         }
     };
 
-    match crate::net::unix::unix_dgram_send(sender_path, target, &data) {
-        Ok(n) => {
-            crate::net::unix::wake_unix_socket(target);
-            n as u64
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+    loop {
+        match crate::net::unix::unix_dgram_send(sender_path.clone(), target, &data) {
+            Ok(n) => {
+                crate::net::unix::wake_unix_socket(target);
+                return n as u64;
+            }
+            Err(_) => {
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
+                restore_caller_context(pid, saved_user_rsp);
+            }
         }
-        Err(_) => NEG_EAGAIN,
     }
 }
 
@@ -9277,8 +9312,9 @@ fn sys_recvfrom_unix(
 ) -> u64 {
     let pid = crate::process::current_pid();
     let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+    let capped = (count as usize).min(4096);
     loop {
-        let mut tmp = alloc::vec![0u8; count as usize];
+        let mut tmp = alloc::vec![0u8; capped];
         match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
             Ok((n, sender_path)) => {
                 if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
@@ -9815,7 +9851,7 @@ fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, addr_
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
             match sock_type {
                 Some(crate::net::unix::UnixSocketType::Datagram) => {
-                    sys_sendto_unix(handle, buf_ptr, len, addr_ptr, addr_len)
+                    sys_sendto_unix(handle, buf_ptr, len, entry.nonblock, addr_ptr, addr_len)
                 }
                 Some(crate::net::unix::UnixSocketType::Stream) => {
                     // Stream sockets use write() semantics.
@@ -10471,21 +10507,11 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                     !s.recv_buf.is_empty(),
                     !s.backlog.is_empty(),
                     !s.dgram_queue.is_empty(),
-                    s.dgram_queue.len() < crate::net::unix::UNIX_DGRAM_QUEUE_MAX,
                     s.shut_rd,
                 )
             });
             match info {
-                Some((
-                    sock_type,
-                    state,
-                    peer,
-                    has_data,
-                    has_backlog,
-                    has_dgram,
-                    dgram_space,
-                    shut_rd,
-                )) => {
+                Some((sock_type, state, peer, has_data, has_backlog, has_dgram, shut_rd)) => {
                     let mut revents: i16 = 0;
                     match sock_type {
                         crate::net::unix::UnixSocketType::Stream => {
@@ -10517,9 +10543,9 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
                             if has_dgram {
                                 revents |= POLLIN;
                             }
-                            if dgram_space {
-                                revents |= POLLOUT;
-                            }
+                            // Datagram writability is not determined by the local
+                            // receive queue — always report writable.
+                            revents |= POLLOUT;
                         }
                     }
                     if shut_rd {

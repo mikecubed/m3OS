@@ -366,15 +366,19 @@ pub fn unix_dgram_send(
 /// Receive a datagram from a datagram socket's own queue.
 /// Returns (bytes_copied, sender_path).
 pub fn unix_dgram_recv(handle: usize, buf: &mut [u8]) -> Result<(usize, Option<String>), i64> {
-    with_unix_socket_mut(handle, |s| {
-        match s.dgram_queue.pop_front() {
-            Some(dgram) => {
-                let n = buf.len().min(dgram.data.len());
-                buf[..n].copy_from_slice(&dgram.data[..n]);
-                Ok((n, dgram.sender_path))
-            }
-            None => Err(-11_i64), // EAGAIN
+    let result = with_unix_socket_mut(handle, |s| match s.dgram_queue.pop_front() {
+        Some(dgram) => {
+            let n = buf.len().min(dgram.data.len());
+            buf[..n].copy_from_slice(&dgram.data[..n]);
+            Ok((n, dgram.sender_path))
         }
+        None => Err(-11_i64), // EAGAIN
     })
-    .ok_or(-9_i64)? // EBADF
+    .ok_or(-9_i64)?; // EBADF
+
+    // Wake senders/pollers that may be waiting for queue space.
+    if result.is_ok() {
+        wake_unix_socket(handle);
+    }
+    result
 }
