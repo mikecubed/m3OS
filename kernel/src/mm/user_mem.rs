@@ -47,7 +47,6 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
     }
 
     let phys_off = crate::mm::phys_offset();
-    let mapper = unsafe { crate::mm::paging::get_mapper() };
 
     let mut copied = 0usize;
     let mut vaddr = src_vaddr;
@@ -57,24 +56,29 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        // Translate the page and validate flags. If the page is not present,
-        // try to demand-fault it (Phase 36: lazy mmap pages).
-        let phys = match mapper.translate_addr(VirtAddr::new(page_base)) {
+        // Translate the page and validate flags. Acquire a short-lived mapper
+        // per iteration so it is dropped before any demand-fault call that
+        // mutates the page tables.
+        let translated = {
+            let mapper = unsafe { crate::mm::paging::get_mapper() };
+            mapper.translate_addr(VirtAddr::new(page_base))
+        };
+        let phys = match translated {
             Some(p) => p,
             None => {
                 if !try_demand_fault(page_base) {
                     return Err(());
                 }
-                // Re-acquire mapper after page table modification.
                 let mapper = unsafe { crate::mm::paging::get_mapper() };
                 mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?
             }
         };
 
-        // Verify USER_ACCESSIBLE via page-table walk.
-        let mapper = unsafe { crate::mm::paging::get_mapper() };
-        if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
-            return Err(());
+        {
+            let mapper = unsafe { crate::mm::paging::get_mapper() };
+            if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
+                return Err(());
+            }
         }
 
         let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
