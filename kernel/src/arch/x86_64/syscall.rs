@@ -54,6 +54,39 @@ const DT_DIR: u8 = 4;
 #[allow(dead_code)]
 const DT_REG: u8 = 8;
 
+const EXT2_SUPER_MAGIC: i64 = 0xEF53;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: i64 = 0x0000_9FA0;
+const RAMFS_MAGIC: i64 = 0x8584_58F6u32 as i64;
+const MSDOS_SUPER_MAGIC: i64 = 0x0000_4D44;
+const PIPEFS_MAGIC: i64 = 0x5049_5045;
+const SOCKFS_MAGIC: i64 = 0x534F_434B;
+const STATFS_BLOCK_SIZE: i64 = 4096;
+const STATFS_NAME_MAX: i64 = 255;
+const TMPFS_TOTAL_BLOCKS: u64 =
+    (crate::fs::tmpfs::MAX_FILE_SIZE as u64).div_ceil(STATFS_BLOCK_SIZE as u64);
+const TMPFS_TOTAL_FILES: u64 = 1024;
+const VIRTUAL_FS_DEFAULT_BLOCKS: u64 = 1024;
+const VIRTUAL_FS_DEFAULT_FILES: u64 = 1024;
+
+#[repr(C)]
+struct Statfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+const _: [(); 120] = [(); core::mem::size_of::<Statfs>()];
+
 // ---------------------------------------------------------------------------
 // Path resolution helpers (Phase 18)
 // ---------------------------------------------------------------------------
@@ -105,6 +138,231 @@ fn current_cwd() -> alloc::string::String {
         Some(p) => p.cwd.clone(),
         None => alloc::string::String::from("/"),
     }
+}
+
+fn make_statfs(
+    f_type: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+) -> Statfs {
+    Statfs {
+        f_type,
+        f_bsize: STATFS_BLOCK_SIZE,
+        f_blocks,
+        f_bfree,
+        f_bavail,
+        f_files,
+        f_ffree,
+        f_fsid: [f_type as i32, 0],
+        f_namelen: STATFS_NAME_MAX,
+        f_frsize: STATFS_BLOCK_SIZE,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
+fn tmpfs_statfs() -> Statfs {
+    let free_blocks = crate::mm::frame_allocator::free_count() as u64;
+    make_statfs(
+        TMPFS_MAGIC,
+        TMPFS_TOTAL_BLOCKS,
+        free_blocks.min(TMPFS_TOTAL_BLOCKS),
+        free_blocks.min(TMPFS_TOTAL_BLOCKS),
+        TMPFS_TOTAL_FILES,
+        TMPFS_TOTAL_FILES,
+    )
+}
+
+fn proc_statfs() -> Statfs {
+    make_statfs(
+        PROC_SUPER_MAGIC,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn ramdisk_statfs() -> Statfs {
+    make_statfs(
+        RAMFS_MAGIC,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        0,
+    )
+}
+
+fn pipefs_statfs() -> Statfs {
+    make_statfs(
+        PIPEFS_MAGIC,
+        0,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn sockfs_statfs() -> Statfs {
+    make_statfs(
+        SOCKFS_MAGIC,
+        0,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn ext2_statfs() -> Statfs {
+    let ext2 = crate::fs::ext2::EXT2_VOLUME.lock();
+    if let Some(vol) = ext2.as_ref() {
+        return make_statfs(
+            EXT2_SUPER_MAGIC,
+            vol.superblock.blocks_count as u64,
+            vol.superblock.free_blocks_count as u64,
+            vol.superblock.free_blocks_count as u64,
+            vol.superblock.inodes_count as u64,
+            vol.superblock.free_inodes_count as u64,
+        );
+    }
+    ramdisk_statfs()
+}
+
+fn fat32_statfs() -> Statfs {
+    let fat32 = crate::fs::fat32::FAT32_VOLUME.lock();
+    if let Some(vol) = fat32.as_ref() {
+        let reserved = vol.bpb.reserved_sectors as u64;
+        let fats = (vol.bpb.num_fats as u64) * (vol.bpb.fat_size_32 as u64);
+        let data_sectors = (vol.bpb.total_sectors_32 as u64).saturating_sub(reserved + fats);
+        let data_bytes = data_sectors * (vol.bpb.bytes_per_sector as u64);
+        let total_blocks = data_bytes.div_ceil(STATFS_BLOCK_SIZE as u64);
+        return make_statfs(
+            MSDOS_SUPER_MAGIC,
+            total_blocks,
+            0,
+            0,
+            VIRTUAL_FS_DEFAULT_FILES,
+            0,
+        );
+    }
+    ramdisk_statfs()
+}
+
+fn write_statfs_to_user(buf_ptr: u64, stat: &Statfs) -> u64 {
+    if buf_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    // SAFETY: `Statfs` is a plain repr(C) POD buffer with a compile-time size check.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (stat as *const Statfs).cast::<u8>(),
+            core::mem::size_of::<Statfs>(),
+        )
+    };
+    if crate::mm::user_mem::copy_to_user(buf_ptr, bytes).is_err() {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+fn statfs_for_path(abs_path: &str) -> Statfs {
+    if abs_path == "/proc" || abs_path.starts_with("/proc/") {
+        return proc_statfs();
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if rel.is_empty() {
+            return fat32_statfs();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.lookup(rel).is_ok()
+            {
+                return fat32_statfs();
+            }
+        }
+    }
+    if abs_path == "/tmp" || abs_path.starts_with("/tmp/") {
+        return tmpfs_statfs();
+    }
+    if abs_path == "/dev" || abs_path.starts_with("/dev/") {
+        return ramdisk_statfs();
+    }
+    if abs_path == "/" {
+        return if crate::fs::ext2::is_mounted() {
+            ext2_statfs()
+        } else {
+            ramdisk_statfs()
+        };
+    }
+    if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
+        return ramdisk_statfs();
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref()
+            && vol.exists(rel)
+        {
+            return ext2_statfs();
+        }
+    }
+    ramdisk_statfs()
+}
+
+fn statfs_path_exists(abs_path: &str) -> bool {
+    if abs_path == "/" || abs_path == "/tmp" {
+        return true;
+    }
+    if abs_path == "/dev"
+        || abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/ptmx"
+        || abs_path.starts_with("/dev/pts/")
+    {
+        return true;
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if rel.is_empty() {
+            return data_is_mounted();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return vol.lookup(rel).is_ok();
+            }
+        }
+    }
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        if rel.is_empty() {
+            return true;
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).is_ok();
+    }
+    if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(abs_path) {
+        return node.is_dir() || node.is_file();
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            return vol.exists(rel);
+        }
+    }
+    false
 }
 
 use core::arch::global_asm;
@@ -487,6 +745,8 @@ pub extern "C" fn syscall_handler(
         124 => sys_getsid(arg0),
         // Phase 19: sigaltstack
         131 => sys_sigaltstack(arg0, arg1),
+        137 => sys_statfs(arg0, arg1),
+        138 => sys_fstatfs(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
         // Phase 24: mount(source, target, fstype)
@@ -4778,6 +5038,51 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         return NEG_EFAULT;
     }
     0
+}
+
+fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw = match read_user_cstr(path_ptr, &mut buf) {
+        Some(p) => p,
+        None => return NEG_EFAULT,
+    };
+    let cwd = current_cwd();
+    let abs = resolve_path(&cwd, raw);
+    if !statfs_path_exists(&abs) {
+        return NEG_ENOENT;
+    }
+    let stat = statfs_for_path(&abs);
+    write_statfs_to_user(buf_ptr, &stat)
+}
+
+fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    let stat = match &entry.backend {
+        FdBackend::Tmpfs { .. } => tmpfs_statfs(),
+        FdBackend::Fat32Disk { .. } => fat32_statfs(),
+        FdBackend::Ext2Disk { .. } => ext2_statfs(),
+        FdBackend::Ramdisk { .. } => ramdisk_statfs(),
+        FdBackend::Dir { path } => statfs_for_path(path),
+        FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. } => ramdisk_statfs(),
+        FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
+        FdBackend::Socket { .. } => sockfs_statfs(),
+    };
+    write_statfs_to_user(buf_ptr, &stat)
 }
 
 // ---------------------------------------------------------------------------
