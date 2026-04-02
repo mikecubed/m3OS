@@ -2533,8 +2533,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     match &entry.backend {
         FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
             // Read from kernel stdin buffer.
-            // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2547,6 +2547,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         }
                         return n as u64;
                     }
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
                 }
                 // Check for pending signals so Ctrl-C works while blocked.
                 if has_pending_signal() {
@@ -2648,6 +2651,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
+            let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
@@ -2663,6 +2667,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return n as u64;
                     }
                     Err(_would_block) => {
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
                         if has_pending_signal() {
                             return NEG_EINTR;
                         }
@@ -2726,6 +2733,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2737,6 +2745,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             let to_read = count.min(dst.len() as u64) as usize;
                             let n = pair.s2m.read(&mut dst[..to_read]);
                             drop(table);
+                            crate::pty::wake_master(pty_id);
                             if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                 return NEG_EFAULT;
                             }
@@ -2748,6 +2757,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     } else {
                         return 0; // PTY freed
                     }
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
                 }
                 if has_pending_signal() {
                     return NEG_EINTR;
@@ -2762,6 +2774,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2780,6 +2793,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     .copy_from_slice(&pair.edit_buf.as_slice()[..to_copy]);
                                 pair.edit_buf.drain(to_copy);
                                 drop(table);
+                                crate::pty::wake_slave(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
                                     .is_err()
                                 {
@@ -2800,6 +2814,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 let to_read = count.min(dst.len() as u64) as usize;
                                 let n = pair.m2s.read(&mut dst[..to_read]);
                                 drop(table);
+                                crate::pty::wake_slave(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                     return NEG_EFAULT;
                                 }
@@ -2812,6 +2827,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     } else {
                         return 0; // PTY freed
                     }
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
                 }
                 if has_pending_signal() {
                     return NEG_EINTR;
@@ -3056,6 +3074,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeWrite { pipe_id } => {
             let pipe_id = *pipe_id;
+            let nonblock = entry.nonblock;
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
@@ -3073,6 +3092,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return NEG_EPIPE;
                     }
                     Err(true) => {
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
                         // Would block — yield and retry.
                         if has_pending_signal() {
                             return NEG_EINTR;
@@ -3241,6 +3263,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     written += 1;
                 }
+                drop(table);
+                // Wake slave waiters (data written to m2s / edit_buf).
+                crate::pty::wake_slave(pty_id);
+                // Wake master waiters (echo may have written to s2m).
+                crate::pty::wake_master(pty_id);
                 written as u64
             } else {
                 NEG_EIO
@@ -3275,6 +3302,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     written += 1;
                 }
+                drop(table);
+                // Wake master waiters (data written to s2m).
+                crate::pty::wake_master(pty_id);
                 written as u64
             } else {
                 NEG_EIO
@@ -7989,7 +8019,6 @@ fn sys_recvfrom_socket(
     addr_len_ptr: u64,
 ) -> u64 {
     const MSG_DONTWAIT: u64 = 0x40;
-    let nonblock = flags & MSG_DONTWAIT != 0;
 
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -7999,6 +8028,7 @@ fn sys_recvfrom_socket(
         Some(e) => e,
         None => return NEG_EBADF,
     };
+    let nonblock = entry.nonblock || flags & MSG_DONTWAIT != 0;
 
     match &entry.backend {
         FdBackend::Socket { handle } => {
