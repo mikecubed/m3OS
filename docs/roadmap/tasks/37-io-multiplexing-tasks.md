@@ -348,7 +348,7 @@ event-driven servers.
 - [x] Syscall 232 dispatches to `sys_epoll_wait()`
 - [x] Scans interest list for ready FDs (level-triggered: check current readiness)
 - [x] If ready events found, copies up to `maxevents` to userspace and returns count
-- [x] If no ready events, blocks on the epoll instance's wait queue
+- [x] If no ready events, blocks on monitored FDs' wait queues (with TOCTOU re-check)
 - [x] Timeout of 0: non-blocking scan only
 - [x] Timeout of -1: block indefinitely
 - [x] Positive timeout: block with timeout

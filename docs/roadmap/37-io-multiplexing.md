@@ -116,7 +116,7 @@ int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 
 Extend `fcntl()` to support:
 - `F_GETFL` — return file status flags (including `O_NONBLOCK`)
-- `F_SETFL` — set file status flags (`O_NONBLOCK`, `O_APPEND`)
+- `F_SETFL` — set file status flags (`O_NONBLOCK`)
 
 ## Important Components and How They Work
 

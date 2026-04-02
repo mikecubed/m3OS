@@ -9209,18 +9209,16 @@ struct EpollInterest {
     data: u64,
 }
 
-/// An epoll instance — tracks interest set and has a wait queue for epoll_wait.
+/// An epoll instance — tracks the interest set (which FDs to monitor).
+/// Blocking in epoll_wait is done by registering on monitored FDs' wait queues.
 struct EpollInstance {
     interests: alloc::vec::Vec<EpollInterest>,
-    #[allow(dead_code)]
-    wait_queue: crate::task::wait_queue::WaitQueue,
 }
 
 impl EpollInstance {
     fn new() -> Self {
         Self {
             interests: alloc::vec::Vec::new(),
-            wait_queue: crate::task::wait_queue::WaitQueue::new(),
         }
     }
 }
@@ -9282,6 +9280,11 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if epfd_idx >= MAX_FDS || fd_idx >= MAX_FDS {
         return NEG_EBADF;
+    }
+
+    // Reject adding an epoll FD to itself (Linux returns EINVAL for this).
+    if epfd_idx == fd_idx {
+        return NEG_EINVAL;
     }
 
     // Get the epoll instance ID from the FD.
