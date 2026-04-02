@@ -2202,13 +2202,24 @@ fn signed_path(path: &Path) -> PathBuf {
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
 fn create_data_disk(output_dir: &Path) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
-    if disk_path.exists() {
-        println!("Data disk: {} (existing, preserved)", disk_path.display());
-        return disk_path;
-    }
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
     const DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
+    if disk_path.exists() {
+        let meta = std::fs::metadata(&disk_path).ok();
+        let size = meta.map(|m| m.len()).unwrap_or(0);
+        if size < DISK_SIZE {
+            println!(
+                "WARNING: existing data disk is {} MB but {} MB is expected. \
+                 Delete {} to recreate at the correct size.",
+                size / (1024 * 1024),
+                DISK_SIZE / (1024 * 1024),
+                disk_path.display()
+            );
+        }
+        println!("Data disk: {} (existing, preserved)", disk_path.display());
+        return disk_path;
+    }
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;

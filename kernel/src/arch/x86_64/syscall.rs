@@ -4960,6 +4960,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
     let flags = per_core_syscall_arg3();
 
+    const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
     if flags & MAP_ANONYMOUS == 0 {
         log::warn!(
@@ -4968,6 +4969,10 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         );
         return NEG_EINVAL;
     }
+    // Mask prot and flags to supported bits only.
+    const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
+    let prot = prot & PROT_MASK;
+    let flags = flags & (MAP_PRIVATE | MAP_ANONYMOUS);
 
     let len = if len == 0 {
         return NEG_EINVAL;
@@ -5158,6 +5163,9 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    // Mask prot to supported POSIX bits only.
+    let prot = prot & 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
+
     // Validate: page-aligned address and non-zero length.
     if addr & 0xFFF != 0 || len == 0 {
         return NEG_EINVAL;

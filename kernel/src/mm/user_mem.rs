@@ -190,6 +190,14 @@ fn try_demand_fault(page_base: u64) -> bool {
             .map(|m| m.prot)
     };
     if let Some(prot) = vma_prot {
+        // Never demand-map PROT_NONE pages — they are guard pages that must
+        // remain inaccessible.
+        const PROT_READ: u64 = 0x1;
+        const PROT_WRITE: u64 = 0x2;
+        const PROT_EXEC: u64 = 0x4;
+        if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+            return false;
+        }
         return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
     }
     false
