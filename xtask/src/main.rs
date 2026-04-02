@@ -246,6 +246,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/hexdump.c", "hexdump"),
         ("userspace/coreutils/du.c", "du"),
         ("userspace/coreutils/df.c", "df"),
+        ("userspace/coreutils/find.c", "find"),
+        ("userspace/coreutils/xargs.c", "xargs"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2641,7 +2643,101 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 14. make clean
+    // 14. Phase 41 file tools: find, xargs
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c'\n",
+        label: "find: match C source files",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify find name match",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find name",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -type d\n",
+        label: "find: directories only",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project",
+        timeout_secs: 10,
+        label: "verify find directory output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find directories",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -type f\n",
+        label: "find: files only",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify find file output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find files",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' | /bin/xargs /bin/grep main\n",
+        label: "xargs: grep matches from find",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main",
+        timeout_secs: 10,
+        label: "verify xargs grep output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs grep",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' -print0 | /bin/xargs -0 /bin/grep main\n",
+        label: "xargs: null-delimited grep",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main",
+        timeout_secs: 10,
+        label: "verify xargs -0 output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs -0",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' | /bin/xargs -I ITEM /bin/echo file:ITEM\n",
+        label: "xargs: replacement string",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "file:/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify xargs replacement output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs replacement",
+    });
+
+    // -----------------------------------------------------------------------
+    // 15. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
