@@ -232,6 +232,11 @@ fn build_musl_bins() {
     let bins: &[(&str, &str)] = &[
         ("userspace/hello-c/hello.c", "hello"),
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
+        ("userspace/coreutils/head.c", "head"),
+        ("userspace/coreutils/tail.c", "tail"),
+        ("userspace/coreutils/tee.c", "tee"),
+        ("userspace/coreutils/chmod.c", "chmod"),
+        ("userspace/coreutils/chown.c", "chown"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2022,7 +2027,184 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     ));
 
     // -----------------------------------------------------------------------
-    // 9. make clean
+    // 9. Phase 41 initial tools: head, tail, tee, chmod, chown
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/head -n 1 /home/project/main.c\n",
+        label: "head: first line of main.c",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "#include",
+        timeout_secs: 10,
+        label: "verify head -n output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after head -n",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /home/project/main.c | /bin/head\n",
+        label: "head: default stdin mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "#include",
+        timeout_secs: 10,
+        label: "verify head default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after head stdin",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/tail -n 1 /etc/passwd\n",
+        label: "tail: last passwd line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify tail -n output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tail -n",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd | /bin/tail\n",
+        label: "tail: default stdin mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify tail default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tail stdin",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo teecheck | /bin/tee /tmp/tee-output\n",
+        label: "tee: write stdout and file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "teecheck",
+        timeout_secs: 10,
+        label: "verify tee stdout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee write",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/tee-output\n",
+        label: "tee: verify written file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "teecheck",
+        timeout_secs: 10,
+        label: "verify tee file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee file check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo appendcheck | /bin/tee -a /tmp/tee-output\n",
+        label: "tee: append mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "appendcheck",
+        timeout_secs: 10,
+        label: "verify tee append stdout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee append",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/tee-output\n",
+        label: "tee: verify appended file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "appendcheck",
+        timeout_secs: 10,
+        label: "verify tee append file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee append check",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/touch /tmp/permfile\n",
+        "send: touch permfile",
+        "wait: prompt after touch permfile",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/chmod 600 /tmp/permfile\n",
+        "send: chmod permfile",
+        "wait: prompt after chmod",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /tmp/permfile\n",
+        label: "stat: verify chmod result",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Access: (00600)",
+        timeout_secs: 10,
+        label: "verify chmod stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after chmod stat",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/chown user:user /tmp/permfile\n",
+        "send: chown permfile",
+        "wait: prompt after chown",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /tmp/permfile\n",
+        label: "stat: verify chown result",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Uid: 1000",
+        timeout_secs: 10,
+        label: "verify chown uid",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Gid: 1000",
+        timeout_secs: 10,
+        label: "verify chown gid",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after chown stat",
+    });
+
+    // -----------------------------------------------------------------------
+    // 10. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

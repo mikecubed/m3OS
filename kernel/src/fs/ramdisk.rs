@@ -98,6 +98,11 @@ static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
 static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
 static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test.elf");
 static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
+static HEAD_ELF: &[u8] = include_bytes!("../../initrd/head.elf");
+static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail.elf");
+static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee.elf");
+static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod.elf");
+static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
@@ -289,6 +294,16 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: MEMINFO_ELF,
         },
     ),
+    ("head", RamdiskNode::File { content: HEAD_ELF }),
+    ("head.elf", RamdiskNode::File { content: HEAD_ELF }),
+    ("tail", RamdiskNode::File { content: TAIL_ELF }),
+    ("tail.elf", RamdiskNode::File { content: TAIL_ELF }),
+    ("tee", RamdiskNode::File { content: TEE_ELF }),
+    ("tee.elf", RamdiskNode::File { content: TEE_ELF }),
+    ("chmod", RamdiskNode::File { content: CHMOD_ELF }),
+    ("chmod.elf", RamdiskNode::File { content: CHMOD_ELF }),
+    ("chown", RamdiskNode::File { content: CHOWN_ELF }),
+    ("chown.elf", RamdiskNode::File { content: CHOWN_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
@@ -605,6 +620,26 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "readlink.elf",
         content: READLINK_ELF,
+    },
+    FlatFile {
+        name: "head.elf",
+        content: HEAD_ELF,
+    },
+    FlatFile {
+        name: "tail.elf",
+        content: TAIL_ELF,
+    },
+    FlatFile {
+        name: "tee.elf",
+        content: TEE_ELF,
+    },
+    FlatFile {
+        name: "chmod.elf",
+        content: CHMOD_ELF,
+    },
+    FlatFile {
+        name: "chown.elf",
+        content: CHOWN_ELF,
     },
 ];
 
