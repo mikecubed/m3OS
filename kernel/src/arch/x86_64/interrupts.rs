@@ -195,16 +195,27 @@ fn has_cow_marker(vaddr: u64) -> bool {
     }
 }
 
+/// Public entry point for kernel-context demand paging (e.g. `copy_from_user`
+/// encountering a lazy mmap page). Delegates to `demand_map_user_page`.
+pub fn demand_map_user_page_from_kernel(vaddr: u64, prot: u64) -> bool {
+    demand_map_user_page(vaddr, prot)
+}
+
 /// Demand-page a single 4 KiB user-accessible frame at the page containing
-/// `vaddr`. Used to grow the stack region on first write (musl's TLS/TCB
-/// allocation writes above the initial RSP — Linux maps 8 MiB so this is
-/// always valid there; we grow on demand).
+/// `vaddr`. Used for stack growth, VMA demand faults, and any other lazy
+/// mapping.
 ///
-/// Called from the page fault ISR (interrupts disabled, single CPU).
+/// `prot` uses POSIX constants: `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
+/// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
+///
+/// Called from the page fault ISR and from kernel-context demand faulting.
 /// Returns `true` on success, `false` on OOM.
-fn demand_map_user_page(vaddr: u64) -> bool {
+fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
 
     let phys_off = crate::mm::phys_offset();
     let phys_offset_va = VirtAddr::new(phys_off);
@@ -217,13 +228,13 @@ fn demand_map_user_page(vaddr: u64) -> bool {
     let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
+    // Intermediate page table levels always get full user-writable permissions.
     let user_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     unsafe {
         let pml4: &mut PageTable = &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
         if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
-            // Allocate a PDPT page.
             let frame = match crate::mm::frame_allocator::allocate_frame() {
                 Some(f) => f,
                 None => return false,
@@ -272,10 +283,14 @@ fn demand_map_user_page(vaddr: u64) -> bool {
         let frame_phys = frame.start_address().as_u64();
         core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
 
-        let data_flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::NO_EXECUTE;
+        // Build PTE flags from the POSIX prot bits.
+        let mut data_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if prot & PROT_WRITE != 0 {
+            data_flags |= PageTableFlags::WRITABLE;
+        }
+        if prot & PROT_EXEC == 0 {
+            data_flags |= PageTableFlags::NO_EXECUTE;
+        }
         pt[p1_idx].set_addr(frame.start_address(), data_flags);
 
         x86_64::instructions::tlb::flush(VirtAddr::new(vaddr & !0xFFF));
@@ -374,9 +389,36 @@ extern "x86-interrupt" fn page_fault_handler(
             const DEMAND_LIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
             if fault_addr_u64 >= stack_bottom
                 && fault_addr_u64 < stack_top + DEMAND_LIMIT
-                && demand_map_user_page(fault_addr_u64)
+                && demand_map_user_page(fault_addr_u64, 0x3)
+            // PROT_READ|PROT_WRITE
             {
                 return;
+            }
+        }
+
+        // Phase 36: VMA-based demand paging for mmap regions.
+        // If the fault address is inside a valid VMA, allocate a frame on demand.
+        if !is_present && let Ok(fault_vaddr) = addr {
+            let fault_addr_u64 = fault_vaddr.as_u64();
+            let pid = crate::process::current_pid();
+            let vma_prot = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table
+                    .find(pid)
+                    .and_then(|p| p.find_vma(fault_addr_u64))
+                    .map(|m| m.prot)
+            };
+            if let Some(prot) = vma_prot {
+                const PROT_READ: u64 = 0x1;
+                const PROT_WRITE: u64 = 0x2;
+                const PROT_EXEC: u64 = 0x4;
+                // PROT_NONE pages must trap — never demand-map them.
+                let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+                // A write fault to a read-only VMA is a genuine violation.
+                let write_ok = !is_write || prot & PROT_WRITE != 0;
+                if any_access && write_ok && demand_map_user_page(fault_addr_u64, prot) {
+                    return;
+                }
             }
         }
 

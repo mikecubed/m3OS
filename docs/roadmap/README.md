@@ -209,8 +209,8 @@ flowchart TD
 |---|---|---|---|---|---|---|
 | 33 | Kernel Memory | Slab allocator, OOM retry, working munmap | Complete | `phase-33` | [Phase 33](./33-kernel-memory-improvements.md) | [Tasks](./tasks/33-kernel-memory-tasks.md) |
 | 34 | Real-Time Clock | CMOS RTC, wall-clock time, CLOCK_REALTIME | Complete | `phase-34` | [Phase 34](./34-real-time-clock.md) | [Tasks](./tasks/34-real-time-clock-tasks.md) |
-| 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | Planned | `phase-35` | [Phase 35](./35-true-smp-multitasking.md) | *not yet created* |
-| 36 | Expanded Memory | Demand paging, mprotect, large mmap, disk/RAM expansion | Planned | `phase-36` | [Phase 36](./36-expanded-memory.md) | *not yet created* |
+| 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | Complete | `phase-35` | [Phase 35](./35-true-smp-multitasking.md) | [Tasks](./tasks/35-true-smp-multitasking-tasks.md) |
+| 36 | Expanded Memory | Demand paging, mprotect, large mmap, disk/RAM expansion | Complete | `phase-36` | [Phase 36](./36-expanded-memory.md) | [Tasks](./tasks/36-expanded-memory-tasks.md) |
 | 37 | I/O Multiplexing | select, epoll, non-blocking I/O | Planned | `phase-37` | [Phase 37](./37-io-multiplexing.md) | *not yet created* |
 | 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | Planned | `phase-38` | [Phase 38](./38-filesystem-enhancements.md) | *not yet created* |
 | 39 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | Planned | `phase-39` | [Phase 39](./39-unix-domain-sockets.md) | *not yet created* |

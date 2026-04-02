@@ -357,8 +357,8 @@ pub extern "C" fn syscall_handler(
         // Ion uses poll() to multiplex between signal pipe and stdin.
         7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
-        // Phase 21: mprotect stub (musl stack guard)
-        10 => 0, // no-op — our ELF loader already sets up guard pages
+        // Phase 36: mprotect(addr, len, prot) — change page permissions.
+        10 => sys_mprotect(arg0, arg1, arg2),
         // Linux-compatible memory (Phase 12, T018–T020)
         9 => sys_linux_mmap(arg0, arg1, arg2),
         11 => sys_linux_munmap(arg0, arg1),
@@ -2000,6 +2000,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
             proc.mmap_next = 0;
+            proc.mappings.clear(); // Phase 36: clear stale VMAs from old address space.
         }
     }
 
@@ -4959,6 +4960,7 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
     let flags = per_core_syscall_arg3();
 
+    const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
     if flags & MAP_ANONYMOUS == 0 {
         log::warn!(
@@ -4967,6 +4969,10 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         );
         return NEG_EINVAL;
     }
+    // Mask prot and flags to supported bits only.
+    const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
+    let prot = prot & PROT_MASK;
+    let flags = flags & (MAP_PRIVATE | MAP_ANONYMOUS);
 
     let len = if len == 0 {
         return NEG_EINVAL;
@@ -5014,63 +5020,19 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    // Map pages in the current address space (current CR3 = this process).
-    use x86_64::{
-        VirtAddr,
-        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
-    };
-    // Phase 31: honour PROT_EXEC — omit NO_EXECUTE when the caller requests
-    // executable memory (needed for TCC's `-run` JIT mode).
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
-    let flags_pt = {
-        let mut f = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if prot & PROT_WRITE != 0 {
-            f |= PageTableFlags::WRITABLE;
-        }
-        if prot & PROT_EXEC == 0 {
-            f |= PageTableFlags::NO_EXECUTE;
-        }
-        f
-    };
-    // SAFETY: current CR3 is the process's page table; no other mapper is live.
-    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
-    let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
+    // Phase 36: demand paging — do NOT allocate physical frames here.
+    // Pages are mapped lazily by the page fault handler on first access.
+    // Only record the VMA with protection and flags metadata.
 
-    for i in 0..pages {
-        // SAFETY: canonical range validated above.
-        let vaddr = VirtAddr::new(base + i * 4096);
-        let page: Page<Size4KiB> = Page::containing_address(vaddr);
-        let frame = match crate::mm::frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => {
-                log::warn!("[mmap] out of frames at page {}/{}", i, pages);
-                return NEG_EINVAL;
-            }
-        };
-        // Zero the frame via physical offset.
-        let phys_off = crate::mm::phys_offset();
-        unsafe {
-            let ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-            core::ptr::write_bytes(ptr, 0, 4096);
-        }
-        // SAFETY: mapper covers the current CR3; frame was just allocated; page is unmapped.
-        match unsafe { mapper.map_to(page, frame, flags_pt, &mut frame_alloc) } {
-            Ok(flush) => flush.flush(),
-            Err(_) => {
-                log::warn!("[mmap] map_to failed at page {}", i);
-                return NEG_EINVAL;
-            }
-        }
-    }
-
-    // Record the mapping in the process's tracking list (Phase 33).
+    // Record the mapping in the process's tracking list.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
             proc.mappings.push(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
+                prot,
+                flags,
             });
         }
     }
@@ -5161,6 +5123,8 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                     let tail = crate::process::MemoryMapping {
                         start: unmap_end,
                         len: m_end - unmap_end,
+                        prot: m.prot,
+                        flags: m.flags,
                     };
                     new_mappings.push(tail);
                     m.len = unmap_start - m.start;
@@ -5188,6 +5152,185 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             addr,
             len
         );
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 36: mprotect(addr, len, prot) — change page permissions on mapped
+// regions. Updates PTEs in-place and splits VMAs at mprotect boundaries.
+// ---------------------------------------------------------------------------
+
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    // Mask prot to supported POSIX bits only.
+    let prot = prot & 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
+
+    // Validate: page-aligned address and non-zero length.
+    if addr & 0xFFF != 0 || len == 0 {
+        return NEG_EINVAL;
+    }
+    if addr >= 0x0000_8000_0000_0000 {
+        return NEG_EINVAL;
+    }
+
+    let total_size = len.div_ceil(4096) * 4096; // round up to page boundary
+    let mprotect_end = match addr.checked_add(total_size) {
+        Some(e) => e,
+        None => return NEG_EINVAL,
+    };
+
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    // Validate that the entire range is covered by VMAs (or stack/brk regions).
+    // For now, we are permissive: if the address falls outside tracked VMAs
+    // (e.g. stack, brk, ELF segments), we still update PTEs but don't fail.
+    // This matches the musl stack guard use case where mprotect targets
+    // ELF loader-mapped regions not tracked as VMAs.
+
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{PageTable, PageTableFlags};
+
+    let phys_off = crate::mm::phys_offset();
+    let phys_offset_va = x86_64::VirtAddr::new(phys_off);
+
+    let (cr3_frame, _) = Cr3::read();
+    let pml4_phys = cr3_frame.start_address().as_u64();
+
+    // Build the new PTE flags from prot.
+    let mut new_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        new_flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        new_flags |= PageTableFlags::NO_EXECUTE;
+    }
+    // PROT_NONE: clear PRESENT to trap all accesses.
+    let is_prot_none = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+
+    let pages = total_size / 4096;
+    let mut changed_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+
+    for i in 0..pages {
+        let page_addr = addr + i * 4096;
+        let p4_idx = ((page_addr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((page_addr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((page_addr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((page_addr >> 12) & 0x1FF) as usize;
+
+        unsafe {
+            let pml4: &mut PageTable = &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
+            if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+                continue; // Not yet demand-mapped — VMA prot update suffices.
+            }
+            let pdpt: &mut PageTable =
+                &mut *(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+            if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pd: &mut PageTable =
+                &mut *(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+            if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pt: &mut PageTable =
+                &mut *(phys_offset_va + pd[p2_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+            if !pt[p1_idx].flags().contains(PageTableFlags::PRESENT) && !is_prot_none {
+                continue; // Not yet demand-mapped.
+            }
+
+            if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+                let old_flags = pt[p1_idx].flags();
+                let old_addr = pt[p1_idx].addr();
+                let is_cow = old_flags.contains(PageTableFlags::BIT_9);
+                let final_flags = if is_prot_none {
+                    // Clear PRESENT to make the page trap on any access.
+                    (old_flags & !PageTableFlags::PRESENT & !PageTableFlags::WRITABLE)
+                        | PageTableFlags::BIT_10 // mark as guard page
+                } else {
+                    // Preserve CoW marker. If the page is CoW, keep it
+                    // non-writable — the CoW fault handler will make it
+                    // writable after copying.
+                    let mut f = new_flags;
+                    if is_cow {
+                        f |= PageTableFlags::BIT_9;
+                        f &= !PageTableFlags::WRITABLE;
+                    }
+                    f
+                };
+                pt[p1_idx].set_addr(old_addr, final_flags);
+                changed_addrs.push(page_addr);
+            }
+        }
+    }
+
+    // TLB shootdown for all changed pages.
+    for &page_addr in &changed_addrs {
+        crate::smp::tlb::tlb_shootdown(page_addr);
+    }
+
+    // Update VMA protection bits and split VMAs at mprotect boundaries.
+    let pid = crate::process::current_pid();
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            let mut new_mappings = alloc::vec::Vec::new();
+            for m in proc.mappings.iter_mut() {
+                let m_end = m.start + m.len;
+                // Skip non-overlapping VMAs.
+                if m.start >= mprotect_end || m_end <= addr {
+                    continue;
+                }
+                // Fully contained — just update prot.
+                if m.start >= addr && m_end <= mprotect_end {
+                    m.prot = prot;
+                    continue;
+                }
+                // Partial overlap — need to split.
+                if m.start < addr && m_end > mprotect_end {
+                    // Middle split: 3 VMAs (head, middle, tail).
+                    let tail = crate::process::MemoryMapping {
+                        start: mprotect_end,
+                        len: m_end - mprotect_end,
+                        prot: m.prot,
+                        flags: m.flags,
+                    };
+                    let middle = crate::process::MemoryMapping {
+                        start: addr,
+                        len: mprotect_end - addr,
+                        prot,
+                        flags: m.flags,
+                    };
+                    new_mappings.push(middle);
+                    new_mappings.push(tail);
+                    m.len = addr - m.start; // head
+                } else if m.start < addr {
+                    // Overlap at tail of VMA — split into head + modified tail.
+                    let modified = crate::process::MemoryMapping {
+                        start: addr,
+                        len: m_end - addr,
+                        prot,
+                        flags: m.flags,
+                    };
+                    new_mappings.push(modified);
+                    m.len = addr - m.start;
+                } else {
+                    // Overlap at head of VMA — split into modified head + tail.
+                    let tail = crate::process::MemoryMapping {
+                        start: mprotect_end,
+                        len: m_end - mprotect_end,
+                        prot: m.prot,
+                        flags: m.flags,
+                    };
+                    new_mappings.push(tail);
+                    m.len = mprotect_end - m.start;
+                    m.prot = prot;
+                }
+            }
+            proc.mappings.extend(new_mappings);
+        }
     }
 
     0

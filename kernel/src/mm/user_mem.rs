@@ -47,7 +47,6 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
     }
 
     let phys_off = crate::mm::phys_offset();
-    let mapper = unsafe { crate::mm::paging::get_mapper() };
 
     let mut copied = 0usize;
     let mut vaddr = src_vaddr;
@@ -57,12 +56,29 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        // Translate the page and validate flags.
-        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+        // Translate the page and validate flags. Acquire a short-lived mapper
+        // per iteration so it is dropped before any demand-fault call that
+        // mutates the page tables.
+        let translated = {
+            let mapper = unsafe { crate::mm::paging::get_mapper() };
+            mapper.translate_addr(VirtAddr::new(page_base))
+        };
+        let phys = match translated {
+            Some(p) => p,
+            None => {
+                if !try_demand_fault(page_base) {
+                    return Err(());
+                }
+                let mapper = unsafe { crate::mm::paging::get_mapper() };
+                mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?
+            }
+        };
 
-        // Verify USER_ACCESSIBLE via page-table walk.
-        if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
-            return Err(());
+        {
+            let mapper = unsafe { crate::mm::paging::get_mapper() };
+            if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
+                return Err(());
+            }
         }
 
         let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
@@ -116,6 +132,16 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         let mapper = unsafe { crate::mm::paging::get_mapper() };
 
         if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
+            // Phase 36: try demand-faulting if the page is not present at all.
+            // Only demand-fault for writable VMAs — read-only VMAs should fail
+            // with EFAULT to avoid allocating frames that can never be written.
+            if mapper.translate_addr(VirtAddr::new(page_base)).is_none() {
+                if try_demand_fault_writable(page_base) {
+                    // Page now exists — re-check writability on next iteration.
+                    continue;
+                }
+                return Err(());
+            }
             // Check for CoW page: present + user-accessible + BIT_9 marker.
             if is_cow_page(&mapper, VirtAddr::new(page_base)) {
                 if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
@@ -152,6 +178,57 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Like [`try_demand_fault`] but also requires the VMA to be writable.
+/// Used by `copy_to_user` to avoid allocating frames for read-only VMAs
+/// that would immediately fail the writability check.
+fn try_demand_fault_writable(page_base: u64) -> bool {
+    let pid = crate::process::current_pid();
+    let vma_prot = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table
+            .find(pid)
+            .and_then(|p| p.find_vma(page_base))
+            .map(|m| m.prot)
+    };
+    const PROT_WRITE: u64 = 0x2;
+    if let Some(prot) = vma_prot {
+        if prot & PROT_WRITE == 0 {
+            return false; // VMA is not writable — fail with EFAULT.
+        }
+        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
+    }
+    false
+}
+
+/// Phase 36: demand-fault a user page if it is in a valid VMA but not yet
+/// present in the page table. Called from `copy_from_user` when the page
+/// table walk finds no mapping.
+///
+/// Returns `true` if the page was successfully demand-mapped; `false` if the
+/// address is not in any VMA or allocation failed.
+fn try_demand_fault(page_base: u64) -> bool {
+    let pid = crate::process::current_pid();
+    let vma_prot = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table
+            .find(pid)
+            .and_then(|p| p.find_vma(page_base))
+            .map(|m| m.prot)
+    };
+    if let Some(prot) = vma_prot {
+        // Never demand-map PROT_NONE pages — they are guard pages that must
+        // remain inaccessible.
+        const PROT_READ: u64 = 0x1;
+        const PROT_WRITE: u64 = 0x2;
+        const PROT_EXEC: u64 = 0x4;
+        if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+            return false;
+        }
+        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
+    }
+    false
 }
 
 /// Check whether the page at `vaddr` is a CoW page (present, user-accessible,

@@ -485,6 +485,10 @@ pub struct MemoryMapping {
     pub start: u64,
     /// Length in bytes (page-aligned, as recorded by `sys_linux_mmap`).
     pub len: u64,
+    /// Protection bits (`PROT_READ | PROT_WRITE | PROT_EXEC`).
+    pub prot: u64,
+    /// Mapping flags (`MAP_PRIVATE | MAP_ANONYMOUS`).
+    pub flags: u64,
 }
 
 /// Identifies the controlling terminal for a process.
@@ -535,6 +539,15 @@ impl Process {
             controlling_tty: Some(ControllingTty::Console),
             mappings: Vec::new(),
         }
+    }
+
+    /// Find the VMA containing `addr`, if any.
+    pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
+        self.mappings.iter().find(|m| {
+            m.start
+                .checked_add(m.len)
+                .is_some_and(|end| addr >= m.start && addr < end)
+        })
     }
 }
 

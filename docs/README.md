@@ -45,6 +45,8 @@ userspace shell and programs.
 | [Build Tools](./32-build-tools.md) | 32 | make, ar, multi-file C projects |
 | [Kernel Memory](./33-kernel-memory.md) | 33 | Buddy allocator, slab caches, working munmap |
 | [Timekeeping](./34-timekeeping.md) | 34 | CMOS RTC, wall-clock time, CLOCK_REALTIME |
+| [True SMP](./25-smp.md) | 35 | Per-core syscalls, priority scheduling, load balancing |
+| [Expanded Memory](./33-kernel-memory.md) | 36 | Demand paging, mprotect, large mmap, 1 GB RAM/disk |
 
 ### Roadmap
 

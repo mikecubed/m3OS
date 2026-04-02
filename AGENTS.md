@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.35.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, and working munmap, and real-time clock with wall-clock timekeeping.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.36.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, and real-time clock with wall-clock timekeeping.
 
 ## Build & Run
 
@@ -260,3 +260,20 @@ Read before making significant changes:
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
+
+### Documentation templates — all docs must conform
+
+All roadmap docs must follow the templates in `docs/appendix/doc-templates.md`. When creating or updating docs, use the matching template:
+
+| Doc type | Template section | Required fields |
+|---|---|---|
+| Phase design doc | `docs/roadmap/NN-slug.md` | Status, Source Ref, Depends on, Builds on, Primary Components, Milestone Goal, Why This Phase Exists, Learning Goals, Feature Scope, Important Components and How They Work, How This Builds on Earlier Phases, Implementation Outline, Acceptance Criteria, Companion Task List, How Real OS Implementations Differ, Deferred Until Later |
+| Phase task doc | `docs/roadmap/tasks/NN-slug-tasks.md` | Status, Source Ref, Depends on, Goal, Track Layout table, per-track sections with tasks containing File/Symbol/Why it matters/Acceptance, Documentation Notes |
+| Roadmap README row | `docs/roadmap/README.md` | Phase, Theme, Primary Outcome, Status, Source Ref, Milestone link, Tasks link |
+
+Rules:
+- Never create a task doc without all template sections populated.
+- Never create a design doc missing Status, Source Ref, Depends on, or Builds on.
+- Task acceptance items must be concrete and measurable — no vague "works correctly".
+- Each task must have File, Symbol, and Why it matters fields.
+- Update the roadmap README row when creating or completing a phase.

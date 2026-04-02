@@ -923,9 +923,9 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 27: increase RAM for embedded ramdisk + userspace.
+        // Phase 36: increase RAM to 1 GB for larger disk image and extended storage workloads.
         "-m".to_string(),
-        "256".to_string(),
+        "1024".to_string(),
         // Phase 25: SMP — boot with 4 CPU cores.
         "-smp".to_string(),
         "4".to_string(),
@@ -2202,13 +2202,24 @@ fn signed_path(path: &Path) -> PathBuf {
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
 fn create_data_disk(output_dir: &Path) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
+    // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
+    // storage requirements for filesystem stress testing and larger workloads.
+    const DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
     if disk_path.exists() {
+        let meta = std::fs::metadata(&disk_path).ok();
+        let size = meta.map(|m| m.len()).unwrap_or(0);
+        if size < DISK_SIZE {
+            println!(
+                "WARNING: existing data disk is {} MB but {} MB is expected. \
+                 Delete {} to recreate at the correct size.",
+                size / (1024 * 1024),
+                DISK_SIZE / (1024 * 1024),
+                disk_path.display()
+            );
+        }
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
-    // Phase 31: increased from 64 MB to 128 MB to accommodate TCC binary,
-    // musl libc/headers, TCC source for self-hosting, and compilation output.
-    const DISK_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
