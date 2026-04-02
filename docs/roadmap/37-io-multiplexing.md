@@ -1,11 +1,29 @@
 # Phase 37 - I/O Multiplexing
 
+**Status:** Planned
+**Source Ref:** phase-37
+**Depends on:** Phase 22 (TTY) ✅, Phase 23 (Socket API) ✅, Phase 35 (True SMP) ✅
+**Builds on:** Replaces the busy-wait `poll()` from Phase 21 with wait-queue-driven
+blocking, extends the FD infrastructure with non-blocking flags, and adds `select()`
+and `epoll` for scalable I/O readiness notification.
+**Primary Components:** syscall (poll/select/epoll/fcntl), pipe, net (sockets),
+pty, stdin, process (FdEntry), task (wait_queue)
+
 ## Milestone Goal
 
 Programs can wait on multiple file descriptors simultaneously without busy-waiting.
 `select()`, an improved `poll()`, and `epoll` provide scalable I/O readiness
 notification. Non-blocking I/O (`O_NONBLOCK`) works for sockets, pipes, and PTYs.
 Event-driven servers become possible.
+
+## Why This Phase Exists
+
+The current `poll()` implementation uses a yield loop — it repeatedly scans all
+requested file descriptors, yields the CPU, and scans again. This wastes CPU time
+and scales poorly. Real network servers (like `telnetd`) need to efficiently wait
+on many connections simultaneously. Without proper I/O multiplexing, every server
+either busy-waits or spawns a thread per connection. This phase introduces the
+standard Unix I/O multiplexing APIs that make event-driven programming possible.
 
 ## Learning Goals
 
@@ -100,26 +118,61 @@ Extend `fcntl()` to support:
 - `F_GETFL` — return file status flags (including `O_NONBLOCK`)
 - `F_SETFL` — set file status flags (`O_NONBLOCK`, `O_APPEND`)
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 23 (Socket API) | Socket fds to multiplex |
-| Phase 22 (TTY) | PTY/TTY fds to multiplex |
-| Phase 35 (SMP) | Wait queues infrastructure |
+### `FdEntry` Non-Blocking Flag
+
+The `FdEntry` struct in `kernel/src/process/mod.rs` gains a `nonblock: bool` field.
+This flag is checked by every read/write syscall path. When set, blocking operations
+return `EAGAIN` instead of entering a yield loop.
+
+### Per-FD Wait Queues
+
+Each pollable FD backend (pipes, sockets, PTYs, stdin) gets an associated
+`WaitQueue`. When data arrives or space becomes available, the producer wakes all
+tasks sleeping on that queue. The existing `WaitQueue` from Phase 35 provides the
+sleep/wake primitives.
+
+### `EpollInstance` FD Backend
+
+A new `FdBackend::Epoll { instance_id }` variant. The kernel maintains a global
+table of `EpollInstance` structs. Each instance tracks its interest set and a
+ready list. When a monitored FD becomes ready, it pushes an event onto the epoll's
+ready list and wakes any task blocked in `epoll_wait()`.
+
+### Improved `sys_poll()` Flow
+
+The rewritten poll replaces the yield loop with proper blocking:
+1. Scan all fds for immediate readiness (fast path).
+2. If none ready, register the calling task on each fd's wait queue.
+3. Block via `WaitQueue::sleep()`.
+4. On wakeup, re-scan and return ready fds.
+5. Deregister from all wait queues before returning.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 21 by replacing the busy-wait `poll()` with wait-queue-driven blocking.
+- Extends Phase 22 (TTY) and Phase 29 (PTY) by adding non-blocking I/O support
+  and pollability to terminal file descriptors.
+- Extends Phase 23 (Socket API) by adding non-blocking socket I/O, `accept4()`,
+  and socket pollability via wait queues.
+- Reuses the `WaitQueue` infrastructure from Phase 35 (True SMP) as the core
+  blocking/waking mechanism for all multiplexing APIs.
+- Extends Phase 21's `fcntl()` stub by implementing `F_GETFL`/`F_SETFL` for real.
 
 ## Implementation Outline
 
-1. Implement `O_NONBLOCK` for pipes (simplest case).
-2. Implement `O_NONBLOCK` for sockets.
-3. Implement `fcntl(F_GETFL/F_SETFL)` for non-blocking flag.
-4. Rewrite `poll()` to use wait queues instead of busy-wait loop.
-5. Implement `select()` on top of the improved poll infrastructure.
-6. Implement `epoll_create1`, `epoll_ctl`, `epoll_wait`.
-7. Implement `accept4()`.
-8. Write test programs: echo server using poll, epoll-based multi-client server.
-9. Verify the telnet server works with improved poll (no busy-wait).
-10. Stress test with many concurrent connections.
+1. Add `nonblock` flag to `FdEntry` and wire `fcntl(F_GETFL/F_SETFL)`.
+2. Implement `O_NONBLOCK` for pipes (simplest case).
+3. Implement `O_NONBLOCK` for sockets.
+4. Implement `O_NONBLOCK` for PTYs and TTY/stdin.
+5. Add per-FD wait queues to pipes, sockets, PTYs, and stdin.
+6. Rewrite `poll()` to use wait queues instead of busy-wait loop.
+7. Implement `select()` on top of the improved poll infrastructure.
+8. Implement `epoll_create1`, `epoll_ctl`, `epoll_wait`.
+9. Implement `accept4()`.
+10. Write test programs: echo server using poll, epoll-based multi-client server.
+11. Verify the telnet server works with improved poll (no busy-wait).
 
 ## Acceptance Criteria
 
@@ -135,21 +188,20 @@ Extend `fcntl()` to support:
 
 ## Companion Task List
 
-- Phase 37 Task List — *not yet created*
+- [Phase 37 Task List](./tasks/37-io-multiplexing-tasks.md)
 
 ## How Real OS Implementations Differ
 
-Linux has a rich set of I/O mechanisms:
-- **io_uring** — the newest, highest-performance async I/O interface (submission/completion rings).
-- **epoll** — the standard for network servers (nginx, Node.js, etc.).
-- **signalfd, timerfd, eventfd** — unify signals, timers, and events as fds for epoll.
-- **splice/tee/vmsplice** — zero-copy data movement between fds.
-- **FUSE** — filesystem in userspace (via poll/epoll on /dev/fuse).
-
-BSD uses **kqueue** instead of epoll — similar concept, different API.
-
-Our implementation provides the essential poll/epoll layer without io_uring or
-the specialized fd types. This is sufficient for building real network servers.
+- Linux has **io_uring** — the newest, highest-performance async I/O interface
+  using submission/completion rings shared between kernel and userspace.
+- Linux's **epoll** is the standard for network servers (nginx, Node.js, etc.)
+  and supports edge-triggered mode, `EPOLLONESHOT`, and `EPOLLEXCLUSIVE`.
+- **signalfd, timerfd, eventfd** unify signals, timers, and inter-thread events
+  as regular file descriptors that work with epoll.
+- **splice/tee/vmsplice** enable zero-copy data movement between fds.
+- BSD uses **kqueue** instead of epoll — similar concept, different API, arguably
+  cleaner design.
+- Real implementations handle thousands of concurrent fds; our MAX_FDS is 32.
 
 ## Deferred Until Later
 
