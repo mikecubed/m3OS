@@ -1280,6 +1280,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: true,
         writable: false,
         cloexec,
+        nonblock: false,
     };
     let write_entry = FdEntry {
         backend: FdBackend::PipeWrite { pipe_id },
@@ -1287,6 +1288,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: false,
         writable: true,
         cloexec,
+        nonblock: false,
     };
 
     let read_fd = match alloc_fd(3, read_entry) {
@@ -3585,6 +3587,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -3605,6 +3608,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable: true,
             writable: true,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -3637,6 +3641,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 readable: true,
                 writable: true,
                 cloexec: false,
+                nonblock: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -3686,6 +3691,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable: true,
             writable: false,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -3741,6 +3747,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -3781,6 +3788,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                 readable: true,
                                 writable: false,
                                 cloexec: false,
+                                nonblock: false,
                             };
 
                             return match alloc_fd(3, fd_entry) {
@@ -3819,6 +3827,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                             readable,
                             writable,
                             cloexec: false,
+                            nonblock: false,
                         };
 
                         // Phase 31: support O_TRUNC on FAT32 — free the old
@@ -3881,6 +3890,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                     readable,
                                     writable,
                                     cloexec: false,
+                                    nonblock: false,
                                 };
 
                                 // Set ownership and permissions on the newly created file.
@@ -3971,6 +3981,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                         readable: true,
                         writable: false,
                         cloexec: false,
+                        nonblock: false,
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -3995,6 +4006,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -4061,6 +4073,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4081,6 +4094,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable: true,
             writable: true,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4113,6 +4127,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 readable: true,
                 writable: true,
                 cloexec: false,
+                nonblock: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -4156,6 +4171,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable: true,
             writable: false,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4195,6 +4211,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4219,6 +4236,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -4396,6 +4414,7 @@ fn open_ext2_file(
                     readable: true,
                     writable: false,
                     cloexec: false,
+                    nonblock: false,
                 };
                 return match alloc_fd(3, fd_entry) {
                     Some(i) => i as u64,
@@ -4437,6 +4456,7 @@ fn open_ext2_file(
                 readable,
                 writable,
                 cloexec: false,
+                nonblock: false,
             };
 
             match alloc_fd(3, fd_entry) {
@@ -4477,6 +4497,7 @@ fn open_ext2_file(
                         readable,
                         writable,
                         cloexec: false,
+                        nonblock: false,
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -7249,7 +7270,29 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             });
             0
         }
-        F_GETFL | F_SETFL => 0,
+        F_GETFL => {
+            const O_NONBLOCK: u64 = 0x800;
+            match current_fd_entry(fd as usize) {
+                Some(e) => {
+                    if e.nonblock {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    }
+                }
+                None => NEG_EBADF,
+            }
+        }
+        F_SETFL => {
+            const O_NONBLOCK: u64 = 0x800;
+            let nonblock = arg & O_NONBLOCK != 0;
+            with_current_fd_mut(fd as usize, |slot| {
+                if let Some(e) = slot {
+                    e.nonblock = nonblock;
+                }
+            });
+            0
+        }
         _ => NEG_EINVAL,
     }
 }
@@ -7476,9 +7519,10 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if domain != 2 {
         return NEG_EAFNOSUPPORT;
     }
-    let sock_flags = socktype & (0x80000 | 0x800); // SOCK_CLOEXEC | SOCK_NONBLOCK
-    let socktype_raw = socktype & !(0x80000 | 0x800);
-    let _ = sock_flags; // SOCK_CLOEXEC/SOCK_NONBLOCK flags stripped but not yet honored
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    let sock_flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let socktype_raw = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let (kind, proto) = match socktype_raw {
         1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
         2 => {
@@ -7500,7 +7544,8 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: true,
-        cloexec: false,
+        cloexec: sock_flags & SOCK_CLOEXEC != 0,
+        nonblock: sock_flags & SOCK_NONBLOCK != 0,
     };
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
@@ -7794,6 +7839,7 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     readable: true,
                     writable: true,
                     cloexec: false,
+                    nonblock: false,
                 };
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,

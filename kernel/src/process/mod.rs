@@ -148,6 +148,9 @@ pub struct FdEntry {
     pub writable: bool,
     /// Close-on-exec flag (FD_CLOEXEC).
     pub cloexec: bool,
+    /// Non-blocking I/O flag (O_NONBLOCK). When set, read/write return
+    /// `-EAGAIN` instead of blocking when no data is available (Phase 37).
+    pub nonblock: bool,
 }
 
 /// Const sentinel for empty FD slots (used in array init).
@@ -282,6 +285,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     });
     table[1] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
@@ -289,6 +293,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: false,
         writable: true,
         cloexec: false,
+        nonblock: false,
     });
     table[2] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
@@ -296,6 +301,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: false,
         writable: true,
         cloexec: false,
+        nonblock: false,
     });
     table
 }
