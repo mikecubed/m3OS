@@ -91,7 +91,7 @@ QEMU with OVMF firmware.
 
 ## Implementation Document
 
-- [Boot Process](../02-boot.md)
+- [Boot Process](../01-boot.md)
 
 ## How Real OS Implementations Differ
 

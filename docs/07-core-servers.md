@@ -1,5 +1,9 @@
 # Core Servers — Phase 7
 
+**Aligned Roadmap Phase:** Phase 7
+**Status:** Complete
+**Source Ref:** phase-07
+
 ## Overview
 
 Phase 7 introduces the first layer of server infrastructure on top of the IPC engine built in
@@ -311,4 +315,4 @@ production service supervisor.
 
 - `docs/06-ipc.md` — IPC model, message format, capabilities, and notification objects
 - `docs/roadmap/07-core-servers.md` — phase milestone plan and acceptance criteria
-- `docs/08-roadmap.md` — overall project design questions and phase scope
+- `docs/roadmap/README.md` — overall project milestones and phase scope

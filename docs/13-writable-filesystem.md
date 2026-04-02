@@ -1,5 +1,9 @@
 # Phase 13 — Writable Filesystem
 
+**Aligned Roadmap Phase:** Phase 13
+**Status:** Complete
+**Source Ref:** phase-13
+
 ## Overview
 
 Phase 13 adds a writable in-memory filesystem (tmpfs) mounted at `/tmp`

@@ -1,5 +1,9 @@
 # Phase 24 — Persistent Storage
 
+**Aligned Roadmap Phase:** Phase 24
+**Status:** Complete
+**Source Ref:** phase-24
+
 ## Overview
 
 Phase 24 gives m3OS a persistent block device: a 64 MB FAT32 data partition on a

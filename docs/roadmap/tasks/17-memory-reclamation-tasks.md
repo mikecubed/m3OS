@@ -135,7 +135,7 @@ Replace the eager full-copy fork with copy-on-write semantics.
 | P17-T041 | Acceptance: existing shell, pipes, utilities, and networking work without regression |
 | P17-T042 | `cargo xtask check` passes (clippy + fmt) |
 | P17-T043 | QEMU boot validation — no panics, no regressions |
-| P17-T044 | Write `docs/17-memory.md` (or update `docs/03-memory.md`): free-list frame allocator data structure and alloc/free paths, frame reference counting and CoW interaction, copy-on-write fork step by step, heap growth strategy, kernel stack lifecycle |
+| P17-T044 | Write `docs/17-memory.md` (or update `docs/02-memory.md`): free-list frame allocator data structure and alloc/free paths, frame reference counting and CoW interaction, copy-on-write fork step by step, heap growth strategy, kernel stack lifecycle |
 
 ---
 

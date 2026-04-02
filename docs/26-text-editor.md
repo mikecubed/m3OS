@@ -1,5 +1,9 @@
 # Phase 26 — Text Editor
 
+**Aligned Roadmap Phase:** Phase 26
+**Status:** Complete
+**Source Ref:** phase-26
+
 ## Overview
 
 Phase 26 adds `edit`, a minimal full-screen text editor for m3OS. It is a

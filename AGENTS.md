@@ -240,16 +240,16 @@ Read before making significant changes:
 
 | File | When |
 |---|---|
-| `docs/01-architecture.md` | Orientation — kernel vs. userspace split |
-| `docs/03-memory.md` | Before touching frame allocator, page tables, or heap |
+| `docs/appendix/architecture-and-syscalls.md` | Orientation — kernel vs. userspace split, syscall ABI |
+| `docs/02-memory.md` | Before touching frame allocator, page tables, or heap |
 | `docs/06-ipc.md` | Before touching `kernel/src/ipc/` or syscalls |
 | `docs/08-storage-and-vfs.md` | Before touching `kernel/src/fs/` or block devices |
-| `docs/09-testing.md` | Before writing kernel tests or modifying the xtask harness |
+| `docs/appendix/testing.md` | Before writing kernel tests or modifying the xtask harness |
 | `docs/11-elf-loader-and-process-model.md` | Before touching ELF loading or process lifecycle |
 | `docs/12-posix-compatibility-layer.md` | Before adding syscalls or POSIX behavior |
 | `docs/16-network.md` | Before touching `kernel/src/net/` |
-| `docs/22-signal-handlers.md` | Before touching signal delivery |
-| `docs/23-tty-terminal.md` | Before touching TTY/terminal subsystem |
+| `docs/19-signal-handlers.md` | Before touching signal delivery |
+| `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
 | `docs/25-smp.md` | Before touching SMP or multi-core code |
 | `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
 | `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
@@ -257,6 +257,6 @@ Read before making significant changes:
 | `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
 | `docs/33-kernel-memory.md` | Before touching buddy allocator, slab caches, munmap, or meminfo |
 | `docs/34-timekeeping.md` | Before touching RTC, clock_gettime, gettimeofday, or time conversion |
-| `docs/08-roadmap.md` | Open design questions and per-phase scope |
+| `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.

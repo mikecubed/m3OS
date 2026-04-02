@@ -1,5 +1,9 @@
 # Memory Management
 
+**Aligned Roadmap Phase:** Phase 2
+**Status:** Complete
+**Source Ref:** phase-02
+
 ## Overview
 
 Memory management is one of the first things the kernel must set up after boot.

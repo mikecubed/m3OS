@@ -1,5 +1,9 @@
 # Phase 30 -- Telnet Server
 
+**Aligned Roadmap Phase:** Phase 30
+**Status:** Complete
+**Source Ref:** phase-30
+
 ## Overview
 
 Phase 30 adds `telnetd`, a telnet server that listens on TCP port 23, accepts

@@ -468,7 +468,7 @@ Ensure keyboard input reaches the userspace shell's stdin fd. The current
 
 ### G.2 — Documentation
 
-**File:** `docs/18-userspace-init.md`
+**File:** `docs/20-userspace-init.md`
 **Why it matters:** Documents the PID 1 contract and the new userspace architecture.
 
 **Acceptance:**
@@ -502,4 +502,4 @@ These items are explicitly out of scope for Phase 20:
 - ~870 lines of kernel-mode shell code removed from `kernel/src/main.rs`
 - `userspace/init/` and `userspace/shell/` are new crate directories
 - `syscall-lib` expanded from `syscall0`–`syscall2` to `syscall0`–`syscall6` with full process lifecycle wrappers
-- `docs/18-userspace-init.md` written as the phase documentation
+- `docs/20-userspace-init.md` written as the phase documentation

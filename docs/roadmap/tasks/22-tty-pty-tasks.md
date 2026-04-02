@@ -179,7 +179,7 @@ terminal multiplexer and SSH work (Phase 23+).
 | P22-T075 | Add `kernel-core` unit tests for `Termios` struct layout (size = 60 bytes, field offsets match Linux) | Done |
 | P22-T076 | Add `kernel-core` unit tests for line discipline logic: cooked-mode erase, kill, word-erase, EOF | Done |
 | P22-T077 | Write `docs/20-tty-terminal.md` covering line discipline model, termios fields, cooked/raw/cbreak modes, ioctl dispatch, isatty behavior, and PTY concepts | Done |
-| P22-T078 | Update `docs/08-roadmap.md`: move Phase 22 from "Usability Phases (planned)" to completed | Done |
+| P22-T078 | Update `docs/roadmap/README.md`: move Phase 22 from "Usability Phases (planned)" to completed | Done |
 
 ---
 

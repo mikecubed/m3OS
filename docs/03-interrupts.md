@@ -1,5 +1,9 @@
 # Interrupts & Exceptions
 
+**Aligned Roadmap Phase:** Phase 3
+**Status:** Complete
+**Source Ref:** phase-03
+
 ## Overview
 
 Interrupts allow the CPU to respond to asynchronous events (hardware I/O, timers) and

@@ -1,5 +1,9 @@
 # Phase 11 — ELF Loader and Process Model
 
+**Aligned Roadmap Phase:** Phase 11
+**Status:** Complete
+**Source Ref:** phase-11
+
 Implementation reference for the ELF loader, per-process address spaces, System V AMD64
 ABI stack layout, fork with eager page copy, and process lifecycle syscalls.
 

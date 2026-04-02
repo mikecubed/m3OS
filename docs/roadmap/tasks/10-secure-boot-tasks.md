@@ -140,7 +140,7 @@
 **Why it matters:** Roadmap accuracy depends on marking phases complete only after full validation.
 
 **Acceptance:**
-- [ ] Update `docs/roadmap/README.md` and `docs/08-roadmap.md` once real hardware validation passes
+- [ ] Update `docs/roadmap/README.md` once real hardware validation passes
 
 > **Deferred:** Blocked on real hardware boot test (C.3).
 

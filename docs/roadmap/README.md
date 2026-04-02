@@ -346,12 +346,10 @@ Each phase must include:
 ## Related Documents
 
 - [Roadmap Task Lists](./tasks/README.md)
-- [Architecture](../01-architecture.md)
-- [Boot Process](../02-boot.md)
-- [Memory Management](../03-memory.md)
-- [Interrupts & Exceptions](../04-interrupts.md)
-- [Tasking & Scheduling](../05-tasking.md)
+- [Architecture & Syscalls](../appendix/architecture-and-syscalls.md)
+- [Boot Process](../01-boot.md)
+- [Memory Management](../02-memory.md)
+- [Interrupts & Exceptions](../03-interrupts.md)
+- [Tasking & Scheduling](../04-tasking.md)
 - [IPC](../06-ipc.md)
-- [Userspace & Syscalls](../07-userspace.md)
-- [Roadmap Summary](../08-roadmap.md)
-- [Testing](../09-testing.md)
+- [Testing](../appendix/testing.md)

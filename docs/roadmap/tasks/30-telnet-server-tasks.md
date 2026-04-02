@@ -512,12 +512,12 @@ Wire telnetd into the boot process and configure QEMU networking for host access
 
 ### G.3 — Roadmap update
 
-**File:** `docs/08-roadmap.md`
+**File:** `docs/roadmap/README.md`
 **Symbol:** `## Phase Overview`
 **Why it matters:** keeps the roadmap index consistent with phase completion status.
 
 **Acceptance:**
-- [ ] Phase 30 marked complete in `docs/08-roadmap.md` _(deferred until manual tests pass)_
+- [ ] Phase 30 marked complete in `docs/roadmap/README.md` _(deferred until manual tests pass)_
 
 ---
 

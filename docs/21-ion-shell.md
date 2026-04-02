@@ -1,5 +1,9 @@
 # Phase 21: Ion Shell Integration
 
+**Aligned Roadmap Phase:** Phase 21
+**Status:** Complete
+**Source Ref:** phase-21
+
 This document describes integrating the [Ion shell](https://github.com/redox-os/ion)
 from Redox OS into m3OS. Ion is a full-featured shell written in Rust, originally
 designed for Redox. This phase cross-compiles it for Linux/musl and embeds it in

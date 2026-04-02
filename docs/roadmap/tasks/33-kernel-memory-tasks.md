@@ -397,7 +397,7 @@ This track verifies that the new allocators, `munmap()` behavior, and reporting 
 ### G.3 — Update documentation
 
 **Files:**
-- `docs/03-memory.md`
+- `docs/02-memory.md`
 - `docs/33-kernel-memory.md`
 - `docs/roadmap/tasks/33-kernel-memory-tasks.md`
 

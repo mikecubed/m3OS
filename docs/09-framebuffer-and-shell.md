@@ -1,5 +1,9 @@
 # Framebuffer and Shell — Phase 9
 
+**Aligned Roadmap Phase:** Phase 9
+**Status:** Complete
+**Source Ref:** phase-09
+
 ## Overview
 
 Phase 9 adds the first interactive layer to m³OS: a pixel framebuffer text console, keyboard

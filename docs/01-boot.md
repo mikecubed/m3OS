@@ -1,5 +1,9 @@
 # Boot Process
 
+**Aligned Roadmap Phase:** Phase 1
+**Status:** Complete
+**Source Ref:** phase-01
+
 This document is the Phase 1 implementation document for bootstrapping the kernel. It
 explains what the boot feature is for, how the current repository implements it, and
 which shortcuts are intentional in this toy project.

@@ -1,5 +1,9 @@
 # Secure Boot Signing — Phase 10
 
+**Aligned Roadmap Phase:** Phase 10
+**Status:** Complete
+**Source Ref:** phase-10
+
 ## Overview
 
 Phase 10 adds a host-side signing workflow so m³OS can produce Secure Boot-friendly

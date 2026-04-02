@@ -1,5 +1,9 @@
 # Phase 12 — POSIX Compatibility Layer
 
+**Aligned Roadmap Phase:** Phase 12
+**Status:** Complete
+**Source Ref:** phase-12
+
 Implementation reference for the Linux-compatible syscall ABI, musl libc integration,
 safe user-memory access, and the C runtime startup sequence.
 

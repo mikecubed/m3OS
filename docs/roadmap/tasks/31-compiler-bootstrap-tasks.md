@@ -536,12 +536,12 @@ TCC compiles itself inside the OS.
 
 ### G.5 — Roadmap update
 
-**File:** `docs/08-roadmap.md`
+**File:** `docs/roadmap/README.md`
 **Symbol:** `## Phase Overview`
 **Why it matters:** keeps the roadmap index consistent with phase completion status.
 
 **Acceptance:**
-- [ ] Phase 31 marked complete in `docs/08-roadmap.md` _(deferred — pending runtime testing)_
+- [ ] Phase 31 marked complete in `docs/roadmap/README.md` _(deferred — pending runtime testing)_
 
 ---
 

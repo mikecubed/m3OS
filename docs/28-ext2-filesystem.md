@@ -1,5 +1,9 @@
 # Phase 28 — ext2 Filesystem
 
+**Aligned Roadmap Phase:** Phase 28
+**Status:** Complete
+**Source Ref:** phase-28
+
 ## Overview
 
 Phase 28 replaces the FAT32 permissions overlay with a native ext2

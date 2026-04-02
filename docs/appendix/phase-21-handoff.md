@@ -67,7 +67,7 @@ This is fundamentally a termios issue (Phase 22).
 ### Should-do for Phase 21 completeness
 - [x] ~~Get `ion -c "echo hello"` working~~ — investigated; deferred to Phase 22
 - [x] Update task list with final status
-- [x] Write `docs/19-ion-shell.md` (P21-T050)
+- [x] Write `docs/21-ion-shell.md` (P21-T050)
 - [x] Update CI assertions (P21-T023)
 
 ### Deferred to Phase 22 (Termios)

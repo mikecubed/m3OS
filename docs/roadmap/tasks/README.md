@@ -236,4 +236,3 @@ When a phase is complete, update the relevant subsystem docs before moving on.
 Related documents:
 
 - [Roadmap Guide](../README.md)
-- [Roadmap Summary](../../08-roadmap.md)
