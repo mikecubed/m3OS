@@ -11,6 +11,7 @@ pub mod icmp;
 pub mod ipv4;
 pub mod tcp;
 pub mod udp;
+pub mod unix;
 pub mod virtio_net;
 
 // ===========================================================================

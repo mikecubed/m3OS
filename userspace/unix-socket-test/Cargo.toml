@@ -1,0 +1,11 @@
+[package]
+name = "unix-socket-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "unix-socket-test"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

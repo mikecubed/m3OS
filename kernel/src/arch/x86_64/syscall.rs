@@ -1029,12 +1029,10 @@ pub extern "C" fn syscall_handler(
         // Note: syscall 10 was IPC but is now mprotect (Phase 21).
         // Phase 11 + Linux-compatible process syscalls
         39 => sys_getpid(),
-        // Phase 21/22: socketpair — implement as pipe pair.
-        // arg1 has type|flags (SOCK_CLOEXEC=0x80000).
+        // Phase 39: socketpair(domain, type, protocol, sv)
         53 => {
             let sv_ptr = per_core_syscall_arg3();
-            let cloexec = arg1 & 0x80000 != 0;
-            sys_pipe_with_flags(sv_ptr, cloexec)
+            sys_socketpair(arg0, arg1, arg2, sv_ptr)
         }
         // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
         56 => sys_clone(arg0, user_rip, user_rsp),
@@ -2004,6 +2002,7 @@ fn sys_dup(oldfd: u64) -> u64 {
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+                FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
                 FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
                 _ => {}
             }
@@ -2048,6 +2047,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+        FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
         FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
         _ => {}
     }
@@ -3596,6 +3596,70 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Delegate to recvfrom with no addr
             sys_recvfrom_socket(fd as u64, buf_ptr, count, 0, 0, 0)
         }
+        FdBackend::UnixSocket { handle } => {
+            if count == 0 {
+                return 0;
+            }
+            let handle = *handle;
+            let nonblock = entry.nonblock;
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+            let capped = (count as usize).min(4096);
+            let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
+            match sock_type {
+                Some(crate::net::unix::UnixSocketType::Stream) => {
+                    let mut tmp = alloc::vec![0u8; capped];
+                    loop {
+                        match crate::net::unix::unix_stream_read(handle, &mut tmp) {
+                            Ok(0) => return 0,
+                            Ok(n) => {
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return n as u64;
+                            }
+                            Err(-11) => {
+                                // EAGAIN — no data yet, block or return.
+                                if nonblock {
+                                    return NEG_EAGAIN;
+                                }
+                                if has_pending_signal() {
+                                    return NEG_EINTR;
+                                }
+                                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                                restore_caller_context(pid, saved_user_rsp);
+                            }
+                            Err(e) => return e as u64, // ENOTCONN, etc.
+                        }
+                    }
+                }
+                Some(crate::net::unix::UnixSocketType::Datagram) => {
+                    let mut tmp = alloc::vec![0u8; capped];
+                    loop {
+                        match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
+                            Ok((n, _sender)) => {
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return n as u64;
+                            }
+                            Err(-11) => {
+                                if nonblock {
+                                    return NEG_EAGAIN;
+                                }
+                                if has_pending_signal() {
+                                    return NEG_EINTR;
+                                }
+                                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                                restore_caller_context(pid, saved_user_rsp);
+                            }
+                            Err(e) => return e as u64,
+                        }
+                    }
+                }
+                None => NEG_EBADF,
+            }
+        }
         FdBackend::Epoll { .. } => NEG_EBADF,
     }
 }
@@ -4070,6 +4134,70 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Socket { .. } => {
             // Delegate to sendto with no addr
             sys_sendto(fd, buf_ptr, count, 0, 0, 0)
+        }
+        FdBackend::UnixSocket { handle } => {
+            let handle = *handle;
+            let nonblock = entry.nonblock;
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+            let capped = (count as usize).min(4096);
+            let mut data = alloc::vec![0u8; capped];
+            if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
+                return NEG_EFAULT;
+            }
+            let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
+            match sock_type {
+                Some(crate::net::unix::UnixSocketType::Stream) => loop {
+                    match crate::net::unix::unix_stream_write(handle, &data) {
+                        Ok(n) => return n as u64,
+                        Err(-11) => {
+                            // EAGAIN — buffer full, block or return.
+                            if nonblock {
+                                return NEG_EAGAIN;
+                            }
+                            if has_pending_signal() {
+                                return NEG_EINTR;
+                            }
+                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                            restore_caller_context(pid, saved_user_rsp);
+                        }
+                        Err(e) => return e as u64, // EPIPE, ENOTCONN, etc.
+                    }
+                },
+                Some(crate::net::unix::UnixSocketType::Datagram) => {
+                    // For connected datagram sockets, send to peer
+                    let peer = crate::net::unix::with_unix_socket(handle, |s| s.peer).flatten();
+                    let sender_path =
+                        crate::net::unix::with_unix_socket(handle, |s| s.path.clone()).flatten();
+                    match peer {
+                        Some(target) => loop {
+                            match crate::net::unix::unix_dgram_send(
+                                sender_path.clone(),
+                                target,
+                                &data,
+                            ) {
+                                Ok(n) => {
+                                    crate::net::unix::wake_unix_socket(target);
+                                    return n as u64;
+                                }
+                                Err(-11) => {
+                                    if nonblock {
+                                        return NEG_EAGAIN;
+                                    }
+                                    if has_pending_signal() {
+                                        return NEG_EINTR;
+                                    }
+                                    crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
+                                    restore_caller_context(pid, saved_user_rsp);
+                                }
+                                Err(e) => return e as u64,
+                            }
+                        },
+                        None => NEG_ENOTCONN,
+                    }
+                }
+                None => NEG_EBADF,
+            }
         }
         FdBackend::Epoll { .. } => NEG_EBADF,
     }
@@ -4902,6 +5030,7 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
+            FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
@@ -5231,7 +5360,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::PtySlave { pty_id } => {
             (0x2000 | 0o620, 0, 0, 0, ((136u64) << 8) | (*pty_id as u64))
         }
-        FdBackend::Socket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
+        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => (0xC000 | 0o755, 0, 0, 0, 0),
         FdBackend::Stdout | FdBackend::Stdin => (0x2000 | 0o620, 0, 0, 0, 0),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => (0x1000 | 0o600, 0, 0, 0, 0),
         FdBackend::Ramdisk { content_len, .. } => {
@@ -5367,7 +5496,7 @@ fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         | FdBackend::Epoll { .. } => ramdisk_statfs(),
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
-        FdBackend::Socket { .. } => sockfs_statfs(),
+        FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
     };
     write_statfs_to_user(buf_ptr, &stat)
 }
@@ -5705,6 +5834,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PtySlave { .. }
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
+        | FdBackend::UnixSocket { .. }
         | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
@@ -7927,6 +8057,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PtySlave { .. }
         | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
+        | FdBackend::UnixSocket { .. }
         | FdBackend::Epoll { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
@@ -8397,6 +8528,9 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::Socket { handle } => {
                             crate::net::add_socket_ref(*handle);
                         }
+                        FdBackend::UnixSocket { handle } => {
+                            crate::net::unix::add_unix_socket_ref(*handle);
+                        }
                         FdBackend::Epoll { instance_id } => {
                             epoll_add_ref(*instance_id);
                         }
@@ -8672,12 +8806,626 @@ const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 const NEG_EOPNOTSUPP: u64 = (-95_i64) as u64;
 const NEG_ENOPROTOOPT: u64 = (-92_i64) as u64;
 const NEG_EAFNOSUPPORT: u64 = (-97_i64) as u64;
+const NEG_EISCONN: u64 = (-106_i64) as u64;
+const NEG_EALREADY: u64 = (-114_i64) as u64;
+
+// ===========================================================================
+// Phase 39: Unix domain socket syscall helpers
+// ===========================================================================
+
+/// Create an AF_UNIX socket.
+fn sys_socket_unix(socktype: u64) -> u64 {
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    let flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let raw_type = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let unix_type = match raw_type {
+        1 | 5 => crate::net::unix::UnixSocketType::Stream, // SOCK_STREAM or SOCK_SEQPACKET
+        2 => crate::net::unix::UnixSocketType::Datagram,
+        _ => return NEG_EINVAL,
+    };
+    let handle = match crate::net::unix::alloc_unix_socket(unix_type) {
+        Some(h) => h,
+        None => return NEG_ENFILE,
+    };
+    let entry = FdEntry {
+        backend: FdBackend::UnixSocket { handle },
+        offset: 0,
+        readable: true,
+        writable: true,
+        cloexec: flags & SOCK_CLOEXEC != 0,
+        nonblock: flags & SOCK_NONBLOCK != 0,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            crate::net::unix::free_unix_socket(handle);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// socketpair(domain, type, protocol, sv) — syscall 53
+fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr: u64) -> u64 {
+    const AF_UNIX: u64 = 1;
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+
+    if domain != AF_UNIX {
+        // Fall back to pipe-based socketpair for non-AF_UNIX.
+        let cloexec = socktype & SOCK_CLOEXEC != 0;
+        return sys_pipe_with_flags(sv_ptr, cloexec);
+    }
+
+    let flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let raw_type = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let unix_type = match raw_type {
+        1 | 5 => crate::net::unix::UnixSocketType::Stream, // SOCK_STREAM or SOCK_SEQPACKET
+        2 => crate::net::unix::UnixSocketType::Datagram,
+        _ => return NEG_EINVAL,
+    };
+
+    let h1 = match crate::net::unix::alloc_unix_socket(unix_type) {
+        Some(h) => h,
+        None => return NEG_ENFILE,
+    };
+    let h2 = match crate::net::unix::alloc_unix_socket(unix_type) {
+        Some(h) => h,
+        None => {
+            crate::net::unix::free_unix_socket(h1);
+            return NEG_ENFILE;
+        }
+    };
+
+    // Peer them together and mark as connected.
+    crate::net::unix::with_unix_socket_mut(h1, |s| {
+        s.peer = Some(h2);
+        s.state = crate::net::unix::UnixSocketState::Connected;
+    });
+    crate::net::unix::with_unix_socket_mut(h2, |s| {
+        s.peer = Some(h1);
+        s.state = crate::net::unix::UnixSocketState::Connected;
+    });
+
+    let cloexec = flags & SOCK_CLOEXEC != 0;
+    let nonblock = flags & SOCK_NONBLOCK != 0;
+
+    let fd1 = match alloc_fd(
+        0,
+        FdEntry {
+            backend: FdBackend::UnixSocket { handle: h1 },
+            offset: 0,
+            readable: true,
+            writable: true,
+            cloexec,
+            nonblock,
+        },
+    ) {
+        Some(fd) => fd,
+        None => {
+            crate::net::unix::free_unix_socket(h1);
+            crate::net::unix::free_unix_socket(h2);
+            return NEG_EMFILE;
+        }
+    };
+    let fd2 = match alloc_fd(
+        0,
+        FdEntry {
+            backend: FdBackend::UnixSocket { handle: h2 },
+            offset: 0,
+            readable: true,
+            writable: true,
+            cloexec,
+            nonblock,
+        },
+    ) {
+        Some(fd) => fd,
+        None => {
+            // Close fd1
+            with_current_fd_mut(fd1, |slot| *slot = None);
+            crate::net::unix::free_unix_socket(h1);
+            crate::net::unix::free_unix_socket(h2);
+            return NEG_EMFILE;
+        }
+    };
+
+    // Write [fd1, fd2] to userspace sv[2] array.
+    let mut sv_bytes = [0u8; 8];
+    sv_bytes[..4].copy_from_slice(&(fd1 as i32).to_ne_bytes());
+    sv_bytes[4..].copy_from_slice(&(fd2 as i32).to_ne_bytes());
+    if crate::mm::user_mem::copy_to_user(sv_ptr, &sv_bytes).is_err() {
+        // Clean up on fault.
+        with_current_fd_mut(fd1, |slot| *slot = None);
+        with_current_fd_mut(fd2, |slot| *slot = None);
+        crate::net::unix::free_unix_socket(h1);
+        crate::net::unix::free_unix_socket(h2);
+        return NEG_EFAULT;
+    }
+    0
+}
+
+/// Parse a sockaddr_un from userspace. Returns the path string.
+fn sockaddr_un_from_user(addr_ptr: u64, addr_len: u64) -> Result<alloc::string::String, u64> {
+    if addr_len < 3 {
+        return Err(NEG_EINVAL); // Must have at least family + 1 byte of path
+    }
+    let len = (addr_len as usize).min(110); // sun_family(2) + path(up to 108)
+    let mut buf = [0u8; 110];
+    if crate::mm::user_mem::copy_from_user(&mut buf[..len], addr_ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    // Validate sun_family == AF_UNIX (1)
+    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    if family != 1 {
+        return Err(NEG_EAFNOSUPPORT);
+    }
+    // Extract NUL-terminated path from bytes [2..len].
+    let path_bytes = &buf[2..len];
+    let path_len = path_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(path_bytes.len());
+    if path_len == 0 {
+        return Err(NEG_EINVAL);
+    }
+    if path_len > 107 {
+        return Err(NEG_EINVAL);
+    }
+    match core::str::from_utf8(&path_bytes[..path_len]) {
+        Ok(s) => Ok(alloc::string::String::from(s)),
+        Err(_) => Err(NEG_EINVAL),
+    }
+}
+
+/// Helper: get Unix socket handle from FD, or ENOTSOCK.
+fn unix_socket_handle_from_fd(fd: u64) -> Result<(usize, FdEntry), u64> {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return Err(NEG_EBADF);
+    }
+    let entry = current_fd_entry(fd_idx).ok_or(NEG_EBADF)?;
+    match &entry.backend {
+        FdBackend::UnixSocket { handle } => Ok((*handle, entry)),
+        _ => Err(NEG_ENOTSOCK),
+    }
+}
+
+/// bind() for Unix sockets.
+fn sys_bind_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    let (handle, _entry) = match unix_socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let path = match sockaddr_un_from_user(addr_ptr, addr_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Check socket is unbound.
+    let state = crate::net::unix::with_unix_socket(handle, |s| s.state);
+    if state != Some(crate::net::unix::UnixSocketState::Unbound) {
+        return NEG_EINVAL;
+    }
+
+    // Register the path in the path map.
+    if crate::net::unix::bind_path(&path, handle).is_err() {
+        return NEG_EADDRINUSE;
+    }
+
+    // Create a socket node in tmpfs if the path is under /tmp.
+    if let Some(rel) = path.strip_prefix("/tmp/") {
+        let pid = crate::process::current_pid();
+        let (uid, gid, umask) = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            match table.find(pid) {
+                Some(p) => (p.uid, p.gid, p.umask),
+                None => (0, 0, 0o022),
+            }
+        };
+        let mode = 0o777 & !umask;
+        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        match tmpfs.create_file_with_meta(rel, uid, gid, mode) {
+            Ok(_) => {}
+            Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => {
+                drop(tmpfs);
+                crate::net::unix::unbind_path(&path);
+                return NEG_EADDRINUSE;
+            }
+            Err(_) => {
+                drop(tmpfs);
+                crate::net::unix::unbind_path(&path);
+                return NEG_EIO;
+            }
+        }
+    }
+
+    // Update socket state.
+    crate::net::unix::with_unix_socket_mut(handle, |s| {
+        s.path = Some(path);
+        s.state = crate::net::unix::UnixSocketState::Bound;
+    });
+    0
+}
+
+/// connect() for Unix stream sockets.
+fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    let (handle, entry) = match unix_socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let path = match sockaddr_un_from_user(addr_ptr, addr_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let sock_type = match crate::net::unix::with_unix_socket(handle, |s| s.socket_type) {
+        Some(t) => t,
+        None => return NEG_EBADF,
+    };
+
+    // Look up the target socket.
+    let target_handle = match crate::net::unix::lookup_path(&path) {
+        Some(h) => h,
+        None => return NEG_ECONNREFUSED,
+    };
+
+    match sock_type {
+        crate::net::unix::UnixSocketType::Stream => {
+            // Guard: reject if already connected or already pending connect.
+            let cur_state = crate::net::unix::with_unix_socket(handle, |s| s.state);
+            match cur_state {
+                Some(crate::net::unix::UnixSocketState::Connected) => return NEG_EISCONN,
+                Some(crate::net::unix::UnixSocketState::Connecting) => return NEG_EALREADY,
+                _ => {}
+            }
+
+            // Verify target is listening.
+            let is_listening = crate::net::unix::with_unix_socket(target_handle, |s| {
+                matches!(s.state, crate::net::unix::UnixSocketState::Listening)
+            });
+            if is_listening != Some(true) {
+                return NEG_ECONNREFUSED;
+            }
+
+            // Check backlog space.
+            let backlog_full = crate::net::unix::with_unix_socket(target_handle, |s| {
+                s.backlog.len() >= s.backlog_limit
+            });
+            if backlog_full == Some(true) {
+                return NEG_ECONNREFUSED;
+            }
+
+            // Increment refcount before enqueuing to prevent use-after-free
+            // if the client FD is closed before accept() processes the entry.
+            crate::net::unix::add_unix_socket_ref(handle);
+
+            // Mark as Connecting to prevent duplicate backlog entries.
+            crate::net::unix::with_unix_socket_mut(handle, |s| {
+                s.state = crate::net::unix::UnixSocketState::Connecting;
+            });
+
+            // Add ourselves to the listener's backlog.
+            crate::net::unix::with_unix_socket_mut(target_handle, |s| {
+                s.backlog.push_back(handle);
+            });
+            // Wake the listener.
+            crate::net::unix::wake_unix_socket(target_handle);
+
+            // Block until accepted (state transitions to Connected) or return EAGAIN.
+            let nonblock = entry.nonblock;
+            let pid = crate::process::current_pid();
+            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+            loop {
+                let state = crate::net::unix::with_unix_socket(handle, |s| s.state);
+                if state == Some(crate::net::unix::UnixSocketState::Connected) {
+                    return 0;
+                }
+                if nonblock || has_pending_signal() {
+                    // Roll back: remove from backlog, reset state, release refcount.
+                    crate::net::unix::with_unix_socket_mut(target_handle, |s| {
+                        s.backlog.retain(|&h| h != handle);
+                    });
+                    crate::net::unix::with_unix_socket_mut(handle, |s| {
+                        s.state = crate::net::unix::UnixSocketState::Unbound;
+                    });
+                    crate::net::unix::free_unix_socket(handle);
+                    return if nonblock { NEG_EAGAIN } else { NEG_EINTR };
+                }
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                restore_caller_context(pid, saved_user_rsp);
+            }
+        }
+        crate::net::unix::UnixSocketType::Datagram => {
+            // For datagram sockets, just set default destination.
+            crate::net::unix::with_unix_socket_mut(handle, |s| {
+                s.peer = Some(target_handle);
+            });
+            0
+        }
+    }
+}
+
+/// listen() for Unix stream sockets.
+fn sys_listen_unix(handle: usize, backlog: u64) -> u64 {
+    let info = crate::net::unix::with_unix_socket(handle, |s| (s.state, s.socket_type));
+    match info {
+        Some((
+            crate::net::unix::UnixSocketState::Bound,
+            crate::net::unix::UnixSocketType::Stream,
+        )) => {}
+        _ => return NEG_EINVAL,
+    }
+    let limit = (backlog as usize).clamp(1, 16);
+    crate::net::unix::with_unix_socket_mut(handle, |s| {
+        s.state = crate::net::unix::UnixSocketState::Listening;
+        s.backlog_limit = limit;
+    });
+    0
+}
+
+/// accept() for Unix stream sockets.
+fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
+    let (handle, entry) = match unix_socket_handle_from_fd(fd) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // Validate this is a listening stream socket.
+    let info = crate::net::unix::with_unix_socket(handle, |s| (s.socket_type, s.state));
+    match info {
+        Some((
+            crate::net::unix::UnixSocketType::Stream,
+            crate::net::unix::UnixSocketState::Listening,
+        )) => {}
+        _ => return NEG_EINVAL,
+    }
+
+    let nonblock = entry.nonblock;
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+
+    loop {
+        // Try to dequeue a pending connection.
+        let client_handle =
+            crate::net::unix::with_unix_socket_mut(handle, |s| s.backlog.pop_front());
+        if let Some(Some(ch)) = client_handle {
+            // Allocate a new server-side socket.
+            let server_handle =
+                match crate::net::unix::alloc_unix_socket(crate::net::unix::UnixSocketType::Stream)
+                {
+                    Some(h) => h,
+                    None => {
+                        // Release backlog refcount on failure.
+                        crate::net::unix::free_unix_socket(ch);
+                        return NEG_ENFILE;
+                    }
+                };
+
+            // Peer the server socket with the client.
+            crate::net::unix::with_unix_socket_mut(server_handle, |s| {
+                s.peer = Some(ch);
+                s.state = crate::net::unix::UnixSocketState::Connected;
+            });
+            crate::net::unix::with_unix_socket_mut(ch, |s| {
+                s.peer = Some(server_handle);
+                s.state = crate::net::unix::UnixSocketState::Connected;
+            });
+            // Wake the client (blocked in connect).
+            crate::net::unix::wake_unix_socket(ch);
+
+            // Release the backlog refcount now that peering is complete.
+            crate::net::unix::free_unix_socket(ch);
+
+            // Create FD for the accepted socket.
+            let new_entry = FdEntry {
+                backend: FdBackend::UnixSocket {
+                    handle: server_handle,
+                },
+                offset: 0,
+                readable: true,
+                writable: true,
+                cloexec: flags & SOCK_CLOEXEC != 0,
+                nonblock: flags & SOCK_NONBLOCK != 0,
+            };
+            let new_fd = match alloc_fd(0, new_entry) {
+                Some(fd) => fd,
+                None => {
+                    crate::net::unix::free_unix_socket(server_handle);
+                    return NEG_EMFILE;
+                }
+            };
+
+            // Write peer address if requested.
+            if addr_ptr != 0 && addr_len_ptr != 0 {
+                let peer_path =
+                    crate::net::unix::with_unix_socket(ch, |s| s.path.clone()).flatten();
+                let _ = sockaddr_un_to_user(addr_ptr, addr_len_ptr, peer_path.as_deref());
+            }
+
+            return new_fd as u64;
+        }
+
+        if nonblock {
+            return NEG_EAGAIN;
+        }
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+        crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+        restore_caller_context(pid, saved_user_rsp);
+    }
+}
+
+/// Helper: write a sockaddr_un to userspace.
+fn sockaddr_un_to_user(addr_ptr: u64, addr_len_ptr: u64, path: Option<&str>) -> Result<(), u64> {
+    // Read the caller-provided buffer size.
+    let mut caller_len_bytes = [0u8; 4];
+    if crate::mm::user_mem::copy_from_user(&mut caller_len_bytes, addr_len_ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let caller_len = u32::from_ne_bytes(caller_len_bytes) as usize;
+
+    let mut buf = [0u8; 110];
+    buf[0] = 1; // AF_UNIX
+    buf[1] = 0;
+    let total_len = if let Some(p) = path {
+        let bytes = p.as_bytes();
+        let copy_len = bytes.len().min(107);
+        buf[2..2 + copy_len].copy_from_slice(&bytes[..copy_len]);
+        2 + copy_len + 1 // family + path + NUL
+    } else {
+        2 // just the family
+    };
+    // Only write up to the caller's buffer size.
+    let write_len = total_len.min(caller_len);
+    if write_len > 0 && crate::mm::user_mem::copy_to_user(addr_ptr, &buf[..write_len]).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    // Write back the actual address length.
+    let len_val = (total_len as u32).to_ne_bytes();
+    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_val).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    Ok(())
+}
+
+/// shutdown() for Unix sockets.
+fn sys_shutdown_unix(handle: usize, how: u64) -> u64 {
+    let peer = crate::net::unix::with_unix_socket_mut(handle, |s| {
+        match how {
+            0 => s.shut_rd = true, // SHUT_RD
+            1 => s.shut_wr = true, // SHUT_WR
+            2 => {
+                s.shut_rd = true;
+                s.shut_wr = true;
+            } // SHUT_RDWR
+            _ => return None,
+        }
+        s.peer
+    });
+    match peer {
+        Some(Some(p)) => {
+            crate::net::unix::wake_unix_socket(p);
+            crate::net::unix::wake_unix_socket(handle);
+            0
+        }
+        Some(None) => {
+            crate::net::unix::wake_unix_socket(handle);
+            0
+        }
+        None => NEG_EINVAL,
+    }
+}
+
+/// sendto() for Unix datagram sockets.
+fn sys_sendto_unix(
+    handle: usize,
+    buf_ptr: u64,
+    len: u64,
+    nonblock: bool,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> u64 {
+    let capped = (len as usize).min(4096);
+    let mut data = alloc::vec![0u8; capped];
+    if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
+        return NEG_EFAULT;
+    }
+
+    let sender_path = crate::net::unix::with_unix_socket(handle, |s| s.path.clone()).flatten();
+
+    // Determine target: explicit addr or connected peer.
+    let target = if addr_ptr != 0 && addr_len >= 3 {
+        let path = match sockaddr_un_from_user(addr_ptr, addr_len) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        match crate::net::unix::lookup_path(&path) {
+            Some(h) => h,
+            None => return NEG_ECONNREFUSED,
+        }
+    } else {
+        match crate::net::unix::with_unix_socket(handle, |s| s.peer).flatten() {
+            Some(p) => p,
+            None => return NEG_ENOTCONN,
+        }
+    };
+
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+    loop {
+        match crate::net::unix::unix_dgram_send(sender_path.clone(), target, &data) {
+            Ok(n) => {
+                crate::net::unix::wake_unix_socket(target);
+                return n as u64;
+            }
+            Err(-11) => {
+                // EAGAIN — queue full, block or return.
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
+                restore_caller_context(pid, saved_user_rsp);
+            }
+            Err(e) => return e as u64, // ECONNREFUSED, etc.
+        }
+    }
+}
+
+/// recvfrom() for Unix datagram sockets.
+fn sys_recvfrom_unix(
+    handle: usize,
+    buf_ptr: u64,
+    count: u64,
+    nonblock: bool,
+    addr_ptr: u64,
+    addr_len_ptr: u64,
+) -> u64 {
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
+    let capped = (count as usize).min(4096);
+    let mut tmp = alloc::vec![0u8; capped];
+    loop {
+        match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
+            Ok((n, sender_path)) => {
+                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                    return NEG_EFAULT;
+                }
+                if addr_ptr != 0 && addr_len_ptr != 0 {
+                    let _ = sockaddr_un_to_user(addr_ptr, addr_len_ptr, sender_path.as_deref());
+                }
+                return n as u64;
+            }
+            Err(_) => {
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
+                if has_pending_signal() {
+                    return NEG_EINTR;
+                }
+                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                restore_caller_context(pid, saved_user_rsp);
+            }
+        }
+    }
+}
 
 /// socket(domain, type, protocol) — syscall 41
 fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     use crate::net::{SocketKind, SocketProtocol};
-    // Only AF_INET (2) supported
-    if domain != 2 {
+    const AF_UNIX: u64 = 1;
+    const AF_INET: u64 = 2;
+
+    if domain == AF_UNIX {
+        return sys_socket_unix(socktype);
+    }
+    if domain != AF_INET {
         return NEG_EAFNOSUPPORT;
     }
     const SOCK_NONBLOCK: u64 = 0x800;
@@ -8719,6 +9467,10 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
 
 /// bind(fd, addr, addrlen) — syscall 49
 fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    // Check for Unix socket first.
+    if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
+        return sys_bind_unix(fd, addr_ptr, addr_len);
+    }
     let (handle, kind, proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -8768,6 +9520,9 @@ fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
 /// connect(fd, addr, addrlen) — syscall 42
 fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+    if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
+        return sys_connect_unix(fd, addr_ptr, addr_len);
+    }
     let (handle, _kind, proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -8879,7 +9634,10 @@ fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 }
 
 /// listen(fd, backlog) — syscall 50
-fn sys_listen(fd: u64, _backlog: u64) -> u64 {
+fn sys_listen(fd: u64, backlog: u64) -> u64 {
+    if let Ok((handle, _)) = unix_socket_handle_from_fd(fd) {
+        return sys_listen_unix(handle, backlog);
+    }
     let (handle, _kind, proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -8906,6 +9664,9 @@ fn sys_listen(fd: u64, _backlog: u64) -> u64 {
 
 /// accept(fd, addr, addrlen) — syscall 43
 fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+    if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
+        return sys_accept_unix(fd, addr_ptr, addr_len_ptr, 0);
+    }
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -9162,6 +9923,20 @@ fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, addr_
                 }
             }
         }
+        FdBackend::UnixSocket { handle } => {
+            let handle = *handle;
+            let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
+            match sock_type {
+                Some(crate::net::unix::UnixSocketType::Datagram) => {
+                    sys_sendto_unix(handle, buf_ptr, len, entry.nonblock, addr_ptr, addr_len)
+                }
+                Some(crate::net::unix::UnixSocketType::Stream) => {
+                    // Stream sockets use write() semantics.
+                    sys_linux_write(fd, buf_ptr, len)
+                }
+                None => NEG_EBADF,
+            }
+        }
         FdBackend::PipeWrite { .. } => {
             // sendto on pipe-based socketpair — delegate to write
             sys_linux_write(fd, buf_ptr, len)
@@ -9400,12 +10175,28 @@ fn sys_recvfrom_socket(
                 }
             }
         }
+        FdBackend::UnixSocket { handle } => {
+            let handle = *handle;
+            let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
+            match sock_type {
+                Some(crate::net::unix::UnixSocketType::Datagram) => {
+                    sys_recvfrom_unix(handle, buf_ptr, count, nonblock, addr_ptr, addr_len_ptr)
+                }
+                Some(crate::net::unix::UnixSocketType::Stream) => {
+                    sys_linux_read(fd, buf_ptr, count)
+                }
+                None => NEG_EBADF,
+            }
+        }
         _ => sys_linux_read(fd, buf_ptr, count),
     }
 }
 
 /// shutdown(fd, how) — syscall 48
 fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
+    if let Ok((handle, _)) = unix_socket_handle_from_fd(fd) {
+        return sys_shutdown_unix(handle, how);
+    }
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -9781,6 +10572,70 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         | FdBackend::Fat32Disk { .. }
         | FdBackend::Ext2Disk { .. }
         | FdBackend::Dir { .. } => POLLIN | POLLOUT,
+        FdBackend::UnixSocket { handle } => {
+            let h = *handle;
+            // Extract socket info under the lock, then check peer separately
+            // to avoid nested lock acquisition (deadlock).
+            let info = crate::net::unix::with_unix_socket(h, |s| {
+                (
+                    s.socket_type,
+                    s.state,
+                    s.peer,
+                    !s.recv_buf.is_empty(),
+                    !s.backlog.is_empty(),
+                    !s.dgram_queue.is_empty(),
+                    s.shut_rd,
+                )
+            });
+            match info {
+                Some((sock_type, state, peer, has_data, has_backlog, has_dgram, shut_rd)) => {
+                    let mut revents: i16 = 0;
+                    match sock_type {
+                        crate::net::unix::UnixSocketType::Stream => {
+                            if has_data {
+                                revents |= POLLIN;
+                            }
+                            if matches!(state, crate::net::unix::UnixSocketState::Listening)
+                                && has_backlog
+                            {
+                                revents |= POLLIN;
+                            }
+                            if let Some(peer_h) = peer {
+                                let peer_has_space =
+                                    crate::net::unix::with_unix_socket(peer_h, |ps| {
+                                        ps.recv_buf.len() < crate::net::unix::UNIX_STREAM_BUF_SIZE
+                                    });
+                                if peer_has_space.unwrap_or(false) {
+                                    revents |= POLLOUT;
+                                }
+                                if peer_has_space.is_none() {
+                                    revents |= POLLHUP; // peer freed
+                                }
+                            } else if matches!(state, crate::net::unix::UnixSocketState::Connected)
+                            {
+                                revents |= POLLHUP;
+                            }
+                        }
+                        crate::net::unix::UnixSocketType::Datagram => {
+                            if has_dgram {
+                                revents |= POLLIN;
+                            }
+                            // Datagram writability is not determined by the local
+                            // receive queue — always report writable.
+                            revents |= POLLOUT;
+                        }
+                    }
+                    if shut_rd {
+                        revents |= POLLIN;
+                    }
+                    if matches!(state, crate::net::unix::UnixSocketState::Closed) {
+                        revents |= POLLHUP;
+                    }
+                    revents
+                }
+                None => POLLNVAL,
+            }
+        }
         FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
     }
 }
@@ -9812,6 +10667,10 @@ fn fd_register_waiter(
             crate::net::SOCKET_WAITQUEUES[*handle as usize].register(task_id, woken);
             true
         }
+        FdBackend::UnixSocket { handle } => {
+            crate::net::unix::UNIX_SOCKET_WAITQUEUES[*handle].register(task_id, woken);
+            true
+        }
         FdBackend::PtyMaster { pty_id } => {
             crate::pty::PTY_MASTER_WQ[*pty_id as usize].register(task_id, woken);
             true
@@ -9838,6 +10697,9 @@ fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
         }
         FdBackend::Socket { handle } => {
             crate::net::SOCKET_WAITQUEUES[*handle as usize].deregister(task_id);
+        }
+        FdBackend::UnixSocket { handle } => {
+            crate::net::unix::UNIX_SOCKET_WAITQUEUES[*handle].deregister(task_id);
         }
         FdBackend::PtyMaster { pty_id } => {
             crate::pty::PTY_MASTER_WQ[*pty_id as usize].deregister(task_id);
