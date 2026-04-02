@@ -30,14 +30,14 @@
 ### A.2 — Implement a simple frame allocator
 
 **File:** `kernel/src/mm/frame_allocator.rs`
-**Symbols:** `FrameAllocator`, `init`, `allocate_frame`, `free_frame`
-**Why it matters:** Physical frame allocation is the foundation for all virtual memory operations — page tables, heap, and userspace mappings all require frames.
+**Symbols:** `BumpAllocator`, `init`, `allocate_frame`
+**Why it matters:** Physical frame allocation is the foundation for all virtual memory operations — page tables, heap, and later userspace mappings all require frames.
 
 **Acceptance:**
 - [x] `init()` scans usable memory regions and builds the allocator state
 - [x] `allocate_frame()` returns a fresh physical frame
-- [x] `free_frame()` returns a frame to the free pool
 - [x] Reserved or already-allocated memory is never reused
+- [x] Reclaiming freed physical frames is explicitly deferred to later phases
 
 ---
 
