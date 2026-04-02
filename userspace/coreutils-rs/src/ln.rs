@@ -17,6 +17,9 @@ fn main(args: &[&str]) -> i32 {
         } else if positional_count < positional.len() {
             positional[positional_count] = arg;
             positional_count += 1;
+        } else {
+            write_str(STDERR_FILENO, "usage: ln [-s] <target> <link>\n");
+            return 1;
         }
     }
 
