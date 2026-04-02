@@ -777,6 +777,20 @@ pub fn lstat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
     newfstatat_flags(path, stat_buf, AT_SYMLINK_NOFOLLOW)
 }
 
+/// `lstat(path, buf)` — get typed metadata without following the final symlink.
+pub fn lstat_stat(path: &[u8], buf: &mut Stat) -> isize {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    unsafe {
+        syscall4(
+            SYS_NEWFSTATAT,
+            (-100i64) as u64,
+            path.as_ptr() as u64,
+            buf as *mut Stat as u64,
+            AT_SYMLINK_NOFOLLOW,
+        ) as isize
+    }
+}
+
 /// `symlink(target, linkpath)` — create a symbolic link.
 pub fn symlink(target: &[u8], linkpath: &[u8]) -> isize {
     unsafe {

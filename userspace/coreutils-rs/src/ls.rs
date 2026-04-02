@@ -3,8 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_DIRECTORY, O_RDONLY, STDERR_FILENO, STDOUT_FILENO, close, getdents64, newfstatat, open,
-    write, write_str,
+    O_DIRECTORY, O_RDONLY, STDERR_FILENO, STDOUT_FILENO, Stat, close, getdents64, lstat_stat, open,
+    readlink, write, write_str,
 };
 
 syscall_lib::entry_point!(main);
@@ -96,10 +96,10 @@ fn main(args: &[&str]) -> i32 {
 
             if long_format {
                 print_long_entry(&base[..base_len], name);
+            } else {
+                let _ = write(STDOUT_FILENO, name);
+                write_str(STDOUT_FILENO, "\n");
             }
-
-            let _ = write(STDOUT_FILENO, name);
-            write_str(STDOUT_FILENO, "\n");
 
             pos += d_reclen;
         }
@@ -121,30 +121,17 @@ fn print_long_entry(base: &[u8], name: &[u8]) {
     fullpath[base.len()..base.len() + name.len()].copy_from_slice(name);
     fullpath[total] = 0;
 
-    let mut stat_buf = [0u8; 144];
-    if newfstatat(&fullpath[..=total], &mut stat_buf) != 0 {
+    let mut st = Stat::zeroed();
+    if lstat_stat(&fullpath[..=total], &mut st) != 0 {
         write_str(STDOUT_FILENO, "?????????? ? ? ? ");
+        let _ = write(STDOUT_FILENO, name);
+        write_str(STDOUT_FILENO, "\n");
         return;
     }
 
-    // Parse stat fields.
-    let mode = u32::from_ne_bytes([stat_buf[24], stat_buf[25], stat_buf[26], stat_buf[27]]);
-    let uid = u32::from_ne_bytes([stat_buf[28], stat_buf[29], stat_buf[30], stat_buf[31]]);
-    let gid = u32::from_ne_bytes([stat_buf[32], stat_buf[33], stat_buf[34], stat_buf[35]]);
-    let size = u64::from_ne_bytes([
-        stat_buf[48],
-        stat_buf[49],
-        stat_buf[50],
-        stat_buf[51],
-        stat_buf[52],
-        stat_buf[53],
-        stat_buf[54],
-        stat_buf[55],
-    ]);
-
     // Format mode string.
     let mut mode_str = [b'-'; 10];
-    let ft = mode & 0o170000;
+    let ft = st.st_mode & 0o170000;
     mode_str[0] = if ft == 0o040000 {
         b'd'
     } else if ft == 0o120000 {
@@ -152,42 +139,54 @@ fn print_long_entry(base: &[u8], name: &[u8]) {
     } else {
         b'-'
     };
-    if mode & 0o400 != 0 {
+    if st.st_mode & 0o400 != 0 {
         mode_str[1] = b'r';
     }
-    if mode & 0o200 != 0 {
+    if st.st_mode & 0o200 != 0 {
         mode_str[2] = b'w';
     }
-    if mode & 0o100 != 0 {
+    if st.st_mode & 0o100 != 0 {
         mode_str[3] = b'x';
     }
-    if mode & 0o040 != 0 {
+    if st.st_mode & 0o040 != 0 {
         mode_str[4] = b'r';
     }
-    if mode & 0o020 != 0 {
+    if st.st_mode & 0o020 != 0 {
         mode_str[5] = b'w';
     }
-    if mode & 0o010 != 0 {
+    if st.st_mode & 0o010 != 0 {
         mode_str[6] = b'x';
     }
-    if mode & 0o004 != 0 {
+    if st.st_mode & 0o004 != 0 {
         mode_str[7] = b'r';
     }
-    if mode & 0o002 != 0 {
+    if st.st_mode & 0o002 != 0 {
         mode_str[8] = b'w';
     }
-    if mode & 0o001 != 0 {
+    if st.st_mode & 0o001 != 0 {
         mode_str[9] = b'x';
     }
     let _ = write(STDOUT_FILENO, &mode_str);
     write_str(STDOUT_FILENO, " ");
 
-    write_padded_uint(uid as u64, 5);
+    write_padded_uint(st.st_nlink, 2);
     write_str(STDOUT_FILENO, " ");
-    write_padded_uint(gid as u64, 5);
+    write_padded_uint(st.st_uid as u64, 5);
     write_str(STDOUT_FILENO, " ");
-    write_padded_uint(size, 8);
+    write_padded_uint(st.st_gid as u64, 5);
     write_str(STDOUT_FILENO, " ");
+    write_padded_uint(st.st_size as u64, 8);
+    write_str(STDOUT_FILENO, " ");
+    let _ = write(STDOUT_FILENO, name);
+    if ft == 0o120000 {
+        let mut target = [0u8; 256];
+        let n = readlink(&fullpath[..=total], &mut target);
+        if n >= 0 {
+            write_str(STDOUT_FILENO, " -> ");
+            let _ = write(STDOUT_FILENO, &target[..n as usize]);
+        }
+    }
+    write_str(STDOUT_FILENO, "\n");
 }
 
 fn write_padded_uint(v: u64, width: usize) {

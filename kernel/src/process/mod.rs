@@ -133,6 +133,8 @@ pub enum FdBackend {
     DevUrandom,
     /// /dev/full — reads return zero bytes, writes return ENOSPC (Phase 38).
     DevFull,
+    /// Synthetic procfs file content, generated on read from kernel state.
+    Proc { path: String },
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
     /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).
@@ -535,6 +537,12 @@ pub struct Process {
     pub controlling_tty: Option<ControllingTty>,
     /// Tracked anonymous mmap regions (Phase 33).
     pub mappings: Vec<MemoryMapping>,
+    /// Last successfully executed binary path, used for procfs.
+    pub exec_path: String,
+    /// Current argv vector, used for `/proc/<pid>/cmdline`.
+    pub cmdline: Vec<String>,
+    /// Process start time in scheduler ticks since boot.
+    pub start_ticks: u64,
 }
 
 /// Describes a contiguous anonymous memory mapping created by `mmap`.
@@ -598,6 +606,9 @@ impl Process {
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
             mappings: Vec::new(),
+            exec_path: String::new(),
+            cmdline: Vec::new(),
+            start_ticks: crate::arch::x86_64::interrupts::tick_count(),
         }
     }
 
@@ -733,6 +744,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -785,6 +799,9 @@ pub fn spawn_process_with_cr3(
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -841,6 +858,9 @@ pub fn spawn_process_with_cr3_and_fds(
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

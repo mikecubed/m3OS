@@ -100,3 +100,11 @@ path = "src/date.rs"
 [[bin]]
 name = "uptime"
 path = "src/uptime.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
+name = "readlink"
+path = "src/readlink.rs"

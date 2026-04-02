@@ -168,8 +168,15 @@ fn basename(path: &str) -> &str {
 }
 
 fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
-    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/proc" || abs_path == "/dev" {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" {
         return Ok(PathNodeKind::Dir);
+    }
+    if let Some(node) = crate::fs::procfs::path_node(abs_path) {
+        return match node {
+            crate::fs::procfs::ProcfsNode::Dir => Ok(PathNodeKind::Dir),
+            crate::fs::procfs::ProcfsNode::File => Ok(PathNodeKind::File),
+            crate::fs::procfs::ProcfsNode::Symlink(target) => Ok(PathNodeKind::Symlink(target)),
+        };
     }
     if abs_path == "/dev/null"
         || abs_path == "/dev/zero"
@@ -633,11 +640,10 @@ fn statfs_for_path(abs_path: &str) -> Statfs {
 }
 
 fn statfs_path_exists(abs_path: &str) -> bool {
-    if abs_path == "/"
-        || abs_path == "/tmp"
-        || abs_path == "/proc"
-        || abs_path.starts_with("/proc/")
-    {
+    if abs_path == "/" || abs_path == "/tmp" {
+        return true;
+    }
+    if crate::fs::procfs::path_exists(abs_path) {
         return true;
     }
     if abs_path == "/dev"
@@ -2374,9 +2380,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_alt_stack,
         parent_fs_base,
         parent_ids,
+        parent_umask,
         parent_session_id,
         parent_ctty,
         parent_mappings,
+        parent_exec_path,
+        parent_cmdline,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -2391,9 +2400,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
                 (p.uid, p.gid, p.euid, p.egid),
+                p.umask,
                 p.session_id,
                 p.controlling_tty.clone(),
                 p.mappings.clone(),
+                p.exec_path.clone(),
+                p.cmdline.clone(),
             ),
             None => (
                 0,
@@ -2409,8 +2421,11 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (0u64, 0u64, 0u32),
                 0,
                 (0u32, 0u32, 0u32, 0u32),
+                0o022,
                 0,
                 Some(crate::process::ControllingTty::Console),
+                alloc::vec::Vec::new(),
+                alloc::string::String::new(),
                 alloc::vec::Vec::new(),
             ),
         }
@@ -2447,10 +2462,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.gid = parent_ids.1;
             child.euid = parent_ids.2;
             child.egid = parent_ids.3;
-            child.umask = current_umask();
+            child.umask = parent_umask;
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
             child.mappings = parent_mappings;
+            child.exec_path = parent_exec_path;
+            child.cmdline = parent_cmdline;
         }
     }
 
@@ -2639,6 +2656,16 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.brk_current = 0;
             proc.mmap_next = 0;
             proc.mappings.clear(); // Phase 36: clear stale VMAs from old address space.
+            proc.exec_path = alloc::string::String::from(name);
+            proc.cmdline = if user_argv.is_empty() {
+                alloc::vec![alloc::string::String::from(name)]
+            } else {
+                user_argv
+                    .iter()
+                    .filter_map(|arg| core::str::from_utf8(arg).ok())
+                    .map(alloc::string::String::from)
+                    .collect()
+            };
         }
     }
 
@@ -3293,6 +3320,28 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
+        FdBackend::Proc { path } => {
+            let Some(data) = crate::fs::procfs::read_file(path) else {
+                return NEG_ENOENT;
+            };
+            let offset = entry.offset.min(data.len());
+            let to_read = (count as usize).min(data.len().saturating_sub(offset));
+            if to_read == 0 {
+                return 0;
+            }
+
+            if crate::mm::user_mem::copy_to_user(buf_ptr, &data[offset..offset + to_read]).is_err()
+            {
+                return NEG_EFAULT;
+            }
+
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
+            to_read as u64
+        }
         FdBackend::Fat32Disk {
             start_cluster,
             file_size,
@@ -3578,6 +3627,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::Stdin => NEG_EBADF,
         FdBackend::Ramdisk { .. } => NEG_EBADF, // ramdisk is read-only
+        FdBackend::Proc { .. } => NEG_EBADF,
         FdBackend::Tmpfs { path } => {
             let len = (count as usize).min(64 * 1024);
             let mut buf = [0u8; 4096];
@@ -4070,6 +4120,9 @@ fn is_directory(path: &str) -> bool {
     if path == "/" {
         return true;
     }
+    if crate::fs::procfs::is_dir(path) {
+        return true;
+    }
     if let Some(rel) = tmpfs_relative_path(path) {
         if rel.is_empty() {
             return true; // /tmp itself
@@ -4429,6 +4482,31 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                 log::info!("[open] {} → fd {} (dir)", name, i);
                 i as u64
             }
+            None => NEG_EMFILE,
+        };
+    }
+
+    if crate::fs::procfs::path_exists(name) {
+        if writable || create || truncate || append {
+            return NEG_EROFS;
+        }
+        if !matches!(
+            crate::fs::procfs::path_node(name),
+            Some(crate::fs::procfs::ProcfsNode::File)
+        ) {
+            return NEG_ENOENT;
+        }
+        let entry = FdEntry {
+            backend: FdBackend::Proc {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+            cloexec: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
             None => NEG_EMFILE,
         };
     }
@@ -5101,12 +5179,25 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     // Determine mode, uid, gid, size, rdev based on backend type.
     let (mode, uid, gid, size, rdev): (u32, u32, u32, u64, u64) = match &entry.backend {
         FdBackend::Dir { path } => {
-            // Try to get metadata from tmpfs for dirs under /tmp
-            let (u, g, m) = dir_metadata(path);
-            (0x4000 | m as u32, u, g, 0, 0)
+            if let Some(st) = crate::fs::procfs::stat(path) {
+                stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+                stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+                (st.mode, st.uid, st.gid, st.size, 0)
+            } else {
+                let (u, g, m) = dir_metadata(path);
+                (0x4000 | m as u32, u, g, 0, 0)
+            }
         }
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
             (0x2000 | 0o666, 0, 0, 0, 0)
+        }
+        FdBackend::Proc { path } => {
+            let Some(st) = crate::fs::procfs::stat(path) else {
+                return NEG_ENOENT;
+            };
+            stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+            stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+            (st.mode, st.uid, st.gid, st.size, 0)
         }
         FdBackend::DeviceTTY { tty_id } => {
             (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
@@ -5225,6 +5316,7 @@ fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
 
     let stat = match &entry.backend {
         FdBackend::Tmpfs { .. } => tmpfs_statfs(),
+        FdBackend::Proc { .. } => proc_statfs(),
         FdBackend::Fat32Disk { .. } => fat32_statfs(),
         FdBackend::Ext2Disk { .. } => ext2_statfs(),
         FdBackend::Ramdisk { .. } => ramdisk_statfs(),
@@ -5283,6 +5375,9 @@ fn check_permission(
 
 /// Get file metadata for permission checking on a resolved absolute path.
 fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    if let Some(st) = crate::fs::procfs::stat(abs_path) {
+        return Some((st.uid, st.gid, (st.mode & 0o7777) as u16));
+    }
     if let Some(rel) = tmpfs_relative_path(abs_path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         if let Ok(s) = tmpfs.stat(rel) {
@@ -5304,11 +5399,7 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if let Some(rel) = abs_path.strip_prefix("/data/") {
         return data_file_metadata(rel);
     }
-    if abs_path == "/"
-        || abs_path == "/tmp"
-        || abs_path.starts_with("/dev")
-        || abs_path.starts_with("/proc")
-    {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path.starts_with("/dev") {
         return Some((0, 0, 0o755));
     }
     None
@@ -5541,6 +5632,7 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
+        | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
@@ -6681,6 +6773,22 @@ fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u6
     };
     let name: &str = &resolved;
 
+    if let Some(st) = crate::fs::procfs::stat(name) {
+        let mut stat = [0u8; 144];
+        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+        stat[24..28].copy_from_slice(&st.mode.to_ne_bytes());
+        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
+        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
+        stat[48..56].copy_from_slice(&st.size.to_ne_bytes());
+        let blksize: u64 = 4096;
+        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
     // Check tmpfs first.
     if let Some(rel) = tmpfs_relative_path(name) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -7706,6 +7814,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
+        | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::Epoll { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
@@ -7773,7 +7882,16 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     entries.push((alloc::string::String::from("."), true));
     entries.push((alloc::string::String::from(".."), true));
 
-    if let Some(rel) = tmpfs_relative_path(&dir_path) {
+    if crate::fs::procfs::is_dir(&dir_path) {
+        match crate::fs::procfs::list_dir(&dir_path) {
+            Some(children) => {
+                for (name, is_dir) in children {
+                    entries.push((name, is_dir));
+                }
+            }
+            None => return NEG_ENOENT,
+        }
+    } else if let Some(rel) = tmpfs_relative_path(&dir_path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         match tmpfs.list_dir(rel) {
             Ok(children) => {
@@ -7810,6 +7928,12 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Add virtual mount points.
         if !seen.contains("tmp") {
             entries.push((alloc::string::String::from("tmp"), true));
+        }
+        if !seen.contains("proc") {
+            entries.push((alloc::string::String::from("proc"), true));
+        }
+        if !seen.contains("dev") {
+            entries.push((alloc::string::String::from("dev"), true));
         }
         if crate::fs::fat32::is_mounted() && !seen.contains("data") {
             entries.push((alloc::string::String::from("data"), true));

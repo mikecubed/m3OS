@@ -197,7 +197,7 @@ flowchart TD
 | 35 | True SMP multitasking (per-core dispatch, priorities) | Complete | `phase-35` | [Phase 35 Tasks](./35-true-smp-multitasking-tasks.md) |
 | 36 | Expanded memory (demand paging, mprotect, disk/RAM) | Complete | `phase-36` | [Phase 36 Tasks](./36-expanded-memory-tasks.md) |
 | 37 | I/O multiplexing (select, epoll, non-blocking) | Planned | `phase-37` | [Phase 37 Tasks](./37-io-multiplexing-tasks.md) |
-| 38 | Filesystem enhancements (symlinks, hard links, /proc, permissions, device nodes) | Planned | `phase-38` | [Phase 38 Tasks](./38-filesystem-enhancements-tasks.md) |
+| 38 | Filesystem enhancements (symlinks, hard links, /proc, permissions, device nodes) | Complete | `phase-38` | [Phase 38 Tasks](./38-filesystem-enhancements-tasks.md) |
 | 39 | Unix domain sockets (AF_UNIX) | Planned | `phase-39` | *not yet created* |
 | 40 | Threading primitives (clone, futex, TLS) | Planned | `phase-40` | *not yet created* |
 
