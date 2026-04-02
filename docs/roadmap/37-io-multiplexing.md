@@ -1,6 +1,6 @@
 # Phase 37 - I/O Multiplexing
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-37
 **Depends on:** Phase 22 (TTY) ✅, Phase 23 (Socket API) ✅, Phase 35 (True SMP) ✅
 **Builds on:** Replaces the busy-wait `poll()` from Phase 21 with wait-queue-driven
