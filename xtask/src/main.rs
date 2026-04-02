@@ -242,6 +242,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/cut.c", "cut"),
         ("userspace/coreutils/tr.c", "tr"),
         ("userspace/coreutils/sed.c", "sed"),
+        ("userspace/coreutils/file.c", "file"),
+        ("userspace/coreutils/hexdump.c", "hexdump"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2459,7 +2461,96 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 12. make clean
+    // 12. Phase 41 file tools: file, hexdump
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /bin/sh0\n",
+        label: "file: detect ELF binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/bin/sh0: ELF 64-bit",
+        timeout_secs: 10,
+        label: "verify file ELF output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file ELF",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /home/project/main.c\n",
+        label: "file: detect ASCII text",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c: ASCII text",
+        timeout_secs: 10,
+        label: "verify file text output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file text",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /dev/null\n",
+        label: "file: detect character special",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/dev/null: character special",
+        timeout_secs: 10,
+        label: "verify file char device output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file char device",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/hexdump -n 16 /bin/sh0\n",
+        label: "hexdump: default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "00000000",
+        timeout_secs: 10,
+        label: "verify hexdump offset",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "7f 45 4c 46",
+        timeout_secs: 10,
+        label: "verify hexdump ELF magic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hexdump default",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/hexdump -C -n 16 /bin/sh0\n",
+        label: "hexdump: canonical output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "00000000",
+        timeout_secs: 10,
+        label: "verify hexdump -C offset",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "7f 45 4c 46",
+        timeout_secs: 10,
+        label: "verify hexdump -C ELF magic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hexdump canonical",
+    });
+
+    // -----------------------------------------------------------------------
+    // 13. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
