@@ -8996,7 +8996,10 @@ fn sys_select(
         }
         let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
         let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-        Some((sec.max(0) as u64) * 1000 + (usec.max(0) as u64) / 1000)
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return NEG_EINVAL;
+        }
+        Some(sec as u64 * 1000 + usec as u64 / 1000)
     };
     select_inner(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ms)
 }
@@ -9191,7 +9194,10 @@ fn sys_pselect6(
         }
         let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
         let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-        Some((sec.max(0) as u64) * 1000 + (nsec.max(0) as u64) / 1_000_000)
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return NEG_EINVAL;
+        }
+        Some(sec as u64 * 1000 + nsec as u64 / 1_000_000)
     } else {
         None // block indefinitely
     };
