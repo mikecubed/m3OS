@@ -18,9 +18,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
+static const char *last_failed_test = NULL;
+static const char *last_failed_reason = NULL;
 
 static void pass(const char *name) {
     printf("  PASS: %s\n", name); /* DevSkim: ignore DS154189 — format string is a literal */
@@ -30,6 +33,8 @@ static void pass(const char *name) {
 static void fail(const char *name, const char *reason) {
     printf("  FAIL: %s — %s\n", name, reason); /* DevSkim: ignore DS154189 — format string is a literal */
     tests_failed++;
+    last_failed_test = name;
+    last_failed_reason = reason;
 }
 
 static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t *out_len) {
@@ -266,6 +271,11 @@ static void test_symlink_semantics(void) {
         fail("symlink: readlink content", "target mismatch");
         return;
     }
+    errno = 0;
+    if (syscall(SYS_readlink, link_path, link_buf, 0) >= 0 || errno != EINVAL) {
+        fail("symlink: readlink zero length", "raw readlink(buf_len=0) did not fail with EINVAL");
+        return;
+    }
 
     DIR *tmp_dir = opendir("/tmp");
     if (tmp_dir == NULL) {
@@ -330,6 +340,66 @@ static void test_symlink_semantics(void) {
     }
     if (memcmp(link_buf, target_text, target_text_len) != 0) {
         fail("symlink: open link content", "did not read target file data");
+        return;
+    }
+
+    if (mkdir("/tmp/chdir-target", 0755) != 0) {
+        fail("symlink: mkdir target dir", "mkdir returned non-zero");
+        return;
+    }
+    if (symlink("/tmp/chdir-target", "/tmp/chdir-link") != 0) {
+        fail("symlink: create dir link", "symlink returned non-zero");
+        return;
+    }
+    if (chdir("/tmp/chdir-link") != 0) {
+        fail("symlink: chdir follow", "chdir through symlink failed");
+        return;
+    }
+    fd = open("created-from-symlink-cwd.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, "cwd", 3) != 3) {
+        fail("symlink: chdir write", "relative create under symlink cwd failed");
+        if (fd >= 0) {
+            close(fd);
+        }
+        chdir("/");
+        return;
+    }
+    close(fd);
+    if (chdir("/") != 0 || access("/tmp/chdir-target/created-from-symlink-cwd.txt", F_OK) != 0) {
+        fail("symlink: chdir target", "relative file landed outside target directory");
+        return;
+    }
+
+    if (mkdir("/tmp/parent-target", 0755) != 0) {
+        fail("symlink: parent target dir", "mkdir returned non-zero");
+        return;
+    }
+    if (symlink("/tmp/parent-target", "/tmp/parent-link") != 0) {
+        fail("symlink: parent link", "symlink returned non-zero");
+        return;
+    }
+    if (mkdir("/tmp/parent-link/mkdir-via-link", 0755) != 0 ||
+        access("/tmp/parent-target/mkdir-via-link", F_OK) != 0) {
+        fail("symlink: mkdir parent follow", "mkdir did not resolve parent symlink");
+        return;
+    }
+    fd = open("/tmp/parent-target/unlink-me.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, "x", 1) != 1) {
+        fail("symlink: create unlink target", "could not create unlink target");
+        if (fd >= 0) {
+            close(fd);
+        }
+        return;
+    }
+    close(fd);
+    if (unlink("/tmp/parent-link/unlink-me.txt") != 0 ||
+        access("/tmp/parent-target/unlink-me.txt", F_OK) == 0) {
+        fail("symlink: unlink parent follow", "unlink did not resolve parent symlink");
+        return;
+    }
+    if (rename("/tmp/parent-link/mkdir-via-link", "/tmp/parent-link/renamed-via-link") != 0 ||
+        access("/tmp/parent-target/renamed-via-link", F_OK) != 0) {
+        fail("symlink: rename parent follow", "rename did not resolve parent symlink");
         return;
     }
 
@@ -670,6 +740,24 @@ static void test_permissions_and_umask(void) {
         if (open("/proc/1/status", O_RDONLY) >= 0) {
             _exit(13);
         }
+        int dev_fd = open("/dev/null", O_WRONLY);
+        if (dev_fd < 0 || write(dev_fd, "ok", 2) != 2) {
+            if (dev_fd >= 0) {
+                close(dev_fd);
+            }
+            _exit(14);
+        }
+        close(dev_fd);
+        dev_fd = open("/dev/full", O_WRONLY);
+        if (dev_fd < 0) {
+            _exit(15);
+        }
+        errno = 0;
+        if (write(dev_fd, "x", 1) >= 0 || errno != ENOSPC) {
+            close(dev_fd);
+            _exit(16);
+        }
+        close(dev_fd);
         if (open(secret_path, O_RDONLY) >= 0) {
             _exit(11);
         }
@@ -680,9 +768,37 @@ static void test_permissions_and_umask(void) {
     }
 
     int status = 0;
-    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        fail("permissions: non-root DAC", "non-root access was not denied");
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status)) {
+        fail("permissions: non-root DAC", "waitpid failed");
         return;
+    }
+    switch (WEXITSTATUS(status)) {
+        case 0:
+            break;
+        case 10:
+            fail("permissions: setuid", "setuid(1000) failed in child");
+            return;
+        case 11:
+            fail("permissions: secret DAC", "non-root child could read root-only file");
+            return;
+        case 12:
+            fail("permissions: directory DAC", "non-root child could create file in root-owned dir");
+            return;
+        case 13:
+            fail("permissions: procfs DAC", "non-root child could read another user's proc status");
+            return;
+        case 14:
+            fail("permissions: /dev/null", "non-root child could not write to /dev/null");
+            return;
+        case 15:
+            fail("permissions: /dev/full open", "non-root child could not open /dev/full");
+            return;
+        case 16:
+            fail("permissions: /dev/full write", "non-root child did not get ENOSPC from /dev/full");
+            return;
+        default:
+            fail("permissions: non-root DAC", "unexpected child exit status");
+            return;
     }
 
     fd = open(secret_path, O_RDONLY);
@@ -757,6 +873,10 @@ int main(void) {
 
     printf("[tmpfs-test] results: %d passed, %d failed\n", /* DevSkim: ignore DS154189 — format string is a literal */
            tests_passed, tests_failed);
+    if (last_failed_test != NULL && last_failed_reason != NULL) {
+        printf("[tmpfs-test] last failure: %s — %s\n",
+               last_failed_test, last_failed_reason); /* DevSkim: ignore DS154189 — format string is a literal */
+    }
 
     return tests_failed > 0 ? 1 : 0;
 }

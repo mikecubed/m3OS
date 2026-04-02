@@ -1962,7 +1962,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         10,
     ));
     steps.extend(cmd_then_prompt(
-        "/bin/ln -s /etc/passwd /phase38-passwd-link\n",
+        "/bin/ln -s /././././././././././././././././././././././././././././././etc/passwd /phase38-passwd-link\n",
         "send: ln -s /etc/passwd /phase38-passwd-link",
         "wait: prompt after ext2 symlink create",
         10,

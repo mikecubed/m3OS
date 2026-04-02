@@ -122,6 +122,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     ("hello.elf", RamdiskNode::File { content: HELLO_ELF }),
     (
+        "tmpfs-test",
+        RamdiskNode::File {
+            content: TMPFS_TEST_ELF,
+        },
+    ),
+    (
         "tmpfs-test.elf",
         RamdiskNode::File {
             content: TMPFS_TEST_ELF,
@@ -130,6 +136,7 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("echo.elf", RamdiskNode::File { content: ECHO_ELF }),
     ("true.elf", RamdiskNode::File { content: TRUE_ELF }),
     ("false.elf", RamdiskNode::File { content: FALSE_ELF }),
+    ("cat", RamdiskNode::File { content: CAT_ELF }),
     ("cat.elf", RamdiskNode::File { content: CAT_ELF }),
     ("ls.elf", RamdiskNode::File { content: LS_ELF }),
     ("pwd.elf", RamdiskNode::File { content: PWD_ELF }),
@@ -509,6 +516,10 @@ static FLAT_FILES: &[FlatFile] = &[
         content: HELLO_ELF,
     },
     FlatFile {
+        name: "tmpfs-test",
+        content: TMPFS_TEST_ELF,
+    },
+    FlatFile {
         name: "tmpfs-test.elf",
         content: TMPFS_TEST_ELF,
     },
@@ -523,6 +534,10 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "false.elf",
         content: FALSE_ELF,
+    },
+    FlatFile {
+        name: "cat",
+        content: CAT_ELF,
     },
     FlatFile {
         name: "cat.elf",

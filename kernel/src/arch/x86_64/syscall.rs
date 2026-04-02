@@ -2551,9 +2551,15 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against the process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
+    // Follow the final symlink like Linux execve().
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     log::info!("[p{}] execve({})", crate::process::current_pid(), name);
@@ -4078,12 +4084,12 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 /// Copies one byte at a time to handle page boundaries gracefully.
 /// Returns the UTF-8 string on success, or `None` if the pointer is invalid,
 /// the string exceeds `buf.len()`, or the bytes are not valid UTF-8.
-fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
+fn read_user_cstr<const N: usize>(ptr: u64, buf: &mut [u8; N]) -> Option<&str> {
     if ptr == 0 {
         return None;
     }
     let mut len = 0usize;
-    while len < 512 {
+    while len < buf.len() {
         let mut b = [0u8; 1];
         let addr = ptr.checked_add(len as u64)?;
         if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
@@ -5397,6 +5403,23 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
+    if abs_path == "/dev" {
+        return Some((0, 0, 0o755));
+    }
+    if abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/tty"
+        || abs_path == "/dev/ptmx"
+        || abs_path.starts_with("/dev/pts/")
+    {
+        return Some((0, 0, 0o666));
+    }
+    if abs_path == "/" || abs_path == "/tmp" {
+        return Some((0, 0, 0o755));
+    }
     // ext2 root filesystem — check for any path.
     if let Some(rel) = ext2_root_path(abs_path)
         && crate::fs::ext2::is_mounted()
@@ -5406,9 +5429,6 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = abs_path.strip_prefix("/data/") {
         return data_file_metadata(rel);
-    }
-    if abs_path == "/" || abs_path == "/tmp" || abs_path.starts_with("/dev") {
-        return Some((0, 0, 0o755));
     }
     None
 }
@@ -6408,8 +6428,14 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
 
     // Phase 27: Execute (search) permission on target directory.
     if let Some((fu, fg, fm)) = path_metadata(&resolved) {
@@ -6934,7 +6960,7 @@ fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> u64 {
 }
 
 fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
-    let mut target_buf = [0u8; 512];
+    let mut target_buf = [0u8; 4096];
     let target = match read_user_cstr(target_ptr, &mut target_buf) {
         Some(s) => s,
         None => return NEG_EFAULT,
@@ -7020,6 +7046,9 @@ fn sys_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 }
 
 fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_len == 0 {
+        return NEG_EINVAL;
+    }
     let mut path_buf = [0u8; 512];
     let raw_path = match read_user_cstr(path_ptr, &mut path_buf) {
         Some(s) => s,
@@ -7271,9 +7300,15 @@ fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    // mkdir() should resolve parent symlinks but operate on the lexical basename.
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
@@ -7464,9 +7499,15 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    // unlink() should resolve parent symlinks but unlink the lexical final component.
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
@@ -7611,11 +7652,23 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve both paths against current process's working directory.
-    let cwd = current_cwd();
     let old_str_raw = core::str::from_utf8(&old_owned[..old_len]).unwrap();
-    let old_resolved = resolve_path(&cwd, old_str_raw);
-    let new_resolved = resolve_path(&cwd, new_raw);
+    let old_lexical = match resolve_path_from_dirfd(AT_FDCWD, old_str_raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_lexical = match resolve_path_from_dirfd(AT_FDCWD, new_raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let old_resolved = match resolve_parent_components(&old_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_resolved = match resolve_parent_components(&new_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
 
     // Phase 27: Write+execute permission on both parent directories.
     {
