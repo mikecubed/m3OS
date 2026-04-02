@@ -91,12 +91,6 @@ pub fn signal_eof() {
     STDIN_WAITQUEUE.wake_all();
 }
 
-/// Register the current task on stdin's wait queue (for poll/select/epoll).
-#[allow(dead_code)]
-pub fn register_waiter() {
-    STDIN_WAITQUEUE.sleep();
-}
-
 /// Flush (discard) all pending stdin data.
 pub fn flush() {
     let mut s = STDIN.lock();

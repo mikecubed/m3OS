@@ -8561,9 +8561,14 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             }
         }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
-            // Only report POLLIN for read readiness; write readiness depends
-            // on whether the FD was opened for writing (handled by caller).
-            if crate::stdin::has_data() { POLLIN } else { 0 }
+            let mut revents: i16 = 0;
+            if entry.readable && crate::stdin::has_data() {
+                revents |= POLLIN;
+            }
+            if entry.writable {
+                revents |= POLLOUT;
+            }
+            revents
         }
         FdBackend::Socket { handle } => {
             let h = *handle;
@@ -8814,7 +8819,10 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         if ready_count > 0 || timeout_i == 0 || timed_out {
             // Write results back to userspace.
             for i in 0..nfds {
-                let base = fds_ptr + (i * 8) as u64;
+                let base = match fds_ptr.checked_add((i * 8) as u64) {
+                    Some(a) => a,
+                    None => return NEG_EFAULT,
+                };
                 if crate::mm::user_mem::copy_to_user(base, &pfds[i]).is_err() {
                     return NEG_EFAULT;
                 }
@@ -8946,8 +8954,9 @@ fn sys_select(
     };
 
     // Parse timeout: NULL = block indefinitely, {0,0} = non-blocking poll.
-    let blocking = if timeout_ptr == 0 {
-        true // block indefinitely
+    // timeout_ms: None = block indefinitely, Some(0) = non-blocking, Some(n) = ms deadline.
+    let timeout_ms: Option<u64> = if timeout_ptr == 0 {
+        None // block indefinitely
     } else {
         let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
         if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
@@ -8955,11 +8964,16 @@ fn sys_select(
         }
         let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
         let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
-        sec != 0 || usec != 0
+        Some((sec.max(0) as u64) * 1000 + (usec.max(0) as u64) / 1000)
     };
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = timeout_ms
+        .filter(|&ms| ms > 0)
+        .map(|ms| start_tick + ms.div_ceil(10));
+    let nonblocking = timeout_ms == Some(0);
 
     let combined = read_mask | write_mask | except_mask;
-    if combined == 0 && !blocking {
+    if combined == 0 && nonblocking {
         // No FDs and non-blocking → return immediately.
         return 0;
     }
@@ -9003,7 +9017,9 @@ fn sys_select(
 
         let total = (r_out.count_ones() + w_out.count_ones() + e_out.count_ones()) as u64;
 
-        if total > 0 || !blocking {
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if total > 0 || nonblocking || timed_out {
             // Write results back.
             if let Err(e) = write_fd_set(readfds_ptr, r_out) {
                 return e;
@@ -9085,38 +9101,26 @@ fn sys_pselect6(
     exceptfds_ptr: u64,
     timeout_ptr: u64,
 ) -> u64 {
-    // pselect6 uses timespec {tv_sec, tv_nsec} instead of timeval {tv_sec, tv_usec}.
-    // Both are 16 bytes on x86_64. We convert to the same blocking decision.
-    // The 6th arg (sigmask) is on the stack and we ignore it.
-    let adjusted_timeout_ptr = if timeout_ptr != 0 {
-        // Read timespec and check for zero.
+    // pselect6 uses timespec {tv_sec, tv_nsec}. Convert to timeval {tv_sec, tv_usec}
+    // in-place so select() can parse it with its existing timeval logic.
+    // The 6th arg (sigmask) is ignored (no signal masking yet).
+    if timeout_ptr != 0 {
         let mut ts = [0u8; 16];
         if crate::mm::user_mem::copy_from_user(&mut ts, timeout_ptr).is_err() {
             return NEG_EFAULT;
         }
         let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
         let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
-        if sec == 0 && nsec == 0 {
-            // Create a zero timeval on the kernel stack to pass through.
-            // We cheat: reuse the same pointer since select checks {0,0}.
-            timeout_ptr
-        } else {
-            // Non-zero timeout: pass as blocking.
-            // We pass 0 (NULL) to mean "block indefinitely" to reuse select logic,
-            // but timespec blocking with actual timeout would need timer support.
-            // For now, treat any non-zero timeout as blocking.
-            0 // NULL → block indefinitely
+        // Convert timespec → timeval: usec = nsec / 1000
+        let usec = nsec / 1000;
+        let mut tv = [0u8; 16];
+        tv[0..8].copy_from_slice(&sec.to_ne_bytes());
+        tv[8..16].copy_from_slice(&usec.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(timeout_ptr, &tv).is_err() {
+            return NEG_EFAULT;
         }
-    } else {
-        0 // NULL → block indefinitely
-    };
-    sys_select(
-        nfds,
-        readfds_ptr,
-        writefds_ptr,
-        exceptfds_ptr,
-        adjusted_timeout_ptr,
-    )
+    }
+    sys_select(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ptr)
 }
 
 // ---------------------------------------------------------------------------
@@ -9236,7 +9240,7 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         return NEG_EBADF;
     }
 
-    // Read epoll_event from userspace: { events: u32, padding: u32, data: u64 }
+    // Read epoll_event from userspace: packed { events: u32, data: u64 } = 12 bytes
     let (events, data) = if op != EPOLL_CTL_DEL {
         if event_ptr == 0 {
             return NEG_EFAULT;
@@ -9349,7 +9353,7 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
                 // Also report unconditional events.
                 let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
                 if matched != 0 || unconditional != 0 {
-                    // Write epoll_event to userspace: { events: u32, padding: u32, data: u64 }
+                    // Write epoll_event to userspace: packed { events: u32, data: u64 } = 12 bytes
                     let base = events_ptr + (out_count * 12) as u64;
                     let ev_out = (matched | unconditional).to_ne_bytes();
                     let data_out = interest.data.to_ne_bytes();
@@ -9374,16 +9378,31 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             return NEG_EINTR;
         }
 
+        // If the interest list is empty, there's nothing to wait on.
+        // Return 0 immediately rather than blocking forever.
+        if interests.is_empty() {
+            return 0;
+        }
+
         // Block on each monitored FD's wait queue so we wake on events.
         let task_id = match crate::task::scheduler::current_task_id() {
             Some(id) => id,
             None => return NEG_EINTR,
         };
         let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut registered_any = false;
         for interest in &interests {
             if let Some(entry) = current_fd_entry(interest.fd) {
                 fd_register_waiter(&entry, task_id, &woken);
+                registered_any = true;
             }
+        }
+
+        // If no pollable FDs were registered, yield once to avoid infinite blocking.
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
         }
 
         // Re-check readiness after registration (TOCTOU).

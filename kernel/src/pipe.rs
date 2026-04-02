@@ -33,15 +33,6 @@ pub fn wake_pipe(pipe_id: usize) {
     }
 }
 
-/// Register the current task on the given pipe's wait queue (for poll/select/epoll).
-#[allow(dead_code)]
-pub fn register_waiter(pipe_id: usize) {
-    let wqs = PIPE_WAITQUEUES.lock();
-    if let Some(Some(wq)) = wqs.get(pipe_id) {
-        wq.sleep();
-    }
-}
-
 /// Allocate a new pipe and return its ID.
 ///
 /// The pipe is created with `reader_count=0, writer_count=0`.

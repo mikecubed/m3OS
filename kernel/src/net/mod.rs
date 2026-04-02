@@ -127,14 +127,6 @@ pub fn wake_socket(handle: SocketHandle) {
     }
 }
 
-/// Register the current task on a socket's wait queue (for poll/select/epoll).
-#[allow(dead_code)]
-pub fn register_socket_waiter(handle: SocketHandle) {
-    if (handle as usize) < MAX_SOCKETS {
-        SOCKET_WAITQUEUES[handle as usize].sleep();
-    }
-}
-
 /// Allocate a new socket entry. Returns the handle (index) or None if full.
 pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<SocketHandle> {
     let mut table = SOCKET_TABLE.lock();

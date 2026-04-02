@@ -42,22 +42,6 @@ pub fn wake_slave(id: u32) {
     }
 }
 
-/// Register the current task on a PTY master's wait queue.
-#[allow(dead_code)]
-pub fn register_master_waiter(id: u32) {
-    if (id as usize) < MAX_PTYS {
-        PTY_MASTER_WQ[id as usize].sleep();
-    }
-}
-
-/// Register the current task on a PTY slave's wait queue.
-#[allow(dead_code)]
-pub fn register_slave_waiter(id: u32) {
-    if (id as usize) < MAX_PTYS {
-        PTY_SLAVE_WQ[id as usize].sleep();
-    }
-}
-
 /// Allocate a new PTY pair. Returns the PTY ID (index) or `Err(())` if full.
 pub fn alloc_pty() -> Result<u32, ()> {
     let mut table = PTY_TABLE.lock();
