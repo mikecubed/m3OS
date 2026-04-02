@@ -2543,6 +2543,51 @@ fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
     None
 }
 
+fn seed_pseudorandom_state() -> u64 {
+    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
+    if state == 0 {
+        state = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    state
+}
+
+fn fill_pseudorandom_bytes(state: &mut u64, out: &mut [u8]) {
+    for byte in out.iter_mut() {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+    }
+}
+
+fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(), ()> {
+    let chunk = [byte; 256];
+    let mut written = 0usize;
+    while written < count {
+        let len = (count - written).min(chunk.len());
+        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+            return Err(());
+        }
+        written += len;
+    }
+    Ok(())
+}
+
+fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
+    let mut state = seed_pseudorandom_state();
+    let mut chunk = [0u8; 256];
+    let mut written = 0usize;
+    while written < count {
+        let len = (count - written).min(chunk.len());
+        fill_pseudorandom_bytes(&mut state, &mut chunk[..len]);
+        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+            return Err(());
+        }
+        written += len;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
@@ -2760,32 +2805,17 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
         FdBackend::DevZero | FdBackend::DevFull => {
-            // /dev/zero and /dev/full: fill buffer with zero bytes.
-            let capped = (count as usize).min(4096);
-            let zeroes = alloc::vec![0u8; capped];
-            if crate::mm::user_mem::copy_to_user(buf_ptr, &zeroes).is_err() {
+            // /dev/zero and /dev/full behave like infinite zero-filled files.
+            if copy_byte_pattern_to_user(buf_ptr, count as usize, 0).is_err() {
                 return NEG_EFAULT;
             }
-            capped as u64
+            count
         }
         FdBackend::DevUrandom => {
-            // /dev/urandom: fill buffer with PRNG bytes (reuses getrandom logic).
-            let capped = (count as usize).min(4096);
-            let mut out = alloc::vec![0u8; capped];
-            let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
-            if state == 0 {
-                state = 0xDEAD_BEEF_CAFE_BABE;
-            }
-            for byte in out.iter_mut() {
-                state ^= state >> 12;
-                state ^= state << 25;
-                state ^= state >> 27;
-                *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
-            }
-            if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+            if copy_pseudorandom_to_user(buf_ptr, count as usize).is_err() {
                 return NEG_EFAULT;
             }
-            capped as u64
+            count
         }
         FdBackend::PtyMaster { pty_id } => {
             if count == 0 {
@@ -7463,17 +7493,8 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
     let actual = len.min(256);
     let mut out = [0u8; 256];
 
-    // Simple xorshift64* PRNG seeded from TSC.
-    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
-    }
-    for byte in out[..actual].iter_mut() {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
-    }
+    let mut state = seed_pseudorandom_state();
+    fill_pseudorandom_bytes(&mut state, &mut out[..actual]);
 
     if crate::mm::user_mem::copy_to_user(buf_ptr, &out[..actual]).is_err() {
         return NEG_EFAULT;
