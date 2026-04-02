@@ -74,6 +74,7 @@ const TMPFS_TOTAL_BLOCKS: u64 =
 const TMPFS_TOTAL_FILES: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_BLOCKS: u64 = 1024;
 const VIRTUAL_FS_DEFAULT_FILES: u64 = 1024;
+static MOUNT_OP_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 #[repr(C)]
 struct Statfs {
@@ -411,6 +412,7 @@ fn resolve_create_path(lexical: &str, follow_final: bool) -> Result<alloc::strin
 }
 
 fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 {
+    let _mount_guard = MOUNT_OP_LOCK.lock();
     if raw_path.is_empty() {
         return NEG_ENOENT;
     }
@@ -1096,6 +1098,7 @@ pub extern "C" fn syscall_handler(
         158 => sys_linux_arch_prctl(arg0, arg1),
         // Phase 24: mount(source, target, fstype)
         165 => sys_linux_mount(arg0, arg1, arg2),
+        166 => sys_linux_umount2(arg0, arg1),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
         186 => sys_gettid(),
         // Phase 40: tkill(tid, sig) — send signal to a specific thread
@@ -2821,23 +2824,10 @@ fn read_user_string_array(
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Read the filename as a null-terminated C string.
     let mut name_cstr = [0u8; 512];
-    let name = match read_user_cstr(path_ptr, &mut name_cstr) {
+    let raw_name = match read_user_cstr(path_ptr, &mut name_cstr) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-
-    // Follow the final symlink like Linux execve().
-    let lexical = match resolve_path_from_dirfd(AT_FDCWD, name) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let resolved = match resolve_existing_fs_path(&lexical, true) {
-        Ok(path) => path,
-        Err(err) => return err,
-    };
-    let name: &str = &resolved;
-
-    log::info!("[p{}] execve({})", crate::process::current_pid(), name);
 
     // Parse argv and envp from user memory.
     let user_argv = match read_user_string_array(argv_ptr, 256) {
@@ -2849,31 +2839,47 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Err(()) => return NEG_EFAULT,
     };
 
-    // Phase 27: Execute permission check.
-    if let Some((fu, fg, fm)) = path_metadata(name) {
-        let (_, _, euid, egid) = current_process_ids();
-        if !check_permission(fu, fg, fm, euid, egid, 1) {
-            return NEG_EACCES;
-        }
-    }
+    let (resolved_name, exec_owned, exec_static) = {
+        let _mount_guard = MOUNT_OP_LOCK.lock();
 
-    // Read the binary from the ramdisk first; fall back to disk filesystems.
-    let disk_buf: alloc::vec::Vec<u8>;
-    let data: &[u8] = match crate::fs::ramdisk::get_file(name) {
-        Some(d) => d,
-        None => {
-            // Phase 31: try ext2, FAT32, and tmpfs before giving up.
-            match read_file_from_disk(name) {
-                Ok(buf) => {
-                    disk_buf = buf;
-                    &disk_buf
-                }
-                Err(errno) => {
-                    log::warn!("[execve] file not found or rejected: {}", name);
-                    return errno;
+        // Follow the final symlink like Linux execve().
+        let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+        let resolved = match resolve_existing_fs_path(&lexical, true) {
+            Ok(path) => path,
+            Err(err) => return err,
+        };
+
+        // Phase 27: Execute permission check.
+        if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+            let (_, _, euid, egid) = current_process_ids();
+            if !check_permission(fu, fg, fm, euid, egid, 1) {
+                return NEG_EACCES;
+            }
+        }
+
+        match crate::fs::ramdisk::get_file(&resolved) {
+            Some(data) => (resolved, None, Some(data)),
+            None => {
+                // Phase 31: try ext2, FAT32, and tmpfs before giving up.
+                match read_file_from_disk(&resolved) {
+                    Ok(buf) => (resolved, Some(buf), None),
+                    Err(errno) => {
+                        log::warn!("[execve] file not found or rejected: {}", resolved);
+                        return errno;
+                    }
                 }
             }
         }
+    };
+    let name: &str = &resolved_name;
+    log::info!("[p{}] execve({})", crate::process::current_pid(), name);
+    let data: &[u8] = match (exec_static, exec_owned.as_deref()) {
+        (Some(data), None) => data,
+        (None, Some(data)) => data,
+        _ => return NEG_EIO,
     };
 
     // Allocate a fresh page table for the new image.
@@ -3603,9 +3609,17 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             });
             to_read as u64
         }
-        FdBackend::Proc { path } => {
-            let Some(data) = crate::fs::procfs::read_file(path) else {
-                return NEG_ENOENT;
+        FdBackend::Proc { path, snapshot } => {
+            let generated;
+            let data: &[u8] = match snapshot.as_deref() {
+                Some(data) => data,
+                None => {
+                    generated = match crate::fs::procfs::read_file(path) {
+                        Some(data) => data,
+                        None => return NEG_ENOENT,
+                    };
+                    &generated
+                }
             };
             let offset = entry.offset.min(data.len());
             let to_read = (count as usize).min(data.len().saturating_sub(offset));
@@ -4910,6 +4924,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         let entry = FdEntry {
             backend: FdBackend::Proc {
                 path: alloc::string::String::from(name),
+                snapshot: (name == "/proc/kmsg").then(crate::fs::procfs::render_kmsg_bytes),
             },
             offset: 0,
             readable: true,
@@ -5614,7 +5629,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
             (0x2000 | 0o666, 0, 0, 0, 0)
         }
-        FdBackend::Proc { path } => {
+        FdBackend::Proc { path, .. } => {
             let Some(st) = crate::fs::procfs::stat(path) else {
                 return NEG_ENOENT;
             };
@@ -6870,6 +6885,7 @@ fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_chdir(path_ptr: u64) -> u64 {
+    let _mount_guard = MOUNT_OP_LOCK.lock();
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8165,6 +8181,7 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
+    let _mount_guard = MOUNT_OP_LOCK.lock();
     let mut buf_target = [0u8; 512];
     let target = match read_user_cstr(target_ptr, &mut buf_target) {
         Some(s) => s,
@@ -8249,6 +8266,90 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
                 NEG_EIO
             }
         }
+    }
+}
+
+fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
+    let _mount_guard = MOUNT_OP_LOCK.lock();
+    if flags != 0 {
+        return NEG_EINVAL;
+    }
+
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
+
+    let mut buf_target = [0u8; 512];
+    let target = match read_user_cstr(target_ptr, &mut buf_target) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let cwd = current_cwd();
+    let resolved_target = resolve_path(&cwd, target);
+    if resolved_target != "/" && resolved_target != "/data" {
+        return NEG_EINVAL;
+    }
+
+    let table = crate::process::PROCESS_TABLE.lock();
+    let busy = table.iter().any(|proc| {
+        mount_contains_path(&resolved_target, &proc.cwd)
+            || proc
+                .fd_table
+                .iter()
+                .flatten()
+                .any(|entry| mount_holds_fd(&resolved_target, &entry.backend))
+    });
+    drop(table);
+    if busy {
+        return (-16_i64) as u64;
+    }
+
+    match resolved_target.as_str() {
+        "/" => {
+            if !crate::fs::ext2::is_mounted() {
+                return NEG_EINVAL;
+            }
+            crate::fs::ext2::unmount_ext2();
+        }
+        "/data" => {
+            if !crate::fs::fat32::is_mounted() {
+                return NEG_EINVAL;
+            }
+            crate::fs::fat32::unmount_fat32();
+        }
+        _ => return NEG_EINVAL,
+    }
+
+    log::info!("[mount] unmounted {}", resolved_target);
+    0
+}
+
+fn mount_contains_path(target: &str, path: &str) -> bool {
+    match target {
+        "/" => {
+            if path == "/tmp"
+                || path.starts_with("/tmp/")
+                || path == "/proc"
+                || path.starts_with("/proc/")
+                || path == "/dev"
+                || path.starts_with("/dev/")
+            {
+                return false;
+            }
+            crate::fs::ramdisk::ramdisk_lookup(path).is_none()
+        }
+        "/data" => path == "/data" || path.starts_with("/data/"),
+        _ => false,
+    }
+}
+
+fn mount_holds_fd(target: &str, backend: &FdBackend) -> bool {
+    match (target, backend) {
+        ("/", FdBackend::Ext2Disk { .. }) | ("/data", FdBackend::Fat32Disk { .. }) => true,
+        (_, FdBackend::Dir { path }) => mount_contains_path(target, path),
+        _ => false,
     }
 }
 

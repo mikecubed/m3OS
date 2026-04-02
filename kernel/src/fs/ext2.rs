@@ -1400,6 +1400,10 @@ pub fn is_mounted() -> bool {
     EXT2_VOLUME.lock().is_some()
 }
 
+pub fn unmount_ext2() {
+    *EXT2_VOLUME.lock() = None;
+}
+
 /// Get uid/gid/mode for an ext2 file by its root-relative path.
 /// Returns `None` if the file is not found or the volume is not mounted.
 pub fn get_ext2_meta(path: &str) -> Option<(u32, u32, u16)> {

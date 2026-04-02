@@ -6,6 +6,7 @@ pub mod buddy;
 pub mod fb;
 pub mod fs;
 pub mod ipc;
+pub mod log_ring;
 pub mod net;
 pub mod pipe;
 pub mod pty;

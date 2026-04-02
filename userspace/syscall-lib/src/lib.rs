@@ -217,6 +217,7 @@ pub const SYS_GETPPID: u64 = 110;
 pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_MOUNT: u64 = 165;
+pub const SYS_UMOUNT2: u64 = 166;
 
 // Phase 27: User identity and file permission syscalls
 pub const SYS_CHMOD: u64 = 90;
@@ -928,6 +929,11 @@ pub fn nanosleep(seconds: u64) -> isize {
 /// Mount a filesystem. Returns 0 on success, negative errno on error.
 pub fn mount(source: *const u8, target: *const u8, fstype: *const u8) -> isize {
     unsafe { syscall3(SYS_MOUNT, source as u64, target as u64, fstype as u64) as isize }
+}
+
+/// Unmount a filesystem. `target` must be null-terminated.
+pub fn umount(target: &[u8]) -> isize {
+    unsafe { syscall2(SYS_UMOUNT2, target.as_ptr() as u64, 0) as isize }
 }
 
 /// Create a socket. Returns fd on success, negative errno on error.
