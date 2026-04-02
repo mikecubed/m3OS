@@ -248,6 +248,12 @@ fn build_musl_bins() {
         ("userspace/coreutils/df.c", "df"),
         ("userspace/coreutils/find.c", "find"),
         ("userspace/coreutils/xargs.c", "xargs"),
+        ("userspace/coreutils/free.c", "free"),
+        ("userspace/coreutils/dmesg.c", "dmesg"),
+        ("userspace/coreutils/mount.c", "mount"),
+        ("userspace/coreutils/umount.c", "umount"),
+        ("userspace/coreutils/kill.c", "kill"),
+        ("userspace/coreutils/ps.c", "ps"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2737,7 +2743,121 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 15. make clean
+    // 15. Phase 41 system tools: ps, free, dmesg, mount, umount, kill
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ps -e\n",
+        label: "ps: list processes",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PID",
+        timeout_secs: 10,
+        label: "verify ps header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ion",
+        timeout_secs: 10,
+        label: "verify ps shell entry",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ps",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/free\n",
+        label: "free: memory summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mem:",
+        timeout_secs: 10,
+        label: "verify free output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after free",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/free -h\n",
+        label: "free: human-readable output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mem:",
+        timeout_secs: 10,
+        label: "verify free -h output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after free -h",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/dmesg\n",
+        label: "dmesg: kernel log snapshot",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "execve(/bin/dmesg)",
+        timeout_secs: 10,
+        label: "verify dmesg output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after dmesg",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/mount\n",
+        label: "mount: list mounts",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify mount output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after mount",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/umount /\n",
+        label: "umount: busy root error",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "busy",
+        timeout_secs: 10,
+        label: "verify umount busy error",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after umount busy",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/kill -l\n",
+        label: "kill: list signals",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TERM",
+        timeout_secs: 10,
+        label: "verify kill -l output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after kill -l",
+    });
+
+    // -----------------------------------------------------------------------
+    // 16. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

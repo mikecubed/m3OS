@@ -114,6 +114,12 @@ static DU_ELF: &[u8] = include_bytes!("../../initrd/du.elf");
 static DF_ELF: &[u8] = include_bytes!("../../initrd/df.elf");
 static FIND_ELF: &[u8] = include_bytes!("../../initrd/find.elf");
 static XARGS_ELF: &[u8] = include_bytes!("../../initrd/xargs.elf");
+static FREE_ELF: &[u8] = include_bytes!("../../initrd/free.elf");
+static DMESG_ELF: &[u8] = include_bytes!("../../initrd/dmesg.elf");
+static MOUNT_ELF: &[u8] = include_bytes!("../../initrd/mount.elf");
+static UMOUNT_ELF: &[u8] = include_bytes!("../../initrd/umount.elf");
+static KILL_ELF: &[u8] = include_bytes!("../../initrd/kill.elf");
+static PS_ELF: &[u8] = include_bytes!("../../initrd/ps.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
@@ -348,6 +354,28 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("find.elf", RamdiskNode::File { content: FIND_ELF }),
     ("xargs", RamdiskNode::File { content: XARGS_ELF }),
     ("xargs.elf", RamdiskNode::File { content: XARGS_ELF }),
+    ("free", RamdiskNode::File { content: FREE_ELF }),
+    ("free.elf", RamdiskNode::File { content: FREE_ELF }),
+    ("dmesg", RamdiskNode::File { content: DMESG_ELF }),
+    ("dmesg.elf", RamdiskNode::File { content: DMESG_ELF }),
+    ("mount", RamdiskNode::File { content: MOUNT_ELF }),
+    ("mount.elf", RamdiskNode::File { content: MOUNT_ELF }),
+    (
+        "umount",
+        RamdiskNode::File {
+            content: UMOUNT_ELF,
+        },
+    ),
+    (
+        "umount.elf",
+        RamdiskNode::File {
+            content: UMOUNT_ELF,
+        },
+    ),
+    ("kill", RamdiskNode::File { content: KILL_ELF }),
+    ("kill.elf", RamdiskNode::File { content: KILL_ELF }),
+    ("ps", RamdiskNode::File { content: PS_ELF }),
+    ("ps.elf", RamdiskNode::File { content: PS_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
@@ -728,6 +756,30 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "xargs.elf",
         content: XARGS_ELF,
+    },
+    FlatFile {
+        name: "free.elf",
+        content: FREE_ELF,
+    },
+    FlatFile {
+        name: "dmesg.elf",
+        content: DMESG_ELF,
+    },
+    FlatFile {
+        name: "mount.elf",
+        content: MOUNT_ELF,
+    },
+    FlatFile {
+        name: "umount.elf",
+        content: UMOUNT_ELF,
+    },
+    FlatFile {
+        name: "kill.elf",
+        content: KILL_ELF,
+    },
+    FlatFile {
+        name: "ps.elf",
+        content: PS_ELF,
     },
 ];
 
