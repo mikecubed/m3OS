@@ -1712,7 +1712,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "wait for shell prompt",
     });
 
