@@ -115,7 +115,7 @@ static SOCKET_TABLE: Mutex<SocketTable> = Mutex::new(SocketTable::new());
 
 /// Per-socket wait queues — woken on data arrival, connection, close, etc.
 #[allow(clippy::declare_interior_mutable_const)]
-static SOCKET_WAITQUEUES: [WaitQueue; MAX_SOCKETS] = {
+pub static SOCKET_WAITQUEUES: [WaitQueue; MAX_SOCKETS] = {
     const WQ: WaitQueue = WaitQueue::new();
     [WQ; MAX_SOCKETS]
 };

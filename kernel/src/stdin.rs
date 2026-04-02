@@ -57,7 +57,7 @@ static STDIN: Mutex<StdinState> = Mutex::new(StdinState::new());
 static EOF_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Wait queue for tasks polling stdin for read readiness (Phase 37).
-static STDIN_WAITQUEUE: WaitQueue = WaitQueue::new();
+pub static STDIN_WAITQUEUE: WaitQueue = WaitQueue::new();
 
 /// Push a byte into stdin (immediately readable by userspace).
 pub fn push_char(c: u8) {

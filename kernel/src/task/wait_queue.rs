@@ -57,6 +57,23 @@ impl WaitQueue {
         }
     }
 
+    /// Register a task on this wait queue without blocking.
+    ///
+    /// Used by poll/select to register on multiple wait queues before
+    /// doing a single block. The caller provides a shared `woken` flag
+    /// so that a wakeup on ANY queue prevents blocking.
+    pub fn register(&self, id: TaskId, woken: &Arc<AtomicBool>) {
+        self.waiters.lock().push_back(WaitEntry {
+            id,
+            woken: Arc::clone(woken),
+        });
+    }
+
+    /// Remove all entries for the given task from this wait queue.
+    pub fn deregister(&self, id: TaskId) {
+        self.waiters.lock().retain(|e| e.id != id);
+    }
+
     /// Wake the first waiting task, if any.
     pub fn wake_one(&self) {
         if let Some(entry) = self.waiters.lock().pop_front() {

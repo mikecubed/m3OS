@@ -23,7 +23,7 @@ static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());
 /// Per-pipe wait queues — indexed by pipe_id, allocated alongside the pipe.
 /// Woken on write (data available to reader), read (space available to writer),
 /// and close (EOF / broken pipe notification).
-static PIPE_WAITQUEUES: Mutex<Vec<Option<WaitQueue>>> = Mutex::new(Vec::new());
+pub static PIPE_WAITQUEUES: Mutex<Vec<Option<WaitQueue>>> = Mutex::new(Vec::new());
 
 /// Wake all tasks waiting on the given pipe.
 pub fn wake_pipe(pipe_id: usize) {

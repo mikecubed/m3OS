@@ -16,14 +16,14 @@ pub static PTY_TABLE: Mutex<[Option<PtyPairState>; MAX_PTYS]> = {
 
 /// Per-PTY wait queues for master side (woken when slave writes data to s2m).
 #[allow(clippy::declare_interior_mutable_const)]
-static PTY_MASTER_WQ: [WaitQueue; MAX_PTYS] = {
+pub static PTY_MASTER_WQ: [WaitQueue; MAX_PTYS] = {
     const WQ: WaitQueue = WaitQueue::new();
     [WQ; MAX_PTYS]
 };
 
 /// Per-PTY wait queues for slave side (woken when master writes data to m2s).
 #[allow(clippy::declare_interior_mutable_const)]
-static PTY_SLAVE_WQ: [WaitQueue; MAX_PTYS] = {
+pub static PTY_SLAVE_WQ: [WaitQueue; MAX_PTYS] = {
     const WQ: WaitQueue = WaitQueue::new();
     [WQ; MAX_PTYS]
 };
