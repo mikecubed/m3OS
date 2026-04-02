@@ -479,3 +479,5 @@ changes discovered during implementation.
   other FDs rather than representing an I/O stream.
 - `accept4()` is a new syscall that wraps the existing `accept()` logic with flag
   support.
+- Timeout support uses tick-based polling (~100 Hz / 10ms granularity) since the
+  kernel does not yet have a proper timer subsystem. Accuracy is within ~10ms.

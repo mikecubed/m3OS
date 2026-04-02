@@ -7351,6 +7351,9 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
         }
         F_SETFL => {
             const O_NONBLOCK: u64 = 0x800;
+            if current_fd_entry(fd as usize).is_none() {
+                return NEG_EBADF;
+            }
             let nonblock = arg & O_NONBLOCK != 0;
             with_current_fd_mut(fd as usize, |slot| {
                 if let Some(e) = slot {
@@ -8536,34 +8539,31 @@ const POLLNVAL: i16 = 0x020;
 fn fd_poll_events(entry: &FdEntry) -> i16 {
     match &entry.backend {
         FdBackend::PipeRead { pipe_id } => {
-            let mut tmp = [0u8; 0];
-            match crate::pipe::pipe_read(*pipe_id, &mut tmp) {
-                Ok(_) => POLLIN | POLLHUP, // EOF — writer closed
-                Err(true) => 0,            // would block
-                Err(false) => POLLIN,      // impossible for read end
+            // Side-effect-free readiness check.
+            match crate::pipe::pipe_read_ready(*pipe_id) {
+                Some(true) => {
+                    if crate::pipe::pipe_read_eof(*pipe_id) {
+                        POLLIN | POLLHUP // EOF — writer closed, buffer empty
+                    } else {
+                        POLLIN // data available
+                    }
+                }
+                Some(false) => 0, // would block
+                None => POLLHUP,  // pipe gone
             }
         }
         FdBackend::PipeWrite { pipe_id } => {
-            let mut revents: i16 = 0;
-            // Check if reader closed (EPIPE → POLLERR).
-            let tmp = [0u8; 0];
-            match crate::pipe::pipe_write(*pipe_id, &tmp) {
-                Ok(_) => revents |= POLLOUT,
-                Err(false) => revents |= POLLERR | POLLHUP, // reader closed
-                Err(true) => {}                             // full but reader alive
+            // Side-effect-free writability check.
+            match crate::pipe::pipe_write_ready(*pipe_id) {
+                Some(true) => POLLOUT,     // writable
+                Some(false) => 0,          // full but reader alive
+                None => POLLERR | POLLHUP, // reader closed (EPIPE)
             }
-            // Also check if pipe has space for writing.
-            if revents == 0 {
-                // Pipe is full but reader is alive — not writable.
-            }
-            revents
         }
         FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
-            let mut revents: i16 = POLLOUT; // stdout always writable
-            if crate::stdin::has_data() {
-                revents |= POLLIN;
-            }
-            revents
+            // Only report POLLIN for read readiness; write readiness depends
+            // on whether the FD was opened for writing (handled by caller).
+            if crate::stdin::has_data() { POLLIN } else { 0 }
         }
         FdBackend::Socket { handle } => {
             let h = *handle;
@@ -8753,6 +8753,13 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
+    // Convert ms timeout to tick deadline. ~100 Hz timer → 10ms/tick.
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = if timeout_i > 0 {
+        Some(start_tick + (timeout_i as u64).div_ceil(10)) // round up
+    } else {
+        None // 0 = non-blocking, -1 = indefinite
+    };
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
 
@@ -8801,8 +8808,10 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             pfds[i][6..8].copy_from_slice(&revents.to_ne_bytes());
         }
 
-        // Fast path: something ready or non-blocking poll.
-        if ready_count > 0 || timeout_i == 0 {
+        // Fast path: something ready, non-blocking poll, or timeout expired.
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if ready_count > 0 || timeout_i == 0 || timed_out {
             // Write results back to userspace.
             for i in 0..nfds {
                 let base = fds_ptr + (i * 8) as u64;
@@ -8828,6 +8837,31 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             if let Some(entry) = &entries[i] {
                 fd_register_waiter(entry, task_id, &woken);
             }
+        }
+
+        // Re-check readiness after registration to close the TOCTOU window.
+        // If an event arrived between the first scan and registration, the
+        // woken flag may not be set, so we must re-scan before blocking.
+        let mut any_ready = false;
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i] {
+                let events = i16::from_ne_bytes([pfds[i][4], pfds[i][5]]);
+                let ready = fd_poll_events(entry);
+                if (ready & events) != 0 || (ready & (POLLHUP | POLLERR)) != 0 {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+
+        if any_ready {
+            // Something became ready — deregister and re-scan on next loop iteration.
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            continue;
         }
 
         // Block — woken when any FD's wait queue fires.
@@ -8860,8 +8894,13 @@ fn read_fd_set(ptr: u64, nfds: usize) -> Result<u32, u64> {
         return Err(NEG_EFAULT);
     }
     let mask = u32::from_ne_bytes(buf);
-    // Clear bits beyond nfds.
-    Ok(mask & ((1u32 << nfds.min(32)) - 1))
+    // Clear bits beyond nfds. Handle nfds >= 32 without shift overflow.
+    let keep = if nfds >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << nfds) - 1
+    };
+    Ok(mask & keep)
 }
 
 /// Write an fd_set bitmap back to userspace.
@@ -8995,6 +9034,34 @@ fn sys_select(
                 fd_register_waiter(entry, task_id, &woken);
             }
         }
+
+        // Re-check readiness after registration to close the TOCTOU window.
+        let mut any_ready = false;
+        for fd in 0..nfds {
+            if let Some(entry) = &entries[fd]
+                && combined & (1 << fd) != 0
+            {
+                let ready = fd_poll_events(entry);
+                if (ready & POLLIN) != 0
+                    || (ready & POLLOUT) != 0
+                    || (ready & (POLLHUP | POLLERR)) != 0
+                {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+        if any_ready {
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            continue;
+        }
+
         crate::task::scheduler::block_current_unless_woken(&woken);
         restore_caller_context(pid, saved_user_rsp);
         for fd in 0..nfds {
@@ -9238,6 +9305,12 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = if timeout_i > 0 {
+        Some(start_tick + (timeout_i as u64).div_ceil(10))
+    } else {
+        None
+    };
 
     let epfd_idx = epfd as usize;
     if epfd_idx >= MAX_FDS {
@@ -9291,7 +9364,9 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             }
         }
 
-        if out_count > 0 || timeout_i == 0 {
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if out_count > 0 || timeout_i == 0 || timed_out {
             return out_count as u64;
         }
 
@@ -9299,8 +9374,7 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             return NEG_EINTR;
         }
 
-        // Block on the epoll instance's wait queue.
-        // Also register on each monitored FD's wait queue so we wake on events.
+        // Block on each monitored FD's wait queue so we wake on events.
         let task_id = match crate::task::scheduler::current_task_id() {
             Some(id) => id,
             None => return NEG_EINTR,
@@ -9311,6 +9385,28 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
                 fd_register_waiter(&entry, task_id, &woken);
             }
         }
+
+        // Re-check readiness after registration (TOCTOU).
+        let mut any_ready = false;
+        for interest in &interests {
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                let ready = fd_poll_events(&entry);
+                let ready_u32 = ready as u16 as u32;
+                if (ready_u32 & interest.events) != 0 || (ready_u32 & (EPOLLHUP | EPOLLERR)) != 0 {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+        if any_ready {
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
+            }
+            continue;
+        }
+
         crate::task::scheduler::block_current_unless_woken(&woken);
         restore_caller_context(pid, saved_user_rsp);
         for interest in &interests {

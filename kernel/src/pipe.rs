@@ -80,6 +80,41 @@ pub fn free_pipe(pipe_id: usize) {
     }
 }
 
+/// Side-effect-free readiness probe for the read end of a pipe.
+/// Returns: `Some(true)` = data or EOF available, `Some(false)` = would block, `None` = pipe gone.
+pub fn pipe_read_ready(pipe_id: usize) -> Option<bool> {
+    let table = PIPE_TABLE.lock();
+    let pipe = table.get(pipe_id)?.as_ref()?;
+    if !pipe.is_empty() || !pipe.has_writer() {
+        Some(true) // data available or EOF
+    } else {
+        Some(false) // would block
+    }
+}
+
+/// Side-effect-free check: does the pipe read end see EOF (writer closed, buffer empty)?
+pub fn pipe_read_eof(pipe_id: usize) -> bool {
+    let table = PIPE_TABLE.lock();
+    match table.get(pipe_id).and_then(|s| s.as_ref()) {
+        Some(pipe) => pipe.is_empty() && !pipe.has_writer(),
+        None => true,
+    }
+}
+
+/// Side-effect-free readiness probe for the write end of a pipe.
+/// Returns: `Some(true)` = space available, `Some(false)` = full, `None` = reader closed / pipe gone.
+pub fn pipe_write_ready(pipe_id: usize) -> Option<bool> {
+    let table = PIPE_TABLE.lock();
+    let pipe = table.get(pipe_id)?.as_ref()?;
+    if !pipe.has_reader() {
+        None // EPIPE — reader closed
+    } else if pipe.is_full() {
+        Some(false) // full
+    } else {
+        Some(true) // writable
+    }
+}
+
 /// Increment the reader ref-count (called by fork/dup2 when cloning a PipeRead FD).
 pub fn pipe_add_reader(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();

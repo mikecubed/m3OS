@@ -231,30 +231,42 @@ where
 /// Wake all sockets that reference a given TCP connection slot.
 /// Called from the TCP handler after processing an incoming segment.
 pub fn wake_sockets_for_tcp_slot(tcp_idx: usize) {
-    let table = SOCKET_TABLE.lock();
-    for (i, slot) in table.entries.iter().enumerate() {
-        if let Some(entry) = slot
-            && entry.tcp_slot == Some(tcp_idx)
-        {
-            drop(table);
-            wake_socket(i as SocketHandle);
-            return;
+    let mut handles = [0u32; MAX_SOCKETS];
+    let mut count = 0;
+    {
+        let table = SOCKET_TABLE.lock();
+        for (i, slot) in table.entries.iter().enumerate() {
+            if let Some(entry) = slot
+                && entry.tcp_slot == Some(tcp_idx)
+            {
+                handles[count] = i as u32;
+                count += 1;
+            }
         }
+    }
+    for h in &handles[..count] {
+        wake_socket(*h);
     }
 }
 
 /// Wake all sockets bound to a given UDP port.
 /// Called from the UDP handler after receiving a datagram.
 pub fn wake_sockets_for_udp_port(port: u16) {
-    let table = SOCKET_TABLE.lock();
-    for (i, slot) in table.entries.iter().enumerate() {
-        if let Some(entry) = slot
-            && entry.protocol == SocketProtocol::Udp
-            && entry.local_port == port
-        {
-            drop(table);
-            wake_socket(i as SocketHandle);
-            return;
+    let mut handles = [0u32; MAX_SOCKETS];
+    let mut count = 0;
+    {
+        let table = SOCKET_TABLE.lock();
+        for (i, slot) in table.entries.iter().enumerate() {
+            if let Some(entry) = slot
+                && entry.protocol == SocketProtocol::Udp
+                && entry.local_port == port
+            {
+                handles[count] = i as u32;
+                count += 1;
+            }
         }
+    }
+    for h in &handles[..count] {
+        wake_socket(*h);
     }
 }

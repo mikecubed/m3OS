@@ -137,17 +137,22 @@ sleep/wake primitives.
 
 A new `FdBackend::Epoll { instance_id }` variant. The kernel maintains a global
 table of `EpollInstance` structs. Each instance tracks its interest set and a
-ready list. When a monitored FD becomes ready, it pushes an event onto the epoll's
-ready list and wakes any task blocked in `epoll_wait()`.
+interest list. `epoll_wait()` scans the interest list for current readiness
+(level-triggered), registers on monitored FDs' wait queues, and blocks until
+an event occurs. There is no separate ready list — readiness is always
+re-evaluated at scan time using `fd_poll_events()`.
 
 ### Improved `sys_poll()` Flow
 
 The rewritten poll replaces the yield loop with proper blocking:
 1. Scan all fds for immediate readiness (fast path).
-2. If none ready, register the calling task on each fd's wait queue.
-3. Block via `WaitQueue::sleep()`.
-4. On wakeup, re-scan and return ready fds.
-5. Deregister from all wait queues before returning.
+2. If none ready, register the calling task on each fd's wait queue via
+   `WaitQueue::register()` (non-blocking registration).
+3. Re-check readiness after registration (closes the TOCTOU window).
+4. Block via `scheduler::block_current_unless_woken()` with a shared atomic
+   woken flag.
+5. On wakeup, deregister from all wait queues and re-scan.
+6. Return ready fds or loop if timeout has not expired.
 
 ## How This Builds on Earlier Phases
 
