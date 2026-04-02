@@ -796,15 +796,31 @@ pub fn sys_sched_setaffinity(pid: u32, mask: u64) -> i64 {
         }
     };
     sched.tasks[idx].affinity_mask = effective;
-    // If currently assigned to a disallowed core, reassign.
-    let current_core = sched.tasks[idx].assigned_core;
-    if effective & (1u64 << current_core) == 0 {
+    // If currently assigned to a disallowed core, reassign and migrate.
+    let old_core = sched.tasks[idx].assigned_core;
+    if effective & (1u64 << old_core) == 0 {
         // Find first allowed core.
+        let mut new_core = old_core;
         for c in 0..64u8 {
             if effective & (1u64 << c) != 0 {
-                sched.tasks[idx].assigned_core = c;
+                new_core = c;
                 break;
             }
+        }
+        sched.tasks[idx].assigned_core = new_core;
+        // If the task is Ready, migrate it from the old core's run queue to the
+        // new core's queue so pick_next doesn't drop it as ineligible.
+        if new_core != old_core && sched.tasks[idx].state == TaskState::Ready {
+            // Remove from old queue (if present).
+            if let Some(old_data) = crate::smp::get_core_data(old_core) {
+                let mut q = old_data.run_queue.lock();
+                if let Some(pos) = q.iter().position(|&i| i == idx) {
+                    q.remove(pos);
+                }
+            }
+            drop(sched);
+            enqueue_to_core(new_core, idx);
+            return 0;
         }
     }
     0
