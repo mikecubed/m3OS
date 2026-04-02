@@ -6,12 +6,10 @@ use alloc::{string::String, vec::Vec};
 use core::fmt::Write;
 
 use crate::{
-    arch::x86_64::interrupts::tick_count,
+    arch::x86_64::{interrupts::tick_count, syscall::TICKS_PER_SEC},
     mm::frame_allocator,
     process::{FdBackend, MemoryMapping, PROCESS_TABLE, ProcessState, current_pid},
 };
-
-const PROCFS_TICKS_PER_SEC: u64 = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcfsNode {
@@ -312,8 +310,8 @@ fn render_stat() -> String {
 
 fn render_uptime() -> String {
     let ticks = tick_count();
-    let secs = ticks / PROCFS_TICKS_PER_SEC;
-    let centis = (ticks % PROCFS_TICKS_PER_SEC) * 100 / PROCFS_TICKS_PER_SEC;
+    let secs = ticks / TICKS_PER_SEC;
+    let centis = (ticks % TICKS_PER_SEC) * 100 / TICKS_PER_SEC;
     alloc::format!("{secs}.{centis:02} {secs}.{centis:02}\n")
 }
 

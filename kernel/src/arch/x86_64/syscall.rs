@@ -5487,6 +5487,13 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
         let rel = abs_path.strip_prefix("/data/").unwrap_or("");
         return FsTarget::DiskData(alloc::string::String::from(rel));
     }
+    if crate::fs::procfs::path_node(abs_path).is_some()
+        || abs_path == "/dev"
+        || abs_path.starts_with("/dev/")
+        || crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some()
+    {
+        return FsTarget::Ramdisk;
+    }
     // When ext2 is mounted at root, route non-ramdisk paths to ext2.
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
@@ -5496,6 +5503,15 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
     FsTarget::Ramdisk
 }
 
+fn create_parent_is_read_only(abs_path: &str) -> bool {
+    let parent = parent_path(abs_path);
+    parent != "/"
+        && (crate::fs::procfs::path_node(parent).is_some()
+            || parent == "/dev"
+            || parent.starts_with("/dev/")
+            || crate::fs::ramdisk::ramdisk_lookup(parent).is_some())
+}
+
 /// `chmod(path, mode)` — change file mode bits (syscall 90).
 fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
@@ -5503,8 +5519,10 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let cwd = current_cwd();
-    let abs = resolve_path(&cwd, raw);
+    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let mode = (mode_arg & 0o7777) as u16;
 
     // Only owner or root can chmod.
@@ -5594,8 +5612,10 @@ fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let cwd = current_cwd();
-    let abs = resolve_path(&cwd, raw);
+    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let new_uid = uid_arg as u32;
     let new_gid = gid_arg as u32;
 
@@ -7016,6 +7036,9 @@ fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
             return NEG_EACCES;
         }
     }
+    if create_parent_is_read_only(&resolved) {
+        return NEG_EROFS;
+    }
 
     match resolve_fs_target(&resolved) {
         FsTarget::Tmpfs(rel) => {
@@ -7147,6 +7170,9 @@ fn sys_linkat(olddirfd: u64, oldpath_ptr: u64, newdirfd: u64, newpath_ptr: u64, 
             return NEG_EACCES;
         }
     }
+    if create_parent_is_read_only(&new_resolved) {
+        return NEG_EROFS;
+    }
 
     let old_target = resolve_fs_target(&old_resolved);
     let new_target = resolve_fs_target(&new_resolved);
@@ -7218,8 +7244,7 @@ fn sys_linkat(olddirfd: u64, oldpath_ptr: u64, newdirfd: u64, newpath_ptr: u64, 
 /// Get approximate current Unix timestamp from LAPIC tick counter.
 fn current_unix_time() -> u32 {
     let ticks = crate::arch::x86_64::interrupts::tick_count();
-    // ~100 ticks/second from LAPIC timer.
-    (ticks / 100) as u32
+    (ticks / TICKS_PER_SEC) as u32
 }
 
 fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64 {
@@ -8470,7 +8495,7 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// LAPIC ticks per second (~100 Hz timer = 10ms per tick).
-const TICKS_PER_SEC: u64 = 100;
+pub(crate) const TICKS_PER_SEC: u64 = 100;
 
 /// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
 fn sys_gettimeofday(tv_ptr: u64) -> u64 {

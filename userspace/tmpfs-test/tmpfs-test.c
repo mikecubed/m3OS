@@ -348,6 +348,30 @@ static void test_symlink_semantics(void) {
         fail("symlink: stat size", "stat did not report target file size");
         return;
     }
+    if (chmod(link_path, 0600) != 0) {
+        fail("symlink: chmod target", "chmod through symlink returned non-zero");
+        return;
+    }
+    if (stat(target_path, &st) != 0 || (st.st_mode & 0777) != 0600) {
+        fail("symlink: chmod target follow", "chmod did not update the target");
+        return;
+    }
+    if (chown(link_path, 123, 456) != 0) {
+        fail("symlink: chown target", "chown through symlink returned non-zero");
+        return;
+    }
+    if (stat(target_path, &st) != 0 || st.st_uid != 123 || st.st_gid != 456) {
+        fail("symlink: chown target follow", "chown did not update the target");
+        return;
+    }
+    if (lstat(link_path, &st) != 0) {
+        fail("symlink: lstat owner", "lstat after chown returned non-zero");
+        return;
+    }
+    if (st.st_uid != 0 || st.st_gid != 0) {
+        fail("symlink: chown link unchanged", "chown unexpectedly changed the symlink inode");
+        return;
+    }
 
     fd = open(link_path, O_RDONLY);
     if (fd < 0) {
@@ -423,6 +447,59 @@ static void test_symlink_semantics(void) {
     if (rename("/tmp/parent-link/mkdir-via-link", "/tmp/parent-link/renamed-via-link") != 0 ||
         access("/tmp/parent-target/renamed-via-link", F_OK) != 0) {
         fail("symlink: rename parent follow", "rename did not resolve parent symlink");
+        return;
+    }
+
+    {
+        const char *disk_target = "/phase38-meta-target.txt";
+        const char *disk_link = "/phase38-meta-link";
+        fd = open(disk_target, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0 || write(fd, "disk", 4) != 4) {
+            fail("symlink: ext2 target create", "could not create ext2 target file");
+            if (fd >= 0) {
+                close(fd);
+            }
+            return;
+        }
+        close(fd);
+        if (symlink(disk_target, disk_link) != 0) {
+            fail("symlink: ext2 link create", "could not create ext2 symlink");
+            return;
+        }
+        if (chmod(disk_link, 0600) != 0) {
+            fail("symlink: ext2 chmod target", "chmod through ext2 symlink returned non-zero");
+            return;
+        }
+        if (stat(disk_target, &st) != 0 || (st.st_mode & 0777) != 0600) {
+            fail("symlink: ext2 chmod target follow", "chmod did not update ext2 target");
+            return;
+        }
+        if (chown(disk_link, 123, 456) != 0) {
+            fail("symlink: ext2 chown target", "chown through ext2 symlink returned non-zero");
+            return;
+        }
+        if (stat(disk_target, &st) != 0 || st.st_uid != 123 || st.st_gid != 456) {
+            fail("symlink: ext2 chown target follow", "chown did not update ext2 target");
+            return;
+        }
+        if (lstat(disk_link, &st) != 0) {
+            fail("symlink: ext2 lstat owner", "lstat after ext2 chown returned non-zero");
+            return;
+        }
+        if (st.st_uid != 0 || st.st_gid != 0) {
+            fail("symlink: ext2 chown link unchanged", "chown unexpectedly changed the ext2 symlink inode");
+            return;
+        }
+    }
+
+    errno = 0;
+    if (symlink("/tmp/target.txt", "/bin/phase38-overlay-link") == 0 || errno != EROFS) {
+        fail("symlink: ramdisk overlay create", "symlink into ramdisk overlay did not fail with EROFS");
+        return;
+    }
+    errno = 0;
+    if (link("/tmp/target.txt", "/bin/phase38-overlay-hard") == 0 || errno != EROFS) {
+        fail("symlink: ramdisk overlay hard link", "hard link into ramdisk overlay did not fail with EROFS");
         return;
     }
 
@@ -865,8 +942,12 @@ static void cleanup(void) {
     unlink("/tmp/loop-a");
     unlink("/tmp/loop-b");
     unlink("/tmp/self-loop");
+    unlink("/tmp/chdir-target/created-from-symlink-cwd.txt");
+    unlink("/tmp/parent-target/unlink-me.txt");
     unlink("/hard-a.txt");
     unlink("/hard-b.txt");
+    unlink("/phase38-meta-link");
+    unlink("/phase38-meta-target.txt");
     unlink("/tmp/root-only.txt");
     for (int i = 0; i < 41; i++) {
         char name[32];
@@ -874,6 +955,11 @@ static void cleanup(void) {
         unlink(name);
     }
     unlink("/tmp/root-owned/child.txt");
+    rmdir("/tmp/parent-target/renamed-via-link");
+    rmdir("/tmp/parent-link");
+    rmdir("/tmp/parent-target");
+    rmdir("/tmp/chdir-link");
+    rmdir("/tmp/chdir-target");
     rmdir("/tmp/umask-private");
     rmdir("/tmp/root-owned");
 }
