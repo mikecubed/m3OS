@@ -26,6 +26,8 @@ pub enum TmpfsError {
 pub struct TmpfsStat {
     pub is_dir: bool,
     pub is_symlink: bool,
+    pub ino: u64,
+    pub nlink: u64,
     pub size: usize,
     /// Owner user ID (Phase 27).
     pub uid: u32,
@@ -42,6 +44,7 @@ enum TmpfsNode {
 }
 
 struct FileData {
+    inode: u64,
     content: Vec<u8>,
     uid: u32,
     gid: u32,
@@ -49,6 +52,7 @@ struct FileData {
 }
 
 struct DirData {
+    inode: u64,
     children: BTreeMap<String, TmpfsNode>,
     uid: u32,
     gid: u32,
@@ -56,6 +60,7 @@ struct DirData {
 }
 
 struct SymlinkData {
+    inode: u64,
     target: String,
     uid: u32,
     gid: u32,
@@ -64,18 +69,27 @@ struct SymlinkData {
 /// A complete tmpfs filesystem instance.
 pub struct Tmpfs {
     root: TmpfsNode,
+    next_inode: u64,
 }
 
 impl Tmpfs {
     pub const fn new() -> Self {
         Tmpfs {
             root: TmpfsNode::Dir(DirData {
+                inode: 1,
                 children: BTreeMap::new(),
                 uid: 0,
                 gid: 0,
                 mode: 0o755,
             }),
+            next_inode: 2,
         }
+    }
+
+    fn alloc_inode(&mut self) -> u64 {
+        let inode = self.next_inode;
+        self.next_inode = self.next_inode.saturating_add(1);
+        inode
     }
 
     fn components(path: &str) -> impl Iterator<Item = &str> {
@@ -164,6 +178,7 @@ impl Tmpfs {
         gid: u32,
         mode: u16,
     ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -171,6 +186,7 @@ impl Tmpfs {
         parent.children.insert(
             name.to_string(),
             TmpfsNode::File(FileData {
+                inode,
                 content: Vec::new(),
                 uid,
                 gid,
@@ -223,6 +239,8 @@ impl Tmpfs {
             TmpfsNode::File(file) => Ok(TmpfsStat {
                 is_dir: false,
                 is_symlink: false,
+                ino: file.inode,
+                nlink: 1,
                 size: file.content.len(),
                 uid: file.uid,
                 gid: file.gid,
@@ -231,6 +249,12 @@ impl Tmpfs {
             TmpfsNode::Dir(dir) => Ok(TmpfsStat {
                 is_dir: true,
                 is_symlink: false,
+                ino: dir.inode,
+                nlink: 2 + dir
+                    .children
+                    .values()
+                    .filter(|child| matches!(child, TmpfsNode::Dir(_)))
+                    .count() as u64,
                 size: 0,
                 uid: dir.uid,
                 gid: dir.gid,
@@ -239,6 +263,8 @@ impl Tmpfs {
             TmpfsNode::Symlink(link) => Ok(TmpfsStat {
                 is_dir: false,
                 is_symlink: true,
+                ino: link.inode,
+                nlink: 1,
                 size: link.target.len(),
                 uid: link.uid,
                 gid: link.gid,
@@ -271,6 +297,7 @@ impl Tmpfs {
         gid: u32,
         mode: u16,
     ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -278,6 +305,7 @@ impl Tmpfs {
         parent.children.insert(
             name.to_string(),
             TmpfsNode::Dir(DirData {
+                inode,
                 children: BTreeMap::new(),
                 uid,
                 gid,
@@ -466,6 +494,7 @@ impl Tmpfs {
         uid: u32,
         gid: u32,
     ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -473,6 +502,7 @@ impl Tmpfs {
         parent.children.insert(
             name.to_string(),
             TmpfsNode::Symlink(SymlinkData {
+                inode,
                 target: target.to_string(),
                 uid,
                 gid,
@@ -530,17 +560,23 @@ mod tests {
         let fstat = fs.stat("/f").unwrap();
         assert!(!fstat.is_dir);
         assert!(!fstat.is_symlink);
+        assert_ne!(fstat.ino, 0);
+        assert_eq!(fstat.nlink, 1);
         assert_eq!(fstat.size, 3);
 
         let dstat = fs.stat("/d").unwrap();
         assert!(dstat.is_dir);
         assert!(!dstat.is_symlink);
+        assert_ne!(dstat.ino, 0);
+        assert_eq!(dstat.nlink, 2);
         assert_eq!(dstat.size, 0);
 
         // Root is a directory
         let rstat = fs.stat("/").unwrap();
         assert!(rstat.is_dir);
         assert!(!rstat.is_symlink);
+        assert_eq!(rstat.ino, 1);
+        assert_eq!(rstat.nlink, 3);
     }
 
     #[test]
@@ -659,6 +695,8 @@ mod tests {
         let st = fs.stat("/link").unwrap();
         assert!(st.is_symlink);
         assert!(!st.is_dir);
+        assert_ne!(st.ino, 0);
+        assert_eq!(st.nlink, 1);
         assert_eq!(st.size, "/some/target".len());
     }
 

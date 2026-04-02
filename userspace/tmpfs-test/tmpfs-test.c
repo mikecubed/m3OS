@@ -97,6 +97,15 @@ static void test_write_read_roundtrip(void) {
         fail("write-read: content", "data mismatch");
         return;
     }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fail("write-read: stat", "stat returned non-zero");
+        return;
+    }
+    if (st.st_ino == 0 || st.st_nlink != 1) {
+        fail("write-read: inode/link count", "tmpfs file metadata was not populated");
+        return;
+    }
     pass("write-read roundtrip");
 }
 
@@ -104,6 +113,15 @@ static void test_write_read_roundtrip(void) {
 static void test_mkdir_rmdir(void) {
     if (mkdir("/tmp/testdir", 0755) != 0) {
         fail("mkdir", "mkdir returned non-zero");
+        return;
+    }
+    struct stat st;
+    if (stat("/tmp/testdir", &st) != 0) {
+        fail("mkdir: stat", "stat returned non-zero");
+        return;
+    }
+    if (st.st_ino == 0 || st.st_nlink < 2) {
+        fail("mkdir: inode/link count", "tmpfs dir metadata was not populated");
         return;
     }
     /* rmdir should succeed on empty dir */
@@ -310,6 +328,10 @@ static void test_symlink_semantics(void) {
     }
     if ((size_t)st.st_size != target_path_len) {
         fail("symlink: lstat size", "symlink size is not target length");
+        return;
+    }
+    if (st.st_ino == 0 || st.st_nlink != 1) {
+        fail("symlink: lstat inode/link count", "tmpfs symlink metadata was not populated");
         return;
     }
 

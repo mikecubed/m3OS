@@ -5192,6 +5192,16 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
                 stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
                 (st.mode, st.uid, st.gid, st.size, 0)
+            } else if let Some(rel) = tmpfs_relative_path(path) {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                match tmpfs.stat(rel) {
+                    Ok(st) => {
+                        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+                        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+                        (0x4000 | st.mode as u32, st.uid, st.gid, st.size as u64, 0)
+                    }
+                    Err(_) => return NEG_ENOENT,
+                }
             } else {
                 let (u, g, m) = dir_metadata(path);
                 (0x4000 | m as u32, u, g, 0, 0)
@@ -5231,7 +5241,18 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.stat(path) {
-                Ok(s) => (0x8000 | s.mode as u32, s.uid, s.gid, s.size as u64, 0),
+                Ok(s) => {
+                    stat[8..16].copy_from_slice(&s.ino.to_ne_bytes());
+                    stat[16..24].copy_from_slice(&s.nlink.to_ne_bytes());
+                    let mode = if s.is_symlink {
+                        0xA000 | 0o777
+                    } else if s.is_dir {
+                        0x4000 | s.mode as u32
+                    } else {
+                        0x8000 | s.mode as u32
+                    };
+                    (mode, s.uid, s.gid, s.size as u64, 0)
+                }
                 Err(_) => return NEG_ENOENT,
             }
         }
@@ -6844,6 +6865,8 @@ fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u6
             0x8000 | st.mode as u32
         };
         let mut stat = [0u8; 144];
+        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
         stat[24..28].copy_from_slice(&mode.to_ne_bytes());
         stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
         stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
