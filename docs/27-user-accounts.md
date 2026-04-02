@@ -1,5 +1,9 @@
 # Phase 27 — User Accounts and Login
 
+**Aligned Roadmap Phase:** Phase 27
+**Status:** Complete
+**Source Ref:** phase-27
+
 ## Overview
 
 Phase 27 adds multi-user support to m3OS: per-process UID/GID identity,

@@ -1,5 +1,9 @@
 # Phase 20: Userspace Init and Shell
 
+**Aligned Roadmap Phase:** Phase 20
+**Status:** Complete
+**Source Ref:** phase-20
+
 This document describes the transition from kernel-resident init/shell
 functions to real ring-3 userspace processes: PID 1 (`/sbin/init`) and
 an interactive shell (`/bin/sh`).

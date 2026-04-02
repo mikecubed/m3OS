@@ -1,5 +1,9 @@
 # Tasking & Context Switching
 
+**Aligned Roadmap Phase:** Phase 4
+**Status:** Complete
+**Source Ref:** phase-04
+
 ## Overview
 
 Phase 4 introduces cooperative multi-tasking to the kernel.  Each **task** is an
@@ -256,5 +260,5 @@ real inter-task communication will require tasks to block on endpoint receive.
 ## See Also
 
 - `docs/04-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers
-- `docs/06-ipc.md` — IPC model that will require `Blocked` state in Phase 5
-- `docs/08-roadmap.md` — per-phase scope and open design questions
+- `docs/06-ipc.md` — IPC model that will require `Blocked` state in Phase 6
+- `docs/roadmap/README.md` — per-phase scope and milestones

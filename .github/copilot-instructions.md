@@ -101,7 +101,7 @@ Wrap every `unsafe` operation in a safe abstraction immediately. Don't leave raw
 
 ### Syscall ABI
 
-The kernel uses a custom syscall convention (see `docs/07-userspace.md`):
+The kernel uses a custom syscall convention (see `docs/appendix/architecture-and-syscalls.md`):
 
 | Register | Role |
 |---|---|
@@ -173,7 +173,7 @@ fn qemu_exit(code: u32) -> ! {
 ```
 
 Tests print results to serial, then call `qemu_exit`. The xtask harness reads the exit
-code and serial output to report pass/fail. See `docs/09-testing.md` for the full harness design.
+code and serial output to report pass/fail. See `docs/appendix/testing.md` for the full harness design.
 
 ### Context switch saves only callee-saved registers
 
@@ -204,8 +204,8 @@ All design documentation is in `docs/`. Read these before making significant cha
 
 | File | When to read it |
 |---|---|
-| `docs/01-architecture.md` | Orientation — what lives in the kernel vs. userspace |
+| `docs/appendix/architecture-and-syscalls.md` | Orientation — what lives in the kernel vs. userspace |
 | `docs/06-ipc.md` | Before touching anything in `kernel/src/ipc/` or syscalls |
 | `docs/03-memory.md` | Before touching frame allocator, page tables, or heap |
-| `docs/08-roadmap.md` | Open design questions and per-phase scope |
-| `docs/09-testing.md` | Before writing kernel tests or modifying the xtask harness |
+| `docs/roadmap/README.md` | Open design questions and per-phase scope |
+| `docs/appendix/testing.md` | Before writing kernel tests or modifying the xtask harness |

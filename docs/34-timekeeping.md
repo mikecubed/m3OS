@@ -1,5 +1,9 @@
 # Phase 34 — Real-Time Clock and Timekeeping
 
+**Aligned Roadmap Phase:** Phase 34
+**Status:** Complete
+**Source Ref:** phase-34
+
 ## Overview
 
 Phase 34 adds wall-clock time awareness to m3OS by reading the CMOS Real-Time

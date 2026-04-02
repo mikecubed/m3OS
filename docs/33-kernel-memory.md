@@ -1,5 +1,8 @@
 # Phase 33 — Kernel Memory Improvements
 
+**Aligned Roadmap Phase:** Phase 33
+**Status:** Complete
+**Source Ref:** phase-33
 **Depends on:** Phase 17 (Memory Reclamation), Phase 25 (SMP)
 
 ## Goal

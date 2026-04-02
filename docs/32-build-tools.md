@@ -1,5 +1,9 @@
 # Phase 32 - Build Tools and Scripting
 
+**Aligned Roadmap Phase:** Phase 32
+**Status:** Complete
+**Source Ref:** phase-32
+
 ## Overview
 
 Phase 32 adds a POSIX-compatible `make` build tool and supporting utilities,

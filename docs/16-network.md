@@ -1,5 +1,9 @@
 # Phase 16 - Network Stack
 
+**Aligned Roadmap Phase:** Phase 16
+**Status:** Complete
+**Source Ref:** phase-16
+
 ## What It Does
 
 Phase 16 adds a minimal TCP/IP network stack over a virtio-net NIC. The OS can
@@ -10,7 +14,7 @@ and initiate ICMP pings, and handle UDP datagrams and TCP connections.
 > (`kernel/src/net/*`) and runs as `net_task`. This is a temporary kernel-mode
 > implementation to get a working TCP/IP stack. The long-term plan is to move
 > these layers behind a userspace `net_server` with socket-style syscalls, in
-> line with the microkernel architecture described in `docs/01-architecture.md`.
+> line with the microkernel architecture described in `docs/appendix/architecture-and-syscalls.md`.
 
 ## Architecture
 

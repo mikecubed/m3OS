@@ -1,5 +1,9 @@
 # Phase 14 — Shell and Userspace Tools
 
+**Aligned Roadmap Phase:** Phase 14
+**Status:** Complete
+**Source Ref:** phase-14
+
 Phase 14 delivers an interactive fork+exec shell with pipes, I/O redirection,
 job control, environment variables, and 14 core utilities compiled as
 standalone musl-linked static ELF binaries.

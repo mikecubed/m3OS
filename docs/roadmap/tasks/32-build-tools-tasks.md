@@ -587,12 +587,12 @@ Create and validate a multi-file C project that exercises `make` and the toolcha
 
 ### G.3 — Roadmap update
 
-**File:** `docs/08-roadmap.md`
+**File:** `docs/roadmap/README.md`
 **Symbol:** `## Phase Overview`
 **Why it matters:** keeps the roadmap index consistent with phase completion status.
 
 **Acceptance:**
-- [x] Phase 32 listed in `docs/08-roadmap.md`
+- [x] Phase 32 listed in `docs/roadmap/README.md`
 
 ---
 

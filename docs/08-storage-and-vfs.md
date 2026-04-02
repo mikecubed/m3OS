@@ -1,5 +1,9 @@
 # Storage and VFS — Phase 8
 
+**Aligned Roadmap Phase:** Phase 8
+**Status:** Complete
+**Source Ref:** phase-08
+
 ## Overview
 
 Phase 8 adds the first file-access layer to m³OS. The additions are:

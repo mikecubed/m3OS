@@ -1,5 +1,9 @@
 # Phase 22b: ANSI Escape Sequence Processing
 
+**Aligned Roadmap Phase:** Phase 22b
+**Status:** Complete
+**Source Ref:** phase-22b
+
 This document describes the ANSI/VT100 escape sequence subsystem in m3OS:
 why it exists, how the parser is architected across two crates, the state
 machine internals, and how the framebuffer console executes the resulting

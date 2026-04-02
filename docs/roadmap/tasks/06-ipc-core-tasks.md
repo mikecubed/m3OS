@@ -139,7 +139,7 @@
 
 ### D.3 — Document the IPC model
 
-**File:** `docs/06-ipc-core.md`
+**File:** `docs/06-ipc.md`
 **Why it matters:** The IPC model is central to the microkernel architecture and must be understood by anyone adding new servers or syscalls.
 
 **Acceptance:**

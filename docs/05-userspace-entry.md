@@ -1,5 +1,9 @@
 # Userspace Entry
 
+**Aligned Roadmap Phase:** Phase 5
+**Status:** Complete
+**Source Ref:** phase-05
+
 ## Overview
 
 Phase 5 delivers the first ring-3 program running on m³OS.  By the end of
@@ -252,7 +256,7 @@ Only two syscalls are implemented in Phase 5:
 | 12 | `sys_debug_print` | Write a UTF-8 string to the kernel serial log; `rdi` = pointer, `rsi` = byte length |
 
 The full syscall table — including `sys_send`, `sys_recv`, `sys_cap_grant`,
-and friends — is defined in `docs/07-userspace.md` and will be implemented in
+and friends — is defined in `docs/appendix/architecture-and-syscalls.md` and will be implemented in
 Phase 6 (IPC) and beyond.
 
 ---
@@ -423,6 +427,6 @@ in a later hardening phase.
 
 ## See Also
 
-- `docs/07-userspace.md` — full userspace design and future server architecture
+- `docs/appendix/architecture-and-syscalls.md` — full userspace design and syscall ABI
 - `docs/06-ipc.md` — IPC model (Phase 6)
-- `docs/08-roadmap.md` — per-phase scope and open design questions
+- `docs/roadmap/README.md` — per-phase scope and milestones

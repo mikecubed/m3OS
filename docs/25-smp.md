@@ -1,5 +1,9 @@
 # Phase 25 — Symmetric Multiprocessing (SMP)
 
+**Aligned Roadmap Phase:** Phase 25
+**Status:** Complete
+**Source Ref:** phase-25
+
 ## Overview
 
 Phase 25 adds multi-core support to m3OS. All Application Processors (APs)

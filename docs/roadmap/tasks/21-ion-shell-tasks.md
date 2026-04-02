@@ -280,11 +280,11 @@ or unexpected behavior.
 
 ### E.3 — Documentation
 
-**File:** `docs/19-ion-shell.md`
+**File:** `docs/21-ion-shell.md`
 **Why it matters:** Documents the ion integration approach and remaining work.
 
 **Acceptance:**
-- [x] `docs/19-ion-shell.md` written
+- [x] `docs/21-ion-shell.md` written
 
 ---
 
@@ -306,4 +306,4 @@ These items require `tcgetattr`/`tcsetattr` (termios) support:
 - Phase 20 shell renamed from `sh` to `sh0` to coexist with ion
 - Multiple critical kernel bugs fixed during ion bring-up (futex CR3 corruption, fork register corruption, demand paging)
 - Ion interactive mode deferred to Phase 22 pending termios support
-- `docs/19-ion-shell.md` written as the phase documentation
+- `docs/21-ion-shell.md` written as the phase documentation

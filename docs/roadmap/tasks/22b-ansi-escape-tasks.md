@@ -156,7 +156,7 @@ messages benefit from it.
 | P22b-T047 | Acceptance: `cargo xtask check` passes (clippy + fmt + host tests) | Done |
 | P22b-T048 | Acceptance: QEMU boot — no panics, no regressions from Phase 22 | Done |
 | P22b-T049 | Remove `docs/roadmap/tasks/22-ion-interactive-followup.md` — all issues resolved by PR #32 | Done |
-| P22b-T050 | Update `docs/08-roadmap.md`: mark ANSI escape support as completed | Done |
+| P22b-T050 | Update `docs/roadmap/README.md`: mark ANSI escape support as completed | Done |
 
 ---
 

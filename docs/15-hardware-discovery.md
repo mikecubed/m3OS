@@ -1,5 +1,9 @@
 # Phase 15 — Hardware Discovery (ACPI + PCI)
 
+**Aligned Roadmap Phase:** Phase 15
+**Status:** Complete
+**Source Ref:** phase-15
+
 Phase 15 replaces the legacy 8259 PIC with the APIC interrupt system and adds
 PCI device enumeration.  The kernel now discovers hardware topology from ACPI
 tables at boot and uses the Local APIC timer for preemptive scheduling.

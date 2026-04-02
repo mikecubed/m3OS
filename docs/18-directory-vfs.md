@@ -1,5 +1,9 @@
 # Phase 18: Directory VFS
 
+**Aligned Roadmap Phase:** Phase 18
+**Status:** Complete
+**Source Ref:** phase-18
+
 This document describes the directory and VFS features added in Phase 18:
 per-process working directories, path resolution, the ramdisk directory
 tree, directory file descriptors, `getdents64`, and `openat`.

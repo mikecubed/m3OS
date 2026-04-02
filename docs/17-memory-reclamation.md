@@ -1,5 +1,9 @@
 # Phase 17: Memory Reclamation
 
+**Aligned Roadmap Phase:** Phase 17
+**Status:** Complete
+**Source Ref:** phase-17
+
 This document covers the memory reclamation infrastructure added in Phase 17:
 the free-list frame allocator, per-frame reference counting, copy-on-write
 fork, growable kernel heap, kernel stack lifecycle, and process page table

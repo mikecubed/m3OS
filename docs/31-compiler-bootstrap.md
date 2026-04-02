@@ -1,5 +1,9 @@
 # Phase 31 -- Compiler Bootstrap
 
+**Aligned Roadmap Phase:** Phase 31
+**Status:** Complete
+**Source Ref:** phase-31
+
 ## Overview
 
 Phase 31 adds a native C compiler (TCC -- Tiny C Compiler) to m3OS. A C source

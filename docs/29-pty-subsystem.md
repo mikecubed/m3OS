@@ -1,5 +1,9 @@
 # Phase 29 — PTY Subsystem
 
+**Aligned Roadmap Phase:** Phase 29
+**Status:** Complete
+**Source Ref:** phase-29
+
 ## Overview
 
 Phase 29 implements pseudo-terminal (PTY) pairs, enabling multiple

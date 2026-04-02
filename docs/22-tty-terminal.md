@@ -1,5 +1,9 @@
 # Phase 22: TTY and Terminal Control
 
+**Aligned Roadmap Phase:** Phase 22
+**Status:** Complete
+**Source Ref:** phase-22
+
 This document describes the TTY and terminal control implementation in
 m3OS. It covers the line discipline that sits between raw keyboard input
 and userspace `read()`, the `termios` struct and its ABI compatibility,

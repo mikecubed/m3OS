@@ -1,5 +1,9 @@
 # Phase 19: Signal Handlers
 
+**Aligned Roadmap Phase:** Phase 19
+**Status:** Complete
+**Source Ref:** phase-19
+
 This document describes the signal handler implementation in m3OS: how
 userspace processes install handlers via `rt_sigaction`, how the kernel
 delivers signals by building a sigframe on the user stack, and how
