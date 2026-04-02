@@ -151,6 +151,10 @@ pub fn free_unix_socket(handle: usize) {
                 // Drain any pending backlog connections.
                 entry.backlog.clear();
             }
+            // Unbind path before freeing the slot to prevent stale resolution.
+            if let Some(ref path) = cleanup_path {
+                unbind_path(path);
+            }
             // Clear the peer's reference to this handle to prevent stale pointers.
             if let Some(ph) = peer_handle
                 && let Some(peer_entry) = table.entries.get_mut(ph).and_then(|s| s.as_mut())
@@ -162,10 +166,6 @@ pub fn free_unix_socket(handle: usize) {
                 *slot = None;
             }
         }
-    }
-    // Unbind path outside the table lock.
-    if let Some(path) = cleanup_path {
-        unbind_path(&path);
     }
     // Wake peer so they see EOF/POLLHUP.
     if let Some(peer) = peer_handle {

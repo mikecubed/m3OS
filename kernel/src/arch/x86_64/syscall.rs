@@ -9106,11 +9106,16 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                 if state == Some(crate::net::unix::UnixSocketState::Connected) {
                     return 0;
                 }
-                if nonblock {
-                    return NEG_EAGAIN;
-                }
-                if has_pending_signal() {
-                    return NEG_EINTR;
+                if nonblock || has_pending_signal() {
+                    // Roll back: remove from backlog, reset state, release refcount.
+                    crate::net::unix::with_unix_socket_mut(target_handle, |s| {
+                        s.backlog.retain(|&h| h != handle);
+                    });
+                    crate::net::unix::with_unix_socket_mut(handle, |s| {
+                        s.state = crate::net::unix::UnixSocketState::Unbound;
+                    });
+                    crate::net::unix::free_unix_socket(handle);
+                    return if nonblock { NEG_EAGAIN } else { NEG_EINTR };
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
                 restore_caller_context(pid, saved_user_rsp);
@@ -9242,6 +9247,13 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
 
 /// Helper: write a sockaddr_un to userspace.
 fn sockaddr_un_to_user(addr_ptr: u64, addr_len_ptr: u64, path: Option<&str>) -> Result<(), u64> {
+    // Read the caller-provided buffer size.
+    let mut caller_len_bytes = [0u8; 4];
+    if crate::mm::user_mem::copy_from_user(&mut caller_len_bytes, addr_len_ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let caller_len = u32::from_ne_bytes(caller_len_bytes) as usize;
+
     let mut buf = [0u8; 110];
     buf[0] = 1; // AF_UNIX
     buf[1] = 0;
@@ -9253,9 +9265,12 @@ fn sockaddr_un_to_user(addr_ptr: u64, addr_len_ptr: u64, path: Option<&str>) -> 
     } else {
         2 // just the family
     };
-    if crate::mm::user_mem::copy_to_user(addr_ptr, &buf[..total_len]).is_err() {
+    // Only write up to the caller's buffer size.
+    let write_len = total_len.min(caller_len);
+    if write_len > 0 && crate::mm::user_mem::copy_to_user(addr_ptr, &buf[..write_len]).is_err() {
         return Err(NEG_EFAULT);
     }
+    // Write back the actual address length.
     let len_val = (total_len as u32).to_ne_bytes();
     if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_val).is_err() {
         return Err(NEG_EFAULT);
