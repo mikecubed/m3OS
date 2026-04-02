@@ -63,4 +63,6 @@ pub fn handle_udp(ip_header: &Ipv4Header, payload: &[u8]) {
             data: udp_data.to_vec(),
         },
     );
+    // Wake any socket polling this UDP port.
+    super::wake_sockets_for_udp_port(udp_hdr.dst_port);
 }

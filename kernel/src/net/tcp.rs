@@ -367,6 +367,8 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
         let full_match = conn.remote_ip == ip_header.src && conn.remote_port == tcp_hdr.src_port;
         if full_match {
             conn.handle_segment(&tcp_hdr, tcp_data);
+            drop(conns);
+            super::wake_sockets_for_tcp_slot(i);
             return;
         }
         if conn.state == TcpState::Listen && listen_idx.is_none() {
@@ -379,6 +381,8 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
     {
         conn.remote_ip = ip_header.src;
         conn.handle_segment(&tcp_hdr, tcp_data);
+        drop(conns);
+        super::wake_sockets_for_tcp_slot(idx);
         return;
     }
 

@@ -135,6 +135,8 @@ pub enum FdBackend {
     PtySlave { pty_id: u32 },
     /// Network socket — Phase 23.
     Socket { handle: u32 },
+    /// epoll instance — Phase 37. Monitors other FDs for readiness events.
+    Epoll { instance_id: usize },
 }
 
 /// A single open-file entry in the per-process FD table.
@@ -148,6 +150,9 @@ pub struct FdEntry {
     pub writable: bool,
     /// Close-on-exec flag (FD_CLOEXEC).
     pub cloexec: bool,
+    /// Non-blocking I/O flag (O_NONBLOCK). When set, read/write return
+    /// `-EAGAIN` instead of blocking when no data is available (Phase 37).
+    pub nonblock: bool,
 }
 
 /// Const sentinel for empty FD slots (used in array init).
@@ -172,6 +177,9 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
             FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+            FdBackend::Epoll { instance_id } => {
+                crate::arch::x86_64::syscall::epoll_add_ref_pub(*instance_id)
+            }
             _ => {}
         }
     }
@@ -184,6 +192,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut epolls = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -200,6 +209,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     _ => {}
                 }
                 *slot = None;
@@ -221,6 +231,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for h in sockets {
         crate::net::free_socket(h);
     }
+    for id in epolls {
+        crate::arch::x86_64::syscall::epoll_free_pub(id);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -237,6 +250,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut epolls = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -251,6 +265,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     _ => {}
                 }
             }
@@ -271,6 +286,9 @@ pub fn close_all_fds_for(pid: Pid) {
     for h in sockets {
         crate::net::free_socket(h);
     }
+    for id in epolls {
+        crate::arch::x86_64::syscall::epoll_free_pub(id);
+    }
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
@@ -282,6 +300,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     });
     table[1] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
@@ -289,6 +308,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: false,
         writable: true,
         cloexec: false,
+        nonblock: false,
     });
     table[2] = Some(FdEntry {
         backend: FdBackend::DeviceTTY { tty_id: 0 },
@@ -296,6 +316,7 @@ fn new_fd_table() -> [Option<FdEntry>; MAX_FDS] {
         readable: false,
         writable: true,
         cloexec: false,
+        nonblock: false,
     });
     table
 }

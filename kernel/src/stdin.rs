@@ -7,6 +7,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
+use crate::task::wait_queue::WaitQueue;
+
 /// Maximum size of the read-ready buffer.
 const STDIN_BUF_SIZE: usize = 4096;
 
@@ -54,9 +56,13 @@ static STDIN: Mutex<StdinState> = Mutex::new(StdinState::new());
 /// EOF flag: when set, has_data() returns true but read() returns 0.
 static EOF_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Wait queue for tasks polling stdin for read readiness (Phase 37).
+pub static STDIN_WAITQUEUE: WaitQueue = WaitQueue::new();
+
 /// Push a byte into stdin (immediately readable by userspace).
 pub fn push_char(c: u8) {
     STDIN.lock().push_byte(c);
+    STDIN_WAITQUEUE.wake_all();
 }
 
 /// Read from stdin. Returns 0 if no data available (or EOF).
@@ -82,6 +88,7 @@ pub fn has_data() -> bool {
 /// Signal EOF: next read() will return 0.
 pub fn signal_eof() {
     EOF_PENDING.store(true, Ordering::Release);
+    STDIN_WAITQUEUE.wake_all();
 }
 
 /// Flush (discard) all pending stdin data.

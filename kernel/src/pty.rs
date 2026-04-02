@@ -6,11 +6,41 @@
 use kernel_core::pty::{MAX_PTYS, PtyPairState};
 use spin::Mutex;
 
+use crate::task::wait_queue::WaitQueue;
+
 /// Global PTY pair table. Each slot is `None` (free) or `Some(PtyPairState)`.
 pub static PTY_TABLE: Mutex<[Option<PtyPairState>; MAX_PTYS]> = {
     const NONE: Option<PtyPairState> = None;
     Mutex::new([NONE; MAX_PTYS])
 };
+
+/// Per-PTY wait queues for master side (woken when slave writes data to s2m).
+#[allow(clippy::declare_interior_mutable_const)]
+pub static PTY_MASTER_WQ: [WaitQueue; MAX_PTYS] = {
+    const WQ: WaitQueue = WaitQueue::new();
+    [WQ; MAX_PTYS]
+};
+
+/// Per-PTY wait queues for slave side (woken when master writes data to m2s).
+#[allow(clippy::declare_interior_mutable_const)]
+pub static PTY_SLAVE_WQ: [WaitQueue; MAX_PTYS] = {
+    const WQ: WaitQueue = WaitQueue::new();
+    [WQ; MAX_PTYS]
+};
+
+/// Wake tasks waiting on the master side of a PTY.
+pub fn wake_master(id: u32) {
+    if (id as usize) < MAX_PTYS {
+        PTY_MASTER_WQ[id as usize].wake_all();
+    }
+}
+
+/// Wake tasks waiting on the slave side of a PTY.
+pub fn wake_slave(id: u32) {
+    if (id as usize) < MAX_PTYS {
+        PTY_SLAVE_WQ[id as usize].wake_all();
+    }
+}
 
 /// Allocate a new PTY pair. Returns the PTY ID (index) or `Err(())` if full.
 pub fn alloc_pty() -> Result<u32, ()> {
@@ -85,6 +115,9 @@ pub fn close_master(id: u32) {
         crate::process::send_signal_to_group(fg, crate::process::SIGHUP);
         crate::process::send_signal_to_group(fg, crate::process::SIGCONT);
     }
+    // Wake both sides — slave readers see EOF, master pollers see HUP.
+    wake_master(id);
+    wake_slave(id);
 }
 
 /// Close one slave reference. Frees the PTY if both sides are done.
@@ -98,4 +131,8 @@ pub fn close_slave(id: u32) {
             try_free(&mut table, id);
         }
     }
+    drop(table);
+    // Wake both sides — master pollers see HUP, slave waiters see close.
+    wake_master(id);
+    wake_slave(id);
 }

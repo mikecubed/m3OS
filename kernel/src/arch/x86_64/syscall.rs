@@ -46,6 +46,7 @@ const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
+const NEG_ENOMEM: u64 = (-12_i64) as u64;
 
 /// linux_dirent64 type constants.
 #[allow(dead_code)]
@@ -353,8 +354,7 @@ pub extern "C" fn syscall_handler(
         4 => sys_linux_fstatat(u64::MAX, arg0, arg1),
         5 => sys_linux_fstat(arg0, arg1),
         6 => sys_linux_fstatat(u64::MAX, arg0, arg1),
-        // Phase 22: poll stub — report all requested fds as ready.
-        // Ion uses poll() to multiplex between signal pipe and stdin.
+        // Phase 37: poll — wait-queue-driven I/O multiplexing.
         7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 36: mprotect(addr, len, prot) — change page permissions.
@@ -372,6 +372,12 @@ pub extern "C" fn syscall_handler(
         20 => sys_linux_writev(arg0, arg1, arg2),
         // Phase 21: access stub (PATH search — check existence only)
         21 => sys_access(arg0),
+        // Phase 37: select(nfds, readfds, writefds, exceptfds, timeout)
+        23 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
         // Phase 14: pipe and dup2
         22 => sys_pipe_with_flags(arg0, false),
         32 => sys_dup(arg0),
@@ -540,12 +546,36 @@ pub extern "C" fn syscall_handler(
             let cloexec = arg1 & 0x80000 != 0;
             sys_pipe_with_flags(arg0, cloexec)
         }
+        // Phase 37: epoll_create1(flags)
+        291 => sys_epoll_create1(arg0),
+        // Phase 37: accept4(fd, addr, addrlen, flags) — syscall 288
+        288 => {
+            let flags = per_core_syscall_arg3();
+            sys_accept4(arg0, arg1, arg2, flags)
+        }
         // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
         302 => NEG_ENOSYS,
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
+        // Phase 37: epoll_wait(epfd, events, maxevents, timeout)
+        232 => {
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
+        // Phase 37: epoll_ctl(epfd, op, fd, event)
+        233 => {
+            let event_ptr = per_core_syscall_arg3();
+            sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
+        }
+        // Phase 37: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+        270 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            // 6th arg (sigmask) is in r9 — ignored for now.
+            sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
         // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
             let flags = per_core_syscall_arg3();
@@ -1280,6 +1310,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: true,
         writable: false,
         cloexec,
+        nonblock: false,
     };
     let write_entry = FdEntry {
         backend: FdBackend::PipeWrite { pipe_id },
@@ -1287,6 +1318,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         readable: false,
         writable: true,
         cloexec,
+        nonblock: false,
     };
 
     let read_fd = match alloc_fd(3, read_entry) {
@@ -1361,6 +1393,7 @@ fn sys_dup(oldfd: u64) -> u64 {
                 FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
                 FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
                 FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+                FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
                 _ => {}
             }
             log::info!("[dup] fd {} → fd {}", oldfd, newfd);
@@ -1404,6 +1437,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
         FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
         FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
         FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+        FdBackend::Epoll { instance_id } => epoll_add_ref(*instance_id),
         _ => {}
     }
 
@@ -2531,8 +2565,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     match &entry.backend {
         FdBackend::Stdin | FdBackend::DeviceTTY { .. } => {
             // Read from kernel stdin buffer.
-            // Yield-loop until data is available.
             let capped = (count as usize).min(4096);
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2545,6 +2579,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         }
                         return n as u64;
                     }
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
                 }
                 // Check for pending signals so Ctrl-C works while blocked.
                 if has_pending_signal() {
@@ -2646,6 +2683,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeRead { pipe_id } => {
             let pipe_id = *pipe_id;
+            let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
@@ -2661,6 +2699,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return n as u64;
                     }
                     Err(_would_block) => {
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
                         if has_pending_signal() {
                             return NEG_EINTR;
                         }
@@ -2724,6 +2765,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2735,6 +2777,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             let to_read = count.min(dst.len() as u64) as usize;
                             let n = pair.s2m.read(&mut dst[..to_read]);
                             drop(table);
+                            // Reading from s2m frees space for slave writers.
+                            crate::pty::wake_slave(pty_id);
                             if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                 return NEG_EFAULT;
                             }
@@ -2746,6 +2790,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     } else {
                         return 0; // PTY freed
                     }
+                }
+                if nonblock {
+                    return NEG_EAGAIN;
                 }
                 if has_pending_signal() {
                     return NEG_EINTR;
@@ -2760,6 +2807,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
+            let nonblock = entry.nonblock;
             let pid = crate::process::current_pid();
             let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
@@ -2778,6 +2826,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     .copy_from_slice(&pair.edit_buf.as_slice()[..to_copy]);
                                 pair.edit_buf.drain(to_copy);
                                 drop(table);
+                                // Draining edit_buf frees space for master writers.
+                                crate::pty::wake_master(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
                                     .is_err()
                                 {
@@ -2798,6 +2848,8 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 let to_read = count.min(dst.len() as u64) as usize;
                                 let n = pair.m2s.read(&mut dst[..to_read]);
                                 drop(table);
+                                // Reading from m2s frees space for master writers.
+                                crate::pty::wake_master(pty_id);
                                 if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
                                     return NEG_EFAULT;
                                 }
@@ -2811,6 +2863,9 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return 0; // PTY freed
                     }
                 }
+                if nonblock {
+                    return NEG_EAGAIN;
+                }
                 if has_pending_signal() {
                     return NEG_EINTR;
                 }
@@ -2822,6 +2877,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Delegate to recvfrom with no addr
             sys_recvfrom_socket(fd as u64, buf_ptr, count, 0, 0, 0)
         }
+        FdBackend::Epoll { .. } => NEG_EBADF,
     }
 }
 
@@ -3054,6 +3110,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeWrite { pipe_id } => {
             let pipe_id = *pipe_id;
+            let nonblock = entry.nonblock;
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
@@ -3071,6 +3128,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         return NEG_EPIPE;
                     }
                     Err(true) => {
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
                         // Would block — yield and retry.
                         if has_pending_signal() {
                             return NEG_EINTR;
@@ -3239,6 +3299,11 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     written += 1;
                 }
+                drop(table);
+                // Wake slave waiters (data written to m2s / edit_buf).
+                crate::pty::wake_slave(pty_id);
+                // Wake master waiters (echo may have written to s2m).
+                crate::pty::wake_master(pty_id);
                 written as u64
             } else {
                 NEG_EIO
@@ -3273,6 +3338,9 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                     written += 1;
                 }
+                drop(table);
+                // Wake master waiters (data written to s2m).
+                crate::pty::wake_master(pty_id);
                 written as u64
             } else {
                 NEG_EIO
@@ -3282,6 +3350,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Delegate to sendto with no addr
             sys_sendto(fd, buf_ptr, count, 0, 0, 0)
         }
+        FdBackend::Epoll { .. } => NEG_EBADF,
     }
 }
 
@@ -3585,6 +3654,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -3605,6 +3675,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable: true,
             writable: true,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -3637,6 +3708,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                 readable: true,
                 writable: true,
                 cloexec: false,
+                nonblock: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -3686,6 +3758,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable: true,
             writable: false,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
@@ -3741,6 +3814,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         match alloc_fd(3, entry) {
             Some(i) => {
@@ -3781,6 +3855,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                 readable: true,
                                 writable: false,
                                 cloexec: false,
+                                nonblock: false,
                             };
 
                             return match alloc_fd(3, fd_entry) {
@@ -3819,6 +3894,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                             readable,
                             writable,
                             cloexec: false,
+                            nonblock: false,
                         };
 
                         // Phase 31: support O_TRUNC on FAT32 — free the old
@@ -3881,6 +3957,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                     readable,
                                     writable,
                                     cloexec: false,
+                                    nonblock: false,
                                 };
 
                                 // Set ownership and permissions on the newly created file.
@@ -3971,6 +4048,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                         readable: true,
                         writable: false,
                         cloexec: false,
+                        nonblock: false,
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -3995,6 +4073,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => {
@@ -4061,6 +4140,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4081,6 +4161,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable: true,
             writable: true,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4113,6 +4194,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
                 readable: true,
                 writable: true,
                 cloexec: false,
+                nonblock: false,
             };
             return match alloc_fd(3, entry) {
                 Some(i) => i as u64,
@@ -4156,6 +4238,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable: true,
             writable: false,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4195,6 +4278,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
             readable,
             writable,
             cloexec: false,
+            nonblock: false,
         };
         return match alloc_fd(3, entry) {
             Some(i) => i as u64,
@@ -4219,6 +4303,7 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         readable: true,
         writable: false,
         cloexec: false,
+        nonblock: false,
     };
     match alloc_fd(3, entry) {
         Some(i) => i as u64,
@@ -4247,9 +4332,12 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+            FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
             _ => {}
         }
     }
+    // Remove this FD from all epoll interest lists to prevent stale references.
+    epoll_remove_fd(fd);
     let mut found = false;
     with_current_fd_mut(fd, |slot| {
         if slot.is_some() {
@@ -4396,6 +4484,7 @@ fn open_ext2_file(
                     readable: true,
                     writable: false,
                     cloexec: false,
+                    nonblock: false,
                 };
                 return match alloc_fd(3, fd_entry) {
                     Some(i) => i as u64,
@@ -4437,6 +4526,7 @@ fn open_ext2_file(
                 readable,
                 writable,
                 cloexec: false,
+                nonblock: false,
             };
 
             match alloc_fd(3, fd_entry) {
@@ -4477,6 +4567,7 @@ fn open_ext2_file(
                         readable,
                         writable,
                         cloexec: false,
+                        nonblock: false,
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
@@ -4597,6 +4688,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             let (u, g, m) = (0u32, 0u32, 0o755u16);
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
+        FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -4907,7 +4999,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
-        | FdBackend::Socket { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::Socket { .. }
+        | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -6816,7 +6909,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
-        | FdBackend::Socket { .. } => NEG_EINVAL,
+        | FdBackend::Socket { .. }
+        | FdBackend::Epoll { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -7219,6 +7313,9 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
                         FdBackend::Socket { handle } => {
                             crate::net::add_socket_ref(*handle);
                         }
+                        FdBackend::Epoll { instance_id } => {
+                            epoll_add_ref(*instance_id);
+                        }
                         _ => {}
                     }
                     new_fd as u64
@@ -7249,7 +7346,39 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             });
             0
         }
-        F_GETFL | F_SETFL => 0,
+        F_GETFL => {
+            const O_NONBLOCK: u64 = 0x800;
+            const O_RDONLY: u64 = 0;
+            const O_WRONLY: u64 = 1;
+            const O_RDWR: u64 = 2;
+            match current_fd_entry(fd as usize) {
+                Some(e) => {
+                    let mut flags = match (e.readable, e.writable) {
+                        (true, true) => O_RDWR,
+                        (false, true) => O_WRONLY,
+                        _ => O_RDONLY,
+                    };
+                    if e.nonblock {
+                        flags |= O_NONBLOCK;
+                    }
+                    flags
+                }
+                None => NEG_EBADF,
+            }
+        }
+        F_SETFL => {
+            const O_NONBLOCK: u64 = 0x800;
+            if current_fd_entry(fd as usize).is_none() {
+                return NEG_EBADF;
+            }
+            let nonblock = arg & O_NONBLOCK != 0;
+            with_current_fd_mut(fd as usize, |slot| {
+                if let Some(e) = slot {
+                    e.nonblock = nonblock;
+                }
+            });
+            0
+        }
         _ => NEG_EINVAL,
     }
 }
@@ -7476,9 +7605,10 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if domain != 2 {
         return NEG_EAFNOSUPPORT;
     }
-    let sock_flags = socktype & (0x80000 | 0x800); // SOCK_CLOEXEC | SOCK_NONBLOCK
-    let socktype_raw = socktype & !(0x80000 | 0x800);
-    let _ = sock_flags; // SOCK_CLOEXEC/SOCK_NONBLOCK flags stripped but not yet honored
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    let sock_flags = socktype & (SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let socktype_raw = socktype & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let (kind, proto) = match socktype_raw {
         1 => (SocketKind::Stream, SocketProtocol::Tcp), // SOCK_STREAM
         2 => {
@@ -7500,7 +7630,8 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
         offset: 0,
         readable: true,
         writable: true,
-        cloexec: false,
+        cloexec: sock_flags & SOCK_CLOEXEC != 0,
+        nonblock: sock_flags & SOCK_NONBLOCK != 0,
     };
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
@@ -7794,6 +7925,7 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     readable: true,
                     writable: true,
                     cloexec: false,
+                    nonblock: false,
                 };
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
@@ -7812,6 +7944,36 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
             }
         }
     }
+}
+
+/// accept4(fd, addr, addrlen, flags) — syscall 288
+///
+/// Like accept() but applies SOCK_NONBLOCK and SOCK_CLOEXEC flags
+/// to the newly accepted socket FD.
+fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x80000;
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return NEG_EINVAL;
+    }
+    let result = sys_accept(fd, addr_ptr, addr_len_ptr);
+    // If accept failed (negative), return the error.
+    if result as i64 >= 0 {
+        let new_fd = result as usize;
+        if flags & (SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+            with_current_fd_mut(new_fd, |slot| {
+                if let Some(e) = slot {
+                    if flags & SOCK_NONBLOCK != 0 {
+                        e.nonblock = true;
+                    }
+                    if flags & SOCK_CLOEXEC != 0 {
+                        e.cloexec = true;
+                    }
+                }
+            });
+        }
+    }
+    result
 }
 
 /// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
@@ -7943,7 +8105,6 @@ fn sys_recvfrom_socket(
     addr_len_ptr: u64,
 ) -> u64 {
     const MSG_DONTWAIT: u64 = 0x40;
-    let nonblock = flags & MSG_DONTWAIT != 0;
 
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
@@ -7953,6 +8114,7 @@ fn sys_recvfrom_socket(
         Some(e) => e,
         None => return NEG_EBADF,
     };
+    let nonblock = entry.nonblock || flags & MSG_DONTWAIT != 0;
 
     match &entry.backend {
         FdBackend::Socket { handle } => {
@@ -8382,185 +8544,1040 @@ fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr
 }
 
 // ---------------------------------------------------------------------------
-// Phase 22: poll(fds, nfds, timeout) — syscall 7
+// Phase 37: I/O multiplexing helpers
 // ---------------------------------------------------------------------------
 
-/// poll(fds, nfds, timeout) — check fd readiness.
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLERR: i16 = 0x008;
+const POLLHUP: i16 = 0x010;
+const POLLNVAL: i16 = 0x020;
+
+/// Query current readiness events for a file descriptor.
 ///
-/// For pipe-read fds: report POLLIN if data available or writer closed (EOF).
-/// For TTY fds: report POLLIN if stdin has data.
-/// Other fds: report requested events (optimistic).
-/// If no fds are ready and timeout != 0, yield once and re-check.
+/// Returns a bitmask of POLLIN/POLLOUT/POLLHUP/POLLERR/POLLNVAL.
+fn fd_poll_events(entry: &FdEntry) -> i16 {
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } => {
+            // Side-effect-free readiness check.
+            let mut revents: i16 = 0;
+            // POLLHUP when writer has closed (even if data remains in buffer).
+            if crate::pipe::pipe_writer_closed(*pipe_id) {
+                revents |= POLLHUP;
+            }
+            match crate::pipe::pipe_read_ready(*pipe_id) {
+                Some(true) => revents |= POLLIN,
+                Some(false) => {}
+                None => revents |= POLLHUP,
+            }
+            revents
+        }
+        FdBackend::PipeWrite { pipe_id } => {
+            // Side-effect-free writability check.
+            match crate::pipe::pipe_write_ready(*pipe_id) {
+                Some(true) => POLLOUT,     // writable
+                Some(false) => 0,          // full but reader alive
+                None => POLLERR | POLLHUP, // reader closed (EPIPE)
+            }
+        }
+        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
+            let mut revents: i16 = 0;
+            if entry.readable && crate::stdin::has_data() {
+                revents |= POLLIN;
+            }
+            if entry.writable {
+                revents |= POLLOUT;
+            }
+            revents
+        }
+        FdBackend::Socket { handle } => {
+            let h = *handle;
+            crate::net::with_socket(h, |s| {
+                let mut revents: i16 = 0;
+                let readable = match s.protocol {
+                    crate::net::SocketProtocol::Tcp => {
+                        if let Some(tcp_idx) = s.tcp_slot {
+                            if matches!(s.state, crate::net::SocketState::Listening) {
+                                matches!(
+                                    crate::net::tcp::state(tcp_idx),
+                                    crate::net::tcp::TcpState::Established
+                                        | crate::net::tcp::TcpState::CloseWait
+                                )
+                            } else {
+                                crate::net::tcp::has_recv_data(tcp_idx)
+                                    || matches!(
+                                        crate::net::tcp::state(tcp_idx),
+                                        crate::net::tcp::TcpState::CloseWait
+                                            | crate::net::tcp::TcpState::Closed
+                                            | crate::net::tcp::TcpState::TimeWait
+                                    )
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    crate::net::SocketProtocol::Udp => crate::net::udp::has_data(s.local_port),
+                    crate::net::SocketProtocol::Icmp => crate::net::icmp::PING_REPLY_RECEIVED
+                        .load(core::sync::atomic::Ordering::Acquire),
+                };
+                let writable = match s.protocol {
+                    crate::net::SocketProtocol::Tcp => {
+                        s.tcp_slot.is_some()
+                            && matches!(s.state, crate::net::SocketState::Connected)
+                    }
+                    _ => true,
+                };
+                if readable {
+                    revents |= POLLIN;
+                }
+                if writable {
+                    revents |= POLLOUT;
+                }
+                if matches!(s.state, crate::net::SocketState::Closed) {
+                    revents |= POLLHUP;
+                }
+                // TCP RST → POLLERR
+                if let Some(tcp_idx) = s.tcp_slot
+                    && matches!(
+                        crate::net::tcp::state(tcp_idx),
+                        crate::net::tcp::TcpState::Closed
+                    )
+                    && !matches!(
+                        s.state,
+                        crate::net::SocketState::Closed | crate::net::SocketState::Listening
+                    )
+                {
+                    revents |= POLLERR;
+                }
+                revents
+            })
+            .unwrap_or(POLLNVAL)
+        }
+        FdBackend::PtyMaster { pty_id } => {
+            let id = *pty_id;
+            let table = crate::pty::PTY_TABLE.lock();
+            if let Some(Some(pair)) = table.get(id as usize) {
+                let mut revents: i16 = 0;
+                if !pair.s2m.is_empty() {
+                    revents |= POLLIN;
+                }
+                if pair.slave_refcount == 0 && pair.slave_opened {
+                    revents |= POLLHUP | POLLIN;
+                }
+                if !pair.m2s.is_full() {
+                    revents |= POLLOUT;
+                }
+                revents
+            } else {
+                POLLHUP
+            }
+        }
+        FdBackend::PtySlave { pty_id } => {
+            let id = *pty_id;
+            let table = crate::pty::PTY_TABLE.lock();
+            if let Some(Some(pair)) = table.get(id as usize) {
+                let mut revents: i16 = 0;
+                if pair.termios.is_canonical() {
+                    if pair.edit_buf.as_slice().contains(&b'\n') || pair.eof_pending {
+                        revents |= POLLIN;
+                    }
+                } else if !pair.m2s.is_empty() {
+                    revents |= POLLIN;
+                }
+                if pair.master_refcount == 0 {
+                    revents |= POLLHUP | POLLIN;
+                }
+                if !pair.s2m.is_full() {
+                    revents |= POLLOUT;
+                }
+                revents
+            } else {
+                POLLHUP
+            }
+        }
+        FdBackend::Stdout => POLLOUT,
+        FdBackend::DevNull => POLLIN | POLLOUT,
+        FdBackend::Ramdisk { .. }
+        | FdBackend::Tmpfs { .. }
+        | FdBackend::Fat32Disk { .. }
+        | FdBackend::Ext2Disk { .. }
+        | FdBackend::Dir { .. } => POLLIN | POLLOUT,
+        FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
+    }
+}
+
+/// Register the current task on the wait queue(s) of a file descriptor.
+///
+/// Uses `WaitQueue::register()` to add the task without blocking, allowing
+/// registration on multiple queues before a single block call.
+/// Returns `true` if a wait queue was registered, `false` for non-pollable types.
+fn fd_register_waiter(
+    entry: &FdEntry,
+    task_id: crate::task::TaskId,
+    woken: &alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+) -> bool {
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } | FdBackend::PipeWrite { pipe_id } => {
+            let wqs = crate::pipe::PIPE_WAITQUEUES.lock();
+            if let Some(Some(wq)) = wqs.get(*pipe_id) {
+                wq.register(task_id, woken);
+                return true;
+            }
+            false
+        }
+        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
+            crate::stdin::STDIN_WAITQUEUE.register(task_id, woken);
+            true
+        }
+        FdBackend::Socket { handle } => {
+            crate::net::SOCKET_WAITQUEUES[*handle as usize].register(task_id, woken);
+            true
+        }
+        FdBackend::PtyMaster { pty_id } => {
+            crate::pty::PTY_MASTER_WQ[*pty_id as usize].register(task_id, woken);
+            true
+        }
+        FdBackend::PtySlave { pty_id } => {
+            crate::pty::PTY_SLAVE_WQ[*pty_id as usize].register(task_id, woken);
+            true
+        }
+        _ => false, // non-pollable types (ramdisk, tmpfs, etc.)
+    }
+}
+
+/// Deregister the current task from all wait queues it was registered on.
+fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
+    match &entry.backend {
+        FdBackend::PipeRead { pipe_id } | FdBackend::PipeWrite { pipe_id } => {
+            let wqs = crate::pipe::PIPE_WAITQUEUES.lock();
+            if let Some(Some(wq)) = wqs.get(*pipe_id) {
+                wq.deregister(task_id);
+            }
+        }
+        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
+            crate::stdin::STDIN_WAITQUEUE.deregister(task_id);
+        }
+        FdBackend::Socket { handle } => {
+            crate::net::SOCKET_WAITQUEUES[*handle as usize].deregister(task_id);
+        }
+        FdBackend::PtyMaster { pty_id } => {
+            crate::pty::PTY_MASTER_WQ[*pty_id as usize].deregister(task_id);
+        }
+        FdBackend::PtySlave { pty_id } => {
+            crate::pty::PTY_SLAVE_WQ[*pty_id as usize].deregister(task_id);
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: poll(fds, nfds, timeout) — syscall 7
+// ---------------------------------------------------------------------------
+
+/// poll(fds, nfds, timeout) — wait-queue-driven I/O readiness notification.
+///
+/// Phase 37 rewrite: uses per-FD wait queues instead of busy-wait yield loop.
+/// The task blocks via WaitQueue until an FD becomes ready or timeout expires.
+#[allow(clippy::needless_range_loop)]
 fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
-    const POLLIN: i16 = 0x001;
     let nfds = nfds as usize;
     if nfds > 256 {
         return NEG_EINVAL;
     }
     let timeout_i = timeout as i64;
+    // Convert ms timeout to tick deadline. ~100 Hz timer → 10ms/tick.
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = if timeout_i > 0 {
+        Some(start_tick + (timeout_i as u64).div_ceil(10)) // round up
+    } else {
+        None // 0 = non-blocking, -1 = indefinite
+    };
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
+
+    // Read all pollfd structs from userspace once.
+    let mut pfds = [[0u8; 8]; 256];
+    for i in 0..nfds {
+        let base = match fds_ptr.checked_add((i * 8) as u64) {
+            Some(a) => a,
+            None => return NEG_EFAULT,
+        };
+        if crate::mm::user_mem::copy_from_user(&mut pfds[i], base).is_err() {
+            return NEG_EFAULT;
+        }
+    }
+
+    // Collect FD entries for wait queue registration.
+    let mut entries: [Option<FdEntry>; 256] = [const { None }; 256];
+    for i in 0..nfds {
+        let fd = i32::from_ne_bytes([pfds[i][0], pfds[i][1], pfds[i][2], pfds[i][3]]);
+        if fd >= 0 && (fd as usize) < MAX_FDS {
+            entries[i] = current_fd_entry(fd as usize);
+        }
+    }
 
     loop {
         let mut ready_count = 0u64;
 
         for i in 0..nfds {
-            let base = match fds_ptr.checked_add((i * 8) as u64) {
-                Some(a) => a,
-                None => return NEG_EFAULT,
-            };
-            let mut pfd = [0u8; 8];
-            if crate::mm::user_mem::copy_from_user(&mut pfd, base).is_err() {
-                return NEG_EFAULT;
-            }
-            let fd = i32::from_ne_bytes([pfd[0], pfd[1], pfd[2], pfd[3]]);
-            let events = i16::from_ne_bytes([pfd[4], pfd[5]]);
+            let events = i16::from_ne_bytes([pfds[i][4], pfds[i][5]]);
+            let fd = i32::from_ne_bytes([pfds[i][0], pfds[i][1], pfds[i][2], pfds[i][3]]);
             let mut revents: i16 = 0;
 
-            if fd >= 0 && (fd as usize) < MAX_FDS {
-                if let Some(entry) = current_fd_entry(fd as usize) {
-                    match &entry.backend {
-                        FdBackend::PipeRead { pipe_id } => {
-                            // Check if pipe has data or is EOF.
-                            let mut tmp = [0u8; 0];
-                            match crate::pipe::pipe_read(*pipe_id, &mut tmp) {
-                                Ok(_) => revents = events & POLLIN,      // EOF (data ready)
-                                Err(true) => {}                          // would block (not ready)
-                                Err(false) => revents = events & POLLIN, // impossible for read
-                            }
-                        }
-                        FdBackend::DeviceTTY { .. } | FdBackend::Stdin => {
-                            if crate::stdin::has_data() {
-                                revents = events & POLLIN;
-                            }
-                        }
-                        FdBackend::Socket { handle } => {
-                            const POLLOUT: i16 = 0x004;
-                            const POLLHUP: i16 = 0x010;
-                            let h = *handle;
-                            if let Some((readable, writable, closed)) = crate::net::with_socket(
-                                h,
-                                |s| {
-                                    let readable = match s.protocol {
-                                        crate::net::SocketProtocol::Tcp => {
-                                            if let Some(tcp_idx) = s.tcp_slot {
-                                                // Listening socket: POLLIN when a
-                                                // connection is ready to accept.
-                                                if matches!(
-                                                    s.state,
-                                                    crate::net::SocketState::Listening
-                                                ) {
-                                                    matches!(
-                                                        crate::net::tcp::state(tcp_idx),
-                                                        crate::net::tcp::TcpState::Established
-                                                            | crate::net::tcp::TcpState::CloseWait
-                                                    )
-                                                } else {
-                                                    crate::net::tcp::has_recv_data(tcp_idx)
-                                                        || matches!(
-                                                            crate::net::tcp::state(tcp_idx),
-                                                            crate::net::tcp::TcpState::CloseWait
-                                                                | crate::net::tcp::TcpState::Closed
-                                                                | crate::net::tcp::TcpState::TimeWait
-                                                        )
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        crate::net::SocketProtocol::Udp => {
-                                            crate::net::udp::has_data(s.local_port)
-                                        }
-                                        crate::net::SocketProtocol::Icmp => {
-                                            crate::net::icmp::PING_REPLY_RECEIVED
-                                                .load(core::sync::atomic::Ordering::Acquire)
-                                        }
-                                    };
-                                    let writable = match s.protocol {
-                                        crate::net::SocketProtocol::Tcp => {
-                                            s.tcp_slot.is_some()
-                                                && matches!(
-                                                    s.state,
-                                                    crate::net::SocketState::Connected
-                                                )
-                                        }
-                                        _ => true, // UDP/ICMP always writable
-                                    };
-                                    let closed = matches!(s.state, crate::net::SocketState::Closed);
-                                    (readable, writable, closed)
-                                },
-                            ) {
-                                if readable && events & POLLIN != 0 {
-                                    revents |= POLLIN;
-                                }
-                                if writable && events & POLLOUT != 0 {
-                                    revents |= POLLOUT;
-                                }
-                                if closed {
-                                    revents |= POLLHUP;
-                                }
-                            }
-                        }
-                        FdBackend::PtyMaster { pty_id } => {
-                            const POLLOUT: i16 = 0x004;
-                            const POLLHUP: i16 = 0x010;
-                            const POLLNVAL: i16 = 0x020;
-                            let id = *pty_id;
-                            let table = crate::pty::PTY_TABLE.lock();
-                            if let Some(slot) = table.get(id as usize) {
-                                if let Some(pair) = slot.as_ref() {
-                                    // POLLIN: slave wrote data to s2m buffer.
-                                    if !pair.s2m.is_empty() && events & POLLIN != 0 {
-                                        revents |= POLLIN;
-                                    }
-                                    // POLLHUP: slave side fully closed.
-                                    if pair.slave_refcount == 0 && pair.slave_opened {
-                                        revents |= POLLHUP;
-                                        if events & POLLIN != 0 {
-                                            revents |= POLLIN;
-                                        }
-                                    }
-                                    // POLLOUT: m2s buffer has space.
-                                    if !pair.m2s.is_full() && events & POLLOUT != 0 {
-                                        revents |= POLLOUT;
-                                    }
-                                } else {
-                                    revents |= POLLHUP;
-                                }
-                            } else {
-                                revents |= POLLNVAL;
-                            }
-                        }
-                        _ => {
-                            // Optimistic: report writable fds as ready.
-                            revents = events;
-                        }
-                    }
+            if fd >= 0 {
+                if let Some(entry) = &entries[i] {
+                    let ready = fd_poll_events(entry);
+                    // Report only events the caller asked for, plus unconditional ones.
+                    revents = (ready & events) | (ready & (POLLHUP | POLLERR));
                 } else {
-                    revents = 0x020; // POLLNVAL
+                    revents = POLLNVAL;
                 }
-            } else if fd >= 0 {
-                revents = 0x020; // POLLNVAL
             }
 
             if revents != 0 {
                 ready_count += 1;
             }
-            pfd[6..8].copy_from_slice(&revents.to_ne_bytes());
-            if crate::mm::user_mem::copy_to_user(base, &pfd).is_err() {
-                return NEG_EFAULT;
-            }
+            pfds[i][6..8].copy_from_slice(&revents.to_ne_bytes());
         }
 
-        if ready_count > 0 || timeout_i == 0 {
+        // Fast path: something ready, non-blocking poll, or timeout expired.
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if ready_count > 0 || timeout_i == 0 || timed_out {
+            // Write results back to userspace.
+            for i in 0..nfds {
+                let base = match fds_ptr.checked_add((i * 8) as u64) {
+                    Some(a) => a,
+                    None => return NEG_EFAULT,
+                };
+                if crate::mm::user_mem::copy_to_user(base, &pfds[i]).is_err() {
+                    return NEG_EFAULT;
+                }
+            }
             return ready_count;
         }
 
-        // No fds ready and timeout != 0: yield and retry.
         if has_pending_signal() {
             return NEG_EINTR;
         }
-        crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
+
+        // Nothing ready — register on all FD wait queues and block.
+        let task_id = match crate::task::scheduler::current_task_id() {
+            Some(id) => id,
+            None => return NEG_EINTR,
+        };
+        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+        let mut registered_any = false;
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i]
+                && fd_register_waiter(entry, task_id, &woken)
+            {
+                registered_any = true;
+            }
+        }
+
+        // If no FDs could be registered (all non-pollable), yield to avoid
+        // blocking forever with no wake source.
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
+        }
+
+        // Re-check readiness after registration to close the TOCTOU window.
+        // If an event arrived between the first scan and registration, the
+        // woken flag may not be set, so we must re-scan before blocking.
+        let mut any_ready = false;
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i] {
+                let events = i16::from_ne_bytes([pfds[i][4], pfds[i][5]]);
+                let ready = fd_poll_events(entry);
+                if (ready & events) != 0 || (ready & (POLLHUP | POLLERR)) != 0 {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+
+        if any_ready {
+            // Something became ready — deregister and re-scan on next loop iteration.
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            continue;
+        }
+
+        // Block until woken by an FD event. For positive timeouts, use
+        // yield instead of full block so the tick counter advances and the
+        // deadline check at the top of the loop can fire.
+        if deadline_tick.is_some() {
+            // Positive timeout: yield once to let timer ticks advance.
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (-1): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for i in 0..nfds {
+                if let Some(entry) = &entries[i] {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+        }
+
+        // Re-scan on next iteration of the loop.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
+// ---------------------------------------------------------------------------
+
+/// Read an fd_set bitmap from userspace. Returns a 32-bit mask (one bit per FD).
+fn read_fd_set(ptr: u64, nfds: usize) -> Result<u32, u64> {
+    if ptr == 0 {
+        return Ok(0);
+    }
+    // fd_set is 128 bytes (1024 bits). We only need the first 4 bytes (32 FDs).
+    let mut buf = [0u8; 4];
+    if crate::mm::user_mem::copy_from_user(&mut buf, ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let mask = u32::from_ne_bytes(buf);
+    // Clear bits beyond nfds. Handle nfds >= 32 without shift overflow.
+    let keep = if nfds >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << nfds) - 1
+    };
+    Ok(mask & keep)
+}
+
+/// Write an fd_set bitmap back to userspace.
+fn write_fd_set(ptr: u64, mask: u32) -> Result<(), u64> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    // Zero the entire 128-byte fd_set, then write our 4 bytes.
+    let zero = [0u8; 128];
+    if crate::mm::user_mem::copy_to_user(ptr, &zero).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let buf = mask.to_ne_bytes();
+    if crate::mm::user_mem::copy_to_user(ptr, &buf).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    Ok(())
+}
+
+/// select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
+fn sys_select(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> u64 {
+    // Parse timeval timeout: NULL = block indefinitely, {0,0} = non-blocking.
+    let timeout_ms: Option<u64> = if timeout_ptr == 0 {
+        None
+    } else {
+        let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
+        if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+        let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return NEG_EINVAL;
+        }
+        Some(sec as u64 * 1000 + usec as u64 / 1000)
+    };
+    select_inner(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ms)
+}
+
+/// Shared select implementation used by both select() and pselect6().
+#[allow(clippy::needless_range_loop)]
+fn select_inner(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ms: Option<u64>,
+) -> u64 {
+    let nfds = (nfds as usize).min(MAX_FDS);
+
+    // Read fd_set bitmaps.
+    let read_mask = match read_fd_set(readfds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let write_mask = match read_fd_set(writefds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let except_mask = match read_fd_set(exceptfds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = timeout_ms
+        .filter(|&ms| ms > 0)
+        .map(|ms| start_tick + ms.div_ceil(10));
+    let nonblocking = timeout_ms == Some(0);
+
+    let combined = read_mask | write_mask | except_mask;
+    if combined == 0 && nonblocking {
+        // No FDs and non-blocking → return immediately.
+        return 0;
+    }
+
+    // Collect FD entries.
+    let mut entries: [Option<FdEntry>; 32] = [const { None }; 32];
+    for fd in 0..nfds {
+        if combined & (1 << fd) != 0 {
+            entries[fd] = current_fd_entry(fd);
+        }
+    }
+
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
+
+    loop {
+        let mut r_out: u32 = 0;
+        let mut w_out: u32 = 0;
+        let mut e_out: u32 = 0;
+
+        for fd in 0..nfds {
+            let bit = 1u32 << fd;
+            if combined & bit == 0 {
+                continue;
+            }
+            if let Some(entry) = &entries[fd] {
+                let ready = fd_poll_events(entry);
+                if read_mask & bit != 0 && ready & POLLIN != 0 {
+                    r_out |= bit;
+                }
+                if write_mask & bit != 0 && ready & POLLOUT != 0 {
+                    w_out |= bit;
+                }
+                if except_mask & bit != 0 && ready & POLLERR != 0 {
+                    e_out |= bit;
+                }
+            } else {
+                return NEG_EBADF;
+            }
+        }
+
+        let total = (r_out.count_ones() + w_out.count_ones() + e_out.count_ones()) as u64;
+
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if total > 0 || nonblocking || timed_out {
+            // Write results back.
+            if let Err(e) = write_fd_set(readfds_ptr, r_out) {
+                return e;
+            }
+            if let Err(e) = write_fd_set(writefds_ptr, w_out) {
+                return e;
+            }
+            if let Err(e) = write_fd_set(exceptfds_ptr, e_out) {
+                return e;
+            }
+            return total;
+        }
+
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+
+        // Block on wait queues.
+        let task_id = match crate::task::scheduler::current_task_id() {
+            Some(id) => id,
+            None => return NEG_EINTR,
+        };
+        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut registered_any = false;
+        for fd in 0..nfds {
+            if let Some(entry) = &entries[fd]
+                && combined & (1 << fd) != 0
+                && fd_register_waiter(entry, task_id, &woken)
+            {
+                registered_any = true;
+            }
+        }
+
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
+        }
+
+        // Re-check readiness after registration to close the TOCTOU window.
+        let mut any_ready = false;
+        for fd in 0..nfds {
+            if let Some(entry) = &entries[fd]
+                && combined & (1 << fd) != 0
+            {
+                let ready = fd_poll_events(entry);
+                if (ready & POLLIN) != 0
+                    || (ready & POLLOUT) != 0
+                    || (ready & (POLLHUP | POLLERR)) != 0
+                {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+        if any_ready {
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            continue;
+        }
+
+        if deadline_tick.is_some() {
+            // Positive timeout: yield to let timer ticks advance.
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (NULL): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for fd in 0..nfds {
+                if let Some(entry) = &entries[fd]
+                    && combined & (1 << fd) != 0
+                {
+                    fd_deregister_waiter(entry, task_id);
+                }
+            }
+        }
+    }
+}
+
+/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_ptr) — syscall 270
+///
+/// Modern variant of select with timespec timeout and signal mask.
+/// Signal mask is accepted but not applied (no signal masking yet).
+fn sys_pselect6(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> u64 {
+    // pselect6 uses timespec {tv_sec, tv_nsec}. Parse to timeout_ms without
+    // mutating user memory. The 6th arg (sigmask) is ignored.
+    let timeout_ms: Option<u64> = if timeout_ptr != 0 {
+        let mut ts = [0u8; 16];
+        if crate::mm::user_mem::copy_from_user(&mut ts, timeout_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+        let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return NEG_EINVAL;
+        }
+        Some(sec as u64 * 1000 + nsec as u64 / 1_000_000)
+    } else {
+        None // block indefinitely
+    };
+    select_inner(nfds, readfds_ptr, writefds_ptr, exceptfds_ptr, timeout_ms)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: epoll interface — syscalls 291, 233, 232
+// ---------------------------------------------------------------------------
+
+const MAX_EPOLL_INSTANCES: usize = 16;
+const MAX_EPOLL_INTEREST: usize = 32;
+
+#[allow(dead_code)]
+const EPOLLIN: u32 = 0x001;
+#[allow(dead_code)]
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+
+const EPOLL_CLOEXEC: u64 = 0x80000;
+
+/// An entry in the epoll interest list: which FD to monitor and for what events.
+#[derive(Clone)]
+struct EpollInterest {
+    fd: usize,
+    events: u32,
+    data: u64,
+}
+
+/// An epoll instance — tracks the interest set (which FDs to monitor).
+/// Blocking in epoll_wait is done by registering on monitored FDs' wait queues.
+struct EpollInstance {
+    interests: alloc::vec::Vec<EpollInterest>,
+    refcount: u32,
+    owner_pid: crate::process::Pid,
+}
+
+impl EpollInstance {
+    fn new(pid: crate::process::Pid) -> Self {
+        Self {
+            interests: alloc::vec::Vec::new(),
+            refcount: 1,
+            owner_pid: pid,
+        }
+    }
+}
+
+static EPOLL_TABLE: spin::Mutex<[Option<EpollInstance>; MAX_EPOLL_INSTANCES]> = {
+    const NONE: Option<EpollInstance> = None;
+    spin::Mutex::new([NONE; MAX_EPOLL_INSTANCES])
+};
+
+/// Public entry point for epoll_free (called from close_cloexec_fds / close_all_fds).
+pub fn epoll_free_pub(instance_id: usize) {
+    epoll_free(instance_id);
+}
+
+/// Public entry point for epoll_add_ref (called from add_fd_refs on fork/dup).
+pub fn epoll_add_ref_pub(instance_id: usize) {
+    epoll_add_ref(instance_id);
+}
+
+/// Decrement epoll instance refcount; free when it reaches zero.
+fn epoll_free(instance_id: usize) {
+    let mut table = EPOLL_TABLE.lock();
+    if let Some(inst) = table.get_mut(instance_id).and_then(|slot| slot.as_mut()) {
+        inst.refcount = inst.refcount.saturating_sub(1);
+        if inst.refcount == 0 {
+            table[instance_id] = None;
+        }
+    }
+}
+
+/// Increment epoll instance refcount (called on dup/fork).
+fn epoll_add_ref(instance_id: usize) {
+    let mut table = EPOLL_TABLE.lock();
+    if let Some(inst) = table.get_mut(instance_id).and_then(|slot| slot.as_mut()) {
+        inst.refcount += 1;
+    }
+}
+
+/// Remove an FD from epoll interest lists owned by the current process.
+fn epoll_remove_fd(fd: usize) {
+    let pid = crate::process::current_pid();
+    let mut table = EPOLL_TABLE.lock();
+    for inst in table.iter_mut().flatten() {
+        if inst.owner_pid == pid {
+            inst.interests.retain(|i| i.fd != fd);
+        }
+    }
+}
+
+/// epoll_create1(flags) — syscall 291
+fn sys_epoll_create1(flags: u64) -> u64 {
+    // Reject unknown flags.
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return NEG_EINVAL;
+    }
+    let cloexec = flags & EPOLL_CLOEXEC != 0;
+
+    // Allocate an instance.
+    let pid = crate::process::current_pid();
+    let instance_id = {
+        let mut table = EPOLL_TABLE.lock();
+        let mut found = None;
+        for (i, slot) in table.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(EpollInstance::new(pid));
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(id) => id,
+            None => return NEG_ENOMEM,
+        }
+    };
+
+    let entry = FdEntry {
+        backend: FdBackend::Epoll { instance_id },
+        offset: 0,
+        readable: true,
+        writable: false,
+        cloexec,
+        nonblock: false,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            epoll_free(instance_id);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// epoll_ctl(epfd, op, fd, event_ptr) — syscall 233
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+    let epfd_idx = epfd as usize;
+    let fd_idx = fd as usize;
+    if epfd_idx >= MAX_FDS || fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    // Reject adding an epoll FD to itself (Linux returns EINVAL for this).
+    if epfd_idx == fd_idx {
+        return NEG_EINVAL;
+    }
+
+    // Get the epoll instance ID from the FD.
+    let instance_id = match current_fd_entry(epfd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::Epoll { instance_id } => instance_id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+
+    // Verify target FD exists and is not an epoll FD.
+    match current_fd_entry(fd_idx) {
+        Some(e) => {
+            if matches!(e.backend, FdBackend::Epoll { .. }) {
+                return NEG_EINVAL; // epoll FDs cannot be monitored
+            }
+        }
+        None => return NEG_EBADF,
+    }
+
+    // Read epoll_event from userspace: packed { events: u32, data: u64 } = 12 bytes
+    let (events, data) = if op != EPOLL_CTL_DEL {
+        if event_ptr == 0 {
+            return NEG_EFAULT;
+        }
+        let mut ev = [0u8; 12];
+        if crate::mm::user_mem::copy_from_user(&mut ev, event_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let events = u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]);
+        let data = u64::from_ne_bytes([ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11]]);
+        (events, data)
+    } else {
+        (0, 0)
+    };
+
+    let mut table = EPOLL_TABLE.lock();
+    let inst = match table.get_mut(instance_id).and_then(|s| s.as_mut()) {
+        Some(i) => i,
+        None => return NEG_EBADF,
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            // Check for duplicate.
+            if inst.interests.iter().any(|i| i.fd == fd_idx) {
+                return NEG_EEXIST;
+            }
+            if inst.interests.len() >= MAX_EPOLL_INTEREST {
+                return NEG_ENOMEM;
+            }
+            inst.interests.push(EpollInterest {
+                fd: fd_idx,
+                events,
+                data,
+            });
+            0
+        }
+        EPOLL_CTL_MOD => {
+            if let Some(entry) = inst.interests.iter_mut().find(|i| i.fd == fd_idx) {
+                entry.events = events;
+                entry.data = data;
+                0
+            } else {
+                const NEG_ENOENT: u64 = (-2_i64) as u64;
+                NEG_ENOENT
+            }
+        }
+        EPOLL_CTL_DEL => {
+            let before = inst.interests.len();
+            inst.interests.retain(|i| i.fd != fd_idx);
+            if inst.interests.len() == before {
+                const NEG_ENOENT: u64 = (-2_i64) as u64;
+                NEG_ENOENT
+            } else {
+                0
+            }
+        }
+        _ => NEG_EINVAL,
+    }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout) — syscall 232
+fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let maxevents = (maxevents as usize).min(MAX_EPOLL_INTEREST);
+    if maxevents == 0 {
+        return NEG_EINVAL;
+    }
+    let timeout_i = timeout as i64;
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = if timeout_i > 0 {
+        Some(start_tick + (timeout_i as u64).div_ceil(10))
+    } else {
+        None
+    };
+
+    let epfd_idx = epfd as usize;
+    if epfd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let instance_id = match current_fd_entry(epfd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::Epoll { instance_id } => instance_id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
+
+    loop {
+        // Scan interest list for ready FDs.
+        let mut out_count = 0usize;
+        let interests = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(instance_id).and_then(|s| s.as_ref()) {
+                Some(inst) => inst.interests.clone(),
+                None => return NEG_EBADF,
+            }
+        };
+
+        for interest in &interests {
+            if out_count >= maxevents {
+                break;
+            }
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                let ready = fd_poll_events(&entry);
+                let ready_u32 = ready as u16 as u32;
+                let matched = ready_u32 & interest.events;
+                // Also report unconditional events.
+                let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
+                if matched != 0 || unconditional != 0 {
+                    // Write epoll_event to userspace: packed { events: u32, data: u64 } = 12 bytes
+                    let base = match events_ptr.checked_add((out_count * 12) as u64) {
+                        Some(a) => a,
+                        None => return NEG_EFAULT,
+                    };
+                    let ev_out = (matched | unconditional).to_ne_bytes();
+                    let data_out = interest.data.to_ne_bytes();
+                    let mut buf = [0u8; 12];
+                    buf[0..4].copy_from_slice(&ev_out);
+                    buf[4..12].copy_from_slice(&data_out);
+                    if crate::mm::user_mem::copy_to_user(base, &buf).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    out_count += 1;
+                }
+            }
+        }
+
+        let timed_out =
+            deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
+        if out_count > 0 || timeout_i == 0 || timed_out {
+            return out_count as u64;
+        }
+
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+
+        // If the interest list is empty, there's nothing to wait on.
+        // Return 0 immediately rather than blocking forever.
+        if interests.is_empty() {
+            return 0;
+        }
+
+        // Block on each monitored FD's wait queue so we wake on events.
+        let task_id = match crate::task::scheduler::current_task_id() {
+            Some(id) => id,
+            None => return NEG_EINTR,
+        };
+        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let mut registered_any = false;
+        for interest in &interests {
+            if let Some(entry) = current_fd_entry(interest.fd)
+                && fd_register_waiter(&entry, task_id, &woken)
+            {
+                registered_any = true;
+            }
+        }
+
+        // If no pollable FDs were registered, yield once to avoid infinite blocking.
+        if !registered_any {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            continue;
+        }
+
+        // Re-check readiness after registration (TOCTOU).
+        let mut any_ready = false;
+        for interest in &interests {
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                let ready = fd_poll_events(&entry);
+                let ready_u32 = ready as u16 as u32;
+                if (ready_u32 & interest.events) != 0 || (ready_u32 & (EPOLLHUP | EPOLLERR)) != 0 {
+                    any_ready = true;
+                    break;
+                }
+            }
+        }
+        if any_ready {
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
+            }
+            continue;
+        }
+
+        if deadline_tick.is_some() {
+            // Positive timeout: yield to let timer ticks advance.
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
+            }
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+        } else {
+            // Indefinite timeout (-1): block on wait queues.
+            crate::task::scheduler::block_current_unless_woken(&woken);
+            restore_caller_context(pid, saved_user_rsp);
+            for interest in &interests {
+                if let Some(entry) = current_fd_entry(interest.fd) {
+                    fd_deregister_waiter(&entry, task_id);
+                }
+            }
+        }
     }
 }
