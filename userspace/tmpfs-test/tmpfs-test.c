@@ -33,11 +33,15 @@ static void fail(const char *name, const char *reason) {
 }
 
 static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t *out_len) {
+    if (buf_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return -1;
     }
-    ssize_t n = read(fd, buf, buf_size);
+    ssize_t n = read(fd, buf, buf_size - 1);
     close(fd);
     if (n < 0) {
         return -1;
@@ -45,9 +49,7 @@ static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t 
     if (out_len) {
         *out_len = n;
     }
-    if ((size_t)n < buf_size) {
-        buf[n] = '\0';
-    }
+    buf[n] = '\0';
     return 0;
 }
 
@@ -228,6 +230,8 @@ static void test_symlink_semantics(void) {
     const char *target_path = "/tmp/target.txt";
     const char *link_path = "/tmp/link.txt";
     const char *target_text = "through symlink";
+    const size_t target_path_len = sizeof("/tmp/target.txt") - 1;
+    const size_t target_text_len = sizeof("through symlink") - 1;
     char link_buf[128];
     struct stat st;
 
@@ -236,7 +240,7 @@ static void test_symlink_semantics(void) {
         fail("symlink: create target", "open returned < 0");
         return;
     }
-    if (write(fd, target_text, strlen(target_text)) != (ssize_t)strlen(target_text)) {
+    if (write(fd, target_text, target_text_len) != (ssize_t)target_text_len) {
         fail("symlink: write target", "short write");
         close(fd);
         return;
@@ -253,7 +257,7 @@ static void test_symlink_semantics(void) {
         fail("symlink: readlink", "readlink returned < 0");
         return;
     }
-    if ((size_t)n != strlen(target_path)) {
+    if ((size_t)n != target_path_len) {
         fail("symlink: readlink length", "wrong target length");
         return;
     }
@@ -271,7 +275,7 @@ static void test_symlink_semantics(void) {
         fail("symlink: lstat mode", "path is not reported as a symlink");
         return;
     }
-    if ((size_t)st.st_size != strlen(target_path)) {
+    if ((size_t)st.st_size != target_path_len) {
         fail("symlink: lstat size", "symlink size is not target length");
         return;
     }
@@ -284,7 +288,7 @@ static void test_symlink_semantics(void) {
         fail("symlink: stat mode", "stat did not follow symlink to file");
         return;
     }
-    if ((size_t)st.st_size != strlen(target_text)) {
+    if ((size_t)st.st_size != target_text_len) {
         fail("symlink: stat size", "stat did not report target file size");
         return;
     }
@@ -297,11 +301,11 @@ static void test_symlink_semantics(void) {
     memset(link_buf, 0, sizeof(link_buf));
     n = read(fd, link_buf, sizeof(link_buf));
     close(fd);
-    if (n != (ssize_t)strlen(target_text)) {
+    if (n != (ssize_t)target_text_len) {
         fail("symlink: open link length", "wrong byte count");
         return;
     }
-    if (memcmp(link_buf, target_text, strlen(target_text)) != 0) {
+    if (memcmp(link_buf, target_text, target_text_len) != 0) {
         fail("symlink: open link content", "did not read target file data");
         return;
     }
@@ -369,7 +373,7 @@ static void test_symlink_chain_and_loops(void) {
         char target[32];
         snprintf(name, sizeof(name), "/tmp/hop-%02d", i);
         if (i == 40) {
-            strcpy(target, target_path); /* DevSkim: ignore DS148264 — bounded copy into fixed buffer */
+            snprintf(target, sizeof(target), "%s", target_path);
         } else {
             snprintf(target, sizeof(target), "/tmp/hop-%02d", i + 1);
         }
@@ -391,6 +395,7 @@ static void test_hard_links(void) {
     const char *path_a = "/hard-a.txt";
     const char *path_b = "/hard-b.txt";
     const char *payload = "linked data";
+    const size_t payload_len = sizeof("linked data") - 1;
     char buf[64];
     struct stat st_a;
     struct stat st_b;
@@ -400,7 +405,7 @@ static void test_hard_links(void) {
         fail("hard-link: create", "open returned < 0");
         return;
     }
-    if (write(fd, payload, strlen(payload)) != (ssize_t)strlen(payload)) {
+    if (write(fd, payload, payload_len) != (ssize_t)payload_len) {
         fail("hard-link: write", "short write");
         close(fd);
         return;
@@ -430,8 +435,8 @@ static void test_hard_links(void) {
         return;
     }
     memset(buf, 0, sizeof(buf));
-    if (read(fd, buf, sizeof(buf)) != (ssize_t)strlen(payload) ||
-        memcmp(buf, payload, strlen(payload)) != 0) {
+    if (read(fd, buf, sizeof(buf)) != (ssize_t)payload_len ||
+        memcmp(buf, payload, payload_len) != 0) {
         fail("hard-link: survivor content", "remaining link lost file contents");
         close(fd);
         return;
@@ -455,43 +460,43 @@ static void test_procfs_and_devices(void) {
     char buf[4097];
     ssize_t n = 0;
 
-    if (read_file_into("/proc/self/status", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/self/status", buf, sizeof(buf), &n) != 0 ||
         strstr(buf, "Pid:\t") == NULL || strstr(buf, "Name:\t") == NULL) {
         fail("procfs: status", "missing status fields");
         return;
     }
 
-    if (read_file_into("/proc/meminfo", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/meminfo", buf, sizeof(buf), &n) != 0 ||
         strstr(buf, "MemTotal:") == NULL || strstr(buf, "MemFree:") == NULL) {
         fail("procfs: meminfo", "missing meminfo lines");
         return;
     }
 
-    if (read_file_into("/proc/self/maps", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/self/maps", buf, sizeof(buf), &n) != 0 ||
         strstr(buf, "[stack]") == NULL) {
         fail("procfs: maps", "maps output missing stack mapping");
         return;
     }
 
-    if (read_file_into("/proc/stat", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/stat", buf, sizeof(buf), &n) != 0 ||
         strncmp(buf, "cpu ", 4) != 0) {
         fail("procfs: stat", "missing aggregate CPU line");
         return;
     }
 
-    if (read_file_into("/proc/version", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/version", buf, sizeof(buf), &n) != 0 ||
         strstr(buf, "m3OS version") == NULL) {
         fail("procfs: version", "missing version string");
         return;
     }
 
-    if (read_file_into("/proc/mounts", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/mounts", buf, sizeof(buf), &n) != 0 ||
         strstr(buf, "/proc") == NULL) {
         fail("procfs: mounts", "missing proc mount");
         return;
     }
 
-    if (read_file_into("/proc/uptime", buf, sizeof(buf) - 1, &n) != 0 ||
+    if (read_file_into("/proc/uptime", buf, sizeof(buf), &n) != 0 ||
         strchr(buf, '.') == NULL) {
         fail("procfs: uptime", "uptime did not contain a decimal value");
         return;
@@ -518,6 +523,7 @@ static void test_procfs_and_devices(void) {
     }
     int saw_self = 0;
     int saw_pid = 0;
+    int saw_meminfo = 0;
     char pid_buf[16];
     snprintf(pid_buf, sizeof(pid_buf), "%d", getpid());
     for (struct dirent *ent = readdir(dir); ent != NULL; ent = readdir(dir)) {
@@ -527,10 +533,13 @@ static void test_procfs_and_devices(void) {
         if (strcmp(ent->d_name, pid_buf) == 0) {
             saw_pid = 1;
         }
+        if (strcmp(ent->d_name, "meminfo") == 0) {
+            saw_meminfo = 1;
+        }
     }
     closedir(dir);
-    if (!saw_self || !saw_pid) {
-        fail("procfs: directory listing", "missing self or pid entry");
+    if (!saw_self || !saw_pid || !saw_meminfo) {
+        fail("procfs: directory listing", "missing self, pid, or top-level proc entry");
         return;
     }
 

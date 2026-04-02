@@ -142,8 +142,14 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
 pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
     let path = trim_proc_path(abs_path);
     if path == "/proc" {
-        let mut entries = Vec::new();
-        entries.push((String::from("self"), false));
+        let mut entries = alloc::vec![
+            (String::from("self"), false),
+            (String::from("meminfo"), false),
+            (String::from("stat"), false),
+            (String::from("uptime"), false),
+            (String::from("version"), false),
+            (String::from("mounts"), false),
+        ];
         let table = PROCESS_TABLE.lock();
         let mut pids: Vec<u32> = table.iter().map(|proc| proc.pid).collect();
         drop(table);
@@ -311,7 +317,7 @@ fn render_mounts() -> String {
     out.push_str(root_fs);
     out.push_str("proc /proc proc rw 0 0\n");
     out.push_str("tmpfs /tmp tmpfs rw 0 0\n");
-    out.push_str("devtmpfs /dev devtmpfs rw 0 0\n");
+    out.push_str("dev /dev ramfs rw 0 0\n");
     if crate::fs::fat32::is_mounted() {
         out.push_str("/dev/vda1 /data vfat rw 0 0\n");
     }

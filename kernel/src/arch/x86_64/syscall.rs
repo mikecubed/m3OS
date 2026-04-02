@@ -5295,8 +5295,14 @@ fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EFAULT,
     };
-    let cwd = current_cwd();
-    let abs = resolve_path(&cwd, raw);
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let abs = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     if !statfs_path_exists(&abs) {
         return NEG_ENOENT;
     }
