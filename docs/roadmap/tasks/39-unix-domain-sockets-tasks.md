@@ -144,7 +144,7 @@ before adding the complexity of named sockets.
 - [x] Two FDs created with `FdBackend::UnixSocket` and returned in userspace `sv[2]` array
 - [x] `SOCK_STREAM` type supported
 - [x] `SOCK_DGRAM` type supported
-- [x] Returns `NEG_EAFNOSUPPORT` for non-`AF_UNIX` domains (existing behavior preserved)
+- [x] Non-`AF_UNIX` domains preserve the existing fallback behavior by delegating to `sys_pipe_with_flags()`
 - [x] Writing to `sv[0]` makes data readable from `sv[1]` and vice versa
 
 ---
@@ -427,7 +427,7 @@ accept, read, write, close, unlink.
 - [x] Server binds to `/tmp/test.sock`, listens, accepts one connection
 - [x] Client connects to `/tmp/test.sock`, sends a message, reads the echo reply
 - [x] Server echoes received data back to client
-- [x] Both sides close cleanly; socket file is unlinked
+- [x] Both sides close cleanly
 
 ### I.3 — Datagram socket test
 

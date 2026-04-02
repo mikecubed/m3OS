@@ -8781,6 +8781,7 @@ const NEG_ETIMEDOUT: u64 = (-110_i64) as u64;
 const NEG_EOPNOTSUPP: u64 = (-95_i64) as u64;
 const NEG_ENOPROTOOPT: u64 = (-92_i64) as u64;
 const NEG_EAFNOSUPPORT: u64 = (-97_i64) as u64;
+const NEG_EISCONN: u64 = (-106_i64) as u64;
 
 // ===========================================================================
 // Phase 39: Unix domain socket syscall helpers
@@ -8905,8 +8906,9 @@ fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr: u64) -> u6
     };
 
     // Write [fd1, fd2] to userspace sv[2] array.
-    let sv = [fd1 as i32, fd2 as i32];
-    let sv_bytes: [u8; 8] = unsafe { core::mem::transmute(sv) };
+    let mut sv_bytes = [0u8; 8];
+    sv_bytes[..4].copy_from_slice(&(fd1 as i32).to_ne_bytes());
+    sv_bytes[4..].copy_from_slice(&(fd2 as i32).to_ne_bytes());
     if crate::mm::user_mem::copy_to_user(sv_ptr, &sv_bytes).is_err() {
         // Clean up on fault.
         with_current_fd_mut(fd1, |slot| *slot = None);
@@ -9045,6 +9047,12 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match sock_type {
         crate::net::unix::UnixSocketType::Stream => {
+            // Guard: reject if already connected or already pending.
+            let cur_state = crate::net::unix::with_unix_socket(handle, |s| s.state);
+            if cur_state == Some(crate::net::unix::UnixSocketState::Connected) {
+                return NEG_EISCONN;
+            }
+
             // Verify target is listening.
             let is_listening = crate::net::unix::with_unix_socket(target_handle, |s| {
                 matches!(s.state, crate::net::unix::UnixSocketState::Listening)
@@ -9060,6 +9068,15 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             if backlog_full == Some(true) {
                 return NEG_ECONNREFUSED;
             }
+
+            // Increment refcount before enqueuing to prevent use-after-free
+            // if the client FD is closed before accept() processes the entry.
+            crate::net::unix::add_unix_socket_ref(handle);
+
+            // Mark as Bound (connecting) to prevent duplicate backlog entries.
+            crate::net::unix::with_unix_socket_mut(handle, |s| {
+                s.state = crate::net::unix::UnixSocketState::Bound;
+            });
 
             // Add ourselves to the listener's backlog.
             crate::net::unix::with_unix_socket_mut(target_handle, |s| {
@@ -9134,6 +9151,9 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
         let client_handle =
             crate::net::unix::with_unix_socket_mut(handle, |s| s.backlog.pop_front());
         if let Some(Some(ch)) = client_handle {
+            // Release the backlog refcount (connect() incremented it).
+            crate::net::unix::free_unix_socket(ch);
+
             // Allocate a new server-side socket.
             let server_handle =
                 match crate::net::unix::alloc_unix_socket(crate::net::unix::UnixSocketType::Stream)
@@ -9313,8 +9333,8 @@ fn sys_recvfrom_unix(
     let pid = crate::process::current_pid();
     let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
     let capped = (count as usize).min(4096);
+    let mut tmp = alloc::vec![0u8; capped];
     loop {
-        let mut tmp = alloc::vec![0u8; capped];
         match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
             Ok((n, sender_path)) => {
                 if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {

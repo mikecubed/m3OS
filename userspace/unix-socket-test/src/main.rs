@@ -7,8 +7,8 @@
 
 use syscall_lib::{
     AF_UNIX, SHUT_WR, SOCK_DGRAM, SOCK_STREAM, SockaddrUn, accept, bind_unix, close, connect_unix,
-    exit, fork, listen, read, recvfrom_unix, sendto_unix, shutdown, socket, socketpair, write,
-    write_str,
+    exit, fork, listen, read, recvfrom_unix, sendto_unix, shutdown, socket, socketpair, unlink,
+    write, write_str,
 };
 
 fn print(s: &[u8]) {
@@ -141,6 +141,8 @@ fn test_named_stream() -> bool {
         return false;
     }
 
+    // Unlink stale socket from prior run.
+    let _ = unlink(b"/tmp/test.sock\0");
     let addr = SockaddrUn::new("/tmp/test.sock");
     let ret = bind_unix(server_fd as i32, &addr);
     if ret < 0 {
@@ -237,6 +239,8 @@ fn test_datagram() -> bool {
         return false;
     }
 
+    // Unlink stale socket from prior run.
+    let _ = unlink(b"/tmp/dgram.sock\0");
     let recv_addr = SockaddrUn::new("/tmp/dgram.sock");
     let ret = bind_unix(recv_fd as i32, &recv_addr);
     if ret < 0 {

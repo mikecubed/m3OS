@@ -303,14 +303,19 @@ pub fn unix_stream_write(handle: usize, data: &[u8]) -> Result<usize, i64> {
 /// Read data from a stream socket's own recv_buf.
 /// Returns the number of bytes read (0 = EOF).
 pub fn unix_stream_read(handle: usize, buf: &mut [u8]) -> Result<usize, i64> {
-    let (n, peer, peer_shut_wr) = with_unix_socket_mut(handle, |s| {
+    let (n, peer, state, shut_rd) = with_unix_socket_mut(handle, |s| {
         let n = buf.len().min(s.recv_buf.len());
         for (i, byte) in s.recv_buf.drain(..n).enumerate() {
             buf[i] = byte;
         }
-        (n, s.peer, s.shut_rd)
+        (n, s.peer, s.state, s.shut_rd)
     })
     .ok_or(-9_i64)?; // EBADF
+
+    // Reject reads on unconnected sockets.
+    if !matches!(state, UnixSocketState::Connected) && peer.is_none() && n == 0 {
+        return Err(-107_i64); // ENOTCONN
+    }
 
     // If we read data, wake the peer (space freed in recv_buf).
     if n > 0 {
@@ -321,7 +326,7 @@ pub fn unix_stream_read(handle: usize, buf: &mut [u8]) -> Result<usize, i64> {
     }
 
     // Buffer empty: check for EOF conditions.
-    if peer_shut_wr {
+    if shut_rd {
         return Ok(0); // shut_rd was set, return EOF
     }
 
