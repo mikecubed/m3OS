@@ -353,8 +353,7 @@ pub extern "C" fn syscall_handler(
         4 => sys_linux_fstatat(u64::MAX, arg0, arg1),
         5 => sys_linux_fstat(arg0, arg1),
         6 => sys_linux_fstatat(u64::MAX, arg0, arg1),
-        // Phase 22: poll stub — report all requested fds as ready.
-        // Ion uses poll() to multiplex between signal pipe and stdin.
+        // Phase 37: poll — wait-queue-driven I/O multiplexing.
         7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 36: mprotect(addr, len, prot) — change page permissions.
@@ -372,6 +371,12 @@ pub extern "C" fn syscall_handler(
         20 => sys_linux_writev(arg0, arg1, arg2),
         // Phase 21: access stub (PATH search — check existence only)
         21 => sys_access(arg0),
+        // Phase 37: select(nfds, readfds, writefds, exceptfds, timeout)
+        23 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
         // Phase 14: pipe and dup2
         22 => sys_pipe_with_flags(arg0, false),
         32 => sys_dup(arg0),
@@ -551,6 +556,13 @@ pub extern "C" fn syscall_handler(
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
+        // Phase 37: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
+        270 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            // 6th arg (sigmask) is in r9 — ignored for now.
+            sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
         // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
             let flags = per_core_syscall_arg3();
@@ -8811,4 +8823,211 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
 
         // Re-scan on next iteration of the loop.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
+// ---------------------------------------------------------------------------
+
+/// Read an fd_set bitmap from userspace. Returns a 32-bit mask (one bit per FD).
+fn read_fd_set(ptr: u64, nfds: usize) -> Result<u32, u64> {
+    if ptr == 0 {
+        return Ok(0);
+    }
+    // fd_set is 128 bytes (1024 bits). We only need the first 4 bytes (32 FDs).
+    let mut buf = [0u8; 4];
+    if crate::mm::user_mem::copy_from_user(&mut buf, ptr).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let mask = u32::from_ne_bytes(buf);
+    // Clear bits beyond nfds.
+    Ok(mask & ((1u32 << nfds.min(32)) - 1))
+}
+
+/// Write an fd_set bitmap back to userspace.
+fn write_fd_set(ptr: u64, mask: u32) -> Result<(), u64> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    // Zero the entire 128-byte fd_set, then write our 4 bytes.
+    let zero = [0u8; 128];
+    if crate::mm::user_mem::copy_to_user(ptr, &zero).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    let buf = mask.to_ne_bytes();
+    if crate::mm::user_mem::copy_to_user(ptr, &buf).is_err() {
+        return Err(NEG_EFAULT);
+    }
+    Ok(())
+}
+
+/// select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
+#[allow(clippy::needless_range_loop)]
+fn sys_select(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> u64 {
+    let nfds = (nfds as usize).min(MAX_FDS);
+
+    // Read fd_set bitmaps.
+    let read_mask = match read_fd_set(readfds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let write_mask = match read_fd_set(writefds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let except_mask = match read_fd_set(exceptfds_ptr, nfds) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    // Parse timeout: NULL = block indefinitely, {0,0} = non-blocking poll.
+    let blocking = if timeout_ptr == 0 {
+        true // block indefinitely
+    } else {
+        let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
+        if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+        let usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+        sec != 0 || usec != 0
+    };
+
+    let combined = read_mask | write_mask | except_mask;
+    if combined == 0 && !blocking {
+        // No FDs and non-blocking → return immediately.
+        return 0;
+    }
+
+    // Collect FD entries.
+    let mut entries: [Option<FdEntry>; 32] = [const { None }; 32];
+    for fd in 0..nfds {
+        if combined & (1 << fd) != 0 {
+            entries[fd] = current_fd_entry(fd);
+        }
+    }
+
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
+
+    loop {
+        let mut r_out: u32 = 0;
+        let mut w_out: u32 = 0;
+        let mut e_out: u32 = 0;
+
+        for fd in 0..nfds {
+            let bit = 1u32 << fd;
+            if combined & bit == 0 {
+                continue;
+            }
+            if let Some(entry) = &entries[fd] {
+                let ready = fd_poll_events(entry);
+                if read_mask & bit != 0 && ready & POLLIN != 0 {
+                    r_out |= bit;
+                }
+                if write_mask & bit != 0 && ready & POLLOUT != 0 {
+                    w_out |= bit;
+                }
+                if except_mask & bit != 0 && ready & POLLERR != 0 {
+                    e_out |= bit;
+                }
+            } else {
+                return NEG_EBADF;
+            }
+        }
+
+        let total = (r_out.count_ones() + w_out.count_ones() + e_out.count_ones()) as u64;
+
+        if total > 0 || !blocking {
+            // Write results back.
+            if let Err(e) = write_fd_set(readfds_ptr, r_out) {
+                return e;
+            }
+            if let Err(e) = write_fd_set(writefds_ptr, w_out) {
+                return e;
+            }
+            if let Err(e) = write_fd_set(exceptfds_ptr, e_out) {
+                return e;
+            }
+            return total;
+        }
+
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+
+        // Block on wait queues.
+        let task_id = match crate::task::scheduler::current_task_id() {
+            Some(id) => id,
+            None => return NEG_EINTR,
+        };
+        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        for fd in 0..nfds {
+            if let Some(entry) = &entries[fd]
+                && combined & (1 << fd) != 0
+            {
+                fd_register_waiter(entry, task_id, &woken);
+            }
+        }
+        crate::task::scheduler::block_current_unless_woken(&woken);
+        restore_caller_context(pid, saved_user_rsp);
+        for fd in 0..nfds {
+            if let Some(entry) = &entries[fd]
+                && combined & (1 << fd) != 0
+            {
+                fd_deregister_waiter(entry, task_id);
+            }
+        }
+    }
+}
+
+/// pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_ptr) — syscall 270
+///
+/// Modern variant of select with timespec timeout and signal mask.
+/// Signal mask is accepted but not applied (no signal masking yet).
+fn sys_pselect6(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> u64 {
+    // pselect6 uses timespec {tv_sec, tv_nsec} instead of timeval {tv_sec, tv_usec}.
+    // Both are 16 bytes on x86_64. We convert to the same blocking decision.
+    // The 6th arg (sigmask) is on the stack and we ignore it.
+    let adjusted_timeout_ptr = if timeout_ptr != 0 {
+        // Read timespec and check for zero.
+        let mut ts = [0u8; 16];
+        if crate::mm::user_mem::copy_from_user(&mut ts, timeout_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+        let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+        if sec == 0 && nsec == 0 {
+            // Create a zero timeval on the kernel stack to pass through.
+            // We cheat: reuse the same pointer since select checks {0,0}.
+            timeout_ptr
+        } else {
+            // Non-zero timeout: pass as blocking.
+            // We pass 0 (NULL) to mean "block indefinitely" to reuse select logic,
+            // but timespec blocking with actual timeout would need timer support.
+            // For now, treat any non-zero timeout as blocking.
+            0 // NULL → block indefinitely
+        }
+    } else {
+        0 // NULL → block indefinitely
+    };
+    sys_select(
+        nfds,
+        readfds_ptr,
+        writefds_ptr,
+        exceptfds_ptr,
+        adjusted_timeout_ptr,
+    )
 }
