@@ -110,6 +110,8 @@ static TR_ELF: &[u8] = include_bytes!("../../initrd/tr.elf");
 static SED_ELF: &[u8] = include_bytes!("../../initrd/sed.elf");
 static FILE_ELF: &[u8] = include_bytes!("../../initrd/file.elf");
 static HEXDUMP_ELF: &[u8] = include_bytes!("../../initrd/hexdump.elf");
+static DU_ELF: &[u8] = include_bytes!("../../initrd/du.elf");
+static DF_ELF: &[u8] = include_bytes!("../../initrd/df.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
@@ -336,6 +338,10 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: HEXDUMP_ELF,
         },
     ),
+    ("du", RamdiskNode::File { content: DU_ELF }),
+    ("du.elf", RamdiskNode::File { content: DU_ELF }),
+    ("df", RamdiskNode::File { content: DF_ELF }),
+    ("df.elf", RamdiskNode::File { content: DF_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
@@ -700,6 +706,14 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "hexdump.elf",
         content: HEXDUMP_ELF,
+    },
+    FlatFile {
+        name: "du.elf",
+        content: DU_ELF,
+    },
+    FlatFile {
+        name: "df.elf",
+        content: DF_ELF,
     },
 ];
 

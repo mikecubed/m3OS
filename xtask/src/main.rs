@@ -244,6 +244,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/sed.c", "sed"),
         ("userspace/coreutils/file.c", "file"),
         ("userspace/coreutils/hexdump.c", "hexdump"),
+        ("userspace/coreutils/du.c", "du"),
+        ("userspace/coreutils/df.c", "df"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2550,7 +2552,96 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 13. make clean
+    // 13. Phase 41 file tools: du, df
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -s /home/project\n",
+        label: "du: summarize project directory",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project",
+        timeout_secs: 10,
+        label: "verify du summary path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du summary",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -h -s /home/project\n",
+        label: "du: human-readable summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project",
+        timeout_secs: 10,
+        label: "verify du human-readable path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "K",
+        timeout_secs: 10,
+        label: "verify du human-readable suffix",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du human-readable",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/df\n",
+        label: "df: list mounted filesystems",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mounted on",
+        timeout_secs: 10,
+        label: "verify df header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: " /",
+        timeout_secs: 10,
+        label: "verify df root mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify df proc mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after df",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/df -h\n",
+        label: "df: human-readable output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mounted on",
+        timeout_secs: 10,
+        label: "verify df -h header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: " /",
+        timeout_secs: 10,
+        label: "verify df -h root mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify df -h proc mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after df -h",
+    });
+
+    // -----------------------------------------------------------------------
+    // 14. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
