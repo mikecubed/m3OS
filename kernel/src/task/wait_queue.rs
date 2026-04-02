@@ -50,10 +50,10 @@ impl WaitQueue {
                 id,
                 woken: Arc::clone(&woken),
             });
-            // If a waker already ran between enqueue and here, skip blocking.
-            if !woken.load(Ordering::Acquire) {
-                scheduler::block_current_on_recv();
-            }
+            // Atomically check woken flag under the scheduler lock before blocking.
+            // This prevents the TOCTOU race where a waker sets woken between our
+            // check and the actual block call.
+            scheduler::block_current_unless_woken(&woken);
         }
     }
 

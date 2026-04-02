@@ -378,10 +378,10 @@ pub extern "C" fn syscall_handler(
         33 => sys_dup2(arg0, arg1),
         // Phase 35: nice(increment) — adjust task priority
         34 => {
-            let uid = crate::process::current_pid();
+            let pid = crate::process::current_pid();
             let uid_val = {
                 let table = crate::process::PROCESS_TABLE.lock();
-                table.find(uid).map(|p| p.uid).unwrap_or(0)
+                table.find(pid).map(|p| p.uid).unwrap_or(0)
             };
             crate::task::sys_nice(arg0 as i32, uid_val) as u64
         }
@@ -494,14 +494,18 @@ pub extern "C" fn syscall_handler(
         // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
         203 => {
             // sched_setaffinity: read mask from user memory
-            let mask = if arg2 != 0 && arg1 >= 8 {
+            if arg2 == 0 {
+                return NEG_EFAULT;
+            }
+            if arg1 < 8 {
+                return NEG_EINVAL;
+            }
+            let mask = {
                 let mut buf = [0u8; 8];
                 if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
                     return NEG_EFAULT;
                 }
                 u64::from_ne_bytes(buf)
-            } else {
-                u64::MAX
             };
             crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
         }
