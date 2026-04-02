@@ -24,6 +24,8 @@ members = [
     "userspace/whoami",
     # Phase 29 PTY test
     "userspace/pty-test",
+    # Phase 39 Unix domain socket test
+    "userspace/unix-socket-test",
     # Rust coreutils (replacing C musl utilities)
     "userspace/coreutils-rs",
     # Future userspace servers:

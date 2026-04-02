@@ -260,6 +260,7 @@ pub const SYS_BIND: u64 = 49;
 pub const SYS_LISTEN: u64 = 50;
 pub const SYS_GETSOCKNAME: u64 = 51;
 pub const SYS_GETPEERNAME: u64 = 52;
+pub const SYS_SOCKETPAIR: u64 = 53;
 pub const SYS_SETSOCKOPT: u64 = 54;
 pub const SYS_GETSOCKOPT: u64 = 55;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
@@ -287,9 +288,11 @@ pub const STDERR_FILENO: i32 = 2;
 // Socket constants (Phase 23)
 // ===========================================================================
 
+pub const AF_UNIX: u64 = 1;
 pub const AF_INET: u64 = 2;
 pub const SOCK_STREAM: u64 = 1;
 pub const SOCK_DGRAM: u64 = 2;
+pub const SOCK_CLOEXEC: u64 = 0x80000;
 
 pub const IPPROTO_TCP: u64 = 6;
 pub const IPPROTO_UDP: u64 = 17;
@@ -357,6 +360,38 @@ impl SockaddrIn {
     /// Return the IP address as a 4-byte array in host order.
     pub fn ip(&self) -> [u8; 4] {
         self.sin_addr.to_ne_bytes()
+    }
+}
+
+/// Unix domain socket address, matching Linux `struct sockaddr_un` layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockaddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; 108],
+}
+
+impl SockaddrUn {
+    /// Create a new `SockaddrUn` for the given path.
+    pub fn new(path: &str) -> Self {
+        let mut addr = Self {
+            sun_family: AF_UNIX as u16,
+            sun_path: [0; 108],
+        };
+        let bytes = path.as_bytes();
+        let n = bytes.len().min(107);
+        addr.sun_path[..n].copy_from_slice(&bytes[..n]);
+        addr
+    }
+
+    /// Return the length (family + path + NUL).
+    pub fn len(&self) -> usize {
+        let path_len = self.sun_path.iter().position(|&b| b == 0).unwrap_or(108);
+        2 + path_len + 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sun_path[0] == 0
     }
 }
 
@@ -1054,6 +1089,79 @@ pub fn getsockopt(fd: i32, level: i32, optname: i32, optval: &mut [u8]) -> isize
             level as u64,
             optname as u64,
             optval.as_mut_ptr() as u64,
+            &mut len as *mut u32 as u64,
+        ) as isize
+    }
+}
+
+// ===========================================================================
+// Phase 39: Unix domain socket helpers
+// ===========================================================================
+
+/// Create a pair of connected Unix domain sockets.
+/// Returns 0 on success (fds written to `sv`), negative errno on error.
+pub fn socketpair(domain: i32, socktype: i32, protocol: i32, sv: &mut [i32; 2]) -> isize {
+    unsafe {
+        syscall4(
+            SYS_SOCKETPAIR,
+            domain as u64,
+            socktype as u64,
+            protocol as u64,
+            sv.as_mut_ptr() as u64,
+        ) as isize
+    }
+}
+
+/// Bind a Unix domain socket to a path.
+pub fn bind_unix(fd: i32, addr: &SockaddrUn) -> isize {
+    unsafe {
+        syscall3(
+            SYS_BIND,
+            fd as u64,
+            addr as *const SockaddrUn as u64,
+            addr.len() as u64,
+        ) as isize
+    }
+}
+
+/// Connect a Unix domain socket to a path.
+pub fn connect_unix(fd: i32, addr: &SockaddrUn) -> isize {
+    unsafe {
+        syscall3(
+            SYS_CONNECT,
+            fd as u64,
+            addr as *const SockaddrUn as u64,
+            addr.len() as u64,
+        ) as isize
+    }
+}
+
+/// Send a datagram to a Unix domain socket address.
+pub fn sendto_unix(fd: i32, buf: &[u8], flags: i32, addr: &SockaddrUn) -> isize {
+    unsafe {
+        syscall6(
+            SYS_SENDTO,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *const SockaddrUn as u64,
+            addr.len() as u64,
+        ) as isize
+    }
+}
+
+/// Receive a datagram from a Unix domain socket (with sender address).
+pub fn recvfrom_unix(fd: i32, buf: &mut [u8], flags: i32, addr: &mut SockaddrUn) -> isize {
+    let mut len: u32 = core::mem::size_of::<SockaddrUn>() as u32;
+    unsafe {
+        syscall6(
+            SYS_RECVFROM,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+            addr as *mut SockaddrUn as u64,
             &mut len as *mut u32 as u64,
         ) as isize
     }

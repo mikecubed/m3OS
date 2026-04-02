@@ -143,6 +143,8 @@ pub enum FdBackend {
     PtySlave { pty_id: u32 },
     /// Network socket — Phase 23.
     Socket { handle: u32 },
+    /// Unix domain socket — Phase 39.
+    UnixSocket { handle: usize },
     /// epoll instance — Phase 37. Monitors other FDs for readiness events.
     Epoll { instance_id: usize },
 }
@@ -185,6 +187,7 @@ pub fn add_fd_refs(fd_table: &[Option<FdEntry>; MAX_FDS]) {
             FdBackend::PtyMaster { pty_id } => crate::pty::add_master_ref(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::add_slave_ref(*pty_id),
             FdBackend::Socket { handle } => crate::net::add_socket_ref(*handle),
+            FdBackend::UnixSocket { handle } => crate::net::unix::add_unix_socket_ref(*handle),
             FdBackend::Epoll { instance_id } => {
                 crate::arch::x86_64::syscall::epoll_add_ref_pub(*instance_id)
             }
@@ -200,6 +203,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     {
@@ -218,6 +222,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
@@ -241,6 +246,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for h in sockets {
         crate::net::free_socket(h);
     }
+    for h in unix_sockets {
+        crate::net::unix::free_unix_socket(h);
+    }
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
@@ -263,6 +271,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut pty_masters = alloc::vec::Vec::new();
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
+    let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
     {
@@ -279,6 +288,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PtyMaster { pty_id } => pty_masters.push(*pty_id),
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
+                    FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
@@ -300,6 +310,9 @@ pub fn close_all_fds_for(pid: Pid) {
     }
     for h in sockets {
         crate::net::free_socket(h);
+    }
+    for h in unix_sockets {
+        crate::net::unix::free_unix_socket(h);
     }
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
