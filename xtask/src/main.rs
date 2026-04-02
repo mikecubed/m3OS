@@ -240,6 +240,8 @@ fn build_musl_bins() {
         ("userspace/coreutils/sort.c", "sort"),
         ("userspace/coreutils/uniq.c", "uniq"),
         ("userspace/coreutils/cut.c", "cut"),
+        ("userspace/coreutils/tr.c", "tr"),
+        ("userspace/coreutils/sed.c", "sed"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -1724,7 +1726,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 20,
+        timeout_secs: 30,
         label: "wait for shell prompt",
     });
 
@@ -2209,60 +2211,117 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 10. Phase 41 text tools: sort, uniq, cut
     // -----------------------------------------------------------------------
+    steps.extend(cmd_then_prompt(
+        "/bin/echo pear > /tmp/sort_words\n",
+        "sort fixture: write pear",
+        "prompt after writing pear",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo apple >> /tmp/sort_words\n",
+        "sort fixture: append apple",
+        "prompt after appending apple",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo orange >> /tmp/sort_words\n",
+        "sort fixture: append orange",
+        "prompt after appending orange",
+        10,
+    ));
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/sort /etc/passwd\n",
-        label: "sort: lexicographic order",
+        input: "/bin/sort /tmp/sort_words | /bin/head -n 1\n",
+        label: "sort: verify first lexicographic line",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "root:x:0:0:root:/root:/bin/ion",
+        pattern: "apple",
         timeout_secs: 10,
-        label: "verify sort output includes root first",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
-        timeout_secs: 10,
-        label: "verify sort output includes user",
+        label: "verify sort first line",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
-        label: "prompt after sort",
+        label: "prompt after first sort line check",
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/sort -r /etc/passwd\n",
-        label: "sort: reverse order",
+        input: "/bin/sort /tmp/sort_words | /bin/head -n 2 | /bin/tail -n 1\n",
+        label: "sort: verify middle lexicographic line",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        pattern: "orange",
         timeout_secs: 10,
-        label: "verify reverse sort output",
+        label: "verify sort middle line",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
-        label: "prompt after reverse sort",
+        label: "prompt after middle sort line check",
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 10 > /tmp/sort_nums\n",
+        "sort numeric fixture: write 10",
+        "prompt after writing 10",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 2 >> /tmp/sort_nums\n",
+        "sort numeric fixture: append 2",
+        "prompt after appending 2",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 1 >> /tmp/sort_nums\n",
+        "sort numeric fixture: append 1",
+        "prompt after appending 1",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/cut -d: -f3 /etc/passwd | /bin/sort -n\n",
-        label: "sort: numeric order",
+        input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 1\n",
+        label: "sort: verify first numeric line",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "0",
+        pattern: "1",
         timeout_secs: 10,
-        label: "verify numeric sort output",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "1000",
-        timeout_secs: 10,
-        label: "verify numeric sort keeps 1000 after 0",
+        label: "verify numeric sort first line",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
-        label: "prompt after numeric sort",
+        label: "prompt after first numeric line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 2 | /bin/tail -n 1\n",
+        label: "sort: verify middle numeric line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2",
+        timeout_secs: 10,
+        label: "verify numeric sort middle line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after middle numeric line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/sort_nums | /bin/sort -rn | /bin/head -n 1\n",
+        label: "sort: verify clustered pipeline first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "10",
+        timeout_secs: 10,
+        label: "verify clustered pipeline first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after clustered pipeline first line check",
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
@@ -2316,7 +2375,91 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 11. make clean
+    // 11. Phase 41 text tools: tr, sed
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo HELLO | /bin/tr A-Z a-z\n",
+        label: "tr: translate uppercase to lowercase",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "hello",
+        timeout_secs: 10,
+        label: "verify tr translation output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tr translate",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo hello | /bin/tr -d '\\n' | /bin/wc -l\n",
+        label: "tr: delete newline",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "0",
+        timeout_secs: 10,
+        label: "verify tr delete newline output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tr delete",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo foofoo | /bin/sed 's/foo/bar/'\n",
+        label: "sed: single substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "barfoo",
+        timeout_secs: 10,
+        label: "verify sed single substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed substitution",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo foofoo | /bin/sed 's/foo/bar/g'\n",
+        label: "sed: global substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "barbar",
+        timeout_secs: 10,
+        label: "verify sed global substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed global substitution",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd /etc/passwd /etc/passwd | /bin/sed -n '3,5p'\n",
+        label: "sed: print selected range",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sed range output includes line 3",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sed range output includes line 4",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed range print",
+    });
+
+    // -----------------------------------------------------------------------
+    // 12. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

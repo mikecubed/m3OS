@@ -67,22 +67,24 @@ int main(int argc, char **argv) {
     size_t cap = 0;
 
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1]) {
+        const char *opt;
         if (strcmp(argv[argi], "--") == 0) {
             argi++;
             break;
         }
-        if (strcmp(argv[argi], "-r") == 0) {
-            reverse_sort = 1;
-            argi++;
-            continue;
+        for (opt = argv[argi] + 1; *opt; opt++) {
+            if (*opt == 'r') {
+                reverse_sort = 1;
+                continue;
+            }
+            if (*opt == 'n') {
+                numeric_sort = 1;
+                continue;
+            }
+            usage();
+            return 1;
         }
-        if (strcmp(argv[argi], "-n") == 0) {
-            numeric_sort = 1;
-            argi++;
-            continue;
-        }
-        usage();
-        return 1;
+        argi++;
     }
 
     if (argi == argc) {
