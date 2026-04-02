@@ -4,272 +4,184 @@
 **Status:** Complete
 **Source Ref:** phase-02
 
+This document is the Phase 2 implementation document for the first memory subsystem.
+It explains what this phase adds, how the tagged Phase 2 code works, and which
+shortcuts are still intentional at this stage of the project.
+
+## Phase 2 Status
+
+Phase 2 is functionally complete in the tagged Phase 2 code:
+
+- the kernel copies and logs the bootloader memory map
+- a simple physical frame allocator hands out usable 4 KiB frames
+- paging helpers reconstruct the active page-table mapper from the bootloader's
+  physical-memory offset mapping
+- a fixed 1 MiB kernel heap is mapped and installed as the global allocator
+- `Box`, `Vec`, and `String` allocations work after memory init
+
+This phase is intentionally conservative. It does not yet reclaim freed physical
+frames, grow the heap, or implement advanced allocator policies.
+
 ## Overview
 
-Memory management is one of the first things the kernel must set up after boot.
-It has three layers:
+After Phase 1, the kernel could boot and print diagnostics, but it still had no
+way to manage RAM dynamically. Phase 2 adds the minimum memory machinery needed
+to build future subsystems:
 
-1. **Physical frame allocator** — tracks which 4 KiB physical pages are free
-2. **Page table manager** — maps virtual addresses to physical frames, enforcing isolation
-3. **Kernel heap allocator** — provides `alloc` support (`Vec`, `Box`, etc.) inside the kernel
+1. capture the bootloader's memory map in kernel-owned state
+2. hand out physical frames from usable RAM
+3. rebuild a page-table mapper from `BootInfo::physical_memory_offset`
+4. map a fixed kernel heap so Rust `alloc` types can be used safely
 
----
-
-## Physical Memory Layout (at boot)
-
-The `bootloader` crate provides a memory map via `BootInfo::memory_regions`. The kernel
-must use this to determine which physical frames are usable.
+## Current Memory Setup Flow
 
 ```mermaid
-graph TD
-    A["BootInfo::memory_regions\n(list of MemoryRegion)"] --> B{Region kind?}
-    B -->|Usable| C["Add to free frame list"]
-    B -->|Reserved / ACPI / etc.| D["Skip — do not touch"]
-    C --> E["FrameAllocator\n(bitmap or free-list)"]
-    E --> F["allocate_frame() → PhysFrame"]
-    E --> G["deallocate_frame(PhysFrame)<br/>(Phase 4+ — not in bump allocator)"]
+flowchart TD
+    A["BootInfo"] --> B["memory_map::init()"]
+    B --> C["frame_allocator::init()"]
+    C --> D["debug::log_reserved_below_1mib()"]
+    D --> E["paging::init(physical_memory_offset)"]
+    E --> F["heap::init_heap(...)"]
+    F --> G["Box / Vec / String smoke tests"]
 ```
 
----
+## Repository Implementation
 
-## Physical Frame Allocator
+### Memory-Map Capture
 
-### Phase 33 implementation: buddy allocator with reference counting
+The memory-map logic lives in `kernel/src/mm/memory_map.rs`.
 
-The frame allocator uses a **buddy allocator** (`kernel-core/src/buddy.rs`) with 10 order
-levels (order 0 = 4 KiB up to order 9 = 2 MiB). It supports O(log n) allocation and
-automatic coalescing of adjacent free blocks.
+Phase 2 does not build a complex ownership model for physical memory yet. Instead,
+it stores the bootloader-provided `memory_regions` slice in a `spin::Once` and
+logs each region so the kernel can reason about what RAM is usable.
 
-**Two-phase initialization:**
-1. Bootstrap phase (before heap): a simple free-list collects frames during boot
-2. After `init_heap()`, `init_buddy()` drains the free-list into a `BuddyAllocator`
-   which coalesces frames into the largest possible power-of-two blocks
+Important details:
 
-**API:**
-- `allocate_frame()` — allocates a single 4 KiB frame (order 0)
-- `allocate_contiguous(order)` — allocates `1 << order` contiguous pages
-- `free_frame(phys)` — frees a single frame after refcount check
-- `free_contiguous(phys, order)` — frees a multi-page block
-- `free_count()` / `total_frames()` / `frame_stats()` for diagnostics
-- Frames below 1 MiB are never allocated (`ALLOC_MIN_ADDR = 0x0010_0000`)
+- `memory_map::init()` must only run once
+- the stored slice is treated as valid for the kernel's lifetime
+- region logging makes early boot failures easier to debug over serial
 
-**Per-frame reference counting** is layered on top:
-- A `Vec<AtomicU16>` table indexed by frame number (phys_addr / 4096)
-- Initialized after heap init; frames allocated before refcounting starts are tracked
-  with refcount 0 and freed directly
-- `allocate_frame()` sets refcount to 1
-- `free_frame()` decrements refcount; only frees to buddy when count reaches 0
-- `refcount_inc(phys)` / `refcount_dec(phys)` / `refcount_get(phys)` for CoW support
+### Frame Allocator
 
-**Slab allocator** (`kernel-core/src/slab.rs`) provides fixed-size caches on top of the
-buddy allocator for common kernel objects (task/fd/endpoint/pipe/socket). Each slab is
-a page divided into equal-size slots with a bitmap tracking free slots.
+The frame allocator lives in `kernel/src/mm/frame_allocator.rs`.
 
-### Concepts: physical frames vs virtual pages vs kernel heap
+In Phase 2, this is a simple bump allocator over the usable regions from the
+bootloader memory map. It is deliberately small and easy to read:
 
-| Concept | What it is | How the kernel uses it |
+- only regions marked `Usable` are considered
+- addresses are aligned to 4 KiB page boundaries
+- frames below 1 MiB are skipped to avoid low-memory firmware hazards
+- allocation advances monotonically through the usable regions
+
+This means Phase 2 can allocate frames safely, but it does **not** reclaim them.
+Physical frame reuse is deferred until later phases.
+
+### Paging Helpers
+
+The page-table helpers live in `kernel/src/mm/paging.rs`.
+
+The bootloader sets up a physical-memory offset mapping. Phase 2 uses that to
+recover a mutable reference to the active level-4 page table and construct an
+`OffsetPageTable`.
+
+Key properties of this implementation:
+
+- `paging::init()` must only run once
+- the `unsafe` pointer reconstruction stays inside the paging module
+- `GlobalFrameAlloc` adapts the global frame allocator to the `x86_64` crate's
+  `FrameAllocator<Size4KiB>` trait
+
+This gives the kernel one controlled place where page-table manipulation becomes
+safe to use from the rest of the memory subsystem.
+
+### Kernel Heap
+
+The heap setup lives in `kernel/src/mm/heap.rs`.
+
+Phase 2 reserves a fixed virtual heap region:
+
+- `HEAP_START = 0xFFFF_8000_0000_0000`
+- `HEAP_SIZE = 1 MiB`
+
+`init_heap()` walks the heap page range, allocates one physical frame per page,
+maps each page writable, and then initializes `linked_list_allocator::LockedHeap`
+as the `#[global_allocator]`.
+
+This is the moment where normal Rust allocation becomes available inside the
+kernel.
+
+### Diagnostics and Validation
+
+The debug helpers live in `kernel/src/mm/debug.rs`, and the smoke-test allocations
+live in `kernel/src/main.rs`.
+
+Phase 2 validates the subsystem in two ways:
+
+- debug logging reports memory-map and frame-allocation information
+- the kernel allocates a `Box<u64>`, a `Vec<u32>`, and a `String` after `mm::init()`
+
+Those checks are intentionally simple, but they prove the heap mapping and global
+allocator are wired correctly.
+
+## Physical Frames vs Virtual Pages vs Kernel Heap
+
+| Concept | Meaning in Phase 2 | Where it appears |
 |---|---|---|
-| **Physical frame** | A 4 KiB-aligned region of RAM, identified by its physical address | Tracked by the frame allocator; handed to `map_to` when creating mappings |
-| **Virtual page** | A 4 KiB-aligned region of virtual address space | What the kernel and userspace programs actually use; backed by a physical frame via page tables |
-| **Kernel heap** | A fixed virtual address range (`0xFFFF_8000_0000_0000`, 1 MiB) with physical frames mapped behind it | Where `Box`, `Vec`, `Arc`, `String` allocate their backing memory |
+| **Physical frame** | A 4 KiB chunk of RAM handed out by the frame allocator | `kernel/src/mm/frame_allocator.rs` |
+| **Virtual page** | A 4 KiB region of virtual address space mapped through page tables | `kernel/src/mm/paging.rs`, `kernel/src/mm/heap.rs` |
+| **Kernel heap** | A fixed virtual range backed by mapped physical frames and managed by the global allocator | `kernel/src/mm/heap.rs` |
 
-The frame allocator works in *physical* space. The page mapper works across the *physical↔virtual* boundary. The heap allocator works entirely in *virtual* space, carving up the already-mapped heap region.
+The important mental model is that the frame allocator manages physical memory,
+the page-table code creates virtual mappings, and the heap allocator uses those
+mappings to support dynamic kernel data structures.
 
-### Copy-on-write fork (Phase 17)
+## Why `physical_memory_offset` Matters
 
-`sys_fork` uses CoW instead of eagerly copying all user pages:
+Phase 2 relies on the bootloader's offset mapping so the kernel can treat a
+physical address `P` as accessible at `physical_memory_offset + P`.
 
-1. `cow_clone_user_pages`: walks parent's PTEs; for writable pages, clears WRITABLE and
-   sets BIT_9 (CoW marker) in both parent and child; increments refcount for each shared
-   frame; maps same physical frame in child's page table. Read-only pages (.text/.rodata)
-   are shared without BIT_9 so writes to them remain genuine protection violations.
-2. Flushes parent TLB via CR3 reload
-3. On write to a CoW page, a page fault fires:
-   - Detection: ring-3 write fault, page present but not writable, PTE BIT_9 set
-   - Resolution (in ISR): allocate fresh frame, copy 4 KiB, remap writable, clear BIT_9,
-     decrement old frame's refcount. On OOM, falls through to kill the process.
-   - Fast path: if refcount == 1 (sole owner), just remap writable without copying
+Without that mapping:
 
-### Future allocator evolution
+- the kernel could not walk the active page tables easily
+- `OffsetPageTable` could not be reconstructed safely
+- heap page mapping would not have a practical way to reach paging structures
 
-Mature kernels add further refinements:
+That is why the bootloader config enables dynamic physical-memory mapping before
+the kernel starts.
 
-1. **Huge pages** — 2 MiB or 1 GiB mappings; fewer TLB entries
-2. **Demand paging** — don't map physical frames until first access
-3. **SLUB allocator** — more sophisticated slab variant with per-CPU caches
+## Acceptance Criteria for Phase 2
 
-```
-Physical Memory
-┌──────────────────┐ 0x0000_0000
-│ First 1 MiB      │  ← BIOS/UEFI reserved, mostly off-limits
-├──────────────────┤ 0x0010_0000
-│ Kernel image     │  ← loaded by bootloader
-│ (code + data)    │
-├──────────────────┤
-│ Bootloader data  │  ← BootInfo, page tables set up by bootloader
-├──────────────────┤
-│                  │
-│  Usable RAM      │  ← managed by frame allocator
-│                  │
-├──────────────────┤
-│ MMIO / PCI       │  ← memory-mapped hardware registers
-└──────────────────┘ top of RAM
-```
+Phase 2 should be considered complete when:
 
----
+- the kernel stores and logs the bootloader memory map
+- a simple frame allocator hands out usable 4 KiB frames
+- the page-table mapper is reconstructed from the physical-memory offset
+- a fixed heap is mapped and installed as the global allocator
+- small `alloc`-based smoke tests succeed after memory initialization
 
-## x86_64 Virtual Memory — 4-Level Paging
+## How Real OS Implementations Differ
 
-x86_64 uses a 4-level page table hierarchy. Each level is a 512-entry table of 64-bit
-entries. A virtual address is split into 5 fields:
+Real kernels usually add much more sophisticated memory management very early:
 
-```
-Virtual Address (48 bits used):
- ┌────────┬────────┬────────┬────────┬─────────────┐
- │  PML4  │  PDPT  │   PD   │   PT   │   Offset    │
- │ [47:39]│ [38:30]│ [29:21]│ [20:12]│   [11:0]    │
- │  9 bits│  9 bits│  9 bits│  9 bits│   12 bits   │
- └────────┴────────┴────────┴────────┴─────────────┘
-      ↓         ↓        ↓        ↓
-    PML4      PDPT      PD       PT
-   (L4)      (L3)     (L2)     (L1)
-```
+- reclaim and reuse of freed physical frames
+- multiple allocator strategies for different object sizes
+- demand paging and copy-on-write
+- huge pages, NUMA awareness, and memory-pressure policies
+- tighter accounting, isolation, and failure recovery
 
-```mermaid
-graph LR
-    CR3["CR3\n(physical addr\nof PML4)"] --> PML4["PML4\n512 entries"]
-    PML4 -->|"entry[i]"| PDPT["PDPT\n512 entries"]
-    PDPT -->|"entry[j]"| PD["Page Directory\n512 entries"]
-    PD -->|"entry[k]"| PT["Page Table\n512 entries"]
-    PT -->|"entry[l]"| PHYS["Physical Frame\n4 KiB"]
+This project intentionally does less in Phase 2. The goal is to teach the first
+working memory pipeline without hiding the core ideas behind a large allocator
+stack.
 
-    style CR3 fill:#c0392b,color:#fff
-    style PHYS fill:#27ae60,color:#fff
-```
+## What This Phase Does Not Try to Solve
 
-### Physical Memory Offset Mapping
+Phase 2 is deliberately narrow. It does not yet aim to provide:
 
-The `bootloader` crate sets up an **offset mapping**: the entire physical memory is
-mapped starting at a configurable virtual address (`physical_memory_offset`). This means
-to access a physical address `P`, you just read from `physical_memory_offset + P`.
+- physical frame reclamation
+- heap growth
+- userspace address spaces
+- copy-on-write or demand paging
+- production-grade memory accounting
 
-To receive `physical_memory_offset` in `BootInfo`, the kernel must opt in via a
-`BootloaderConfig` constant at compile time:
-
-```rust
-const BOOTLOADER_CONFIG: BootloaderConfig = {
-    let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config
-};
-entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
-```
-
-Without this, `BootInfo::physical_memory_offset` is `None` and the kernel panics on
-the first attempt to walk page tables.
-
-This avoids the complexity of recursive page tables and makes it easy to modify page
-tables from the kernel:
-
-```rust
-let phys_addr = PhysAddr::new(0x1000);
-let virt_addr = VirtAddr::new(physical_memory_offset + phys_addr.as_u64());
-let page_table = unsafe { &mut *(virt_addr.as_mut_ptr::<PageTable>()) };
-```
-
----
-
-## Kernel Heap
-
-The kernel heap starts at `HEAP_START = 0xFFFF_8000_0000_0000` with an initial size of
-4 MiB. It uses a `RetryAllocator` wrapper around `linked_list_allocator::LockedHeap` as
-the `#[global_allocator]`.
-
-**Growable heap (Phase 17):** The heap can grow up to `HEAP_MAX_SIZE = 64 MiB`.
-`grow_heap(bytes)` maps fresh frames and calls `ALLOCATOR.inner.lock().extend()`. On
-partial failure (mid-growth OOM), only successfully mapped pages are extended.
-
-**OOM retry (Phase 33):** The `RetryAllocator` wrapper intercepts allocation failures
-at the `GlobalAlloc::alloc()` level. On failure, it tries growing the heap with
-escalating sizes (layout-proportional, 1 MiB, 2 MiB, 4 MiB) and retries the allocation.
-This is more effective than the old `alloc_error_handler` approach which could not retry.
-
-**Statistics:** `heap_stats()` returns total/used/free bytes and alloc/dealloc counts.
-Counters are tracked via atomics in the `RetryAllocator`.
-
-After `init_heap`, `alloc` types (`Vec`, `Box`, `Arc`, `String`, etc.) work in the kernel.
-
----
-
-## Address Space per Process
-
-Each userspace process gets its own **PML4 table** (page table root). The kernel
-pages are mapped into the top half of every address space (but with supervisor-only
-permissions — ring 3 cannot access them).
-
-```mermaid
-graph LR
-    subgraph P1["Process A"]
-        PML4A["PML4-A"]
-        UA["User pages A\n(code, stack, heap)"]
-        KA["Kernel pages\n(shared, ring 0 only)"]
-    end
-    subgraph P2["Process B"]
-        PML4B["PML4-B"]
-        UB["User pages B"]
-        KB["Kernel pages\n(same physical frames)"]
-    end
-
-    PML4A --> UA
-    PML4A --> KA
-    PML4B --> UB
-    PML4B --> KB
-    KA -. "same phys" .-> KB
-```
-
----
-
-## Key Crates
-
-| Crate | Role |
-|---|---|
-| `x86_64` | `PhysAddr`, `VirtAddr`, `PageTable`, `Mapper`, `FrameAllocator` trait |
-| `linked_list_allocator` | `#[global_allocator]` for kernel heap |
-| `bootloader_api` | `BootInfo::memory_regions`, `physical_memory_offset` |
-
----
-
-## Process Exit Cleanup (Phase 17)
-
-When a process exits (`sys_exit` or fault kill):
-1. Read the process's CR3 from the process table
-2. `restore_kernel_cr3()` — switch to the kernel's page table
-3. `free_process_page_table(cr3_phys)` — walk PML4[0..256], skip entries shared with
-   the kernel (detected by matching PDPT frame addresses), free user-accessible leaf
-   pages and private page table structure frames via `free_frame()` (refcount-aware)
-4. `mark_current_dead()` — scheduler removes the task; `Task::_stack` `Box<[u8]>` drops,
-   freeing the kernel stack back to the heap
-
-## munmap (Phase 33)
-
-`sys_linux_munmap(addr, len)` reclaims physical memory for unmapped pages:
-1. Validates page-aligned addr, positive len, userspace range
-2. Walks the process page table via `OffsetPageTable::unmap()`
-3. Frees physical frames via buddy allocator (refcount-aware)
-4. Sends SMP TLB shootdown IPIs (batched, only for actually-unmapped pages)
-5. Updates the per-process mapping list (shrink, split, or remove entries)
-
-Per-process `MemoryMapping` tracking records mmap allocations for accounting and cleanup on process exit. `munmap` operates directly on page tables and does not reject requests that fall outside tracked mappings — it unmaps whatever portion of the range is currently mapped (POSIX-permissive semantics).
-
-## meminfo (Phase 33)
-
-The `meminfo` command (syscall 0x1001) reports:
-- Kernel heap: total/used/free bytes, allocation counts
-- Frame allocator: total/free/allocated frames, per-order buddy breakdown
-- Slab caches: per-cache slab count, active objects, free slots
-
-## Open Questions
-
-- **Kernel stack guard pages** — unmapped page below each stack to catch overflow
-- **Per-process memory limits** — tracking and capping process RSS
-- **Migrate kernel objects to slab caches** — Task, FD, Endpoint allocations
+Those belong to later phases once the basic memory model is established and easy
+to reason about.
