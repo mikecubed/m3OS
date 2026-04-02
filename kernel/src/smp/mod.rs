@@ -408,9 +408,9 @@ pub fn init_bsp_per_core() {
         PER_CORE_DATA[0] = bsp_data;
     }
 
-    // Set gs_base and kernel_gs_base to point to BSP's PerCoreData.
-    // Both are set so that `swapgs` in syscall entry/exit works correctly:
-    // kernel code uses gs_base, swapgs swaps with kernel_gs_base.
+    // Set gs_base to point to BSP's PerCoreData for gs-relative access.
+    // Also set kernel_gs_base for consistency (unused — swapgs is not used
+    // because user code cannot change gs_base: no FSGSBASE, no wrmsr in ring 3).
     write_gs_base(bsp_data as u64);
     write_kernel_gs_base(bsp_data as u64);
 

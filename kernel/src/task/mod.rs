@@ -58,8 +58,8 @@ pub use scheduler::{
     block_current_on_notif, block_current_on_recv, block_current_on_reply, block_current_on_send,
     current_task_id, deliver_message, insert_cap, mark_current_dead, maybe_load_balance,
     remove_task_cap, run, server_endpoint, set_server_endpoint, signal_reschedule, spawn,
-    spawn_idle, spawn_idle_for_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity,
-    take_message, task_cap, wake_task, yield_now,
+    spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice, sys_sched_getaffinity,
+    sys_sched_setaffinity, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -121,6 +121,8 @@ pub struct Task {
     pub server_endpoint: Option<crate::ipc::EndpointId>,
     /// Core this task is assigned to for per-CPU run queue dispatch (Phase 35).
     pub assigned_core: u8,
+    /// PID of the userspace process this task is associated with (0 = kernel task).
+    pub pid: u32,
     /// Task priority (Phase 35): 0-9 = real-time, 10-29 = normal, 30 = idle.
     /// Lower numeric value = higher priority.
     pub priority: u8,
@@ -156,6 +158,7 @@ impl Task {
             pending_msg: None,
             server_endpoint: None,
             assigned_core: 0,
+            pid: 0,                  // Set by fork_child_trampoline for userspace tasks
             priority: 20,            // Normal priority (middle of 10-29 range)
             affinity_mask: u64::MAX, // Can run on any core
             user_ticks: 0,

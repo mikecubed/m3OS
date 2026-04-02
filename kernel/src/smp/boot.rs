@@ -384,6 +384,10 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     super::write_gs_base(per_core_data_ptr as u64);
     super::write_kernel_gs_base(per_core_data_ptr as u64);
 
+    // Configure SYSCALL MSRs (STAR, LSTAR, SFMASK, EFER.SCE) so userspace
+    // processes dispatched on this core can execute SYSCALL instructions.
+    crate::arch::x86_64::syscall::init_ap();
+
     // Initialize this AP's LAPIC and timer using the phys_offset-based address.
     // Now that EFER.NXE is set, APs can access the phys_offset range.
     ap_lapic_init_from(data.lapic_virt_base as usize, data.lapic_ticks_per_ms);
@@ -403,10 +407,12 @@ extern "C" fn ap_entry(per_core_data_ptr: *mut super::PerCoreData) -> ! {
     crate::task::run()
 }
 
-/// Idle task for AP cores — halts until an interrupt wakes the core.
+/// Idle task for AP cores — halts until an interrupt wakes the core,
+/// then yields back to the scheduler so newly ready tasks can run.
 fn ap_idle_task() -> ! {
     loop {
         x86_64::instructions::interrupts::enable_and_hlt();
+        crate::task::yield_now();
     }
 }
 

@@ -1019,6 +1019,9 @@ pub fn fork_child_trampoline() -> ! {
 
     set_current_pid(ctx.pid);
 
+    // Store PID in the current task so the scheduler can restore it on re-dispatch.
+    crate::task::scheduler::set_current_task_pid(ctx.pid);
+
     // Look up page table root and kernel stack for this process.
     let (cr3_phys, kstack_top) = {
         let table = PROCESS_TABLE.lock();

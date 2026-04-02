@@ -127,7 +127,8 @@ use super::gdt;
 // ---------------------------------------------------------------------------
 //
 // All syscall user-state storage has moved to `PerCoreData` (smp/mod.rs).
-// The assembly entry stub accesses them via `gs:[OFFSET]` after `swapgs`.
+// The assembly entry stub accesses them via `gs:[OFFSET]` (gs_base is always
+// PerCoreData — user code cannot change it: no FSGSBASE, no wrmsr in ring 3).
 // The Rust-side helpers below read from per-core data.
 
 /// Read the per-core `syscall_arg3` (R10 at SYSCALL entry).
@@ -189,10 +190,7 @@ global_asm!(
     //   R11  = user RFLAGS
     //   RAX  = syscall number
     //   RDI/RSI/RDX = args 0-2
-    //   GS_BASE = user value (or PerCoreData if user hasn't changed it)
-
-    // --- Swap to kernel gs_base (PerCoreData) ---
-    "swapgs",
+    //   GS_BASE = PerCoreData (user cannot change it: no FSGSBASE, no wrmsr)
 
     // --- Switch to per-core kernel stack ---
     "mov gs:[OFF_USER_RSP], rsp",
@@ -267,9 +265,8 @@ global_asm!(
     "pop r11", // user RFLAGS
     "pop rcx", // user RIP
 
-    // --- Restore user RSP, swap gs back, return ---
+    // --- Restore user RSP and return ---
     "mov rsp, gs:[OFF_USER_RSP]",
-    "swapgs",
     "sysretq",
 
     off_stack_top   = const crate::smp::offsets::SYSCALL_STACK_TOP,
@@ -2407,6 +2404,31 @@ pub fn init() {
         gdt::kernel_data_selector(),
     )
     .expect("STAR MSR write failed: segment selector layout mismatch");
+
+    unsafe extern "C" {
+        fn syscall_entry();
+    }
+    LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG);
+    unsafe {
+        Efer::update(|flags| *flags |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+    }
+}
+
+/// Initialize SYSCALL MSRs on an AP core.
+///
+/// Sets STAR, LSTAR, SFMASK, and EFER.SCE so that userspace processes
+/// dispatched on this core can use the SYSCALL instruction.
+/// TSS.RSP0 and per-core syscall_stack_top are handled separately via
+/// `set_current_core_kernel_stack` and `set_per_core_syscall_stack_top`.
+pub fn init_ap() {
+    Star::write(
+        gdt::user_code_selector(),
+        gdt::user_data_selector(),
+        gdt::kernel_code_selector(),
+        gdt::kernel_data_selector(),
+    )
+    .expect("STAR MSR write failed on AP");
 
     unsafe extern "C" {
         fn syscall_entry();

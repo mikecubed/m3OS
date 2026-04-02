@@ -115,31 +115,14 @@ impl Scheduler {
 
     /// Remove all tasks in the `Dead` state from the task vec.
     fn drain_dead(&mut self) {
-        let mut i = self.tasks.len();
-        while i > 0 {
-            i -= 1;
-            if self.tasks[i].state == TaskState::Dead {
-                self.tasks.remove(i);
-                // Fix up idle_task indices.
-                for idle in self.idle_tasks.iter_mut() {
-                    *idle = idle.and_then(|idx| {
-                        if idx == i {
-                            None
-                        } else if idx > i {
-                            Some(idx - 1)
-                        } else {
-                            Some(idx)
-                        }
-                    });
-                }
-                // Adjust last_run.
-                if self.tasks.is_empty() {
-                    self.last_run = 0;
-                } else if i < self.last_run {
-                    self.last_run -= 1;
-                } else {
-                    self.last_run = self.last_run.min(self.tasks.len() - 1);
-                }
+        // With SMP, removing tasks from the vec would invalidate indices held
+        // by per-core run queues, current_task_idx, and PENDING_REENQUEUE.
+        // Instead, dead tasks remain in the vec and are skipped by pick_next.
+        // Their stack memory is released here to avoid leaks.
+        for task in &mut self.tasks {
+            if task.state == TaskState::Dead && task.saved_rsp != 0 {
+                // Mark as drained so we don't try to free again.
+                task.saved_rsp = 0;
             }
         }
     }
@@ -192,6 +175,8 @@ impl Scheduler {
         }
 
         // Fallback: global round-robin scan for unqueued Ready tasks.
+        // Tasks found here have valid saved_rsp because they were re-enqueued
+        // by the scheduler loop AFTER switch_context (not by yield_now).
         let n = self.tasks.len();
         if n > 0 {
             let start = (self.last_run + 1) % n;
@@ -289,6 +274,21 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
     enqueue_to_core(target, idx);
 }
 
+/// Spawn a new kernel task on the calling core.
+///
+/// Used for fork children so they stay on the same core as the parent,
+/// avoiding cross-core context migration during fork+exec.
+pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
+    let mut task = Task::new(entry, name);
+    let core = crate::smp::per_core().core_id;
+    task.assigned_core = core;
+    let mut sched = SCHEDULER.lock();
+    let idx = sched.tasks.len();
+    sched.tasks.push(task);
+    drop(sched);
+    enqueue_to_core(core, idx);
+}
+
 /// Register an idle task for a specific core.
 ///
 /// Each core should have its own idle task that runs when no other task
@@ -316,26 +316,36 @@ fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
     sched.tasks[idx].user_ticks += elapsed;
 }
 
+/// Per-core pending re-enqueue slot. When a task yields, its index is stored
+/// here instead of being immediately enqueued. The scheduler loop re-enqueues
+/// it AFTER `switch_context` has saved the task's RSP, preventing a race where
+/// another core picks up the task with a stale RSP.
+/// -1 = no pending task. Indexed by core_id.
+#[allow(clippy::declare_interior_mutable_const)]
+static PENDING_REENQUEUE: [core::sync::atomic::AtomicI32; crate::smp::MAX_CORES] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+    [INIT; crate::smp::MAX_CORES]
+};
+
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
-    let (task_rsp_ptr, core_id, idx) = {
+    let (task_rsp_ptr, idx) = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
             Some(i) => i,
             None => return,
         };
         accumulate_ticks(&mut sched, idx);
-        sched.tasks[idx].state = TaskState::Ready;
-        let core = sched.tasks[idx].assigned_core;
+        // Keep state as Running — the scheduler will set Ready + enqueue AFTER
+        // switch_context saves the RSP. This prevents the global fallback from
+        // picking up the task with a stale saved_rsp on another core.
         set_current_task_idx(None);
-        (
-            core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp),
-            core,
-            idx,
-        )
+        (core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp), idx)
     };
-    // Re-enqueue to the local core's run queue.
-    enqueue_to_core(core_id, idx);
+    // Store pending re-enqueue for the scheduler to process after switch_context.
+    let my_core = crate::smp::per_core().core_id as usize;
+    PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
     let sched_rsp = per_core_scheduler_rsp();
     unsafe { switch_context(task_rsp_ptr, sched_rsp) };
 }
@@ -343,6 +353,19 @@ pub fn yield_now() {
 // ---------------------------------------------------------------------------
 // IPC scheduler primitives
 // ---------------------------------------------------------------------------
+
+/// Store a PID in the current task so the scheduler can restore per-core
+/// process context on re-dispatch.
+pub fn set_current_task_pid(pid: u32) {
+    if let Some(idx) = get_current_task_idx() {
+        SCHEDULER.lock().tasks[idx].pid = pid;
+    }
+}
+
+/// Return the PID associated with the given task index.
+fn task_pid(idx: usize) -> u32 {
+    SCHEDULER.lock().tasks[idx].pid
+}
 
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
@@ -520,6 +543,12 @@ pub fn run() -> ! {
             sched.drain_dead();
         }
 
+        // Periodic load balancing (BSP only, every 50 scheduler ticks).
+        // Disabled for now — causes task migration thrashing that interferes
+        // with short-lived userspace processes.  Re-enable once per-task
+        // cooldown or work-stealing is implemented.
+        // if core_id == 0 { maybe_load_balance(); }
+
         // Pick the next ready task and atomically mark it Running.
         let next = {
             let mut sched = SCHEDULER.lock();
@@ -527,24 +556,75 @@ pub fn run() -> ! {
                 sched.tasks[idx].state = TaskState::Running;
                 sched.tasks[idx].start_tick = crate::arch::x86_64::interrupts::tick_count();
                 set_current_task_idx(Some(idx));
-                let name = sched.tasks[idx].name;
-                let id = sched.tasks[idx].id;
-                Some((rsp, idx, name, id))
+                Some((rsp, idx))
             } else {
                 None
             }
         };
 
-        let (task_rsp, _task_idx, _name, _id) = match next {
+        let (task_rsp, _task_idx) = match next {
             Some(t) => t,
             None => continue,
         };
 
-        log::debug!("[sched] core {} → task {}({})", core_id, _name, _id.0);
+        // Restore per-core process context for the dispatched task.
+        // Read the task's PID and update: current_pid, CR3, TSS.RSP0,
+        // syscall_stack_top, and FS.base.
+        {
+            let pid = task_pid(_task_idx);
+            crate::process::set_current_pid(pid);
+            if pid != 0 {
+                let (cr3_phys, kstack, fs) = {
+                    let table = crate::process::PROCESS_TABLE.lock();
+                    match table.find(pid) {
+                        Some(p) => (p.page_table_root, p.kernel_stack_top, p.fs_base),
+                        None => (None, 0, 0),
+                    }
+                };
+                // Restore CR3 so the task's user-space pages are mapped.
+                if let Some(cr3) = cr3_phys {
+                    unsafe {
+                        use x86_64::{
+                            PhysAddr,
+                            registers::control::{Cr3, Cr3Flags},
+                            structures::paging::{PhysFrame, Size4KiB},
+                        };
+                        let frame: PhysFrame<Size4KiB> =
+                            PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
+                        Cr3::write(frame, Cr3Flags::empty());
+                    }
+                }
+                if kstack != 0 {
+                    crate::smp::set_current_core_kernel_stack(kstack);
+                    unsafe {
+                        crate::arch::x86_64::syscall::set_per_core_syscall_stack_top(kstack);
+                    }
+                    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs));
+                }
+            }
+        }
 
         // Switch to the task.
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
+        }
+
+        // --- Scheduler resumes here after the task yields back ---
+        // The task's RSP has now been saved by switch_context.
+        // Re-enqueue any pending task that yielded on this core.
+        let pending = PENDING_REENQUEUE[core_id as usize].swap(-1, Ordering::Acquire);
+        if pending >= 0 {
+            let pidx = pending as usize;
+            let target_core = {
+                let mut sched = SCHEDULER.lock();
+                if pidx < sched.tasks.len() {
+                    sched.tasks[pidx].state = TaskState::Ready;
+                    sched.tasks[pidx].assigned_core
+                } else {
+                    core_id
+                }
+            };
+            enqueue_to_core(target_core, pidx);
         }
     }
 }
@@ -562,7 +642,7 @@ static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::Atom
 /// and migrates one task if the longest queue exceeds the shortest by >1.
 pub fn maybe_load_balance() {
     let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if !cnt.is_multiple_of(10) {
+    if !cnt.is_multiple_of(50) {
         return;
     }
     let cores = crate::smp::core_count();
@@ -586,29 +666,30 @@ pub fn maybe_load_balance() {
             }
         }
     }
-    if longest_len <= shortest_len + 1 {
-        return; // Balanced enough.
+    if longest_len <= shortest_len + 2 {
+        return; // Balanced enough — require > 2 difference to avoid thrashing.
     }
     // Migrate one task from longest to shortest.
+    // Lock ordering: SCHEDULER first, then run_queue (matches pick_next).
     if let Some(src) = crate::smp::get_core_data(longest_core) {
+        let sched = SCHEDULER.lock();
         let mut q = src.run_queue.lock();
         // Find a migratable (non-pinned) task.
         let mut found = None;
         for i in 0..q.len() {
-            if let Some(&idx) = q.get(i) {
-                let sched = SCHEDULER.lock();
-                if idx < sched.tasks.len()
-                    && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
-                {
-                    found = Some(i);
-                    break;
-                }
+            if let Some(&idx) = q.get(i)
+                && idx < sched.tasks.len()
+                && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
+            {
+                found = Some(i);
+                break;
             }
         }
         if let Some(pos) = found
             && let Some(idx) = q.remove(pos)
         {
             drop(q);
+            drop(sched);
             // Update assigned_core.
             {
                 let mut sched = SCHEDULER.lock();
