@@ -283,9 +283,6 @@ pub fn unix_stream_write(handle: usize, data: &[u8]) -> Result<usize, i64> {
 
     // Check if peer is still alive and has space.
     let written = with_unix_socket_mut(peer_handle, |peer| {
-        if peer.shut_rd {
-            return Err(-32_i64); // EPIPE — peer won't read
-        }
         let space = UNIX_STREAM_BUF_SIZE.saturating_sub(peer.recv_buf.len());
         if space == 0 {
             return Err(-11_i64); // EAGAIN — buffer full

@@ -3604,49 +3604,56 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let capped = (count as usize).min(4096);
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
             match sock_type {
-                Some(crate::net::unix::UnixSocketType::Stream) => loop {
+                Some(crate::net::unix::UnixSocketType::Stream) => {
                     let mut tmp = alloc::vec![0u8; capped];
-                    match crate::net::unix::unix_stream_read(handle, &mut tmp) {
-                        Ok(0) => return 0,
-                        Ok(n) => {
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
-                                return NEG_EFAULT;
+                    loop {
+                        match crate::net::unix::unix_stream_read(handle, &mut tmp) {
+                            Ok(0) => return 0,
+                            Ok(n) => {
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return n as u64;
                             }
-                            return n as u64;
-                        }
-                        Err(_) => {
-                            if nonblock {
-                                return NEG_EAGAIN;
+                            Err(-11) => {
+                                // EAGAIN — no data yet, block or return.
+                                if nonblock {
+                                    return NEG_EAGAIN;
+                                }
+                                if has_pending_signal() {
+                                    return NEG_EINTR;
+                                }
+                                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                                restore_caller_context(pid, saved_user_rsp);
                             }
-                            if has_pending_signal() {
-                                return NEG_EINTR;
-                            }
-                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                            restore_caller_context(pid, saved_user_rsp);
+                            Err(e) => return e as u64, // ENOTCONN, etc.
                         }
                     }
-                },
-                Some(crate::net::unix::UnixSocketType::Datagram) => loop {
+                }
+                Some(crate::net::unix::UnixSocketType::Datagram) => {
                     let mut tmp = alloc::vec![0u8; capped];
-                    match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
-                        Ok((n, _sender)) => {
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
-                                return NEG_EFAULT;
+                    loop {
+                        match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
+                            Ok((n, _sender)) => {
+                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                    return NEG_EFAULT;
+                                }
+                                return n as u64;
                             }
-                            return n as u64;
-                        }
-                        Err(_) => {
-                            if nonblock {
-                                return NEG_EAGAIN;
+                            Err(-11) => {
+                                if nonblock {
+                                    return NEG_EAGAIN;
+                                }
+                                if has_pending_signal() {
+                                    return NEG_EINTR;
+                                }
+                                crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
+                                restore_caller_context(pid, saved_user_rsp);
                             }
-                            if has_pending_signal() {
-                                return NEG_EINTR;
-                            }
-                            crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                            restore_caller_context(pid, saved_user_rsp);
+                            Err(e) => return e as u64,
                         }
                     }
-                },
+                }
                 None => NEG_EBADF,
             }
         }
@@ -4140,8 +4147,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 Some(crate::net::unix::UnixSocketType::Stream) => loop {
                     match crate::net::unix::unix_stream_write(handle, &data) {
                         Ok(n) => return n as u64,
-                        Err(-32) => return NEG_EPIPE, // EPIPE
-                        Err(_) => {
+                        Err(-11) => {
+                            // EAGAIN — buffer full, block or return.
                             if nonblock {
                                 return NEG_EAGAIN;
                             }
@@ -4151,6 +4158,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
                             restore_caller_context(pid, saved_user_rsp);
                         }
+                        Err(e) => return e as u64, // EPIPE, ENOTCONN, etc.
                     }
                 },
                 Some(crate::net::unix::UnixSocketType::Datagram) => {
@@ -4165,7 +4173,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     crate::net::unix::wake_unix_socket(target);
                                     n as u64
                                 }
-                                Err(_) => NEG_EAGAIN,
+                                Err(e) => e as u64, // ECONNREFUSED, EAGAIN, etc.
                             }
                         }
                         None => NEG_ENOTCONN,
@@ -8782,12 +8790,11 @@ const NEG_EOPNOTSUPP: u64 = (-95_i64) as u64;
 const NEG_ENOPROTOOPT: u64 = (-92_i64) as u64;
 const NEG_EAFNOSUPPORT: u64 = (-97_i64) as u64;
 const NEG_EISCONN: u64 = (-106_i64) as u64;
+const NEG_EALREADY: u64 = (-114_i64) as u64;
 
 // ===========================================================================
 // Phase 39: Unix domain socket syscall helpers
 // ===========================================================================
-
-const NEG_EPIPE: u64 = (-32_i64) as u64;
 
 /// Create an AF_UNIX socket.
 fn sys_socket_unix(socktype: u64) -> u64 {
@@ -9047,10 +9054,12 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match sock_type {
         crate::net::unix::UnixSocketType::Stream => {
-            // Guard: reject if already connected or already pending.
+            // Guard: reject if already connected or already pending (Bound = pending connect).
             let cur_state = crate::net::unix::with_unix_socket(handle, |s| s.state);
-            if cur_state == Some(crate::net::unix::UnixSocketState::Connected) {
-                return NEG_EISCONN;
+            match cur_state {
+                Some(crate::net::unix::UnixSocketState::Connected) => return NEG_EISCONN,
+                Some(crate::net::unix::UnixSocketState::Bound) => return NEG_EALREADY,
+                _ => {}
             }
 
             // Verify target is listening.
@@ -9139,6 +9148,16 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
         Err(e) => return e,
     };
 
+    // Validate this is a listening stream socket.
+    let info = crate::net::unix::with_unix_socket(handle, |s| (s.socket_type, s.state));
+    match info {
+        Some((
+            crate::net::unix::UnixSocketType::Stream,
+            crate::net::unix::UnixSocketState::Listening,
+        )) => {}
+        _ => return NEG_EINVAL,
+    }
+
     let nonblock = entry.nonblock;
     let pid = crate::process::current_pid();
     let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
@@ -9151,15 +9170,16 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
         let client_handle =
             crate::net::unix::with_unix_socket_mut(handle, |s| s.backlog.pop_front());
         if let Some(Some(ch)) = client_handle {
-            // Release the backlog refcount (connect() incremented it).
-            crate::net::unix::free_unix_socket(ch);
-
             // Allocate a new server-side socket.
             let server_handle =
                 match crate::net::unix::alloc_unix_socket(crate::net::unix::UnixSocketType::Stream)
                 {
                     Some(h) => h,
-                    None => return NEG_ENFILE,
+                    None => {
+                        // Release backlog refcount on failure.
+                        crate::net::unix::free_unix_socket(ch);
+                        return NEG_ENFILE;
+                    }
                 };
 
             // Peer the server socket with the client.
@@ -9173,6 +9193,9 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
             });
             // Wake the client (blocked in connect).
             crate::net::unix::wake_unix_socket(ch);
+
+            // Release the backlog refcount now that peering is complete.
+            crate::net::unix::free_unix_socket(ch);
 
             // Create FD for the accepted socket.
             let new_entry = FdEntry {
@@ -9307,7 +9330,8 @@ fn sys_sendto_unix(
                 crate::net::unix::wake_unix_socket(target);
                 return n as u64;
             }
-            Err(_) => {
+            Err(-11) => {
+                // EAGAIN — queue full, block or return.
                 if nonblock {
                     return NEG_EAGAIN;
                 }
@@ -9317,6 +9341,7 @@ fn sys_sendto_unix(
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
                 restore_caller_context(pid, saved_user_rsp);
             }
+            Err(e) => return e as u64, // ECONNREFUSED, etc.
         }
     }
 }

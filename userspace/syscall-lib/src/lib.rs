@@ -384,10 +384,11 @@ impl SockaddrUn {
         addr
     }
 
-    /// Return the length (family + path + NUL).
+    /// Return the length (family + path + NUL), clamped to struct size.
     pub fn len(&self) -> usize {
         let path_len = self.sun_path.iter().position(|&b| b == 0).unwrap_or(108);
-        2 + path_len + 1
+        // Clamp to struct size (110 = 2 + 108).
+        (2 + path_len + 1).min(core::mem::size_of::<Self>())
     }
 
     pub fn is_empty(&self) -> bool {
