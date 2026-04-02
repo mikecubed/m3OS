@@ -493,19 +493,26 @@ therefore packs the endpoint cap handle into `rdx` (arg2) rather than the
 full SysV `r8` (arg4) position.  The reply payload (`data[0]`) is not
 forwarded in the syscall form; kernel threads use the Rust API directly.
 
-Note: syscall number 6 is `sys_exit` (Phase 5).  Syscall number 12 is
-`sys_debug_print` (Phase 5).  Numbers 1–5 and 7–8 are reserved for IPC.
+Note: in the original Phase 6 design, syscall number 6 was `sys_exit` (Phase 5)
+and syscall number 12 was `sys_debug_print` (Phase 5), with a contiguous range
+of syscall numbers reserved for IPC.  In the current implementation, the syscall
+table follows a Linux-like layout (e.g., `1 = write`, `2 = open`, etc.); the
+authoritative mapping lives in `kernel/src/arch/x86_64/syscall.rs`, and
+userspace uses it via `userspace/syscall-lib`.  Treat the table above as
+describing the logical IPC interface; consult the code for the actual syscall
+numbers or call paths.
 
 ### Error Convention
 
 Error returns are per-syscall:
 
-- **Rendezvous (1–5):** return `u64::MAX` on any error (invalid handle, wrong
-  capability type, capability table full).
-- **`notify_wait` (7):** returns `0` on error (invalid handle or wrong type).
+- **Rendezvous IPC calls** (e.g., `ipc_call`, `ipc_reply`, `ipc_reply_recv`):
+  return `u64::MAX` on any error (invalid handle, wrong capability type,
+  capability table full).
+- **`notify_wait`:** returns `0` on error (invalid handle or wrong type).
   A return of `0` cannot be a valid success value because `wait()` only returns
   when at least one pending bit is set.
-- **`notify_signal` (8):** returns `u64::MAX` on error, `0` on success.
+- **`notify_signal`:** returns `u64::MAX` on error, `0` on success.
 
 `u64::MAX` is chosen for rendezvous errors because it cannot be a valid message
 label, clearly distinguishing success from failure without a separate register.
