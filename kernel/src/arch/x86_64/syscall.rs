@@ -4170,15 +4170,29 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     let sender_path =
                         crate::net::unix::with_unix_socket(handle, |s| s.path.clone()).flatten();
                     match peer {
-                        Some(target) => {
-                            match crate::net::unix::unix_dgram_send(sender_path, target, &data) {
+                        Some(target) => loop {
+                            match crate::net::unix::unix_dgram_send(
+                                sender_path.clone(),
+                                target,
+                                &data,
+                            ) {
                                 Ok(n) => {
                                     crate::net::unix::wake_unix_socket(target);
-                                    n as u64
+                                    return n as u64;
                                 }
-                                Err(e) => e as u64, // ECONNREFUSED, EAGAIN, etc.
+                                Err(-11) => {
+                                    if nonblock {
+                                        return NEG_EAGAIN;
+                                    }
+                                    if has_pending_signal() {
+                                        return NEG_EINTR;
+                                    }
+                                    crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
+                                    restore_caller_context(pid, saved_user_rsp);
+                                }
+                                Err(e) => return e as u64,
                             }
-                        }
+                        },
                         None => NEG_ENOTCONN,
                     }
                 }
