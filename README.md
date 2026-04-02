@@ -32,10 +32,10 @@ docs/       — Architecture docs and learning roadmap
 
 Full documentation lives in [`docs/`](docs/README.md):
 
-- [Boot Process](docs/02-boot.md) — UEFI boot flow and kernel entry
-- [Memory Management](docs/03-memory.md) — Frame allocator, page tables, heap
-- [Interrupts & Exceptions](docs/04-interrupts.md) — IDT, PIC, hardware IRQs
-- [Tasking & Scheduling](docs/05-tasking.md) — Task model and context switching
+- [Boot Process](docs/01-boot.md) — UEFI boot flow and kernel entry
+- [Memory Management](docs/02-memory.md) — Frame allocator, page tables, heap
+- [Interrupts & Exceptions](docs/03-interrupts.md) — IDT, PIC, hardware IRQs
+- [Tasking & Scheduling](docs/04-tasking.md) — Task model and context switching
 - [IPC](docs/06-ipc.md) — The core microkernel primitive
 - [Roadmap Guide](docs/roadmap/README.md) — Phased implementation plan
 - [Architecture & Syscalls](docs/appendix/architecture-and-syscalls.md) — Microkernel design, privilege model, syscall ABI

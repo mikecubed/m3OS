@@ -347,9 +347,9 @@ Each phase must include:
 
 - [Roadmap Task Lists](./tasks/README.md)
 - [Architecture & Syscalls](../appendix/architecture-and-syscalls.md)
-- [Boot Process](../02-boot.md)
-- [Memory Management](../03-memory.md)
-- [Interrupts & Exceptions](../04-interrupts.md)
-- [Tasking & Scheduling](../05-tasking.md)
+- [Boot Process](../01-boot.md)
+- [Memory Management](../02-memory.md)
+- [Interrupts & Exceptions](../03-interrupts.md)
+- [Tasking & Scheduling](../04-tasking.md)
 - [IPC](../06-ipc.md)
 - [Testing](../appendix/testing.md)

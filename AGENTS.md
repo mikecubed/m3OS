@@ -241,7 +241,7 @@ Read before making significant changes:
 | File | When |
 |---|---|
 | `docs/appendix/architecture-and-syscalls.md` | Orientation — kernel vs. userspace split, syscall ABI |
-| `docs/03-memory.md` | Before touching frame allocator, page tables, or heap |
+| `docs/02-memory.md` | Before touching frame allocator, page tables, or heap |
 | `docs/06-ipc.md` | Before touching `kernel/src/ipc/` or syscalls |
 | `docs/08-storage-and-vfs.md` | Before touching `kernel/src/fs/` or block devices |
 | `docs/appendix/testing.md` | Before writing kernel tests or modifying the xtask harness |

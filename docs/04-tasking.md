@@ -187,7 +187,7 @@ sequenceDiagram
 
 `signal_reschedule` is the _only_ scheduler function called from the ISR.  It
 performs a single atomic store — no locks, no allocation, no IPC — satisfying the
-interrupt-handler minimalism rule from `docs/04-interrupts.md`.
+interrupt-handler minimalism rule from `docs/03-interrupts.md`.
 
 ### Idle behavior (P4-T005, P4-T009)
 
@@ -259,6 +259,6 @@ real inter-task communication will require tasks to block on endpoint receive.
 
 ## See Also
 
-- `docs/04-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers
+- `docs/03-interrupts.md` — timer ISR and the rule against allocation in IRQ handlers
 - `docs/06-ipc.md` — IPC model that will require `Blocked` state in Phase 6
 - `docs/roadmap/README.md` — per-phase scope and milestones

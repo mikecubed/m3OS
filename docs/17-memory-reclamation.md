@@ -8,7 +8,7 @@ This document covers the memory reclamation infrastructure added in Phase 17:
 the free-list frame allocator, per-frame reference counting, copy-on-write
 fork, growable kernel heap, kernel stack lifecycle, and process page table
 teardown. For foundational memory concepts (physical vs virtual, 4-level
-paging, address space layout), see [docs/03-memory.md](03-memory.md).
+paging, address space layout), see [docs/02-memory.md](02-memory.md).
 
 ## Free-List Frame Allocator
 

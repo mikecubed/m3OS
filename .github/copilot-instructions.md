@@ -206,6 +206,6 @@ All design documentation is in `docs/`. Read these before making significant cha
 |---|---|
 | `docs/appendix/architecture-and-syscalls.md` | Orientation — what lives in the kernel vs. userspace |
 | `docs/06-ipc.md` | Before touching anything in `kernel/src/ipc/` or syscalls |
-| `docs/03-memory.md` | Before touching frame allocator, page tables, or heap |
+| `docs/02-memory.md` | Before touching frame allocator, page tables, or heap |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 | `docs/appendix/testing.md` | Before writing kernel tests or modifying the xtask harness |

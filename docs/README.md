@@ -10,10 +10,10 @@ userspace shell and programs.
 
 | Document | Phase | Description |
 |---|---|---|
-| [Boot Process](./02-boot.md) | 1 | UEFI boot flow, `bootloader` crate, kernel entry |
-| [Memory Management](./03-memory.md) | 2 | Frame allocator, page tables, kernel heap |
-| [Interrupts & Exceptions](./04-interrupts.md) | 3 | IDT, PIC, exception handlers, hardware IRQs |
-| [Tasking & Scheduling](./05-tasking.md) | 4 | Task model, context switching, scheduler |
+| [Boot Process](./01-boot.md) | 1 | UEFI boot flow, `bootloader` crate, kernel entry |
+| [Memory Management](./02-memory.md) | 2 | Frame allocator, page tables, kernel heap |
+| [Interrupts & Exceptions](./03-interrupts.md) | 3 | IDT, PIC, exception handlers, hardware IRQs |
+| [Tasking & Scheduling](./04-tasking.md) | 4 | Task model, context switching, scheduler |
 | [Userspace Entry](./05-userspace-entry.md) | 5 | Ring 3 transition, syscall gate, first userspace binary |
 | [IPC](./06-ipc.md) | 6 | Synchronous rendezvous, capabilities, notifications |
 | [Core Servers](./07-core-servers.md) | 7 | init, console_server, kbd_server, service registry |
