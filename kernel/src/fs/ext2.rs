@@ -12,9 +12,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use kernel_core::fs::ext2::{
-    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_IND_BLOCK, EXT2_NDIR_BLOCKS,
-    EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode, Ext2Superblock,
-    S_IFDIR, S_IFREG,
+    EXT2_DIND_BLOCK, EXT2_FT_DIR, EXT2_FT_REG_FILE, EXT2_FT_SYMLINK, EXT2_IND_BLOCK,
+    EXT2_NDIR_BLOCKS, EXT2_ROOT_INO, Ext2BlockGroupDescriptor, Ext2DirEntry, Ext2Error, Ext2Inode,
+    Ext2Superblock, S_IFDIR, S_IFLNK, S_IFREG,
 };
 use spin::Mutex;
 
@@ -1044,14 +1044,65 @@ impl Ext2Volume {
         }
 
         child_inode.links_count = child_inode.links_count.saturating_sub(1);
-        if child_inode.links_count == 0 {
-            self.truncate_file(child_ino, &mut child_inode)?;
-            self.free_inode(child_ino)?;
-        } else {
+        self.remove_directory_entry(&parent_inode, name)?;
+
+        if child_inode.links_count != 0 {
             self.write_inode(child_ino, &child_inode)?;
+            return Ok(());
         }
 
-        self.remove_directory_entry(&parent_inode, name)
+        if crate::process::ext2_inode_open_count(child_ino) != 0 {
+            self.write_inode(child_ino, &child_inode)?;
+        } else {
+            self.truncate_file(child_ino, &mut child_inode)?;
+            self.free_inode(child_ino)?;
+        }
+
+        Ok(())
+    }
+
+    /// Create a hard link to an existing non-directory inode.
+    pub fn create_hard_link(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target_ino: u32,
+    ) -> Result<(), Ext2Error> {
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+
+        let mut target_inode = self.read_inode(target_ino)?;
+        if target_inode.is_dir() {
+            return Err(Ext2Error::IsDirectory);
+        }
+
+        target_inode.links_count = target_inode.links_count.saturating_add(1);
+        self.write_inode(target_ino, &target_inode)?;
+
+        let file_type = if target_inode.is_symlink() {
+            EXT2_FT_SYMLINK
+        } else {
+            EXT2_FT_REG_FILE
+        };
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        if let Err(err) = self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            target_ino,
+            file_type,
+        ) {
+            target_inode.links_count = target_inode.links_count.saturating_sub(1);
+            let _ = self.write_inode(target_ino, &target_inode);
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// Delete an empty directory (P28-T042).
@@ -1154,6 +1205,180 @@ impl Ext2Volume {
                 Err(_) => false,
             },
             Err(_) => false,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Symlink operations (Phase 38)
+    // -----------------------------------------------------------------------
+
+    /// Maximum symlink target length stored inline in the inode's block array.
+    const SYMLINK_INLINE_MAX: usize = 60; // 15 × 4 bytes
+
+    /// Create a symbolic link in directory `parent_inode_num` with the given
+    /// `name`, pointing at `target`.
+    ///
+    /// Short targets (≤60 bytes) are stored inline in the inode block pointers;
+    /// longer targets are stored in an allocated data block.
+    pub fn create_symlink(
+        &mut self,
+        parent_inode_num: u32,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, Ext2Error> {
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Ext2Error::NotDirectory);
+        }
+
+        if self.lookup_in_directory(&parent_inode, name).is_ok() {
+            return Err(Ext2Error::AlreadyExists);
+        }
+
+        let parent_group = kernel_core::fs::ext2::inode_block_group(
+            parent_inode_num,
+            self.superblock.inodes_per_group,
+        );
+        let new_ino = self.allocate_inode(parent_group)?;
+
+        let target_bytes = target.as_bytes();
+        if target_bytes.len() > self.block_size as usize {
+            self.free_inode(new_ino)?;
+            return Err(Ext2Error::OutOfSpace);
+        }
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFLNK | 0o777;
+        inode.uid = uid as u16;
+        inode.gid = gid as u16;
+        inode.links_count = 1;
+        inode.size = target_bytes.len() as u32;
+        let mut allocated_block = None;
+
+        if target_bytes.len() <= Self::SYMLINK_INLINE_MAX {
+            // Inline: store target bytes directly in the block pointer array.
+            let mut raw = [0u8; 60];
+            raw[..target_bytes.len()].copy_from_slice(target_bytes);
+            for (i, slot) in inode.block.iter_mut().enumerate() {
+                let off = i * 4;
+                *slot = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+            }
+            // blocks stays 0 for inline symlinks
+        } else {
+            // Block-backed: allocate a data block and write the target into it.
+            let data_block = self.allocate_block(parent_group)?;
+            allocated_block = Some(data_block);
+            let bs = self.block_size as usize;
+            let mut block_data = vec![0u8; bs];
+            block_data[..target_bytes.len()].copy_from_slice(target_bytes);
+            if let Err(err) = self.write_block(data_block, &block_data) {
+                if let Some(block) = allocated_block.take()
+                    && let Err(cleanup_err) = self.free_block(block)
+                {
+                    log::warn!(
+                        "[ext2] create_symlink cleanup failed freeing block {} after write error: {:?}",
+                        block,
+                        cleanup_err
+                    );
+                }
+                if let Err(cleanup_err) = self.free_inode(new_ino) {
+                    log::warn!(
+                        "[ext2] create_symlink cleanup failed freeing inode {} after write error: {:?}",
+                        new_ino,
+                        cleanup_err
+                    );
+                }
+                return Err(err);
+            }
+
+            inode.block[0] = data_block;
+            inode.blocks = self.block_size / 512;
+        }
+
+        if let Err(err) = self.write_inode(new_ino, &inode) {
+            if let Some(block) = allocated_block.take()
+                && let Err(cleanup_err) = self.free_block(block)
+            {
+                log::warn!(
+                    "[ext2] create_symlink cleanup failed freeing block {} after inode write error: {:?}",
+                    block,
+                    cleanup_err
+                );
+            }
+            if let Err(cleanup_err) = self.free_inode(new_ino) {
+                log::warn!(
+                    "[ext2] create_symlink cleanup failed freeing inode {} after inode write error: {:?}",
+                    new_ino,
+                    cleanup_err
+                );
+            }
+            return Err(err);
+        }
+
+        // Add directory entry with EXT2_FT_SYMLINK type.
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        if let Err(err) = self.add_directory_entry(
+            parent_inode_num,
+            &mut parent_inode,
+            name,
+            new_ino,
+            EXT2_FT_SYMLINK,
+        ) {
+            if let Some(block) = allocated_block
+                && let Err(cleanup_err) = self.free_block(block)
+            {
+                log::warn!(
+                    "[ext2] create_symlink cleanup failed freeing block {} after dir entry error: {:?}",
+                    block,
+                    cleanup_err
+                );
+            }
+            if let Err(cleanup_err) = self.free_inode(new_ino) {
+                log::warn!(
+                    "[ext2] create_symlink cleanup failed freeing inode {} after dir entry error: {:?}",
+                    new_ino,
+                    cleanup_err
+                );
+            }
+            return Err(err);
+        }
+
+        Ok(new_ino)
+    }
+
+    /// Read the target of a symbolic link inode.
+    ///
+    /// Returns `Ext2Error::NotSymlink` if the inode is not a symlink.
+    pub fn read_symlink(&self, inode_num: u32) -> Result<String, Ext2Error> {
+        let inode = self.read_inode(inode_num)?;
+        if !inode.is_symlink() {
+            return Err(Ext2Error::NotSymlink);
+        }
+
+        let target_len = inode.size as usize;
+
+        if inode.blocks == 0 && target_len <= Self::SYMLINK_INLINE_MAX {
+            // Inline: target is stored in the block pointer array bytes.
+            let mut raw = [0u8; 60];
+            for (i, &slot) in inode.block.iter().enumerate() {
+                let off = i * 4;
+                raw[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+            }
+            let bytes = &raw[..target_len];
+            String::from_utf8(bytes.to_vec()).map_err(|_| Ext2Error::CorruptedEntry)
+        } else {
+            // Block-backed: read from the first data block.
+            let block_num = inode.block[0];
+            if block_num == 0 {
+                return Err(Ext2Error::CorruptedEntry);
+            }
+            let block_data = self.read_block(block_num)?;
+            if target_len > block_data.len() {
+                return Err(Ext2Error::CorruptedEntry);
+            }
+            String::from_utf8(block_data[..target_len].to_vec())
+                .map_err(|_| Ext2Error::CorruptedEntry)
         }
     }
 }

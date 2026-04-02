@@ -2,7 +2,9 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, write_str, write_u64};
+use syscall_lib::{
+    STDERR_FILENO, STDOUT_FILENO, Stat, lstat_stat, readlink, write, write_str, write_u64,
+};
 
 syscall_lib::entry_point!(main);
 
@@ -55,8 +57,8 @@ fn main(args: &[&str]) -> i32 {
         path[..bytes.len()].copy_from_slice(bytes);
         path[bytes.len()] = 0;
 
-        let mut st = syscall_lib::Stat::zeroed();
-        if syscall_lib::stat(&path[..=bytes.len()], &mut st) < 0 {
+        let mut st = Stat::zeroed();
+        if lstat_stat(&path[..=bytes.len()], &mut st) < 0 {
             write_str(STDERR_FILENO, "stat: cannot stat '");
             write_str(STDERR_FILENO, arg);
             write_str(STDERR_FILENO, "'\n");
@@ -66,6 +68,18 @@ fn main(args: &[&str]) -> i32 {
 
         write_str(STDOUT_FILENO, "  File: ");
         write_str(STDOUT_FILENO, arg);
+        if filetype(st.st_mode) == "symbolic link" {
+            let mut target = [0u8; 256];
+            let n = readlink(&path[..=bytes.len()], &mut target);
+            if n >= 0 {
+                write_str(STDOUT_FILENO, " -> ");
+                if n as usize == target.len() {
+                    write_str(STDOUT_FILENO, "[target truncated]");
+                } else {
+                    let _ = write(STDOUT_FILENO, &target[..n as usize]);
+                }
+            }
+        }
         write_str(STDOUT_FILENO, "\n");
         write_str(STDOUT_FILENO, "  Size: ");
         write_i64(STDOUT_FILENO, st.st_size);
@@ -88,6 +102,13 @@ fn main(args: &[&str]) -> i32 {
         write_str(STDOUT_FILENO, "\tGid: ");
         write_u64(STDOUT_FILENO, st.st_gid as u64);
         write_str(STDOUT_FILENO, "\n");
+        if filetype(st.st_mode) == "character device" || filetype(st.st_mode) == "block device" {
+            write_str(STDOUT_FILENO, "Device type: ");
+            write_u64(STDOUT_FILENO, (st.st_rdev >> 8) & 0xff);
+            write_str(STDOUT_FILENO, ",");
+            write_u64(STDOUT_FILENO, st.st_rdev & 0xff);
+            write_str(STDOUT_FILENO, "\n");
+        }
         write_str(STDOUT_FILENO, "Access: ");
         write_i64(STDOUT_FILENO, st.st_atime);
         write_str(STDOUT_FILENO, "\n");

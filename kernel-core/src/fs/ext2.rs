@@ -75,6 +75,8 @@ pub enum Ext2Error {
     NotEmpty,
     /// File or directory already exists.
     AlreadyExists,
+    /// Expected a symlink but got a different file type.
+    NotSymlink,
 }
 
 // ---------------------------------------------------------------------------
@@ -835,5 +837,56 @@ mod tests {
         assert_eq!(parsed.free_blocks_count, 700);
         assert_eq!(parsed.free_inodes_count, 50);
         assert_eq!(parsed.used_dirs_count, 10);
+    }
+
+    #[test]
+    fn parse_inode_symlink() {
+        let mut buf = [0u8; 128];
+        let mode = S_IFLNK | 0o777;
+        buf[0..2].copy_from_slice(&mode.to_le_bytes());
+        buf[26..28].copy_from_slice(&1u16.to_le_bytes()); // links_count = 1
+
+        let inode = Ext2Inode::parse(&buf).unwrap();
+        assert!(inode.is_symlink());
+        assert!(!inode.is_dir());
+        assert!(!inode.is_regular());
+        assert_eq!(inode.permission_mode(), 0o777);
+        assert_eq!(inode.file_type(), S_IFLNK);
+    }
+
+    #[test]
+    fn symlink_inline_roundtrip() {
+        // Simulate inline symlink: target stored in block pointer bytes.
+        let target = b"/usr/bin/env";
+        let mut inode = Ext2Inode::new_empty();
+        inode.mode = S_IFLNK | 0o777;
+        inode.links_count = 1;
+        inode.size = target.len() as u32;
+        // blocks = 0 signals inline storage
+
+        // Write target into block array (as the kernel ext2 driver does).
+        let mut raw = [0u8; 60];
+        raw[..target.len()].copy_from_slice(target);
+        for (i, slot) in inode.block.iter_mut().enumerate() {
+            let off = i * 4;
+            *slot = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+        }
+
+        // Serialize and re-parse.
+        let mut buf = [0u8; 128];
+        inode.write_into(&mut buf);
+        let parsed = Ext2Inode::parse(&buf).unwrap();
+
+        assert!(parsed.is_symlink());
+        assert_eq!(parsed.size, target.len() as u32);
+        assert_eq!(parsed.blocks, 0);
+
+        // Extract target back from block array.
+        let mut out = [0u8; 60];
+        for (i, &slot) in parsed.block.iter().enumerate() {
+            let off = i * 4;
+            out[off..off + 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        assert_eq!(&out[..target.len()], target);
     }
 }

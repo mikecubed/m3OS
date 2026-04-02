@@ -127,6 +127,14 @@ pub enum FdBackend {
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
     DevNull,
+    /// /dev/zero — reads return zero bytes, writes are silently discarded (Phase 38).
+    DevZero,
+    /// /dev/urandom — reads return PRNG bytes, writes are silently discarded (Phase 38).
+    DevUrandom,
+    /// /dev/full — reads return zero bytes, writes return ENOSPC (Phase 38).
+    DevFull,
+    /// Synthetic procfs file content, generated on read from kernel state.
+    Proc { path: String },
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
     /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).
@@ -193,6 +201,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut ext2_inodes = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -210,6 +219,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
                 }
                 *slot = None;
@@ -234,6 +244,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
+    for inode_num in ext2_inodes {
+        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -251,6 +264,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut pty_slaves = alloc::vec::Vec::new();
     let mut sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
+    let mut ext2_inodes = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -266,6 +280,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::PtySlave { pty_id } => pty_slaves.push(*pty_id),
                     FdBackend::Socket { handle } => sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
+                    FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
                     _ => {}
                 }
             }
@@ -289,6 +304,29 @@ pub fn close_all_fds_for(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
+    for inode_num in ext2_inodes {
+        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    }
+}
+
+/// Count open ext2-backed file descriptors referencing `inode_num`.
+pub fn ext2_inode_open_count(inode_num: u32) -> usize {
+    let table = PROCESS_TABLE.lock();
+    table
+        .iter()
+        .flat_map(|proc| proc.fd_table.iter().flatten())
+        .filter(|entry| {
+            matches!(
+                entry,
+                FdEntry {
+                    backend: FdBackend::Ext2Disk {
+                        inode_num: fd_inode, ..
+                    },
+                    ..
+                } if *fd_inode == inode_num
+            )
+        })
+        .count()
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
@@ -491,12 +529,20 @@ pub struct Process {
     pub euid: u32,
     /// Effective group ID (Phase 27). Used for permission checks.
     pub egid: u32,
+    /// Per-process file creation mask (Phase 38). Defaults to 0o022.
+    pub umask: u16,
     /// Session ID (Phase 29). Equals the PID of the session leader.
     pub session_id: u32,
     /// Controlling terminal (Phase 29).
     pub controlling_tty: Option<ControllingTty>,
     /// Tracked anonymous mmap regions (Phase 33).
     pub mappings: Vec<MemoryMapping>,
+    /// Last successfully executed binary path, used for procfs.
+    pub exec_path: String,
+    /// Current argv vector, used for `/proc/<pid>/cmdline`.
+    pub cmdline: Vec<String>,
+    /// Process start time in scheduler ticks since boot.
+    pub start_ticks: u64,
 }
 
 /// Describes a contiguous anonymous memory mapping created by `mmap`.
@@ -556,9 +602,13 @@ impl Process {
             gid: 0,
             euid: 0,
             egid: 0,
+            umask: 0o022,
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
             mappings: Vec::new(),
+            exec_path: String::new(),
+            cmdline: Vec::new(),
+            start_ticks: crate::arch::x86_64::interrupts::tick_count(),
         }
     }
 
@@ -690,9 +740,13 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -741,9 +795,13 @@ pub fn spawn_process_with_cr3(
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -796,9 +854,13 @@ pub fn spawn_process_with_cr3_and_fds(
         gid: 0,
         euid: 0,
         egid: 0,
+        umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
         mappings: Vec::new(),
+        exec_path: String::new(),
+        cmdline: Vec::new(),
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

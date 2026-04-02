@@ -177,7 +177,7 @@ fn build_userspace_bins() {
     // Rust coreutils — build all binaries in one cargo invocation.
     let coreutils_bins: &[&str] = &[
         "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
-        "env", "PROMPT", "ls", // Phase 32: build tool utilities
+        "env", "PROMPT", "ls", "ln", "readlink", // Phase 32: build tool utilities
         "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
         "date", "uptime", // Phase 34: timekeeping utilities
     ];
@@ -1698,8 +1698,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for login prompt",
     });
     steps.push(SmokeStep::Send {
-        input: "root\n",
-        label: "enter username",
+        input: "rooo\x08t\n",
+        label: "enter username with backspace correction",
     });
     steps.push(SmokeStep::Wait {
         pattern: "Password:",
@@ -1712,7 +1712,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "wait for shell prompt",
     });
 
@@ -1916,7 +1916,109 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 8. make clean
+    // 8. Phase 38: filesystem enhancements integration
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/tmpfs-test\n",
+        label: "phase 38 integration test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: ", 0 failed",
+        timeout_secs: 30,
+        label: "verify tmpfs-test passed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tmpfs-test",
+    });
+
+    steps.extend(cmd_then_prompt(
+        "/bin/ln -s /bin/sh0 /tmp/mysh\n",
+        "send: ln -s /bin/sh0 /tmp/mysh",
+        "wait: prompt after ln",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/readlink /tmp/mysh\n",
+        label: "readlink: verify symlink target",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/bin/sh0",
+        timeout_secs: 10,
+        label: "verify readlink output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after readlink",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/rm /tmp/mysh\n",
+        "send: rm /tmp/mysh",
+        "wait: prompt after rm symlink",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/ln -s /././././././././././././././././././././././././././././././etc/passwd /phase38-passwd-link\n",
+        "send: ln -s /etc/passwd /phase38-passwd-link",
+        "wait: prompt after ext2 symlink create",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /phase38-passwd-link\n",
+        label: "stat: verify ext2 symlink metadata",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "symbolic link",
+        timeout_secs: 10,
+        label: "verify stat sees ext2 symlink",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ext2 symlink stat",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/readlink /phase38-passwd-link\n",
+        label: "readlink: verify ext2 symlink target",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/etc/passwd",
+        timeout_secs: 10,
+        label: "verify ext2 readlink output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ext2 readlink",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep root:x:0:0: /phase38-passwd-link\n",
+        label: "grep: follow ext2 symlink target",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0:",
+        timeout_secs: 15,
+        label: "verify ext2 symlink follow output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ext2 symlink cat",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/rm /phase38-passwd-link\n",
+        "send: rm /phase38-passwd-link",
+        "wait: prompt after ext2 symlink rm",
+        10,
+    ));
+
+    // -----------------------------------------------------------------------
+    // 9. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

@@ -14,6 +14,7 @@
 
 pub mod ext2;
 pub mod fat32;
+pub mod procfs;
 pub mod protocol;
 pub mod ramdisk;
 pub mod tmpfs;

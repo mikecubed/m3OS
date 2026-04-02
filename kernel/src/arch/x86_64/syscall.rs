@@ -47,12 +47,51 @@ const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
 const NEG_ENOMEM: u64 = (-12_i64) as u64;
+#[allow(dead_code)]
+const NEG_ELOOP: u64 = (-40_i64) as u64;
+#[allow(dead_code)]
+const NEG_EXDEV: u64 = (-18_i64) as u64;
 
 /// linux_dirent64 type constants.
 #[allow(dead_code)]
 const DT_DIR: u8 = 4;
 #[allow(dead_code)]
+const DT_LNK: u8 = 10;
+#[allow(dead_code)]
 const DT_REG: u8 = 8;
+
+const EXT2_SUPER_MAGIC: i64 = 0xEF53;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: i64 = 0x0000_9FA0;
+const RAMFS_MAGIC: i64 = 0x8584_58F6u32 as i64;
+const MSDOS_SUPER_MAGIC: i64 = 0x0000_4D44;
+const PIPEFS_MAGIC: i64 = 0x5049_5045;
+const SOCKFS_MAGIC: i64 = 0x534F_434B;
+const STATFS_BLOCK_SIZE: i64 = 4096;
+const STATFS_NAME_MAX: i64 = 255;
+const TMPFS_TOTAL_BLOCKS: u64 =
+    (crate::fs::tmpfs::MAX_FILE_SIZE as u64).div_ceil(STATFS_BLOCK_SIZE as u64);
+const TMPFS_TOTAL_FILES: u64 = 1024;
+const VIRTUAL_FS_DEFAULT_BLOCKS: u64 = 1024;
+const VIRTUAL_FS_DEFAULT_FILES: u64 = 1024;
+
+#[repr(C)]
+struct Statfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+}
+
+const _: [(); 120] = [(); core::mem::size_of::<Statfs>()];
 
 // ---------------------------------------------------------------------------
 // Path resolution helpers (Phase 18)
@@ -105,6 +144,561 @@ fn current_cwd() -> alloc::string::String {
         Some(p) => p.cwd.clone(),
         None => alloc::string::String::from("/"),
     }
+}
+
+fn current_umask() -> u16 {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table.find(pid).map(|proc| proc.umask).unwrap_or(0o022)
+}
+
+enum PathNodeKind {
+    File,
+    Dir,
+    Symlink(alloc::string::String),
+}
+
+fn parent_path(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" {
+        return Ok(PathNodeKind::Dir);
+    }
+    if let Some(node) = crate::fs::procfs::path_node(abs_path) {
+        return match node {
+            crate::fs::procfs::ProcfsNode::Dir => Ok(PathNodeKind::Dir),
+            crate::fs::procfs::ProcfsNode::File => Ok(PathNodeKind::File),
+            crate::fs::procfs::ProcfsNode::Symlink(target) => Ok(PathNodeKind::Symlink(target)),
+        };
+    }
+    if abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/ptmx"
+    {
+        return Ok(PathNodeKind::File);
+    }
+    if abs_path.starts_with("/dev/pts/") {
+        return if dev_pts_path_exists(abs_path) {
+            Ok(PathNodeKind::File)
+        } else {
+            Err(NEG_ENOENT)
+        };
+    }
+
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        if rel.is_empty() {
+            return Ok(PathNodeKind::Dir);
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return match tmpfs.stat(rel) {
+            Ok(stat) if stat.is_symlink => tmpfs
+                .read_symlink(rel)
+                .map(|target| PathNodeKind::Symlink(alloc::string::String::from(target)))
+                .map_err(|_| NEG_EIO),
+            Ok(stat) if stat.is_dir => Ok(PathNodeKind::Dir),
+            Ok(_) => Ok(PathNodeKind::File),
+            Err(crate::fs::tmpfs::TmpfsError::NotFound) => Err(NEG_ENOENT),
+            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => Err(NEG_ENOTDIR),
+            Err(_) => Err(NEG_EIO),
+        };
+    }
+
+    if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(abs_path) {
+        return if node.is_dir() {
+            Ok(PathNodeKind::Dir)
+        } else {
+            Ok(PathNodeKind::File)
+        };
+    }
+
+    if abs_path == "/data" {
+        return Ok(PathNodeKind::Dir);
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && let Ok(ino) = vol.resolve_path(rel)
+                && let Ok(inode) = vol.read_inode(ino)
+            {
+                return if inode.is_symlink() {
+                    vol.read_symlink(ino)
+                        .map(PathNodeKind::Symlink)
+                        .map_err(|_| NEG_EIO)
+                } else if inode.is_dir() {
+                    Ok(PathNodeKind::Dir)
+                } else {
+                    Ok(PathNodeKind::File)
+                };
+            }
+        }
+        if rel.is_empty() {
+            return if data_is_mounted() {
+                Ok(PathNodeKind::Dir)
+            } else {
+                Err(NEG_ENOENT)
+            };
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return match vol.lookup(rel) {
+                    Ok(entry) if entry.is_dir() => Ok(PathNodeKind::Dir),
+                    Ok(_) => Ok(PathNodeKind::File),
+                    Err(_) => Err(NEG_ENOENT),
+                };
+            }
+        }
+    }
+
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            return match vol.resolve_path(rel) {
+                Ok(ino) => match vol.read_inode(ino) {
+                    Ok(inode) if inode.is_symlink() => vol
+                        .read_symlink(ino)
+                        .map(PathNodeKind::Symlink)
+                        .map_err(|_| NEG_EIO),
+                    Ok(inode) if inode.is_dir() => Ok(PathNodeKind::Dir),
+                    Ok(_) => Ok(PathNodeKind::File),
+                    Err(_) => Err(NEG_EIO),
+                },
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) => Err(NEG_ENOENT),
+                Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => Err(NEG_ENOTDIR),
+                Err(_) => Err(NEG_EIO),
+            };
+        }
+    }
+
+    Err(NEG_ENOENT)
+}
+
+fn resolve_existing_fs_path(
+    abs_path: &str,
+    follow_final: bool,
+) -> Result<alloc::string::String, u64> {
+    let mut current = resolve_path("/", abs_path);
+    let mut hops = 0usize;
+
+    'restart: loop {
+        let parts: alloc::vec::Vec<&str> = current
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Ok(alloc::string::String::from("/"));
+        }
+
+        let mut prefix = alloc::string::String::from("/");
+        for (index, part) in parts.iter().enumerate() {
+            require_search_permission(&prefix)?;
+            let candidate = if prefix == "/" {
+                alloc::format!("/{}", part)
+            } else {
+                alloc::format!("{}/{}", prefix, part)
+            };
+            let is_final = index + 1 == parts.len();
+            match path_node_nofollow(&candidate)? {
+                PathNodeKind::Symlink(target) if !is_final || follow_final => {
+                    if hops >= 40 {
+                        return Err(NEG_ELOOP);
+                    }
+                    hops += 1;
+                    let remaining = if is_final {
+                        alloc::string::String::new()
+                    } else {
+                        parts[index + 1..].join("/")
+                    };
+                    let base = if target.starts_with('/') {
+                        target
+                    } else {
+                        resolve_path(parent_path(&candidate), &target)
+                    };
+                    current = if remaining.is_empty() {
+                        base
+                    } else {
+                        resolve_path(&base, &remaining)
+                    };
+                    continue 'restart;
+                }
+                PathNodeKind::Dir if !is_final => prefix = candidate,
+                PathNodeKind::File | PathNodeKind::Symlink(_) if !is_final => {
+                    return Err(NEG_ENOTDIR);
+                }
+                _ => prefix = candidate,
+            }
+        }
+
+        return Ok(prefix);
+    }
+}
+
+fn resolve_parent_components(abs_path: &str) -> Result<alloc::string::String, u64> {
+    let normalized = resolve_path("/", abs_path);
+    let name = basename(&normalized);
+    let parent = parent_path(&normalized);
+    let resolved_parent = resolve_existing_fs_path(parent, true)?;
+    if resolved_parent == "/" {
+        Ok(alloc::format!("/{}", name))
+    } else {
+        Ok(alloc::format!("{}/{}", resolved_parent, name))
+    }
+}
+
+fn resolve_path_from_dirfd(dirfd: u64, raw_path: &str) -> Result<alloc::string::String, u64> {
+    if raw_path.is_empty() {
+        return Err(NEG_ENOENT);
+    }
+    if raw_path.starts_with('/') {
+        return Ok(resolve_path("/", raw_path));
+    }
+    if dirfd == AT_FDCWD {
+        return Ok(resolve_path(&current_cwd(), raw_path));
+    }
+
+    let dirfd_idx = dirfd as usize;
+    if dirfd_idx >= MAX_FDS {
+        return Err(NEG_EBADF);
+    }
+    let dir_entry = current_fd_entry(dirfd_idx).ok_or(NEG_EBADF)?;
+    let base = match &dir_entry.backend {
+        FdBackend::Dir { path } => path.clone(),
+        _ => return Err(NEG_ENOTDIR),
+    };
+    Ok(resolve_path(&base, raw_path))
+}
+
+fn require_search_permission(abs_path: &str) -> Result<(), u64> {
+    if let Some((uid, gid, mode)) = path_metadata(abs_path) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(uid, gid, mode, euid, egid, 1) {
+            return Err(NEG_EACCES);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_create_path(lexical: &str, follow_final: bool) -> Result<alloc::string::String, u64> {
+    if follow_final && let Ok(PathNodeKind::Symlink(target)) = path_node_nofollow(lexical) {
+        let target_path = if target.starts_with('/') {
+            resolve_path("/", &target)
+        } else {
+            resolve_path(parent_path(lexical), &target)
+        };
+        return match resolve_existing_fs_path(&target_path, true) {
+            Ok(path) => Ok(path),
+            Err(NEG_ENOENT) => resolve_parent_components(&target_path),
+            Err(err) => Err(err),
+        };
+    }
+
+    resolve_parent_components(lexical)
+}
+
+fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 {
+    if raw_path.is_empty() {
+        return NEG_ENOENT;
+    }
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let follow_final = flags & O_NOFOLLOW == 0;
+    let resolved = if flags & O_CREAT != 0 {
+        match resolve_existing_fs_path(&lexical, follow_final) {
+            Ok(path) => path,
+            Err(NEG_ENOENT) => match resolve_create_path(&lexical, follow_final) {
+                Ok(path) => path,
+                Err(err) => return err,
+            },
+            Err(err) => return err,
+        }
+    } else {
+        match resolve_existing_fs_path(&lexical, follow_final) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    };
+
+    if flags & O_NOFOLLOW != 0
+        && matches!(path_node_nofollow(&resolved), Ok(PathNodeKind::Symlink(_)))
+    {
+        return NEG_ELOOP;
+    }
+
+    open_resolved_path(&resolved, flags, mode_arg)
+}
+
+fn make_statfs(
+    f_type: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+) -> Statfs {
+    Statfs {
+        f_type,
+        f_bsize: STATFS_BLOCK_SIZE,
+        f_blocks,
+        f_bfree,
+        f_bavail,
+        f_files,
+        f_ffree,
+        f_fsid: [f_type as i32, 0],
+        f_namelen: STATFS_NAME_MAX,
+        f_frsize: STATFS_BLOCK_SIZE,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
+fn tmpfs_statfs() -> Statfs {
+    let free_blocks = crate::mm::frame_allocator::free_count() as u64;
+    make_statfs(
+        TMPFS_MAGIC,
+        TMPFS_TOTAL_BLOCKS,
+        free_blocks.min(TMPFS_TOTAL_BLOCKS),
+        free_blocks.min(TMPFS_TOTAL_BLOCKS),
+        TMPFS_TOTAL_FILES,
+        TMPFS_TOTAL_FILES,
+    )
+}
+
+fn proc_statfs() -> Statfs {
+    make_statfs(
+        PROC_SUPER_MAGIC,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn ramdisk_statfs() -> Statfs {
+    make_statfs(
+        RAMFS_MAGIC,
+        VIRTUAL_FS_DEFAULT_BLOCKS,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        0,
+    )
+}
+
+fn pipefs_statfs() -> Statfs {
+    make_statfs(
+        PIPEFS_MAGIC,
+        0,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn sockfs_statfs() -> Statfs {
+    make_statfs(
+        SOCKFS_MAGIC,
+        0,
+        0,
+        0,
+        VIRTUAL_FS_DEFAULT_FILES,
+        VIRTUAL_FS_DEFAULT_FILES,
+    )
+}
+
+fn ext2_statfs() -> Statfs {
+    let ext2 = crate::fs::ext2::EXT2_VOLUME.lock();
+    if let Some(vol) = ext2.as_ref() {
+        return make_statfs(
+            EXT2_SUPER_MAGIC,
+            vol.superblock.blocks_count as u64,
+            vol.superblock.free_blocks_count as u64,
+            vol.superblock.free_blocks_count as u64,
+            vol.superblock.inodes_count as u64,
+            vol.superblock.free_inodes_count as u64,
+        );
+    }
+    ramdisk_statfs()
+}
+
+fn fat32_statfs() -> Statfs {
+    let fat32 = crate::fs::fat32::FAT32_VOLUME.lock();
+    if let Some(vol) = fat32.as_ref() {
+        let reserved = vol.bpb.reserved_sectors as u64;
+        let fats = (vol.bpb.num_fats as u64) * (vol.bpb.fat_size_32 as u64);
+        let data_sectors = (vol.bpb.total_sectors_32 as u64).saturating_sub(reserved + fats);
+        let data_bytes = data_sectors * (vol.bpb.bytes_per_sector as u64);
+        let total_blocks = data_bytes.div_ceil(STATFS_BLOCK_SIZE as u64);
+        return make_statfs(
+            MSDOS_SUPER_MAGIC,
+            total_blocks,
+            0,
+            0,
+            VIRTUAL_FS_DEFAULT_FILES,
+            0,
+        );
+    }
+    ramdisk_statfs()
+}
+
+fn write_statfs_to_user(buf_ptr: u64, stat: &Statfs) -> u64 {
+    if buf_ptr == 0 {
+        return NEG_EFAULT;
+    }
+    // SAFETY: `Statfs` is a plain repr(C) POD buffer with a compile-time size check.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (stat as *const Statfs).cast::<u8>(),
+            core::mem::size_of::<Statfs>(),
+        )
+    };
+    if crate::mm::user_mem::copy_to_user(buf_ptr, bytes).is_err() {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+fn dev_pts_path_exists(abs_path: &str) -> bool {
+    let Some(suffix) = abs_path.strip_prefix("/dev/pts/") else {
+        return false;
+    };
+    let Ok(pty_id) = suffix.parse::<usize>() else {
+        return false;
+    };
+    let table = crate::pty::PTY_TABLE.lock();
+    table.get(pty_id).and_then(|slot| slot.as_ref()).is_some()
+}
+
+fn statfs_for_path(abs_path: &str) -> Statfs {
+    if abs_path == "/proc" || abs_path.starts_with("/proc/") {
+        return proc_statfs();
+    }
+    if abs_path == "/tmp" || abs_path.starts_with("/tmp/") {
+        return tmpfs_statfs();
+    }
+    if abs_path == "/dev" || abs_path.starts_with("/dev/") {
+        return ramdisk_statfs();
+    }
+    if abs_path == "/" {
+        return if crate::fs::ext2::is_mounted() {
+            ext2_statfs()
+        } else {
+            ramdisk_statfs()
+        };
+    }
+    if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
+        return ramdisk_statfs();
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref()
+            && vol.exists(rel)
+        {
+            return ext2_statfs();
+        }
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return ext2_statfs();
+            }
+        }
+        if rel.is_empty() {
+            return fat32_statfs();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.lookup(rel).is_ok()
+            {
+                return fat32_statfs();
+            }
+        }
+    }
+    ramdisk_statfs()
+}
+
+fn statfs_path_exists(abs_path: &str) -> bool {
+    if abs_path == "/" || abs_path == "/tmp" {
+        return true;
+    }
+    if crate::fs::procfs::path_exists(abs_path) {
+        return true;
+    }
+    if abs_path == "/dev"
+        || abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/ptmx"
+    {
+        return true;
+    }
+    if abs_path.starts_with("/dev/pts/") {
+        return dev_pts_path_exists(abs_path);
+    }
+    if let Some(rel) = tmpfs_relative_path(abs_path) {
+        if rel.is_empty() {
+            return true;
+        }
+        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+        return tmpfs.stat(rel).is_ok();
+    }
+    if let Some(node) = crate::fs::ramdisk::ramdisk_lookup(abs_path) {
+        return node.is_dir() || node.is_file();
+    }
+    if crate::fs::ext2::is_mounted()
+        && let Some(rel) = ext2_root_path(abs_path)
+    {
+        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+        if let Some(vol) = vol.as_ref() {
+            return vol.exists(rel);
+        }
+    }
+    if let Some(rel) = fat32_relative_path(abs_path) {
+        if crate::fs::ext2::is_mounted() {
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            if let Some(vol) = vol.as_ref()
+                && vol.exists(rel)
+            {
+                return true;
+            }
+        }
+        if rel.is_empty() {
+            return data_is_mounted();
+        }
+        if crate::fs::fat32::is_mounted() {
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            if let Some(vol) = vol.as_ref() {
+                return vol.lookup(rel).is_ok();
+            }
+        }
+    }
+    false
 }
 
 use core::arch::global_asm;
@@ -350,11 +944,13 @@ pub extern "C" fn syscall_handler(
         1 => sys_linux_write(arg0, arg1, arg2),
         2 => sys_linux_open(arg0, arg1, arg2),
         3 => sys_linux_close(arg0),
-        // stat(path, buf) and lstat(path, buf) — no symlinks, both delegate to fstatat.
-        4 => sys_linux_fstatat(u64::MAX, arg0, arg1),
+        // stat(path, buf) follows the final symlink.
+        4 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
         5 => sys_linux_fstat(arg0, arg1),
-        6 => sys_linux_fstatat(u64::MAX, arg0, arg1),
-        // Phase 37: poll — wait-queue-driven I/O multiplexing.
+        // lstat(path, buf) inspects the final symlink itself.
+        6 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, AT_SYMLINK_NOFOLLOW),
+        // Phase 22: poll stub — report all requested fds as ready.
+        // Ion uses poll() to multiplex between signal pipe and stdin.
         7 => sys_poll(arg0, arg1, arg2),
         8 => sys_linux_lseek(arg0, arg1, arg2),
         // Phase 36: mprotect(addr, len, prot) — change page permissions.
@@ -363,6 +959,9 @@ pub extern "C" fn syscall_handler(
         9 => sys_linux_mmap(arg0, arg1, arg2),
         11 => sys_linux_munmap(arg0, arg1),
         12 => sys_linux_brk(arg0),
+        86 => sys_link(arg0, arg1),
+        88 => sys_symlink(arg0, arg1),
+        89 => sys_readlink(arg0, arg1, arg2),
         // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
         13 => sys_rt_sigaction(arg0, arg1, arg2),
         14 => sys_rt_sigprocmask(arg0, arg1, arg2),
@@ -464,6 +1063,7 @@ pub extern "C" fn syscall_handler(
         91 => sys_linux_fchmod(arg0, arg1),
         92 => sys_linux_chown(arg0, arg1, arg2),
         93 => sys_linux_fchown(arg0, arg1, arg2),
+        95 => sys_umask(arg0),
         // Phase 35: times(buf) — fill struct tms with CPU time accounting
         100 => sys_times(arg0),
         // Phase 27: user/group identity syscalls
@@ -487,6 +1087,8 @@ pub extern "C" fn syscall_handler(
         124 => sys_getsid(arg0),
         // Phase 19: sigaltstack
         131 => sys_sigaltstack(arg0, arg1),
+        137 => sys_statfs(arg0, arg1),
+        138 => sys_fstatfs(arg0, arg1),
         // musl TLS init (Phase 12, T030 dependency)
         158 => sys_linux_arch_prctl(arg0, arg1),
         // Phase 24: mount(source, target, fstype)
@@ -558,7 +1160,7 @@ pub extern "C" fn syscall_handler(
         // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
-        262 => sys_linux_fstatat(arg0, arg1, arg2),
+        262 => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
         // Phase 37: epoll_wait(epfd, events, maxevents, timeout)
         232 => {
             let timeout = per_core_syscall_arg3();
@@ -576,6 +1178,15 @@ pub extern "C" fn syscall_handler(
             // 6th arg (sigmask) is in r9 — ignored for now.
             sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
         }
+        265 => sys_linkat(
+            arg0,
+            arg1,
+            arg2,
+            per_core_syscall_arg3(),
+            crate::smp::per_core().syscall_user_r8,
+        ),
+        266 => sys_symlinkat(arg0, arg1, arg2),
+        267 => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
         // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
         280 => {
             let flags = per_core_syscall_arg3();
@@ -1771,9 +2382,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_alt_stack,
         parent_fs_base,
         parent_ids,
+        parent_umask,
         parent_session_id,
         parent_ctty,
         parent_mappings,
+        parent_exec_path,
+        parent_cmdline,
     ) = {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(parent_pid) {
@@ -1788,9 +2402,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
                 (p.uid, p.gid, p.euid, p.egid),
+                p.umask,
                 p.session_id,
                 p.controlling_tty.clone(),
                 p.mappings.clone(),
+                p.exec_path.clone(),
+                p.cmdline.clone(),
             ),
             None => (
                 0,
@@ -1806,8 +2423,11 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 (0u64, 0u64, 0u32),
                 0,
                 (0u32, 0u32, 0u32, 0u32),
+                0o022,
                 0,
                 Some(crate::process::ControllingTty::Console),
+                alloc::vec::Vec::new(),
+                alloc::string::String::new(),
                 alloc::vec::Vec::new(),
             ),
         }
@@ -1844,9 +2464,12 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.gid = parent_ids.1;
             child.euid = parent_ids.2;
             child.egid = parent_ids.3;
+            child.umask = parent_umask;
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
             child.mappings = parent_mappings;
+            child.exec_path = parent_exec_path;
+            child.cmdline = parent_cmdline;
         }
     }
 
@@ -1928,9 +2551,15 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against the process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
+    // Follow the final symlink like Linux execve().
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     log::info!("[p{}] execve({})", crate::process::current_pid(), name);
@@ -2035,6 +2664,16 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.brk_current = 0;
             proc.mmap_next = 0;
             proc.mappings.clear(); // Phase 36: clear stale VMAs from old address space.
+            proc.exec_path = alloc::string::String::from(name);
+            proc.cmdline = if user_argv.is_empty() {
+                alloc::vec![alloc::string::String::from(name)]
+            } else {
+                user_argv
+                    .iter()
+                    .filter_map(|arg| core::str::from_utf8(arg).ok())
+                    .map(alloc::string::String::from)
+                    .collect()
+            };
         }
     }
 
@@ -2543,6 +3182,51 @@ fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
     None
 }
 
+fn seed_pseudorandom_state() -> u64 {
+    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
+    if state == 0 {
+        state = 0xDEAD_BEEF_CAFE_BABE;
+    }
+    state
+}
+
+fn fill_pseudorandom_bytes(state: &mut u64, out: &mut [u8]) {
+    for byte in out.iter_mut() {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+    }
+}
+
+fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(), ()> {
+    let chunk = [byte; 256];
+    let mut written = 0usize;
+    while written < count {
+        let len = (count - written).min(chunk.len());
+        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+            return Err(());
+        }
+        written += len;
+    }
+    Ok(())
+}
+
+fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
+    let mut state = seed_pseudorandom_state();
+    let mut chunk = [0u8; 256];
+    let mut written = 0usize;
+    while written < count {
+        let len = (count - written).min(chunk.len());
+        fill_pseudorandom_bytes(&mut state, &mut chunk[..len]);
+        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+            return Err(());
+        }
+        written += len;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
@@ -2637,6 +3321,28 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
 
             drop(tmpfs);
+            with_current_fd_mut(fd, |slot| {
+                if let Some(e) = slot {
+                    e.offset += to_read;
+                }
+            });
+            to_read as u64
+        }
+        FdBackend::Proc { path } => {
+            let Some(data) = crate::fs::procfs::read_file(path) else {
+                return NEG_ENOENT;
+            };
+            let offset = entry.offset.min(data.len());
+            let to_read = (count as usize).min(data.len().saturating_sub(offset));
+            if to_read == 0 {
+                return 0;
+            }
+
+            if crate::mm::user_mem::copy_to_user(buf_ptr, &data[offset..offset + to_read]).is_err()
+            {
+                return NEG_EFAULT;
+            }
+
             with_current_fd_mut(fd, |slot| {
                 if let Some(e) = slot {
                     e.offset += to_read;
@@ -2759,6 +3465,19 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
+        FdBackend::DevZero | FdBackend::DevFull => {
+            // /dev/zero and /dev/full behave like infinite zero-filled files.
+            if copy_byte_pattern_to_user(buf_ptr, count as usize, 0).is_err() {
+                return NEG_EFAULT;
+            }
+            count
+        }
+        FdBackend::DevUrandom => {
+            if copy_pseudorandom_to_user(buf_ptr, count as usize).is_err() {
+                return NEG_EFAULT;
+            }
+            count
+        }
         FdBackend::PtyMaster { pty_id } => {
             if count == 0 {
                 return 0;
@@ -2916,6 +3635,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::Stdin => NEG_EBADF,
         FdBackend::Ramdisk { .. } => NEG_EBADF, // ramdisk is read-only
+        FdBackend::Proc { .. } => NEG_EBADF,
         FdBackend::Tmpfs { path } => {
             let len = (count as usize).min(64 * 1024);
             let mut buf = [0u8; 4096];
@@ -3143,7 +3863,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
-        FdBackend::DevNull => count, // silently discard
+        FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom => count, // silently discard
+        FdBackend::DevFull => NEG_ENOSPC, // no space left on device
         FdBackend::PtyMaster { pty_id } => {
             // Master writes to m2s (master-to-slave) buffer.
             // Apply line discipline on the slave side (input processing).
@@ -3363,12 +4084,12 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 /// Copies one byte at a time to handle page boundaries gracefully.
 /// Returns the UTF-8 string on success, or `None` if the pointer is invalid,
 /// the string exceeds `buf.len()`, or the bytes are not valid UTF-8.
-fn read_user_cstr(ptr: u64, buf: &mut [u8; 512]) -> Option<&str> {
+fn read_user_cstr<const N: usize>(ptr: u64, buf: &mut [u8; N]) -> Option<&str> {
     if ptr == 0 {
         return None;
     }
     let mut len = 0usize;
-    while len < 512 {
+    while len < buf.len() {
         let mut b = [0u8; 1];
         let addr = ptr.checked_add(len as u64)?;
         if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
@@ -3394,13 +4115,20 @@ const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200000;
+#[allow(dead_code)]
+const O_NOFOLLOW: u64 = 0o400000;
 
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
 const AT_FDCWD: u64 = (-100_i64) as u64;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
 
 /// Check if a resolved absolute path is a directory across all filesystems.
 fn is_directory(path: &str) -> bool {
     if path == "/" {
+        return true;
+    }
+    if crate::fs::procfs::is_dir(path) {
         return true;
     }
     if let Some(rel) = tmpfs_relative_path(path) {
@@ -3601,18 +4329,7 @@ fn ext2_root_path(path: &str) -> Option<&str> {
     Some(rest)
 }
 
-fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
-    let mut buf = [0u8; 512];
-    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
-        Some(n) => n,
-        None => return NEG_EFAULT,
-    };
-
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
-    let name: &str = &resolved;
-
+fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     // Decode POSIX access mode (O_ACCMODE = 0o3).
     let (readable, writable) = match flags & 0o3 {
         0 => (true, false),     // O_RDONLY
@@ -3646,10 +4363,18 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     }
 
     // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
+    // Phase 38: /dev/zero, /dev/urandom, /dev/full device nodes.
     // Placed after flags decode so O_RDONLY/O_WRONLY are respected.
-    if name == "/dev/null" {
+    let dev_backend = match name {
+        "/dev/null" => Some(FdBackend::DevNull),
+        "/dev/zero" => Some(FdBackend::DevZero),
+        "/dev/urandom" | "/dev/random" => Some(FdBackend::DevUrandom),
+        "/dev/full" => Some(FdBackend::DevFull),
+        _ => None,
+    };
+    if let Some(backend) = dev_backend {
         let entry = FdEntry {
-            backend: FdBackend::DevNull,
+            backend,
             offset: 0,
             readable,
             writable,
@@ -3769,6 +4494,32 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         };
     }
 
+    if crate::fs::procfs::path_exists(name) {
+        if writable || create || truncate || append {
+            return NEG_EROFS;
+        }
+        if !matches!(
+            crate::fs::procfs::path_node(name),
+            Some(crate::fs::procfs::ProcfsNode::File)
+        ) {
+            return NEG_ENOENT;
+        }
+        let entry = FdEntry {
+            backend: FdBackend::Proc {
+                path: alloc::string::String::from(name),
+            },
+            offset: 0,
+            readable: true,
+            writable: false,
+            cloexec: false,
+            nonblock: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => NEG_EMFILE,
+        };
+    }
+
     // Check if this is a tmpfs path.
     if let Some(rel) = tmpfs_relative_path(name) {
         if rel.is_empty() {
@@ -3779,7 +4530,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
         let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
 
         // Open or create the file with caller's ownership.
-        let create_mode = (mode_arg as u16) & 0o7777;
+        let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
         let (_, _, caller_euid, caller_egid) = current_process_ids();
         match tmpfs.open_or_create_with_meta(rel, create, caller_euid, caller_egid, create_mode) {
             Ok(_created) => {}
@@ -3961,7 +4712,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
                                 };
 
                                 // Set ownership and permissions on the newly created file.
-                                let create_mode = (mode_arg as u16) & 0o7777;
+                                let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
                                 let (_, _, caller_euid, caller_egid) = current_process_ids();
                                 crate::fs::fat32::set_fat32_meta(
                                     rel,
@@ -4087,6 +4838,16 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     }
 }
 
+fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw_name = match read_user_cstr(path_ptr, &mut buf) {
+        Some(n) => n,
+        None => return NEG_EFAULT,
+    };
+
+    open_user_path(AT_FDCWD, raw_name, flags, mode_arg)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 18: openat(dirfd, path, flags, mode) — syscall 257
 // ---------------------------------------------------------------------------
@@ -4094,221 +4855,31 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
     let mode_arg = per_core_syscall_arg3();
-    if dirfd == AT_FDCWD {
-        // Resolve relative to process cwd — same as sys_linux_open.
-        return sys_linux_open(path_ptr, flags, mode_arg);
-    }
-
-    // dirfd is a directory fd — resolve path relative to it.
-    let dirfd_idx = dirfd as usize;
-    if dirfd_idx >= MAX_FDS {
-        return NEG_EBADF;
-    }
-    let dir_entry = match current_fd_entry(dirfd_idx) {
-        Some(e) => e,
-        None => return NEG_EBADF,
-    };
-    let base_path = match &dir_entry.backend {
-        FdBackend::Dir { path } => path.clone(),
-        _ => return NEG_ENOTDIR,
-    };
-
-    // Read the relative path from userspace.
     let mut buf = [0u8; 512];
     let rel_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Resolve relative to the directory fd's path.
-    let resolved = resolve_path(&base_path, rel_name);
-    let name: &str = &resolved;
+    open_user_path(dirfd, rel_name, flags, mode_arg)
+}
 
-    // Decode flags and delegate to the same open logic.
-    let (readable, writable) = match flags & 0o3 {
-        0 => (true, false),
-        1 => (false, true),
-        2 => (true, true),
-        _ => return NEG_EINVAL,
+pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
+    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+    let Some(vol) = vol.as_mut() else {
+        return;
     };
-
-    // /dev/null special file — placed after flags decode to respect O_RDONLY/O_WRONLY.
-    if name == "/dev/null" {
-        let entry = FdEntry {
-            backend: FdBackend::DevNull,
-            offset: 0,
-            readable,
-            writable,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Phase 29: /dev/ptmx — allocate a PTY pair and return the master fd.
-    if name == "/dev/ptmx" {
-        let pty_id = match crate::pty::alloc_pty() {
-            Ok(id) => id,
-            Err(()) => return NEG_ENOSPC,
-        };
-        log::info!("[pty] allocated PTY pair {}", pty_id);
-        let entry = FdEntry {
-            backend: FdBackend::PtyMaster { pty_id },
-            offset: 0,
-            readable: true,
-            writable: true,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => {
-                crate::pty::close_master(pty_id);
-                NEG_EMFILE
-            }
-        };
-    }
-
-    // Phase 29: /dev/pts/N — open the slave side of PTY N.
-    if let Some(suffix) = name.strip_prefix("/dev/pts/") {
-        if let Ok(pty_id) = suffix.parse::<u32>() {
-            // Check + increment refcount under the same lock to prevent
-            // a race where the PTY is freed between check and alloc_fd.
-            {
-                let mut table = crate::pty::PTY_TABLE.lock();
-                match table.get_mut(pty_id as usize).and_then(|s| s.as_mut()) {
-                    None => return NEG_ENOENT,
-                    Some(pair) if pair.locked => return NEG_EIO,
-                    Some(pair) => {
-                        pair.slave_refcount += 1;
-                        pair.slave_opened = true;
-                    }
-                }
-            }
-            let entry = FdEntry {
-                backend: FdBackend::PtySlave { pty_id },
-                offset: 0,
-                readable: true,
-                writable: true,
-                cloexec: false,
-                nonblock: false,
-            };
-            return match alloc_fd(3, entry) {
-                Some(i) => i as u64,
-                None => {
-                    crate::pty::close_slave(pty_id);
-                    NEG_EMFILE
-                }
-            };
-        }
-        return NEG_ENOENT;
-    }
-
-    let create = flags & O_CREAT != 0;
-    let truncate = flags & O_TRUNC != 0;
-    let append = flags & O_APPEND != 0;
-    let o_directory = flags & O_DIRECTORY != 0;
-    let path_is_dir = is_directory(name);
-
-    if o_directory && !path_is_dir {
-        if let Some(rel) = tmpfs_relative_path(name) {
-            if !rel.is_empty() {
-                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-                if tmpfs.stat(rel).is_ok() {
-                    return NEG_ENOTDIR;
-                }
-            }
-        } else if crate::fs::ramdisk::get_file(name).is_some() {
-            return NEG_ENOTDIR;
-        }
-    }
-
-    if path_is_dir {
-        if writable || create || truncate {
-            return NEG_EISDIR;
-        }
-        let entry = FdEntry {
-            backend: FdBackend::Dir {
-                path: alloc::string::String::from(name),
-            },
-            offset: 0,
-            readable: true,
-            writable: false,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Tmpfs file open.
-    if let Some(rel) = tmpfs_relative_path(name) {
-        if rel.is_empty() {
-            return NEG_EISDIR;
-        }
-        let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        let create_mode = (mode_arg as u16) & 0o7777;
-        let (_, _, caller_euid2, caller_egid2) = current_process_ids();
-        match tmpfs.open_or_create_with_meta(rel, create, caller_euid2, caller_egid2, create_mode) {
-            Ok(_) => {}
-            Err(crate::fs::tmpfs::TmpfsError::NotFound) => return NEG_ENOENT,
-            Err(crate::fs::tmpfs::TmpfsError::WrongType) => return NEG_EISDIR,
-            Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => return NEG_ENOTDIR,
-            Err(_) => return NEG_EINVAL,
-        }
-        if truncate && writable {
-            let _ = tmpfs.truncate(rel, 0);
-        }
-        let initial_offset = if append {
-            tmpfs.file_size(rel).unwrap_or(0)
-        } else {
-            0
-        };
-        drop(tmpfs);
-        let entry = FdEntry {
-            backend: FdBackend::Tmpfs {
-                path: alloc::string::String::from(rel),
-            },
-            offset: initial_offset,
-            readable,
-            writable,
-            cloexec: false,
-            nonblock: false,
-        };
-        return match alloc_fd(3, entry) {
-            Some(i) => i as u64,
-            None => NEG_EMFILE,
-        };
-    }
-
-    // Ramdisk fallback — read-only.
-    if writable || create {
-        return NEG_EROFS;
-    }
-    let content = match crate::fs::ramdisk::get_file(name) {
-        Some(c) => c,
-        None => return NEG_ENOENT,
+    let Ok(mut inode) = vol.read_inode(inode_num) else {
+        return;
     };
-    let entry = FdEntry {
-        backend: FdBackend::Ramdisk {
-            content_addr: content.as_ptr() as usize,
-            content_len: content.len(),
-        },
-        offset: 0,
-        readable: true,
-        writable: false,
-        cloexec: false,
-        nonblock: false,
-    };
-    match alloc_fd(3, entry) {
-        Some(i) => i as u64,
-        None => NEG_EMFILE,
+    if inode.links_count != 0 {
+        return;
     }
+    if crate::process::ext2_inode_open_count(inode_num) != 0 {
+        return;
+    }
+    let _ = vol.truncate_file(inode_num, &mut inode);
+    let _ = vol.free_inode(inode_num);
 }
 
 // ---------------------------------------------------------------------------
@@ -4324,6 +4895,7 @@ fn sys_linux_close(fd: u64) -> u64 {
     if fd >= MAX_FDS {
         return NEG_EBADF;
     }
+    let mut ext2_inode = None;
     // Close-time cleanup for resource-backed FDs.
     if let Some(entry) = current_fd_entry(fd) {
         match &entry.backend {
@@ -4333,6 +4905,7 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
+            FdBackend::Ext2Disk { inode_num, .. } => ext2_inode = Some(*inode_num),
             _ => {}
         }
     }
@@ -4345,7 +4918,13 @@ fn sys_linux_close(fd: u64) -> u64 {
             found = true;
         }
     });
-    if found { 0 } else { NEG_EBADF }
+    if !found {
+        return NEG_EBADF;
+    }
+    if let Some(inode_num) = ext2_inode {
+        cleanup_ext2_inode_if_unused(inode_num);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -4551,7 +5130,7 @@ fn open_ext2_file(
                 (parent_ino, parts[parts.len() - 1])
             };
 
-            let create_mode = (mode_arg as u16) & 0o7777;
+            let create_mode = ((mode_arg as u16) & 0o7777) & !current_umask();
             let (_, _, caller_euid, caller_egid) = current_process_ids();
 
             match vol.create_file(parent_ino, file_name, create_mode, caller_euid, caller_egid) {
@@ -4609,11 +5188,36 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     // Determine mode, uid, gid, size, rdev based on backend type.
     let (mode, uid, gid, size, rdev): (u32, u32, u32, u64, u64) = match &entry.backend {
         FdBackend::Dir { path } => {
-            // Try to get metadata from tmpfs for dirs under /tmp
-            let (u, g, m) = dir_metadata(path);
-            (0x4000 | m as u32, u, g, 0, 0)
+            if let Some(st) = crate::fs::procfs::stat(path) {
+                stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+                stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+                (st.mode, st.uid, st.gid, st.size, 0)
+            } else if let Some(rel) = tmpfs_relative_path(path) {
+                let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+                match tmpfs.stat(rel) {
+                    Ok(st) => {
+                        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+                        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+                        (0x4000 | st.mode as u32, st.uid, st.gid, st.size as u64, 0)
+                    }
+                    Err(_) => return NEG_ENOENT,
+                }
+            } else {
+                let (u, g, m) = dir_metadata(path);
+                (0x4000 | m as u32, u, g, 0, 0)
+            }
         }
-        FdBackend::DevNull => (0x2000 | 0o666, 0, 0, 0, 0),
+        FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
+            (0x2000 | 0o666, 0, 0, 0, 0)
+        }
+        FdBackend::Proc { path } => {
+            let Some(st) = crate::fs::procfs::stat(path) else {
+                return NEG_ENOENT;
+            };
+            stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+            stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+            (st.mode, st.uid, st.gid, st.size, 0)
+        }
         FdBackend::DeviceTTY { tty_id } => {
             (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
         }
@@ -4637,7 +5241,18 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
             match tmpfs.stat(path) {
-                Ok(s) => (0x8000 | s.mode as u32, s.uid, s.gid, s.size as u64, 0),
+                Ok(s) => {
+                    stat[8..16].copy_from_slice(&s.ino.to_ne_bytes());
+                    stat[16..24].copy_from_slice(&s.nlink.to_ne_bytes());
+                    let mode = if s.is_symlink {
+                        0xA000 | 0o777
+                    } else if s.is_dir {
+                        0x4000 | s.mode as u32
+                    } else {
+                        0x8000 | s.mode as u32
+                    };
+                    (mode, s.uid, s.gid, s.size as u64, 0)
+                }
                 Err(_) => return NEG_ENOENT,
             }
         }
@@ -4704,6 +5319,59 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     0
 }
 
+fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
+    let mut buf = [0u8; 512];
+    let raw = match read_user_cstr(path_ptr, &mut buf) {
+        Some(p) => p,
+        None => return NEG_EFAULT,
+    };
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let abs = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !statfs_path_exists(&abs) {
+        return NEG_ENOENT;
+    }
+    let stat = statfs_for_path(&abs);
+    write_statfs_to_user(buf_ptr, &stat)
+}
+
+fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
+    let fd_idx = fd as usize;
+    if fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let entry = match current_fd_entry(fd_idx) {
+        Some(e) => e,
+        None => return NEG_EBADF,
+    };
+
+    let stat = match &entry.backend {
+        FdBackend::Tmpfs { .. } => tmpfs_statfs(),
+        FdBackend::Proc { .. } => proc_statfs(),
+        FdBackend::Fat32Disk { .. } => fat32_statfs(),
+        FdBackend::Ext2Disk { .. } => ext2_statfs(),
+        FdBackend::Ramdisk { .. } => ramdisk_statfs(),
+        FdBackend::Dir { path } => statfs_for_path(path),
+        FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::DeviceTTY { .. }
+        | FdBackend::PtyMaster { .. }
+        | FdBackend::PtySlave { .. }
+        | FdBackend::Epoll { .. } => ramdisk_statfs(),
+        FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
+        FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
+        FdBackend::Socket { .. } => sockfs_statfs(),
+    };
+    write_statfs_to_user(buf_ptr, &stat)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 27: chmod, fchmod, chown, fchown
 // ---------------------------------------------------------------------------
@@ -4744,6 +5412,9 @@ fn check_permission(
 
 /// Get file metadata for permission checking on a resolved absolute path.
 fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
+    if let Some(st) = crate::fs::procfs::stat(abs_path) {
+        return Some((st.uid, st.gid, (st.mode & 0o7777) as u16));
+    }
     if let Some(rel) = tmpfs_relative_path(abs_path) {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
         if let Ok(s) = tmpfs.stat(rel) {
@@ -4755,6 +5426,23 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
+    if abs_path == "/dev" {
+        return Some((0, 0, 0o755));
+    }
+    if abs_path == "/dev/null"
+        || abs_path == "/dev/zero"
+        || abs_path == "/dev/urandom"
+        || abs_path == "/dev/random"
+        || abs_path == "/dev/full"
+        || abs_path == "/dev/tty"
+        || abs_path == "/dev/ptmx"
+        || abs_path.starts_with("/dev/pts/")
+    {
+        return Some((0, 0, 0o666));
+    }
+    if abs_path == "/" || abs_path == "/tmp" {
+        return Some((0, 0, 0o755));
+    }
     // ext2 root filesystem — check for any path.
     if let Some(rel) = ext2_root_path(abs_path)
         && crate::fs::ext2::is_mounted()
@@ -4764,13 +5452,6 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     // Legacy: /data paths for FAT32 fallback.
     if let Some(rel) = abs_path.strip_prefix("/data/") {
         return data_file_metadata(rel);
-    }
-    if abs_path == "/"
-        || abs_path == "/tmp"
-        || abs_path.starts_with("/dev")
-        || abs_path.starts_with("/proc")
-    {
-        return Some((0, 0, 0o755));
     }
     None
 }
@@ -4806,6 +5487,13 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
         let rel = abs_path.strip_prefix("/data/").unwrap_or("");
         return FsTarget::DiskData(alloc::string::String::from(rel));
     }
+    if crate::fs::procfs::path_node(abs_path).is_some()
+        || abs_path == "/dev"
+        || abs_path.starts_with("/dev/")
+        || crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some()
+    {
+        return FsTarget::Ramdisk;
+    }
     // When ext2 is mounted at root, route non-ramdisk paths to ext2.
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
@@ -4815,6 +5503,15 @@ fn resolve_fs_target(abs_path: &str) -> FsTarget {
     FsTarget::Ramdisk
 }
 
+fn create_parent_is_read_only(abs_path: &str) -> bool {
+    let parent = parent_path(abs_path);
+    parent != "/"
+        && (crate::fs::procfs::path_node(parent).is_some()
+            || parent == "/dev"
+            || parent.starts_with("/dev/")
+            || crate::fs::ramdisk::ramdisk_lookup(parent).is_some())
+}
+
 /// `chmod(path, mode)` — change file mode bits (syscall 90).
 fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
@@ -4822,8 +5519,10 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let cwd = current_cwd();
-    let abs = resolve_path(&cwd, raw);
+    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let mode = (mode_arg & 0o7777) as u16;
 
     // Only owner or root can chmod.
@@ -4913,8 +5612,10 @@ fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
-    let cwd = current_cwd();
-    let abs = resolve_path(&cwd, raw);
+    let abs = match resolve_existing_fs_path(&resolve_path(&current_cwd(), raw), true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let new_uid = uid_arg as u32;
     let new_gid = gid_arg as u32;
 
@@ -4996,9 +5697,13 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
+        | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
@@ -5766,8 +6471,14 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
 
     // Phase 27: Execute (search) permission on target directory.
     if let Some((fu, fg, fm)) = path_metadata(&resolved) {
@@ -6122,17 +6833,38 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
 // T026 (via path): newfstatat(dirfd, path, stat_ptr, flags)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
+fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, flags & AT_SYMLINK_NOFOLLOW == 0) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
+
+    if let Some(st) = crate::fs::procfs::stat(name) {
+        let mut stat = [0u8; 144];
+        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
+        stat[24..28].copy_from_slice(&st.mode.to_ne_bytes());
+        stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
+        stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
+        stat[48..56].copy_from_slice(&st.size.to_ne_bytes());
+        let blksize: u64 = 4096;
+        stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
+        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
 
     // Check tmpfs first.
     if let Some(rel) = tmpfs_relative_path(name) {
@@ -6147,10 +6879,14 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
         };
         let mode: u32 = if st.is_dir {
             0x4000 | st.mode as u32
+        } else if st.is_symlink {
+            0xA000 | 0o777
         } else {
             0x8000 | st.mode as u32
         };
         let mut stat = [0u8; 144];
+        stat[8..16].copy_from_slice(&st.ino.to_ne_bytes());
+        stat[16..24].copy_from_slice(&st.nlink.to_ne_bytes());
         stat[24..28].copy_from_slice(&mode.to_ne_bytes());
         stat[28..32].copy_from_slice(&st.uid.to_ne_bytes());
         stat[32..36].copy_from_slice(&st.gid.to_ne_bytes());
@@ -6231,7 +6967,14 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
                 }
             }
             // Device special files.
-            if name == "/dev/null" || name == "/dev/ptmx" || name.starts_with("/dev/pts/") {
+            if name == "/dev/null"
+                || name == "/dev/zero"
+                || name == "/dev/urandom"
+                || name == "/dev/random"
+                || name == "/dev/full"
+                || name == "/dev/ptmx"
+                || name.starts_with("/dev/pts/")
+            {
                 let mut stat = [0u8; 144];
                 let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
                 stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -6257,6 +7000,243 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
     }
 }
 
+fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> u64 {
+    sys_symlinkat(target_ptr, AT_FDCWD, linkpath_ptr)
+}
+
+fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
+    let mut target_buf = [0u8; 4096];
+    let target = match read_user_cstr(target_ptr, &mut target_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let mut link_buf = [0u8; 512];
+    let raw_link = match read_user_cstr(linkpath_ptr, &mut link_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_link) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if path_node_nofollow(&resolved).is_ok() {
+        return NEG_EEXIST;
+    }
+
+    if let Some((pu, pg, pm)) = parent_dir_metadata(&resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
+    if create_parent_is_read_only(&resolved) {
+        return NEG_EROFS;
+    }
+
+    match resolve_fs_target(&resolved) {
+        FsTarget::Tmpfs(rel) => {
+            let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            let (_, _, euid, egid) = current_process_ids();
+            match tmpfs.create_symlink_with_meta(&rel, target, euid, egid) {
+                Ok(()) => 0,
+                Err(crate::fs::tmpfs::TmpfsError::AlreadyExists) => NEG_EEXIST,
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => NEG_ENOENT,
+                Err(crate::fs::tmpfs::TmpfsError::NotADirectory) => NEG_ENOTDIR,
+                Err(_) => NEG_EIO,
+            }
+        }
+        FsTarget::DiskData(rel) => {
+            if !crate::fs::ext2::is_mounted() {
+                return NEG_EROFS;
+            }
+            let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            let Some(vol) = vol.as_mut() else {
+                return NEG_EIO;
+            };
+            let parts: alloc::vec::Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            if parts.is_empty() {
+                return NEG_EINVAL;
+            }
+            let (parent_ino, link_name) = if parts.len() == 1 {
+                (kernel_core::fs::ext2::EXT2_ROOT_INO, parts[0])
+            } else {
+                let parent_rel = parts[..parts.len() - 1].join("/");
+                match vol.resolve_path(&parent_rel) {
+                    Ok(ino) => (ino, parts[parts.len() - 1]),
+                    Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+                    Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+                    Err(_) => return NEG_EIO,
+                }
+            };
+            let (_, _, euid, egid) = current_process_ids();
+            match vol.create_symlink(parent_ino, link_name, target, euid, egid) {
+                Ok(_) => 0,
+                Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
+                Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => NEG_ENOTDIR,
+                Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+                Err(kernel_core::fs::ext2::Ext2Error::OutOfSpace) => NEG_ENOSPC,
+                Err(_) => NEG_EIO,
+            }
+        }
+        FsTarget::Ramdisk => NEG_EROFS,
+    }
+}
+
+fn sys_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    sys_readlinkat(AT_FDCWD, path_ptr, buf_ptr, buf_len)
+}
+
+fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if buf_len == 0 {
+        return NEG_EINVAL;
+    }
+    let mut path_buf = [0u8; 512];
+    let raw_path = match read_user_cstr(path_ptr, &mut path_buf) {
+        Some(s) => s,
+        None => return NEG_EFAULT,
+    };
+    let lexical = match resolve_path_from_dirfd(dirfd, raw_path) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_existing_fs_path(&lexical, false) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let target = match path_node_nofollow(&resolved) {
+        Ok(PathNodeKind::Symlink(target)) => target,
+        Ok(_) => return NEG_EINVAL,
+        Err(err) => return err,
+    };
+
+    let to_copy = core::cmp::min(target.len(), buf_len as usize);
+    if crate::mm::user_mem::copy_to_user(buf_ptr, &target.as_bytes()[..to_copy]).is_err() {
+        return NEG_EFAULT;
+    }
+    to_copy as u64
+}
+
+fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> u64 {
+    sys_linkat(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
+}
+
+fn sys_linkat(olddirfd: u64, oldpath_ptr: u64, newdirfd: u64, newpath_ptr: u64, flags: u64) -> u64 {
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return NEG_EINVAL;
+    }
+    let mut old_buf = [0u8; 512];
+    let raw_old = match read_user_cstr(oldpath_ptr, &mut old_buf) {
+        Some(path) => path,
+        None => return NEG_EFAULT,
+    };
+    let mut new_buf = [0u8; 512];
+    let raw_new = match read_user_cstr(newpath_ptr, &mut new_buf) {
+        Some(path) => path,
+        None => return NEG_EFAULT,
+    };
+
+    let old_lexical = match resolve_path_from_dirfd(olddirfd, raw_old) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let follow_old = flags & AT_SYMLINK_FOLLOW != 0;
+    let old_resolved = match resolve_existing_fs_path(&old_lexical, follow_old) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_lexical = match resolve_path_from_dirfd(newdirfd, raw_new) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_resolved = match resolve_parent_components(&new_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if path_node_nofollow(&new_resolved).is_ok() {
+        return NEG_EEXIST;
+    }
+    if let Some((pu, pg, pm)) = parent_dir_metadata(&new_resolved) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(pu, pg, pm, euid, egid, 3) {
+            return NEG_EACCES;
+        }
+    }
+    if create_parent_is_read_only(&new_resolved) {
+        return NEG_EROFS;
+    }
+
+    let old_target = resolve_fs_target(&old_resolved);
+    let new_target = resolve_fs_target(&new_resolved);
+    match (&old_target, &new_target) {
+        (FsTarget::DiskData(_), FsTarget::DiskData(_)) => {}
+        (FsTarget::DiskData(_), _) | (_, FsTarget::DiskData(_)) => return NEG_EXDEV,
+        _ => return NEG_EROFS,
+    }
+    if !crate::fs::ext2::is_mounted() {
+        return NEG_EROFS;
+    }
+
+    let FsTarget::DiskData(old_rel) = old_target else {
+        return NEG_EROFS;
+    };
+    let FsTarget::DiskData(new_rel) = new_target else {
+        return NEG_EROFS;
+    };
+
+    let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
+    let Some(vol) = vol.as_mut() else {
+        return NEG_EIO;
+    };
+    let old_ino = match vol.resolve_path(&old_rel) {
+        Ok(ino) => ino,
+        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+        Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+        Err(_) => return NEG_EIO,
+    };
+    let old_inode = match vol.read_inode(old_ino) {
+        Ok(inode) => inode,
+        Err(_) => return NEG_EIO,
+    };
+    if old_inode.is_dir() {
+        return NEG_EPERM;
+    }
+
+    let parts: alloc::vec::Vec<&str> = new_rel.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return NEG_EEXIST;
+    }
+    let (parent_ino, link_name) = if parts.len() == 1 {
+        (kernel_core::fs::ext2::EXT2_ROOT_INO, parts[0])
+    } else {
+        let parent_path = parts[..parts.len() - 1].join("/");
+        match vol.resolve_path(&parent_path) {
+            Ok(ino) => (ino, parts[parts.len() - 1]),
+            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => return NEG_ENOENT,
+            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => return NEG_ENOTDIR,
+            Err(_) => return NEG_EIO,
+        }
+    };
+
+    match vol.create_hard_link(parent_ino, link_name, old_ino) {
+        Ok(()) => 0,
+        Err(kernel_core::fs::ext2::Ext2Error::AlreadyExists) => NEG_EEXIST,
+        Err(kernel_core::fs::ext2::Ext2Error::IsDirectory) => NEG_EPERM,
+        Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => NEG_ENOTDIR,
+        Err(kernel_core::fs::ext2::Ext2Error::NotFound) => NEG_ENOENT,
+        Err(kernel_core::fs::ext2::Ext2Error::OutOfSpace) => NEG_ENOSPC,
+        Err(_) => NEG_EIO,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 32: utimensat(dirfd, path, times, flags) — syscall 280
 // ---------------------------------------------------------------------------
@@ -6264,8 +7244,7 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
 /// Get approximate current Unix timestamp from LAPIC tick counter.
 fn current_unix_time() -> u32 {
     let ticks = crate::arch::x86_64::interrupts::tick_count();
-    // ~100 ticks/second from LAPIC timer.
-    (ticks / 100) as u32
+    (ticks / TICKS_PER_SEC) as u32
 }
 
 fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64 {
@@ -6364,16 +7343,22 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
 // Phase 13: mkdir(pathname) — syscall 83
 // ---------------------------------------------------------------------------
 
-fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
+fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    // mkdir() should resolve parent symlinks but operate on the lexical basename.
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
@@ -6402,7 +7387,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                 }
             };
             let (_, _, mk_euid, mk_egid) = current_process_ids();
-            return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid) {
+            let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+            return match vol.create_directory(parent_ino, dir_name, create_mode, mk_euid, mk_egid) {
                 Ok(_) => {
                     log::info!("[mkdir] {} (ext2)", name);
                     0
@@ -6434,7 +7420,14 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                     }
                 };
                 let (_, _, mk_euid, mk_egid) = current_process_ids();
-                return match vol.create_directory(parent_ino, dir_name, 0o755, mk_euid, mk_egid) {
+                let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+                return match vol.create_directory(
+                    parent_ino,
+                    dir_name,
+                    create_mode,
+                    mk_euid,
+                    mk_egid,
+                ) {
                     Ok(_) => {
                         log::info!("[mkdir] {} (ext2)", name);
                         0
@@ -6464,7 +7457,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
                     Ok(_) => {
                         log::info!("[mkdir] {} (fat32)", name);
                         let (_, _, mk_euid2, mk_egid2) = current_process_ids();
-                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, 0o755);
+                        let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+                        crate::fs::fat32::set_fat32_meta(rel, mk_euid2, mk_egid2, create_mode);
                         0
                     }
                     Err(kernel_core::fs::fat32::Fat32Error::AlreadyExists) => NEG_EEXIST,
@@ -6485,7 +7479,8 @@ fn sys_linux_mkdir(path_ptr: u64, _mode: u64) -> u64 {
 
     let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
     let (_, _, mk_euid, mk_egid) = current_process_ids();
-    match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, 0o755) {
+    let create_mode = ((mode as u16) & 0o7777) & !current_umask();
+    match tmpfs.mkdir_with_meta(rel, mk_euid, mk_egid, create_mode) {
         Ok(()) => {
             log::info!("[mkdir] {}", name);
             0
@@ -6554,9 +7549,15 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve path against current process's working directory.
-    let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, raw_name);
+    // unlink() should resolve parent symlinks but unlink the lexical final component.
+    let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let resolved = match resolve_parent_components(&lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
     let name: &str = &resolved;
 
     // Phase 27: Write+execute permission on parent directory.
@@ -6701,11 +7702,23 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
-    // Resolve both paths against current process's working directory.
-    let cwd = current_cwd();
     let old_str_raw = core::str::from_utf8(&old_owned[..old_len]).unwrap();
-    let old_resolved = resolve_path(&cwd, old_str_raw);
-    let new_resolved = resolve_path(&cwd, new_raw);
+    let old_lexical = match resolve_path_from_dirfd(AT_FDCWD, old_str_raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_lexical = match resolve_path_from_dirfd(AT_FDCWD, new_raw) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let old_resolved = match resolve_parent_components(&old_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let new_resolved = match resolve_parent_components(&new_lexical) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
 
     // Phase 27: Write+execute permission on both parent directories.
     {
@@ -6906,9 +7919,13 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
+        | FdBackend::Proc { .. }
         | FdBackend::Socket { .. }
         | FdBackend::Epoll { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
@@ -6961,37 +7978,77 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::Dir { path } => path.clone(),
         _ => return NEG_ENOTDIR,
     };
+    if let Some((uid, gid, mode)) = path_metadata(&dir_path) {
+        let (_, _, euid, egid) = current_process_ids();
+        if !check_permission(uid, gid, mode, euid, egid, 4) {
+            return NEG_EACCES;
+        }
+    }
 
     let offset = entry.offset;
     let max_bytes = (count as usize).min(64 * 1024);
 
-    // Collect directory entries: [(".", true), ("..", true), ...children...]
-    let mut entries: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
-    entries.push((alloc::string::String::from("."), true));
-    entries.push((alloc::string::String::from(".."), true));
+    fn dirent_type_for_path(path: &str, is_dir: bool) -> u8 {
+        if is_dir {
+            DT_DIR
+        } else {
+            match path_node_nofollow(path) {
+                Ok(PathNodeKind::Symlink(_)) => DT_LNK,
+                Ok(PathNodeKind::Dir) => DT_DIR,
+                _ => DT_REG,
+            }
+        }
+    }
 
-    if let Some(rel) = tmpfs_relative_path(&dir_path) {
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        match tmpfs.list_dir(rel) {
-            Ok(children) => {
+    // Collect directory entries: [(".", DT_DIR), ("..", DT_DIR), ...children...]
+    let mut entries: alloc::vec::Vec<(alloc::string::String, u8)> = alloc::vec::Vec::new();
+    entries.push((alloc::string::String::from("."), DT_DIR));
+    entries.push((alloc::string::String::from(".."), DT_DIR));
+
+    if crate::fs::procfs::is_dir(&dir_path) {
+        match crate::fs::procfs::list_dir(&dir_path) {
+            Some(children) => {
                 for (name, is_dir) in children {
-                    entries.push((name, is_dir));
+                    let child_path = if dir_path == "/" {
+                        alloc::format!("/{name}")
+                    } else {
+                        alloc::format!("{dir_path}/{name}")
+                    };
+                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                 }
             }
-            Err(_) => return NEG_ENOENT,
+            None => return NEG_ENOENT,
+        }
+    } else if let Some(rel) = tmpfs_relative_path(&dir_path) {
+        let children = {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.list_dir(rel) {
+                Ok(children) => children,
+                Err(_) => return NEG_ENOENT,
+            }
+        };
+        for (name, is_dir) in children {
+            let child_path = if dir_path == "/" {
+                alloc::format!("/{name}")
+            } else {
+                alloc::format!("{dir_path}/{name}")
+            };
+            entries.push((name, dirent_type_for_path(&child_path, is_dir)));
         }
     } else if dir_path == "/" {
         // Root directory: merge ext2 root + ramdisk overlays + virtual mounts.
         // Start with ext2 root entries if mounted.
         let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
-            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-            if let Some(vol) = vol.as_ref()
-                && let Ok(children) = vol.list_dir("/")
-            {
+            let children = {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+            };
+            if let Some(children) = children {
                 for (name, is_dir) in children {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    let child_path = alloc::format!("/{name}");
+                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                 }
             }
         }
@@ -7000,16 +8057,22 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             for (name, is_dir) in ramdisk_children {
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
         }
         // Add virtual mount points.
         if !seen.contains("tmp") {
-            entries.push((alloc::string::String::from("tmp"), true));
+            entries.push((alloc::string::String::from("tmp"), DT_DIR));
+        }
+        if !seen.contains("proc") {
+            entries.push((alloc::string::String::from("proc"), DT_DIR));
+        }
+        if !seen.contains("dev") {
+            entries.push((alloc::string::String::from("dev"), DT_DIR));
         }
         if crate::fs::fat32::is_mounted() && !seen.contains("data") {
-            entries.push((alloc::string::String::from("data"), true));
+            entries.push((alloc::string::String::from("data"), DT_DIR));
         }
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).
@@ -7019,18 +8082,22 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
                 for (name, is_dir) in children {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
-            {
+            let children = {
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                if let Some(vol) = vol.as_ref()
-                    && let Ok(children) = vol.list_dir(rel)
-                {
-                    for (name, is_dir) in children {
-                        if !seen.contains(&name) {
-                            entries.push((name, is_dir));
-                        }
+                vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+            };
+            if let Some(children) = children {
+                for (name, is_dir) in children {
+                    if !seen.contains(&name) {
+                        let child_path = if dir_path == "/" {
+                            alloc::format!("/{name}")
+                        } else {
+                            alloc::format!("{dir_path}/{name}")
+                        };
+                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                     }
                 }
             }
@@ -7051,7 +8118,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 match vol.list_dir(dir_cluster) {
                     Ok(children) => {
                         for (name, is_dir) in children {
-                            entries.push((name, is_dir));
+                            entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                         }
                     }
                     Err(_) => return NEG_EIO,
@@ -7062,7 +8129,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Ramdisk directory listing.
         if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
             for (name, is_dir) in children {
-                entries.push((name, is_dir));
+                entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
             }
         }
     }
@@ -7076,7 +8143,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let mut idx = offset;
 
     while idx < entries.len() {
-        let (ref name, is_dir) = entries[idx];
+        let (ref name, d_type) = entries[idx];
         let name_bytes = name.as_bytes();
         // reclen = 19 (fixed fields) + name_len + 1 (null), rounded up to 8
         let reclen = (19 + name_bytes.len() + 1 + 7) & !7;
@@ -7094,8 +8161,6 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
         let d_ino: u64 = (idx + 1) as u64;
         let d_off: i64 = (idx + 1) as i64;
-        let d_type: u8 = if is_dir { DT_DIR } else { DT_REG };
-
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
         out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());
@@ -7122,6 +8187,18 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     });
 
     out.len() as u64
+}
+
+fn sys_umask(mask: u64) -> u64 {
+    let new_mask = (mask as u16) & 0o777;
+    let pid = crate::process::current_pid();
+    let mut table = crate::process::PROCESS_TABLE.lock();
+    let Some(proc) = table.find_mut(pid) else {
+        return 0o022;
+    };
+    let old = proc.umask;
+    proc.umask = new_mask;
+    old as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -7183,7 +8260,14 @@ fn sys_access(path_ptr: u64) -> u64 {
 
     // Phase 21: /dev/null always exists.
     // Phase 22: /dev/ptmx and /dev/pts/* always exist.
-    if resolved == "/dev/null" || resolved == "/dev/ptmx" || resolved.starts_with("/dev/pts/") {
+    if resolved == "/dev/null"
+        || resolved == "/dev/zero"
+        || resolved == "/dev/urandom"
+        || resolved == "/dev/random"
+        || resolved == "/dev/full"
+        || resolved == "/dev/ptmx"
+        || resolved.starts_with("/dev/pts/")
+    {
         return 0;
     }
 
@@ -7397,17 +8481,8 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
     let actual = len.min(256);
     let mut out = [0u8; 256];
 
-    // Simple xorshift64* PRNG seeded from TSC.
-    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
-    }
-    for byte in out[..actual].iter_mut() {
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
-    }
+    let mut state = seed_pseudorandom_state();
+    fill_pseudorandom_bytes(&mut state, &mut out[..actual]);
 
     if crate::mm::user_mem::copy_to_user(buf_ptr, &out[..actual]).is_err() {
         return NEG_EFAULT;
@@ -7420,7 +8495,7 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// LAPIC ticks per second (~100 Hz timer = 10ms per tick).
-const TICKS_PER_SEC: u64 = 100;
+pub(crate) const TICKS_PER_SEC: u64 = 100;
 
 /// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
 fn sys_gettimeofday(tv_ptr: u64) -> u64 {
@@ -8697,7 +9772,11 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         }
         FdBackend::Stdout => POLLOUT,
         FdBackend::DevNull => POLLIN | POLLOUT,
-        FdBackend::Ramdisk { .. }
+        FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
+        | FdBackend::Proc { .. }
+        | FdBackend::Ramdisk { .. }
         | FdBackend::Tmpfs { .. }
         | FdBackend::Fat32Disk { .. }
         | FdBackend::Ext2Disk { .. }

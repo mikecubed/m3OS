@@ -208,7 +208,10 @@ pub const SYS_CHDIR: u64 = 80;
 pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
+pub const SYS_LINK: u64 = 86;
 pub const SYS_UNLINK: u64 = 87;
+pub const SYS_SYMLINK: u64 = 88;
+pub const SYS_READLINK: u64 = 89;
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_GETPPID: u64 = 110;
 pub const SYS_SETPGID: u64 = 109;
@@ -220,6 +223,7 @@ pub const SYS_CHMOD: u64 = 90;
 pub const SYS_FCHMOD: u64 = 91;
 pub const SYS_CHOWN: u64 = 92;
 pub const SYS_FCHOWN: u64 = 93;
+pub const SYS_UMASK: u64 = 95;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
 pub const SYS_SETUID: u64 = 105;
@@ -232,6 +236,9 @@ pub const SYS_SETREGID: u64 = 114;
 // Directory listing and stat
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_LINKAT: u64 = 265;
+pub const SYS_SYMLINKAT: u64 = 266;
+pub const SYS_READLINKAT: u64 = 267;
 
 /// Custom kernel debug-print syscall.
 pub const SYS_DEBUG_PRINT: u64 = 0x1000;
@@ -715,6 +722,11 @@ pub fn unlink(path: &[u8]) -> isize {
     unsafe { syscall1(SYS_UNLINK, path.as_ptr() as u64) as isize }
 }
 
+/// Create a hard link. Both paths must be null-terminated byte strings.
+pub fn link(oldpath: &[u8], newpath: &[u8]) -> isize {
+    unsafe { syscall2(SYS_LINK, oldpath.as_ptr() as u64, newpath.as_ptr() as u64) as isize }
+}
+
 /// Rename a file or directory. Both paths must be null-terminated byte strings.
 pub fn rename(old: &[u8], new: &[u8]) -> isize {
     unsafe { syscall2(SYS_RENAME, old.as_ptr() as u64, new.as_ptr() as u64) as isize }
@@ -745,8 +757,8 @@ pub fn newfstatat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
 /// `path` must be null-terminated. `stat_buf` must be 144 bytes.
 /// Uses `AT_FDCWD` (-100) as dirfd.
 ///
-/// Note: the m3OS kernel currently ignores the `flags` parameter.
-/// This wrapper passes it for forward compatibility with the Linux ABI.
+/// Supported flags currently include `AT_SYMLINK_NOFOLLOW` for `lstat`-style
+/// metadata lookups. Other Linux `newfstatat` flags are not implemented yet.
 pub fn newfstatat_flags(path: &[u8], stat_buf: &mut [u8; 144], flags: u64) -> isize {
     unsafe {
         syscall4(
@@ -757,6 +769,93 @@ pub fn newfstatat_flags(path: &[u8], stat_buf: &mut [u8; 144], flags: u64) -> is
             flags,
         ) as isize
     }
+}
+
+/// `lstat(path, buf)` — get metadata without following the final symlink.
+pub fn lstat(path: &[u8], stat_buf: &mut [u8; 144]) -> isize {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    newfstatat_flags(path, stat_buf, AT_SYMLINK_NOFOLLOW)
+}
+
+/// `lstat(path, buf)` — get typed metadata without following the final symlink.
+pub fn lstat_stat(path: &[u8], buf: &mut Stat) -> isize {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    unsafe {
+        syscall4(
+            SYS_NEWFSTATAT,
+            (-100i64) as u64,
+            path.as_ptr() as u64,
+            buf as *mut Stat as u64,
+            AT_SYMLINK_NOFOLLOW,
+        ) as isize
+    }
+}
+
+/// `symlink(target, linkpath)` — create a symbolic link.
+pub fn symlink(target: &[u8], linkpath: &[u8]) -> isize {
+    unsafe {
+        syscall2(
+            SYS_SYMLINK,
+            target.as_ptr() as u64,
+            linkpath.as_ptr() as u64,
+        ) as isize
+    }
+}
+
+/// `readlink(path, buf)` — read a symbolic link target without NUL termination.
+pub fn readlink(path: &[u8], buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_READLINK,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// `symlinkat(target, dirfd, linkpath)` — create a symbolic link relative to a directory fd.
+pub fn symlinkat(target: &[u8], dirfd: i32, linkpath: &[u8]) -> isize {
+    unsafe {
+        syscall3(
+            SYS_SYMLINKAT,
+            target.as_ptr() as u64,
+            dirfd as u64,
+            linkpath.as_ptr() as u64,
+        ) as isize
+    }
+}
+
+/// `readlinkat(dirfd, path, buf)` — read a symbolic link target relative to a directory fd.
+pub fn readlinkat(dirfd: i32, path: &[u8], buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall4(
+            SYS_READLINKAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — create a hard link relative to directory fds.
+pub fn linkat(olddirfd: i32, oldpath: &[u8], newdirfd: i32, newpath: &[u8], flags: i32) -> isize {
+    unsafe {
+        syscall5(
+            SYS_LINKAT,
+            olddirfd as u64,
+            oldpath.as_ptr() as u64,
+            newdirfd as u64,
+            newpath.as_ptr() as u64,
+            flags as u64,
+        ) as isize
+    }
+}
+
+/// `umask(mask)` — set file creation mask and return the previous mask.
+pub fn umask(mask: u32) -> isize {
+    unsafe { syscall1(SYS_UMASK, mask as u64) as isize }
 }
 
 // ===========================================================================

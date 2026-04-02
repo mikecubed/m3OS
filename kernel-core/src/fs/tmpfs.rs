@@ -25,6 +25,9 @@ pub enum TmpfsError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TmpfsStat {
     pub is_dir: bool,
+    pub is_symlink: bool,
+    pub ino: u64,
+    pub nlink: u64,
     pub size: usize,
     /// Owner user ID (Phase 27).
     pub uid: u32,
@@ -37,9 +40,11 @@ pub struct TmpfsStat {
 enum TmpfsNode {
     File(FileData),
     Dir(DirData),
+    Symlink(SymlinkData),
 }
 
 struct FileData {
+    inode: u64,
     content: Vec<u8>,
     uid: u32,
     gid: u32,
@@ -47,27 +52,44 @@ struct FileData {
 }
 
 struct DirData {
+    inode: u64,
     children: BTreeMap<String, TmpfsNode>,
     uid: u32,
     gid: u32,
     mode: u16,
 }
 
+struct SymlinkData {
+    inode: u64,
+    target: String,
+    uid: u32,
+    gid: u32,
+}
+
 /// A complete tmpfs filesystem instance.
 pub struct Tmpfs {
     root: TmpfsNode,
+    next_inode: u64,
 }
 
 impl Tmpfs {
     pub const fn new() -> Self {
         Tmpfs {
             root: TmpfsNode::Dir(DirData {
+                inode: 1,
                 children: BTreeMap::new(),
                 uid: 0,
                 gid: 0,
                 mode: 0o755,
             }),
+            next_inode: 2,
         }
+    }
+
+    fn alloc_inode(&mut self) -> u64 {
+        let inode = self.next_inode;
+        self.next_inode = self.next_inode.saturating_add(1);
+        inode
     }
 
     fn components(path: &str) -> impl Iterator<Item = &str> {
@@ -100,13 +122,15 @@ impl Tmpfs {
                     Some(child) => child,
                     None => return Err(TmpfsError::NotFound),
                 },
-                TmpfsNode::File(_) => return Err(TmpfsError::NotADirectory),
+                TmpfsNode::File(_) | TmpfsNode::Symlink(_) => {
+                    return Err(TmpfsError::NotADirectory);
+                }
             };
         }
 
         match current {
             TmpfsNode::Dir(dir) => Ok((dir, name)),
-            TmpfsNode::File(_) => Err(TmpfsError::NotADirectory),
+            TmpfsNode::File(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::NotADirectory),
         }
     }
 
@@ -118,7 +142,9 @@ impl Tmpfs {
                     Some(child) => child,
                     None => return Err(TmpfsError::NotFound),
                 },
-                TmpfsNode::File(_) => return Err(TmpfsError::NotADirectory),
+                TmpfsNode::File(_) | TmpfsNode::Symlink(_) => {
+                    return Err(TmpfsError::NotADirectory);
+                }
             };
         }
         Ok(current)
@@ -132,7 +158,9 @@ impl Tmpfs {
                     Some(child) => child,
                     None => return Err(TmpfsError::NotFound),
                 },
-                TmpfsNode::File(_) => return Err(TmpfsError::NotADirectory),
+                TmpfsNode::File(_) | TmpfsNode::Symlink(_) => {
+                    return Err(TmpfsError::NotADirectory);
+                }
             };
         }
         Ok(current)
@@ -150,6 +178,7 @@ impl Tmpfs {
         gid: u32,
         mode: u16,
     ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -157,6 +186,7 @@ impl Tmpfs {
         parent.children.insert(
             name.to_string(),
             TmpfsNode::File(FileData {
+                inode,
                 content: Vec::new(),
                 uid,
                 gid,
@@ -180,7 +210,7 @@ impl Tmpfs {
                 file.content[offset..end].copy_from_slice(data);
                 Ok(())
             }
-            TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
+            TmpfsNode::Dir(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::WrongType),
         }
     }
 
@@ -199,7 +229,7 @@ impl Tmpfs {
                 let end = offset.saturating_add(max_len).min(file.content.len());
                 Ok(&file.content[offset..end])
             }
-            TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
+            TmpfsNode::Dir(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::WrongType),
         }
     }
 
@@ -208,6 +238,9 @@ impl Tmpfs {
         match node {
             TmpfsNode::File(file) => Ok(TmpfsStat {
                 is_dir: false,
+                is_symlink: false,
+                ino: file.inode,
+                nlink: 1,
                 size: file.content.len(),
                 uid: file.uid,
                 gid: file.gid,
@@ -215,10 +248,27 @@ impl Tmpfs {
             }),
             TmpfsNode::Dir(dir) => Ok(TmpfsStat {
                 is_dir: true,
+                is_symlink: false,
+                ino: dir.inode,
+                nlink: 2 + dir
+                    .children
+                    .values()
+                    .filter(|child| matches!(child, TmpfsNode::Dir(_)))
+                    .count() as u64,
                 size: 0,
                 uid: dir.uid,
                 gid: dir.gid,
                 mode: dir.mode,
+            }),
+            TmpfsNode::Symlink(link) => Ok(TmpfsStat {
+                is_dir: false,
+                is_symlink: true,
+                ino: link.inode,
+                nlink: 1,
+                size: link.target.len(),
+                uid: link.uid,
+                gid: link.gid,
+                mode: 0o777,
             }),
         }
     }
@@ -226,7 +276,7 @@ impl Tmpfs {
     pub fn unlink(&mut self, path: &str) -> Result<(), TmpfsError> {
         let (parent, name) = self.parent_and_name(path)?;
         match parent.children.get(name) {
-            Some(TmpfsNode::File(_)) => {
+            Some(TmpfsNode::File(_) | TmpfsNode::Symlink(_)) => {
                 parent.children.remove(name);
                 Ok(())
             }
@@ -247,6 +297,7 @@ impl Tmpfs {
         gid: u32,
         mode: u16,
     ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
         let (parent, name) = self.parent_and_name(path)?;
         if parent.children.contains_key(name) {
             return Err(TmpfsError::AlreadyExists);
@@ -254,6 +305,7 @@ impl Tmpfs {
         parent.children.insert(
             name.to_string(),
             TmpfsNode::Dir(DirData {
+                inode,
                 children: BTreeMap::new(),
                 uid,
                 gid,
@@ -273,7 +325,7 @@ impl Tmpfs {
                 parent.children.remove(name);
                 Ok(())
             }
-            Some(TmpfsNode::File(_)) => Err(TmpfsError::WrongType),
+            Some(TmpfsNode::File(_) | TmpfsNode::Symlink(_)) => Err(TmpfsError::WrongType),
             None => Err(TmpfsError::NotFound),
         }
     }
@@ -292,7 +344,7 @@ impl Tmpfs {
                     .collect();
                 Ok(entries)
             }
-            TmpfsNode::File(_) => Err(TmpfsError::WrongType),
+            TmpfsNode::File(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::WrongType),
         }
     }
 
@@ -320,8 +372,10 @@ impl Tmpfs {
             Ok((new_parent, new_name)) => {
                 if let Some(existing) = new_parent.children.get(new_name) {
                     let reject = match (&node, existing) {
-                        (TmpfsNode::File(_), TmpfsNode::Dir(_))
-                        | (TmpfsNode::Dir(_), TmpfsNode::File(_)) => Some(TmpfsError::WrongType),
+                        (TmpfsNode::File(_) | TmpfsNode::Symlink(_), TmpfsNode::Dir(_))
+                        | (TmpfsNode::Dir(_), TmpfsNode::File(_) | TmpfsNode::Symlink(_)) => {
+                            Some(TmpfsError::WrongType)
+                        }
                         (_, TmpfsNode::Dir(dst)) if !dst.children.is_empty() => {
                             Some(TmpfsError::NotEmpty)
                         }
@@ -350,16 +404,18 @@ impl Tmpfs {
     }
 
     /// Change the permission mode of a file or directory.
+    /// Symlinks are silently ignored (POSIX: lchmod is a no-op on most systems).
     pub fn chmod(&mut self, path: &str, mode: u16) -> Result<(), TmpfsError> {
         let node = self.get_node_mut(path)?;
         match node {
             TmpfsNode::File(f) => f.mode = mode,
             TmpfsNode::Dir(d) => d.mode = mode,
+            TmpfsNode::Symlink(_) => {}
         }
         Ok(())
     }
 
-    /// Change the owner uid/gid of a file or directory.
+    /// Change the owner uid/gid of a file, directory, or symlink.
     pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), TmpfsError> {
         let node = self.get_node_mut(path)?;
         match node {
@@ -370,6 +426,10 @@ impl Tmpfs {
             TmpfsNode::Dir(d) => {
                 d.uid = uid;
                 d.gid = gid;
+            }
+            TmpfsNode::Symlink(s) => {
+                s.uid = uid;
+                s.gid = gid;
             }
         }
         Ok(())
@@ -385,7 +445,7 @@ impl Tmpfs {
                 file.content.resize(new_size, 0);
                 Ok(())
             }
-            TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
+            TmpfsNode::Dir(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::WrongType),
         }
     }
 
@@ -404,7 +464,7 @@ impl Tmpfs {
     ) -> Result<bool, TmpfsError> {
         match self.get_node(path) {
             Ok(TmpfsNode::File(_)) => Ok(false),
-            Ok(TmpfsNode::Dir(_)) => Err(TmpfsError::WrongType),
+            Ok(TmpfsNode::Dir(_) | TmpfsNode::Symlink(_)) => Err(TmpfsError::WrongType),
             Err(TmpfsError::NotFound) if create => {
                 self.create_file_with_meta(path, uid, gid, mode)?;
                 Ok(true)
@@ -417,7 +477,46 @@ impl Tmpfs {
         let node = self.get_node(path)?;
         match node {
             TmpfsNode::File(file) => Ok(file.content.len()),
-            TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
+            TmpfsNode::Dir(_) | TmpfsNode::Symlink(_) => Err(TmpfsError::WrongType),
+        }
+    }
+
+    /// Create a symbolic link at `path` pointing to `target`.
+    pub fn create_symlink(&mut self, path: &str, target: &str) -> Result<(), TmpfsError> {
+        self.create_symlink_with_meta(path, target, 0, 0)
+    }
+
+    /// Create a symbolic link with specific ownership.
+    pub fn create_symlink_with_meta(
+        &mut self,
+        path: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), TmpfsError> {
+        let inode = self.alloc_inode();
+        let (parent, name) = self.parent_and_name(path)?;
+        if parent.children.contains_key(name) {
+            return Err(TmpfsError::AlreadyExists);
+        }
+        parent.children.insert(
+            name.to_string(),
+            TmpfsNode::Symlink(SymlinkData {
+                inode,
+                target: target.to_string(),
+                uid,
+                gid,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Read the target of a symbolic link at `path`.
+    pub fn read_symlink(&self, path: &str) -> Result<&str, TmpfsError> {
+        let node = self.get_node(path)?;
+        match node {
+            TmpfsNode::Symlink(link) => Ok(&link.target),
+            TmpfsNode::File(_) | TmpfsNode::Dir(_) => Err(TmpfsError::WrongType),
         }
     }
 }
@@ -460,15 +559,24 @@ mod tests {
 
         let fstat = fs.stat("/f").unwrap();
         assert!(!fstat.is_dir);
+        assert!(!fstat.is_symlink);
+        assert_ne!(fstat.ino, 0);
+        assert_eq!(fstat.nlink, 1);
         assert_eq!(fstat.size, 3);
 
         let dstat = fs.stat("/d").unwrap();
         assert!(dstat.is_dir);
+        assert!(!dstat.is_symlink);
+        assert_ne!(dstat.ino, 0);
+        assert_eq!(dstat.nlink, 2);
         assert_eq!(dstat.size, 0);
 
         // Root is a directory
         let rstat = fs.stat("/").unwrap();
         assert!(rstat.is_dir);
+        assert!(!rstat.is_symlink);
+        assert_eq!(rstat.ino, 1);
+        assert_eq!(rstat.nlink, 3);
     }
 
     #[test]
@@ -573,5 +681,72 @@ mod tests {
             fs.open_or_create("/missing", false),
             Err(TmpfsError::NotFound)
         );
+    }
+
+    #[test]
+    fn symlink_round_trip() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/some/target").unwrap();
+
+        // read_symlink returns the target
+        assert_eq!(fs.read_symlink("/link").unwrap(), "/some/target");
+
+        // stat reports is_symlink and target length as size
+        let st = fs.stat("/link").unwrap();
+        assert!(st.is_symlink);
+        assert!(!st.is_dir);
+        assert_ne!(st.ino, 0);
+        assert_eq!(st.nlink, 1);
+        assert_eq!(st.size, "/some/target".len());
+    }
+
+    #[test]
+    fn readlink_on_non_symlink_returns_error() {
+        let mut fs = Tmpfs::new();
+        fs.create_file("/f").unwrap();
+        fs.mkdir("/d").unwrap();
+
+        assert_eq!(fs.read_symlink("/f"), Err(TmpfsError::WrongType));
+        assert_eq!(fs.read_symlink("/d"), Err(TmpfsError::WrongType));
+    }
+
+    #[test]
+    fn unlink_symlink() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/target").unwrap();
+        fs.unlink("/link").unwrap();
+        assert_eq!(fs.stat("/link"), Err(TmpfsError::NotFound));
+    }
+    #[test]
+    fn symlink_already_exists() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/a").unwrap();
+        assert_eq!(
+            fs.create_symlink("/link", "/b"),
+            Err(TmpfsError::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn stat_symlink_not_dir() {
+        let mut fs = Tmpfs::new();
+        fs.create_symlink("/link", "/target").unwrap();
+        let st = fs.stat("/link").unwrap();
+        assert!(!st.is_dir);
+        assert!(st.is_symlink);
+    }
+
+    #[test]
+    fn stat_file_not_symlink() {
+        let mut fs = Tmpfs::new();
+        fs.create_file("/f").unwrap();
+        let st = fs.stat("/f").unwrap();
+        assert!(!st.is_symlink);
+    }
+
+    #[test]
+    fn stat_dir_not_symlink() {
+        let st = Tmpfs::new().stat("/").unwrap();
+        assert!(!st.is_symlink);
     }
 }

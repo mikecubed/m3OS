@@ -90,6 +90,8 @@ static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd.elf");
 // Phase 32: build tools and utilities
 static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch.elf");
 static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat.elf");
+static LN_ELF: &[u8] = include_bytes!("../../initrd/ln.elf");
+static READLINK_ELF: &[u8] = include_bytes!("../../initrd/readlink.elf");
 static WC_ELF: &[u8] = include_bytes!("../../initrd/wc.elf");
 static AR_ELF: &[u8] = include_bytes!("../../initrd/ar.elf");
 static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
@@ -120,6 +122,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     ("hello.elf", RamdiskNode::File { content: HELLO_ELF }),
     (
+        "tmpfs-test",
+        RamdiskNode::File {
+            content: TMPFS_TEST_ELF,
+        },
+    ),
+    (
         "tmpfs-test.elf",
         RamdiskNode::File {
             content: TMPFS_TEST_ELF,
@@ -128,6 +136,7 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("echo.elf", RamdiskNode::File { content: ECHO_ELF }),
     ("true.elf", RamdiskNode::File { content: TRUE_ELF }),
     ("false.elf", RamdiskNode::File { content: FALSE_ELF }),
+    ("cat", RamdiskNode::File { content: CAT_ELF }),
     ("cat.elf", RamdiskNode::File { content: CAT_ELF }),
     ("ls.elf", RamdiskNode::File { content: LS_ELF }),
     ("pwd.elf", RamdiskNode::File { content: PWD_ELF }),
@@ -236,6 +245,20 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("touch.elf", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),
     ("stat.elf", RamdiskNode::File { content: STAT_ELF }),
+    ("ln", RamdiskNode::File { content: LN_ELF }),
+    ("ln.elf", RamdiskNode::File { content: LN_ELF }),
+    (
+        "readlink",
+        RamdiskNode::File {
+            content: READLINK_ELF,
+        },
+    ),
+    (
+        "readlink.elf",
+        RamdiskNode::File {
+            content: READLINK_ELF,
+        },
+    ),
     ("wc", RamdiskNode::File { content: WC_ELF }),
     ("wc.elf", RamdiskNode::File { content: WC_ELF }),
     ("ar", RamdiskNode::File { content: AR_ELF }),
@@ -493,6 +516,10 @@ static FLAT_FILES: &[FlatFile] = &[
         content: HELLO_ELF,
     },
     FlatFile {
+        name: "tmpfs-test",
+        content: TMPFS_TEST_ELF,
+    },
+    FlatFile {
         name: "tmpfs-test.elf",
         content: TMPFS_TEST_ELF,
     },
@@ -507,6 +534,10 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "false.elf",
         content: FALSE_ELF,
+    },
+    FlatFile {
+        name: "cat",
+        content: CAT_ELF,
     },
     FlatFile {
         name: "cat.elf",
@@ -551,6 +582,14 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "grep.elf",
         content: GREP_ELF,
+    },
+    FlatFile {
+        name: "ln.elf",
+        content: LN_ELF,
+    },
+    FlatFile {
+        name: "readlink.elf",
+        content: READLINK_ELF,
     },
 ];
 
