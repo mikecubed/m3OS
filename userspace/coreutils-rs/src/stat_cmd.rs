@@ -73,7 +73,11 @@ fn main(args: &[&str]) -> i32 {
             let n = readlink(&path[..=bytes.len()], &mut target);
             if n >= 0 {
                 write_str(STDOUT_FILENO, " -> ");
-                let _ = write(STDOUT_FILENO, &target[..n as usize]);
+                if n as usize == target.len() {
+                    write_str(STDOUT_FILENO, "[target truncated]");
+                } else {
+                    let _ = write(STDOUT_FILENO, &target[..n as usize]);
+                }
             }
         }
         write_str(STDOUT_FILENO, "\n");

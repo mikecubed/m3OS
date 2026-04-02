@@ -56,6 +56,8 @@ const NEG_EXDEV: u64 = (-18_i64) as u64;
 #[allow(dead_code)]
 const DT_DIR: u8 = 4;
 #[allow(dead_code)]
+const DT_LNK: u8 = 10;
+#[allow(dead_code)]
 const DT_REG: u8 = 8;
 
 const EXT2_SUPER_MAGIC: i64 = 0xEF53;
@@ -7883,42 +7885,67 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let offset = entry.offset;
     let max_bytes = (count as usize).min(64 * 1024);
 
-    // Collect directory entries: [(".", true), ("..", true), ...children...]
-    let mut entries: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
-    entries.push((alloc::string::String::from("."), true));
-    entries.push((alloc::string::String::from(".."), true));
+    fn dirent_type_for_path(path: &str, is_dir: bool) -> u8 {
+        if is_dir {
+            DT_DIR
+        } else {
+            match path_node_nofollow(path) {
+                Ok(PathNodeKind::Symlink(_)) => DT_LNK,
+                Ok(PathNodeKind::Dir) => DT_DIR,
+                _ => DT_REG,
+            }
+        }
+    }
+
+    // Collect directory entries: [(".", DT_DIR), ("..", DT_DIR), ...children...]
+    let mut entries: alloc::vec::Vec<(alloc::string::String, u8)> = alloc::vec::Vec::new();
+    entries.push((alloc::string::String::from("."), DT_DIR));
+    entries.push((alloc::string::String::from(".."), DT_DIR));
 
     if crate::fs::procfs::is_dir(&dir_path) {
         match crate::fs::procfs::list_dir(&dir_path) {
             Some(children) => {
                 for (name, is_dir) in children {
-                    entries.push((name, is_dir));
+                    let child_path = if dir_path == "/" {
+                        alloc::format!("/{name}")
+                    } else {
+                        alloc::format!("{dir_path}/{name}")
+                    };
+                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                 }
             }
             None => return NEG_ENOENT,
         }
     } else if let Some(rel) = tmpfs_relative_path(&dir_path) {
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        match tmpfs.list_dir(rel) {
-            Ok(children) => {
-                for (name, is_dir) in children {
-                    entries.push((name, is_dir));
-                }
+        let children = {
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.list_dir(rel) {
+                Ok(children) => children,
+                Err(_) => return NEG_ENOENT,
             }
-            Err(_) => return NEG_ENOENT,
+        };
+        for (name, is_dir) in children {
+            let child_path = if dir_path == "/" {
+                alloc::format!("/{name}")
+            } else {
+                alloc::format!("{dir_path}/{name}")
+            };
+            entries.push((name, dirent_type_for_path(&child_path, is_dir)));
         }
     } else if dir_path == "/" {
         // Root directory: merge ext2 root + ramdisk overlays + virtual mounts.
         // Start with ext2 root entries if mounted.
         let mut seen = alloc::collections::BTreeSet::new();
         if crate::fs::ext2::is_mounted() {
-            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-            if let Some(vol) = vol.as_ref()
-                && let Ok(children) = vol.list_dir("/")
-            {
+            let children = {
+                let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                vol.as_ref().and_then(|vol| vol.list_dir("/").ok())
+            };
+            if let Some(children) = children {
                 for (name, is_dir) in children {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    let child_path = alloc::format!("/{name}");
+                    entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                 }
             }
         }
@@ -7927,22 +7954,22 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             for (name, is_dir) in ramdisk_children {
                 if !seen.contains(&name) {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
         }
         // Add virtual mount points.
         if !seen.contains("tmp") {
-            entries.push((alloc::string::String::from("tmp"), true));
+            entries.push((alloc::string::String::from("tmp"), DT_DIR));
         }
         if !seen.contains("proc") {
-            entries.push((alloc::string::String::from("proc"), true));
+            entries.push((alloc::string::String::from("proc"), DT_DIR));
         }
         if !seen.contains("dev") {
-            entries.push((alloc::string::String::from("dev"), true));
+            entries.push((alloc::string::String::from("dev"), DT_DIR));
         }
         if crate::fs::fat32::is_mounted() && !seen.contains("data") {
-            entries.push((alloc::string::String::from("data"), true));
+            entries.push((alloc::string::String::from("data"), DT_DIR));
         }
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).
@@ -7952,18 +7979,22 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
                 for (name, is_dir) in children {
                     seen.insert(name.clone());
-                    entries.push((name, is_dir));
+                    entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                 }
             }
-            {
+            let children = {
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-                if let Some(vol) = vol.as_ref()
-                    && let Ok(children) = vol.list_dir(rel)
-                {
-                    for (name, is_dir) in children {
-                        if !seen.contains(&name) {
-                            entries.push((name, is_dir));
-                        }
+                vol.as_ref().and_then(|vol| vol.list_dir(rel).ok())
+            };
+            if let Some(children) = children {
+                for (name, is_dir) in children {
+                    if !seen.contains(&name) {
+                        let child_path = if dir_path == "/" {
+                            alloc::format!("/{name}")
+                        } else {
+                            alloc::format!("{dir_path}/{name}")
+                        };
+                        entries.push((name, dirent_type_for_path(&child_path, is_dir)));
                     }
                 }
             }
@@ -7984,7 +8015,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 match vol.list_dir(dir_cluster) {
                     Ok(children) => {
                         for (name, is_dir) in children {
-                            entries.push((name, is_dir));
+                            entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
                         }
                     }
                     Err(_) => return NEG_EIO,
@@ -7995,7 +8026,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         // Ramdisk directory listing.
         if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
             for (name, is_dir) in children {
-                entries.push((name, is_dir));
+                entries.push((name, if is_dir { DT_DIR } else { DT_REG }));
             }
         }
     }
@@ -8009,7 +8040,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let mut idx = offset;
 
     while idx < entries.len() {
-        let (ref name, is_dir) = entries[idx];
+        let (ref name, d_type) = entries[idx];
         let name_bytes = name.as_bytes();
         // reclen = 19 (fixed fields) + name_len + 1 (null), rounded up to 8
         let reclen = (19 + name_bytes.len() + 1 + 7) & !7;
@@ -8027,8 +8058,6 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 
         let d_ino: u64 = (idx + 1) as u64;
         let d_off: i64 = (idx + 1) as i64;
-        let d_type: u8 = if is_dir { DT_DIR } else { DT_REG };
-
         out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
         out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
         out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());

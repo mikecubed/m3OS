@@ -27,6 +27,10 @@ fn main(args: &[&str]) -> i32 {
         write_str(STDERR_FILENO, "readlink: cannot read link\n");
         return 1;
     }
+    if n as usize == target.len() {
+        write_str(STDERR_FILENO, "readlink: target too long\n");
+        return 1;
+    }
     let _ = write(STDOUT_FILENO, &target[..n as usize]);
     let _ = write(STDOUT_FILENO, b"\n");
     0

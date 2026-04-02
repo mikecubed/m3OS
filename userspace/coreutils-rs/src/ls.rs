@@ -183,7 +183,11 @@ fn print_long_entry(base: &[u8], name: &[u8]) {
         let n = readlink(&fullpath[..=total], &mut target);
         if n >= 0 {
             write_str(STDOUT_FILENO, " -> ");
-            let _ = write(STDOUT_FILENO, &target[..n as usize]);
+            if n as usize == target.len() {
+                write_str(STDOUT_FILENO, "[target truncated]");
+            } else {
+                let _ = write(STDOUT_FILENO, &target[..n as usize]);
+            }
         }
     }
     write_str(STDOUT_FILENO, "\n");

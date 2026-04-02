@@ -142,6 +142,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
 pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
     let path = trim_proc_path(abs_path);
     if path == "/proc" {
+        let caller_pid = current_pid();
         let mut entries = alloc::vec![
             (String::from("self"), false),
             (String::from("meminfo"), false),
@@ -151,7 +152,12 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
             (String::from("mounts"), false),
         ];
         let table = PROCESS_TABLE.lock();
-        let mut pids: Vec<u32> = table.iter().map(|proc| proc.pid).collect();
+        let caller_euid = table.find(caller_pid).map(|proc| proc.euid).unwrap_or(0);
+        let mut pids: Vec<u32> = table
+            .iter()
+            .filter(|proc| caller_euid == 0 || proc.pid == caller_pid || proc.euid == caller_euid)
+            .map(|proc| proc.pid)
+            .collect();
         drop(table);
         pids.sort_unstable();
         for pid in pids {
@@ -205,7 +211,12 @@ fn parse_pid_component(component: &str) -> Option<u32> {
 
 fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
     let table = PROCESS_TABLE.lock();
+    let caller_pid = current_pid();
+    let caller_euid = table.find(caller_pid).map(|proc| proc.euid).unwrap_or(0);
     let proc = table.find(pid)?;
+    if caller_euid != 0 && proc.pid != caller_pid && proc.euid != caller_euid {
+        return None;
+    }
     let mut fd_targets = Vec::new();
     for (fd, entry) in proc.fd_table.iter().enumerate() {
         if let Some(entry) = entry

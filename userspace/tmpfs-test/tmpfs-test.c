@@ -267,6 +267,29 @@ static void test_symlink_semantics(void) {
         return;
     }
 
+    DIR *tmp_dir = opendir("/tmp");
+    if (tmp_dir == NULL) {
+        fail("symlink: dirent open", "could not open /tmp");
+        return;
+    }
+    int saw_link_entry = 0;
+    for (struct dirent *ent = readdir(tmp_dir); ent != NULL; ent = readdir(tmp_dir)) {
+        if (strcmp(ent->d_name, "link.txt") == 0) {
+            saw_link_entry = 1;
+            if (ent->d_type != DT_LNK) {
+                fail("symlink: dirent type", "directory entry was not reported as DT_LNK");
+                closedir(tmp_dir);
+                return;
+            }
+            break;
+        }
+    }
+    closedir(tmp_dir);
+    if (!saw_link_entry) {
+        fail("symlink: dirent entry", "link missing from /tmp listing");
+        return;
+    }
+
     if (lstat(link_path, &st) != 0) {
         fail("symlink: lstat", "lstat returned non-zero");
         return;
@@ -524,22 +547,26 @@ static void test_procfs_and_devices(void) {
     int saw_self = 0;
     int saw_pid = 0;
     int saw_meminfo = 0;
+    int self_is_symlink = 0;
+    int pid_is_dir = 0;
     char pid_buf[16];
     snprintf(pid_buf, sizeof(pid_buf), "%d", getpid());
     for (struct dirent *ent = readdir(dir); ent != NULL; ent = readdir(dir)) {
         if (strcmp(ent->d_name, "self") == 0) {
             saw_self = 1;
+            self_is_symlink = (ent->d_type == DT_LNK);
         }
         if (strcmp(ent->d_name, pid_buf) == 0) {
             saw_pid = 1;
+            pid_is_dir = (ent->d_type == DT_DIR);
         }
         if (strcmp(ent->d_name, "meminfo") == 0) {
             saw_meminfo = 1;
         }
     }
     closedir(dir);
-    if (!saw_self || !saw_pid || !saw_meminfo) {
-        fail("procfs: directory listing", "missing self, pid, or top-level proc entry");
+    if (!saw_self || !saw_pid || !saw_meminfo || !self_is_symlink || !pid_is_dir) {
+        fail("procfs: directory listing", "missing or mistyped self, pid, or top-level proc entry");
         return;
     }
 
@@ -639,6 +666,9 @@ static void test_permissions_and_umask(void) {
     if (child == 0) {
         if (setuid(1000) != 0) {
             _exit(10);
+        }
+        if (open("/proc/1/status", O_RDONLY) >= 0) {
+            _exit(13);
         }
         if (open(secret_path, O_RDONLY) >= 0) {
             _exit(11);
