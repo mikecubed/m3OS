@@ -135,6 +135,8 @@ pub enum FdBackend {
     PtySlave { pty_id: u32 },
     /// Network socket — Phase 23.
     Socket { handle: u32 },
+    /// epoll instance — Phase 37. Monitors other FDs for readiness events.
+    Epoll { instance_id: usize },
 }
 
 /// A single open-file entry in the per-process FD table.

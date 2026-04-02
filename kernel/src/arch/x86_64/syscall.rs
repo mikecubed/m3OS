@@ -46,6 +46,7 @@ const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
+const NEG_ENOMEM: u64 = (-12_i64) as u64;
 
 /// linux_dirent64 type constants.
 #[allow(dead_code)]
@@ -545,6 +546,8 @@ pub extern "C" fn syscall_handler(
             let cloexec = arg1 & 0x80000 != 0;
             sys_pipe_with_flags(arg0, cloexec)
         }
+        // Phase 37: epoll_create1(flags)
+        291 => sys_epoll_create1(arg0),
         // Phase 37: accept4(fd, addr, addrlen, flags) — syscall 288
         288 => {
             let flags = per_core_syscall_arg3();
@@ -556,6 +559,16 @@ pub extern "C" fn syscall_handler(
         318 => sys_getrandom(arg0, arg1, arg2),
         // newfstatat: fstat via path lookup
         262 => sys_linux_fstatat(arg0, arg1, arg2),
+        // Phase 37: epoll_wait(epfd, events, maxevents, timeout)
+        232 => {
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
+        // Phase 37: epoll_ctl(epfd, op, fd, event)
+        233 => {
+            let event_ptr = per_core_syscall_arg3();
+            sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
+        }
         // Phase 37: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
         270 => {
             let exceptfds = per_core_syscall_arg3();
@@ -2859,6 +2872,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Delegate to recvfrom with no addr
             sys_recvfrom_socket(fd as u64, buf_ptr, count, 0, 0, 0)
         }
+        FdBackend::Epoll { .. } => NEG_EBADF,
     }
 }
 
@@ -3331,6 +3345,7 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Delegate to sendto with no addr
             sys_sendto(fd, buf_ptr, count, 0, 0, 0)
         }
+        FdBackend::Epoll { .. } => NEG_EBADF,
     }
 }
 
@@ -4312,6 +4327,7 @@ fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::Socket { handle } => crate::net::free_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
+            FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
             _ => {}
         }
     }
@@ -4665,6 +4681,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             let (u, g, m) = (0u32, 0u32, 0o755u16);
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
+        FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -4975,7 +4992,8 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
-        | FdBackend::Socket { .. } => return NEG_EINVAL, // not seekable
+        | FdBackend::Socket { .. }
+        | FdBackend::Epoll { .. } => return NEG_EINVAL, // not seekable
         FdBackend::Ramdisk { content_len, .. } => *content_len,
         FdBackend::Tmpfs { path } => {
             let tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -6884,7 +6902,8 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
-        | FdBackend::Socket { .. } => NEG_EINVAL,
+        | FdBackend::Socket { .. }
+        | FdBackend::Epoll { .. } => NEG_EINVAL,
         FdBackend::Ramdisk { .. } => NEG_EROFS,
         FdBackend::Tmpfs { path } => {
             let mut tmpfs = crate::fs::tmpfs::TMPFS.lock();
@@ -8658,6 +8677,7 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
         | FdBackend::Fat32Disk { .. }
         | FdBackend::Ext2Disk { .. }
         | FdBackend::Dir { .. } => POLLIN | POLLOUT,
+        FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
     }
 }
 
@@ -9030,4 +9050,273 @@ fn sys_pselect6(
         exceptfds_ptr,
         adjusted_timeout_ptr,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: epoll interface — syscalls 291, 233, 232
+// ---------------------------------------------------------------------------
+
+const MAX_EPOLL_INSTANCES: usize = 16;
+const MAX_EPOLL_INTEREST: usize = 32;
+
+#[allow(dead_code)]
+const EPOLLIN: u32 = 0x001;
+#[allow(dead_code)]
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+
+const EPOLL_CLOEXEC: u64 = 0x80000;
+
+/// An entry in the epoll interest list: which FD to monitor and for what events.
+#[derive(Clone)]
+struct EpollInterest {
+    fd: usize,
+    events: u32,
+    data: u64,
+}
+
+/// An epoll instance — tracks interest set and has a wait queue for epoll_wait.
+struct EpollInstance {
+    interests: alloc::vec::Vec<EpollInterest>,
+    #[allow(dead_code)]
+    wait_queue: crate::task::wait_queue::WaitQueue,
+}
+
+impl EpollInstance {
+    fn new() -> Self {
+        Self {
+            interests: alloc::vec::Vec::new(),
+            wait_queue: crate::task::wait_queue::WaitQueue::new(),
+        }
+    }
+}
+
+static EPOLL_TABLE: spin::Mutex<[Option<EpollInstance>; MAX_EPOLL_INSTANCES]> = {
+    const NONE: Option<EpollInstance> = None;
+    spin::Mutex::new([NONE; MAX_EPOLL_INSTANCES])
+};
+
+/// Free an epoll instance by ID.
+fn epoll_free(instance_id: usize) {
+    let mut table = EPOLL_TABLE.lock();
+    if instance_id < MAX_EPOLL_INSTANCES {
+        table[instance_id] = None;
+    }
+}
+
+/// epoll_create1(flags) — syscall 291
+fn sys_epoll_create1(flags: u64) -> u64 {
+    let cloexec = flags & EPOLL_CLOEXEC != 0;
+
+    // Allocate an instance.
+    let instance_id = {
+        let mut table = EPOLL_TABLE.lock();
+        let mut found = None;
+        for (i, slot) in table.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(EpollInstance::new());
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(id) => id,
+            None => return NEG_ENOMEM,
+        }
+    };
+
+    let entry = FdEntry {
+        backend: FdBackend::Epoll { instance_id },
+        offset: 0,
+        readable: true,
+        writable: false,
+        cloexec,
+        nonblock: false,
+    };
+    match alloc_fd(0, entry) {
+        Some(fd) => fd as u64,
+        None => {
+            epoll_free(instance_id);
+            NEG_EMFILE
+        }
+    }
+}
+
+/// epoll_ctl(epfd, op, fd, event_ptr) — syscall 233
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+    let epfd_idx = epfd as usize;
+    let fd_idx = fd as usize;
+    if epfd_idx >= MAX_FDS || fd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+
+    // Get the epoll instance ID from the FD.
+    let instance_id = match current_fd_entry(epfd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::Epoll { instance_id } => instance_id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+
+    // Verify target FD exists.
+    if current_fd_entry(fd_idx).is_none() {
+        return NEG_EBADF;
+    }
+
+    // Read epoll_event from userspace: { events: u32, padding: u32, data: u64 }
+    let (events, data) = if op != EPOLL_CTL_DEL {
+        if event_ptr == 0 {
+            return NEG_EFAULT;
+        }
+        let mut ev = [0u8; 12];
+        if crate::mm::user_mem::copy_from_user(&mut ev, event_ptr).is_err() {
+            return NEG_EFAULT;
+        }
+        let events = u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]);
+        let data = u64::from_ne_bytes([ev[4], ev[5], ev[6], ev[7], ev[8], ev[9], ev[10], ev[11]]);
+        (events, data)
+    } else {
+        (0, 0)
+    };
+
+    let mut table = EPOLL_TABLE.lock();
+    let inst = match table.get_mut(instance_id).and_then(|s| s.as_mut()) {
+        Some(i) => i,
+        None => return NEG_EBADF,
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            // Check for duplicate.
+            if inst.interests.iter().any(|i| i.fd == fd_idx) {
+                return NEG_EEXIST;
+            }
+            if inst.interests.len() >= MAX_EPOLL_INTEREST {
+                return NEG_ENOMEM;
+            }
+            inst.interests.push(EpollInterest {
+                fd: fd_idx,
+                events,
+                data,
+            });
+            0
+        }
+        EPOLL_CTL_MOD => {
+            if let Some(entry) = inst.interests.iter_mut().find(|i| i.fd == fd_idx) {
+                entry.events = events;
+                entry.data = data;
+                0
+            } else {
+                const NEG_ENOENT: u64 = (-2_i64) as u64;
+                NEG_ENOENT
+            }
+        }
+        EPOLL_CTL_DEL => {
+            let before = inst.interests.len();
+            inst.interests.retain(|i| i.fd != fd_idx);
+            if inst.interests.len() == before {
+                const NEG_ENOENT: u64 = (-2_i64) as u64;
+                NEG_ENOENT
+            } else {
+                0
+            }
+        }
+        _ => NEG_EINVAL,
+    }
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout) — syscall 232
+fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let maxevents = maxevents as usize;
+    if maxevents == 0 {
+        return NEG_EINVAL;
+    }
+    let timeout_i = timeout as i64;
+
+    let epfd_idx = epfd as usize;
+    if epfd_idx >= MAX_FDS {
+        return NEG_EBADF;
+    }
+    let instance_id = match current_fd_entry(epfd_idx) {
+        Some(e) => match e.backend {
+            FdBackend::Epoll { instance_id } => instance_id,
+            _ => return NEG_EINVAL,
+        },
+        None => return NEG_EBADF,
+    };
+
+    let pid = crate::process::current_pid();
+    let saved_user_rsp = per_core_syscall_user_rsp();
+
+    loop {
+        // Scan interest list for ready FDs.
+        let mut out_count = 0usize;
+        let interests = {
+            let table = EPOLL_TABLE.lock();
+            match table.get(instance_id).and_then(|s| s.as_ref()) {
+                Some(inst) => inst.interests.clone(),
+                None => return NEG_EBADF,
+            }
+        };
+
+        for interest in &interests {
+            if out_count >= maxevents {
+                break;
+            }
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                let ready = fd_poll_events(&entry);
+                let ready_u32 = ready as u16 as u32;
+                let matched = ready_u32 & interest.events;
+                // Also report unconditional events.
+                let unconditional = ready_u32 & (EPOLLHUP | EPOLLERR);
+                if matched != 0 || unconditional != 0 {
+                    // Write epoll_event to userspace: { events: u32, padding: u32, data: u64 }
+                    let base = events_ptr + (out_count * 12) as u64;
+                    let ev_out = (matched | unconditional).to_ne_bytes();
+                    let data_out = interest.data.to_ne_bytes();
+                    let mut buf = [0u8; 12];
+                    buf[0..4].copy_from_slice(&ev_out);
+                    buf[4..12].copy_from_slice(&data_out);
+                    if crate::mm::user_mem::copy_to_user(base, &buf).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    out_count += 1;
+                }
+            }
+        }
+
+        if out_count > 0 || timeout_i == 0 {
+            return out_count as u64;
+        }
+
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
+
+        // Block on the epoll instance's wait queue.
+        // Also register on each monitored FD's wait queue so we wake on events.
+        let task_id = match crate::task::scheduler::current_task_id() {
+            Some(id) => id,
+            None => return NEG_EINTR,
+        };
+        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        for interest in &interests {
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                fd_register_waiter(&entry, task_id, &woken);
+            }
+        }
+        crate::task::scheduler::block_current_unless_woken(&woken);
+        restore_caller_context(pid, saved_user_rsp);
+        for interest in &interests {
+            if let Some(entry) = current_fd_entry(interest.fd) {
+                fd_deregister_waiter(&entry, task_id);
+            }
+        }
+    }
 }
