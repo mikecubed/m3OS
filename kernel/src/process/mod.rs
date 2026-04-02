@@ -127,6 +127,12 @@ pub enum FdBackend {
     Dir { path: String },
     /// /dev/null — reads return EOF, writes are silently discarded (Phase 21).
     DevNull,
+    /// /dev/zero — reads return zero bytes, writes are silently discarded (Phase 38).
+    DevZero,
+    /// /dev/urandom — reads return PRNG bytes, writes are silently discarded (Phase 38).
+    DevUrandom,
+    /// /dev/full — reads return zero bytes, writes return ENOSPC (Phase 38).
+    DevFull,
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
     /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).

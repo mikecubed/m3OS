@@ -2759,6 +2759,34 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::PipeWrite { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EISDIR,
         FdBackend::DevNull => 0, // EOF
+        FdBackend::DevZero | FdBackend::DevFull => {
+            // /dev/zero and /dev/full: fill buffer with zero bytes.
+            let capped = (count as usize).min(4096);
+            let zeroes = alloc::vec![0u8; capped];
+            if crate::mm::user_mem::copy_to_user(buf_ptr, &zeroes).is_err() {
+                return NEG_EFAULT;
+            }
+            capped as u64
+        }
+        FdBackend::DevUrandom => {
+            // /dev/urandom: fill buffer with PRNG bytes (reuses getrandom logic).
+            let capped = (count as usize).min(4096);
+            let mut out = alloc::vec![0u8; capped];
+            let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
+            if state == 0 {
+                state = 0xDEAD_BEEF_CAFE_BABE;
+            }
+            for byte in out.iter_mut() {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+            }
+            if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+                return NEG_EFAULT;
+            }
+            capped as u64
+        }
         FdBackend::PtyMaster { pty_id } => {
             if count == 0 {
                 return 0;
@@ -3143,7 +3171,8 @@ fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         }
         FdBackend::PipeRead { .. } => NEG_EBADF,
         FdBackend::Dir { .. } => NEG_EBADF,
-        FdBackend::DevNull => count, // silently discard
+        FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom => count, // silently discard
+        FdBackend::DevFull => NEG_ENOSPC, // no space left on device
         FdBackend::PtyMaster { pty_id } => {
             // Master writes to m2s (master-to-slave) buffer.
             // Apply line discipline on the slave side (input processing).
@@ -3646,10 +3675,18 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     }
 
     // Phase 21: /dev/null special file — reads return EOF, writes are discarded.
+    // Phase 38: /dev/zero, /dev/urandom, /dev/full device nodes.
     // Placed after flags decode so O_RDONLY/O_WRONLY are respected.
-    if name == "/dev/null" {
+    let dev_backend = match name {
+        "/dev/null" => Some(FdBackend::DevNull),
+        "/dev/zero" => Some(FdBackend::DevZero),
+        "/dev/urandom" | "/dev/random" => Some(FdBackend::DevUrandom),
+        "/dev/full" => Some(FdBackend::DevFull),
+        _ => None,
+    };
+    if let Some(backend) = dev_backend {
         let entry = FdEntry {
-            backend: FdBackend::DevNull,
+            backend,
             offset: 0,
             readable,
             writable,
@@ -4132,10 +4169,17 @@ fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
         _ => return NEG_EINVAL,
     };
 
-    // /dev/null special file — placed after flags decode to respect O_RDONLY/O_WRONLY.
-    if name == "/dev/null" {
+    // /dev/null, /dev/zero, /dev/urandom, /dev/full — placed after flags decode.
+    let dev_backend = match name {
+        "/dev/null" => Some(FdBackend::DevNull),
+        "/dev/zero" => Some(FdBackend::DevZero),
+        "/dev/urandom" | "/dev/random" => Some(FdBackend::DevUrandom),
+        "/dev/full" => Some(FdBackend::DevFull),
+        _ => None,
+    };
+    if let Some(backend) = dev_backend {
         let entry = FdEntry {
-            backend: FdBackend::DevNull,
+            backend,
             offset: 0,
             readable,
             writable,
@@ -4613,7 +4657,9 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             let (u, g, m) = dir_metadata(path);
             (0x4000 | m as u32, u, g, 0, 0)
         }
-        FdBackend::DevNull => (0x2000 | 0o666, 0, 0, 0, 0),
+        FdBackend::DevNull | FdBackend::DevZero | FdBackend::DevUrandom | FdBackend::DevFull => {
+            (0x2000 | 0o666, 0, 0, 0, 0)
+        }
         FdBackend::DeviceTTY { tty_id } => {
             (0x2000 | 0o620, 0, 0, 0, ((5u64) << 8) | (*tty_id as u64))
         }
@@ -4996,6 +5042,9 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
@@ -6231,7 +6280,14 @@ fn sys_linux_fstatat(_dirfd: u64, path_ptr: u64, stat_ptr: u64) -> u64 {
                 }
             }
             // Device special files.
-            if name == "/dev/null" || name == "/dev/ptmx" || name.starts_with("/dev/pts/") {
+            if name == "/dev/null"
+                || name == "/dev/zero"
+                || name == "/dev/urandom"
+                || name == "/dev/random"
+                || name == "/dev/full"
+                || name == "/dev/ptmx"
+                || name.starts_with("/dev/pts/")
+            {
                 let mut stat = [0u8; 144];
                 let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
                 stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -6906,6 +6962,9 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
         | FdBackend::PipeWrite { .. }
         | FdBackend::Dir { .. }
         | FdBackend::DevNull
+        | FdBackend::DevZero
+        | FdBackend::DevUrandom
+        | FdBackend::DevFull
         | FdBackend::DeviceTTY { .. }
         | FdBackend::PtyMaster { .. }
         | FdBackend::PtySlave { .. }
@@ -7183,7 +7242,14 @@ fn sys_access(path_ptr: u64) -> u64 {
 
     // Phase 21: /dev/null always exists.
     // Phase 22: /dev/ptmx and /dev/pts/* always exist.
-    if resolved == "/dev/null" || resolved == "/dev/ptmx" || resolved.starts_with("/dev/pts/") {
+    if resolved == "/dev/null"
+        || resolved == "/dev/zero"
+        || resolved == "/dev/urandom"
+        || resolved == "/dev/random"
+        || resolved == "/dev/full"
+        || resolved == "/dev/ptmx"
+        || resolved.starts_with("/dev/pts/")
+    {
         return 0;
     }
 
