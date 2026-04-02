@@ -19,6 +19,8 @@ pub mod virtio_net;
 
 use spin::Mutex;
 
+use crate::task::wait_queue::WaitQueue;
+
 /// Maximum number of open sockets system-wide.
 pub const MAX_SOCKETS: usize = 32;
 
@@ -111,6 +113,28 @@ impl SocketTable {
 
 static SOCKET_TABLE: Mutex<SocketTable> = Mutex::new(SocketTable::new());
 
+/// Per-socket wait queues — woken on data arrival, connection, close, etc.
+#[allow(clippy::declare_interior_mutable_const)]
+static SOCKET_WAITQUEUES: [WaitQueue; MAX_SOCKETS] = {
+    const WQ: WaitQueue = WaitQueue::new();
+    [WQ; MAX_SOCKETS]
+};
+
+/// Wake all tasks waiting on the given socket.
+pub fn wake_socket(handle: SocketHandle) {
+    if (handle as usize) < MAX_SOCKETS {
+        SOCKET_WAITQUEUES[handle as usize].wake_all();
+    }
+}
+
+/// Register the current task on a socket's wait queue (for poll/select/epoll).
+#[allow(dead_code)]
+pub fn register_socket_waiter(handle: SocketHandle) {
+    if (handle as usize) < MAX_SOCKETS {
+        SOCKET_WAITQUEUES[handle as usize].sleep();
+    }
+}
+
 /// Allocate a new socket entry. Returns the handle (index) or None if full.
 pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<SocketHandle> {
     let mut table = SOCKET_TABLE.lock();
@@ -169,6 +193,9 @@ pub fn free_socket(handle: SocketHandle) {
             *slot = None;
         }
     }
+    drop(table);
+    // Wake any pollers on this socket (HUP / close notification).
+    wake_socket(handle);
 }
 
 /// Increment socket refcount (called when FD table is cloned on fork).
@@ -199,4 +226,35 @@ where
 {
     let mut table = SOCKET_TABLE.lock();
     table.entries.get_mut(handle as usize)?.as_mut().map(f)
+}
+
+/// Wake all sockets that reference a given TCP connection slot.
+/// Called from the TCP handler after processing an incoming segment.
+pub fn wake_sockets_for_tcp_slot(tcp_idx: usize) {
+    let table = SOCKET_TABLE.lock();
+    for (i, slot) in table.entries.iter().enumerate() {
+        if let Some(entry) = slot
+            && entry.tcp_slot == Some(tcp_idx)
+        {
+            drop(table);
+            wake_socket(i as SocketHandle);
+            return;
+        }
+    }
+}
+
+/// Wake all sockets bound to a given UDP port.
+/// Called from the UDP handler after receiving a datagram.
+pub fn wake_sockets_for_udp_port(port: u16) {
+    let table = SOCKET_TABLE.lock();
+    for (i, slot) in table.entries.iter().enumerate() {
+        if let Some(entry) = slot
+            && entry.protocol == SocketProtocol::Udp
+            && entry.local_port == port
+        {
+            drop(table);
+            wake_socket(i as SocketHandle);
+            return;
+        }
+    }
 }

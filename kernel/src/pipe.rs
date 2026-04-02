@@ -13,10 +13,34 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::task::wait_queue::WaitQueue;
+
 pub use kernel_core::pipe::Pipe;
 
 /// Global pipe table.
 static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());
+
+/// Per-pipe wait queues — indexed by pipe_id, allocated alongside the pipe.
+/// Woken on write (data available to reader), read (space available to writer),
+/// and close (EOF / broken pipe notification).
+static PIPE_WAITQUEUES: Mutex<Vec<Option<WaitQueue>>> = Mutex::new(Vec::new());
+
+/// Wake all tasks waiting on the given pipe.
+pub fn wake_pipe(pipe_id: usize) {
+    let wqs = PIPE_WAITQUEUES.lock();
+    if let Some(Some(wq)) = wqs.get(pipe_id) {
+        wq.wake_all();
+    }
+}
+
+/// Register the current task on the given pipe's wait queue (for poll/select/epoll).
+#[allow(dead_code)]
+pub fn register_waiter(pipe_id: usize) {
+    let wqs = PIPE_WAITQUEUES.lock();
+    if let Some(Some(wq)) = wqs.get(pipe_id) {
+        wq.sleep();
+    }
+}
 
 /// Allocate a new pipe and return its ID.
 ///
@@ -25,15 +49,20 @@ static PIPE_TABLE: Mutex<Vec<Option<Pipe>>> = Mutex::new(Vec::new());
 /// for each FD they create that references the pipe.
 pub fn create_pipe() -> usize {
     let mut table = PIPE_TABLE.lock();
+    let mut wqs = PIPE_WAITQUEUES.lock();
     // Reuse a freed slot if available.
     for (i, slot) in table.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Pipe::new());
+            if i < wqs.len() {
+                wqs[i] = Some(WaitQueue::new());
+            }
             return i;
         }
     }
     let id = table.len();
     table.push(Some(Pipe::new()));
+    wqs.push(Some(WaitQueue::new()));
     id
 }
 
@@ -43,6 +72,11 @@ pub fn free_pipe(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
     if pipe_id < table.len() {
         table[pipe_id] = None;
+    }
+    drop(table);
+    let mut wqs = PIPE_WAITQUEUES.lock();
+    if pipe_id < wqs.len() {
+        wqs[pipe_id] = None;
     }
 }
 
@@ -79,7 +113,11 @@ pub fn pipe_read(pipe_id: usize, dst: &mut [u8]) -> Result<usize, bool> {
         return Err(true); // would block
     }
 
-    Ok(pipe.read(dst))
+    let n = pipe.read(dst);
+    drop(table);
+    // Wake writers that may be waiting for space.
+    wake_pipe(pipe_id);
+    Ok(n)
 }
 
 /// Write to a pipe. Returns:
@@ -101,16 +139,34 @@ pub fn pipe_write(pipe_id: usize, src: &[u8]) -> Result<usize, bool> {
         return Err(true); // would block
     }
 
-    Ok(pipe.write(src))
+    let n = pipe.write(src);
+    drop(table);
+    // Wake readers that may be waiting for data.
+    wake_pipe(pipe_id);
+    Ok(n)
 }
 
 /// Decrement reader ref-count. Frees the pipe when both counts reach 0.
 pub fn pipe_close_reader(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
-    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+    let freed = if let Some(Some(pipe)) = table.get_mut(pipe_id) {
         pipe.reader_count = pipe.reader_count.saturating_sub(1);
         if pipe.reader_count == 0 && pipe.writer_count == 0 {
             table[pipe_id] = None;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    drop(table);
+    // Wake writers — broken pipe (EPIPE) notification.
+    wake_pipe(pipe_id);
+    if freed {
+        let mut wqs = PIPE_WAITQUEUES.lock();
+        if pipe_id < wqs.len() {
+            wqs[pipe_id] = None;
         }
     }
 }
@@ -118,10 +174,24 @@ pub fn pipe_close_reader(pipe_id: usize) {
 /// Decrement writer ref-count. Frees the pipe when both counts reach 0.
 pub fn pipe_close_writer(pipe_id: usize) {
     let mut table = PIPE_TABLE.lock();
-    if let Some(Some(pipe)) = table.get_mut(pipe_id) {
+    let freed = if let Some(Some(pipe)) = table.get_mut(pipe_id) {
         pipe.writer_count = pipe.writer_count.saturating_sub(1);
         if pipe.reader_count == 0 && pipe.writer_count == 0 {
             table[pipe_id] = None;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    drop(table);
+    // Wake readers — EOF notification.
+    wake_pipe(pipe_id);
+    if freed {
+        let mut wqs = PIPE_WAITQUEUES.lock();
+        if pipe_id < wqs.len() {
+            wqs[pipe_id] = None;
         }
     }
 }
