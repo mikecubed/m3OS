@@ -195,6 +195,12 @@ fn has_cow_marker(vaddr: u64) -> bool {
     }
 }
 
+/// Public entry point for kernel-context demand paging (e.g. `copy_from_user`
+/// encountering a lazy mmap page). Delegates to `demand_map_user_page`.
+pub fn demand_map_user_page_from_kernel(vaddr: u64, prot: u64) -> bool {
+    demand_map_user_page(vaddr, prot)
+}
+
 /// Demand-page a single 4 KiB user-accessible frame at the page containing
 /// `vaddr`. Used for stack growth, VMA demand faults, and any other lazy
 /// mapping.
@@ -202,7 +208,7 @@ fn has_cow_marker(vaddr: u64) -> bool {
 /// `prot` uses POSIX constants: `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
 /// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
 ///
-/// Called from the page fault ISR (interrupts disabled, single CPU).
+/// Called from the page fault ISR and from kernel-context demand faulting.
 /// Returns `true` on success, `false` on OOM.
 fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     use x86_64::registers::control::Cr3;

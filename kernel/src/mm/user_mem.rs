@@ -57,10 +57,22 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        // Translate the page and validate flags.
-        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
+        // Translate the page and validate flags. If the page is not present,
+        // try to demand-fault it (Phase 36: lazy mmap pages).
+        let phys = match mapper.translate_addr(VirtAddr::new(page_base)) {
+            Some(p) => p,
+            None => {
+                if !try_demand_fault(page_base) {
+                    return Err(());
+                }
+                // Re-acquire mapper after page table modification.
+                let mapper = unsafe { crate::mm::paging::get_mapper() };
+                mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?
+            }
+        };
 
         // Verify USER_ACCESSIBLE via page-table walk.
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
         if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
             return Err(());
         }
@@ -116,6 +128,14 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         let mapper = unsafe { crate::mm::paging::get_mapper() };
 
         if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
+            // Phase 36: try demand-faulting if the page is not present at all.
+            if mapper.translate_addr(VirtAddr::new(page_base)).is_none() {
+                if try_demand_fault(page_base) {
+                    // Page now exists — re-check writability on next iteration.
+                    continue;
+                }
+                return Err(());
+            }
             // Check for CoW page: present + user-accessible + BIT_9 marker.
             if is_cow_page(&mapper, VirtAddr::new(page_base)) {
                 if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
@@ -152,6 +172,27 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Phase 36: demand-fault a user page if it is in a valid VMA but not yet
+/// present in the page table. Called from `copy_from_user` / `copy_to_user`
+/// when the page table walk finds no mapping.
+///
+/// Returns `true` if the page was successfully demand-mapped; `false` if the
+/// address is not in any VMA or allocation failed.
+fn try_demand_fault(page_base: u64) -> bool {
+    let pid = crate::process::current_pid();
+    let vma_prot = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table
+            .find(pid)
+            .and_then(|p| p.find_vma(page_base))
+            .map(|m| m.prot)
+    };
+    if let Some(prot) = vma_prot {
+        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
+    }
+    false
 }
 
 /// Check whether the page at `vaddr` is a CoW page (present, user-accessible,
