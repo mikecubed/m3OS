@@ -1,6 +1,6 @@
 # Phase 36 - Expanded Memory
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-36
 **Depends on:** Phase 33 (Kernel Memory) ✅, Phase 35 (True SMP Multitasking) ✅
 **Builds on:** Extends Phase 33's buddy allocator, slab caches, and munmap with demand paging, VMA-based fault resolution, and mprotect. Reuses Phase 35's TLB shootdown infrastructure for cross-core permission updates.

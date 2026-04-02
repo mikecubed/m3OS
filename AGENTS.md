@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.35.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, and working munmap, and real-time clock with wall-clock timekeeping.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.36.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, and real-time clock with wall-clock timekeeping.
 
 ## Build & Run
 

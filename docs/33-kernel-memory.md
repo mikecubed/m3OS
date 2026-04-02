@@ -100,6 +100,21 @@ a user buffer for shell display.
 | `userspace/syscall-lib/src/lib.rs` | meminfo() syscall wrapper |
 | `userspace/coreutils-rs/src/meminfo.rs` | New: meminfo command |
 
+## Phase 36 Extension — Demand Paging and mprotect
+
+Phase 36 extends the memory subsystem with demand paging and `mprotect()`:
+
+- **Demand paging:** `mmap()` no longer eagerly allocates physical frames. The page
+  fault handler checks the VMA list and allocates frames on first access. This
+  enables large 256 MB+ mappings without exhausting physical memory.
+- **VMA protection tracking:** `MemoryMapping` now carries `prot` and `flags` fields
+  so the page fault handler and mprotect can set correct page permissions.
+- **mprotect:** The Phase 21 no-op stub is replaced with a real implementation that
+  walks page tables, updates PTE permission bits, splits VMAs at mprotect boundaries,
+  and issues TLB shootdown across all cores.
+- **QEMU/disk expansion:** RAM increased from 256 MB to 1 GB, data partition from
+  128 MB to 1 GB, to support large cross-compiled toolchains.
+
 ## Deferred Items
 
 - **A.4:** OOM stress QEMU test (requires test infrastructure for allocation loops)

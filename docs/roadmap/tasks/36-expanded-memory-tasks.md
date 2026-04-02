@@ -1,6 +1,6 @@
 # Phase 36 — Expanded Memory: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-36
 **Depends on:** Phase 33 (Kernel Memory) ✅, Phase 35 (True SMP Multitasking) ✅
 **Goal:** Convert the eager mmap allocator to demand paging, implement mprotect,
@@ -11,11 +11,11 @@ size to support large cross-compiled binaries.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | VMA tracking with protection bits | — | Planned |
-| B | Demand paging (lazy mmap) | A | Planned |
-| C | mprotect syscall | A | Planned |
-| D | QEMU and disk image expansion | — | Planned |
-| E | Integration testing and documentation | A, B, C, D | Planned |
+| A | VMA tracking with protection bits | — | Complete |
+| B | Demand paging (lazy mmap) | A | Complete |
+| C | mprotect syscall | A | Complete |
+| D | QEMU and disk image expansion | — | Complete |
+| E | Integration testing and documentation | A, B, C, D | Complete |
 
 ---
 
@@ -33,10 +33,10 @@ permissions to set when demand-mapping a frame, and mprotect needs flags to spli
 and update VMAs correctly.
 
 **Acceptance:**
-- [ ] `MemoryMapping` has `prot: u64` field storing `PROT_READ | PROT_WRITE | PROT_EXEC` bits
-- [ ] `MemoryMapping` has `flags: u64` field storing `MAP_PRIVATE | MAP_ANONYMOUS` bits
-- [ ] Existing mmap callsites populate both fields
-- [ ] Existing munmap logic unchanged — still works with the extended struct
+- [x] `MemoryMapping` has `prot: u64` field storing `PROT_READ | PROT_WRITE | PROT_EXEC` bits
+- [x] `MemoryMapping` has `flags: u64` field storing `MAP_PRIVATE | MAP_ANONYMOUS` bits
+- [x] Existing mmap callsites populate both fields
+- [x] Existing munmap logic unchanged — still works with the extended struct
 
 ### A.2 — Update mmap to record prot and flags in VMA
 
@@ -46,9 +46,9 @@ and update VMAs correctly.
 protection and flags so later fault handling and mprotect can use them.
 
 **Acceptance:**
-- [ ] `sys_linux_mmap()` stores `prot` and `flags` arguments in the `MemoryMapping`
-- [ ] VMA list remains correctly ordered and non-overlapping
-- [ ] `cargo xtask check` passes
+- [x] `sys_linux_mmap()` stores `prot` and `flags` arguments in the `MemoryMapping`
+- [x] VMA list remains correctly ordered and non-overlapping
+- [x] `cargo xtask check` passes
 
 ### A.3 — Add VMA lookup helper
 
@@ -58,9 +58,9 @@ protection and flags so later fault handling and mprotect can use them.
 containing a given virtual address. A shared helper avoids duplicating the linear scan.
 
 **Acceptance:**
-- [ ] `find_vma(addr)` returns `Option<&MemoryMapping>` for the VMA containing `addr`
-- [ ] Returns `None` for addresses not in any VMA
-- [ ] Used by the page fault handler (Track B) and mprotect (Track C)
+- [x] `find_vma(addr)` returns `Option<&MemoryMapping>` for the VMA containing `addr`
+- [x] Returns `None` for addresses not in any VMA
+- [x] Used by the page fault handler (Track B) and mprotect (Track C)
 
 ---
 
@@ -77,10 +77,10 @@ on first access by the page fault handler.
 frames at map time. It records the VMA and returns the virtual address immediately.
 
 **Acceptance:**
-- [ ] `sys_linux_mmap()` does NOT call `allocate_frame()` for anonymous mappings
-- [ ] `sys_linux_mmap()` does NOT map any pages into the page table
-- [ ] Returns a valid virtual address from the process's mmap region
-- [ ] VMA is recorded in the process's mapping list with correct prot/flags
+- [x] `sys_linux_mmap()` does NOT call `allocate_frame()` for anonymous mappings
+- [x] `sys_linux_mmap()` does NOT map any pages into the page table
+- [x] Returns a valid virtual address from the process's mmap region
+- [x] VMA is recorded in the process's mapping list with correct prot/flags
 
 ### B.2 — Extend page fault handler with VMA-based demand mapping
 
@@ -90,11 +90,11 @@ frames at map time. It records the VMA and returns the virtual address immediate
 must check the VMA list to decide whether to allocate a frame or deliver SIGSEGV.
 
 **Acceptance:**
-- [ ] Faulting address inside a valid VMA triggers frame allocation, zero-fill, and mapping
-- [ ] Page permissions match the VMA's `prot` field (read-only VMA produces read-only PTE)
-- [ ] Faulting address outside all VMAs delivers SIGSEGV
-- [ ] CoW faults (Phase 17) still resolved before VMA check — existing behavior preserved
-- [ ] Stack demand-paging still works alongside VMA demand-paging
+- [x] Faulting address inside a valid VMA triggers frame allocation, zero-fill, and mapping
+- [x] Page permissions match the VMA's `prot` field (read-only VMA produces read-only PTE)
+- [x] Faulting address outside all VMAs delivers SIGSEGV
+- [x] CoW faults (Phase 17) still resolved before VMA check — existing behavior preserved
+- [x] Stack demand-paging still works alongside VMA demand-paging
 
 ### B.3 — Update `demand_map_user_page()` to accept protection flags
 
@@ -104,11 +104,11 @@ must check the VMA list to decide whether to allocate a frame or deliver SIGSEGV
 paging for VMA regions must respect the VMA's protection bits.
 
 **Acceptance:**
-- [ ] `demand_map_user_page()` accepts a `prot` parameter
-- [ ] Maps read-only pages without the writable bit
-- [ ] Maps executable pages with the execute bit (no NX)
-- [ ] Existing stack demand-paging callers updated to pass appropriate flags
-- [ ] TLB flushed after mapping (local core; SMP shootdown not needed for fresh mappings)
+- [x] `demand_map_user_page()` accepts a `prot` parameter
+- [x] Maps read-only pages without the writable bit
+- [x] Maps executable pages with the execute bit (no NX)
+- [x] Existing stack demand-paging callers updated to pass appropriate flags
+- [x] TLB flushed after mapping (local core; SMP shootdown not needed for fresh mappings)
 
 ### B.4 — Large mmap region validation
 
@@ -119,10 +119,10 @@ physical memory. This task validates that the virtual address space management
 handles large regions correctly.
 
 **Acceptance:**
-- [ ] `mmap(NULL, 256*1024*1024, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)` succeeds
-- [ ] Physical memory usage does not increase until pages are touched
-- [ ] Touching individual pages in the region triggers demand faults that succeed
-- [ ] munmap of a large region frees only the frames that were actually allocated
+- [x] `mmap(NULL, 256*1024*1024, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)` succeeds
+- [x] Physical memory usage does not increase until pages are touched
+- [x] Touching individual pages in the region triggers demand faults that succeed
+- [x] munmap of a large region frees only the frames that were actually allocated
 
 ---
 
@@ -141,12 +141,12 @@ implementation that changes page permissions.
 update PTE permission bits in place. This is the core implementation.
 
 **Acceptance:**
-- [ ] `mprotect(addr, len, PROT_READ)` removes the writable bit from all PTEs in range
-- [ ] `mprotect(addr, len, PROT_READ|PROT_WRITE|PROT_EXEC)` sets full permissions
-- [ ] `mprotect(addr, len, PROT_NONE)` makes pages inaccessible (guard pages)
-- [ ] Handles pages that are not yet demand-mapped (updates VMA prot only, no PTE to change)
-- [ ] Returns `-EINVAL` for unaligned addresses or zero length
-- [ ] Returns `-ENOMEM` for addresses not in any VMA
+- [x] `mprotect(addr, len, PROT_READ)` removes the writable bit from all PTEs in range
+- [x] `mprotect(addr, len, PROT_READ|PROT_WRITE|PROT_EXEC)` sets full permissions
+- [x] `mprotect(addr, len, PROT_NONE)` makes pages inaccessible (guard pages)
+- [x] Handles pages that are not yet demand-mapped (updates VMA prot only, no PTE to change)
+- [x] Returns `-EINVAL` for unaligned addresses or zero length
+- [x] Returns `-ENOMEM` for addresses not in any VMA
 
 ### C.2 — VMA splitting on mprotect boundaries
 
@@ -156,10 +156,10 @@ update PTE permission bits in place. This is the core implementation.
 into separate regions with different protection bits.
 
 **Acceptance:**
-- [ ] mprotect on a sub-range of a VMA splits it into 2 or 3 VMAs with correct bounds
-- [ ] The modified sub-range gets the new protection bits
-- [ ] Surrounding sub-ranges retain original protection bits
-- [ ] munmap still works correctly after VMA splits
+- [x] mprotect on a sub-range of a VMA splits it into 2 or 3 VMAs with correct bounds
+- [x] The modified sub-range gets the new protection bits
+- [x] Surrounding sub-ranges retain original protection bits
+- [x] munmap still works correctly after VMA splits
 
 ### C.3 — TLB shootdown for mprotect
 
@@ -169,9 +169,9 @@ into separate regions with different protection bits.
 all cores that may have cached the old PTEs.
 
 **Acceptance:**
-- [ ] mprotect flushes TLB locally for affected pages
-- [ ] mprotect sends IPI TLB shootdown to other cores (reusing Phase 35 infrastructure)
-- [ ] A process running on core 1 sees updated permissions after mprotect on core 0
+- [x] mprotect flushes TLB locally for affected pages
+- [x] mprotect sends IPI TLB shootdown to other cores (reusing Phase 35 infrastructure)
+- [x] A process running on core 1 sees updated permissions after mprotect on core 0
 
 ---
 
@@ -187,9 +187,9 @@ These are configuration-only changes that enable testing with larger workloads.
 on demand paging. 1 GB provides headroom for Phase 50 workloads.
 
 **Acceptance:**
-- [ ] QEMU `-m` argument changed from `256` to `1024`
-- [ ] Kernel boots successfully with 1 GB RAM
-- [ ] Frame allocator correctly detects and manages the larger memory pool
+- [x] QEMU `-m` argument changed from `256` to `1024`
+- [x] Kernel boots successfully with 1 GB RAM
+- [x] Frame allocator correctly detects and manages the larger memory pool
 
 ### D.2 — Expand data partition to 1 GB
 
@@ -199,9 +199,9 @@ on demand paging. 1 GB provides headroom for Phase 50 workloads.
 Python ~60 MB, Node.js ~80 MB, git ~20 MB).
 
 **Acceptance:**
-- [ ] `DISK_SIZE` constant changed from `128 * 1024 * 1024` to `1024 * 1024 * 1024`
-- [ ] Data partition mounts and is usable at the larger size
-- [ ] Existing filesystem tests still pass
+- [x] `DISK_SIZE` constant changed from `128 * 1024 * 1024` to `1024 * 1024 * 1024`
+- [x] Data partition mounts and is usable at the larger size
+- [x] Existing filesystem tests still pass
 
 ---
 
@@ -216,9 +216,9 @@ fork (Phase 17) must still work correctly — the handler must resolve CoW befor
 checking VMAs.
 
 **Acceptance:**
-- [ ] Fork-exec workloads still function correctly
-- [ ] Parent and child processes with shared pages trigger CoW on write, not demand-map
-- [ ] Multi-process shell workloads (pipe chains) pass without regression
+- [x] Fork-exec workloads still function correctly
+- [x] Parent and child processes with shared pages trigger CoW on write, not demand-map
+- [x] Multi-process shell workloads (pipe chains) pass without regression
 
 ### E.2 — Demand paging stress test
 
@@ -228,9 +228,9 @@ checking VMAs.
 processes faulting pages simultaneously on multiple cores.
 
 **Acceptance:**
-- [ ] Spawn 4+ processes each mapping 16 MB; all complete without panic
-- [ ] Physical memory usage grows only as pages are touched
-- [ ] No deadlocks in the page fault handler under concurrent faults
+- [x] Spawn 4+ processes each mapping 16 MB; all complete without panic
+- [x] Physical memory usage grows only as pages are touched
+- [x] No deadlocks in the page fault handler under concurrent faults
 
 ### E.3 — mprotect validation
 
@@ -240,9 +240,9 @@ processes faulting pages simultaneously on multiple cores.
 page setup or any other existing mprotect callers.
 
 **Acceptance:**
-- [ ] musl-linked binaries still start correctly (musl calls mprotect for stack guard)
-- [ ] Write to a `PROT_READ`-only page delivers SIGSEGV
-- [ ] `PROT_NONE` guard pages trap on any access
+- [x] musl-linked binaries still start correctly (musl calls mprotect for stack guard)
+- [x] Write to a `PROT_READ`-only page delivers SIGSEGV
+- [x] `PROT_NONE` guard pages trap on any access
 
 ### E.4 — Run full existing test suite
 
@@ -252,9 +252,9 @@ page setup or any other existing mprotect callers.
 must still pass.
 
 **Acceptance:**
-- [ ] All QEMU integration tests pass
-- [ ] All kernel-core host tests pass
-- [ ] `cargo xtask check` clean (no warnings)
+- [x] All QEMU integration tests pass
+- [x] All kernel-core host tests pass
+- [x] `cargo xtask check` clean (no warnings)
 
 ### E.5 — Update documentation
 
@@ -268,10 +268,10 @@ must still pass.
 the demand paging extension.
 
 **Acceptance:**
-- [ ] Phase 36 design doc updated with completion status
-- [ ] Task list updated with completion status and any deferred items
-- [ ] Roadmap README row updated from "Planned" to "Complete"
-- [ ] `docs/33-kernel-memory.md` updated to mention demand paging as a Phase 36 extension
+- [x] Phase 36 design doc updated with completion status
+- [x] Task list updated with completion status and any deferred items
+- [x] Roadmap README row updated from "Planned" to "Complete"
+- [x] `docs/33-kernel-memory.md` updated to mention demand paging as a Phase 36 extension
 
 ---
 
