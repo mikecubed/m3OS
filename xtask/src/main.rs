@@ -1698,8 +1698,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for login prompt",
     });
     steps.push(SmokeStep::Send {
-        input: "root\n",
-        label: "enter username",
+        input: "rooo\x08t\n",
+        label: "enter username with backspace correction",
     });
     steps.push(SmokeStep::Wait {
         pattern: "Password:",
