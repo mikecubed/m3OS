@@ -96,6 +96,7 @@ flowchart TD
     P23 --> P37["Phase 37 Tasks"]
     P22 --> P37
     P35 --> P37
+    P13 --> P38
     P28 --> P38["Phase 38 Tasks"]
     P27 --> P38
     P23 --> P39["Phase 39 Tasks"]
@@ -187,16 +188,16 @@ flowchart TD
 | 31 | Compiler bootstrap (TCC) | Complete | `phase-31` | [Phase 31 Tasks](./31-compiler-bootstrap-tasks.md) |
 | 32 | Build tools (make, ar) | Complete | `phase-32` | [Phase 32 Tasks](./32-build-tools-tasks.md) |
 
-### Kernel Infrastructure Phases (phases 33-34 complete)
+### Kernel Infrastructure Phases (phases 33-36 complete)
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 33 | Kernel memory improvements (slab, OOM retry, munmap) | Complete | `phase-33` | [Phase 33 Tasks](./33-kernel-memory-tasks.md) |
 | 34 | Real-time clock and timekeeping | Complete | `phase-34` | [Phase 34 Tasks](./34-real-time-clock-tasks.md) |
-| 35 | True SMP multitasking (per-core dispatch, priorities) | Planned | `phase-35` | *not yet created* |
-| 36 | Expanded memory (demand paging, mprotect, disk/RAM) | Planned | `phase-36` | *not yet created* |
-| 37 | I/O multiplexing (select, epoll, non-blocking) | Planned | `phase-37` | *not yet created* |
-| 38 | Filesystem enhancements (symlinks, /proc, permissions) | Planned | `phase-38` | *not yet created* |
+| 35 | True SMP multitasking (per-core dispatch, priorities) | Complete | `phase-35` | [Phase 35 Tasks](./35-true-smp-multitasking-tasks.md) |
+| 36 | Expanded memory (demand paging, mprotect, disk/RAM) | Complete | `phase-36` | [Phase 36 Tasks](./36-expanded-memory-tasks.md) |
+| 37 | I/O multiplexing (select, epoll, non-blocking) | Planned | `phase-37` | [Phase 37 Tasks](./37-io-multiplexing-tasks.md) |
+| 38 | Filesystem enhancements (symlinks, hard links, /proc, permissions, device nodes) | Planned | `phase-38` | [Phase 38 Tasks](./38-filesystem-enhancements-tasks.md) |
 | 39 | Unix domain sockets (AF_UNIX) | Planned | `phase-39` | *not yet created* |
 | 40 | Threading primitives (clone, futex, TLS) | Planned | `phase-40` | *not yet created* |
 

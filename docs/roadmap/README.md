@@ -100,6 +100,7 @@ flowchart TD
     P23 --> P37["Phase 37<br/>I/O Multiplexing"]
     P22 --> P37
     P35 --> P37
+    P13 --> P38
     P28 --> P38["Phase 38<br/>Filesystem Enhancements"]
     P27 --> P38
     P23 --> P39["Phase 39<br/>Unix Domain Sockets"]
@@ -203,7 +204,7 @@ flowchart TD
 | 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | Complete | `phase-31` | [Phase 31](./31-compiler-bootstrap.md) | [Tasks](./tasks/31-compiler-bootstrap-tasks.md) |
 | 32 | Build Tools | make, ar, shell scripting for multi-file projects | Complete | `phase-32` | [Phase 32](./32-build-tools.md) | [Tasks](./tasks/32-build-tools-tasks.md) |
 
-### Kernel Infrastructure Phases (phases 33-34 complete, 35-40 planned)
+### Kernel Infrastructure Phases (phases 33-36 complete, 37-40 planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
@@ -212,7 +213,7 @@ flowchart TD
 | 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | Complete | `phase-35` | [Phase 35](./35-true-smp-multitasking.md) | [Tasks](./tasks/35-true-smp-multitasking-tasks.md) |
 | 36 | Expanded Memory | Demand paging, mprotect, large mmap, disk/RAM expansion | Complete | `phase-36` | [Phase 36](./36-expanded-memory.md) | [Tasks](./tasks/36-expanded-memory-tasks.md) |
 | 37 | I/O Multiplexing | select, epoll, non-blocking I/O | Complete | `phase-37` | [Phase 37](./37-io-multiplexing.md) | [Tasks](./tasks/37-io-multiplexing-tasks.md) |
-| 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | Planned | `phase-38` | [Phase 38](./38-filesystem-enhancements.md) | *not yet created* |
+| 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | Planned | `phase-38` | [Phase 38](./38-filesystem-enhancements.md) | [Tasks](./tasks/38-filesystem-enhancements-tasks.md) |
 | 39 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | Planned | `phase-39` | [Phase 39](./39-unix-domain-sockets.md) | *not yet created* |
 | 40 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | Planned | `phase-40` | [Phase 40](./40-threading-primitives.md) | *not yet created* |
 
