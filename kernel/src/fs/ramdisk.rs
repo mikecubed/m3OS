@@ -103,6 +103,9 @@ static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail.elf");
 static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee.elf");
 static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod.elf");
 static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown.elf");
+static SORT_ELF: &[u8] = include_bytes!("../../initrd/sort.elf");
+static UNIQ_ELF: &[u8] = include_bytes!("../../initrd/uniq.elf");
+static CUT_ELF: &[u8] = include_bytes!("../../initrd/cut.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
@@ -304,6 +307,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("chmod.elf", RamdiskNode::File { content: CHMOD_ELF }),
     ("chown", RamdiskNode::File { content: CHOWN_ELF }),
     ("chown.elf", RamdiskNode::File { content: CHOWN_ELF }),
+    ("sort", RamdiskNode::File { content: SORT_ELF }),
+    ("sort.elf", RamdiskNode::File { content: SORT_ELF }),
+    ("uniq", RamdiskNode::File { content: UNIQ_ELF }),
+    ("uniq.elf", RamdiskNode::File { content: UNIQ_ELF }),
+    ("cut", RamdiskNode::File { content: CUT_ELF }),
+    ("cut.elf", RamdiskNode::File { content: CUT_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
@@ -640,6 +649,18 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "chown.elf",
         content: CHOWN_ELF,
+    },
+    FlatFile {
+        name: "sort.elf",
+        content: SORT_ELF,
+    },
+    FlatFile {
+        name: "uniq.elf",
+        content: UNIQ_ELF,
+    },
+    FlatFile {
+        name: "cut.elf",
+        content: CUT_ELF,
     },
 ];
 

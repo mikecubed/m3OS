@@ -237,6 +237,9 @@ fn build_musl_bins() {
         ("userspace/coreutils/tee.c", "tee"),
         ("userspace/coreutils/chmod.c", "chmod"),
         ("userspace/coreutils/chown.c", "chown"),
+        ("userspace/coreutils/sort.c", "sort"),
+        ("userspace/coreutils/uniq.c", "uniq"),
+        ("userspace/coreutils/cut.c", "cut"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2204,7 +2207,116 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 10. make clean
+    // 10. Phase 41 text tools: sort, uniq, cut
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort /etc/passwd\n",
+        label: "sort: lexicographic order",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sort output includes root first",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sort output includes user",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sort",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort -r /etc/passwd\n",
+        label: "sort: reverse order",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify reverse sort output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after reverse sort",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cut -d: -f3 /etc/passwd | /bin/sort -n\n",
+        label: "sort: numeric order",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "0",
+        timeout_secs: 10,
+        label: "verify numeric sort output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "1000",
+        timeout_secs: 10,
+        label: "verify numeric sort keeps 1000 after 0",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after numeric sort",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd /etc/passwd | /bin/sort | /bin/uniq -c\n",
+        label: "uniq: count adjacent duplicates",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2 root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "verify uniq count output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after uniq",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cut -d: -f1 /etc/passwd\n",
+        label: "cut: passwd usernames",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root",
+        timeout_secs: 10,
+        label: "verify cut field output includes root",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user",
+        timeout_secs: 10,
+        label: "verify cut field output includes user",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cut field",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo abcdef | /bin/cut -c2-4\n",
+        label: "cut: character range",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "bcd",
+        timeout_secs: 10,
+        label: "verify cut character output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cut chars",
+    });
+
+    // -----------------------------------------------------------------------
+    // 11. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
