@@ -5071,6 +5071,8 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
             proc.mappings.push(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
+                prot,
+                flags,
             });
         }
     }
@@ -5161,6 +5163,8 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                     let tail = crate::process::MemoryMapping {
                         start: unmap_end,
                         len: m_end - unmap_end,
+                        prot: m.prot,
+                        flags: m.flags,
                     };
                     new_mappings.push(tail);
                     m.len = unmap_start - m.start;

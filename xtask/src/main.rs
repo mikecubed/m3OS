@@ -923,9 +923,9 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         format!("format=raw,file={}", uefi_image.display()),
         "-serial".to_string(),
         "stdio".to_string(),
-        // Phase 27: increase RAM for embedded ramdisk + userspace.
+        // Phase 36: increase RAM to 1 GB for larger disk image and extended storage workloads.
         "-m".to_string(),
-        "256".to_string(),
+        "1024".to_string(),
         // Phase 25: SMP — boot with 4 CPU cores.
         "-smp".to_string(),
         "4".to_string(),
@@ -2206,9 +2206,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
-    // Phase 31: increased from 64 MB to 128 MB to accommodate TCC binary,
-    // musl libc/headers, TCC source for self-hosting, and compilation output.
-    const DISK_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
+    // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
+    // storage requirements for filesystem stress testing and larger workloads.
+    const DISK_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB
     const SECTOR_SIZE: u64 = 512;
     const PARTITION_START_LBA: u32 = 2048; // 1 MB offset
     let total_sectors = (DISK_SIZE / SECTOR_SIZE) as u32;
