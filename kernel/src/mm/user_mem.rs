@@ -129,8 +129,10 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
 
         if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
             // Phase 36: try demand-faulting if the page is not present at all.
+            // Only demand-fault for writable VMAs — read-only VMAs should fail
+            // with EFAULT to avoid allocating frames that can never be written.
             if mapper.translate_addr(VirtAddr::new(page_base)).is_none() {
-                if try_demand_fault(page_base) {
+                if try_demand_fault_writable(page_base) {
                     // Page now exists — re-check writability on next iteration.
                     continue;
                 }
@@ -174,9 +176,31 @@ pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
+/// Like [`try_demand_fault`] but also requires the VMA to be writable.
+/// Used by `copy_to_user` to avoid allocating frames for read-only VMAs
+/// that would immediately fail the writability check.
+fn try_demand_fault_writable(page_base: u64) -> bool {
+    let pid = crate::process::current_pid();
+    let vma_prot = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table
+            .find(pid)
+            .and_then(|p| p.find_vma(page_base))
+            .map(|m| m.prot)
+    };
+    const PROT_WRITE: u64 = 0x2;
+    if let Some(prot) = vma_prot {
+        if prot & PROT_WRITE == 0 {
+            return false; // VMA is not writable — fail with EFAULT.
+        }
+        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
+    }
+    false
+}
+
 /// Phase 36: demand-fault a user page if it is in a valid VMA but not yet
-/// present in the page table. Called from `copy_from_user` / `copy_to_user`
-/// when the page table walk finds no mapping.
+/// present in the page table. Called from `copy_from_user` when the page
+/// table walk finds no mapping.
 ///
 /// Returns `true` if the page was successfully demand-mapped; `false` if the
 /// address is not in any VMA or allocation failed.

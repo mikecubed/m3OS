@@ -543,9 +543,11 @@ impl Process {
 
     /// Find the VMA containing `addr`, if any.
     pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
-        self.mappings
-            .iter()
-            .find(|m| addr >= m.start && addr < m.start + m.len)
+        self.mappings.iter().find(|m| {
+            m.start
+                .checked_add(m.len)
+                .is_some_and(|end| addr >= m.start && addr < end)
+        })
     }
 }
 
