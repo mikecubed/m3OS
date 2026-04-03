@@ -59,10 +59,6 @@ static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t 
     return 0;
 }
 
-static long mount_fs(const char *source, const char *target, const char *fstype) {
-    return syscall(__NR_mount, source, target, fstype);
-}
-
 static long umount_fs(const char *target) {
     return syscall(__NR_umount2, target, 0);
 }

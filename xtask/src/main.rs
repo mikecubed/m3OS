@@ -2559,6 +2559,11 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "verify hexdump -C ELF magic",
     });
     steps.push(SmokeStep::Wait {
+        pattern: "|.ELF",
+        timeout_secs: 10,
+        label: "verify hexdump -C ASCII gutter",
+    });
+    steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
         label: "prompt after hexdump canonical",
@@ -2701,7 +2706,6 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after find files",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -name '*.c' | /bin/xargs /bin/grep main\n",
         label: "xargs: grep matches from find",

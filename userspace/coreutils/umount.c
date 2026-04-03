@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (syscall(166, argv[1], 0) != 0) {
+    if (syscall(__NR_umount2, argv[1], 0) != 0) {
         fprintf(stderr, "umount: %s\n", strerror(errno));
         return 1;
     }

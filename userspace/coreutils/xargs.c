@@ -40,7 +40,15 @@ static char *dup_with_replacement(const char *template, const char *needle, cons
     return out;
 }
 
-static char **read_items(int null_delimited, size_t *count_out) {
+static void free_items(char **items, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+/* Returns 0 on success (items/count_out populated), -1 on allocation failure. */
+static int read_items(int null_delimited, char ***items_out, size_t *count_out) {
     char **items = NULL;
     size_t count = 0;
     size_t cap = 0;
@@ -58,8 +66,7 @@ static char **read_items(int null_delimited, size_t *count_out) {
                 size_t new_cap = cap ? cap * 2 : 16;
                 char **new_items = realloc(items, new_cap * sizeof(char *));
                 if (!new_items) {
-                    free(buf);
-                    return NULL;
+                    goto oom;
                 }
                 items = new_items;
                 cap = new_cap;
@@ -76,8 +83,7 @@ static char **read_items(int null_delimited, size_t *count_out) {
             size_t new_cap = buf_cap ? buf_cap * 2 : 64;
             char *new_buf = realloc(buf, new_cap);
             if (!new_buf) {
-                free(buf);
-                return NULL;
+                goto oom;
             }
             buf = new_buf;
             buf_cap = new_cap;
@@ -90,8 +96,7 @@ static char **read_items(int null_delimited, size_t *count_out) {
             size_t new_cap = cap ? cap * 2 : 16;
             char **new_items = realloc(items, new_cap * sizeof(char *));
             if (!new_items) {
-                free(buf);
-                return NULL;
+                goto oom;
             }
             items = new_items;
             cap = new_cap;
@@ -102,8 +107,14 @@ static char **read_items(int null_delimited, size_t *count_out) {
         free(buf);
     }
 
+    *items_out = items;
     *count_out = count;
-    return items;
+    return 0;
+
+oom:
+    free(buf);
+    free_items(items, count);
+    return -1;
 }
 
 static int run_command(char **argv) {
@@ -159,12 +170,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    items = read_items(null_delimited, &count);
-    if (!items && ferror(stdin)) {
-        fprintf(stderr, "xargs: read error\n");
+    if (read_items(null_delimited, &items, &count) < 0) {
+        fprintf(stderr, "xargs: out of memory\n");
         return 1;
     }
-    if (!items || count == 0) {
+    if (ferror(stdin)) {
+        fprintf(stderr, "xargs: read error\n");
+        free_items(items, count);
+        return 1;
+    }
+    if (count == 0) {
         free(items);
         return 0;
     }
@@ -212,9 +227,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (size_t item_idx = 0; item_idx < count; item_idx++) {
-        free(items[item_idx]);
-    }
-    free(items);
+    free_items(items, count);
     return status;
 }
