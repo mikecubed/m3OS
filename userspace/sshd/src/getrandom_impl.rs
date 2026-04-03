@@ -4,10 +4,10 @@ use getrandom::{Error, register_custom_getrandom};
 
 fn kernel_getrandom(dest: &mut [u8]) -> Result<(), Error> {
     let ret = syscall_lib::getrandom(dest);
-    if ret < 0 {
-        Err(Error::UNEXPECTED)
-    } else {
+    if ret == dest.len() as isize {
         Ok(())
+    } else {
+        Err(Error::UNEXPECTED)
     }
 }
 

@@ -65,6 +65,13 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut pty_buf = [0u8; 4096];
     let mut chan_buf = [0u8; 4096];
 
+    // Pending data buffers: carry unconsumed bytes across main loop iterations
+    // when sunset or the channel cannot accept more data (backpressure).
+    let mut sock_pending_buf = [0u8; 4096];
+    let mut sock_pending_len: usize = 0;
+    let mut pty_pending_buf = [0u8; 4096];
+    let mut pty_pending_len: usize = 0;
+
     loop {
         // Flush pending output.
         flush_output(&mut runner, sock_fd);
@@ -108,8 +115,28 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             break;
         }
 
+        // Feed any pending bytes to sunset first.
+        while sock_pending_len > 0 {
+            match runner.input(&sock_pending_buf[..sock_pending_len]) {
+                Ok(0) => {
+                    flush_output(&mut runner, sock_fd);
+                    let _ = runner.progress();
+                    flush_output(&mut runner, sock_fd);
+                    break; // Still blocked — try again next iteration.
+                }
+                Ok(c) => {
+                    sock_pending_buf.copy_within(c..sock_pending_len, 0);
+                    sock_pending_len -= c;
+                }
+                Err(_) => {
+                    cleanup(shell_pid, pty_master, pty_slave);
+                    return 1;
+                }
+            }
+        }
+
         // Socket readable: feed bytes to sunset.
-        if (pfds_arr[0].revents & POLLIN) != 0 {
+        if sock_pending_len == 0 && (pfds_arr[0].revents & POLLIN) != 0 {
             let n = syscall_lib::read(sock_fd, &mut sock_buf);
             if n <= 0 {
                 break;
@@ -118,21 +145,10 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             while consumed < n as usize {
                 match runner.input(&sock_buf[consumed..n as usize]) {
                     Ok(0) => {
-                        // Sunset can't accept more input right now — flush
-                        // output and drive progress to make room, then retry.
                         flush_output(&mut runner, sock_fd);
                         let _ = runner.progress();
                         flush_output(&mut runner, sock_fd);
-                        // Try once more; if still 0, break to avoid busy-loop
-                        // (remaining bytes stay in sock_buf for next iteration).
-                        match runner.input(&sock_buf[consumed..n as usize]) {
-                            Ok(0) => break,
-                            Ok(c) => consumed += c,
-                            Err(_) => {
-                                cleanup(shell_pid, pty_master, pty_slave);
-                                return 1;
-                            }
-                        }
+                        break; // Stash remainder below.
                     }
                     Ok(c) => consumed += c,
                     Err(_) => {
@@ -141,14 +157,43 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 }
             }
+            // Stash unconsumed bytes for next iteration.
+            if consumed < n as usize {
+                let remaining = n as usize - consumed;
+                let stash = remaining.min(sock_pending_buf.len());
+                sock_pending_buf[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
+                sock_pending_len = stash;
+            }
         }
 
         if (pfds_arr[0].revents & (POLLHUP | POLLERR)) != 0 && (pfds_arr[0].revents & POLLIN) == 0 {
             break;
         }
 
+        // Drain any pending PTY data into the channel first.
+        if let Some(ref ch) = chan_handle {
+            while pty_pending_len > 0 {
+                match runner.write_channel(
+                    ch,
+                    ChanData::Normal,
+                    &pty_pending_buf[..pty_pending_len],
+                ) {
+                    Ok(0) => {
+                        flush_output(&mut runner, sock_fd);
+                        break; // Still blocked — try again next iteration.
+                    }
+                    Ok(w) => {
+                        pty_pending_buf.copy_within(w..pty_pending_len, 0);
+                        pty_pending_len -= w;
+                        flush_output(&mut runner, sock_fd);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         // PTY readable: read from PTY, send as channel data.
-        if nfds > 1 && (pfds_arr[1].revents & POLLIN) != 0 {
+        if pty_pending_len == 0 && nfds > 1 && (pfds_arr[1].revents & POLLIN) != 0 {
             if let Some(pty_fd) = pty_master {
                 let n = syscall_lib::read(pty_fd, &mut pty_buf);
                 if n > 0 {
@@ -158,19 +203,20 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                         while sent < data.len() {
                             match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
                                 Ok(0) => {
-                                    // Backpressure — flush and retry once.
                                     flush_output(&mut runner, sock_fd);
-                                    match runner.write_channel(ch, ChanData::Normal, &data[sent..])
-                                    {
-                                        Ok(0) => break, // Still blocked, retry next iteration.
-                                        Ok(w) => sent += w,
-                                        Err(_) => break,
-                                    }
+                                    break; // Stash remainder below.
                                 }
                                 Ok(w) => sent += w,
                                 Err(_) => break,
                             }
                             flush_output(&mut runner, sock_fd);
+                        }
+                        // Stash unsent bytes for next iteration.
+                        if sent < data.len() {
+                            let remaining = data.len() - sent;
+                            let stash = remaining.min(pty_pending_buf.len());
+                            pty_pending_buf[..stash].copy_from_slice(&data[sent..sent + stash]);
+                            pty_pending_len = stash;
                         }
                     }
                 }
@@ -224,37 +270,66 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 }
                 Ok(Event::Serv(ServEvent::PubkeyAuth(pk_auth))) => {
+                    let is_real = pk_auth.real();
                     let username = match pk_auth.username() {
                         Ok(u) => String::from(u),
                         Err(_) => {
+                            if is_real {
+                                auth_attempts += 1;
+                            }
                             let _ = pk_auth.reject();
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                cleanup(shell_pid, pty_master, pty_slave);
+                                return 1;
+                            }
                             continue;
                         }
                     };
                     let pubkey = match pk_auth.pubkey() {
                         Ok(pk) => pk,
                         Err(_) => {
+                            if is_real {
+                                auth_attempts += 1;
+                            }
                             let _ = pk_auth.reject();
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                cleanup(shell_pid, pty_master, pty_slave);
+                                return 1;
+                            }
                             continue;
                         }
                     };
                     let pk_bytes: &[u8] = match &pubkey {
                         sunset::PubKey::Ed25519(ed_pk) => &ed_pk.key.0,
                         _ => {
+                            if is_real {
+                                auth_attempts += 1;
+                            }
                             let _ = pk_auth.reject();
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                cleanup(shell_pid, pty_master, pty_slave);
+                                return 1;
+                            }
                             continue;
                         }
                     };
                     match auth::check_pubkey(&username, pk_bytes) {
                         Some(info) => {
-                            if pk_auth.real() {
+                            if is_real {
                                 authenticated = true;
                                 user_info = Some(info);
                             }
                             let _ = pk_auth.allow();
                         }
                         None => {
+                            if is_real {
+                                auth_attempts += 1;
+                            }
                             let _ = pk_auth.reject();
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                cleanup(shell_pid, pty_master, pty_slave);
+                                return 1;
+                            }
                         }
                     }
                 }
