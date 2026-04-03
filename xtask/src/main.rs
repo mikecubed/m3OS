@@ -3880,7 +3880,7 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     let ports_src = root.join("target/ports-src");
     populate_ports_tree(&part_tmp, &root, &ports_src);
     // Phase 47: place doom1.wad on the ext2 partition.
-    populate_doom_files(&part_tmp, output_dir);
+    populate_doom_files(&part_tmp);
 
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
@@ -4641,6 +4641,8 @@ fn fetch_doom_wad(dest: &Path) {
 /// file) on a mismatch or when `sha256sum` is unavailable — callers that set
 /// `M3OS_DOWNLOAD_WAD=1` have opted into supply-chain verification, so a
 /// missing tool must not silently allow an unverified binary to proceed.
+/// Note: file deletion on mismatch is performed by `fetch_doom_wad`; this
+/// function deletes only when `sha256sum` is unavailable.
 fn verify_sha256(path: &Path, expected: &str) -> bool {
     // Use the `sha256sum` tool if available (common on Linux).
     let output = Command::new("sha256sum")
@@ -4671,7 +4673,7 @@ fn verify_sha256(path: &Path, expected: &str) -> bool {
 ///
 /// The WAD is cached in target/doom1.wad (gitignored) and auto-downloaded on
 /// first use. The shareware doom1.wad is freely redistributable (~4 MB).
-fn populate_doom_files(part_path: &Path, output_dir: &Path) {
+fn populate_doom_files(part_path: &Path) {
     // Cache the WAD in target/ so it is never committed and persists across
     // builds.  Also accept a manually placed doom1.wad at the repo root for
     // users who already have it.
@@ -4694,6 +4696,9 @@ fn populate_doom_files(part_path: &Path, output_dir: &Path) {
     let mut cmds = String::new();
 
     // Create /usr/share/doom/ directory tree.
+    // debugfs mkdir does not create parent directories, so each level must be
+    // created explicitly starting from the top-level `usr` directory.
+    cmds.push_str("mkdir usr\n");
     cmds.push_str("mkdir usr/share\n");
     cmds.push_str("mkdir usr/share/doom\n");
 
@@ -4704,6 +4709,7 @@ fn populate_doom_files(part_path: &Path, output_dir: &Path) {
     ));
 
     // Set permissions.
+    cmds.push_str("sif usr mode 0x41ED\n");
     cmds.push_str("sif usr/share mode 0x41ED\n");
     cmds.push_str("sif usr/share/doom mode 0x41ED\n");
     cmds.push_str("sif usr/share/doom/doom1.wad mode 0x81A4\n");
@@ -4733,8 +4739,6 @@ fn populate_doom_files(part_path: &Path, output_dir: &Path) {
     } else {
         println!("doom: placed doom1.wad at /usr/share/doom/doom1.wad");
     }
-
-    let _ = output_dir; // suppress unused warning
 }
 
 fn cmd_image(image_args: &ImageArgs) {

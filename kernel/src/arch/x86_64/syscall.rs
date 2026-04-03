@@ -6426,7 +6426,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    use x86_64::structures::paging::{Mapper, Page, Size4KiB};
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
 
     // SAFETY: current CR3 is the calling process's page table; this is the
     // same approach used by sys_linux_mmap.
@@ -6437,13 +6437,28 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         let page_addr = addr + (i as u64 * 4096);
         let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
 
+        // Read PTE flags *before* unmapping to detect device-mapped pages.
+        // BIT_11 marks MMIO / hardware frames (e.g. UEFI framebuffer) that are
+        // not owned by the frame allocator and must not be freed.
+        let is_device_frame = {
+            use x86_64::structures::paging::Translate as _;
+            use x86_64::structures::paging::mapper::TranslateResult;
+            match mapper.translate(x86_64::VirtAddr::new(page_addr)) {
+                TranslateResult::Mapped { flags, .. } => flags.contains(PageTableFlags::BIT_11),
+                _ => false,
+            }
+        };
+
         // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
         match mapper.unmap(page) {
             Ok((frame, flush)) => {
                 // Skip the local TLB flush here — we batch a single shootdown
                 // (which includes a local invlpg) after the loop.
                 flush.ignore();
-                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                if !is_device_frame {
+                    // Only return system-RAM frames to the allocator.
+                    crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                }
                 unmapped_addrs.push(page_addr);
             }
             Err(_) => {
@@ -6799,7 +6814,8 @@ impl core::fmt::Write for BufWriter<'_> {
 //
 // Writes a packed FbInfo struct into a user-supplied buffer.
 // arg0 = user buffer pointer, arg1 = buffer length (must be >= 20 bytes)
-// Returns 0 on success, NEG_EINVAL on error.
+// Returns 0 on success, NEG_EINVAL on bad arguments, NEG_EFAULT if the
+// copy to userspace fails.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -6851,7 +6867,8 @@ fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
 // Phase 47 Track A: framebuffer mmap syscall (0x1006)
 //
 // Maps the physical framebuffer into the calling process's address space.
-// Returns the userspace virtual address, or NEG_EINVAL on error.
+// Returns the userspace virtual address on success, NEG_EBUSY if another
+// process already owns the framebuffer, or NEG_EINVAL on other errors.
 // ---------------------------------------------------------------------------
 
 fn sys_framebuffer_mmap() -> u64 {
