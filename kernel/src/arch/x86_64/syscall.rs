@@ -173,7 +173,7 @@ fn basename(path: &str) -> &str {
 }
 
 fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
-    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" || abs_path == "/dev/pts" {
         return Ok(PathNodeKind::Dir);
     }
     if let Some(node) = crate::fs::procfs::path_node(abs_path) {
@@ -653,6 +653,7 @@ fn statfs_path_exists(abs_path: &str) -> bool {
         return true;
     }
     if abs_path == "/dev"
+        || abs_path == "/dev/pts"
         || abs_path == "/dev/null"
         || abs_path == "/dev/zero"
         || abs_path == "/dev/urandom"
@@ -5889,7 +5890,7 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
-    if abs_path == "/dev" {
+    if abs_path == "/dev" || abs_path == "/dev/pts" {
         return Some((0, 0, 0o755));
     }
     if abs_path == "/dev/null"

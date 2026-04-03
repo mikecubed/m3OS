@@ -132,7 +132,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     sock_pending_len -= c;
                 }
                 Err(_) => {
-                    write_str(STDOUT_FILENO, "sshd: input pending error\n");
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
@@ -238,15 +237,12 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         loop {
             match runner.progress() {
                 Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
-                    write_str(STDOUT_FILENO, "sshd: hostkeys event\n");
                     if hostkeys.hostkeys(&[&host_key.key]).is_err() {
-                        write_str(STDOUT_FILENO, "sshd: hostkeys failed\n");
                         cleanup(shell_pid, pty_master, pty_slave);
                         return 1;
                     }
                 }
                 Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
-                    write_str(STDOUT_FILENO, "sshd: first auth\n");
                     let _ = first_auth.reject();
                 }
                 Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
@@ -343,7 +339,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 }
                 Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
-                    write_str(STDOUT_FILENO, "sshd: open session\n");
                     if !authenticated {
                         let _ = open_session
                             .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
@@ -351,81 +346,22 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                     match open_session.accept() {
                         Ok(handle) => {
-                            write_str(STDOUT_FILENO, "sshd: channel accepted\n");
                             chan_handle = Some(handle);
                         }
-                        Err(_) => {
-                            write_str(STDOUT_FILENO, "sshd: channel accept failed\n");
-                        }
+                        Err(_) => {}
                     }
                 }
-                Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
-                    write_str(STDOUT_FILENO, "sshd: pty request\n");
-                    // Inline PTY open with diagnostics.
-                    let master_fd = syscall_lib::open(b"/dev/ptmx\0", 2, 0);
-                    write_str(STDOUT_FILENO, "sshd: ptmx open=");
-                    syscall_lib::write_u64(STDOUT_FILENO, master_fd as u64);
-                    write_str(STDOUT_FILENO, "\n");
-                    if master_fd >= 0 {
-                        let mfd = master_fd as i32;
-                        // Unlock slave.
-                        let zero: i32 = 0;
-                        let ret = syscall_lib::ioctl(mfd, 0x40045431, &zero as *const _ as usize);
-                        write_str(STDOUT_FILENO, "sshd: unlock=");
-                        syscall_lib::write_u64(STDOUT_FILENO, ret as u64);
-                        write_str(STDOUT_FILENO, "\n");
-                        // Get PTY number.
-                        let mut pty_num: u32 = 0;
-                        let ret =
-                            syscall_lib::ioctl(mfd, 0x80045430, &mut pty_num as *mut _ as usize);
-                        write_str(STDOUT_FILENO, "sshd: getptn=");
-                        syscall_lib::write_u64(STDOUT_FILENO, ret as u64);
-                        write_str(STDOUT_FILENO, " num=");
-                        syscall_lib::write_u64(STDOUT_FILENO, pty_num as u64);
-                        write_str(STDOUT_FILENO, "\n");
-                        // Open slave.
-                        let mut path = [0u8; 32];
-                        let prefix = b"/dev/pts/";
-                        path[..prefix.len()].copy_from_slice(prefix);
-                        let mut p = prefix.len();
-                        if pty_num == 0 {
-                            path[p] = b'0';
-                            p += 1;
-                        } else {
-                            let mut digits = [0u8; 10];
-                            let mut dp = digits.len();
-                            let mut n = pty_num;
-                            while n > 0 {
-                                dp -= 1;
-                                digits[dp] = b'0' + (n % 10) as u8;
-                                n /= 10;
-                            }
-                            let len = digits.len() - dp;
-                            path[p..p + len].copy_from_slice(&digits[dp..]);
-                            p += len;
-                        }
-                        path[p] = 0;
-                        write_str(STDOUT_FILENO, "sshd: opening ");
-                        syscall_lib::write(STDOUT_FILENO, &path[..p]);
-                        write_str(STDOUT_FILENO, "\n");
-                        let slave_fd = syscall_lib::open(&path, 2, 0);
-                        write_str(STDOUT_FILENO, "sshd: slave=");
-                        syscall_lib::write_u64(STDOUT_FILENO, slave_fd as u64);
-                        write_str(STDOUT_FILENO, "\n");
-                        if slave_fd >= 0 {
-                            pty_master = Some(mfd);
-                            pty_slave = Some(slave_fd as i32);
-                            let _ = pty_req.succeed();
-                        } else {
-                            close(mfd);
-                            let _ = pty_req.fail();
-                        }
-                    } else {
+                Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => match syscall_lib::openpty() {
+                    Ok((master, slave)) => {
+                        pty_master = Some(master);
+                        pty_slave = Some(slave);
+                        let _ = pty_req.succeed();
+                    }
+                    Err(_) => {
                         let _ = pty_req.fail();
                     }
-                }
+                },
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
-                    write_str(STDOUT_FILENO, "sshd: shell request\n");
                     // Only acknowledge success after the shell is actually spawned.
                     if shell_spawned {
                         let _ = shell_req.fail();
@@ -532,17 +468,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::Progressed) => continue,
                 Ok(Event::None) => break,
                 Ok(_) => break,
-                Err(e) => {
-                    write_str(STDOUT_FILENO, "sshd: progress error: ");
-                    // Use Debug formatting since we're no_std.
-                    struct FmtWriter;
-                    impl core::fmt::Write for FmtWriter {
-                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                            syscall_lib::write(STDOUT_FILENO, s.as_bytes());
-                            Ok(())
-                        }
-                    }
-                    let _ = core::fmt::write(&mut FmtWriter, format_args!("{:?}\n", e));
+                Err(_) => {
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
