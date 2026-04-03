@@ -204,7 +204,7 @@ flowchart TD
 | 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | Complete | `phase-31` | [Phase 31](./31-compiler-bootstrap.md) | [Tasks](./tasks/31-compiler-bootstrap-tasks.md) |
 | 32 | Build Tools | make, ar, shell scripting for multi-file projects | Complete | `phase-32` | [Phase 32](./32-build-tools.md) | [Tasks](./tasks/32-build-tools-tasks.md) |
 
-### Kernel Infrastructure Phases (phases 33-36 complete, 37-40 planned)
+### Kernel Infrastructure Phases (phases 33-39 complete, 40 planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
@@ -298,14 +298,14 @@ gantt
     Compiler Bootstrap   :done, p31, after p26, 1
     Build Tools          :done, p32, after p31, 1
 
-    section Kernel Infrastructure (phases 33-34 complete)
+    section Kernel Infrastructure (phases 33-39 complete)
     Kernel Memory        :done, p33, after p25, 1
     Real-Time Clock      :done, p34, after p15, 1
-    True SMP             :p35, after p33, 1
-    Expanded Memory      :p36, after p33, 1
-    I/O Multiplexing     :p37, after p35, 1
-    Filesystem Enhance   :p38, after p28, 1
-    Unix Domain Sockets  :p39, after p38, 1
+    True SMP             :done, p35, after p33, 1
+    Expanded Memory      :done, p36, after p33, 1
+    I/O Multiplexing     :done, p37, after p35, 1
+    Filesystem Enhance   :done, p38, after p28, 1
+    Unix Domain Sockets  :done, p39, after p38, 1
     Threading            :p40, after p35, 1
 
     section Applications (planned)

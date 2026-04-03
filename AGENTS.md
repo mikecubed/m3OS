@@ -69,6 +69,7 @@ Ring 0 (kernel/):                Ring 3 (userspace/):
   - Syscall gate
   - VFS + FAT32 + tmpfs
   - Network stack (IPv4/TCP/UDP)
+  - Unix domain sockets (AF_UNIX)
   - VirtIO drivers (blk, net)
   - ACPI / PCI enumeration
   - Framebuffer console
@@ -97,6 +98,7 @@ userspace/
   passwd/                 # change password (Phase 27)
   adduser/                # create user account (Phase 27)
   pty-test/               # PTY subsystem test (Phase 29)
+  unix-socket-test/       # Unix domain socket test (Phase 39)
   telnetd/                # Telnet server daemon (Phase 30)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
   coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime
@@ -127,7 +129,7 @@ kernel/src/
   fs/                  # VFS layer, FAT32, tmpfs, ramdisk, protocol
   ipc/                 # endpoints, capabilities, messages, notifications, registry
   mm/                  # buddy frame allocator, paging, heap, slab caches, user_space, ELF loader
-  net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, VirtIO-net, dispatch
+  net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, Unix domain sockets, VirtIO-net, dispatch
   pci/                 # PCI device enumeration
   process/             # process management (fork, exec, exit, wait)
   smp/                 # AP boot, IPI, TLB shootdown
@@ -257,6 +259,7 @@ Read before making significant changes:
 | `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
 | `docs/33-kernel-memory.md` | Before touching buddy allocator, slab caches, munmap, or meminfo |
 | `docs/34-timekeeping.md` | Before touching RTC, clock_gettime, gettimeofday, or time conversion |
+| `docs/roadmap/39-unix-domain-sockets.md` | Before touching Unix domain sockets, AF_UNIX, socketpair, or `kernel/src/net/unix.rs` |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
