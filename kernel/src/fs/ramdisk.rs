@@ -101,6 +101,8 @@ static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
+// Phase 40: threading test
+static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -315,6 +317,19 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "uptime.elf",
         RamdiskNode::File {
             content: UPTIME_ELF,
+        },
+    ),
+    // Phase 40: threading test
+    (
+        "thread-test",
+        RamdiskNode::File {
+            content: THREAD_TEST_ELF,
+        },
+    ),
+    (
+        "thread-test.elf",
+        RamdiskNode::File {
+            content: THREAD_TEST_ELF,
         },
     ),
 ];

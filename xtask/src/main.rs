@@ -137,6 +137,7 @@ fn build_userspace_bins() {
         ("whoami", "whoami", false),
         ("pty-test", "pty-test", false),
         ("unix-socket-test", "unix-socket-test", false),
+        ("thread-test", "thread-test", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1036,6 +1037,7 @@ fn cmd_check() {
         "whoami",
         "pty-test",
         "unix-socket-test",
+        "thread-test",
         "coreutils-rs",
     ];
     let mut clippy_args = vec![

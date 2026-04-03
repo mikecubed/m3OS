@@ -26,6 +26,8 @@ members = [
     "userspace/pty-test",
     # Phase 39 Unix domain socket test
     "userspace/unix-socket-test",
+    # Phase 40 thread test
+    "userspace/thread-test",
     # Rust coreutils (replacing C musl utilities)
     "userspace/coreutils-rs",
     # Future userspace servers:
