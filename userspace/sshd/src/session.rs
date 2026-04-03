@@ -471,8 +471,17 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::Progressed) => continue,
                 Ok(Event::None) => break,
                 Ok(_) => break,
-                Err(_) => {
-                    write_str(STDOUT_FILENO, "sshd: progress err\n");
+                Err(e) => {
+                    write_str(STDOUT_FILENO, "sshd: progress err: ");
+                    struct W;
+                    impl core::fmt::Write for W {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            syscall_lib::write(STDOUT_FILENO, s.as_bytes());
+                            Ok(())
+                        }
+                    }
+                    let _ = core::fmt::write(&mut W, format_args!("{:?}", e));
+                    write_str(STDOUT_FILENO, "\n");
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
