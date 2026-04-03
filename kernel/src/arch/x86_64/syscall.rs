@@ -4948,7 +4948,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
-                log::info!("[open] {} → fd {} (dir)", name, i);
+                log::debug!("[open] {} → fd {} (dir)", name, i);
                 i as u64
             }
             None => NEG_EMFILE,
@@ -5031,7 +5031,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         };
         match alloc_fd(3, entry) {
             Some(i) => {
-                log::info!("[open] {} → fd {} (tmpfs)", name, i);
+                log::debug!("[open] {} → fd {} (tmpfs)", name, i);
                 return i as u64;
             }
             None => {
@@ -5073,7 +5073,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                             return match alloc_fd(3, fd_entry) {
                                 Some(i) => {
-                                    log::info!("[open] {} → fd {} (fat32 dir)", name, i);
+                                    log::debug!("[open] {} → fd {} (fat32 dir)", name, i);
                                     i as u64
                                 }
                                 None => NEG_EMFILE,
@@ -5136,7 +5136,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                         return match alloc_fd(3, fd_entry) {
                             Some(i) => {
-                                log::info!("[open] {} → fd {} (fat32)", name, i);
+                                log::debug!("[open] {} → fd {} (fat32)", name, i);
                                 i as u64
                             }
                             None => NEG_EMFILE,
@@ -5185,7 +5185,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                                 return match alloc_fd(3, fd_entry) {
                                     Some(i) => {
-                                        log::info!("[open] {} → fd {} (fat32 new)", name, i);
+                                        log::debug!("[open] {} → fd {} (fat32 new)", name, i);
                                         i as u64
                                     }
                                     None => NEG_EMFILE,
@@ -5265,7 +5265,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
-                            log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
+                            log::debug!("[open] {} → fd {} (fat32 /etc alias)", name, i);
                             i as u64
                         }
                         None => NEG_EMFILE,
@@ -5290,7 +5290,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     };
     match alloc_fd(3, entry) {
         Some(i) => {
-            log::info!("[open] {} → fd {}", name, i);
+            log::debug!("[open] {} → fd {}", name, i);
             i as u64
         }
         None => {
@@ -5573,7 +5573,7 @@ fn open_ext2_file(
 
             match alloc_fd(3, fd_entry) {
                 Some(i) => {
-                    log::info!("[open] {} → fd {} (ext2)", name, i);
+                    log::debug!("[open] {} → fd {} (ext2)", name, i);
                     i as u64
                 }
                 None => NEG_EMFILE,
@@ -5613,7 +5613,7 @@ fn open_ext2_file(
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
-                            log::info!("[open] {} → fd {} (ext2 new)", name, i);
+                            log::debug!("[open] {} → fd {} (ext2 new)", name, i);
                             i as u64
                         }
                         None => NEG_EMFILE,
@@ -6299,7 +6299,6 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
-    log::info!("[mmap] anon {}×4K @ {:#x}", pages, base);
     base
 }
 
@@ -6354,7 +6353,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             }
         }
     }
-    let freed_count = unmapped_addrs.len();
+    let _freed_count = unmapped_addrs.len();
 
     // SMP TLB shootdown: invalidate only pages that were actually unmapped.
     for &page_addr in &unmapped_addrs {
@@ -6405,15 +6404,6 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             });
             proc.mappings.extend(new_mappings);
         }
-    }
-
-    if freed_count > 0 {
-        log::info!(
-            "[munmap] freed {} pages @ {:#x} (len={:#x})",
-            freed_count,
-            addr,
-            len
-        );
     }
 
     0
@@ -6790,7 +6780,7 @@ fn sys_linux_brk(addr: u64) -> u64 {
         }
     }
 
-    log::info!("[brk] extended to {:#x} ({} pages)", new_brk, pages_needed);
+    // Omit per-call log to avoid flooding serial during high-alloc workloads.
     new_brk
 }
 

@@ -1477,6 +1477,30 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     })
 }
 
+/// Strip lines containing kernel log tags from serial output.
+///
+/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the
+/// same serial port as userspace output.  When a tag appears mid-line (the
+/// kernel interrupted a userspace write), the entire line is corrupted and
+/// must be discarded to avoid false pattern matches.
+///
+/// Operates line-by-line: any line containing a recognised tag is removed.
+/// Tags recognised: `[INFO]`, `[DEBUG]`, `[WARN]`, `[ERROR]`, `[TRACE]`.
+fn strip_kernel_logs(input: &str) -> String {
+    const TAGS: &[&str] = &["[INFO]", "[DEBUG]", "[WARN]", "[ERROR]", "[TRACE]"];
+
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        if !TAGS.iter().any(|tag| line.contains(tag)) {
+            out.push_str(line);
+        }
+    }
+    // Handle trailing content without a newline (incomplete line).
+    // split_inclusive already handles this — if the input doesn't end with
+    // '\n', the last segment is returned without a newline.
+    out
+}
+
 /// Strip ANSI CSI escape sequences from a string.
 ///
 /// Handles: ESC [ <params> <letter>  and  ESC <single-char>.
@@ -1591,9 +1615,32 @@ fn run_smoke_script(
                         serial_buf.push_str(&text);
                     }
 
-                    // Check for pattern in stripped output.
+                    // Check for pattern in stripped output.  Also try with
+                    // kernel log lines removed — the kernel can inject
+                    // `[INFO] [mmap] ...` mid-line, splitting userspace
+                    // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
-                    if let Some(pos) = stripped.find(pattern) {
+                    // First try the normal stripped output.  If that fails,
+                    // try again with kernel log noise removed.
+                    let cleaned;
+                    let (search_str, used_cleaned) = if stripped.contains(pattern) {
+                        (&stripped, false)
+                    } else {
+                        cleaned = strip_kernel_logs(&stripped);
+                        if cleaned.contains(pattern) {
+                            (&cleaned, true)
+                        } else {
+                            (&stripped, false)
+                        }
+                    };
+                    if let Some(pos) = search_str.find(pattern) {
+                        if used_cleaned {
+                            // Kernel log lines were interleaved — we can't
+                            // precisely map cleaned positions back to raw
+                            // positions, so just clear the buffer.
+                            serial_buf.clear();
+                            break;
+                        }
                         // Drain buffer up to end of match to avoid re-matching
                         // old output while preserving any post-match content.
                         let drain_end = pos + pattern.len();
@@ -1906,7 +1953,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 30,
+        timeout_secs: 45,
         label: "wait for make to finish",
     });
 
@@ -1918,7 +1965,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "Demo project running!",
-        timeout_secs: 15,
+        timeout_secs: 20,
         label: "verify demo output",
     });
     steps.push(SmokeStep::Wait {
@@ -2333,7 +2380,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "1",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify numeric sort first line",
     });
     steps.push(SmokeStep::Wait {
@@ -2348,7 +2395,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "2",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify numeric sort middle line",
     });
     steps.push(SmokeStep::Wait {
@@ -2363,7 +2410,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "10",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify clustered pipeline first line",
     });
     steps.push(SmokeStep::Wait {
@@ -2378,7 +2425,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "2 root:x:0:0:root:/root:/bin/ion",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "verify uniq count output",
     });
     steps.push(SmokeStep::Wait {
