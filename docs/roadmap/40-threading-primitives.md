@@ -1,10 +1,10 @@
 # Phase 40 - Threading Primitives
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-40
 **Depends on:** Phase 25 (SMP) ✅, Phase 33 (Kernel Memory) ✅, Phase 35 (True SMP) ✅
 **Builds on:** Extends the single-threaded process model from Phase 11 with kernel-level threads that share an address space, and replaces the Phase 39 futex stub with a real wait/wake implementation
-**Primary Components:** kernel/src/process/mod.rs, kernel/src/task/mod.rs, kernel/src/arch/x86_64/syscall.rs, kernel/src/net/futex.rs
+**Primary Components:** kernel/src/process/mod.rs, kernel/src/task/mod.rs, kernel/src/arch/x86_64/syscall.rs, kernel/src/process/futex.rs
 
 ## Milestone Goal
 
