@@ -115,6 +115,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 
         let ret = poll(&mut pfds_arr[..nfds], 200);
         if ret < 0 {
+            write_str(STDOUT_FILENO, "sshd: poll error\n");
             break;
         }
 
@@ -142,6 +143,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         if sock_pending_len == 0 && (pfds_arr[0].revents & POLLIN) != 0 {
             let n = syscall_lib::read(sock_fd, &mut sock_buf);
             if n <= 0 {
+                write_str(STDOUT_FILENO, "sshd: sock read eof\n");
                 break;
             }
             let mut consumed = 0;
@@ -170,6 +172,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         }
 
         if (pfds_arr[0].revents & (POLLHUP | POLLERR)) != 0 && (pfds_arr[0].revents & POLLIN) == 0 {
+            write_str(STDOUT_FILENO, "sshd: sock hup\n");
             break;
         }
 
@@ -469,6 +472,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::None) => break,
                 Ok(_) => break,
                 Err(_) => {
+                    write_str(STDOUT_FILENO, "sshd: progress err\n");
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
