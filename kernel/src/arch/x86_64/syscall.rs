@@ -9345,6 +9345,23 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 None => return NEG_EAGAIN,
             };
 
+            // Single-threaded fast path: if this process has no thread group,
+            // blocking would deadlock because no other thread exists to wake
+            // us. Clear the futex word to 0 (matching the pre-Phase 40 stub
+            // behavior that musl's __lock relies on) and return immediately.
+            let is_single_threaded = {
+                let pid = crate::process::current_pid();
+                let table = crate::process::PROCESS_TABLE.lock();
+                table
+                    .find(pid)
+                    .map(|p| p.thread_group.is_none())
+                    .unwrap_or(true)
+            };
+            if is_single_threaded {
+                let _ = crate::mm::user_mem::copy_to_user(uaddr, &0u32.to_ne_bytes());
+                return 0;
+            }
+
             let woken_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
 
             {
