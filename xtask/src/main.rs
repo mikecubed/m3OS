@@ -720,21 +720,25 @@ fn build_doom() {
             }
             return;
         }
-        // Pin to the known-good commit for reproducible builds.
-        let checkout = Command::new("git")
-            .args([
-                "-C",
-                dg_src.to_str().unwrap(),
-                "checkout",
-                DOOMGENERIC_COMMIT,
-            ])
-            .status()
-            .expect("failed to run git checkout for doomgeneric");
-        if !checkout.success() {
-            eprintln!(
-                "warning: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT}; using HEAD"
-            );
-        }
+    }
+
+    // Always enforce the pinned commit — even in a cached clone.
+    // This guards against stale caches and DOOMGENERIC_COMMIT changes.
+    println!("doom: ensuring doomgeneric is at pinned commit {DOOMGENERIC_COMMIT}...");
+    let checkout = Command::new("git")
+        .args([
+            "-C",
+            dg_src.to_str().unwrap(),
+            "checkout",
+            "--force",
+            DOOMGENERIC_COMMIT,
+        ])
+        .status()
+        .expect("failed to run git checkout for doomgeneric");
+    if !checkout.success() {
+        eprintln!(
+            "warning: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT}; proceeding with current HEAD"
+        );
     }
 
     // Collect core engine .c files — skip all platform-specific implementations.
