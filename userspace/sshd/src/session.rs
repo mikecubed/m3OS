@@ -238,6 +238,10 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 
         // Drive sunset event loop.
         loop {
+            // Flush any pending output before calling progress() — sunset
+            // may need output buffer space, and the remote peer may be
+            // waiting for a response before sending the next packet.
+            flush_output(&mut runner, sock_fd);
             match runner.progress() {
                 Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
                     if hostkeys.hostkeys(&[&host_key.key]).is_err() {
