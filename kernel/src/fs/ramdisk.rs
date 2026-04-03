@@ -125,9 +125,15 @@ static CAL_ELF: &[u8] = include_bytes!("../../initrd/cal");
 static DIFF_ELF: &[u8] = include_bytes!("../../initrd/diff");
 static PATCH_ELF: &[u8] = include_bytes!("../../initrd/patch");
 static LESS_ELF: &[u8] = include_bytes!("../../initrd/less");
+// Phase 23: ping
+static PING_ELF: &[u8] = include_bytes!("../../initrd/ping");
+// Phase 29: PTY test
+static PTY_TEST_ELF: &[u8] = include_bytes!("../../initrd/pty-test");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime");
+// Phase 39: Unix domain socket test
+static UNIX_SOCKET_TEST_ELF: &[u8] = include_bytes!("../../initrd/unix-socket-test");
 // Phase 40: threading test
 static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test");
 // Phase 42: crypto primitives
@@ -291,6 +297,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ("patch", RamdiskNode::File { content: PATCH_ELF }),
     ("less", RamdiskNode::File { content: LESS_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
+    ("ping", RamdiskNode::File { content: PING_ELF }),
+    (
+        "pty-test",
+        RamdiskNode::File {
+            content: PTY_TEST_ELF,
+        },
+    ),
     // Phase 33: mmap/munmap leak test
     (
         "mmap-leak-test",
@@ -304,6 +317,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "uptime",
         RamdiskNode::File {
             content: UPTIME_ELF,
+        },
+    ),
+    // Phase 39: Unix domain socket test
+    (
+        "unix-socket-test",
+        RamdiskNode::File {
+            content: UNIX_SOCKET_TEST_ELF,
         },
     ),
     // Phase 40: threading test
