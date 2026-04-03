@@ -952,10 +952,12 @@ pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
 
 /// Suppresses all framebuffer console output.
 ///
-/// Called when a graphical process maps the framebuffer directly.  Serial
-/// output continues unaffected — only the pixel framebuffer is suppressed.
-pub fn yield_console(owner_pid: u32) {
+/// For internal use only.  External callers that need to claim the
+/// framebuffer should use [`try_yield_console`] which performs an
+/// atomic compare-and-swap ownership check.
+fn yield_console(owner_pid: u32) {
     FB_OWNER_PID.store(owner_pid, Ordering::Release);
+    let _guard = CONSOLE.lock();
     CONSOLE_YIELDED.store(true, Ordering::Release);
 }
 

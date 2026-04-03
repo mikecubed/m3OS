@@ -6913,6 +6913,15 @@ fn sys_framebuffer_mmap() -> u64 {
     if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
         .is_err()
     {
+        // Roll back mmap_next so the virtual address range is not leaked on
+        // mapping failure.  Any pages already mapped in the page table before
+        // the failure will be cleaned up by free_process_page_table on exit.
+        {
+            let mut table = crate::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.find_mut(pid) {
+                proc.mmap_next = virt_addr;
+            }
+        }
         crate::fb::release_console_claim(pid);
         return NEG_EINVAL;
     }
