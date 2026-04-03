@@ -2589,9 +2589,9 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "du: isolate human-readable size field",
     });
     steps.push(SmokeStep::Wait {
-        pattern: ".",
+        pattern: "K",
         timeout_secs: 10,
-        label: "verify du human-readable suffix",
+        label: "verify du human-readable K-byte suffix",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",

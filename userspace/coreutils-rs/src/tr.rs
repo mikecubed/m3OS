@@ -77,6 +77,18 @@ fn expand_set(spec: &[u8], out: &mut [u8; 256]) -> usize {
     len
 }
 
+fn write_all(fd: i32, data: &[u8]) -> bool {
+    let mut off = 0;
+    while off < data.len() {
+        let w = write(fd, &data[off..]);
+        if w <= 0 {
+            return false;
+        }
+        off += w as usize;
+    }
+    true
+}
+
 fn main(args: &[&str]) -> i32 {
     let mut argi = 1usize;
     let mut delete_mode = false;
@@ -139,13 +151,15 @@ fn main(args: &[&str]) -> i32 {
                 out_buf[out_len] = mapped as u8;
                 out_len += 1;
                 if out_len == out_buf.len() {
-                    let _ = write(STDOUT_FILENO, &out_buf[..out_len]);
+                    if !write_all(STDOUT_FILENO, &out_buf[..out_len]) {
+                        return 1;
+                    }
                     out_len = 0;
                 }
             }
         }
-        if out_len > 0 {
-            let _ = write(STDOUT_FILENO, &out_buf[..out_len]);
+        if out_len > 0 && !write_all(STDOUT_FILENO, &out_buf[..out_len]) {
+            return 1;
         }
     }
     0

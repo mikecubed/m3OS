@@ -17,6 +17,8 @@ enum Mode {
 
 fn main(args: &[&str]) -> i32 {
     let mut mode: Option<Mode> = None;
+    let mut pending_field: Option<usize> = None;
+    let mut pending_delim: Option<u8> = None;
     let mut files_start = args.len();
     let mut i = 1;
 
@@ -35,35 +37,19 @@ fn main(args: &[&str]) -> i32 {
                     return 1;
                 }
             };
-            // Look ahead for -d
-            let delim = if i + 1 < args.len() && args[i + 1].as_bytes().starts_with(b"-d") {
-                let d_arg = args[i + 1].as_bytes();
-                if d_arg.len() == 2 {
-                    // -d <char>
-                    i += 1;
-                    i += 1;
-                    if i >= args.len() {
-                        eprintln("cut: option -d requires an argument");
-                        return 1;
-                    }
-                    let dc = args[i].as_bytes();
-                    if dc.is_empty() {
-                        eprintln("cut: delimiter must be a single character");
-                        return 1;
-                    }
-                    i += 1;
-                    dc[0]
-                } else {
-                    // -d<char> combined
-                    i += 1;
-                    i += 1;
-                    d_arg[2]
+            i += 1;
+            pending_field = Some(n);
+            files_start = i;
+        } else if a.starts_with(b"-f") && a.len() > 2 {
+            let n = match common::parse_positive_u64(&a[2..]) {
+                Some(v) => v as usize,
+                None => {
+                    eprintln("cut: invalid field number");
+                    return 1;
                 }
-            } else {
-                i += 1;
-                b'\t'
             };
-            mode = Some(Mode::Field { n, delim });
+            i += 1;
+            pending_field = Some(n);
             files_start = i;
         } else if a == b"-d" {
             i += 1;
@@ -76,24 +62,12 @@ fn main(args: &[&str]) -> i32 {
                 eprintln("cut: delimiter must be a single character");
                 return 1;
             }
-            let delim = dc[0];
+            pending_delim = Some(dc[0]);
             i += 1;
-            // -d without -f means nothing useful; set a pending delim if -f comes next
-            // Actually we need -f, so just store and continue; -f will override
-            // For simplicity, handle combined -d -f or -f -d ordering by reparsing
-            // Look for -f in remaining args
-            mode = Some(Mode::Field { n: 1, delim });
             files_start = i;
-        } else if a.starts_with(b"-f") && a.len() > 2 {
-            let n = match common::parse_positive_u64(&a[2..]) {
-                Some(v) => v as usize,
-                None => {
-                    eprintln("cut: invalid field number");
-                    return 1;
-                }
-            };
+        } else if a.starts_with(b"-d") && a.len() > 2 {
+            pending_delim = Some(a[2]);
             i += 1;
-            mode = Some(Mode::Field { n, delim: b'\t' });
             files_start = i;
         } else if a == b"-c" {
             i += 1;
@@ -126,6 +100,19 @@ fn main(args: &[&str]) -> i32 {
         } else {
             files_start = i;
             break;
+        }
+    }
+
+    // Combine -f and -d (parsed independently, order-independent)
+    if mode.is_none() {
+        if let Some(n) = pending_field {
+            mode = Some(Mode::Field {
+                n,
+                delim: pending_delim.unwrap_or(b'\t'),
+            });
+        } else if let Some(delim) = pending_delim {
+            // -d given without -f: default to field 1
+            mode = Some(Mode::Field { n: 1, delim });
         }
     }
 

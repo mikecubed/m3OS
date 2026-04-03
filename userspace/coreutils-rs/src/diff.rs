@@ -38,17 +38,29 @@ fn main(args: &[&str]) -> i32 {
     static mut LINES2: [u32; MAX_LINES] = [0u32; MAX_LINES];
 
     // SAFETY: single-threaded; no other references to these statics exist.
-    let (len1, nlines1) = unsafe { read_file(path1, &raw mut BUF1, &raw mut LINES1) };
-    if len1 == usize::MAX {
-        eprintln("diff: cannot open file1");
-        return 1;
-    }
+    let (len1, nlines1) = match unsafe { read_file(path1, &raw mut BUF1, &raw mut LINES1) } {
+        None => {
+            eprintln("diff: file too large");
+            return 1;
+        }
+        Some((v, _)) if v == usize::MAX => {
+            eprintln("diff: cannot open file1");
+            return 1;
+        }
+        Some(v) => v,
+    };
 
-    let (len2, nlines2) = unsafe { read_file(path2, &raw mut BUF2, &raw mut LINES2) };
-    if len2 == usize::MAX {
-        eprintln("diff: cannot open file2");
-        return 1;
-    }
+    let (len2, nlines2) = match unsafe { read_file(path2, &raw mut BUF2, &raw mut LINES2) } {
+        None => {
+            eprintln("diff: file too large");
+            return 1;
+        }
+        Some((v, _)) if v == usize::MAX => {
+            eprintln("diff: cannot open file2");
+            return 1;
+        }
+        Some(v) => v,
+    };
 
     // SAFETY: read_file populated these buffers up to len1/len2.
     let data1 = unsafe { core::slice::from_raw_parts(&raw const BUF1 as *const u8, len1) };
@@ -93,8 +105,9 @@ fn main(args: &[&str]) -> i32 {
 }
 
 /// Read a file into `buf`, recording the byte offset of each line start in
-/// `line_offsets`. Returns `(total_bytes_read, number_of_lines)`.
-/// Returns `(usize::MAX, 0)` on error.
+/// `line_offsets`. Returns `Some((total_bytes_read, number_of_lines))` on
+/// success, `Some((usize::MAX, 0))` if the file cannot be opened, and `None`
+/// if the file exceeds `MAX_FILE` bytes or contains more than `MAX_LINES` lines.
 ///
 /// # Safety
 /// `buf` must point to a valid `[u8; MAX_FILE]` and `line_offsets` to a
@@ -104,9 +117,9 @@ unsafe fn read_file(
     path: &[u8],
     buf: *mut [u8; MAX_FILE],
     line_offsets: *mut [u32; MAX_LINES],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     if path.len() > 255 {
-        return (usize::MAX, 0);
+        return Some((usize::MAX, 0));
     }
     let mut nul_path = [0u8; 256];
     nul_path[..path.len()].copy_from_slice(path);
@@ -114,16 +127,22 @@ unsafe fn read_file(
 
     let fd = open(&nul_path[..=path.len()], O_RDONLY, 0);
     if fd < 0 {
-        return (usize::MAX, 0);
+        return Some((usize::MAX, 0));
     }
     let fd = fd as i32;
 
     let buf = unsafe { &mut *buf };
 
     let mut total = 0usize;
+    let mut overflow = false;
     loop {
         let space = buf.len().saturating_sub(total);
         if space == 0 {
+            // Buffer full; attempt one extra read to detect a file larger than MAX_FILE.
+            let mut one = [0u8; 1];
+            if read(fd, &mut one) > 0 {
+                overflow = true;
+            }
             break;
         }
         let n = read(fd, &mut buf[total..]);
@@ -134,6 +153,10 @@ unsafe fn read_file(
     }
     close(fd);
 
+    if overflow {
+        return None;
+    }
+
     let line_offsets = unsafe { &mut *line_offsets };
 
     // Scan for line starts
@@ -141,10 +164,11 @@ unsafe fn read_file(
     let mut at_line_start = true;
     for (i, &b) in buf[..total].iter().enumerate() {
         if at_line_start {
-            if nlines < MAX_LINES {
-                line_offsets[nlines] = i as u32;
-                nlines += 1;
+            if nlines >= MAX_LINES {
+                return None;
             }
+            line_offsets[nlines] = i as u32;
+            nlines += 1;
             at_line_start = false;
         }
         if b == b'\n' {
@@ -152,7 +176,7 @@ unsafe fn read_file(
         }
     }
     // If file ends without newline and there's content, last line already recorded
-    (total, nlines)
+    Some((total, nlines))
 }
 
 fn print_lines(data: &[u8], line_offsets: &[u32], prefix: u8) {
