@@ -376,11 +376,18 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                             // Child: set up PTY and exec shell.
                             close(master);
                             close(sock_fd);
-                            setsid();
-                            syscall_lib::ioctl(slave, TIOCSCTTY, 0);
-                            dup2(slave, 0);
-                            dup2(slave, 1);
-                            dup2(slave, 2);
+                            if setsid() < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setsid failed\n");
+                                exit(1);
+                            }
+                            if syscall_lib::ioctl(slave, TIOCSCTTY, 0) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: TIOCSCTTY failed\n");
+                                exit(1);
+                            }
+                            if dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: dup2 failed\n");
+                                exit(1);
+                            }
                             if slave > 2 {
                                 close(slave);
                             }
@@ -451,7 +458,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     let _ = sub_req.fail();
                 }
                 Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
-                    let _ = env_req.succeed();
+                    let _ = env_req.fail();
                 }
                 Ok(Event::Serv(ServEvent::Defunct)) => {
                     cleanup(shell_pid, pty_master, pty_slave);
