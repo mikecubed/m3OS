@@ -215,7 +215,7 @@ flowchart TD
 | 37 | I/O Multiplexing | select, epoll, non-blocking I/O | Complete | `phase-37` | [Phase 37](./37-io-multiplexing.md) | [Tasks](./tasks/37-io-multiplexing-tasks.md) |
 | 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | Complete | `phase-38` | [Phase 38](./38-filesystem-enhancements.md) | [Tasks](./tasks/38-filesystem-enhancements-tasks.md) |
 | 39 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | Complete | `phase-39` | [Phase 39](./39-unix-domain-sockets.md) | [Tasks](./tasks/39-unix-domain-sockets-tasks.md) |
-| 40 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | Planned | `phase-40` | [Phase 40](./40-threading-primitives.md) | *not yet created* |
+| 40 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | Planned | `phase-40` | [Phase 40](./40-threading-primitives.md) | [Tasks](./tasks/40-threading-primitives-tasks.md) |
 
 ### Application Phases (planned)
 
