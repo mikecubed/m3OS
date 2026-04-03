@@ -198,15 +198,15 @@ flowchart TD
 | 36 | Expanded memory (demand paging, mprotect, disk/RAM) | Complete | `phase-36` | [Phase 36 Tasks](./36-expanded-memory-tasks.md) |
 | 37 | I/O multiplexing (select, epoll, non-blocking) | Complete | `phase-37` | [Phase 37 Tasks](./37-io-multiplexing-tasks.md) |
 | 38 | Filesystem enhancements (symlinks, hard links, /proc, permissions, device nodes) | Complete | `phase-38` | [Phase 38 Tasks](./38-filesystem-enhancements-tasks.md) |
-| 39 | Unix domain sockets (AF_UNIX) | Planned | `phase-39` | *not yet created* |
-| 40 | Threading primitives (clone, futex, TLS) | Planned | `phase-40` | *not yet created* |
+| 39 | Unix domain sockets (AF_UNIX) | Complete | `phase-39` | [Phase 39 Tasks](./39-unix-domain-sockets-tasks.md) |
+| 40 | Threading primitives (clone, futex, TLS) | Complete | `phase-40` | [Phase 40 Tasks](./40-threading-primitives-tasks.md) |
 
 ### Application Phases (planned)
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | Complete | `phase-41` | [Phase 41 Tasks](./41-expanded-coreutils-tasks.md) |
-| 42 | Crypto and TLS (RustCrypto + rustls) | Planned | `phase-42` | *not yet created* |
+| 42 | Crypto and TLS (RustCrypto + rustls) | Planned | `phase-42` | [Tasks](./42-crypto-primitives-tasks.md) |
 | 43 | SSH (sunset or Dropbear) | Planned | `phase-43` | *not yet created* |
 | 44 | Rust cross-compilation | Planned | `phase-44` | *not yet created* |
 | 45 | Ports system (source-based package building) | Planned | `phase-45` | *not yet created* |

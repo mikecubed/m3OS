@@ -222,7 +222,7 @@ flowchart TD
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
 | 41 | Expanded Coreutils | head, tail, sort, find, diff, ps, less | Complete | `phase-41` | [Phase 41](./41-expanded-coreutils.md) | [Tasks](./tasks/41-expanded-coreutils-tasks.md) |
-| 42 | Crypto and TLS | RustCrypto + rustls + TLS 1.3 | Planned | `phase-42` | [Phase 42](./42-crypto-primitives.md) | *not yet created* |
+| 42 | Crypto and TLS | RustCrypto + rustls + TLS 1.3 | Planned | `phase-42` | [Phase 42](./42-crypto-primitives.md) | [Tasks](./tasks/42-crypto-primitives-tasks.md) |
 | 43 | SSH | SSH client and server (sunset or Dropbear) | Planned | `phase-43` | [Phase 43](./43-ssh-server.md) | *not yet created* |
 | 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | Planned | `phase-44` | [Phase 44](./44-rust-cross-compilation.md) | *not yet created* |
 | 45 | Ports System | Source-based package building and installation | Planned | `phase-45` | [Phase 45](./45-ports-system.md) | *not yet created* |
