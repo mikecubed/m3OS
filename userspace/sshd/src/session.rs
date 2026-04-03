@@ -351,9 +351,12 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                     match open_session.accept() {
                         Ok(handle) => {
+                            write_str(STDOUT_FILENO, "sshd: channel accepted\n");
                             chan_handle = Some(handle);
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            write_str(STDOUT_FILENO, "sshd: channel accept failed\n");
+                        }
                     }
                 }
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
