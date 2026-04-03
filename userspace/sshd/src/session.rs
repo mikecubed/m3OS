@@ -361,19 +361,67 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
                     write_str(STDOUT_FILENO, "sshd: pty request\n");
-                    match syscall_lib::openpty() {
-                        Ok((master, slave)) => {
-                            write_str(STDOUT_FILENO, "sshd: pty allocated\n");
-                            pty_master = Some(master);
-                            pty_slave = Some(slave);
-                            let _ = pty_req.succeed();
+                    // Inline PTY open with diagnostics.
+                    let master_fd = syscall_lib::open(b"/dev/ptmx\0", 2, 0);
+                    write_str(STDOUT_FILENO, "sshd: ptmx open=");
+                    syscall_lib::write_u64(STDOUT_FILENO, master_fd as u64);
+                    write_str(STDOUT_FILENO, "\n");
+                    if master_fd >= 0 {
+                        let mfd = master_fd as i32;
+                        // Unlock slave.
+                        let zero: i32 = 0;
+                        let ret = syscall_lib::ioctl(mfd, 0x40045431, &zero as *const _ as usize);
+                        write_str(STDOUT_FILENO, "sshd: unlock=");
+                        syscall_lib::write_u64(STDOUT_FILENO, ret as u64);
+                        write_str(STDOUT_FILENO, "\n");
+                        // Get PTY number.
+                        let mut pty_num: u32 = 0;
+                        let ret =
+                            syscall_lib::ioctl(mfd, 0x80045430, &mut pty_num as *mut _ as usize);
+                        write_str(STDOUT_FILENO, "sshd: getptn=");
+                        syscall_lib::write_u64(STDOUT_FILENO, ret as u64);
+                        write_str(STDOUT_FILENO, " num=");
+                        syscall_lib::write_u64(STDOUT_FILENO, pty_num as u64);
+                        write_str(STDOUT_FILENO, "\n");
+                        // Open slave.
+                        let mut path = [0u8; 32];
+                        let prefix = b"/dev/pts/";
+                        path[..prefix.len()].copy_from_slice(prefix);
+                        let mut p = prefix.len();
+                        if pty_num == 0 {
+                            path[p] = b'0';
+                            p += 1;
+                        } else {
+                            let mut digits = [0u8; 10];
+                            let mut dp = digits.len();
+                            let mut n = pty_num;
+                            while n > 0 {
+                                dp -= 1;
+                                digits[dp] = b'0' + (n % 10) as u8;
+                                n /= 10;
+                            }
+                            let len = digits.len() - dp;
+                            path[p..p + len].copy_from_slice(&digits[dp..]);
+                            p += len;
                         }
-                        Err(e) => {
-                            write_str(STDOUT_FILENO, "sshd: openpty failed (");
-                            syscall_lib::write_u64(STDOUT_FILENO, (-e) as u64);
-                            write_str(STDOUT_FILENO, ")\n");
+                        path[p] = 0;
+                        write_str(STDOUT_FILENO, "sshd: opening ");
+                        syscall_lib::write(STDOUT_FILENO, &path[..p]);
+                        write_str(STDOUT_FILENO, "\n");
+                        let slave_fd = syscall_lib::open(&path, 2, 0);
+                        write_str(STDOUT_FILENO, "sshd: slave=");
+                        syscall_lib::write_u64(STDOUT_FILENO, slave_fd as u64);
+                        write_str(STDOUT_FILENO, "\n");
+                        if slave_fd >= 0 {
+                            pty_master = Some(mfd);
+                            pty_slave = Some(slave_fd as i32);
+                            let _ = pty_req.succeed();
+                        } else {
+                            close(mfd);
                             let _ = pty_req.fail();
                         }
+                    } else {
+                        let _ = pty_req.fail();
                     }
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
