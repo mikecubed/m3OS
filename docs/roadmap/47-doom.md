@@ -138,7 +138,7 @@ Nearest-neighbor is simplest and preserves the pixel art aesthetic.
 
 ## Companion Task List
 
-- Phase 47 Task List — *not yet created*
+- [Phase 47 Task List](./tasks/47-doom-tasks.md)
 
 ## How Real OS Implementations Differ
 
