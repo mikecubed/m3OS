@@ -116,6 +116,11 @@ void DG_Init(void)
 
     g_x_offset = ((int)g_fb_info.width  - DOOMGENERIC_RESX * g_scale) / 2;
     g_y_offset = ((int)g_fb_info.height - DOOMGENERIC_RESY * g_scale) / 2;
+    /* Clamp: if the framebuffer is smaller than the scaled DOOM canvas the
+     * offsets go negative, which would cause out-of-bounds writes in
+     * DG_DrawFrame.  A zero offset is safe and simply clips the image. */
+    if (g_x_offset < 0) g_x_offset = 0;
+    if (g_y_offset < 0) g_y_offset = 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -153,10 +158,16 @@ void DG_DrawFrame(void)
             /* Write a scale x scale block of pixels */
             for (int ry = 0; ry < scale; ry++) {
                 int fb_row = y_off + sy * scale + ry;
+                /* Bounds guard: skip rows outside the framebuffer height. */
+                if ((unsigned)fb_row >= g_fb_info.height) continue;
+                int fb_col = x_off + sx * scale;
+                /* Bounds guard: skip columns outside the framebuffer width. */
+                if ((unsigned)fb_col >= g_fb_info.width)  continue;
                 uint8_t *dst = g_fb_ptr
                              + (uint32_t)fb_row * pitch
-                             + (uint32_t)(x_off + sx * scale) * g_fb_info.bpp;
+                             + (uint32_t)fb_col * g_fb_info.bpp;
                 for (int rx = 0; rx < scale; rx++) {
+                    if ((unsigned)(fb_col + rx) >= g_fb_info.width) break;
                     memcpy(dst + rx * g_fb_info.bpp, &pixel, g_fb_info.bpp);
                 }
             }
