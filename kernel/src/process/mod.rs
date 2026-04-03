@@ -21,7 +21,7 @@ pub mod futex;
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, string::String, vec::Vec};
+use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -472,6 +472,22 @@ pub enum ProcessState {
 }
 
 // ---------------------------------------------------------------------------
+// Thread group (Phase 40)
+// ---------------------------------------------------------------------------
+
+/// A thread group: all threads sharing the same TGID.
+///
+/// The leader is the first thread created; `members` tracks all TIDs in
+/// the group (including the leader).
+#[derive(Debug)]
+pub struct ThreadGroup {
+    /// TID of the thread group leader (equals the TGID).
+    pub leader_tid: u32,
+    /// All TIDs that belong to this group (including the leader).
+    pub members: Mutex<Vec<u32>>,
+}
+
+// ---------------------------------------------------------------------------
 // Process descriptor
 // ---------------------------------------------------------------------------
 
@@ -561,6 +577,15 @@ pub struct Process {
     pub cmdline: Vec<String>,
     /// Process start time in scheduler ticks since boot.
     pub start_ticks: u64,
+    /// Thread group this process/thread belongs to (Phase 40).
+    /// `None` for single-threaded processes.
+    pub thread_group: Option<Arc<ThreadGroup>>,
+    /// Shared fd table for threads created with CLONE_FILES (Phase 40).
+    /// `None` for single-threaded processes (uses `fd_table` directly).
+    pub shared_fd_table: Option<Arc<Mutex<[Option<FdEntry>; MAX_FDS]>>>,
+    /// Shared signal actions for threads created with CLONE_SIGHAND (Phase 40).
+    /// `None` for single-threaded processes (uses `signal_actions` directly).
+    pub shared_signal_actions: Option<Arc<Mutex<[SignalAction; 32]>>>,
 }
 
 /// Describes a contiguous anonymous memory mapping created by `mmap`.
@@ -630,6 +655,9 @@ impl Process {
             exec_path: String::new(),
             cmdline: Vec::new(),
             start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+            thread_group: None,
+            shared_fd_table: None,
+            shared_signal_actions: None,
         }
     }
 
@@ -771,6 +799,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -829,6 +860,9 @@ pub fn spawn_process_with_cr3(
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -891,6 +925,9 @@ pub fn spawn_process_with_cr3_and_fds(
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid

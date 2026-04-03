@@ -1134,7 +1134,7 @@ pub extern "C" fn syscall_handler(
             }
         }
         217 => sys_linux_getdents64(arg0, arg1, arg2),
-        218 => sys_linux_set_tid_address(),
+        218 => sys_linux_set_tid_address(arg0),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
         228 => sys_clock_gettime(arg0, arg1),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
@@ -1467,6 +1467,51 @@ fn sys_exit(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::info!("[p{}] exit({})", pid, code);
     if pid != 0 {
+        // Phase 40: clear_child_tid — write 0 to the userspace address and
+        // futex-wake one waiter so pthread_join unblocks.
+        {
+            let clear_tid_addr = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
+            };
+            if clear_tid_addr != 0 {
+                // Write 0u32 to the userspace address.
+                let zero = 0u32.to_ne_bytes();
+                let _ = crate::mm::user_mem::copy_to_user(clear_tid_addr, &zero);
+                // Wake one waiter on the private futex key (0, addr) — this
+                // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
+                {
+                    use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
+                    let key = (0u64, clear_tid_addr);
+                    let to_wake = {
+                        let mut table = FUTEX_TABLE.lock();
+                        let mut wake_ids = alloc::vec::Vec::new();
+                        if let Some(waiters) = table.get_mut(&key) {
+                            if !waiters.is_empty() {
+                                // Wake up to 1 waiter with matching bitset.
+                                let mut i = 0;
+                                while i < waiters.len() && wake_ids.is_empty() {
+                                    if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
+                                        let w = waiters.swap_remove(i);
+                                        wake_ids.push(w.tid);
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            if waiters.is_empty() {
+                                table.remove(&key);
+                            }
+                        }
+                        wake_ids
+                    };
+                    for tid in to_wake {
+                        crate::task::wake_task(tid);
+                    }
+                }
+            }
+        }
+
         // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
         crate::process::close_all_fds_for(pid);
         {
@@ -8381,11 +8426,23 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 // set_tid_address(tidptr) — syscall 218 (musl TLS initialization)
 // ---------------------------------------------------------------------------
 
-/// Stub: stores nothing, returns the caller's PID (which is also the TID in
-/// our single-threaded model).  musl calls this during `__init_tls` to record
-/// the `clear_child_tid` pointer; we can safely ignore the pointer.
-fn sys_linux_set_tid_address() -> u64 {
-    crate::process::current_pid() as u64
+/// `set_tid_address(tidptr)` — store the `clear_child_tid` pointer for the
+/// calling thread and return the caller's TID.
+///
+/// musl calls this during `__init_tls` to record the address that the kernel
+/// should clear (and futex-wake) when the thread exits.
+fn sys_linux_set_tid_address(tidptr: u64) -> u64 {
+    let pid = crate::process::current_pid();
+
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.clear_child_tid = tidptr;
+            proc.tid as u64
+        } else {
+            pid as u64
+        }
+    }
 }
 
 // ===========================================================================
