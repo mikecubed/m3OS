@@ -18,6 +18,8 @@ const LOGIN_PATH: &[u8] = b"/bin/login\0";
 const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const TELNETD_PATH: &[u8] = b"/bin/telnetd\0";
 const TELNETD_ARGV0: &[u8] = b"/bin/telnetd\0";
+const SSHD_PATH: &[u8] = b"/bin/sshd\0";
+const SSHD_ARGV0: &[u8] = b"/bin/sshd\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -44,6 +46,9 @@ pub extern "C" fn _start() -> ! {
 
     // Phase 30: spawn telnetd daemon (background, not waited on).
     spawn_telnetd();
+
+    // Phase 43: spawn sshd daemon (background, not waited on).
+    spawn_sshd();
 
     // Spawn the first login session.
     let mut login_pid = spawn_login();
@@ -116,6 +121,24 @@ fn spawn_telnetd() {
         exit(1);
     }
     write_str(STDOUT_FILENO, "init: telnetd forked\n");
+}
+
+fn spawn_sshd() {
+    let pid = fork();
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: sshd fork failed\n");
+        return;
+    }
+    if pid == 0 {
+        let envp: [*const u8; 3] = [ENV_PATH.as_ptr(), ENV_HOME.as_ptr(), core::ptr::null()];
+        let argv: [*const u8; 2] = [SSHD_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SSHD_PATH, &argv, &envp);
+        write_str(STDOUT_FILENO, "init: sshd execve failed (");
+        syscall_lib::write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+        exit(1);
+    }
+    write_str(STDOUT_FILENO, "init: sshd forked\n");
 }
 
 #[panic_handler]

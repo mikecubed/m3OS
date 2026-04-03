@@ -1,6 +1,6 @@
 # Phase 43 - SSH Server
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-43
 **Depends on:** Phase 23 (Socket API) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY) ✅, Phase 37 (I/O Multiplexing) ✅, Phase 42 (Crypto Primitives) ✅
 **Builds on:** Uses the crypto-lib from Phase 42 (Ed25519, X25519, ChaCha20-Poly1305, SHA-256) for all cryptographic operations; reuses the PTY pair infrastructure from Phase 29 and the telnetd session architecture from Phase 30; authenticates against /etc/shadow from Phase 27; uses epoll from Phase 37 for multi-session I/O multiplexing

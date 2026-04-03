@@ -139,6 +139,7 @@ fn build_userspace_bins() {
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
         ("crypto-test", "crypto-test", true),
+        ("sshd", "sshd", true), // Phase 43: SSH server
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1011,7 +1012,7 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         "-device".to_string(),
         "virtio-net-pci,netdev=net0".to_string(),
         "-netdev".to_string(),
-        "user,id=net0,hostfwd=tcp::2323-:23".to_string(),
+        "user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22".to_string(),
     ]);
 
     // Phase 24: virtio-blk data disk.

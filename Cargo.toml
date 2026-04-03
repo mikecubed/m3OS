@@ -32,6 +32,8 @@ members = [
     "userspace/crypto-lib",
     # Phase 42 crypto integration test
     "userspace/crypto-test",
+    # Phase 43 SSH server
+    "userspace/sshd",
     # Rust coreutils (replacing C musl utilities)
     "userspace/coreutils-rs",
     # coreutils host tests
@@ -69,3 +71,5 @@ ed25519-dalek = { version = "2", default-features = false, features = ["rand_cor
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 rand_chacha = { version = "0.3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
+sunset = { version = "0.4", default-features = false }
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
