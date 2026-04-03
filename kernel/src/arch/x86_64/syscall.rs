@@ -6747,8 +6747,9 @@ impl core::fmt::Write for BufWriter<'_> {
 //
 // Writes a packed FbInfo struct into a user-supplied buffer.
 // arg0 = user buffer pointer, arg1 = buffer length (must be >= 20 bytes)
-// Returns 0 on success, NEG_EINVAL on bad arguments, NEG_EFAULT if the
-// copy to userspace fails.
+// Returns 0 on success, NEG_EINVAL on bad arguments or unsupported pixel
+// format (only RGB and BGR are supported), NEG_EFAULT if the copy to
+// userspace fails.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -6776,7 +6777,7 @@ fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
     let pixel_format_val: u32 = match pixel_format {
         bootloader_api::info::PixelFormat::Rgb => 0,
         bootloader_api::info::PixelFormat::Bgr => 1,
-        _ => 2,
+        _ => return NEG_EINVAL,
     };
 
     let info = FbInfo {
