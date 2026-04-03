@@ -703,13 +703,11 @@ fn build_doom() {
     // Clone doomgeneric source and pin to the known-good commit.
     let dg_src = root.join("target/doomgeneric-src");
     if !dg_src.join("doomgeneric").join("doomgeneric.c").exists() {
-        println!("doom: cloning doomgeneric from GitHub (commit {DOOMGENERIC_COMMIT})...");
+        println!("doom: cloning doomgeneric (full history) for commit {DOOMGENERIC_COMMIT}...");
         let _ = fs::remove_dir_all(&dg_src);
         let status = Command::new("git")
             .args([
                 "clone",
-                "--depth",
-                "1",
                 "https://github.com/ozkl/doomgeneric.git",
                 dg_src.to_str().unwrap(),
             ])
@@ -3502,13 +3500,13 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 300 });
     steps.push(SmokeStep::Send {
-        input: "ls /bin/doom\n",
-        label: "doom: list binary",
+        input: "ls /bin\n",
+        label: "doom: list /bin directory",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "/bin/doom",
+        pattern: "doom",
         timeout_secs: 10,
-        label: "doom: verify /bin/doom exists in ramdisk",
+        label: "doom: verify doom binary appears in /bin listing",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
@@ -4657,12 +4655,14 @@ fn fetch_doom_wad(dest: &Path) {
 
 /// Compute the hex SHA-256 digest of `path` and compare it to `expected`.
 ///
-/// Returns `true` on a confirmed match.  Returns `false` (and deletes the
-/// file) on a mismatch or when `sha256sum` is unavailable — callers that set
-/// `M3OS_DOWNLOAD_WAD=1` have opted into supply-chain verification, so a
-/// missing tool must not silently allow an unverified binary to proceed.
-/// Note: file deletion on mismatch is performed by `fetch_doom_wad`; this
-/// function deletes only when `sha256sum` is unavailable.
+/// Returns `true` on a confirmed match.  Returns `false` on a checksum
+/// mismatch or when `sha256sum` is unavailable.
+///
+/// When `sha256sum` is unavailable this function deletes `path` and returns
+/// `false` — callers that set `M3OS_DOWNLOAD_WAD=1` have opted into
+/// supply-chain verification, so a missing tool must not silently allow an
+/// unverified binary to proceed.  On a checksum mismatch the file is left in
+/// place and deletion is the caller's responsibility (see `fetch_doom_wad`).
 fn verify_sha256(path: &Path, expected: &str) -> bool {
     // Use the `sha256sum` tool if available (common on Linux).
     let output = Command::new("sha256sum")

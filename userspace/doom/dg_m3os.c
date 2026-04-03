@@ -3,6 +3,8 @@
  *
  * Bridges the doomgeneric engine to m3OS via three custom syscalls:
  *   0x1002  sys_framebuffer_info  -- retrieve FB dimensions, stride, bpp
+ *                                    (only RGB=0 and BGR=1 pixel formats supported;
+ *                                     returns NEG_EINVAL for any other format)
  *   0x1003  sys_framebuffer_mmap  -- map FB physical pages into userspace
  *   0x1004  sys_read_scancode     -- poll raw PS/2 make/break scancode
  *
@@ -98,6 +100,12 @@ void DG_Init(void)
          * DG_DrawFrame will be a no-op in this case. */
         g_fb_ptr = NULL;
         return;
+    }
+
+    /* Guard: only RGB (0) and BGR (1) are supported by DG_DrawFrame. */
+    if (g_fb_info.pixel_format > 1) {
+        I_Error("DOOM: unsupported framebuffer pixel format %u (only RGB=0 and BGR=1 are supported)\n",
+                g_fb_info.pixel_format);
     }
 
     /* Map framebuffer physical pages into our virtual address space */
