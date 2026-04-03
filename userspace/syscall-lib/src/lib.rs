@@ -1312,7 +1312,11 @@ pub fn framebuffer_info(buf: &mut [u8]) -> isize {
 }
 
 /// Maps the framebuffer into the calling process's address space.
-/// Returns the userspace virtual address of the mapped framebuffer.
+///
+/// Returns the userspace virtual address of the mapped framebuffer on success.
+/// On error, returns a large `u64` encoding a negative errno (e.g.
+/// `(-22_i64) as u64` for EINVAL, `(-16_i64) as u64` for EBUSY).
+/// Callers should check `ret > u64::MAX - 4096` to detect error values.
 pub fn framebuffer_mmap() -> u64 {
     unsafe { syscall0(SYS_FRAMEBUFFER_MMAP) }
 }

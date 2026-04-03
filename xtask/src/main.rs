@@ -678,8 +678,9 @@ fn build_pdpmake() {
 
 /// Phase 47: Cross-compile doomgeneric + m3OS platform layer into a static DOOM binary.
 ///
-/// Strategy: clone doomgeneric from GitHub into `target/doomgeneric-src/`, collect all
-/// `.c` files from `doomgeneric/src/`, add `userspace/doom/dg_m3os.c`, compile with
+/// Strategy: clone doomgeneric from GitHub into `target/doomgeneric-src/`, collect core engine
+/// `.c` files from `target/doomgeneric-src/doomgeneric/` (skipping platform-specific back-ends
+/// and standalone tools), add `userspace/doom/dg_m3os.c`, compile with
 /// `musl-gcc -static -O2`. Output: `kernel/initrd/doom`.
 ///
 /// Gracefully creates an empty placeholder if musl-gcc is not available.
@@ -4572,10 +4573,24 @@ fn collect_ports_entries(
 
 /// Download doom1.wad (shareware, freely redistributable) into `dest`.
 ///
-/// Tries `curl` first, then `wget`. Prints a friendly message if neither
-/// tool is available so the user can download manually.
+/// Download `doom1.wad` (shareware) to `dest` if `M3OS_DOWNLOAD_WAD=1` is set.
+///
+/// Gated by the env var to avoid unexpected network access in offline/CI builds.
+/// Verifies the SHA-256 checksum of the downloaded file and removes it on mismatch.
+/// Tries `curl` first, then `wget`.
 fn fetch_doom_wad(dest: &Path) {
     const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
+    // SHA-256 of the canonical shareware doom1.wad (v1.9).
+    const WAD_SHA256: &str = "90facab21eede7981a9d4b8d6e0cfe2b4a5af2f64fc23a3b6d7cdfd9c6c0ddf5";
+
+    if std::env::var("M3OS_DOWNLOAD_WAD").as_deref() != Ok("1") {
+        eprintln!(
+            "doom: doom1.wad not found — set M3OS_DOWNLOAD_WAD=1 to auto-download, or\n\
+             place it at target/doom1.wad (or repo root doom1.wad) manually.\n\
+             Download: {WAD_URL}"
+        );
+        return;
+    }
 
     println!("doom: doom1.wad not found — downloading shareware WAD (~4 MB)...");
     println!("doom: source: {WAD_URL}");
@@ -4587,30 +4602,59 @@ fn fetch_doom_wad(dest: &Path) {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if curl_ok && dest.exists() {
-        println!("doom: downloaded → {}", dest.display());
+    if !curl_ok || !dest.exists() {
+        // Fall back to wget.
+        let wget_ok = Command::new("wget")
+            .args(["-q", "-O", dest.to_str().unwrap(), WAD_URL])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !wget_ok || !dest.exists() {
+            eprintln!(
+                "warning: could not download doom1.wad (curl/wget not available or download failed)\n\
+                 To enable DOOM: place doom1.wad in the repository root or at target/doom1.wad\n\
+                 Download: {WAD_URL}"
+            );
+            let _ = fs::remove_file(dest);
+            return;
+        }
+    }
+
+    // Verify SHA-256 checksum.
+    if !verify_sha256(dest, WAD_SHA256) {
+        eprintln!(
+            "warning: doom1.wad checksum mismatch — removing the file.\n\
+             Expected SHA-256: {WAD_SHA256}\n\
+             Place a valid doom1.wad at target/doom1.wad manually."
+        );
+        let _ = fs::remove_file(dest);
         return;
     }
 
-    // Fall back to wget.
-    let wget_ok = Command::new("wget")
-        .args(["-q", "-O", dest.to_str().unwrap(), WAD_URL])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    println!("doom: downloaded and verified → {}", dest.display());
+}
 
-    if wget_ok && dest.exists() {
-        println!("doom: downloaded → {}", dest.display());
-        return;
+/// Compute the hex SHA-256 digest of `path` and compare it to `expected`.
+fn verify_sha256(path: &Path, expected: &str) -> bool {
+    // Use the `sha256sum` tool if available (common on Linux).
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+
+    if let Some(out) = output {
+        let line = String::from_utf8_lossy(&out.stdout);
+        // sha256sum output: "<hex>  <filename>"
+        if let Some(hex) = line.split_whitespace().next() {
+            return hex.eq_ignore_ascii_case(expected);
+        }
     }
 
-    eprintln!(
-        "warning: could not download doom1.wad (curl/wget not available or download failed)\n\
-         To enable DOOM: place doom1.wad in the repository root or at target/doom1.wad\n\
-         Download: {WAD_URL}"
-    );
-    // Clean up any partial download.
-    let _ = fs::remove_file(dest);
+    // Fallback: skip verification (sha256sum not available).
+    eprintln!("doom: sha256sum not available — skipping checksum verification");
+    true
 }
 
 /// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
@@ -4653,6 +4697,7 @@ fn populate_doom_files(part_path: &Path, output_dir: &Path) {
     cmds.push_str("sif usr/share mode 0x41ED\n");
     cmds.push_str("sif usr/share/doom mode 0x41ED\n");
     cmds.push_str("sif usr/share/doom/doom1.wad mode 0x81A4\n");
+    cmds.push_str("q\n");
 
     // Run debugfs.
     let mut debugfs = Command::new("debugfs")

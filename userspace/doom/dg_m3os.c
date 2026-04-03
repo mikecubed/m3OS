@@ -141,8 +141,10 @@ void DG_DrawFrame(void)
         for (int sx = 0; sx < DOOMGENERIC_RESX; sx++) {
             uint32_t pixel = src_row[sx];
 
-            /* Optional R/B swap for BGR framebuffers */
-            if (bgr) {
+            /* On LE the u32 bytes are [B, G, R, A].
+             * BGR framebuffer expects [B, G, R, ...] — memcpy as-is.
+             * RGB framebuffer expects [R, G, B, ...] — swap R and B. */
+            if (!bgr) {
                 uint8_t r = (pixel >> 16) & 0xFF;
                 uint8_t b = (pixel >>  0) & 0xFF;
                 pixel = (pixel & 0xFF00FF00u) | (b << 16) | r;

@@ -291,7 +291,9 @@ pub fn free_process_page_table(cr3_phys: u64) {
         !flags.contains(PageTableFlags::HUGE_PAGE)
     }
     fn user_leaf(flags: PageTableFlags) -> bool {
-        flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        // BIT_11 marks "device/hardware frame" (e.g. UEFI framebuffer) that
+        // must NOT be returned to the frame allocator on process teardown.
+        flags.contains(PageTableFlags::USER_ACCESSIBLE) && !flags.contains(PageTableFlags::BIT_11)
     }
 
     // SAFETY: cr3_phys is a valid PML4 frame being freed. The caller guarantees

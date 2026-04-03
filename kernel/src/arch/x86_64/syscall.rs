@@ -6838,11 +6838,12 @@ fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
         pixel_format: pixel_format_val,
     };
 
-    // Safety: buf_addr validated to be non-null and within user address space.
-    unsafe {
-        core::ptr::write_unaligned(buf_addr as *mut FbInfo, info);
+    let info_bytes = unsafe {
+        core::slice::from_raw_parts(&info as *const FbInfo as *const u8, FB_INFO_SIZE as usize)
+    };
+    if crate::mm::user_mem::copy_to_user(buf_addr, info_bytes).is_err() {
+        return NEG_EFAULT;
     }
-
     0
 }
 
@@ -6860,7 +6861,12 @@ fn sys_framebuffer_mmap() -> u64 {
     };
 
     let phys_off = crate::mm::phys_offset();
-    let buf_phys = buf_virt - phys_off;
+    // checked_sub guards against buf_virt < phys_off (would underflow to a
+    // spurious physical address and map arbitrary memory into userspace).
+    let buf_phys = match buf_virt.checked_sub(phys_off) {
+        Some(v) if v % 4096 == 0 => v,
+        _ => return NEG_EINVAL,
+    };
 
     let num_pages = (byte_len as u64).div_ceil(4096);
     let total_size = num_pages * 4096;
@@ -6881,6 +6887,13 @@ fn sys_framebuffer_mmap() -> u64 {
 
     let pid = crate::process::current_pid();
 
+    // Reject if another process already holds the framebuffer; only one
+    // process at a time may own the raw framebuffer.
+    let owner = crate::fb::fb_owner_pid();
+    if owner != 0 && owner != pid {
+        return NEG_EBUSY;
+    }
+
     // Determine the virtual address for the mapping in the process address space.
     let virt_addr = {
         let mut table = crate::process::PROCESS_TABLE.lock();
@@ -6893,10 +6906,13 @@ fn sys_framebuffer_mmap() -> u64 {
         }
         // Round up to page boundary.
         let base = (proc.mmap_next + 4095) & !4095;
-        proc.mmap_next = match base.checked_add(total_size) {
-            Some(v) => v,
-            None => return NEG_EINVAL,
+        // Guard against pushing mmap_next past the canonical user-space limit.
+        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+        let end = match base.checked_add(total_size) {
+            Some(v) if v <= USER_SPACE_END => v,
+            _ => return NEG_EINVAL,
         };
+        proc.mmap_next = end;
         base
     };
 
@@ -6920,10 +6936,14 @@ fn sys_framebuffer_mmap() -> u64 {
     let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
 
     use x86_64::structures::paging::PageTableFlags;
+    // BIT_11 is an OS-available bit used here to mark "device/hardware frame —
+    // do not return to the frame allocator on process teardown".  The frame
+    // allocator only owns system-RAM frames; the UEFI framebuffer is MMIO.
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::BIT_11;
 
     if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
         .is_err()

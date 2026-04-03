@@ -953,17 +953,25 @@ pub fn yield_console(owner_pid: u32) {
 
 /// Restores framebuffer console output after a graphical process exits.
 ///
-/// Clears the framebuffer and resets the owner PID.
+/// Clears the framebuffer and resets the owner PID.  The console lock is held
+/// throughout the clear so no writer can sneak in between the flag flip and the
+/// clear and have its output immediately wiped.
 pub fn restore_console() {
     FB_OWNER_PID.store(0, Ordering::Release);
-    CONSOLE_YIELDED.store(false, Ordering::Release);
-    if let Some(ref mut console) = *CONSOLE.lock() {
+    // Hold the lock while clearing so no concurrent writer observes
+    // CONSOLE_YIELDED = false and starts writing before the clear completes.
+    let mut guard = CONSOLE.lock();
+    if let Some(ref mut console) = *guard {
         let rows = console.rows();
         let cols = console.cols();
         if rows > 0 && cols > 0 {
             console.clear_region(0, 0, cols, rows);
         }
     }
+    // Flip the flag only after the clear is done and while we still hold the
+    // lock, so the first write after restore sees a freshly-cleared screen.
+    CONSOLE_YIELDED.store(false, Ordering::Release);
+    drop(guard);
 }
 
 /// Returns the PID of the process currently owning the raw framebuffer
