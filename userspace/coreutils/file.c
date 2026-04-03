@@ -1,8 +1,10 @@
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static void usage(void) {
     fputs("usage: file FILE...\n", stderr);
@@ -29,43 +31,47 @@ static const char *describe_magic(const unsigned char *buf, size_t len) {
 
 static int describe_path(const char *path) {
     struct stat st;
-    FILE *fp;
+    int fd;
     unsigned char buf[256];
-    size_t nread;
+    ssize_t nread;
     const char *kind;
 
-    if (lstat(path, &st) != 0) {
+    fd = open(path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        if (errno == ELOOP) {
+            printf("%s: symbolic link\n", path);
+            return 0;
+        }
+        fprintf(stderr, "file: cannot open '%s': %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    if (fstat(fd, &st) != 0) {
         fprintf(stderr, "file: cannot stat '%s': %s\n", path, strerror(errno));
+        close(fd);
         return 1;
     }
 
     if (S_ISCHR(st.st_mode)) {
         printf("%s: character special\n", path);
+        close(fd);
         return 0;
     }
     if (S_ISDIR(st.st_mode)) {
         printf("%s: directory\n", path);
-        return 0;
-    }
-    if (S_ISLNK(st.st_mode)) {
-        printf("%s: symbolic link\n", path);
+        close(fd);
         return 0;
     }
 
-    fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "file: cannot open '%s': %s\n", path, strerror(errno));
-        return 1;
-    }
-    nread = fread(buf, 1, sizeof(buf), fp);
-    if (ferror(fp)) {
+    nread = read(fd, buf, sizeof(buf));
+    if (nread < 0) {
         fprintf(stderr, "file: cannot read '%s'\n", path);
-        fclose(fp);
+        close(fd);
         return 1;
     }
-    fclose(fp);
+    close(fd);
 
-    kind = describe_magic(buf, nread);
+    kind = describe_magic(buf, (size_t)nread);
     printf("%s: %s\n", path, kind);
     return 0;
 }
