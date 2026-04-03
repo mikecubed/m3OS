@@ -170,10 +170,10 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                         "[ipc] recv_msg: capability table full, unblocking sender without reply"
                     );
                     scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                    scheduler::wake_task(pending.task);
+                    let _ = scheduler::wake_task(pending.task);
                 }
             } else {
-                scheduler::wake_task(pending.task);
+                let _ = scheduler::wake_task(pending.task);
             }
         }
         None => {
@@ -236,7 +236,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
-            scheduler::wake_task(receiver);
+            let _ = scheduler::wake_task(receiver);
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -286,12 +286,12 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                 } else {
                     // Endpoint was destroyed; wake receiver to avoid leaving it blocked.
                     drop(reg);
-                    scheduler::wake_task(receiver);
+                    let _ = scheduler::wake_task(receiver);
                 }
                 return Message::new(u64::MAX);
             }
             scheduler::deliver_message(receiver, msg);
-            scheduler::wake_task(receiver);
+            let _ = scheduler::wake_task(receiver);
         }
         None => {
             // Server not yet waiting — we're already enqueued above with
@@ -327,7 +327,7 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(caller: TaskId, reply_msg: Message) {
     scheduler::deliver_message(caller, reply_msg);
-    scheduler::wake_task(caller);
+    let _ = scheduler::wake_task(caller);
 }
 
 /// Reply to the current caller and immediately receive the next message.

@@ -55,12 +55,13 @@ pub mod wait_queue;
 
 #[allow(unused_imports)]
 pub use scheduler::{
-    block_current_on_futex, block_current_on_notif, block_current_on_recv, block_current_on_reply,
-    block_current_on_send, block_current_unless_woken, current_task_id, deliver_message,
-    insert_cap, mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
-    server_endpoint, set_server_endpoint, signal_reschedule, spawn, spawn_idle,
-    spawn_idle_for_core, spawn_on_current_core, sys_nice, sys_sched_getaffinity,
-    sys_sched_setaffinity, take_message, task_cap, wake_task, yield_now,
+    block_current_on_futex, block_current_on_futex_unless_woken, block_current_on_notif,
+    block_current_on_recv, block_current_on_reply, block_current_on_send,
+    block_current_unless_woken, current_task_id, deliver_message, insert_cap, mark_current_dead,
+    mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run, server_endpoint,
+    set_server_endpoint, signal_reschedule, spawn, spawn_idle, spawn_idle_for_core,
+    spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_message,
+    task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------

@@ -1504,7 +1504,7 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
             wake_ids
         };
         for tid in to_wake {
-            crate::task::wake_task(tid);
+            let _ = crate::task::wake_task(tid);
         }
     }
 }
@@ -8944,35 +8944,48 @@ fn sys_clone_thread(
         }
     };
 
-    // Share fd table: create Arc from parent's fd_table if not already shared.
-    let shared_fd = match parent_shared_fd {
-        Some(arc) => arc,
-        None => {
-            let arc = Arc::new(spin::Mutex::new(parent_fds));
-            // Update parent to use shared fd table.
-            {
-                let mut table = PROCESS_TABLE.lock();
-                if let Some(p) = table.find_mut(parent_pid) {
-                    p.shared_fd_table = Some(arc.clone());
+    // Share fd table only when CLONE_FILES is set; otherwise child gets a
+    // private copy (shared_fd_table stays None).
+    // Clone parent_fds before the potential move into an Arc so it remains
+    // available for the non-shared path in the child Process builder.
+    let child_fds_copy = parent_fds.clone();
+    let shared_fd = if flags & CLONE_FILES != 0 {
+        Some(match parent_shared_fd {
+            Some(arc) => arc,
+            None => {
+                let arc = Arc::new(spin::Mutex::new(parent_fds));
+                // Update parent to use shared fd table.
+                {
+                    let mut table = PROCESS_TABLE.lock();
+                    if let Some(p) = table.find_mut(parent_pid) {
+                        p.shared_fd_table = Some(arc.clone());
+                    }
                 }
+                arc
             }
-            arc
-        }
+        })
+    } else {
+        None
     };
 
-    // Share signal actions: same approach.
-    let shared_sig = match parent_shared_sig {
-        Some(arc) => arc,
-        None => {
-            let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
-            {
-                let mut table = PROCESS_TABLE.lock();
-                if let Some(p) = table.find_mut(parent_pid) {
-                    p.shared_signal_actions = Some(arc.clone());
+    // Share signal actions only when CLONE_SIGHAND is set; otherwise child
+    // gets its own private copy.
+    let shared_sig = if flags & CLONE_SIGHAND != 0 {
+        Some(match parent_shared_sig {
+            Some(arc) => arc,
+            None => {
+                let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
+                {
+                    let mut table = PROCESS_TABLE.lock();
+                    if let Some(p) = table.find_mut(parent_pid) {
+                        p.shared_signal_actions = Some(arc.clone());
+                    }
                 }
+                arc
             }
-            arc
-        }
+        })
+    } else {
+        None
     };
 
     // Allocate a NEW kernel stack for the child thread.
@@ -9011,16 +9024,22 @@ fn sys_clone_thread(
         mmap_next: parent_mmap,
         pgid: parent_pgid,
         fd_table: {
-            // Copy current shared fd table snapshot for the local field.
-            // The actual sharing is via shared_fd_table Arc.
-            let lock = shared_fd.lock();
-            lock.clone()
+            // When sharing via Arc, snapshot from the shared table;
+            // otherwise use the private copy.
+            if let Some(ref arc) = shared_fd {
+                arc.lock().clone()
+            } else {
+                child_fds_copy
+            }
         },
         pending_signals: 0,
         blocked_signals: parent_blocked_signals,
         signal_actions: {
-            let lock = shared_sig.lock();
-            *lock
+            if let Some(ref arc) = shared_sig {
+                *arc.lock()
+            } else {
+                parent_signal_actions
+            }
         },
         alt_stack_base: 0,
         alt_stack_size: 0,
@@ -9039,8 +9058,8 @@ fn sys_clone_thread(
         cmdline: parent_cmdline,
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
         thread_group: Some(thread_group),
-        shared_fd_table: Some(shared_fd),
-        shared_signal_actions: Some(shared_sig),
+        shared_fd_table: shared_fd,
+        shared_signal_actions: shared_sig,
     };
 
     PROCESS_TABLE.lock().insert(child_proc);
@@ -9385,13 +9404,10 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 });
             }
 
-            // If a waker already removed us from the table and set our flag
-            // between the lock-drop above and now, skip the block to avoid
-            // sleeping forever (missed-wakeup race).
-            if !woken_flag.load(core::sync::atomic::Ordering::Acquire) {
-                // Block the current task (releases scheduler lock internally).
-                crate::task::block_current_on_futex();
-            }
+            // Atomically check the woken flag and block under the scheduler
+            // lock to avoid a missed-wakeup race where a waker sets the flag
+            // and calls wake_task() between our check and block.
+            crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
             // Woken — return success.
             0

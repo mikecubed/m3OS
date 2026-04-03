@@ -201,7 +201,7 @@ pub fn signal(notif_id: NotifId, bits: u64) {
         waiters[idx].take()
     };
     if let Some(task) = waiter {
-        scheduler::wake_task(task);
+        let _ = scheduler::wake_task(task);
     }
     // Also trigger reschedule in case the waiter wasn't in WAITERS yet
     // (it may be between the swap(0) check and the waiter registration).
@@ -236,7 +236,7 @@ pub fn drain_pending_waiters() {
             }
         };
         if let Some(task) = waiter {
-            scheduler::wake_task(task);
+            let _ = scheduler::wake_task(task);
         }
     }
 }

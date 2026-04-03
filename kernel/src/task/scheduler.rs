@@ -423,6 +423,31 @@ pub fn block_current_on_futex() {
     block_current(TaskState::BlockedOnFutex);
 }
 
+/// Block the current task on a futex unless the woken flag is already set.
+///
+/// The check is performed under the scheduler lock so that a concurrent
+/// `wake_task()` call cannot slip between the flag check and the state
+/// transition, which would cause a missed wakeup.
+pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        if woken.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => return,
+        };
+        accumulate_ticks(&mut sched, idx);
+        sched.tasks[idx].state = TaskState::BlockedOnFutex;
+        set_current_task_idx(None);
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    per_core_reschedule().store(true, Ordering::Relaxed);
+    let sched_rsp = per_core_scheduler_rsp();
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
