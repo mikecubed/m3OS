@@ -19,4 +19,8 @@ uint32_t DG_GetTicksMs(void);
 int DG_GetKey(int *pressed, unsigned char *doomKey);
 void DG_SetWindowTitle(const char *title);
 
+/* Engine entry points called by main() */
+void doomgeneric_Create(int argc, char **argv);
+void doomgeneric_Tick(void);
+
 #endif /* DOOMGENERIC_H */

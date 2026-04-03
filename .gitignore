@@ -33,3 +33,5 @@ boot*.log
 .DS_Store
 Thumbs.db
 
+# DOOM shareware WAD (auto-downloaded to target/; not committed)
+doom1.wad

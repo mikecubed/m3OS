@@ -295,3 +295,17 @@ void DG_SetWindowTitle(const char *title)
 {
     (void)title;
 }
+
+/* -------------------------------------------------------------------------
+ * main -- entry point: create the DOOM instance and tick forever
+ * ------------------------------------------------------------------------- */
+
+int main(int argc, char **argv)
+{
+    doomgeneric_Create(argc, argv);
+
+    for (;;)
+        doomgeneric_Tick();
+
+    return 0;
+}
