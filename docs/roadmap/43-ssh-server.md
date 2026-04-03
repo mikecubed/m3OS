@@ -3,7 +3,7 @@
 **Status:** Complete
 **Source Ref:** phase-43
 **Depends on:** Phase 23 (Socket API) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY) ✅, Phase 37 (I/O Multiplexing) ✅, Phase 42 (Crypto Primitives) ✅
-**Builds on:** Uses the crypto-lib from Phase 42 (Ed25519, X25519, ChaCha20-Poly1305, SHA-256) for all cryptographic operations; reuses the PTY pair infrastructure from Phase 29 and the telnetd session architecture from Phase 30; authenticates against /etc/shadow from Phase 27; uses epoll from Phase 37 for multi-session I/O multiplexing
+**Builds on:** Uses the crypto-lib from Phase 42 (Ed25519, X25519, ChaCha20-Poly1305, SHA-256) for all cryptographic operations; reuses the PTY pair infrastructure from Phase 29 and the telnetd session architecture from Phase 30; authenticates against /etc/shadow from Phase 27; uses poll-based I/O multiplexing from Phase 37 for per-session socket/PTY relay
 **Primary Components:** userspace sshd binary, sunset SSH library integration, host key management, authorized_keys support
 
 ## Milestone Goal
@@ -52,8 +52,8 @@ considered secure for any network beyond localhost.
 **Connection Layer**
 - Session channels with PTY allocation.
 - Shell execution (via login or direct shell spawn).
-- Window size changes (`window-change` channel request).
-- Signal forwarding.
+- Window size changes (`window-change` channel request) — deferred.
+- Signal forwarding — deferred.
 - Graceful channel close and session cleanup.
 
 ### Implementation Strategy
@@ -134,11 +134,12 @@ Each accepted TCP connection spawns a child process that:
 2. Authenticates the user (password or public key).
 3. Allocates a PTY pair (reusing Phase 29 infrastructure).
 4. Forks and execs `login` (or the user's shell directly) on the slave side.
-5. Relays encrypted data between the TCP socket and the PTY master using epoll.
-6. Handles window-change and signal requests from the SSH channel.
-7. Cleans up on disconnect (close PTY, reap child, close socket).
+5. Relays encrypted data between the TCP socket and the PTY master using poll.
+6. Cleans up on disconnect (close PTY, reap child, close socket).
 
 This mirrors the telnetd architecture from Phase 30, but with encryption and proper
+authentication wrapping the connection. Channel requests beyond basic interactive shell
+I/O — including `window-change` handling and signal forwarding — are deferred.
 authentication wrapping the connection.
 
 ### Authentication Against /etc/shadow and authorized_keys
@@ -169,7 +170,7 @@ the session ID — the private key never leaves the client.
 5. Implement password authentication callback against `/etc/shadow`.
 6. Implement session channel handling: PTY allocation, shell exec, data relay.
 7. Implement public key authentication with `~/.ssh/authorized_keys`.
-8. Implement window-change and signal forwarding.
+8. (Deferred) Window-change and signal forwarding.
 9. Add sshd to init's startup sequence and initrd.
 10. Test from host with `ssh -p 2222 user@localhost`.
 11. Test multiple simultaneous SSH sessions.

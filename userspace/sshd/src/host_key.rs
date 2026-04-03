@@ -67,8 +67,13 @@ fn generate_host_key() -> Result<HostKey, ()> {
         write_str(STDOUT_FILENO, "sshd: cannot write host key\n");
         return Err(());
     }
-    syscall_lib::write(fd as i32, &seed);
+    let n = syscall_lib::write(fd as i32, &seed);
     close(fd as i32);
+    if n != 32 {
+        write_str(STDOUT_FILENO, "sshd: short write on host key\n");
+        syscall_lib::unlink(HOST_KEY_PATH);
+        return Err(());
+    }
 
     // Write public key (mode 0644).
     let pubkey_bytes = match &key {
@@ -77,8 +82,11 @@ fn generate_host_key() -> Result<HostKey, ()> {
     };
     let fd = open(HOST_KEY_PUB_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
     if fd >= 0 {
-        syscall_lib::write(fd as i32, &pubkey_bytes);
+        let n = syscall_lib::write(fd as i32, &pubkey_bytes);
         close(fd as i32);
+        if n != 32 {
+            syscall_lib::unlink(HOST_KEY_PUB_PATH);
+        }
     }
 
     // Print fingerprint (SHA-256 of public key) to log.

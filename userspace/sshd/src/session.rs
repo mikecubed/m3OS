@@ -117,7 +117,23 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let mut consumed = 0;
             while consumed < n as usize {
                 match runner.input(&sock_buf[consumed..n as usize]) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        // Sunset can't accept more input right now — flush
+                        // output and drive progress to make room, then retry.
+                        flush_output(&mut runner, sock_fd);
+                        let _ = runner.progress();
+                        flush_output(&mut runner, sock_fd);
+                        // Try once more; if still 0, break to avoid busy-loop
+                        // (remaining bytes stay in sock_buf for next iteration).
+                        match runner.input(&sock_buf[consumed..n as usize]) {
+                            Ok(0) => break,
+                            Ok(c) => consumed += c,
+                            Err(_) => {
+                                cleanup(shell_pid, pty_master, pty_slave);
+                                return 1;
+                            }
+                        }
+                    }
                     Ok(c) => consumed += c,
                     Err(_) => {
                         cleanup(shell_pid, pty_master, pty_slave);
@@ -141,7 +157,16 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                         let mut sent = 0;
                         while sent < data.len() {
                             match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
-                                Ok(0) => break,
+                                Ok(0) => {
+                                    // Backpressure — flush and retry once.
+                                    flush_output(&mut runner, sock_fd);
+                                    match runner.write_channel(ch, ChanData::Normal, &data[sent..])
+                                    {
+                                        Ok(0) => break, // Still blocked, retry next iteration.
+                                        Ok(w) => sent += w,
+                                        Err(_) => break,
+                                    }
+                                }
                                 Ok(w) => sent += w,
                                 Err(_) => break,
                             }
@@ -257,76 +282,86 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 },
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
-                    let _ = shell_req.succeed();
-                    if !shell_spawned {
-                        if let (Some(master), Some(slave), Some(info)) =
-                            (pty_master, pty_slave, &user_info)
-                        {
-                            shell_spawned = true;
-                            let pid = fork();
-                            if pid < 0 {
-                                write_str(STDOUT_FILENO, "sshd: shell fork failed\n");
-                            } else if pid == 0 {
-                                // Child: set up PTY and exec shell.
-                                close(master);
-                                close(sock_fd);
-                                setsid();
-                                syscall_lib::ioctl(slave, TIOCSCTTY, 0);
-                                dup2(slave, 0);
-                                dup2(slave, 1);
-                                dup2(slave, 2);
-                                if slave > 2 {
-                                    close(slave);
-                                }
-
-                                syscall_lib::setgid(info.gid);
-                                syscall_lib::setuid(info.uid);
-
-                                let home_bytes = info.home.as_bytes();
-                                let mut home_env = [0u8; 128];
-                                let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
-
-                                let mut user_env = [0u8; 128];
-                                let ue_len =
-                                    build_env(b"USER=", info.username.as_bytes(), &mut user_env);
-
-                                let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-                                let env_term: &[u8] = b"TERM=xterm\0";
-                                let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
-
-                                let envp: [*const u8; 6] = [
-                                    env_path.as_ptr(),
-                                    home_env[..he_len].as_ptr(),
-                                    env_term.as_ptr(),
-                                    env_editor.as_ptr(),
-                                    user_env[..ue_len].as_ptr(),
-                                    core::ptr::null(),
-                                ];
-
-                                let mut shell_path = [0u8; 128];
-                                let shell_bytes = info.shell.as_bytes();
-                                let slen = shell_bytes.len().min(shell_path.len() - 1);
-                                shell_path[..slen].copy_from_slice(&shell_bytes[..slen]);
-                                shell_path[slen] = 0;
-
-                                let argv: [*const u8; 2] =
-                                    [shell_path[..slen + 1].as_ptr(), core::ptr::null()];
-                                let ret =
-                                    syscall_lib::execve(&shell_path[..slen + 1], &argv, &envp);
-
-                                if ret < 0 {
-                                    let sh0: &[u8] = b"/bin/sh0\0";
-                                    let argv2: [*const u8; 2] = [sh0.as_ptr(), core::ptr::null()];
-                                    syscall_lib::execve(sh0, &argv2, &envp);
-                                }
-                                exit(1);
-                            } else {
-                                // Parent.
+                    // Only acknowledge success after the shell is actually spawned.
+                    if shell_spawned {
+                        let _ = shell_req.fail();
+                    } else if let (Some(master), Some(slave), Some(info)) =
+                        (pty_master, pty_slave, &user_info)
+                    {
+                        let pid = fork();
+                        if pid < 0 {
+                            write_str(STDOUT_FILENO, "sshd: shell fork failed\n");
+                            let _ = shell_req.fail();
+                        } else if pid == 0 {
+                            // Child: set up PTY and exec shell.
+                            close(master);
+                            close(sock_fd);
+                            setsid();
+                            syscall_lib::ioctl(slave, TIOCSCTTY, 0);
+                            dup2(slave, 0);
+                            dup2(slave, 1);
+                            dup2(slave, 2);
+                            if slave > 2 {
                                 close(slave);
-                                pty_slave = None;
-                                shell_pid = Some(pid);
                             }
+
+                            // Drop privileges — abort if either fails.
+                            if syscall_lib::setgid(info.gid) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setgid failed\n");
+                                exit(1);
+                            }
+                            if syscall_lib::setuid(info.uid) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setuid failed\n");
+                                exit(1);
+                            }
+
+                            let home_bytes = info.home.as_bytes();
+                            let mut home_env = [0u8; 128];
+                            let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
+
+                            let mut user_env = [0u8; 128];
+                            let ue_len =
+                                build_env(b"USER=", info.username.as_bytes(), &mut user_env);
+
+                            let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+                            let env_term: &[u8] = b"TERM=xterm\0";
+                            let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
+
+                            let envp: [*const u8; 6] = [
+                                env_path.as_ptr(),
+                                home_env[..he_len].as_ptr(),
+                                env_term.as_ptr(),
+                                env_editor.as_ptr(),
+                                user_env[..ue_len].as_ptr(),
+                                core::ptr::null(),
+                            ];
+
+                            let mut shell_path = [0u8; 128];
+                            let shell_bytes = info.shell.as_bytes();
+                            let slen = shell_bytes.len().min(shell_path.len() - 1);
+                            shell_path[..slen].copy_from_slice(&shell_bytes[..slen]);
+                            shell_path[slen] = 0;
+
+                            let argv: [*const u8; 2] =
+                                [shell_path[..slen + 1].as_ptr(), core::ptr::null()];
+                            let ret = syscall_lib::execve(&shell_path[..slen + 1], &argv, &envp);
+
+                            if ret < 0 {
+                                let sh0: &[u8] = b"/bin/sh0\0";
+                                let argv2: [*const u8; 2] = [sh0.as_ptr(), core::ptr::null()];
+                                syscall_lib::execve(sh0, &argv2, &envp);
+                            }
+                            exit(1);
+                        } else {
+                            // Parent: shell spawned successfully.
+                            close(slave);
+                            pty_slave = None;
+                            shell_pid = Some(pid);
+                            shell_spawned = true;
+                            let _ = shell_req.succeed();
                         }
+                    } else {
+                        let _ = shell_req.fail();
                     }
                 }
                 Ok(Event::Serv(ServEvent::SessionExec(exec_req))) => {
@@ -397,8 +432,12 @@ fn flush_output(runner: &mut Runner<'_, Server>, sock_fd: i32) {
         let mut tmp = [0u8; 4096];
         let chunk = len.min(tmp.len());
         tmp[..chunk].copy_from_slice(&out[..chunk]);
-        runner.consume_output(chunk);
-        write_all(sock_fd, &tmp[..chunk]);
+        // Write to socket first, then consume only what was sent.
+        let written = write_all_count(sock_fd, &tmp[..chunk]);
+        if written == 0 {
+            break; // Socket write failed — stop flushing.
+        }
+        runner.consume_output(written);
     }
 }
 
@@ -414,24 +453,42 @@ fn write_all(fd: i32, data: &[u8]) {
     }
 }
 
+/// Write all bytes to a file descriptor. Returns number of bytes written.
+fn write_all_count(fd: i32, data: &[u8]) -> usize {
+    let mut written = 0;
+    while written < data.len() {
+        let n = syscall_lib::write(fd, &data[written..]);
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
+    }
+    written
+}
+
 /// Build an environment string like "KEY=value\0".
+/// Always NUL-terminates, reserving one byte for the terminator.
 fn build_env(prefix: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+
     let mut pos = 0;
+    let max = buf.len() - 1; // Reserve 1 byte for NUL.
+
     for &b in prefix {
-        if pos < buf.len() {
+        if pos < max {
             buf[pos] = b;
             pos += 1;
         }
     }
     for &b in value {
-        if pos < buf.len() {
+        if pos < max {
             buf[pos] = b;
             pos += 1;
         }
     }
-    if pos < buf.len() {
-        buf[pos] = 0;
-        pos += 1;
-    }
-    pos
+
+    buf[pos] = 0; // Always NUL-terminate.
+    pos + 1
 }

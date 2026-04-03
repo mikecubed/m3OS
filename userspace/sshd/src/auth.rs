@@ -52,23 +52,18 @@ pub fn check_pubkey(username: &str, pubkey_bytes: &[u8]) -> Option<UserInfo> {
 
     // Build path to authorized_keys: /home/<user>/.ssh/authorized_keys
     let mut ak_path = [0u8; 256];
-    let mut pos = 0;
-    for &b in user_info.home.as_bytes() {
-        if pos < ak_path.len() - 1 {
-            ak_path[pos] = b;
-            pos += 1;
-        }
+    let suffix = b"/.ssh/authorized_keys\0";
+    let home = user_info.home.as_bytes();
+    let required_len = home.len() + suffix.len();
+    if required_len > ak_path.len() {
+        return None; // Path would overflow buffer.
     }
-    for &b in b"/.ssh/authorized_keys\0" {
-        if pos < ak_path.len() {
-            ak_path[pos] = b;
-            pos += 1;
-        }
-    }
+    ak_path[..home.len()].copy_from_slice(home);
+    ak_path[home.len()..required_len].copy_from_slice(suffix);
 
     // Read authorized_keys file.
     let mut ak_buf = [0u8; 2048];
-    let ak_len = read_file(&ak_path[..pos], &mut ak_buf);
+    let ak_len = read_file(&ak_path[..required_len], &mut ak_buf);
     if ak_len == 0 {
         return None;
     }

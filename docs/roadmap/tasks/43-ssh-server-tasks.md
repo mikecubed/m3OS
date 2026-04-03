@@ -5,7 +5,7 @@
 **Depends on:** Phase 23 (Socket API) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY) ✅, Phase 37 (I/O Multiplexing) ✅, Phase 42 (Crypto Primitives) ✅
 **Goal:** Add an SSH server (`sshd`) using the sunset IO-less SSH library, providing
 encrypted remote shell access with password and public key authentication, PTY-based
-sessions, and multi-session support via epoll.
+sessions, and multi-session support.
 
 ## Track Layout
 
