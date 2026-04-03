@@ -269,7 +269,7 @@ pub const SYS_CLOCK_GETTIME: u64 = 228;
 // Phase 32: File timestamp syscall
 pub const SYS_UTIMENSAT: u64 = 280;
 
-// Phase 42: getrandom
+// Phase 21: getrandom (kernel syscall 318)
 pub const SYS_GETRANDOM: u64 = 318;
 
 // ===========================================================================

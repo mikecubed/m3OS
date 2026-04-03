@@ -4,7 +4,7 @@
 **Source Ref:** phase-42
 **Depends on:** Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅, Phase 31 (Compiler Toolchain) ✅
 **Builds on:** Uses the `getrandom` syscall from Phase 12 as the entropy source; stores generated keys on the FAT32 filesystem from Phase 24; optionally compiles crypto code inside the OS using the TCC toolchain from Phase 31
-**Primary Components:** kernel-core (CSPRNG seed), userspace crypto library, sha256sum, genkey
+**Primary Components:** userspace crypto-lib crate, sha256sum, genkey, crypto-test
 
 ## Milestone Goal
 

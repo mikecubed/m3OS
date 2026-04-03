@@ -179,19 +179,64 @@ fn build_userspace_bins() {
 
     // Rust coreutils — build all binaries in one cargo invocation.
     let coreutils_bins: &[&str] = &[
-        "true", "false", "echo", "pwd", "sleep", "rm", "mkdir", "rmdir", "mv", "cat", "cp", "grep",
-        "env", "PROMPT", "ls", "ln", "readlink", // Phase 32: build tool utilities
-        "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
-        "date", "uptime", // Phase 34: timekeeping utilities
+        "true",
+        "false",
+        "echo",
+        "pwd",
+        "sleep",
+        "rm",
+        "mkdir",
+        "rmdir",
+        "mv",
+        "cat",
+        "cp",
+        "grep",
+        "env",
+        "PROMPT",
+        "ls",
+        "ln",
+        "readlink", // Phase 32: build tool utilities
+        "touch",
+        "stat",
+        "wc",
+        "ar",
+        "install",
+        "meminfo", // Phase 33: memory diagnostics
+        "date",
+        "uptime", // Phase 34: timekeeping utilities
         // Phase 41 Rust ports (batch 1 — trivial)
-        "umount", "dmesg", "chmod", "mount", "kill", "tee",
+        "umount",
+        "dmesg",
+        "chmod",
+        "mount",
+        "kill",
+        "tee",
         // Phase 41 Rust ports (batch 2 — small)
-        "head", "file", "strings", "uniq", "free", "df", "hexdump",
+        "head",
+        "file",
+        "strings",
+        "uniq",
+        "free",
+        "df",
+        "hexdump",
         // Phase 41 Rust ports (batch 3 — medium)
-        "cal", "tr", "sort", "tail", "ps", "du", "chown", "find",
+        "cal",
+        "tr",
+        "sort",
+        "tail",
+        "ps",
+        "du",
+        "chown",
+        "find",
         // Phase 41 Rust ports (batch 4 — complex)
-        "cut", "diff", "sed", "xargs", "less", "patch",
-        "sha256sum", "genkey", // Phase 42: crypto utilities
+        "cut",
+        "diff",
+        "sed",
+        "xargs",
+        "less",
+        "patch",
+        "sha256sum",
+        "genkey", // Phase 42: crypto utilities
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)

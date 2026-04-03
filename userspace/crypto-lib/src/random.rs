@@ -23,13 +23,14 @@ pub fn csprng_init() -> Result<CsprngState, CryptoError> {
     let mut seed = [0u8; 32];
     let n = syscall_lib::getrandom(&mut seed);
     if n < 32 {
-        // Zero partial seed before returning.
-        seed.fill(0);
+        // Zero partial seed before returning (volatile to prevent elision).
+        unsafe { core::ptr::write_volatile(&mut seed, [0u8; 32]) };
         return Err(CryptoError::SeedingFailed);
     }
     let rng = ChaCha20Rng::from_seed(seed);
-    // Zero the seed from stack memory.
-    seed.fill(0);
+    // Zero the seed from stack memory using a volatile write to prevent
+    // the compiler from optimizing the zeroing away.
+    unsafe { core::ptr::write_volatile(&mut seed, [0u8; 32]) };
     Ok(CsprngState { rng })
 }
 
