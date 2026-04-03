@@ -291,8 +291,8 @@ keypairs and validates the full path from CSPRNG → key generation → file I/O
 
 ### F.3 — Add sha256sum and genkey to initrd
 
-**File:** `kernel/build.rs`
-**Symbol:** `INITRD_BINARIES` or equivalent initrd build list
+**File:** `xtask/src/main.rs`
+**Symbol:** `coreutils_bins` array in `build_userspace_bins()`
 **Why it matters:** Userspace binaries must be embedded in the initial ramdisk to
 be available at boot. Without adding them to the initrd build, the utilities exist
 as compiled artifacts but cannot be executed inside the OS.
