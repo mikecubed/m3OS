@@ -206,7 +206,7 @@ flowchart TD
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | Complete | `phase-41` | [Phase 41 Tasks](./41-expanded-coreutils-tasks.md) |
-| 42 | Crypto and TLS (RustCrypto + rustls) | Planned | `phase-42` | [Tasks](./42-crypto-primitives-tasks.md) |
+| 42 | Crypto Primitives (RustCrypto crypto-lib) | Complete | `phase-42` | [Tasks](./42-crypto-primitives-tasks.md) |
 | 43 | SSH (sunset or Dropbear) | Planned | `phase-43` | *not yet created* |
 | 44 | Rust cross-compilation | Planned | `phase-44` | *not yet created* |
 | 45 | Ports system (source-based package building) | Planned | `phase-45` | *not yet created* |
