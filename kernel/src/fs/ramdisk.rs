@@ -148,6 +148,8 @@ static SYSINFO_RUST_ELF: &[u8] = include_bytes!("../../initrd/sysinfo-rust");
 static HTTPD_RUST_ELF: &[u8] = include_bytes!("../../initrd/httpd-rust");
 static CALC_RUST_ELF: &[u8] = include_bytes!("../../initrd/calc-rust");
 static TODO_RUST_ELF: &[u8] = include_bytes!("../../initrd/todo-rust");
+// Phase 47: DOOM binary
+static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -393,6 +395,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: TODO_RUST_ELF,
         },
     ),
+    // Phase 47: DOOM
+    ("doom", RamdiskNode::File { content: DOOM_BIN }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[

@@ -1,6 +1,6 @@
 # Phase 47 — DOOM: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-47
 **Depends on:** Phase 9 (Framebuffer) ✅, Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅
 **Goal:** Make DOOM playable inside m3OS. Expose the UEFI framebuffer to userspace via
@@ -13,12 +13,12 @@ frame rate and accept keyboard input for full gameplay.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Kernel framebuffer syscalls (`sys_framebuffer_info`, `sys_framebuffer_mmap`) | — | Planned |
-| B | Kernel raw scancode syscall (`sys_read_scancode`) | — | Planned |
-| C | Framebuffer console yield/restore (dual-mode console) | A | Planned |
-| D | doomgeneric platform layer (C userspace code) | A, B | Planned |
-| E | xtask build integration and WAD disk image | D | Planned |
-| F | Integration testing and documentation | A–E | Planned |
+| A | Kernel framebuffer syscalls (`sys_framebuffer_info`, `sys_framebuffer_mmap`) | — | Complete |
+| B | Kernel raw scancode syscall (`sys_read_scancode`) | — | Complete |
+| C | Framebuffer console yield/restore (dual-mode console) | A | Complete |
+| D | doomgeneric platform layer (C userspace code) | A, B | Complete |
+| E | xtask build integration and WAD disk image | D | Complete |
+| F | Integration testing and documentation | A–E | Complete |
 
 ---
 
@@ -58,7 +58,7 @@ address space using the existing `map_user_frames` infrastructure.
 - [ ] Computes the framebuffer physical base address from `FbConsole.buf` and the kernel physical offset (`mm::PHYS_OFFSET`)
 - [ ] Calls `map_user_frames` (from `kernel/src/mm/user_space.rs`) to map the framebuffer physical frames into the process's page table with `USER_ACCESSIBLE | WRITABLE` flags
 - [ ] Returns the userspace virtual address of the mapped framebuffer on success
-- [ ] Returns `NEG_ENOMEM` if page table mapping fails, `NEG_EINVAL` if no framebuffer exists
+- [ ] Returns `NEG_EINVAL` if no framebuffer exists or if page table mapping fails, `NEG_EBUSY` if another process already owns the framebuffer
 - [ ] Records the mapping in the process's `mappings` vector as a `MemoryMapping` so `munmap` can clean it up
 
 ### A.3 — Syscall constants in `syscall-lib`
@@ -260,7 +260,7 @@ by every other binary (e.g. `EDIT_ELF`, `SH0_ELF`) so `init` can `exec` the bina
 
 **Acceptance:**
 - [ ] `static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");` added after the last existing ELF static in `ramdisk.rs`
-- [ ] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_ELF`
+- [ ] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_BIN`
 - [ ] The binary is accessible as `/bin/doom` in the VFS after boot
 - [ ] `doom` command is recognized by the shell and can be exec'd
 
