@@ -19,8 +19,13 @@ fn main(args: &[&str]) -> i32 {
     let mut path = [0u8; 256];
     path[..bytes.len()].copy_from_slice(bytes);
     path[bytes.len()] = 0;
-    if umount(&path[..=bytes.len()]) != 0 {
-        write_str(STDERR_FILENO, "umount: failed\n");
+    let ret = umount(&path[..=bytes.len()]);
+    if ret != 0 {
+        if ret == -16 {
+            write_str(STDERR_FILENO, "umount: target is busy\n");
+        } else {
+            write_str(STDERR_FILENO, "umount: failed\n");
+        }
         return 1;
     }
     0

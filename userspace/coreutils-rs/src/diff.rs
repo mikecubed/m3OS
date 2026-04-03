@@ -82,6 +82,8 @@ fn main(args: &[&str]) -> i32 {
 
     if nlines1 == 0 {
         write_all(STDOUT_FILENO, b"0,0");
+    } else if nlines1 == 1 {
+        write_all(STDOUT_FILENO, b"1");
     } else {
         write_all(STDOUT_FILENO, b"1,");
         write_u64(STDOUT_FILENO, nlines1 as u64);
@@ -89,6 +91,8 @@ fn main(args: &[&str]) -> i32 {
     write_all(STDOUT_FILENO, b" +");
     if nlines2 == 0 {
         write_all(STDOUT_FILENO, b"0,0");
+    } else if nlines2 == 1 {
+        write_all(STDOUT_FILENO, b"1");
     } else {
         write_all(STDOUT_FILENO, b"1,");
         write_u64(STDOUT_FILENO, nlines2 as u64);

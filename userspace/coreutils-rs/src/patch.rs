@@ -5,7 +5,7 @@
 #[path = "common.rs"]
 mod common;
 
-use common::write_all;
+use common::{write_all, write_u64};
 use syscall_lib::{
     O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDERR_FILENO, STDOUT_FILENO, close, open, read, rename,
     write, write_str,
@@ -702,6 +702,12 @@ fn main(args: &[&str]) -> i32 {
     write_all(STDOUT_FILENO, b"patching file ");
     write_all(STDOUT_FILENO, &target_path[..tplen]);
     write_all(STDOUT_FILENO, b"\n");
+
+    for hi in 0..(fp.hunk_count as usize) {
+        write_all(STDOUT_FILENO, b"applied hunk ");
+        write_u64(STDOUT_FILENO, (hi + 1) as u64);
+        write_all(STDOUT_FILENO, b"\n");
+    }
 
     0
 }
