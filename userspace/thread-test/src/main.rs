@@ -219,9 +219,15 @@ fn test_basic_thread() -> bool {
         child_tid_addr,
     );
 
-    if child_tid == u64::MAX || child_tid == 0 {
+    if (child_tid as i64) < 0 || child_tid == 0 {
         serial_print("FAIL (clone returned ");
-        print_num(child_tid);
+        let signed = child_tid as i64;
+        if signed < 0 {
+            serial_print("-");
+            print_num((-signed) as u64);
+        } else {
+            print_num(child_tid);
+        }
         serial_print(")\n");
         return false;
     }
