@@ -6,7 +6,9 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
 use spin::Lazy;
 use spin::Mutex;
 
@@ -22,6 +24,12 @@ pub struct FutexWaiter {
     pub tid: TaskId,
     /// Bitset used for `FUTEX_WAIT_BITSET` / `FUTEX_WAKE_BITSET` filtering.
     pub bitset: u32,
+    /// Flag set to `true` by the wake path before calling `wake_task()`.
+    ///
+    /// The wait path checks this after dropping the `FUTEX_TABLE` lock to
+    /// avoid blocking when a wake arrived in the window between lock-drop
+    /// and the `block_current_on_futex()` call.
+    pub woken: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------

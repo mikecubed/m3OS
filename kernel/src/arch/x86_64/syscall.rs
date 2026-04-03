@@ -1490,6 +1490,7 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
                     while i < waiters.len() && wake_ids.is_empty() {
                         if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
                             let w = waiters.swap_remove(i);
+                            w.woken.store(true, core::sync::atomic::Ordering::Release);
                             wake_ids.push(w.tid);
                         } else {
                             i += 1;
@@ -9287,11 +9288,14 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
         0u64
     } else {
         let pid = crate::process::current_pid();
-        crate::process::PROCESS_TABLE
+        match crate::process::PROCESS_TABLE
             .lock()
             .find(pid)
             .and_then(|p| p.page_table_root.map(|a| a.as_u64()))
-            .unwrap_or(0)
+        {
+            Some(root) => root,
+            None => return NEG_EINVAL, // non-private futex requires a page table root
+        }
     };
     let key = (page_table_root, uaddr);
 
@@ -9315,6 +9319,8 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 None => return NEG_EAGAIN,
             };
 
+            let woken_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
             {
                 let mut table = FUTEX_TABLE.lock();
 
@@ -9329,14 +9335,20 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 }
 
                 // Value matches — enqueue this thread as a waiter.
-                table
-                    .entry(key)
-                    .or_default()
-                    .push(FutexWaiter { tid, bitset });
+                table.entry(key).or_default().push(FutexWaiter {
+                    tid,
+                    bitset,
+                    woken: alloc::sync::Arc::clone(&woken_flag),
+                });
             }
 
-            // Block the current task (releases scheduler lock internally).
-            crate::task::block_current_on_futex();
+            // If a waker already removed us from the table and set our flag
+            // between the lock-drop above and now, skip the block to avoid
+            // sleeping forever (missed-wakeup race).
+            if !woken_flag.load(core::sync::atomic::Ordering::Acquire) {
+                // Block the current task (releases scheduler lock internally).
+                crate::task::block_current_on_futex();
+            }
 
             // Woken — return success.
             0
@@ -9354,18 +9366,21 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             };
 
             let max_wake = val as usize;
-            let mut woken = 0usize;
+            let mut woken_count = 0usize;
 
             let to_wake = {
                 let mut table = FUTEX_TABLE.lock();
-                let mut wake_ids = alloc::vec::Vec::new();
+                let mut wake_list = alloc::vec::Vec::new();
                 if let Some(waiters) = table.get_mut(&key) {
                     let mut i = 0;
-                    while i < waiters.len() && woken < max_wake {
+                    while i < waiters.len() && woken_count < max_wake {
                         if (waiters[i].bitset & bitset) != 0 {
                             let w = waiters.swap_remove(i);
-                            wake_ids.push(w.tid);
-                            woken += 1;
+                            // Set the woken flag *before* calling wake_task so the
+                            // waiter can detect the wake even if it has not blocked yet.
+                            w.woken.store(true, core::sync::atomic::Ordering::Release);
+                            wake_list.push(w.tid);
+                            woken_count += 1;
                             // Don't increment i — swap_remove moved the last element here.
                         } else {
                             i += 1;
@@ -9376,7 +9391,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                         table.remove(&key);
                     }
                 }
-                wake_ids
+                wake_list
             };
 
             // Wake the tasks outside the FUTEX_TABLE lock.
@@ -9384,7 +9399,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 crate::task::wake_task(tid);
             }
 
-            woken as u64
+            woken_count as u64
         }
 
         _ => 0, // Unknown ops succeed silently (Linux compat).
