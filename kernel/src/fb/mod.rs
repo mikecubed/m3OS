@@ -909,10 +909,18 @@ pub fn console_text_size() -> Option<(u16, u16)> {
 ///
 /// Does nothing if [`init`] has not been called yet.
 pub fn write_str(s: &str) {
+    // Fast path: skip taking the lock if the console is clearly yielded.
     if CONSOLE_YIELDED.load(Ordering::Acquire) {
         return;
     }
-    if let Some(ref mut console) = *CONSOLE.lock() {
+    let mut guard = CONSOLE.lock();
+    // Re-check under the lock: serializes with try_yield_console's
+    // lock-guarded flag transition so a yield cannot slip between our
+    // pre-check above and the framebuffer write below.
+    if CONSOLE_YIELDED.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(ref mut console) = *guard {
         console.write_str(s);
     }
 }
@@ -960,7 +968,9 @@ pub fn yield_console(owner_pid: u32) {
 pub fn try_yield_console(owner_pid: u32) -> bool {
     match FB_OWNER_PID.compare_exchange(0, owner_pid, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
-            // Newly claimed — suppress console text output.
+            // Hold the console lock while flipping the flag so write_str
+            // cannot slip through between the CAS and the flag transition.
+            let _guard = CONSOLE.lock();
             CONSOLE_YIELDED.store(true, Ordering::Release);
             true
         }
