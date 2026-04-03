@@ -1951,14 +1951,21 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         input: "/bin/make\n",
         label: "make: build demo project",
     });
+    // Wait for the final link step to appear, then wait for the prompt.
+    // (Just waiting for `# ` can match sub-shell prompts between make recipes.)
+    steps.push(SmokeStep::Wait {
+        pattern: "-o demo main.o util.o",
+        timeout_secs: 45,
+        label: "wait for make link step",
+    });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 45,
-        label: "wait for make to finish",
+        timeout_secs: 20,
+        label: "wait for prompt after make",
     });
 
     // Run the built binary
-    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Sleep { millis: 1000 });
     steps.push(SmokeStep::Send {
         input: "/home/project/demo\n",
         label: "run demo binary",
