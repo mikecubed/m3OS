@@ -82,6 +82,9 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let ret = waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 shell_pid = None;
+                // Drain remaining PTY output before exiting.
+                drain_pty(&mut runner, sock_fd, pty_master, &chan_handle, &mut pty_buf);
+                flush_output(&mut runner, sock_fd);
                 break;
             }
         }
@@ -224,7 +227,9 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         }
 
         if nfds > 1 && (pfds_arr[1].revents & POLLHUP) != 0 {
-            // PTY closed — shell exited.
+            // PTY closed — drain any remaining output before exiting.
+            drain_pty(&mut runner, sock_fd, pty_master, &chan_handle, &mut pty_buf);
+            flush_output(&mut runner, sock_fd);
             break;
         }
 
@@ -479,6 +484,50 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 
     cleanup(shell_pid, pty_master, pty_slave);
     0
+}
+
+/// Drain remaining PTY output through sunset and onto the socket.
+/// Called when the shell has exited or the PTY reports POLLHUP so that
+/// the last bytes of output are not truncated on the client.
+fn drain_pty(
+    runner: &mut Runner<'_, Server>,
+    sock_fd: i32,
+    pty_master: Option<i32>,
+    chan_handle: &Option<ChanHandle>,
+    buf: &mut [u8],
+) {
+    let pty_fd = match pty_master {
+        Some(fd) => fd,
+        None => return,
+    };
+    let ch = match chan_handle {
+        Some(h) => h,
+        None => return,
+    };
+    // Read until EOF (read returns 0 or error).
+    loop {
+        let n = syscall_lib::read(pty_fd, buf);
+        if n <= 0 {
+            break;
+        }
+        let data = &buf[..n as usize];
+        let mut sent = 0;
+        while sent < data.len() {
+            match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
+                Ok(0) => {
+                    flush_output(runner, sock_fd);
+                    // One more attempt after flush.
+                    match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(w) => sent += w,
+                    }
+                }
+                Ok(w) => sent += w,
+                Err(_) => break,
+            }
+            flush_output(runner, sock_fd);
+        }
+    }
 }
 
 /// E.6: Clean up all session resources.
