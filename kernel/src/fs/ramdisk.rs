@@ -130,6 +130,10 @@ static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
 // Phase 40: threading test
 static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test.elf");
+// Phase 42: crypto primitives
+static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test.elf");
+static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum.elf");
+static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey.elf");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -442,6 +446,25 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "thread-test.elf",
         RamdiskNode::File {
             content: THREAD_TEST_ELF,
+        },
+    ),
+    // Phase 42: crypto primitives
+    (
+        "crypto-test.elf",
+        RamdiskNode::File {
+            content: CRYPTO_TEST_ELF,
+        },
+    ),
+    (
+        "sha256sum.elf",
+        RamdiskNode::File {
+            content: SHA256SUM_ELF,
+        },
+    ),
+    (
+        "genkey.elf",
+        RamdiskNode::File {
+            content: GENKEY_ELF,
         },
     ),
 ];
