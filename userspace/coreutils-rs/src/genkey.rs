@@ -6,11 +6,23 @@ use crypto_lib::asymmetric::{
     ed25519_keygen, ed25519_signing_key_to_bytes, ed25519_verifying_key_to_bytes,
 };
 use crypto_lib::random::csprng_init;
-use syscall_lib::{O_CREAT, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, open, write};
+use syscall_lib::{O_CREAT, O_TRUNC, O_WRONLY, STDERR_FILENO, STDOUT_FILENO, close, open, write};
 
 syscall_lib::entry_point!(main);
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Write all bytes to a file descriptor, retrying on partial writes.
+fn write_all(fd: i32, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let n = write(fd, data);
+        if n <= 0 {
+            return false;
+        }
+        data = &data[n as usize..];
+    }
+    true
+}
 
 fn write_key_file(dir: &[u8], name: &[u8], data: &[u8]) -> bool {
     let mut path = [0u8; 256];
@@ -36,14 +48,19 @@ fn write_key_file(dir: &[u8], name: &[u8], data: &[u8]) -> bool {
 
     let fd = open(&path[..total_len], O_WRONLY | O_CREAT | O_TRUNC, 0o600);
     if fd < 0 {
-        let _ = write(STDOUT_FILENO, b"genkey: failed to create ");
-        let _ = write(STDOUT_FILENO, &path[..total_len - 1]);
-        let _ = write(STDOUT_FILENO, b"\n");
+        let _ = write(STDERR_FILENO, b"genkey: failed to create ");
+        let _ = write(STDERR_FILENO, &path[..total_len - 1]);
+        let _ = write(STDERR_FILENO, b"\n");
         return false;
     }
-    let _ = write(fd as i32, data);
+    let ok = write_all(fd as i32, data);
     close(fd as i32);
-    true
+    if !ok {
+        let _ = write(STDERR_FILENO, b"genkey: write error for ");
+        let _ = write(STDERR_FILENO, &path[..total_len - 1]);
+        let _ = write(STDERR_FILENO, b"\n");
+    }
+    ok
 }
 
 fn main(args: &[&str]) -> i32 {
@@ -53,13 +70,13 @@ fn main(args: &[&str]) -> i32 {
     while i < args.len() {
         if args[i] == "-o" {
             if i + 1 >= args.len() {
-                let _ = write(STDOUT_FILENO, b"genkey: -o requires an argument\n");
+                let _ = write(STDERR_FILENO, b"genkey: -o requires an argument\n");
                 return 1;
             }
             output_dir = args[i + 1].as_bytes();
             i += 2;
         } else {
-            let _ = write(STDOUT_FILENO, b"Usage: genkey [-o <dir>]\n");
+            let _ = write(STDERR_FILENO, b"Usage: genkey [-o <dir>]\n");
             return 1;
         }
     }
@@ -68,7 +85,7 @@ fn main(args: &[&str]) -> i32 {
     let mut rng = match csprng_init() {
         Ok(r) => r,
         Err(_) => {
-            let _ = write(STDOUT_FILENO, b"genkey: failed to initialize CSPRNG\n");
+            let _ = write(STDERR_FILENO, b"genkey: failed to initialize CSPRNG\n");
             return 1;
         }
     };

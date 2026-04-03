@@ -1549,8 +1549,28 @@ pub fn format_datetime(dt: &DateTime, buf: &mut [u8]) -> usize {
     pos
 }
 
-/// Fill buffer with random bytes from the kernel's getrandom syscall.
-/// Returns the number of bytes written, or a negative errno on failure.
+/// Fill the entire buffer with random bytes from the kernel's getrandom syscall.
+/// Loops internally to handle partial reads (the kernel may cap per-call output).
+/// Returns `buf.len()` on success, or a negative errno on failure.
 pub fn getrandom(buf: &mut [u8]) -> isize {
-    unsafe { syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as isize }
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let ret = unsafe {
+            syscall3(
+                SYS_GETRANDOM,
+                buf[filled..].as_mut_ptr() as u64,
+                (buf.len() - filled) as u64,
+                0,
+            ) as isize
+        };
+        if ret < 0 {
+            return ret;
+        }
+        let written = ret as usize;
+        if written == 0 {
+            break;
+        }
+        filled += written;
+    }
+    filled as isize
 }
