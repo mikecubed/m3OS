@@ -599,13 +599,42 @@ fn build_doom() {
         .status()
         .expect("failed to run git checkout for doomgeneric");
     if !checkout.success() {
-        eprintln!(
-            "doom: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT} — aborting build"
-        );
-        if !doom_bin.exists() {
-            let _ = fs::write(&doom_bin, b"");
+        // The cached clone may be shallow or corrupted — self-heal by
+        // deleting it and re-cloning before retrying.
+        eprintln!("doom: checkout failed — re-cloning doomgeneric to recover...");
+        let _ = fs::remove_dir_all(&dg_src);
+        let reclone = Command::new("git")
+            .args([
+                "clone",
+                "https://github.com/ozkl/doomgeneric.git",
+                dg_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for doomgeneric recovery");
+        if !reclone.success() {
+            eprintln!("doom: re-clone failed — aborting build");
+            if !doom_bin.exists() {
+                let _ = fs::write(&doom_bin, b"");
+            }
+            return;
         }
-        return;
+        let retry = Command::new("git")
+            .args([
+                "-C",
+                dg_src.to_str().unwrap(),
+                "checkout",
+                "--force",
+                DOOMGENERIC_COMMIT,
+            ])
+            .status()
+            .expect("failed to run git checkout for doomgeneric recovery");
+        if !retry.success() {
+            eprintln!("doom: checkout still failed after re-clone — aborting build");
+            if !doom_bin.exists() {
+                let _ = fs::write(&doom_bin, b"");
+            }
+            return;
+        }
     }
 
     // Collect core engine .c files — skip all platform-specific implementations.
@@ -4127,7 +4156,7 @@ fn fetch_doom_wad(dest: &Path) {
     // Verify SHA-256 checksum.
     if !verify_sha256(dest, WAD_SHA256) {
         eprintln!(
-            "warning: doom1.wad checksum mismatch — removing the file.\n\
+            "warning: doom1.wad verification failed (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
              Expected SHA-256: {WAD_SHA256}\n\
              Place a valid doom1.wad at target/doom1.wad manually."
         );

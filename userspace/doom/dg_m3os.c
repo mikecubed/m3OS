@@ -13,6 +13,7 @@
  */
 
 #include "doomgeneric/doomgeneric.h"
+#include "doomgeneric/i_system.h"
 
 #include <stdint.h>
 #include <string.h>
