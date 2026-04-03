@@ -78,7 +78,7 @@ impl WaitQueue {
     pub fn wake_one(&self) {
         if let Some(entry) = self.waiters.lock().pop_front() {
             entry.woken.store(true, Ordering::Release);
-            scheduler::wake_task(entry.id);
+            let _ = scheduler::wake_task(entry.id);
         }
     }
 
@@ -90,7 +90,7 @@ impl WaitQueue {
         };
         for entry in waiters {
             entry.woken.store(true, Ordering::Release);
-            scheduler::wake_task(entry.id);
+            let _ = scheduler::wake_task(entry.id);
         }
     }
 

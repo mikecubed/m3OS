@@ -419,6 +419,35 @@ pub fn block_current_on_reply() {
     block_current(TaskState::BlockedOnReply);
 }
 
+pub fn block_current_on_futex() {
+    block_current(TaskState::BlockedOnFutex);
+}
+
+/// Block the current task on a futex unless the woken flag is already set.
+///
+/// The check is performed under the scheduler lock so that a concurrent
+/// `wake_task()` call cannot slip between the flag check and the state
+/// transition, which would cause a missed wakeup.
+pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    let task_rsp_ptr: *mut u64 = {
+        let mut sched = SCHEDULER.lock();
+        if woken.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => return,
+        };
+        accumulate_ticks(&mut sched, idx);
+        sched.tasks[idx].state = TaskState::BlockedOnFutex;
+        set_current_task_idx(None);
+        core::ptr::addr_of_mut!(sched.tasks[idx].saved_rsp)
+    };
+    per_core_reschedule().store(true, Ordering::Relaxed);
+    let sched_rsp = per_core_scheduler_rsp();
+    unsafe { switch_context(task_rsp_ptr, sched_rsp) };
+}
+
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
@@ -463,8 +492,23 @@ pub fn mark_current_dead() -> ! {
     }
 }
 
+/// Mark a task as [`TaskState::Dead`] by its process/thread PID.
+///
+/// Used by `exit_group()` to kill sibling threads.  Returns `true` if the
+/// task was found and marked dead, `false` otherwise.
+pub fn mark_task_dead_by_pid(pid: u32) -> bool {
+    let mut sched = SCHEDULER.lock();
+    for task in sched.tasks.iter_mut() {
+        if task.pid == pid && task.state != TaskState::Dead {
+            task.state = TaskState::Dead;
+            return true;
+        }
+    }
+    false
+}
+
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
-pub fn wake_task(id: TaskId) {
+pub fn wake_task(id: TaskId) -> bool {
     let enqueue = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
@@ -472,7 +516,8 @@ pub fn wake_task(id: TaskId) {
                 TaskState::BlockedOnRecv
                 | TaskState::BlockedOnSend
                 | TaskState::BlockedOnReply
-                | TaskState::BlockedOnNotif => {
+                | TaskState::BlockedOnNotif
+                | TaskState::BlockedOnFutex => {
                     sched.tasks[idx].state = TaskState::Ready;
                     Some((sched.tasks[idx].assigned_core, idx))
                 }
@@ -484,6 +529,9 @@ pub fn wake_task(id: TaskId) {
     };
     if let Some((core, idx)) = enqueue {
         enqueue_to_core(core, idx);
+        true
+    } else {
+        false
     }
 }
 

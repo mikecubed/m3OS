@@ -17,9 +17,11 @@
 
 #![allow(dead_code)]
 
+pub mod futex;
+
 extern crate alloc;
 
-use alloc::{collections::VecDeque, string::String, vec::Vec};
+use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -79,6 +81,11 @@ static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 /// call, which the atomic fetch-add guarantees regardless of memory order.
 fn alloc_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Public wrapper for `alloc_pid` — used by `sys_clone_thread`.
+pub(crate) fn alloc_pid_pub() -> Pid {
+    alloc_pid()
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +219,7 @@ pub fn close_cloexec_fds(pid: Pid) {
             Some(p) => p,
             None => return,
         };
-        for slot in proc.fd_table.iter_mut() {
+        proc.fd_for_each_mut(|_i, slot| {
             if let Some(entry) = slot
                 && entry.cloexec
             {
@@ -229,7 +236,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                 }
                 *slot = None;
             }
-        }
+        });
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -280,7 +287,7 @@ pub fn close_all_fds_for(pid: Pid) {
             Some(p) => p,
             None => return,
         };
-        for slot in proc.fd_table.iter_mut() {
+        proc.fd_for_each_mut(|_i, slot| {
             if let Some(entry) = slot.take() {
                 match &entry.backend {
                     FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
@@ -294,7 +301,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     _ => {}
                 }
             }
-        }
+        });
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -323,13 +330,21 @@ pub fn close_all_fds_for(pid: Pid) {
 }
 
 /// Count open ext2-backed file descriptors referencing `inode_num`.
+/// Checks the shared fd table when present (thread groups), otherwise
+/// falls back to the per-process fd table.
 pub fn ext2_inode_open_count(inode_num: u32) -> usize {
     let table = PROCESS_TABLE.lock();
-    table
-        .iter()
-        .flat_map(|proc| proc.fd_table.iter().flatten())
-        .filter(|entry| {
-            matches!(
+    let mut count = 0usize;
+    for proc in table.iter() {
+        // Skip non-leader threads in a thread group — the leader's shared
+        // fd table will already be counted, so counting it again for every
+        // sibling thread would inflate the result.
+        if proc.thread_group.is_some() && proc.tid != proc.tgid {
+            continue;
+        }
+        let snapshot = proc.fd_table_snapshot();
+        for entry in snapshot.iter().flatten() {
+            if matches!(
                 entry,
                 FdEntry {
                     backend: FdBackend::Ext2Disk {
@@ -337,9 +352,12 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
                     },
                     ..
                 } if *fd_inode == inode_num
-            )
-        })
-        .count()
+            ) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
@@ -470,6 +488,22 @@ pub enum ProcessState {
 }
 
 // ---------------------------------------------------------------------------
+// Thread group (Phase 40)
+// ---------------------------------------------------------------------------
+
+/// A thread group: all threads sharing the same TGID.
+///
+/// The leader is the first thread created; `members` tracks all TIDs in
+/// the group (including the leader).
+#[derive(Debug)]
+pub struct ThreadGroup {
+    /// TID of the thread group leader (equals the TGID).
+    pub leader_tid: u32,
+    /// All TIDs that belong to this group (including the leader).
+    pub members: Mutex<Vec<u32>>,
+}
+
+// ---------------------------------------------------------------------------
 // Process descriptor
 // ---------------------------------------------------------------------------
 
@@ -477,6 +511,9 @@ pub enum ProcessState {
 pub struct Process {
     /// This process's unique identifier.
     pub pid: Pid,
+    pub tid: u32,
+    pub tgid: u32,
+    pub clear_child_tid: u64,
     /// Parent PID.  0 means no parent (init or an orphan).
     pub ppid: Pid,
     /// Current lifecycle state.
@@ -556,6 +593,15 @@ pub struct Process {
     pub cmdline: Vec<String>,
     /// Process start time in scheduler ticks since boot.
     pub start_ticks: u64,
+    /// Thread group this process/thread belongs to (Phase 40).
+    /// `None` for single-threaded processes.
+    pub thread_group: Option<Arc<ThreadGroup>>,
+    /// Shared fd table for threads created with CLONE_FILES (Phase 40).
+    /// `None` for single-threaded processes (uses `fd_table` directly).
+    pub shared_fd_table: Option<Arc<Mutex<[Option<FdEntry>; MAX_FDS]>>>,
+    /// Shared signal actions for threads created with CLONE_SIGHAND (Phase 40).
+    /// `None` for single-threaded processes (uses `signal_actions` directly).
+    pub shared_signal_actions: Option<Arc<Mutex<[SignalAction; 32]>>>,
 }
 
 /// Describes a contiguous anonymous memory mapping created by `mmap`.
@@ -590,6 +636,9 @@ impl Process {
         let pid = alloc_pid();
         Process {
             pid,
+            tid: pid,
+            tgid: pid,
+            clear_child_tid: 0,
             ppid: 0,
             state: ProcessState::Ready,
             page_table_root: None,
@@ -622,6 +671,9 @@ impl Process {
             exec_path: String::new(),
             cmdline: Vec::new(),
             start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+            thread_group: None,
+            shared_fd_table: None,
+            shared_signal_actions: None,
         }
     }
 
@@ -632,6 +684,128 @@ impl Process {
                 .checked_add(m.len)
                 .is_some_and(|end| addr >= m.start && addr < end)
         })
+    }
+
+    // -----------------------------------------------------------------
+    // Shared fd table helpers (Phase 40 — threading)
+    // -----------------------------------------------------------------
+
+    /// Read an fd entry, preferring the shared fd table when present.
+    pub fn fd_get(&self, fd: usize) -> Option<FdEntry> {
+        if let Some(shared) = &self.shared_fd_table {
+            shared.lock().get(fd)?.clone()
+        } else {
+            self.fd_table.get(fd)?.clone()
+        }
+    }
+
+    /// Write an fd entry, preferring the shared fd table when present.
+    pub fn fd_set(&mut self, fd: usize, entry: Option<FdEntry>) {
+        if let Some(shared) = &self.shared_fd_table {
+            if fd < MAX_FDS {
+                shared.lock()[fd] = entry;
+            }
+        } else if fd < MAX_FDS {
+            self.fd_table[fd] = entry;
+        }
+    }
+
+    /// Allocate the lowest free fd slot (>= `min_fd`), returning the fd number.
+    pub fn fd_alloc(&mut self, min_fd: usize, entry: FdEntry) -> Option<usize> {
+        if let Some(shared) = &self.shared_fd_table {
+            let mut lock = shared.lock();
+            for i in min_fd..MAX_FDS {
+                if lock[i].is_none() {
+                    lock[i] = Some(entry);
+                    return Some(i);
+                }
+            }
+            None
+        } else {
+            for i in min_fd..MAX_FDS {
+                if self.fd_table[i].is_none() {
+                    self.fd_table[i] = Some(entry);
+                    return Some(i);
+                }
+            }
+            None
+        }
+    }
+
+    /// Snapshot the effective fd table (shared if present, else local).
+    pub fn fd_table_snapshot(&self) -> [Option<FdEntry>; MAX_FDS] {
+        if let Some(shared) = &self.shared_fd_table {
+            shared.lock().clone()
+        } else {
+            self.fd_table.clone()
+        }
+    }
+
+    /// Iterate over effective fd table entries for read-only enumeration.
+    /// Returns a snapshot as a `Vec` of `(fd_index, FdEntry)`.
+    pub fn fd_entries(&self) -> alloc::vec::Vec<(usize, FdEntry)> {
+        let table = if let Some(shared) = &self.shared_fd_table {
+            shared.lock().clone()
+        } else {
+            self.fd_table.clone()
+        };
+        table
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|e| (i, e.clone())))
+            .collect()
+    }
+
+    /// Iterate mutably over the effective fd table, calling `f` on each slot.
+    /// Used by close-on-exec and process cleanup.
+    pub fn fd_for_each_mut<F: FnMut(usize, &mut Option<FdEntry>)>(&mut self, mut f: F) {
+        if let Some(shared) = &self.shared_fd_table {
+            let mut lock = shared.lock();
+            for i in 0..MAX_FDS {
+                f(i, &mut lock[i]);
+            }
+        } else {
+            for i in 0..MAX_FDS {
+                f(i, &mut self.fd_table[i]);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared signal actions helpers (Phase 40 — threading)
+    // -----------------------------------------------------------------
+
+    /// Read a signal action, preferring the shared table when present.
+    pub fn sigaction_get(&self, sig: usize) -> SignalAction {
+        if sig >= 32 {
+            return SignalAction::Default;
+        }
+        if let Some(shared) = &self.shared_signal_actions {
+            shared.lock()[sig]
+        } else {
+            self.signal_actions[sig]
+        }
+    }
+
+    /// Write a signal action, preferring the shared table when present.
+    pub fn sigaction_set(&mut self, sig: usize, action: SignalAction) {
+        if sig >= 32 {
+            return;
+        }
+        if let Some(shared) = &self.shared_signal_actions {
+            shared.lock()[sig] = action;
+        } else {
+            self.signal_actions[sig] = action;
+        }
+    }
+
+    /// Snapshot all signal actions (shared if present, else local).
+    pub fn signal_actions_snapshot(&self) -> [SignalAction; 32] {
+        if let Some(shared) = &self.shared_signal_actions {
+            *shared.lock()
+        } else {
+            self.signal_actions
+        }
     }
 }
 
@@ -656,6 +830,11 @@ fn alloc_kernel_stack() -> u64 {
     // SYSCALL stack must be 16-byte aligned for call instructions).
     let top = (ptr as u64) + KERNEL_STACK_SIZE as u64;
     top & !15
+}
+
+/// Public wrapper for `alloc_kernel_stack` — used by `sys_clone_thread`.
+pub(crate) fn alloc_kernel_stack_pub() -> u64 {
+    alloc_kernel_stack()
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +907,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
     let pid = alloc_pid();
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: None,
@@ -760,6 +942,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -783,6 +968,9 @@ pub fn spawn_process_with_cr3(
     let pid = alloc_pid();
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: Some(cr3),
@@ -815,6 +1003,9 @@ pub fn spawn_process_with_cr3(
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -842,6 +1033,9 @@ pub fn spawn_process_with_cr3_and_fds(
     let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: Some(cr3),
@@ -874,6 +1068,9 @@ pub fn spawn_process_with_cr3_and_fds(
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: None,
+        shared_fd_table: None,
+        shared_signal_actions: None,
     };
     PROCESS_TABLE.lock().insert(proc);
     pid
@@ -958,12 +1155,8 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
     }
     proc.pending_signals &= !(1u64 << sig);
 
-    // Determine disposition.
-    let action = if sig < 32 {
-        proc.signal_actions[sig as usize]
-    } else {
-        SignalAction::Default
-    };
+    // Determine disposition (uses shared signal actions table if present).
+    let action = proc.sigaction_get(sig as usize);
 
     let disposition = match action {
         SignalAction::Ignore => {
@@ -1111,6 +1304,37 @@ pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r9: 0,
         user_r10: 0,
         user_rflags: 0x202, // IF set, reserved bit set — safe default
+    });
+}
+
+/// Push a fork context for a clone(CLONE_THREAD) child.
+///
+/// The child thread starts at `user_rip` (the return address from the
+/// clone syscall) with `user_rsp` set to the provided child stack.
+/// Callee-saved registers are inherited from the parent's syscall entry.
+/// Caller-saved registers (rdi, rsi, rdx, r8, r9, r10) are zeroed
+/// because the clone wrapper sets up its own context.
+pub fn push_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) {
+    let pc = crate::smp::per_core();
+    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+        pid,
+        user_rip,
+        user_rsp: child_stack,
+        user_rbx: pc.syscall_user_rbx,
+        user_rbp: pc.syscall_user_rbp,
+        user_r12: pc.syscall_user_r12,
+        user_r13: pc.syscall_user_r13,
+        user_r14: pc.syscall_user_r14,
+        user_r15: pc.syscall_user_r15,
+        // Caller-saved registers — zeroed for clone child since the
+        // clone wrapper (musl __clone) will set up its own context.
+        user_rdi: 0,
+        user_rsi: 0,
+        user_rdx: 0,
+        user_r8: 0,
+        user_r9: 0,
+        user_r10: 0,
+        user_rflags: pc.syscall_user_rflags,
     });
 }
 

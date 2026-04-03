@@ -22,7 +22,7 @@
 //! | 60      | exit          | code                |
 //! | 61      | waitpid       | pid, status_ptr     |
 //! | 110     | getppid       | —                   |
-//! | 231     | exit_group    | code (alias exit)   |
+//! | 231     | exit_group    | code                |
 
 extern crate alloc;
 
@@ -919,7 +919,7 @@ global_asm!(
 /// |     110 | getppid     | ✓ same as Phase 11    |
 /// |     158 | arch_prctl  | ARCH_SET_FS only       |
 /// |     218 | set_tid_addr| stub, returns PID      |
-/// |     231 | exit_group  | ✓ same as Phase 11    |
+/// |     231 | exit_group  | ✓ kills all threads   |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
 #[unsafe(no_mangle)]
@@ -934,7 +934,8 @@ pub extern "C" fn syscall_handler(
     // Divergent syscalls (exit, sigreturn) never return — handle them first.
     match number {
         15 => sys_sigreturn(user_rsp),
-        60 | 231 => sys_exit(arg0 as i32),
+        60 => sys_exit(arg0 as i32),
+        231 => sys_exit_group(arg0 as i32),
         _ => {}
     }
 
@@ -1034,8 +1035,12 @@ pub extern "C" fn syscall_handler(
             let sv_ptr = per_core_syscall_arg3();
             sys_socketpair(arg0, arg1, arg2, sv_ptr)
         }
-        // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
-        56 => sys_clone(arg0, user_rip, user_rsp),
+        // Phase 21/40: clone — fork or thread creation
+        56 => {
+            let child_tidptr = per_core_syscall_arg3(); // r10
+            let tls = crate::smp::per_core().syscall_user_r8;
+            sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
+        }
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
         61 => sys_waitpid(arg0, arg1, arg2),
@@ -1092,11 +1097,14 @@ pub extern "C" fn syscall_handler(
         // Phase 24: mount(source, target, fstype)
         165 => sys_linux_mount(arg0, arg1, arg2),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
-        186 => sys_getpid(),
-        // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
-        200 => sys_kill(arg0, arg1),
-        // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
-        202 => sys_futex(arg0, arg1, arg2),
+        186 => sys_gettid(),
+        // Phase 40: tkill(tid, sig) — send signal to a specific thread
+        200 => sys_tkill(arg0, arg1),
+        // Phase 40: futex — real wait/wake queues
+        202 => {
+            let val3 = crate::smp::per_core().syscall_user_r9;
+            sys_futex(arg0, arg1, arg2, val3)
+        }
         // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
         203 => {
             // sched_setaffinity: read mask from user memory
@@ -1131,7 +1139,7 @@ pub extern "C" fn syscall_handler(
             }
         }
         217 => sys_linux_getdents64(arg0, arg1, arg2),
-        218 => sys_linux_set_tid_address(),
+        218 => sys_linux_set_tid_address(arg0),
         // Phase 21: clock_gettime — return approximate time from LAPIC ticks
         228 => sys_clock_gettime(arg0, arg1),
         // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
@@ -1425,9 +1433,24 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
 // Phase 11 syscalls
 // ---------------------------------------------------------------------------
 
-/// `getpid()` — return the calling process's PID.
+/// `getpid()` — return the calling thread's thread-group ID (POSIX PID).
 fn sys_getpid() -> u64 {
-    crate::process::current_pid() as u64
+    let pid = crate::process::current_pid();
+    crate::process::PROCESS_TABLE
+        .lock()
+        .find(pid)
+        .map(|p| p.tgid as u64)
+        .unwrap_or(pid as u64)
+}
+
+/// `gettid()` — return the calling thread's unique thread ID.
+fn sys_gettid() -> u64 {
+    let pid = crate::process::current_pid();
+    crate::process::PROCESS_TABLE
+        .lock()
+        .find(pid)
+        .map(|p| p.tid as u64)
+        .unwrap_or(pid as u64)
 }
 
 /// `getppid()` — return the calling process's parent PID.
@@ -1440,27 +1463,68 @@ fn sys_getppid() -> u64 {
         .unwrap_or(0)
 }
 
-/// `exit(code)` / `exit_group(code)` — terminate the calling process.
+/// Perform clear_child_tid futex wake for the given process/thread.
 ///
-/// Marks the process as a zombie, stores the exit code, restores the kernel
-/// CR3 (so the next scheduled task has a consistent address space), then marks
-/// the kernel task as dead so it is never rescheduled.
-fn sys_exit(code: i32) -> ! {
-    let pid = crate::process::current_pid();
-    log::info!("[p{}] exit({})", pid, code);
-    if pid != 0 {
-        // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
-        crate::process::close_all_fds_for(pid);
-        {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
-                proc.state = crate::process::ProcessState::Zombie;
-                proc.exit_code = Some(code);
+/// Writes 0 to the userspace `clear_child_tid` address and wakes one futex
+/// waiter, allowing `pthread_join` to unblock.
+fn do_clear_child_tid(pid: crate::process::Pid) {
+    let clear_tid_addr = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
+    };
+    if clear_tid_addr != 0 {
+        // Write 0u32 to the userspace address.
+        let zero = 0u32.to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(clear_tid_addr, &zero);
+        // Wake one waiter on the private futex key (0, addr) — this
+        // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
+        use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
+        let key = (0u64, clear_tid_addr);
+        let to_wake = {
+            let mut table = FUTEX_TABLE.lock();
+            let mut wake_ids = alloc::vec::Vec::new();
+            if let Some(waiters) = table.get_mut(&key) {
+                if !waiters.is_empty() {
+                    // Wake up to 1 waiter with matching bitset.
+                    let mut i = 0;
+                    while i < waiters.len() && wake_ids.is_empty() {
+                        if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
+                            let w = waiters.remove(i);
+                            w.woken.store(true, core::sync::atomic::Ordering::Release);
+                            wake_ids.push(w.tid);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                if waiters.is_empty() {
+                    table.remove(&key);
+                }
             }
+            wake_ids
+        };
+        for tid in to_wake {
+            let _ = crate::task::wake_task(tid);
         }
-        // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
-        crate::process::send_sigchld_to_parent(pid);
     }
+}
+
+/// Perform full process exit cleanup: close FDs, mark zombie, send SIGCHLD,
+/// free page table.  Called when a single-threaded process exits or when the
+/// last thread in a thread group exits.
+fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
+    // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+    crate::process::close_all_fds_for(pid);
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.state = crate::process::ProcessState::Zombie;
+            proc.exit_code = Some(code);
+        }
+    }
+    // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
+    crate::process::send_sigchld_to_parent(pid);
+
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
@@ -1475,6 +1539,118 @@ fn sys_exit(code: i32) -> ! {
         crate::mm::free_process_page_table(phys.as_u64());
     }
     // Mark the kernel task as dead so the scheduler reclaims it.
+    crate::task::mark_current_dead();
+}
+
+/// `exit(code)` — terminate the calling thread (syscall 60).
+///
+/// For single-threaded processes: full process exit (zombie, SIGCHLD, free PT).
+/// For threads in a thread group:
+///   - If this is the LAST thread: full process cleanup.
+///   - Otherwise: minimal cleanup — remove from group, clear_child_tid wake,
+///     remove Process entry, mark scheduler task as Dead.
+fn sys_exit(code: i32) -> ! {
+    let pid = crate::process::current_pid();
+    log::info!("[p{}] exit({})", pid, code);
+
+    if pid != 0 {
+        // Phase 40: clear_child_tid futex wake.
+        do_clear_child_tid(pid);
+
+        // Check if we are in a thread group.
+        let thread_group = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).and_then(|p| p.thread_group.clone())
+        };
+
+        if let Some(tg) = thread_group {
+            // Remove ourselves from the thread group member list.
+            let (is_last, tgid) = {
+                let mut members = tg.members.lock();
+                members.retain(|&tid| tid != pid);
+                (members.is_empty(), tg.leader_tid)
+            };
+
+            if !is_last {
+                // Non-last thread: minimal cleanup only.
+                if pid == tgid {
+                    // Group leader: keep as zombie placeholder so TGID lookups
+                    // still work for remaining threads.
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    if let Some(proc) = table.find_mut(pid) {
+                        proc.state = crate::process::ProcessState::Zombie;
+                    }
+                } else {
+                    // Non-leader thread: remove Process entry (shared resources
+                    // stay alive via Arc).
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    table.reap(pid);
+                }
+                // Restore kernel CR3 before dying — we share the address space
+                // but must not leave the scheduler pointing at user CR3.
+                crate::mm::restore_kernel_cr3();
+                // Mark our scheduler task as Dead (do NOT free page table or fds).
+                crate::task::mark_current_dead();
+            }
+            // Last thread: fall through to full process cleanup below.
+        }
+        // Single-threaded process OR last thread in group: full cleanup.
+        do_full_process_exit(pid, code);
+    }
+    // pid == 0 (kernel context): just die.
+    crate::mm::restore_kernel_cr3();
+    crate::task::mark_current_dead();
+}
+
+/// `exit_group(code)` — terminate all threads in the thread group (syscall 231).
+///
+/// For single-threaded processes: identical to `sys_exit`.
+/// For thread groups: kills all sibling threads first, then the caller does
+/// full process cleanup as the last thread standing.
+fn sys_exit_group(code: i32) -> ! {
+    let pid = crate::process::current_pid();
+    log::info!("[p{}] exit_group({})", pid, code);
+
+    if pid != 0 {
+        // Check if we are in a thread group.
+        let thread_group = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).and_then(|p| p.thread_group.clone())
+        };
+
+        if let Some(tg) = thread_group {
+            // Collect sibling TIDs (everyone except us).
+            let siblings: alloc::vec::Vec<u32> = {
+                let members = tg.members.lock();
+                members.iter().copied().filter(|&tid| tid != pid).collect()
+            };
+
+            // Kill each sibling thread.
+            for sibling_tid in &siblings {
+                // Perform clear_child_tid wake for the sibling.
+                do_clear_child_tid(*sibling_tid);
+                // Remove sibling from process table (shared resources stay via Arc).
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    table.reap(*sibling_tid);
+                }
+                // Mark sibling's scheduler task as Dead.
+                crate::task::mark_task_dead_by_pid(*sibling_tid);
+            }
+
+            // Clear the members list — only we remain, and we're about to exit.
+            {
+                let mut members = tg.members.lock();
+                members.clear();
+            }
+        }
+
+        // Now do our own clear_child_tid + full exit.
+        do_clear_child_tid(pid);
+        do_full_process_exit(pid, code);
+    }
+    // pid == 0 (kernel context): just die.
+    crate::mm::restore_kernel_cr3();
     crate::task::mark_current_dead();
 }
 
@@ -1503,8 +1679,8 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 
     const NEG_ESRCH_KILL: u64 = (-3_i64) as u64;
     if target_pid > 0 {
-        // Send to a specific process.
-        if crate::process::send_signal(target_pid as crate::process::Pid, sig) {
+        // Send to a specific process (or thread group).
+        if send_signal_to_thread_group(target_pid as crate::process::Pid, sig) {
             0
         } else {
             NEG_ESRCH_KILL
@@ -1528,6 +1704,104 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
     } else {
         // pid=0 or pid=-1: not fully implemented yet.
         NEG_EINVAL
+    }
+}
+
+/// Helper: deliver a signal to a thread group (or single-threaded process).
+///
+/// When the target PID belongs to a thread group, we find any thread in the
+/// group that does NOT have the signal blocked and deliver there.  If all
+/// threads block the signal, deliver to the group leader (stays pending).
+/// For single-threaded processes (no `thread_group`), behaves identically to
+/// `send_signal`.
+fn send_signal_to_thread_group(pid: crate::process::Pid, sig: u32) -> bool {
+    use crate::process::{PROCESS_TABLE, send_signal};
+
+    // First, check if the target exists and whether it has a thread group.
+    let thread_group_info: Option<(u32, alloc::vec::Vec<u32>)> = {
+        let table = PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(proc) => {
+                match &proc.thread_group {
+                    None => {
+                        // Single-threaded — fall through to normal delivery.
+                        None
+                    }
+                    Some(tg) => {
+                        let members = tg.members.lock();
+                        Some((tg.leader_tid, members.clone()))
+                    }
+                }
+            }
+            None => {
+                // Leader may have been reaped — scan for any thread with
+                // matching tgid to recover the thread group.
+                let mut found = None;
+                for p in table.iter() {
+                    if p.tgid == pid
+                        && let Some(ref tg) = p.thread_group
+                    {
+                        let members = tg.members.lock();
+                        found = Some((tg.leader_tid, members.clone()));
+                        break;
+                    }
+                }
+                match found {
+                    Some(info) => Some(info),
+                    None => return false,
+                }
+            }
+        }
+    };
+
+    match thread_group_info {
+        None => {
+            // Single-threaded process — deliver directly.
+            send_signal(pid, sig)
+        }
+        Some((leader_tid, members)) => {
+            // Multi-threaded: find a thread that does not block this signal.
+            let sig_mask = 1u64 << sig;
+            let table = PROCESS_TABLE.lock();
+
+            // First pass: find any member that doesn't block the signal.
+            for &tid in &members {
+                if let Some(proc) = table.find(tid)
+                    && proc.blocked_signals & sig_mask == 0
+                {
+                    // Found an unblocked thread — deliver here.
+                    drop(table);
+                    return send_signal(tid, sig);
+                }
+            }
+
+            // All threads block the signal — deliver to group leader
+            // (it stays pending until someone unblocks).
+            drop(table);
+            send_signal(leader_tid, sig)
+        }
+    }
+}
+
+/// `tkill(tid, sig)` — send a signal to a specific thread (syscall 200).
+fn sys_tkill(tid: u64, sig: u64) -> u64 {
+    let sig = sig as u32;
+    if sig > 63 {
+        return NEG_EINVAL;
+    }
+    if sig == 0 {
+        // Permission/existence check only.
+        let table = crate::process::PROCESS_TABLE.lock();
+        return if table.find(tid as crate::process::Pid).is_some() {
+            0
+        } else {
+            NEG_ESRCH
+        };
+    }
+    if crate::process::send_signal(tid as crate::process::Pid, sig) {
+        0
+    } else {
+        NEG_ESRCH
     }
 }
 
@@ -1674,7 +1948,7 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     // Linux struct sigaction layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes
     if oldact_ptr != 0 {
         let mut old_sa = [0u8; 32];
-        match proc.signal_actions[sig as usize] {
+        match proc.sigaction_get(sig as usize) {
             crate::process::SignalAction::Default => {
                 old_sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
             }
@@ -1721,7 +1995,7 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
         let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
-        proc.signal_actions[sig as usize] = match handler_addr {
+        let new_action = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
             _ => {
@@ -1746,6 +2020,7 @@ fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
                 }
             }
         };
+        proc.sigaction_set(sig as usize, new_action);
     }
 
     0
@@ -2394,11 +2669,11 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             Some(p) => (
                 p.brk_current,
                 p.mmap_next,
-                p.fd_table.clone(),
+                p.fd_table_snapshot(),
                 p.pgid,
                 p.cwd.clone(),
                 p.blocked_signals,
-                p.signal_actions,
+                p.signal_actions_snapshot(),
                 (p.alt_stack_base, p.alt_stack_size, p.alt_stack_flags),
                 p.fs_base,
                 (p.uid, p.gid, p.euid, p.egid),
@@ -2910,11 +3185,7 @@ fn has_pending_signal() -> bool {
     }
     for sig in 0..64u32 {
         if deliverable & (1u64 << sig) != 0 {
-            let action = if sig < 32 {
-                proc.signal_actions[sig as usize]
-            } else {
-                crate::process::SignalAction::Default
-            };
+            let action = proc.sigaction_get(sig as usize);
             let disposition = match action {
                 crate::process::SignalAction::Ignore => {
                     if sig == crate::process::SIGKILL || sig == crate::process::SIGSTOP {
@@ -3149,37 +3420,41 @@ use crate::process::{FdBackend, FdEntry, MAX_FDS};
 /// Clone the FD entry at `fd` from the current process's FD table.
 ///
 /// Returns `None` if no process is running or the FD slot is empty.
+/// Uses the shared fd table when the process is part of a thread group
+/// created with `CLONE_FILES`.
 fn current_fd_entry(fd: usize) -> Option<FdEntry> {
     let pid = crate::process::current_pid();
     let table = crate::process::PROCESS_TABLE.lock();
     let proc = table.find(pid)?;
-    proc.fd_table.get(fd)?.clone()
+    proc.fd_get(fd)
 }
 
 /// Mutate the FD entry at `fd` in the current process's FD table.
+/// Uses the shared fd table when the process is part of a thread group
+/// created with `CLONE_FILES`.
 fn with_current_fd_mut<F: FnOnce(&mut Option<FdEntry>)>(fd: usize, f: F) {
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
-    if let Some(proc) = table.find_mut(pid)
-        && let Some(slot) = proc.fd_table.get_mut(fd)
-    {
-        f(slot);
+    if let Some(proc) = table.find_mut(pid) {
+        if let Some(shared) = &proc.shared_fd_table {
+            if fd < MAX_FDS {
+                f(&mut shared.lock()[fd]);
+            }
+        } else if let Some(slot) = proc.fd_table.get_mut(fd) {
+            f(slot);
+        }
     }
 }
 
 /// Allocate the lowest available FD slot (starting from `min_fd`) in the
 /// current process's FD table. Returns the FD number or `None` if full.
+/// Uses the shared fd table when the process is part of a thread group
+/// created with `CLONE_FILES`.
 fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = table.find_mut(pid)?;
-    for i in min_fd..MAX_FDS {
-        if proc.fd_table[i].is_none() {
-            proc.fd_table[i] = Some(entry);
-            return Some(i);
-        }
-    }
-    None
+    proc.fd_alloc(min_fd, entry)
 }
 
 fn seed_pseudorandom_state() -> u64 {
@@ -8363,11 +8638,23 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 // set_tid_address(tidptr) — syscall 218 (musl TLS initialization)
 // ---------------------------------------------------------------------------
 
-/// Stub: stores nothing, returns the caller's PID (which is also the TID in
-/// our single-threaded model).  musl calls this during `__init_tls` to record
-/// the `clear_child_tid` pointer; we can safely ignore the pointer.
-fn sys_linux_set_tid_address() -> u64 {
-    crate::process::current_pid() as u64
+/// `set_tid_address(tidptr)` — store the `clear_child_tid` pointer for the
+/// calling thread and return the caller's TID.
+///
+/// musl calls this during `__init_tls` to record the address that the kernel
+/// should clear (and futex-wake) when the thread exits.
+fn sys_linux_set_tid_address(tidptr: u64) -> u64 {
+    let pid = crate::process::current_pid();
+
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.clear_child_tid = tidptr;
+            proc.tid as u64
+        } else {
+            pid as u64
+        }
+    }
 }
 
 // ===========================================================================
@@ -8454,25 +8741,352 @@ fn sys_access(path_ptr: u64) -> u64 {
 // clone(flags, ...) — syscall 56
 // ---------------------------------------------------------------------------
 
-/// Minimal clone stub: if flags indicate a plain fork (flags == SIGCHLD or 0),
-/// delegate to sys_fork. Otherwise return -ENOSYS.
-fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
-    const SIGCHLD: u64 = 17;
-    const CLONE_VM: u64 = 0x100;
-    const CLONE_VFORK: u64 = 0x4000;
+// ---------------------------------------------------------------------------
+// Clone flags (Phase 40)
+// ---------------------------------------------------------------------------
+
+const SIGCHLD: u64 = 17;
+const CLONE_VM: u64 = 0x0000_0100;
+#[allow(dead_code)]
+const CLONE_FS: u64 = 0x0000_0200;
+#[allow(dead_code)]
+const CLONE_FILES: u64 = 0x0000_0400;
+#[allow(dead_code)]
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_VFORK: u64 = 0x0000_4000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+/// Parse clone(2) flags and dispatch to the appropriate implementation.
+///
+/// Linux clone ABI: flags (rdi), child_stack (rsi), parent_tidptr (rdx),
+/// child_tidptr (r10), tls (r8).
+fn sys_clone(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: u64,
+    child_tidptr: u64,
+    tls: u64,
+    user_rip: u64,
+    user_rsp: u64,
+) -> u64 {
+    // CLONE_THREAD requires CLONE_VM — threads must share address space.
+    if flags & CLONE_THREAD != 0 && flags & CLONE_VM == 0 {
+        log::warn!("sys_clone: CLONE_THREAD without CLONE_VM");
+        return NEG_EINVAL;
+    }
+
+    // Thread creation path (Phase 40).
+    if flags & CLONE_THREAD != 0 {
+        return sys_clone_thread(
+            flags,
+            child_stack,
+            parent_tidptr,
+            child_tidptr,
+            tls,
+            user_rip,
+        );
+    }
+
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
     // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
     // combination used by musl's posix_spawn/system() — treat all as fork.
-    if flags == 0
-        || flags == SIGCHLD
-        || flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
-        || flags == (CLONE_VM | CLONE_VFORK)
+    let fork_flags =
+        flags & !(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID | CLONE_SETTLS);
+    if fork_flags == 0
+        || fork_flags == SIGCHLD
+        || fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+        || fork_flags == (CLONE_VM | CLONE_VFORK)
     {
         sys_fork(user_rip, user_rsp)
     } else {
         log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS
     }
+}
+
+// ---------------------------------------------------------------------------
+// clone(CLONE_THREAD) — Phase 40, Track C
+// ---------------------------------------------------------------------------
+
+/// Create a new thread sharing the parent's address space.
+///
+/// The child thread:
+/// - gets a new PID/TID but shares the parent's TGID
+/// - shares the parent's page table (no CoW clone)
+/// - shares the parent's fd table and signal actions via Arc
+/// - gets its own kernel stack
+/// - starts executing in userspace at `user_rip` with RSP = `child_stack`
+fn sys_clone_thread(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: u64,
+    child_tidptr: u64,
+    tls: u64,
+    user_rip: u64,
+) -> u64 {
+    use crate::process::{
+        PROCESS_TABLE, Process, ProcessState, ThreadGroup, alloc_kernel_stack_pub,
+    };
+    use alloc::sync::Arc;
+
+    let parent_pid = crate::process::current_pid();
+    log::info!(
+        "[p{}] clone_thread(flags={:#x}, child_stack={:#x})",
+        parent_pid,
+        flags,
+        child_stack
+    );
+
+    if child_stack == 0 {
+        log::warn!("sys_clone_thread: child_stack is NULL");
+        return NEG_EINVAL;
+    }
+
+    // Gather parent state under lock.
+    let parent_info = {
+        let table = PROCESS_TABLE.lock();
+        match table.find(parent_pid) {
+            Some(p) => {
+                let cr3 = match p.page_table_root {
+                    Some(cr3) => cr3,
+                    None => {
+                        log::warn!("sys_clone_thread: parent has no page table");
+                        return NEG_EINVAL;
+                    }
+                };
+                Some((
+                    cr3,
+                    p.tgid,
+                    p.ppid,
+                    p.brk_current,
+                    p.mmap_next,
+                    p.pgid,
+                    p.cwd.clone(),
+                    p.blocked_signals,
+                    p.signal_actions_snapshot(),
+                    p.fs_base,
+                    (p.uid, p.gid, p.euid, p.egid),
+                    p.umask,
+                    p.session_id,
+                    p.controlling_tty.clone(),
+                    p.mappings.clone(),
+                    p.exec_path.clone(),
+                    p.cmdline.clone(),
+                    p.fd_table_snapshot(),
+                    p.thread_group.clone(),
+                    p.shared_fd_table.clone(),
+                    p.shared_signal_actions.clone(),
+                ))
+            }
+            None => None,
+        }
+    };
+
+    let (
+        parent_cr3,
+        parent_tgid,
+        parent_ppid,
+        parent_brk,
+        parent_mmap,
+        parent_pgid,
+        parent_cwd,
+        parent_blocked_signals,
+        parent_signal_actions,
+        parent_fs_base,
+        parent_ids,
+        parent_umask,
+        parent_session_id,
+        parent_ctty,
+        parent_mappings,
+        parent_exec_path,
+        parent_cmdline,
+        parent_fds,
+        parent_thread_group,
+        parent_shared_fd,
+        parent_shared_sig,
+    ) = match parent_info {
+        Some(info) => info,
+        None => {
+            log::warn!("sys_clone_thread: parent {} not found", parent_pid);
+            return NEG_EINVAL;
+        }
+    };
+
+    // Allocate child PID (also serves as TID).
+    let child_pid = crate::process::alloc_pid_pub();
+    let child_tgid = parent_tgid;
+
+    // Create or join the ThreadGroup.
+    let thread_group = match parent_thread_group {
+        Some(tg) => {
+            // Parent already in a thread group — add child.
+            tg.members.lock().push(child_pid);
+            tg
+        }
+        None => {
+            // First thread creation — create a new group with parent as leader.
+            let tg = Arc::new(ThreadGroup {
+                leader_tid: parent_tgid,
+                members: spin::Mutex::new(alloc::vec![parent_tgid, child_pid]),
+            });
+            // Set the parent's thread_group under lock.
+            {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(p) = table.find_mut(parent_pid) {
+                    p.thread_group = Some(tg.clone());
+                }
+            }
+            tg
+        }
+    };
+
+    // Share fd table only when CLONE_FILES is set; otherwise child gets a
+    // private copy (shared_fd_table stays None).
+    // Clone parent_fds before the potential move into an Arc so it remains
+    // available for the non-shared path in the child Process builder.
+    let child_fds_copy = parent_fds.clone();
+    let shared_fd = if flags & CLONE_FILES != 0 {
+        Some(match parent_shared_fd {
+            Some(arc) => arc,
+            None => {
+                let arc = Arc::new(spin::Mutex::new(parent_fds));
+                // Update parent to use shared fd table.
+                {
+                    let mut table = PROCESS_TABLE.lock();
+                    if let Some(p) = table.find_mut(parent_pid) {
+                        p.shared_fd_table = Some(arc.clone());
+                    }
+                }
+                arc
+            }
+        })
+    } else {
+        None
+    };
+
+    // Share signal actions only when CLONE_SIGHAND is set; otherwise child
+    // gets its own private copy.
+    let shared_sig = if flags & CLONE_SIGHAND != 0 {
+        Some(match parent_shared_sig {
+            Some(arc) => arc,
+            None => {
+                let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
+                {
+                    let mut table = PROCESS_TABLE.lock();
+                    if let Some(p) = table.find_mut(parent_pid) {
+                        p.shared_signal_actions = Some(arc.clone());
+                    }
+                }
+                arc
+            }
+        })
+    } else {
+        None
+    };
+
+    // Allocate a NEW kernel stack for the child thread.
+    let kstack_top = alloc_kernel_stack_pub();
+
+    // Determine TLS: if CLONE_SETTLS, use the provided tls value.
+    let child_fs_base = if flags & CLONE_SETTLS != 0 {
+        tls
+    } else {
+        parent_fs_base
+    };
+
+    // Determine clear_child_tid.
+    let child_clear_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+        child_tidptr
+    } else {
+        0
+    };
+
+    // Build the child Process entry.
+    let child_proc = Process {
+        pid: child_pid,
+        tid: child_pid,
+        tgid: child_tgid,
+        clear_child_tid: child_clear_tid,
+        ppid: parent_ppid,
+        state: ProcessState::Ready,
+        page_table_root: Some(parent_cr3), // SHARED — same physical page table
+        kernel_stack_top: kstack_top,
+        entry_point: user_rip,
+        user_stack_top: child_stack,
+        exit_code: None,
+        stop_signal: 0,
+        stop_reported: false,
+        brk_current: parent_brk,
+        mmap_next: parent_mmap,
+        pgid: parent_pgid,
+        fd_table: {
+            // When sharing via Arc, snapshot from the shared table;
+            // otherwise use the private copy.
+            if let Some(ref arc) = shared_fd {
+                arc.lock().clone()
+            } else {
+                child_fds_copy
+            }
+        },
+        pending_signals: 0,
+        blocked_signals: parent_blocked_signals,
+        signal_actions: {
+            if let Some(ref arc) = shared_sig {
+                *arc.lock()
+            } else {
+                parent_signal_actions
+            }
+        },
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
+        cwd: parent_cwd,
+        fs_base: child_fs_base,
+        uid: parent_ids.0,
+        gid: parent_ids.1,
+        euid: parent_ids.2,
+        egid: parent_ids.3,
+        umask: parent_umask,
+        session_id: parent_session_id,
+        controlling_tty: parent_ctty,
+        mappings: parent_mappings,
+        exec_path: parent_exec_path,
+        cmdline: parent_cmdline,
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: Some(thread_group),
+        shared_fd_table: shared_fd,
+        shared_signal_actions: shared_sig,
+    };
+
+    PROCESS_TABLE.lock().insert(child_proc);
+
+    // CLONE_PARENT_SETTID: write child TID to parent_tidptr in userspace.
+    if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(parent_tidptr, &tid_bytes);
+    }
+
+    // CLONE_CHILD_SETTID: write child TID to child_tidptr in userspace.
+    // Since we share the address space, we can write it now from the parent context.
+    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(child_tidptr, &tid_bytes);
+    }
+
+    // Push a fork context for the child thread. The child will start at
+    // user_rip (the return address from the clone syscall) with rax=0 and
+    // RSP = child_stack.
+    crate::process::push_fork_ctx_for_thread(child_pid, user_rip, child_stack);
+
+    // Spawn a kernel task for the child thread.
+    crate::task::spawn(crate::process::fork_child_trampoline, "clone-thread");
+
+    log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
+    child_pid as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -8696,40 +9310,170 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
 // futex(uaddr, op, val, ...) — syscall 202
 // ---------------------------------------------------------------------------
 
-/// Minimal futex stub for single-threaded OS.
+/// Futex wait/wake implementation for thread synchronization.
+/// Supports WAIT, WAKE, WAIT_BITSET, WAKE_BITSET with real blocking queues.
 ///
-/// In a single-threaded/cooperative OS, no other thread can change
-/// the futex word or wake a waiter. If FUTEX_WAIT sees *uaddr == val,
-/// the lock is deadlocked — we clear the word to 0 so the caller's
-/// next compare-and-swap succeeds and acquires the lock.
-fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
+/// Supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, and
+/// `FUTEX_WAKE_BITSET` operations with the `FUTEX_PRIVATE_FLAG`.
+fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
-    const FUTEX_PRIVATE: u64 = 128;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
 
-    let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
-    match cmd {
-        FUTEX_WAIT => {
-            // Check *uaddr == val per the futex contract.
-            let mut cur = [0u8; 4];
-            if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
-                return NEG_EFAULT;
-            }
-            let current_val = u32::from_ne_bytes(cur) as u64;
-            if current_val != val {
-                return NEG_EAGAIN;
-            }
-            // Single-threaded deadlock: no other thread can wake us.
-            // Force-clear the futex word to 0 so the caller's next
-            // lock-acquire CAS (compare_exchange(0, tid)) succeeds.
-            let zero = 0u32.to_ne_bytes();
-            if crate::mm::user_mem::copy_to_user(uaddr, &zero).is_err() {
-                return NEG_EFAULT;
-            }
-            0 // pretend we were woken
+    use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE, FutexWaiter};
+
+    let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
+    let cmd = op & !(FUTEX_PRIVATE_FLAG);
+
+    // Build the futex key: (page_table_root, uaddr).
+    // Private futexes use 0 as root; shared futexes use the real CR3.
+    let page_table_root = if is_private {
+        0u64
+    } else {
+        let pid = crate::process::current_pid();
+        match crate::process::PROCESS_TABLE
+            .lock()
+            .find(pid)
+            .and_then(|p| p.page_table_root.map(|a| a.as_u64()))
+        {
+            Some(root) => root,
+            None => return NEG_EINVAL, // non-private futex requires a page table root
         }
-        FUTEX_WAKE => 1, // pretend one waiter woke up
-        _ => 0,          // unknown ops succeed silently
+    };
+    let key = (page_table_root, uaddr);
+
+    match cmd {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let bitset = if cmd == FUTEX_WAIT_BITSET {
+                let bs = val3 as u32;
+                if bs == 0 {
+                    return NEG_EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
+
+            // Atomically: check *uaddr == val and enqueue waiter under the
+            // FUTEX_TABLE lock so no wake can be missed between the check
+            // and the block.
+            let tid = match crate::task::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EAGAIN,
+            };
+
+            // Single-threaded fast path: if this process has no thread group,
+            // blocking would deadlock because no other thread exists to wake
+            // us. Clear the futex word to 0 (matching the pre-Phase 40 stub
+            // behavior that musl's __lock relies on) and return immediately.
+            let is_single_threaded = {
+                let pid = crate::process::current_pid();
+                let table = crate::process::PROCESS_TABLE.lock();
+                table
+                    .find(pid)
+                    .map(|p| p.thread_group.is_none())
+                    .unwrap_or(true)
+            };
+            if is_single_threaded {
+                let mut cur = [0u8; 4];
+                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                    return NEG_EFAULT;
+                }
+                if u32::from_ne_bytes(cur) as u64 != val {
+                    return NEG_EAGAIN;
+                }
+                let _ = crate::mm::user_mem::copy_to_user(uaddr, &0u32.to_ne_bytes());
+                return 0;
+            }
+
+            let woken_flag = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+            {
+                let mut table = FUTEX_TABLE.lock();
+
+                // Read the futex word from userspace.
+                let mut cur = [0u8; 4];
+                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                    return NEG_EFAULT;
+                }
+                let current_val = u32::from_ne_bytes(cur) as u64;
+                if current_val != val {
+                    return NEG_EAGAIN;
+                }
+
+                // Value matches — enqueue this thread as a waiter.
+                table.entry(key).or_default().push(FutexWaiter {
+                    tid,
+                    bitset,
+                    woken: alloc::sync::Arc::clone(&woken_flag),
+                });
+            }
+
+            // Atomically check the woken flag and block under the scheduler
+            // lock to avoid a missed-wakeup race where a waker sets the flag
+            // and calls wake_task() between our check and block.
+            crate::task::block_current_on_futex_unless_woken(&woken_flag);
+
+            // Woken — return success.
+            0
+        }
+
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let bitset = if cmd == FUTEX_WAKE_BITSET {
+                let bs = val3 as u32;
+                if bs == 0 {
+                    return NEG_EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
+
+            let max_wake = val as usize;
+            let mut woken_count = 0usize;
+
+            let to_wake = {
+                let mut table = FUTEX_TABLE.lock();
+                let mut wake_list = alloc::vec::Vec::new();
+                if let Some(waiters) = table.get_mut(&key) {
+                    let mut i = 0;
+                    while i < waiters.len() && woken_count < max_wake {
+                        if (waiters[i].bitset & bitset) != 0 {
+                            let w = waiters.remove(i);
+                            // Set the woken flag *before* calling wake_task so the
+                            // waiter can detect the wake even if it has not blocked yet.
+                            w.woken.store(true, core::sync::atomic::Ordering::Release);
+                            wake_list.push(w.tid);
+                            woken_count += 1;
+                            // Don't increment i — remove shifted elements down.
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    // Clean up empty entries.
+                    if waiters.is_empty() {
+                        table.remove(&key);
+                    }
+                }
+                wake_list
+            };
+
+            // Wake the tasks outside the FUTEX_TABLE lock.
+            // Only count tasks that were actually transitioned to Ready
+            // (skip Dead or already-woken tasks).
+            let mut actual_woken = 0usize;
+            for tid in to_wake {
+                if crate::task::wake_task(tid) {
+                    actual_woken += 1;
+                }
+            }
+
+            actual_woken as u64
+        }
+
+        _ => 0, // Unknown ops succeed silently (Linux compat).
     }
 }
 
