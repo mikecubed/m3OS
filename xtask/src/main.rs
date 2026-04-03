@@ -685,6 +685,11 @@ fn build_pdpmake() {
 ///
 /// Gracefully creates an empty placeholder if musl-gcc is not available.
 fn build_doom() {
+    // Pinned upstream commit — update when pulling in doomgeneric changes.
+    // Commit date: 2026-03-28  "__bool_true_false_are_defined handling"
+    // Repo: https://github.com/ozkl/doomgeneric
+    const DOOMGENERIC_COMMIT: &str = "3b1d53020373b502035d7d48dede645a7c429feb";
+
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
     let doom_bin = initrd.join("doom");
@@ -695,10 +700,10 @@ fn build_doom() {
         return;
     }
 
-    // Clone doomgeneric source.
+    // Clone doomgeneric source and pin to the known-good commit.
     let dg_src = root.join("target/doomgeneric-src");
     if !dg_src.join("doomgeneric").join("doomgeneric.c").exists() {
-        println!("doom: cloning doomgeneric from GitHub...");
+        println!("doom: cloning doomgeneric from GitHub (commit {DOOMGENERIC_COMMIT})...");
         let _ = fs::remove_dir_all(&dg_src);
         let status = Command::new("git")
             .args([
@@ -716,6 +721,21 @@ fn build_doom() {
                 fs::write(&doom_bin, b"").unwrap();
             }
             return;
+        }
+        // Pin to the known-good commit for reproducible builds.
+        let checkout = Command::new("git")
+            .args([
+                "-C",
+                dg_src.to_str().unwrap(),
+                "checkout",
+                DOOMGENERIC_COMMIT,
+            ])
+            .status()
+            .expect("failed to run git checkout for doomgeneric");
+        if !checkout.success() {
+            eprintln!(
+                "warning: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT}; using HEAD"
+            );
         }
     }
 
