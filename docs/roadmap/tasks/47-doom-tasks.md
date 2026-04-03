@@ -1,6 +1,6 @@
 # Phase 47 — DOOM: Task List
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-47
 **Depends on:** Phase 9 (Framebuffer) ✅, Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅
 **Goal:** Make DOOM playable inside m3OS. Expose the UEFI framebuffer to userspace via
