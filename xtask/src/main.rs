@@ -188,6 +188,8 @@ fn build_userspace_bins() {
         "head", "file", "strings", "uniq", "free", "df", "hexdump",
         // Phase 41 Rust ports (batch 3 — medium)
         "cal", "tr", "sort", "tail", "ps", "du", "chown", "find",
+        // Phase 41 Rust ports (batch 4 — complex)
+        "cut", "diff", "sed", "xargs", "less", "patch",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -238,13 +240,6 @@ fn build_musl_bins() {
     let bins: &[(&str, &str)] = &[
         ("userspace/hello-c/hello.c", "hello"),
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
-        // Phase 41 complex utils (remaining C, not yet ported to Rust)
-        ("userspace/coreutils/cut.c", "cut"),
-        ("userspace/coreutils/sed.c", "sed"),
-        ("userspace/coreutils/xargs.c", "xargs"),
-        ("userspace/coreutils/diff.c", "diff"),
-        ("userspace/coreutils/patch.c", "patch"),
-        ("userspace/coreutils/less.c", "less"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test

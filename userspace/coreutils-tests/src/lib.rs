@@ -1,0 +1,14 @@
+pub mod cal;
+pub mod cut;
+pub mod diff;
+pub mod find_glob;
+pub mod grep;
+pub mod head_tail;
+pub mod hexdump;
+pub mod patch;
+pub mod sed;
+pub mod sort;
+pub mod strings;
+pub mod tr;
+pub mod wc;
+pub mod xargs;

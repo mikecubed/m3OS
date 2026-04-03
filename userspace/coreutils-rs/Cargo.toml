@@ -195,3 +195,28 @@ path = "src/chown.rs"
 [[bin]]
 name = "find"
 path = "src/find.rs"
+
+# Phase 41 Rust ports (batch 4 — complex C utils)
+[[bin]]
+name = "cut"
+path = "src/cut.rs"
+
+[[bin]]
+name = "diff"
+path = "src/diff.rs"
+
+[[bin]]
+name = "sed"
+path = "src/sed.rs"
+
+[[bin]]
+name = "xargs"
+path = "src/xargs.rs"
+
+[[bin]]
+name = "less"
+path = "src/less.rs"
+
+[[bin]]
+name = "patch"
+path = "src/patch.rs"
