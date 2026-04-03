@@ -22,7 +22,7 @@
 //! | 60      | exit          | code                |
 //! | 61      | waitpid       | pid, status_ptr     |
 //! | 110     | getppid       | —                   |
-//! | 231     | exit_group    | code (alias exit)   |
+//! | 231     | exit_group    | code                |
 
 extern crate alloc;
 
@@ -919,7 +919,7 @@ global_asm!(
 /// |     110 | getppid     | ✓ same as Phase 11    |
 /// |     158 | arch_prctl  | ARCH_SET_FS only       |
 /// |     218 | set_tid_addr| stub, returns PID      |
-/// |     231 | exit_group  | ✓ same as Phase 11    |
+/// |     231 | exit_group  | ✓ kills all threads   |
 /// |     257 | openat      | delegates to open     |
 /// |     262 | newfstatat  | delegates to fstat    |
 #[unsafe(no_mangle)]
@@ -934,7 +934,8 @@ pub extern "C" fn syscall_handler(
     // Divergent syscalls (exit, sigreturn) never return — handle them first.
     match number {
         15 => sys_sigreturn(user_rsp),
-        60 | 231 => sys_exit(arg0 as i32),
+        60 => sys_exit(arg0 as i32),
+        231 => sys_exit_group(arg0 as i32),
         _ => {}
     }
 
@@ -1097,8 +1098,8 @@ pub extern "C" fn syscall_handler(
         165 => sys_linux_mount(arg0, arg1, arg2),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
         186 => sys_gettid(),
-        // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
-        200 => sys_kill(arg0, arg1),
+        // Phase 40: tkill(tid, sig) — send signal to a specific thread
+        200 => sys_tkill(arg0, arg1),
         // Phase 40: futex — real wait/wake queues
         202 => {
             let val3 = crate::smp::per_core().syscall_user_r9;
@@ -1462,72 +1463,67 @@ fn sys_getppid() -> u64 {
         .unwrap_or(0)
 }
 
-/// `exit(code)` / `exit_group(code)` — terminate the calling process.
+/// Perform clear_child_tid futex wake for the given process/thread.
 ///
-/// Marks the process as a zombie, stores the exit code, restores the kernel
-/// CR3 (so the next scheduled task has a consistent address space), then marks
-/// the kernel task as dead so it is never rescheduled.
-fn sys_exit(code: i32) -> ! {
-    let pid = crate::process::current_pid();
-    log::info!("[p{}] exit({})", pid, code);
-    if pid != 0 {
-        // Phase 40: clear_child_tid — write 0 to the userspace address and
-        // futex-wake one waiter so pthread_join unblocks.
-        {
-            let clear_tid_addr = {
-                let table = crate::process::PROCESS_TABLE.lock();
-                table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
-            };
-            if clear_tid_addr != 0 {
-                // Write 0u32 to the userspace address.
-                let zero = 0u32.to_ne_bytes();
-                let _ = crate::mm::user_mem::copy_to_user(clear_tid_addr, &zero);
-                // Wake one waiter on the private futex key (0, addr) — this
-                // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
-                {
-                    use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
-                    let key = (0u64, clear_tid_addr);
-                    let to_wake = {
-                        let mut table = FUTEX_TABLE.lock();
-                        let mut wake_ids = alloc::vec::Vec::new();
-                        if let Some(waiters) = table.get_mut(&key) {
-                            if !waiters.is_empty() {
-                                // Wake up to 1 waiter with matching bitset.
-                                let mut i = 0;
-                                while i < waiters.len() && wake_ids.is_empty() {
-                                    if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
-                                        let w = waiters.swap_remove(i);
-                                        wake_ids.push(w.tid);
-                                    } else {
-                                        i += 1;
-                                    }
-                                }
-                            }
-                            if waiters.is_empty() {
-                                table.remove(&key);
-                            }
+/// Writes 0 to the userspace `clear_child_tid` address and wakes one futex
+/// waiter, allowing `pthread_join` to unblock.
+fn do_clear_child_tid(pid: crate::process::Pid) {
+    let clear_tid_addr = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).map(|p| p.clear_child_tid).unwrap_or(0)
+    };
+    if clear_tid_addr != 0 {
+        // Write 0u32 to the userspace address.
+        let zero = 0u32.to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(clear_tid_addr, &zero);
+        // Wake one waiter on the private futex key (0, addr) — this
+        // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
+        use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
+        let key = (0u64, clear_tid_addr);
+        let to_wake = {
+            let mut table = FUTEX_TABLE.lock();
+            let mut wake_ids = alloc::vec::Vec::new();
+            if let Some(waiters) = table.get_mut(&key) {
+                if !waiters.is_empty() {
+                    // Wake up to 1 waiter with matching bitset.
+                    let mut i = 0;
+                    while i < waiters.len() && wake_ids.is_empty() {
+                        if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
+                            let w = waiters.swap_remove(i);
+                            wake_ids.push(w.tid);
+                        } else {
+                            i += 1;
                         }
-                        wake_ids
-                    };
-                    for tid in to_wake {
-                        crate::task::wake_task(tid);
                     }
                 }
+                if waiters.is_empty() {
+                    table.remove(&key);
+                }
             }
+            wake_ids
+        };
+        for tid in to_wake {
+            crate::task::wake_task(tid);
         }
-
-        // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
-        crate::process::close_all_fds_for(pid);
-        {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
-                proc.state = crate::process::ProcessState::Zombie;
-                proc.exit_code = Some(code);
-            }
-        }
-        // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
-        crate::process::send_sigchld_to_parent(pid);
     }
+}
+
+/// Perform full process exit cleanup: close FDs, mark zombie, send SIGCHLD,
+/// free page table.  Called when a single-threaded process exits or when the
+/// last thread in a thread group exits.
+fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
+    // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
+    crate::process::close_all_fds_for(pid);
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.state = crate::process::ProcessState::Zombie;
+            proc.exit_code = Some(code);
+        }
+    }
+    // Deliver SIGCHLD to parent (Phase 14, P14-T033a).
+    crate::process::send_sigchld_to_parent(pid);
+
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
@@ -1542,6 +1538,110 @@ fn sys_exit(code: i32) -> ! {
         crate::mm::free_process_page_table(phys.as_u64());
     }
     // Mark the kernel task as dead so the scheduler reclaims it.
+    crate::task::mark_current_dead();
+}
+
+/// `exit(code)` — terminate the calling thread (syscall 60).
+///
+/// For single-threaded processes: full process exit (zombie, SIGCHLD, free PT).
+/// For threads in a thread group:
+///   - If this is the LAST thread: full process cleanup.
+///   - Otherwise: minimal cleanup — remove from group, clear_child_tid wake,
+///     remove Process entry, mark scheduler task as Dead.
+fn sys_exit(code: i32) -> ! {
+    let pid = crate::process::current_pid();
+    log::info!("[p{}] exit({})", pid, code);
+
+    if pid != 0 {
+        // Phase 40: clear_child_tid futex wake.
+        do_clear_child_tid(pid);
+
+        // Check if we are in a thread group.
+        let thread_group = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).and_then(|p| p.thread_group.clone())
+        };
+
+        if let Some(tg) = thread_group {
+            // Remove ourselves from the thread group member list.
+            let is_last = {
+                let mut members = tg.members.lock();
+                members.retain(|&tid| tid != pid);
+                members.is_empty()
+            };
+
+            if !is_last {
+                // Non-last thread: minimal cleanup only.
+                // Remove our Process entry (shared resources stay alive via Arc).
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    table.reap(pid);
+                }
+                // Restore kernel CR3 before dying — we share the address space
+                // but must not leave the scheduler pointing at user CR3.
+                crate::mm::restore_kernel_cr3();
+                // Mark our scheduler task as Dead (do NOT free page table or fds).
+                crate::task::mark_current_dead();
+            }
+            // Last thread: fall through to full process cleanup below.
+        }
+        // Single-threaded process OR last thread in group: full cleanup.
+        do_full_process_exit(pid, code);
+    }
+    // pid == 0 (kernel context): just die.
+    crate::mm::restore_kernel_cr3();
+    crate::task::mark_current_dead();
+}
+
+/// `exit_group(code)` — terminate all threads in the thread group (syscall 231).
+///
+/// For single-threaded processes: identical to `sys_exit`.
+/// For thread groups: kills all sibling threads first, then the caller does
+/// full process cleanup as the last thread standing.
+fn sys_exit_group(code: i32) -> ! {
+    let pid = crate::process::current_pid();
+    log::info!("[p{}] exit_group({})", pid, code);
+
+    if pid != 0 {
+        // Check if we are in a thread group.
+        let thread_group = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table.find(pid).and_then(|p| p.thread_group.clone())
+        };
+
+        if let Some(tg) = thread_group {
+            // Collect sibling TIDs (everyone except us).
+            let siblings: alloc::vec::Vec<u32> = {
+                let members = tg.members.lock();
+                members.iter().copied().filter(|&tid| tid != pid).collect()
+            };
+
+            // Kill each sibling thread.
+            for sibling_tid in &siblings {
+                // Perform clear_child_tid wake for the sibling.
+                do_clear_child_tid(*sibling_tid);
+                // Remove sibling from process table (shared resources stay via Arc).
+                {
+                    let mut table = crate::process::PROCESS_TABLE.lock();
+                    table.reap(*sibling_tid);
+                }
+                // Mark sibling's scheduler task as Dead.
+                crate::task::mark_task_dead_by_pid(*sibling_tid);
+            }
+
+            // Clear the members list — only we remain, and we're about to exit.
+            {
+                let mut members = tg.members.lock();
+                members.clear();
+            }
+        }
+
+        // Now do our own clear_child_tid + full exit.
+        do_clear_child_tid(pid);
+        do_full_process_exit(pid, code);
+    }
+    // pid == 0 (kernel context): just die.
+    crate::mm::restore_kernel_cr3();
     crate::task::mark_current_dead();
 }
 
@@ -1570,8 +1670,8 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
 
     const NEG_ESRCH_KILL: u64 = (-3_i64) as u64;
     if target_pid > 0 {
-        // Send to a specific process.
-        if crate::process::send_signal(target_pid as crate::process::Pid, sig) {
+        // Send to a specific process (or thread group).
+        if send_signal_to_thread_group(target_pid as crate::process::Pid, sig) {
             0
         } else {
             NEG_ESRCH_KILL
@@ -1595,6 +1695,87 @@ fn sys_kill(pid: u64, sig: u64) -> u64 {
     } else {
         // pid=0 or pid=-1: not fully implemented yet.
         NEG_EINVAL
+    }
+}
+
+/// Helper: deliver a signal to a thread group (or single-threaded process).
+///
+/// When the target PID belongs to a thread group, we find any thread in the
+/// group that does NOT have the signal blocked and deliver there.  If all
+/// threads block the signal, deliver to the group leader (stays pending).
+/// For single-threaded processes (no `thread_group`), behaves identically to
+/// `send_signal`.
+fn send_signal_to_thread_group(pid: crate::process::Pid, sig: u32) -> bool {
+    use crate::process::{PROCESS_TABLE, send_signal};
+
+    // First, check if the target exists and whether it has a thread group.
+    let thread_group_info: Option<(u32, alloc::vec::Vec<u32>)> = {
+        let table = PROCESS_TABLE.lock();
+        match table.find(pid) {
+            None => return false,
+            Some(proc) => {
+                match &proc.thread_group {
+                    None => {
+                        // Single-threaded — fall through to normal delivery.
+                        None
+                    }
+                    Some(tg) => {
+                        let members = tg.members.lock();
+                        Some((tg.leader_tid, members.clone()))
+                    }
+                }
+            }
+        }
+    };
+
+    match thread_group_info {
+        None => {
+            // Single-threaded process — deliver directly.
+            send_signal(pid, sig)
+        }
+        Some((leader_tid, members)) => {
+            // Multi-threaded: find a thread that does not block this signal.
+            let sig_mask = 1u64 << sig;
+            let table = PROCESS_TABLE.lock();
+
+            // First pass: find any member that doesn't block the signal.
+            for &tid in &members {
+                if let Some(proc) = table.find(tid)
+                    && proc.blocked_signals & sig_mask == 0
+                {
+                    // Found an unblocked thread — deliver here.
+                    drop(table);
+                    return send_signal(tid, sig);
+                }
+            }
+
+            // All threads block the signal — deliver to group leader
+            // (it stays pending until someone unblocks).
+            drop(table);
+            send_signal(leader_tid, sig)
+        }
+    }
+}
+
+/// `tkill(tid, sig)` — send a signal to a specific thread (syscall 200).
+fn sys_tkill(tid: u64, sig: u64) -> u64 {
+    let sig = sig as u32;
+    if sig > 63 {
+        return NEG_EINVAL;
+    }
+    if sig == 0 {
+        // Permission/existence check only.
+        let table = crate::process::PROCESS_TABLE.lock();
+        return if table.find(tid as crate::process::Pid).is_some() {
+            0
+        } else {
+            NEG_ESRCH
+        };
+    }
+    if crate::process::send_signal(tid as crate::process::Pid, sig) {
+        0
+    } else {
+        NEG_ESRCH
     }
 }
 

@@ -467,6 +467,21 @@ pub fn mark_current_dead() -> ! {
     }
 }
 
+/// Mark a task as [`TaskState::Dead`] by its process/thread PID.
+///
+/// Used by `exit_group()` to kill sibling threads.  Returns `true` if the
+/// task was found and marked dead, `false` otherwise.
+pub fn mark_task_dead_by_pid(pid: u32) -> bool {
+    let mut sched = SCHEDULER.lock();
+    for task in sched.tasks.iter_mut() {
+        if task.pid == pid && task.state != TaskState::Dead {
+            task.state = TaskState::Dead;
+            return true;
+        }
+    }
+    false
+}
+
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
 pub fn wake_task(id: TaskId) {
     let enqueue = {
