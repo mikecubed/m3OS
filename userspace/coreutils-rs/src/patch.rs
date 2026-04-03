@@ -197,8 +197,11 @@ fn get_line<'a>(
 
 /// Strip leading `n` path components from `path`.
 fn strip_components(path: &[u8], n: u32) -> &[u8] {
+    if n == 0 {
+        return path; // preserve absolute paths
+    }
     let mut p = path;
-    // Strip leading slashes
+    // Strip leading slashes before the first real component
     while p.first() == Some(&b'/') {
         p = &p[1..];
     }
@@ -535,7 +538,7 @@ fn nul_len(buf: &[u8]) -> usize {
 
 #[allow(clippy::deref_addrof)]
 fn main(args: &[&str]) -> i32 {
-    let mut strip: u32 = 1;
+    let mut strip: u32 = 0;
     let mut argi = 1usize;
 
     // Parse -pN argument
