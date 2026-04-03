@@ -254,6 +254,11 @@ fn build_musl_bins() {
         ("userspace/coreutils/umount.c", "umount"),
         ("userspace/coreutils/kill.c", "kill"),
         ("userspace/coreutils/ps.c", "ps"),
+        ("userspace/coreutils/strings.c", "strings"),
+        ("userspace/coreutils/cal.c", "cal"),
+        ("userspace/coreutils/diff.c", "diff"),
+        ("userspace/coreutils/patch.c", "patch"),
+        ("userspace/coreutils/less.c", "less"),
         // Phase 19 signal handler test
         ("userspace/signal-test/signal-test.c", "signal-test"),
         // Phase 21: stdin test
@@ -2857,7 +2862,156 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 16. make clean
+    // 16. Phase 41 developer tools: strings, cal, diff, patch, less
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/strings -n 4 /etc/passwd | /bin/head -n 1\n",
+        label: "strings: extract printable text",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0",
+        timeout_secs: 10,
+        label: "verify strings output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after strings",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cal 6 2025\n",
+        label: "cal: specific month",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "June 2025",
+        timeout_secs: 10,
+        label: "verify cal month header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Su Mo Tu We Th Fr Sa",
+        timeout_secs: 10,
+        label: "verify cal weekday header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cal month",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cal 2025 | /bin/grep December\n",
+        label: "cal: full year output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "December",
+        timeout_secs: 10,
+        label: "verify cal year output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cal year",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo alpha > /tmp/diff-a\n",
+        label: "diff fixture: write alpha",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff fixture alpha",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo beta > /tmp/diff-b\n",
+        label: "diff fixture: write beta",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff fixture beta",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/diff /tmp/diff-a /tmp/diff-b > /tmp/change.diff ; /bin/cat /tmp/change.diff\n",
+        label: "diff: unified output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "--- /tmp/diff-a",
+        timeout_secs: 10,
+        label: "verify diff old header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "+++ /tmp/diff-b",
+        timeout_secs: 10,
+        label: "verify diff new header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "@@ -1 +1 @@",
+        timeout_secs: 10,
+        label: "verify diff hunk header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/patch < /tmp/change.diff\n",
+        label: "patch: apply unified diff",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "applied hunk 1",
+        timeout_secs: 10,
+        label: "verify patch apply output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after patch",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/diff-a\n",
+        label: "patch: verify patched file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "beta",
+        timeout_secs: 10,
+        label: "verify patched file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after patched file check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/less /etc/passwd\n",
+        label: "less: open pager",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:",
+        timeout_secs: 10,
+        label: "verify less initial content",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "\x1b[Bq",
+        label: "less: scroll once and quit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after less",
+    });
+
+    // -----------------------------------------------------------------------
+    // 17. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

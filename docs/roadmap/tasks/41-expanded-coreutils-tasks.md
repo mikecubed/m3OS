@@ -1,6 +1,6 @@
 # Phase 41 — Expanded Coreutils: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-41
 **Depends on:** Phase 14 (Shell and Tools) ✅, Phase 27 (User Accounts) ✅, Phase 38 (Filesystem Enhancements) ✅
 **Goal:** Ship a comprehensive set of Unix utilities beyond the minimal Phase 14 set.
@@ -14,14 +14,14 @@ shell pipes and works with the existing procfs, syscall, and filesystem infrastr
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Text processing tools (head, tail, sort, uniq, cut, tr, sed, tee) | — | Planned |
-| B | File and directory tools (find, xargs, du, df, ln, file, hexdump) | — | Planned |
-| C | System tools (ps, kill, free, uptime, dmesg, mount, umount) | D | Planned |
-| D | Kernel support (dmesg ring buffer, umount syscall) | — | Planned |
-| E | Permission tools (chmod, chown) | — | Planned |
-| F | Developer tools (diff, patch, less, strings, cal) | A | Planned |
-| G | Initrd packaging and shell integration | A–F | Planned |
-| H | Integration testing and documentation | A–G | Planned |
+| A | Text processing tools (head, tail, sort, uniq, cut, tr, sed, tee) | — | Complete |
+| B | File and directory tools (find, xargs, du, df, ln, file, hexdump) | — | Complete |
+| C | System tools (ps, kill, free, uptime, dmesg, mount, umount) | D | Complete |
+| D | Kernel support (dmesg ring buffer, umount syscall) | — | Complete |
+| E | Permission tools (chmod, chown) | — | Complete |
+| F | Developer tools (diff, patch, less, strings, cal) | A | Complete |
+| G | Initrd packaging and shell integration | A–F | Complete |
+| H | Integration testing and documentation | A–G | Complete |
 
 ---
 
@@ -39,9 +39,9 @@ with `musl-gcc -static`.
 `read()`, `write()`, and basic argument parsing — all already available.
 
 **Acceptance:**
-- [ ] `head -n 5 file.txt` prints first 5 lines
-- [ ] `cat file.txt | head` prints first 10 lines (default)
-- [ ] Exit code 0 on success, non-zero on read error
+- [x] `head -n 5 file.txt` prints first 5 lines
+- [x] `cat file.txt | head` prints first 10 lines (default)
+- [x] Exit code 0 on success, non-zero on read error
 
 ### A.2 — `tail`: print last N lines
 
@@ -51,9 +51,9 @@ with `musl-gcc -static`.
 lines of input — a different read pattern that exercises ring-buffer thinking.
 
 **Acceptance:**
-- [ ] `tail -n 5 file.txt` prints last 5 lines
-- [ ] `cat file.txt | tail` prints last 10 lines (default)
-- [ ] Works on stdin via pipe
+- [x] `tail -n 5 file.txt` prints last 5 lines
+- [x] `cat file.txt | tail` prints last 10 lines (default)
+- [x] Works on stdin via pipe
 
 ### A.3 — `sort`: sort lines alphabetically
 
@@ -64,10 +64,10 @@ requires reading all input into memory then sorting — exercises `malloc`/heap
 usage in musl-linked binaries.
 
 **Acceptance:**
-- [ ] `sort file.txt` outputs lines in lexicographic order
-- [ ] `sort -r` reverses order
-- [ ] `sort -n` sorts numerically
-- [ ] Works on stdin via pipe
+- [x] `sort file.txt` outputs lines in lexicographic order
+- [x] `sort -r` reverses order
+- [x] `sort -n` sorts numerically
+- [x] Works on stdin via pipe
 
 ### A.4 — `uniq`: filter duplicate adjacent lines
 
@@ -77,9 +77,9 @@ usage in musl-linked binaries.
 pipelines like `sort | uniq -c | sort -rn`.
 
 **Acceptance:**
-- [ ] `uniq` filters adjacent duplicate lines
-- [ ] `uniq -c` prefixes lines with occurrence count
-- [ ] Works on stdin via pipe
+- [x] `uniq` filters adjacent duplicate lines
+- [x] `uniq -c` prefixes lines with occurrence count
+- [x] Works on stdin via pipe
 
 ### A.5 — `cut`: extract fields or columns
 
@@ -89,9 +89,9 @@ pipelines like `sort | uniq -c | sort -rn`.
 delimited text, which `awk` handles in larger systems but `cut` does simply.
 
 **Acceptance:**
-- [ ] `cut -d: -f1` extracts first colon-delimited field
-- [ ] `cut -c1-5` extracts characters 1 through 5
-- [ ] Works on stdin via pipe
+- [x] `cut -d: -f1` extracts first colon-delimited field
+- [x] `cut -c1-5` extracts characters 1 through 5
+- [x] Works on stdin via pipe
 
 ### A.6 — `tr`: translate or delete characters
 
@@ -101,9 +101,9 @@ delimited text, which `awk` handles in larger systems but `cut` does simply.
 conversion, whitespace normalization) that are fundamental to shell scripting.
 
 **Acceptance:**
-- [ ] `echo "HELLO" | tr 'A-Z' 'a-z'` outputs `hello`
-- [ ] `tr -d '\n'` deletes newlines
-- [ ] Works on stdin (pipe-only tool)
+- [x] `echo "HELLO" | tr 'A-Z' 'a-z'` outputs `hello`
+- [x] `tr -d '\n'` deletes newlines
+- [x] Works on stdin (pipe-only tool)
 
 ### A.7 — `sed`: stream editor
 
@@ -113,10 +113,10 @@ conversion, whitespace normalization) that are fundamental to shell scripting.
 minimal subset (`s/old/new/`, `d`, `p`) covers the vast majority of use cases.
 
 **Acceptance:**
-- [ ] `sed 's/foo/bar/' file.txt` performs substitution on each line
-- [ ] `sed 's/foo/bar/g'` performs global substitution
-- [ ] `sed -n '3,5p'` prints only lines 3 through 5
-- [ ] Works on stdin via pipe
+- [x] `sed 's/foo/bar/' file.txt` performs substitution on each line
+- [x] `sed 's/foo/bar/g'` performs global substitution
+- [x] `sed -n '3,5p'` prints only lines 3 through 5
+- [x] Works on stdin via pipe
 
 ### A.8 — `tee`: duplicate stdin to file and stdout
 
@@ -126,9 +126,9 @@ minimal subset (`s/old/new/`, `d`, `p`) covers the vast majority of use cases.
 file while passing it along, which is critical for debugging pipelines.
 
 **Acceptance:**
-- [ ] `echo hello | tee output.txt` writes to both stdout and `output.txt`
-- [ ] `tee -a output.txt` appends instead of truncating
-- [ ] Works in multi-stage pipelines
+- [x] `echo hello | tee output.txt` writes to both stdout and `output.txt`
+- [x] `tee -a output.txt` appends instead of truncating
+- [x] Works in multi-stage pipelines
 
 ---
 
@@ -143,10 +143,10 @@ It exercises recursive directory traversal (`getdents64`), symlink-aware `stat`,
 and pattern matching.
 
 **Acceptance:**
-- [ ] `find /path -name "*.c"` lists matching files recursively
-- [ ] `find /path -type f` lists regular files only
-- [ ] `find /path -type d` lists directories only
-- [ ] Follows symlinks by default (or `-L` flag)
+- [x] `find /path -name "*.c"` lists matching files recursively
+- [x] `find /path -type f` lists regular files only
+- [x] `find /path -type d` lists directories only
+- [x] Follows symlinks by default (or `-L` flag)
 
 ### B.2 — `xargs`: build commands from stdin
 
@@ -156,9 +156,9 @@ and pattern matching.
 command arguments, enabling `find ... | xargs grep ...` workflows.
 
 **Acceptance:**
-- [ ] `find . -name "*.c" | xargs grep "main"` executes `grep` on found files
-- [ ] `xargs -I {} cmd {}` supports replacement strings
-- [ ] `xargs -0` supports null-delimited input (for `find -print0`)
+- [x] `find . -name "*.c" | xargs grep "main"` executes `grep` on found files
+- [x] `xargs -I {} cmd {}` supports replacement strings
+- [x] `xargs -0` supports null-delimited input (for `find -print0`)
 
 ### B.3 — `du`: disk usage summary
 
@@ -168,9 +168,9 @@ command arguments, enabling `find ... | xargs grep ...` workflows.
 via `stat()`, providing the first disk-space visibility tool.
 
 **Acceptance:**
-- [ ] `du /path` shows space used by each subdirectory
-- [ ] `du -s /path` shows only the total for the given path
-- [ ] `du -h` prints human-readable sizes (K, M)
+- [x] `du /path` shows space used by each subdirectory
+- [x] `du -s /path` shows only the total for the given path
+- [x] `du -h` prints human-readable sizes (K, M)
 
 ### B.4 — `df`: filesystem free space
 
@@ -180,9 +180,9 @@ via `stat()`, providing the first disk-space visibility tool.
 display free and used space on each mounted filesystem.
 
 **Acceptance:**
-- [ ] `df` lists all mounted filesystems with total/used/free space
-- [ ] `df -h` prints human-readable sizes
-- [ ] Reads from `statfs()` syscall (or `/proc/mounts` + per-mount `statfs`)
+- [x] `df` lists all mounted filesystems with total/used/free space
+- [x] `df -h` prints human-readable sizes
+- [x] Reads from `statfs()` syscall (or `/proc/mounts` + per-mount `statfs`)
 
 ### B.5 — `ln`: create links
 
@@ -193,9 +193,9 @@ but a C version covers the case where sbase or other ported tools expect a
 standalone `ln` binary without the Rust runtime.
 
 **Acceptance:**
-- [ ] `ln -s target linkname` creates a symlink (delegates to `symlink()` syscall)
-- [ ] `ln target linkname` creates a hard link (delegates to `link()` syscall)
-- [ ] Error messages on permission or filesystem failures
+- [x] `ln -s target linkname` creates a symlink (delegates to `symlink()` syscall)
+- [x] `ln target linkname` creates a hard link (delegates to `link()` syscall)
+- [x] Error messages on permission or filesystem failures
 
 ### B.6 — `file`: basic file type identification
 
@@ -205,9 +205,9 @@ standalone `ln` binary without the Rust runtime.
 files, and other common types — useful for debugging and scripting.
 
 **Acceptance:**
-- [ ] `file binary.elf` prints `ELF 64-bit` (reads ELF magic `\x7fELF`)
-- [ ] `file text.c` prints `ASCII text` (heuristic: no NUL bytes)
-- [ ] `file /dev/null` prints `character special`
+- [x] `file binary.elf` prints `ELF 64-bit` (reads ELF magic `\x7fELF`)
+- [x] `file text.c` prints `ASCII text` (heuristic: no NUL bytes)
+- [x] `file /dev/null` prints `character special`
 
 ### B.7 — `hexdump`: hex dump of binary files
 
@@ -217,9 +217,9 @@ files, and other common types — useful for debugging and scripting.
 debugging ELF loading, filesystem corruption, and raw data formats.
 
 **Acceptance:**
-- [ ] `hexdump file` prints canonical hex+ASCII output
-- [ ] `hexdump -C file` prints offset, hex bytes, and ASCII sidebar
-- [ ] `hexdump -n 64 file` limits output to first 64 bytes
+- [x] `hexdump file` prints canonical hex+ASCII output
+- [x] `hexdump -C file` prints offset, hex bytes, and ASCII sidebar
+- [x] `hexdump -n 64 file` limits output to first 64 bytes
 
 ---
 
@@ -236,10 +236,10 @@ existing libc-visible syscalls.
 `/proc/{pid}/status` and `/proc/{pid}/cmdline` for every PID listed in `/proc/`.
 
 **Acceptance:**
-- [ ] `ps` shows PID, status, and command name for the calling user's processes
-- [ ] `ps -e` (or `ps -A`) shows all processes
-- [ ] Output columns: PID, STATE, CMD at minimum
-- [ ] Reads from `/proc/{pid}/status` and `/proc/{pid}/cmdline`
+- [x] `ps` shows PID, status, and command name for the calling user's processes
+- [x] `ps -e` (or `ps -A`) shows all processes
+- [x] Output columns: PID, STATE, CMD at minimum
+- [x] Reads from `/proc/{pid}/status` and `/proc/{pid}/cmdline`
 
 ### C.2 — `kill`: send signals to processes (standalone binary)
 
@@ -250,10 +250,10 @@ signals without depending on shell-specific builtins. It is a thin wrapper
 around the existing `kill(2)` syscall exposed through musl libc.
 
 **Acceptance:**
-- [ ] `kill -9 <pid>` sends SIGKILL
-- [ ] `kill <pid>` sends SIGTERM (default)
-- [ ] `kill -l` lists available signal names
-- [ ] Uses the existing `kill(2)` interface available to C userspace
+- [x] `kill -9 <pid>` sends SIGKILL
+- [x] `kill <pid>` sends SIGTERM (default)
+- [x] `kill -l` lists available signal names
+- [x] Uses the existing `kill(2)` interface available to C userspace
 
 ### C.3 — `free`: memory usage summary
 
@@ -265,10 +265,10 @@ available memory. The `meminfo` Rust coreutil already exists
 `free`-style output format.
 
 **Acceptance:**
-- [ ] `free` displays total, used, and available memory in KB
-- [ ] `free -m` displays in MB
-- [ ] `free -h` displays human-readable sizes
-- [ ] Reads from `/proc/meminfo`
+- [x] `free` displays total, used, and available memory in KB
+- [x] `free -m` displays in MB
+- [x] `free -h` displays human-readable sizes
+- [x] Reads from `/proc/meminfo`
 
 ### C.4 — `uptime`: show time since boot
 
@@ -279,9 +279,9 @@ Phase 41 should either keep that binary as the canonical implementation or
 extend its output/options so it fits the broader expanded-coreutils milestone.
 
 **Acceptance:**
-- [ ] `uptime` prints time since boot using `CLOCK_MONOTONIC`
-- [ ] Output remains available by default from the shell without an absolute path
-- [ ] If Phase 41 changes the output format, the design doc records that choice explicitly
+- [x] `uptime` prints time since boot using `CLOCK_MONOTONIC`
+- [x] Output remains available by default from the shell without an absolute path
+- [x] If Phase 41 changes the output format, the design doc records that choice explicitly
 
 ### C.5 — `dmesg`: display kernel log buffer
 
@@ -295,10 +295,10 @@ to userspace. A kernel ring buffer plus a `/proc/kmsg` (or `sys_syslog`) read
 interface lets userspace inspect boot and runtime kernel messages.
 
 **Acceptance:**
-- [ ] Kernel captures log output into a fixed-size ring buffer alongside serial
-- [ ] `dmesg` reads and displays the kernel log buffer from userspace
-- [ ] New log lines appear in `dmesg` output after boot messages
-- [ ] Interface is either `/proc/kmsg` file or a custom syscall
+- [x] Kernel captures log output into a fixed-size ring buffer alongside serial
+- [x] `dmesg` reads and displays the kernel log buffer from userspace
+- [x] New log lines appear in `dmesg` output after boot messages
+- [x] Interface is either `/proc/kmsg` file or a custom syscall
 
 ### C.6 — `mount` / `umount`: mount and unmount filesystems
 
@@ -312,10 +312,10 @@ interface lets userspace inspect boot and runtime kernel messages.
 display currently mounted filesystems by reading `/proc/mounts`.
 
 **Acceptance:**
-- [ ] `mount` (no args) displays mounted filesystems from `/proc/mounts`
-- [ ] `mount -t ext2 /dev/vda1 /mnt` mounts a filesystem
-- [ ] `umount /mnt` unmounts a filesystem
-- [ ] Error messages for permission denied (non-root) and busy filesystems
+- [x] `mount` (no args) displays mounted filesystems from `/proc/mounts`
+- [x] `mount -t ext2 /dev/vda1 /mnt` mounts a filesystem
+- [x] `umount /mnt` unmounts a filesystem
+- [x] Error messages for permission denied (non-root) and busy filesystems
 
 ---
 
@@ -333,10 +333,10 @@ Adding a fixed-size ring buffer that captures output alongside serial lets
 userspace read boot and runtime logs via `dmesg`.
 
 **Acceptance:**
-- [ ] `DMESG_RING` is a fixed-size buffer (e.g. 64 KiB) behind a `spin::Mutex`
-- [ ] Every `serial_println!()` call also appends to the ring buffer
-- [ ] Buffer wraps on overflow, preserving the most recent messages
-- [ ] `cargo xtask test` still passes (serial output unchanged)
+- [x] `DMESG_RING` is a fixed-size buffer (e.g. 64 KiB) behind a `spin::Mutex`
+- [x] Every `serial_println!()` call also appends to the ring buffer
+- [x] Buffer wraps on overflow, preserving the most recent messages
+- [x] `cargo xtask test` still passes (serial output unchanged)
 
 ### D.2 — Expose kernel log to userspace via `/proc/kmsg`
 
@@ -347,9 +347,9 @@ userspace read boot and runtime logs via `dmesg`.
 approach — no new syscall needed.
 
 **Acceptance:**
-- [ ] `cat /proc/kmsg` returns current ring buffer contents
-- [ ] File appears in `/proc/` directory listing
-- [ ] Read returns a snapshot (not streaming) of the buffer
+- [x] `cat /proc/kmsg` returns current ring buffer contents
+- [x] File appears in `/proc/` directory listing
+- [x] Read returns a snapshot (not streaming) of the buffer
 
 ### D.3 — `sys_umount2()` syscall
 
@@ -362,11 +362,11 @@ approach — no new syscall needed.
 `umount` binary needs it to detach a filesystem from a mount point.
 
 **Acceptance:**
-- [ ] `SYS_UMOUNT2` (166) dispatched in the syscall handler
-- [ ] Kernel removes the mount point from the VFS mount table
-- [ ] Returns `-EBUSY` if files on the mount are still open
-- [ ] Returns `-EPERM` if caller is not root
-- [ ] `syscall-lib` wrapper `umount()` added
+- [x] `SYS_UMOUNT2` (166) dispatched in the syscall handler
+- [x] Kernel removes the mount point from the VFS mount table
+- [x] Returns `-EBUSY` if files on the mount are still open
+- [x] Returns `-EPERM` if caller is not root
+- [x] `syscall-lib` wrapper `umount()` added
 
 ---
 
@@ -380,10 +380,10 @@ approach — no new syscall needed.
 `chmod(2)` syscall and needs reliable octal mode parsing (`chmod 755 file`).
 
 **Acceptance:**
-- [ ] `chmod 755 file` sets rwxr-xr-x permissions
-- [ ] `chmod u+x file` adds execute for owner (symbolic mode, stretch goal)
-- [ ] Error on non-existent file or permission denied
-- [ ] Uses the existing `chmod(2)` interface available to C userspace
+- [x] `chmod 755 file` sets rwxr-xr-x permissions
+- [x] `chmod u+x file` adds execute for owner (symbolic mode, stretch goal)
+- [x] Error on non-existent file or permission denied
+- [x] Uses the existing `chmod(2)` interface available to C userspace
 
 ### E.2 — `chown`: change file ownership
 
@@ -393,10 +393,10 @@ approach — no new syscall needed.
 `chown(2)` syscall and needs `user:group` parsing with `/etc/passwd` lookup.
 
 **Acceptance:**
-- [ ] `chown root:root file` changes owner and group
-- [ ] `chown 0:0 file` accepts numeric UID:GID
-- [ ] Only root can change ownership (kernel enforces)
-- [ ] Uses the existing `chown(2)` interface available to C userspace
+- [x] `chown root:root file` changes owner and group
+- [x] `chown 0:0 file` accepts numeric UID:GID
+- [x] Only root can change ownership (kernel enforces)
+- [x] Uses the existing `chown(2)` interface available to C userspace
 
 ---
 
@@ -411,10 +411,10 @@ changes, creating patches. A minimal unified-diff implementation covers most
 use cases.
 
 **Acceptance:**
-- [ ] `diff file1 file2` outputs differences in unified format
-- [ ] `diff -u file1 file2` explicitly requests unified format
-- [ ] Exit code 0 = identical, 1 = differences, 2 = error
-- [ ] Output is compatible with `patch` (Track F.2)
+- [x] `diff file1 file2` outputs differences in unified format
+- [x] `diff -u file1 file2` explicitly requests unified format
+- [x] Exit code 0 = identical, 1 = differences, 2 = error
+- [x] Output is compatible with `patch` (Track F.2)
 
 ### F.2 — `patch`: apply diffs
 
@@ -424,9 +424,9 @@ use cases.
 development cycle that `diff` starts.
 
 **Acceptance:**
-- [ ] `patch < changes.diff` applies a unified diff to the working directory
-- [ ] `patch -p1 < changes.diff` strips one leading path component
-- [ ] Reports success/failure for each hunk
+- [x] `patch < changes.diff` applies a unified diff to the working directory
+- [x] `patch -p1 < changes.diff` strips one leading path component
+- [x] Reports success/failure for each hunk
 
 ### F.3 — `less`: scrollable file pager
 
@@ -437,11 +437,11 @@ output. It uses raw terminal mode (termios, implemented in Phase 22) to capture
 arrow keys and page-up/down.
 
 **Acceptance:**
-- [ ] `less file.txt` displays file with scrollable navigation
-- [ ] Arrow keys and Page Up/Page Down scroll the viewport
-- [ ] `/pattern` searches forward in the file
-- [ ] `q` exits the pager
-- [ ] Works as a pipe target: `cat file | less`
+- [x] `less file.txt` displays file with scrollable navigation
+- [x] Arrow keys and Page Up/Page Down scroll the viewport
+- [x] `/pattern` searches forward in the file
+- [x] `q` exits the pager
+- [x] Works as a pipe target: `cat file | less`
 
 ### F.4 — `strings`: extract printable strings from binaries
 
@@ -451,9 +451,9 @@ arrow keys and page-up/down.
 examining ELF binaries, debugging, and reverse engineering.
 
 **Acceptance:**
-- [ ] `strings binary.elf` prints sequences of ≥4 printable characters
-- [ ] `strings -n 8 binary.elf` sets minimum string length to 8
-- [ ] Works on any file type (reads raw bytes)
+- [x] `strings binary.elf` prints sequences of ≥4 printable characters
+- [x] `strings -n 8 binary.elf` sets minimum string length to 8
+- [x] Works on any file type (reads raw bytes)
 
 ### F.5 — `cal`: calendar display
 
@@ -464,10 +464,10 @@ arithmetic. Reads the current date via `gettimeofday()` or `clock_gettime()`
 (available since Phase 34).
 
 **Acceptance:**
-- [ ] `cal` displays the current month's calendar
-- [ ] `cal 2025` displays all 12 months of 2025
-- [ ] `cal 6 2025` displays June 2025
-- [ ] Highlights today's date (if terminal supports bold/inverse)
+- [x] `cal` displays the current month's calendar
+- [x] `cal 2025` displays all 12 months of 2025
+- [x] `cal 6 2025` displays June 2025
+- [x] Highlights today's date (if terminal supports bold/inverse)
 
 ---
 
@@ -482,9 +482,9 @@ list so it gets cross-compiled with `musl-gcc -static` and placed in
 `kernel/initrd/`.
 
 **Acceptance:**
-- [ ] All new C binaries from Tracks A–F added to the `bins` array in `build_musl_bins()`
-- [ ] `cargo xtask image` compiles and packages all new tools
-- [ ] Each binary appears as `kernel/initrd/{name}.elf`
+- [x] All new C binaries from Tracks A–F added to the `bins` array in `build_musl_bins()`
+- [x] `cargo xtask image` compiles and packages all new tools
+- [x] Each binary appears as `kernel/initrd/{name}.elf`
 
 ### G.2 — Register binaries in init or shell PATH
 
@@ -498,9 +498,9 @@ shell's PATH already covers `/bin` (where initrd tools are copied at boot), or
 init must copy the new ELFs to the correct directory.
 
 **Acceptance:**
-- [ ] All new tools are available by name from the shell prompt
-- [ ] `head`, `find`, `ps`, and `dmesg` run from the default shell PATH without absolute paths
-- [ ] Boot or startup packaging places each binary in the same location the shell already searches
+- [x] All new tools are available by name from the shell prompt
+- [x] `head`, `find`, `ps`, and `dmesg` run from the default shell PATH without absolute paths
+- [x] Boot or startup packaging places each binary in the same location the shell already searches
 
 ### G.3 — Add new Rust binaries to `coreutils_bins` (if any)
 
@@ -510,9 +510,9 @@ init must copy the new ELFs to the correct directory.
 they must be added to the `coreutils_bins` array so they are built and packaged.
 
 **Acceptance:**
-- [ ] Any Rust-implemented tools added to `coreutils_bins` list
-- [ ] Corresponding `[[bin]]` entry added to `userspace/coreutils-rs/Cargo.toml`
-- [ ] `cargo xtask image` builds and packages them alongside existing Rust tools
+- [x] Any Rust-implemented tools added to `coreutils_bins` list
+- [x] Corresponding `[[bin]]` entry added to `userspace/coreutils-rs/Cargo.toml`
+- [x] `cargo xtask image` builds and packages them alongside existing Rust tools
 
 ---
 
@@ -525,13 +525,13 @@ they must be added to the `coreutils_bins` array so they are built and packaged.
 multi-tool pipelines to work. These are validated manually inside QEMU.
 
 **Acceptance:**
-- [ ] `cat file | sort | uniq -c | sort -rn | head -10` produces correct output
-- [ ] `find . -name "*.c" | xargs grep "main"` finds matches
-- [ ] `diff file1 file2 > changes.diff && patch < changes.diff` round-trips
-- [ ] `ps -e` shows all running processes with PID, state, and command
-- [ ] `free -h` shows total and available memory
-- [ ] `less file.txt` provides scrollable viewing with `q` to exit
-- [ ] `dmesg` shows kernel boot messages
+- [x] `cat file | sort | uniq -c | sort -rn | head -10` produces correct output
+- [x] `find . -name "*.c" | xargs grep "main"` finds matches
+- [x] `diff file1 file2 > changes.diff && patch < changes.diff` round-trips
+- [x] `ps -e` shows all running processes with PID, state, and command
+- [x] `free -h` shows total and available memory
+- [x] `less file.txt` provides scrollable viewing with `q` to exit
+- [x] `dmesg` shows kernel boot messages
 
 ### H.2 — Update Phase 41 design doc
 
@@ -541,9 +541,9 @@ multi-tool pipelines to work. These are validated manually inside QEMU.
 implementation — which tools were ported vs. written, and any scope changes.
 
 **Acceptance:**
-- [ ] Status updated to "Complete"
-- [ ] Any deferred tools noted in the "Deferred Until Later" section
-- [ ] Implementation Outline reflects actual approach taken
+- [x] Status updated to "Complete"
+- [x] Any deferred tools noted in the "Deferred Until Later" section
+- [x] Implementation Outline reflects actual approach taken
 
 ### H.3 — Update roadmap README
 
@@ -552,8 +552,8 @@ implementation — which tools were ported vs. written, and any scope changes.
 **Why it matters:** The roadmap summary must stay current.
 
 **Acceptance:**
-- [ ] Phase 41 status updated to "Complete"
-- [ ] Tasks column links to the task list
+- [x] Phase 41 status updated to "Complete"
+- [x] Tasks column links to the task list
 
 ---
 

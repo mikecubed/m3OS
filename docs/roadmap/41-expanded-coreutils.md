@@ -1,6 +1,6 @@
 # Phase 41 - Expanded Coreutils
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-41
 **Depends on:** Phase 14 (Shell and Tools) ✅, Phase 27 (User Accounts) ✅, Phase 38 (Filesystem Enhancements) ✅
 **Builds on:** Extends the minimal coreutils from Phase 14 with a comprehensive set of
@@ -23,7 +23,8 @@ That set is enough for simple file manipulation but not for real development wor
 Developers expect text processing pipelines (`sort | uniq -c`), file search
 (`find | xargs`), system introspection (`ps`, `free`, `dmesg`), permission management
 (`chmod`, `chown`), and a pager (`less`). Without these, the OS feels like a demo rather
-than a usable environment. This phase closes that gap by porting or writing ~30 tools.
+than a usable environment. This phase closes that gap by shipping the expanded Unix toolset
+needed for daily development workflows.
 
 ## Learning Goals
 
@@ -56,7 +57,7 @@ than a usable environment. This phase closes that gap by porting or writing ~30 
 | `xargs` | Build commands from stdin | Port from sbase (~100 lines C) |
 | `du` | Disk usage | Write or port (~60 lines C) |
 | `df` | Filesystem free space | Write (~40 lines C) |
-| `ln` | Create links (hard/symlinks when supported) | Write (~30 lines C) |
+| `ln` | Create links (hard/symlinks when supported) | Reuse existing Rust coreutil |
 | `file` | Identify file type (basic) | Write (~100 lines C) |
 | `hexdump` / `xxd` | Hex dump of binary files | Write (~80 lines C) |
 
@@ -66,7 +67,7 @@ than a usable environment. This phase closes that gap by porting or writing ~30 
 |---|---|---|
 | `ps` | List running processes | Write (reads kernel proc info) |
 | `kill` | Send signals to processes | Write (thin wrapper over `kill(2)`) |
-| `uptime` | System uptime | Extend existing Rust utility or add C equivalent |
+| `uptime` | System uptime | Reuse existing Rust utility from Phase 34 |
 | `free` | Memory usage summary | Write (~30 lines C) |
 | `dmesg` | Kernel log buffer | Write (reads kernel ring buffer) |
 | `mount` / `umount` | Mount/unmount filesystems | Write (wraps mount syscall) |
@@ -130,6 +131,17 @@ The `chmod()`, `chown()`, `fchmod()`, and `fchown()` syscalls (and their `syscal
 wrappers) were implemented in Phase 27/38. The `chmod` and `chown` binaries are thin
 argument-parsing wrappers around these existing syscalls.
 
+### Phase 41 implementation notes
+
+- `ln` remained the existing Rust coreutil rather than adding a redundant C port.
+- `uptime` remained the Phase 34 Rust binary and stayed available on the default shell PATH.
+- `diff` and `patch` use a minimal unified-diff workflow that is sufficient for the validated
+  `diff file1 file2 > changes.diff && patch < changes.diff` round-trip.
+- `less` uses Phase 22 raw-mode terminal support for arrow keys, page navigation, forward search,
+  and `q` exit.
+- The larger Phase 41 initrd required increasing the boot-mapped kernel heap so the full smoke
+  workload stays stable with the added userspace tools.
+
 ## How This Builds on Earlier Phases
 
 - Extends Phase 14 by adding ~30 tools to the original ~15 basic coreutils.
@@ -158,7 +170,7 @@ argument-parsing wrappers around these existing syscalls.
 - `find . -name "*.c" | xargs grep "main"` works.
 - `ps` shows running processes with PID, name, and status.
 - `free` shows total and available memory.
-- `uptime` reports time since boot and is available from the default shell PATH.
+- `uptime` reports time since boot via the existing Rust utility and is available from the default shell PATH.
 - `diff file1 file2` shows differences; `patch` can apply the diff.
 - `less` provides scrollable file viewing with search.
 
