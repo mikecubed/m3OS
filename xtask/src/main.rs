@@ -182,6 +182,12 @@ fn build_userspace_bins() {
         "env", "PROMPT", "ls", "ln", "readlink", // Phase 32: build tool utilities
         "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
         "date", "uptime", // Phase 34: timekeeping utilities
+        // Phase 41 Rust ports (batch 1 — trivial)
+        "umount", "dmesg", "chmod", "mount", "kill", "tee",
+        // Phase 41 Rust ports (batch 2 — small)
+        "head", "file", "strings", "uniq", "free", "df", "hexdump",
+        // Phase 41 Rust ports (batch 3 — medium)
+        "cal", "tr", "sort", "tail", "ps", "du", "chown", "find",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -232,30 +238,10 @@ fn build_musl_bins() {
     let bins: &[(&str, &str)] = &[
         ("userspace/hello-c/hello.c", "hello"),
         ("userspace/tmpfs-test/tmpfs-test.c", "tmpfs-test"),
-        ("userspace/coreutils/head.c", "head"),
-        ("userspace/coreutils/tail.c", "tail"),
-        ("userspace/coreutils/tee.c", "tee"),
-        ("userspace/coreutils/chmod.c", "chmod"),
-        ("userspace/coreutils/chown.c", "chown"),
-        ("userspace/coreutils/sort.c", "sort"),
-        ("userspace/coreutils/uniq.c", "uniq"),
+        // Phase 41 complex utils (remaining C, not yet ported to Rust)
         ("userspace/coreutils/cut.c", "cut"),
-        ("userspace/coreutils/tr.c", "tr"),
         ("userspace/coreutils/sed.c", "sed"),
-        ("userspace/coreutils/file.c", "file"),
-        ("userspace/coreutils/hexdump.c", "hexdump"),
-        ("userspace/coreutils/du.c", "du"),
-        ("userspace/coreutils/df.c", "df"),
-        ("userspace/coreutils/find.c", "find"),
         ("userspace/coreutils/xargs.c", "xargs"),
-        ("userspace/coreutils/free.c", "free"),
-        ("userspace/coreutils/dmesg.c", "dmesg"),
-        ("userspace/coreutils/mount.c", "mount"),
-        ("userspace/coreutils/umount.c", "umount"),
-        ("userspace/coreutils/kill.c", "kill"),
-        ("userspace/coreutils/ps.c", "ps"),
-        ("userspace/coreutils/strings.c", "strings"),
-        ("userspace/coreutils/cal.c", "cal"),
         ("userspace/coreutils/diff.c", "diff"),
         ("userspace/coreutils/patch.c", "patch"),
         ("userspace/coreutils/less.c", "less"),

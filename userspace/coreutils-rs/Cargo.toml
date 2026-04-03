@@ -108,3 +108,90 @@ path = "src/ln.rs"
 [[bin]]
 name = "readlink"
 path = "src/readlink.rs"
+
+# Phase 41 Rust ports (batch 1 — trivial)
+[[bin]]
+name = "umount"
+path = "src/umount.rs"
+
+[[bin]]
+name = "dmesg"
+path = "src/dmesg.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/chmod.rs"
+
+[[bin]]
+name = "mount"
+path = "src/mount.rs"
+
+[[bin]]
+name = "kill"
+path = "src/kill.rs"
+
+[[bin]]
+name = "tee"
+path = "src/tee.rs"
+
+# Phase 41 Rust ports (batch 2 — small)
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "file"
+path = "src/file.rs"
+
+[[bin]]
+name = "strings"
+path = "src/strings.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
+name = "free"
+path = "src/free.rs"
+
+[[bin]]
+name = "df"
+path = "src/df.rs"
+
+[[bin]]
+name = "hexdump"
+path = "src/hexdump.rs"
+
+# Phase 41 Rust ports (batch 3 — medium)
+[[bin]]
+name = "cal"
+path = "src/cal.rs"
+
+[[bin]]
+name = "tr"
+path = "src/tr.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "ps"
+path = "src/ps.rs"
+
+[[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
+name = "chown"
+path = "src/chown.rs"
+
+[[bin]]
+name = "find"
+path = "src/find.rs"
