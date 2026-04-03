@@ -4100,6 +4100,11 @@ fn fetch_doom_wad(dest: &Path) {
 }
 
 /// Compute the hex SHA-256 digest of `path` and compare it to `expected`.
+///
+/// Returns `true` on a confirmed match.  Returns `false` (and deletes the
+/// file) on a mismatch or when `sha256sum` is unavailable — callers that set
+/// `M3OS_DOWNLOAD_WAD=1` have opted into supply-chain verification, so a
+/// missing tool must not silently allow an unverified binary to proceed.
 fn verify_sha256(path: &Path, expected: &str) -> bool {
     // Use the `sha256sum` tool if available (common on Linux).
     let output = Command::new("sha256sum")
@@ -4116,9 +4121,14 @@ fn verify_sha256(path: &Path, expected: &str) -> bool {
         }
     }
 
-    // Fallback: skip verification (sha256sum not available).
-    eprintln!("doom: sha256sum not available — skipping checksum verification");
-    true
+    // sha256sum is not available — treat as a hard error when the caller has
+    // explicitly opted into verified downloads (M3OS_DOWNLOAD_WAD=1).
+    eprintln!(
+        "doom: sha256sum not found — cannot verify {}; deleting download",
+        path.display()
+    );
+    let _ = std::fs::remove_file(path);
+    false
 }
 
 /// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.

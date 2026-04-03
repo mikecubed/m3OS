@@ -951,6 +951,38 @@ pub fn yield_console(owner_pid: u32) {
     CONSOLE_YIELDED.store(true, Ordering::Release);
 }
 
+/// Atomically claim the framebuffer for `owner_pid` using compare-and-swap,
+/// then suppress console text output.
+///
+/// Returns `true` if the framebuffer was unowned (CAS succeeded) or is already
+/// owned by `owner_pid` (re-entrant call).  Returns `false` if another process
+/// owns it — caller should return `EBUSY` without doing any mapping.
+pub fn try_yield_console(owner_pid: u32) -> bool {
+    match FB_OWNER_PID.compare_exchange(0, owner_pid, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            // Newly claimed — suppress console text output.
+            CONSOLE_YIELDED.store(true, Ordering::Release);
+            true
+        }
+        Err(current) if current == owner_pid => true, // re-entrant: already owned by us
+        Err(_) => false,                              // owned by another process
+    }
+}
+
+/// Release a previously claimed console ownership without a full restore.
+///
+/// Used to roll back `try_yield_console` when the framebuffer mapping fails
+/// after a successful CAS.  Does not clear the screen.
+pub fn release_console_claim(owner_pid: u32) {
+    // Only clear if we still own it (guard against accidental double-release).
+    if FB_OWNER_PID
+        .compare_exchange(owner_pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        CONSOLE_YIELDED.store(false, Ordering::Release);
+    }
+}
+
 /// Restores framebuffer console output after a graphical process exits.
 ///
 /// Clears the framebuffer and resets the owner PID.  The console lock is held
