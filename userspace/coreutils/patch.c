@@ -273,7 +273,10 @@ static char *strip_components(const char *path, int strip_count) {
         }
         strip_count--;
     }
-    return strdup(*cursor ? cursor : path);
+    if (!*cursor) {
+        return NULL; /* -pN stripped past end of path — invalid usage */
+    }
+    return strdup(cursor);
 }
 
 static int read_file_lines(const char *path, LineVec *vec) {
@@ -337,6 +340,10 @@ static int apply_file_patch(const FilePatch *patch, int strip_count) {
         strip_count
     );
     if (!path) {
+        const char *src = strcmp(patch->old_path, "/dev/null") == 0
+            ? patch->new_path : patch->old_path;
+        fprintf(stderr, "patch: -p%d strips all components from '%s'\n",
+                strip_count, src);
         return -1;
     }
 

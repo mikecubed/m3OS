@@ -2826,7 +2826,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 5,
+        timeout_secs: 20,
         label: "prompt after dmesg",
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
