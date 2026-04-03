@@ -1,11 +1,27 @@
 # Phase 43 - SSH Server
 
+**Status:** Planned
+**Source Ref:** phase-43
+**Depends on:** Phase 23 (Socket API) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY) ✅, Phase 37 (I/O Multiplexing) ✅, Phase 42 (Crypto Primitives) ✅
+**Builds on:** Uses the crypto-lib from Phase 42 (Ed25519, X25519, ChaCha20-Poly1305, SHA-256) for all cryptographic operations; reuses the PTY pair infrastructure from Phase 29 and the telnetd session architecture from Phase 30; authenticates against /etc/shadow from Phase 27; uses epoll from Phase 37 for multi-session I/O multiplexing
+**Primary Components:** userspace sshd binary, sunset SSH library integration, host key management, authorized_keys support
+
 ## Milestone Goal
 
 An SSH server runs inside the OS, providing encrypted remote shell access. Users can
 connect from any standard SSH client (`ssh user@host`) with password or public key
 authentication. This replaces the telnet server for untrusted networks and is a major
 milestone: the OS is now a secure, networked, multi-user system.
+
+## Why This Phase Exists
+
+Phases 1–42 built a multi-user OS with networking, persistent storage, and
+cryptographic primitives — but the only remote access is via telnet (Phase 30), which
+transmits passwords and all session data in plaintext. Any observer on the network can
+read everything. SSH is the universal standard for secure remote administration: it
+encrypts the entire session, authenticates the server (preventing impersonation), and
+authenticates the user (password or public key). Without SSH, the OS cannot be
+considered secure for any network beyond localhost.
 
 ## Learning Goals
 
@@ -14,10 +30,11 @@ milestone: the OS is now a secure, networked, multi-user system.
 - Learn how key exchange (Diffie-Hellman / X25519) establishes a shared secret.
 - See how public key authentication works without transmitting the private key.
 - Understand why SSH is the universal standard for remote system administration.
+- Learn how an IO-less protocol library integrates with an OS's socket and PTY layers.
 
 ## Feature Scope
 
-### SSH Server (`/sbin/sshd`)
+### SSH Server (`sshd`)
 
 **Transport Layer**
 - SSH-2 protocol only (SSH-1 is obsolete and insecure).
@@ -69,7 +86,7 @@ Using the Phase 42 crypto primitives, implement the SSH-2 protocol directly. Thi
 the maximum learning path but is significantly more work. The SSH protocol has many
 subtle requirements around packet framing, key re-exchange, and channel multiplexing.
 
-**Option C: Port tinyssh**
+**Option D: Port tinyssh**
 
 [tinyssh](https://tinyssh.org/) is an even smaller SSH server (~30 KB) that only
 supports modern crypto (Ed25519, ChaCha20). However, it uses a non-standard build
@@ -91,27 +108,72 @@ qemu ... -nic user,hostfwd=tcp::2222-:22
 ssh -p 2222 user@localhost
 ```
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 23 (Socket API) | TCP server sockets |
-| Phase 27 (User Accounts) | Authentication, UID/GID |
-| Phase 29 (PTY) | Terminal sessions |
-| Phase 42 (Crypto) | Ed25519, X25519, ChaCha20, SHA-256 |
+### sunset SSH Library Integration
+
+The sunset crate provides an IO-less SSH-2 protocol engine. The m3OS adapter feeds
+TCP socket bytes into sunset and writes sunset's output bytes back to the socket.
+Separately, sunset emits decrypted channel data that the adapter routes to/from a PTY
+pair. This separation means the protocol logic is independent of m3OS I/O — sunset
+handles key exchange, encryption, authentication callbacks, and channel multiplexing,
+while the adapter handles socket reads/writes and PTY relay.
+
+### Host Key Management
+
+On first boot (or when `/etc/ssh/ssh_host_ed25519_key` is missing), sshd generates an
+Ed25519 keypair using the crypto-lib from Phase 42 and writes it to `/etc/ssh/`. On
+subsequent boots, the existing key is loaded. The host key is used during key exchange
+to prove the server's identity — clients cache the fingerprint and warn if it changes
+(protecting against man-in-the-middle attacks).
+
+### Session Lifecycle
+
+Each accepted TCP connection spawns a child process that:
+1. Performs SSH handshake (version exchange, key exchange, algorithm negotiation).
+2. Authenticates the user (password or public key).
+3. Allocates a PTY pair (reusing Phase 29 infrastructure).
+4. Forks and execs `login` (or the user's shell directly) on the slave side.
+5. Relays encrypted data between the TCP socket and the PTY master using epoll.
+6. Handles window-change and signal requests from the SSH channel.
+7. Cleans up on disconnect (close PTY, reap child, close socket).
+
+This mirrors the telnetd architecture from Phase 30, but with encryption and proper
+authentication wrapping the connection.
+
+### Authentication Against /etc/shadow and authorized_keys
+
+Password auth reads the user's hashed password from `/etc/shadow` (Phase 27), hashes
+the provided password, and compares. Public key auth reads `~/.ssh/authorized_keys`,
+parses each line for an Ed25519 public key, and verifies the client's signature over
+the session ID — the private key never leaves the client.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 23 by using TCP server sockets to accept SSH connections on port 22
+- Extends Phase 27 by authenticating SSH users against `/etc/shadow` and reading
+  `~/.ssh/authorized_keys` with per-user file permissions
+- Extends Phase 29 by allocating PTY pairs for SSH sessions (same mechanism as telnetd)
+- Extends Phase 30 by replacing the telnet protocol with encrypted SSH — the session
+  lifecycle (accept → auth → PTY → shell → relay → cleanup) is structurally identical
+- Extends Phase 37 by using epoll for multiplexing socket and PTY I/O within each session
+- Extends Phase 42 by consuming Ed25519, X25519, ChaCha20-Poly1305, HMAC-SHA-256, and
+  HKDF through the crypto-lib crate for all SSH cryptographic operations
 
 ## Implementation Outline
 
-1. Cross-compile Dropbear with musl (or begin SSH protocol implementation).
-2. Generate Ed25519 host key at first boot.
-3. Implement SSH transport: version exchange, key exchange, encrypted packets.
-4. Implement password authentication against `/etc/shadow`.
-5. Implement session channel with PTY allocation.
-6. Implement shell execution (fork + setsid + exec login).
-7. Test from host with `ssh -p 2222 user@localhost`.
-8. Implement public key authentication.
-9. Add sshd to init's startup sequence.
-10. Test multiple simultaneous SSH sessions.
+1. Evaluate sunset crate: add dependency, verify it compiles for x86_64-m3os target.
+2. Create `userspace/sshd/` crate with basic TCP accept loop.
+3. Generate Ed25519 host key on first boot, store at `/etc/ssh/ssh_host_ed25519_key`.
+4. Implement sunset adapter: feed TCP bytes into sunset, write output back to socket.
+5. Implement password authentication callback against `/etc/shadow`.
+6. Implement session channel handling: PTY allocation, shell exec, data relay.
+7. Implement public key authentication with `~/.ssh/authorized_keys`.
+8. Implement window-change and signal forwarding.
+9. Add sshd to init's startup sequence and initrd.
+10. Test from host with `ssh -p 2222 user@localhost`.
+11. Test multiple simultaneous SSH sessions.
+12. Verify encryption by inspecting traffic.
 
 ## Acceptance Criteria
 
@@ -128,23 +190,20 @@ ssh -p 2222 user@localhost
 
 ## Companion Task List
 
-- Phase 43 Task List — *not yet created*
+- [Phase 43 Task List](./tasks/43-ssh-server-tasks.md)
 
 ## How Real OS Implementations Differ
 
-Production SSH servers (OpenSSH) support:
-- SFTP and SCP for file transfer
-- Port forwarding and tunneling
-- X11 forwarding
-- Agent forwarding
-- ProxyJump / ProxyCommand
-- Match blocks for conditional configuration
-- Kerberos/GSSAPI authentication
-- Certificate-based authentication
-- Audit logging
-
-Dropbear intentionally omits many of these features for simplicity. Our deployment
-is further simplified: single-server, no forwarding, no SFTP (initially).
+- Production SSH servers (OpenSSH) support SFTP, SCP, port forwarding, tunneling,
+  X11 forwarding, agent forwarding, ProxyJump, certificate auth, and GSSAPI.
+- OpenSSH uses privilege separation (unprivileged child handles the network, privileged
+  parent handles authentication) to limit the impact of vulnerabilities.
+- Real systems support multiple host key types (RSA, ECDSA, Ed25519) and algorithm
+  negotiation across dozens of ciphers and MACs.
+- Dropbear intentionally omits many features for simplicity. Our deployment is further
+  simplified: single-server, no forwarding, no SFTP (initially).
+- Production systems implement connection rate limiting, fail2ban integration, and
+  audit logging for brute-force protection.
 
 ## Deferred Until Later
 
@@ -154,3 +213,6 @@ is further simplified: single-server, no forwarding, no SFTP (initially).
 - Key agent
 - Certificate authentication
 - Connection rate limiting and brute-force protection
+- Privilege separation (sshd runs as a single process per session)
+- Multiple host key types (Ed25519 only)
+- Key re-exchange during long sessions
