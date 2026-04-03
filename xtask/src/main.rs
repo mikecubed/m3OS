@@ -2593,19 +2593,29 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "du: human-readable summary",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "/home/project",
+        pattern: "\t/home/project",
         timeout_secs: 10,
         label: "verify du human-readable path",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "K",
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du human-readable",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -h -s /home/project | /bin/cut -f1\n",
+        label: "du: isolate human-readable size field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: ".",
         timeout_secs: 10,
         label: "verify du human-readable suffix",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
-        label: "prompt after du human-readable",
+        label: "prompt after du human-readable size field",
     });
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

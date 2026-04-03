@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 static void usage(void) {
-    fputs("usage: mount [-t TYPE] SOURCE TARGET\n", stderr);
+    fputs("usage: mount -t TYPE SOURCE TARGET\n", stderr);
 }
 
 int main(int argc, char **argv) {
