@@ -54,136 +54,128 @@ impl RamdiskNode {
 
 static HELLO_TXT: &[u8] = include_bytes!("../../initrd/hello.txt");
 static README_TXT: &[u8] = include_bytes!("../../initrd/readme.txt");
-static EXIT0_ELF: &[u8] = include_bytes!("../../initrd/exit0.elf");
-static FORK_TEST_ELF: &[u8] = include_bytes!("../../initrd/fork-test.elf");
-static ECHO_ARGS_ELF: &[u8] = include_bytes!("../../initrd/echo-args.elf");
-static HELLO_ELF: &[u8] = include_bytes!("../../initrd/hello.elf");
-static TMPFS_TEST_ELF: &[u8] = include_bytes!("../../initrd/tmpfs-test.elf");
-static ECHO_ELF: &[u8] = include_bytes!("../../initrd/echo.elf");
-static TRUE_ELF: &[u8] = include_bytes!("../../initrd/true.elf");
-static FALSE_ELF: &[u8] = include_bytes!("../../initrd/false.elf");
-static CAT_ELF: &[u8] = include_bytes!("../../initrd/cat.elf");
-static LS_ELF: &[u8] = include_bytes!("../../initrd/ls.elf");
-static PWD_ELF: &[u8] = include_bytes!("../../initrd/pwd.elf");
-static MKDIR_ELF: &[u8] = include_bytes!("../../initrd/mkdir.elf");
-static RMDIR_ELF: &[u8] = include_bytes!("../../initrd/rmdir.elf");
-static RM_ELF: &[u8] = include_bytes!("../../initrd/rm.elf");
-static CP_ELF: &[u8] = include_bytes!("../../initrd/cp.elf");
-static MV_ELF: &[u8] = include_bytes!("../../initrd/mv.elf");
-static ENV_ELF: &[u8] = include_bytes!("../../initrd/env.elf");
-static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep.elf");
-static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep.elf");
-static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test.elf");
-static PROMPT_ELF: &[u8] = include_bytes!("../../initrd/PROMPT.elf");
-static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test.elf");
-static INIT_ELF: &[u8] = include_bytes!("../../initrd/init.elf");
-static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0.elf");
-static ION_ELF: &[u8] = include_bytes!("../../initrd/ion.elf");
-static EDIT_ELF: &[u8] = include_bytes!("../../initrd/edit.elf");
-static LOGIN_ELF: &[u8] = include_bytes!("../../initrd/login.elf");
-static SU_ELF: &[u8] = include_bytes!("../../initrd/su.elf");
-static PASSWD_ELF: &[u8] = include_bytes!("../../initrd/passwd.elf");
-static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser.elf");
-static ID_ELF: &[u8] = include_bytes!("../../initrd/id.elf");
-static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami.elf");
-static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd.elf");
+static EXIT0_ELF: &[u8] = include_bytes!("../../initrd/exit0");
+static FORK_TEST_ELF: &[u8] = include_bytes!("../../initrd/fork-test");
+static ECHO_ARGS_ELF: &[u8] = include_bytes!("../../initrd/echo-args");
+static HELLO_ELF: &[u8] = include_bytes!("../../initrd/hello");
+static TMPFS_TEST_ELF: &[u8] = include_bytes!("../../initrd/tmpfs-test");
+static ECHO_ELF: &[u8] = include_bytes!("../../initrd/echo");
+static TRUE_ELF: &[u8] = include_bytes!("../../initrd/true");
+static FALSE_ELF: &[u8] = include_bytes!("../../initrd/false");
+static CAT_ELF: &[u8] = include_bytes!("../../initrd/cat");
+static LS_ELF: &[u8] = include_bytes!("../../initrd/ls");
+static PWD_ELF: &[u8] = include_bytes!("../../initrd/pwd");
+static MKDIR_ELF: &[u8] = include_bytes!("../../initrd/mkdir");
+static RMDIR_ELF: &[u8] = include_bytes!("../../initrd/rmdir");
+static RM_ELF: &[u8] = include_bytes!("../../initrd/rm");
+static CP_ELF: &[u8] = include_bytes!("../../initrd/cp");
+static MV_ELF: &[u8] = include_bytes!("../../initrd/mv");
+static ENV_ELF: &[u8] = include_bytes!("../../initrd/env");
+static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep");
+static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep");
+static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test");
+static PROMPT_ELF: &[u8] = include_bytes!("../../initrd/PROMPT");
+static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test");
+static INIT_ELF: &[u8] = include_bytes!("../../initrd/init");
+static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0");
+static ION_ELF: &[u8] = include_bytes!("../../initrd/ion");
+static EDIT_ELF: &[u8] = include_bytes!("../../initrd/edit");
+static LOGIN_ELF: &[u8] = include_bytes!("../../initrd/login");
+static SU_ELF: &[u8] = include_bytes!("../../initrd/su");
+static PASSWD_ELF: &[u8] = include_bytes!("../../initrd/passwd");
+static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser");
+static ID_ELF: &[u8] = include_bytes!("../../initrd/id");
+static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami");
+static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd");
 // Phase 32: build tools and utilities
-static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch.elf");
-static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat.elf");
-static LN_ELF: &[u8] = include_bytes!("../../initrd/ln.elf");
-static READLINK_ELF: &[u8] = include_bytes!("../../initrd/readlink.elf");
-static WC_ELF: &[u8] = include_bytes!("../../initrd/wc.elf");
-static AR_ELF: &[u8] = include_bytes!("../../initrd/ar.elf");
-static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
-static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
-static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test.elf");
-static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
-static HEAD_ELF: &[u8] = include_bytes!("../../initrd/head.elf");
-static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail.elf");
-static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee.elf");
-static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod.elf");
-static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown.elf");
-static SORT_ELF: &[u8] = include_bytes!("../../initrd/sort.elf");
-static UNIQ_ELF: &[u8] = include_bytes!("../../initrd/uniq.elf");
-static CUT_ELF: &[u8] = include_bytes!("../../initrd/cut.elf");
-static TR_ELF: &[u8] = include_bytes!("../../initrd/tr.elf");
-static SED_ELF: &[u8] = include_bytes!("../../initrd/sed.elf");
-static FILE_ELF: &[u8] = include_bytes!("../../initrd/file.elf");
-static HEXDUMP_ELF: &[u8] = include_bytes!("../../initrd/hexdump.elf");
-static DU_ELF: &[u8] = include_bytes!("../../initrd/du.elf");
-static DF_ELF: &[u8] = include_bytes!("../../initrd/df.elf");
-static FIND_ELF: &[u8] = include_bytes!("../../initrd/find.elf");
-static XARGS_ELF: &[u8] = include_bytes!("../../initrd/xargs.elf");
-static FREE_ELF: &[u8] = include_bytes!("../../initrd/free.elf");
-static DMESG_ELF: &[u8] = include_bytes!("../../initrd/dmesg.elf");
-static MOUNT_ELF: &[u8] = include_bytes!("../../initrd/mount.elf");
-static UMOUNT_ELF: &[u8] = include_bytes!("../../initrd/umount.elf");
-static KILL_ELF: &[u8] = include_bytes!("../../initrd/kill.elf");
-static PS_ELF: &[u8] = include_bytes!("../../initrd/ps.elf");
-static STRINGS_ELF: &[u8] = include_bytes!("../../initrd/strings.elf");
-static CAL_ELF: &[u8] = include_bytes!("../../initrd/cal.elf");
-static DIFF_ELF: &[u8] = include_bytes!("../../initrd/diff.elf");
-static PATCH_ELF: &[u8] = include_bytes!("../../initrd/patch.elf");
-static LESS_ELF: &[u8] = include_bytes!("../../initrd/less.elf");
+static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch");
+static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat");
+static LN_ELF: &[u8] = include_bytes!("../../initrd/ln");
+static READLINK_ELF: &[u8] = include_bytes!("../../initrd/readlink");
+static WC_ELF: &[u8] = include_bytes!("../../initrd/wc");
+static AR_ELF: &[u8] = include_bytes!("../../initrd/ar");
+static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install");
+static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo");
+static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test");
+static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make");
+static HEAD_ELF: &[u8] = include_bytes!("../../initrd/head");
+static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail");
+static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee");
+static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod");
+static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown");
+static SORT_ELF: &[u8] = include_bytes!("../../initrd/sort");
+static UNIQ_ELF: &[u8] = include_bytes!("../../initrd/uniq");
+static CUT_ELF: &[u8] = include_bytes!("../../initrd/cut");
+static TR_ELF: &[u8] = include_bytes!("../../initrd/tr");
+static SED_ELF: &[u8] = include_bytes!("../../initrd/sed");
+static FILE_ELF: &[u8] = include_bytes!("../../initrd/file");
+static HEXDUMP_ELF: &[u8] = include_bytes!("../../initrd/hexdump");
+static DU_ELF: &[u8] = include_bytes!("../../initrd/du");
+static DF_ELF: &[u8] = include_bytes!("../../initrd/df");
+static FIND_ELF: &[u8] = include_bytes!("../../initrd/find");
+static XARGS_ELF: &[u8] = include_bytes!("../../initrd/xargs");
+static FREE_ELF: &[u8] = include_bytes!("../../initrd/free");
+static DMESG_ELF: &[u8] = include_bytes!("../../initrd/dmesg");
+static MOUNT_ELF: &[u8] = include_bytes!("../../initrd/mount");
+static UMOUNT_ELF: &[u8] = include_bytes!("../../initrd/umount");
+static KILL_ELF: &[u8] = include_bytes!("../../initrd/kill");
+static PS_ELF: &[u8] = include_bytes!("../../initrd/ps");
+static STRINGS_ELF: &[u8] = include_bytes!("../../initrd/strings");
+static CAL_ELF: &[u8] = include_bytes!("../../initrd/cal");
+static DIFF_ELF: &[u8] = include_bytes!("../../initrd/diff");
+static PATCH_ELF: &[u8] = include_bytes!("../../initrd/patch");
+static LESS_ELF: &[u8] = include_bytes!("../../initrd/less");
 // Phase 34: timekeeping utilities
-static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
-static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
+static DATE_ELF: &[u8] = include_bytes!("../../initrd/date");
+static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime");
 // Phase 40: threading test
-static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test.elf");
+static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test");
 // Phase 42: crypto primitives
-static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test.elf");
-static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum.elf");
-static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey.elf");
+static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test");
+static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum");
+static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
 // ---------------------------------------------------------------------------
 
 static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
-    ("exit0.elf", RamdiskNode::File { content: EXIT0_ELF }),
+    ("exit0", RamdiskNode::File { content: EXIT0_ELF }),
     (
-        "fork-test.elf",
+        "fork-test",
         RamdiskNode::File {
             content: FORK_TEST_ELF,
         },
     ),
     (
-        "echo-args.elf",
+        "echo-args",
         RamdiskNode::File {
             content: ECHO_ARGS_ELF,
         },
     ),
-    ("hello.elf", RamdiskNode::File { content: HELLO_ELF }),
+    ("hello", RamdiskNode::File { content: HELLO_ELF }),
     (
         "tmpfs-test",
         RamdiskNode::File {
             content: TMPFS_TEST_ELF,
         },
     ),
-    (
-        "tmpfs-test.elf",
-        RamdiskNode::File {
-            content: TMPFS_TEST_ELF,
-        },
-    ),
     ("echo", RamdiskNode::File { content: ECHO_ELF }),
-    ("echo.elf", RamdiskNode::File { content: ECHO_ELF }),
-    ("true.elf", RamdiskNode::File { content: TRUE_ELF }),
-    ("false.elf", RamdiskNode::File { content: FALSE_ELF }),
+    ("true", RamdiskNode::File { content: TRUE_ELF }),
+    ("false", RamdiskNode::File { content: FALSE_ELF }),
     ("cat", RamdiskNode::File { content: CAT_ELF }),
-    ("cat.elf", RamdiskNode::File { content: CAT_ELF }),
-    ("ls.elf", RamdiskNode::File { content: LS_ELF }),
-    ("pwd.elf", RamdiskNode::File { content: PWD_ELF }),
-    ("mkdir.elf", RamdiskNode::File { content: MKDIR_ELF }),
-    ("rmdir.elf", RamdiskNode::File { content: RMDIR_ELF }),
-    ("rm.elf", RamdiskNode::File { content: RM_ELF }),
-    ("cp.elf", RamdiskNode::File { content: CP_ELF }),
-    ("mv.elf", RamdiskNode::File { content: MV_ELF }),
-    ("env.elf", RamdiskNode::File { content: ENV_ELF }),
-    ("sleep.elf", RamdiskNode::File { content: SLEEP_ELF }),
-    ("grep.elf", RamdiskNode::File { content: GREP_ELF }),
+    ("ls", RamdiskNode::File { content: LS_ELF }),
+    ("pwd", RamdiskNode::File { content: PWD_ELF }),
+    ("mkdir", RamdiskNode::File { content: MKDIR_ELF }),
+    ("rmdir", RamdiskNode::File { content: RMDIR_ELF }),
+    ("rm", RamdiskNode::File { content: RM_ELF }),
+    ("cp", RamdiskNode::File { content: CP_ELF }),
+    ("mv", RamdiskNode::File { content: MV_ELF }),
+    ("env", RamdiskNode::File { content: ENV_ELF }),
+    ("sleep", RamdiskNode::File { content: SLEEP_ELF }),
+    ("grep", RamdiskNode::File { content: GREP_ELF }),
     (
-        "signal-test.elf",
+        "signal-test",
         RamdiskNode::File {
             content: SIGNAL_TEST_ELF,
         },
@@ -195,43 +187,20 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     (
-        "PROMPT.elf",
-        RamdiskNode::File {
-            content: PROMPT_ELF,
-        },
-    ),
-    (
         "stdin-test",
         RamdiskNode::File {
             content: STDIN_TEST_ELF,
         },
     ),
-    (
-        "stdin-test.elf",
-        RamdiskNode::File {
-            content: STDIN_TEST_ELF,
-        },
-    ),
     ("sh0", RamdiskNode::File { content: SH0_ELF }),
-    ("sh0.elf", RamdiskNode::File { content: SH0_ELF }),
     ("ion", RamdiskNode::File { content: ION_ELF }),
-    ("ion.elf", RamdiskNode::File { content: ION_ELF }),
     // Phase 32: /bin/sh alias for ion (pdpmake and scripts expect /bin/sh)
     ("sh", RamdiskNode::File { content: ION_ELF }),
     ("edit", RamdiskNode::File { content: EDIT_ELF }),
-    ("edit.elf", RamdiskNode::File { content: EDIT_ELF }),
     ("login", RamdiskNode::File { content: LOGIN_ELF }),
-    ("login.elf", RamdiskNode::File { content: LOGIN_ELF }),
     ("su", RamdiskNode::File { content: SU_ELF }),
-    ("su.elf", RamdiskNode::File { content: SU_ELF }),
     (
         "passwd",
-        RamdiskNode::File {
-            content: PASSWD_ELF,
-        },
-    ),
-    (
-        "passwd.elf",
         RamdiskNode::File {
             content: PASSWD_ELF,
         },
@@ -242,22 +211,9 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: ADDUSER_ELF,
         },
     ),
-    (
-        "adduser.elf",
-        RamdiskNode::File {
-            content: ADDUSER_ELF,
-        },
-    ),
     ("id", RamdiskNode::File { content: ID_ELF }),
-    ("id.elf", RamdiskNode::File { content: ID_ELF }),
     (
         "whoami",
-        RamdiskNode::File {
-            content: WHOAMI_ELF,
-        },
-    ),
-    (
-        "whoami.elf",
         RamdiskNode::File {
             content: WHOAMI_ELF,
         },
@@ -268,43 +224,20 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: TELNETD_ELF,
         },
     ),
-    (
-        "telnetd.elf",
-        RamdiskNode::File {
-            content: TELNETD_ELF,
-        },
-    ),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
-    ("touch.elf", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),
-    ("stat.elf", RamdiskNode::File { content: STAT_ELF }),
     ("ln", RamdiskNode::File { content: LN_ELF }),
-    ("ln.elf", RamdiskNode::File { content: LN_ELF }),
     (
         "readlink",
         RamdiskNode::File {
             content: READLINK_ELF,
         },
     ),
-    (
-        "readlink.elf",
-        RamdiskNode::File {
-            content: READLINK_ELF,
-        },
-    ),
     ("wc", RamdiskNode::File { content: WC_ELF }),
-    ("wc.elf", RamdiskNode::File { content: WC_ELF }),
     ("ar", RamdiskNode::File { content: AR_ELF }),
-    ("ar.elf", RamdiskNode::File { content: AR_ELF }),
     (
         "install",
-        RamdiskNode::File {
-            content: INSTALL_ELF,
-        },
-    ),
-    (
-        "install.elf",
         RamdiskNode::File {
             content: INSTALL_ELF,
         },
@@ -315,98 +248,49 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: MEMINFO_ELF,
         },
     ),
-    (
-        "meminfo.elf",
-        RamdiskNode::File {
-            content: MEMINFO_ELF,
-        },
-    ),
     ("head", RamdiskNode::File { content: HEAD_ELF }),
-    ("head.elf", RamdiskNode::File { content: HEAD_ELF }),
     ("tail", RamdiskNode::File { content: TAIL_ELF }),
-    ("tail.elf", RamdiskNode::File { content: TAIL_ELF }),
     ("tee", RamdiskNode::File { content: TEE_ELF }),
-    ("tee.elf", RamdiskNode::File { content: TEE_ELF }),
     ("chmod", RamdiskNode::File { content: CHMOD_ELF }),
-    ("chmod.elf", RamdiskNode::File { content: CHMOD_ELF }),
     ("chown", RamdiskNode::File { content: CHOWN_ELF }),
-    ("chown.elf", RamdiskNode::File { content: CHOWN_ELF }),
     ("sort", RamdiskNode::File { content: SORT_ELF }),
-    ("sort.elf", RamdiskNode::File { content: SORT_ELF }),
     ("uniq", RamdiskNode::File { content: UNIQ_ELF }),
-    ("uniq.elf", RamdiskNode::File { content: UNIQ_ELF }),
     ("cut", RamdiskNode::File { content: CUT_ELF }),
-    ("cut.elf", RamdiskNode::File { content: CUT_ELF }),
     ("tr", RamdiskNode::File { content: TR_ELF }),
-    ("tr.elf", RamdiskNode::File { content: TR_ELF }),
     ("sed", RamdiskNode::File { content: SED_ELF }),
-    ("sed.elf", RamdiskNode::File { content: SED_ELF }),
     ("file", RamdiskNode::File { content: FILE_ELF }),
-    ("file.elf", RamdiskNode::File { content: FILE_ELF }),
     (
         "hexdump",
         RamdiskNode::File {
             content: HEXDUMP_ELF,
         },
     ),
-    (
-        "hexdump.elf",
-        RamdiskNode::File {
-            content: HEXDUMP_ELF,
-        },
-    ),
     ("du", RamdiskNode::File { content: DU_ELF }),
-    ("du.elf", RamdiskNode::File { content: DU_ELF }),
     ("df", RamdiskNode::File { content: DF_ELF }),
-    ("df.elf", RamdiskNode::File { content: DF_ELF }),
     ("find", RamdiskNode::File { content: FIND_ELF }),
-    ("find.elf", RamdiskNode::File { content: FIND_ELF }),
     ("xargs", RamdiskNode::File { content: XARGS_ELF }),
-    ("xargs.elf", RamdiskNode::File { content: XARGS_ELF }),
     ("free", RamdiskNode::File { content: FREE_ELF }),
-    ("free.elf", RamdiskNode::File { content: FREE_ELF }),
     ("dmesg", RamdiskNode::File { content: DMESG_ELF }),
-    ("dmesg.elf", RamdiskNode::File { content: DMESG_ELF }),
     ("mount", RamdiskNode::File { content: MOUNT_ELF }),
-    ("mount.elf", RamdiskNode::File { content: MOUNT_ELF }),
     (
         "umount",
         RamdiskNode::File {
             content: UMOUNT_ELF,
         },
     ),
-    (
-        "umount.elf",
-        RamdiskNode::File {
-            content: UMOUNT_ELF,
-        },
-    ),
     ("kill", RamdiskNode::File { content: KILL_ELF }),
-    ("kill.elf", RamdiskNode::File { content: KILL_ELF }),
     ("ps", RamdiskNode::File { content: PS_ELF }),
-    ("ps.elf", RamdiskNode::File { content: PS_ELF }),
     (
         "strings",
         RamdiskNode::File {
             content: STRINGS_ELF,
         },
     ),
-    (
-        "strings.elf",
-        RamdiskNode::File {
-            content: STRINGS_ELF,
-        },
-    ),
     ("cal", RamdiskNode::File { content: CAL_ELF }),
-    ("cal.elf", RamdiskNode::File { content: CAL_ELF }),
     ("diff", RamdiskNode::File { content: DIFF_ELF }),
-    ("diff.elf", RamdiskNode::File { content: DIFF_ELF }),
     ("patch", RamdiskNode::File { content: PATCH_ELF }),
-    ("patch.elf", RamdiskNode::File { content: PATCH_ELF }),
     ("less", RamdiskNode::File { content: LESS_ELF }),
-    ("less.elf", RamdiskNode::File { content: LESS_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
-    ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
     (
         "mmap-leak-test",
@@ -414,23 +298,10 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: MMAP_LEAK_TEST_ELF,
         },
     ),
-    (
-        "mmap-leak-test.elf",
-        RamdiskNode::File {
-            content: MMAP_LEAK_TEST_ELF,
-        },
-    ),
     // Phase 34: timekeeping utilities
     ("date", RamdiskNode::File { content: DATE_ELF }),
-    ("date.elf", RamdiskNode::File { content: DATE_ELF }),
     (
         "uptime",
-        RamdiskNode::File {
-            content: UPTIME_ELF,
-        },
-    ),
-    (
-        "uptime.elf",
         RamdiskNode::File {
             content: UPTIME_ELF,
         },
@@ -442,27 +313,21 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: THREAD_TEST_ELF,
         },
     ),
-    (
-        "thread-test.elf",
-        RamdiskNode::File {
-            content: THREAD_TEST_ELF,
-        },
-    ),
     // Phase 42: crypto primitives
     (
-        "crypto-test.elf",
+        "crypto-test",
         RamdiskNode::File {
             content: CRYPTO_TEST_ELF,
         },
     ),
     (
-        "sha256sum.elf",
+        "sha256sum",
         RamdiskNode::File {
             content: SHA256SUM_ELF,
         },
     ),
     (
-        "genkey.elf",
+        "genkey",
         RamdiskNode::File {
             content: GENKEY_ELF,
         },
@@ -479,10 +344,7 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
 ];
 
-static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[
-    ("init", RamdiskNode::File { content: INIT_ELF }),
-    ("init.elf", RamdiskNode::File { content: INIT_ELF }),
-];
+static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
 
 static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
     (
@@ -516,7 +378,7 @@ static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
 
 /// Look up a node by path in the ramdisk tree.
 ///
-/// Accepts both absolute (`/bin/cat.elf`) and relative (`bin/cat.elf`) paths;
+/// Accepts both absolute (`/bin/cat`) and relative (`bin/cat`) paths;
 /// leading slashes are stripped before traversal. An empty path returns root.
 ///
 /// # Examples
@@ -524,7 +386,7 @@ static RAMDISK_ROOT: RamdiskNode = RamdiskNode::Dir {
 /// ```ignore
 /// ramdisk_lookup("/")              // → root Dir
 /// ramdisk_lookup("/bin")           // → bin Dir
-/// ramdisk_lookup("/bin/cat.elf")   // → File
+/// ramdisk_lookup("/bin/cat")       // → File
 /// ramdisk_lookup("/etc/hello.txt") // → File
 /// ```
 pub fn ramdisk_lookup(path: &str) -> Option<&'static RamdiskNode> {
@@ -576,7 +438,7 @@ pub fn ramdisk_list_dir(path: &str) -> Option<Vec<(String, bool)>> {
 /// Look up a file by path and return a reference to its static content.
 ///
 /// Accepts paths with or without a leading `/`.  For backward compatibility a
-/// bare filename such as `"cat.elf"` is searched under `/bin/` and then
+/// bare filename such as `"cat"` is searched under `/bin/` and then
 /// `/etc/`.
 ///
 /// Used by `sys_open`, `sys_execve`, and `resolve_command`.
@@ -586,23 +448,10 @@ pub fn get_file(name: &str) -> Option<&'static [u8]> {
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(name) {
             return Some(content);
         }
-        // Try with .elf suffix (ramdisk binaries use this extension).
-        if !name.ends_with(".elf") {
-            let elf_path = alloc::format!("{}.elf", name);
-            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&elf_path) {
-                return Some(content);
-            }
-        }
     } else {
         let path = alloc::format!("/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&path) {
             return Some(content);
-        }
-        if !name.ends_with(".elf") {
-            let elf_path = alloc::format!("/{}.elf", name);
-            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&elf_path) {
-                return Some(content);
-            }
         }
     }
 
@@ -611,12 +460,6 @@ pub fn get_file(name: &str) -> Option<&'static [u8]> {
         let bin_path = alloc::format!("/bin/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&bin_path) {
             return Some(content);
-        }
-        if !name.ends_with(".elf") {
-            let bin_elf = alloc::format!("/bin/{}.elf", name);
-            if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&bin_elf) {
-                return Some(content);
-            }
         }
         let etc_path = alloc::format!("/etc/{}", name);
         if let Some(RamdiskNode::File { content }) = ramdisk_lookup(&etc_path) {
@@ -650,19 +493,19 @@ static FLAT_FILES: &[FlatFile] = &[
         content: README_TXT,
     },
     FlatFile {
-        name: "exit0.elf",
+        name: "exit0",
         content: EXIT0_ELF,
     },
     FlatFile {
-        name: "fork-test.elf",
+        name: "fork-test",
         content: FORK_TEST_ELF,
     },
     FlatFile {
-        name: "echo-args.elf",
+        name: "echo-args",
         content: ECHO_ARGS_ELF,
     },
     FlatFile {
-        name: "hello.elf",
+        name: "hello",
         content: HELLO_ELF,
     },
     FlatFile {
@@ -670,19 +513,15 @@ static FLAT_FILES: &[FlatFile] = &[
         content: TMPFS_TEST_ELF,
     },
     FlatFile {
-        name: "tmpfs-test.elf",
-        content: TMPFS_TEST_ELF,
-    },
-    FlatFile {
-        name: "echo.elf",
+        name: "echo",
         content: ECHO_ELF,
     },
     FlatFile {
-        name: "true.elf",
+        name: "true",
         content: TRUE_ELF,
     },
     FlatFile {
-        name: "false.elf",
+        name: "false",
         content: FALSE_ELF,
     },
     FlatFile {
@@ -690,163 +529,159 @@ static FLAT_FILES: &[FlatFile] = &[
         content: CAT_ELF,
     },
     FlatFile {
-        name: "cat.elf",
-        content: CAT_ELF,
-    },
-    FlatFile {
-        name: "ls.elf",
+        name: "ls",
         content: LS_ELF,
     },
     FlatFile {
-        name: "pwd.elf",
+        name: "pwd",
         content: PWD_ELF,
     },
     FlatFile {
-        name: "mkdir.elf",
+        name: "mkdir",
         content: MKDIR_ELF,
     },
     FlatFile {
-        name: "rmdir.elf",
+        name: "rmdir",
         content: RMDIR_ELF,
     },
     FlatFile {
-        name: "rm.elf",
+        name: "rm",
         content: RM_ELF,
     },
     FlatFile {
-        name: "cp.elf",
+        name: "cp",
         content: CP_ELF,
     },
     FlatFile {
-        name: "mv.elf",
+        name: "mv",
         content: MV_ELF,
     },
     FlatFile {
-        name: "env.elf",
+        name: "env",
         content: ENV_ELF,
     },
     FlatFile {
-        name: "sleep.elf",
+        name: "sleep",
         content: SLEEP_ELF,
     },
     FlatFile {
-        name: "grep.elf",
+        name: "grep",
         content: GREP_ELF,
     },
     FlatFile {
-        name: "ln.elf",
+        name: "ln",
         content: LN_ELF,
     },
     FlatFile {
-        name: "readlink.elf",
+        name: "readlink",
         content: READLINK_ELF,
     },
     FlatFile {
-        name: "head.elf",
+        name: "head",
         content: HEAD_ELF,
     },
     FlatFile {
-        name: "tail.elf",
+        name: "tail",
         content: TAIL_ELF,
     },
     FlatFile {
-        name: "tee.elf",
+        name: "tee",
         content: TEE_ELF,
     },
     FlatFile {
-        name: "chmod.elf",
+        name: "chmod",
         content: CHMOD_ELF,
     },
     FlatFile {
-        name: "chown.elf",
+        name: "chown",
         content: CHOWN_ELF,
     },
     FlatFile {
-        name: "sort.elf",
+        name: "sort",
         content: SORT_ELF,
     },
     FlatFile {
-        name: "uniq.elf",
+        name: "uniq",
         content: UNIQ_ELF,
     },
     FlatFile {
-        name: "cut.elf",
+        name: "cut",
         content: CUT_ELF,
     },
     FlatFile {
-        name: "tr.elf",
+        name: "tr",
         content: TR_ELF,
     },
     FlatFile {
-        name: "sed.elf",
+        name: "sed",
         content: SED_ELF,
     },
     FlatFile {
-        name: "file.elf",
+        name: "file",
         content: FILE_ELF,
     },
     FlatFile {
-        name: "hexdump.elf",
+        name: "hexdump",
         content: HEXDUMP_ELF,
     },
     FlatFile {
-        name: "du.elf",
+        name: "du",
         content: DU_ELF,
     },
     FlatFile {
-        name: "df.elf",
+        name: "df",
         content: DF_ELF,
     },
     FlatFile {
-        name: "find.elf",
+        name: "find",
         content: FIND_ELF,
     },
     FlatFile {
-        name: "xargs.elf",
+        name: "xargs",
         content: XARGS_ELF,
     },
     FlatFile {
-        name: "free.elf",
+        name: "free",
         content: FREE_ELF,
     },
     FlatFile {
-        name: "dmesg.elf",
+        name: "dmesg",
         content: DMESG_ELF,
     },
     FlatFile {
-        name: "mount.elf",
+        name: "mount",
         content: MOUNT_ELF,
     },
     FlatFile {
-        name: "umount.elf",
+        name: "umount",
         content: UMOUNT_ELF,
     },
     FlatFile {
-        name: "kill.elf",
+        name: "kill",
         content: KILL_ELF,
     },
     FlatFile {
-        name: "ps.elf",
+        name: "ps",
         content: PS_ELF,
     },
     FlatFile {
-        name: "strings.elf",
+        name: "strings",
         content: STRINGS_ELF,
     },
     FlatFile {
-        name: "cal.elf",
+        name: "cal",
         content: CAL_ELF,
     },
     FlatFile {
-        name: "diff.elf",
+        name: "diff",
         content: DIFF_ELF,
     },
     FlatFile {
-        name: "patch.elf",
+        name: "patch",
         content: PATCH_ELF,
     },
     FlatFile {
-        name: "less.elf",
+        name: "less",
         content: LESS_ELF,
     },
 ];

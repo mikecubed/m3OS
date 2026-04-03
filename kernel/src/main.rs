@@ -258,12 +258,10 @@ fn init_task() -> ! {
 fn spawn_userspace_init() {
     use mm::elf::load_elf_into;
 
-    let data = fs::ramdisk::get_file("sbin/init")
-        .or_else(|| fs::ramdisk::get_file("sbin/init.elf"))
-        .expect("[init] /sbin/init (or /sbin/init.elf) not found in ramdisk");
+    let data = fs::ramdisk::get_file("sbin/init").expect("[init] /sbin/init not found in ramdisk");
 
     if data.is_empty() {
-        panic!("[init] /sbin/init (or .elf) is empty — not built?");
+        panic!("[init] /sbin/init is empty — not built?");
     }
 
     log::info!("[init] loading /sbin/init: {} bytes", data.len());

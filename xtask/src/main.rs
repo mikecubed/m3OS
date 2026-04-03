@@ -170,11 +170,11 @@ fn build_userspace_bins() {
         }
 
         let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
-        let dst = initrd.join(format!("{bin}.elf"));
+        let dst = initrd.join(format!("{bin}"));
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
-        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+        println!("userspace: {} → kernel/initrd/{bin}", src.display());
     }
 
     // Rust coreutils — build all binaries in one cargo invocation.
@@ -261,11 +261,11 @@ fn build_userspace_bins() {
 
     for bin in coreutils_bins {
         let src = root.join(format!("target/x86_64-unknown-none/release/{bin}"));
-        let dst = initrd.join(format!("{bin}.elf"));
+        let dst = initrd.join(format!("{bin}"));
         fs::copy(&src, &dst).unwrap_or_else(|e| {
             panic!("failed to copy {bin} to initrd: {e}");
         });
-        println!("userspace: {} → kernel/initrd/{bin}.elf", src.display());
+        println!("userspace: {} → kernel/initrd/{bin}", src.display());
     }
 }
 
@@ -302,7 +302,7 @@ fn build_musl_bins() {
 
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
-        let dst = initrd.join(format!("{name}.elf"));
+        let dst = initrd.join(format!("{name}"));
         let status = match Command::new("musl-gcc")
             .args([
                 "-static",
@@ -320,7 +320,7 @@ fn build_musl_bins() {
                 );
                 // Create empty placeholders so include_bytes! doesn't fail.
                 for (_, name) in bins {
-                    let dst = initrd.join(format!("{name}.elf"));
+                    let dst = initrd.join(format!("{name}"));
                     if !dst.exists() {
                         fs::write(&dst, b"").unwrap_or_else(|e| {
                             eprintln!(
@@ -338,7 +338,7 @@ fn build_musl_bins() {
             eprintln!("musl-gcc failed for {name}");
             std::process::exit(1);
         }
-        println!("musl: {} → kernel/initrd/{name}.elf", src.display());
+        println!("musl: {} → kernel/initrd/{name}", src.display());
     }
 }
 
@@ -346,16 +346,16 @@ fn build_musl_bins() {
 ///
 /// Strategy: clone ion from GitHub (or use cached clone in target/ion-src/),
 /// build with `cargo build --release --target x86_64-unknown-linux-musl`,
-/// strip, and copy to kernel/initrd/ion.elf.
+/// strip, and copy to kernel/initrd/ion.
 ///
-/// If the ion.elf binary already exists and is newer than ion's Cargo.toml,
+/// If the ion binary already exists and is newer than ion's Cargo.toml,
 /// the build is skipped (cache hit).
 fn build_ion() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
-    let ion_elf = initrd.join("ion.elf");
+    let ion_elf = initrd.join("ion");
 
-    // If a pre-built ion.elf exists, skip the build.
+    // If a pre-built ion binary exists, skip the build.
     if ion_elf.exists() && ion_elf.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         println!("ion: using cached {}", ion_elf.display());
         return;
@@ -415,18 +415,18 @@ fn build_ion() {
             fs::copy(&built, &ion_elf).expect("failed to copy ion binary to initrd");
         }
     }
-    println!("ion: {} → kernel/initrd/ion.elf", built.display());
+    println!("ion: {} → kernel/initrd/ion", built.display());
 }
 
 /// Phase 32: Cross-compile pdpmake (POSIX make) for the OS.
 ///
 /// Strategy: clone pdpmake from GitHub (or use cached clone in target/pdpmake-src/),
 /// build with `musl-gcc -static -O2`, and place the resulting binary in
-/// kernel/initrd/make.elf.
+/// kernel/initrd/make.
 fn build_pdpmake() {
     let root = workspace_root();
     let initrd = root.join("kernel/initrd");
-    let make_elf = initrd.join("make.elf");
+    let make_elf = initrd.join("make");
 
     // Check cache.
     if make_elf.exists() && make_elf.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -524,7 +524,7 @@ fn build_pdpmake() {
         return;
     }
 
-    println!("pdpmake: built → kernel/initrd/make.elf");
+    println!("pdpmake: built → kernel/initrd/make");
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
