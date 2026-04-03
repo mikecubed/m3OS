@@ -988,22 +988,32 @@ pub fn release_console_claim(owner_pid: u32) {
 /// Clears the framebuffer and resets the owner PID.  The console lock is held
 /// throughout the clear so no writer can sneak in between the flag flip and the
 /// clear and have its output immediately wiped.
+///
+/// `FB_OWNER_PID` is cleared **last** — after `CONSOLE_YIELDED` is already
+/// false and the lock is dropped — so `try_yield_console` cannot win the CAS
+/// while the restore is still in progress (the CAS requires owner == 0).
 pub fn restore_console() {
-    FB_OWNER_PID.store(0, Ordering::Release);
     // Hold the lock while clearing so no concurrent writer observes
     // CONSOLE_YIELDED = false and starts writing before the clear completes.
-    let mut guard = CONSOLE.lock();
-    if let Some(ref mut console) = *guard {
-        let rows = console.rows();
-        let cols = console.cols();
-        if rows > 0 && cols > 0 {
-            console.clear_region(0, 0, cols, rows);
+    {
+        let mut guard = CONSOLE.lock();
+        if let Some(ref mut console) = *guard {
+            let rows = console.rows();
+            let cols = console.cols();
+            if rows > 0 && cols > 0 {
+                console.clear_region(0, 0, cols, rows);
+            }
         }
-    }
-    // Flip the flag only after the clear is done and while we still hold the
-    // lock, so the first write after restore sees a freshly-cleared screen.
-    CONSOLE_YIELDED.store(false, Ordering::Release);
-    drop(guard);
+        // Flip the flag only after the clear is done and while we still hold
+        // the lock, so the first write after restore sees a freshly-cleared
+        // screen.
+        CONSOLE_YIELDED.store(false, Ordering::Release);
+    } // ← lock drops here
+
+    // Clear ownership last: a concurrent try_yield_console sees owner != 0
+    // until this point, preventing it from racing mid-restore and then having
+    // CONSOLE_YIELDED overwritten back to false by this function.
+    FB_OWNER_PID.store(0, Ordering::Release);
 }
 
 /// Returns the PID of the process currently owning the raw framebuffer

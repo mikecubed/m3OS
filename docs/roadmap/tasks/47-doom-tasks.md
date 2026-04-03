@@ -58,7 +58,7 @@ address space using the existing `map_user_frames` infrastructure.
 - [ ] Computes the framebuffer physical base address from `FbConsole.buf` and the kernel physical offset (`mm::PHYS_OFFSET`)
 - [ ] Calls `map_user_frames` (from `kernel/src/mm/user_space.rs`) to map the framebuffer physical frames into the process's page table with `USER_ACCESSIBLE | WRITABLE` flags
 - [ ] Returns the userspace virtual address of the mapped framebuffer on success
-- [ ] Returns `NEG_ENOMEM` if page table mapping fails, `NEG_EINVAL` if no framebuffer exists
+- [ ] Returns `NEG_EINVAL` if no framebuffer exists or if page table mapping fails, `NEG_EBUSY` if another process already owns the framebuffer
 - [ ] Records the mapping in the process's `mappings` vector as a `MemoryMapping` so `munmap` can clean it up
 
 ### A.3 — Syscall constants in `syscall-lib`
@@ -260,7 +260,7 @@ by every other binary (e.g. `EDIT_ELF`, `SH0_ELF`) so `init` can `exec` the bina
 
 **Acceptance:**
 - [ ] `static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");` added after the last existing ELF static in `ramdisk.rs`
-- [ ] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_ELF`
+- [ ] Entry added to the ramdisk file table mapping `"/bin/doom"` to `DOOM_BIN`
 - [ ] The binary is accessible as `/bin/doom` in the VFS after boot
 - [ ] `doom` command is recognized by the shell and can be exec'd
 

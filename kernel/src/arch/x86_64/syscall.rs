@@ -6346,6 +6346,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     let mut mapper = unsafe { crate::mm::paging::get_mapper() };
 
     let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut device_frame_unmapped = false;
     for i in 0..pages {
         let page_addr = addr + (i as u64 * 4096);
         let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
@@ -6371,6 +6372,8 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                 if !is_device_frame {
                     // Only return system-RAM frames to the allocator.
                     crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                } else {
+                    device_frame_unmapped = true;
                 }
                 unmapped_addrs.push(page_addr);
             }
@@ -6430,6 +6433,23 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             });
             proc.mappings.extend(new_mappings);
         }
+    }
+
+
+    if freed_count > 0 {
+        log::info!(
+            "[munmap] freed {} pages @ {:#x} (len={:#x})",
+            freed_count,
+            addr,
+            len
+        );
+    }
+
+    // If device (BIT_11) pages were unmapped and this process is the current
+    // framebuffer owner, release the claim and restore console output so the
+    // console is usable again and other processes can acquire the framebuffer.
+    if device_frame_unmapped && crate::fb::fb_owner_pid() == pid {
+        crate::fb::restore_console();
     }
 
     0
