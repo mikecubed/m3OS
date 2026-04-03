@@ -6347,6 +6347,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 
     let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut device_frame_unmapped = false;
+    let mut fb_fully_unmapped = false;
     for i in 0..pages {
         let page_addr = addr + (i as u64 * 4096);
         let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
@@ -6432,6 +6433,10 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
                 true
             });
             proc.mappings.extend(new_mappings);
+
+            // The FB mapping is fully gone when no mapping with FB_MAPPING_FLAG
+            // survives; a partial unmap leaves a trimmed or split mapping in place.
+            fb_fully_unmapped = !proc.mappings.iter().any(|m| m.flags & FB_MAPPING_FLAG != 0);
         }
     }
 
@@ -6445,10 +6450,10 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         );
     }
 
-    // If device (BIT_11) pages were unmapped and this process is the current
-    // framebuffer owner, release the claim and restore console output so the
-    // console is usable again and other processes can acquire the framebuffer.
-    if device_frame_unmapped && crate::fb::fb_owner_pid() == pid {
+    // Only release framebuffer ownership when ALL device pages are gone.
+    // A partial unmap must not clear the owner — another process could then
+    // claim the FB via CAS while the current owner still has pages mapped.
+    if device_frame_unmapped && fb_fully_unmapped && crate::fb::fb_owner_pid() == pid {
         crate::fb::restore_console();
     }
 
@@ -6805,6 +6810,11 @@ fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
 // process already owns the framebuffer, or NEG_EINVAL on other errors.
 // ---------------------------------------------------------------------------
 
+/// Internal flag bit stored in `MemoryMapping.flags` to identify the
+/// framebuffer mapping.  The lower bits are POSIX MAP_* flags; this bit
+/// lives in the OS-private range and is never returned to userspace.
+const FB_MAPPING_FLAG: u64 = 1 << 32;
+
 fn sys_framebuffer_mmap() -> u64 {
     let (buf_virt, byte_len) = match crate::fb::framebuffer_buf_addr() {
         Some(v) => v,
@@ -6933,8 +6943,8 @@ fn sys_framebuffer_mmap() -> u64 {
             proc.mappings.push(crate::process::MemoryMapping {
                 start: virt_addr,
                 len: total_size,
-                prot: 3,  // PROT_READ | PROT_WRITE
-                flags: 1, // MAP_SHARED
+                prot: 3,                    // PROT_READ | PROT_WRITE
+                flags: 1 | FB_MAPPING_FLAG, // MAP_SHARED + internal FB marker
             });
         }
     }

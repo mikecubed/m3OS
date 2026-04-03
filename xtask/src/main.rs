@@ -600,8 +600,12 @@ fn build_doom() {
         .expect("failed to run git checkout for doomgeneric");
     if !checkout.success() {
         eprintln!(
-            "warning: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT}; proceeding with current HEAD"
+            "doom: failed to checkout doomgeneric commit {DOOMGENERIC_COMMIT} — aborting build"
         );
+        if !doom_bin.exists() {
+            let _ = fs::write(&doom_bin, b"");
+        }
+        return;
     }
 
     // Collect core engine .c files — skip all platform-specific implementations.
