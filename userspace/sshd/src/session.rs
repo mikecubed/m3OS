@@ -244,15 +244,18 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             flush_output(&mut runner, sock_fd);
             match runner.progress() {
                 Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=hostkeys\n");
                     if hostkeys.hostkeys(&[&host_key.key]).is_err() {
                         cleanup(shell_pid, pty_master, pty_slave);
                         return 1;
                     }
                 }
                 Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=first_auth\n");
                     let _ = first_auth.reject();
                 }
                 Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=pw_auth\n");
                     auth_attempts += 1;
                     let (u, p) = match (pw_auth.username(), pw_auth.password()) {
                         (Ok(u), Ok(p)) => (String::from(u), String::from(p)),
@@ -471,10 +474,22 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 0;
                 }
-                Ok(Event::Serv(ServEvent::PollAgain)) => continue,
-                Ok(Event::Progressed) => continue,
-                Ok(Event::None) => break,
-                Ok(_) => break,
+                Ok(Event::Serv(ServEvent::PollAgain)) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=poll_again\n");
+                    continue;
+                }
+                Ok(Event::Progressed) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=progressed\n");
+                    continue;
+                }
+                Ok(Event::None) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=none\n");
+                    break;
+                }
+                Ok(_ev) => {
+                    write_str(STDOUT_FILENO, "sshd: ev=other\n");
+                    break;
+                }
                 Err(e) => {
                     write_str(STDOUT_FILENO, "sshd: progress err: ");
                     struct W;
