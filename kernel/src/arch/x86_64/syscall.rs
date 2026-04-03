@@ -51,6 +51,8 @@ const NEG_ENOMEM: u64 = (-12_i64) as u64;
 const NEG_ELOOP: u64 = (-40_i64) as u64;
 #[allow(dead_code)]
 const NEG_EXDEV: u64 = (-18_i64) as u64;
+const NEG_EBUSY: u64 = (-16_i64) as u64;
+const NEG_ENXIO: u64 = (-6_i64) as u64;
 
 /// linux_dirent64 type constants.
 #[allow(dead_code)]
@@ -4863,6 +4865,48 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         return NEG_ENOENT;
     }
 
+    // /dev/tty — resolve to the calling process's controlling terminal.
+    if name == "/dev/tty" {
+        let calling_pid = crate::process::current_pid();
+        let ctty = {
+            let pt = crate::process::PROCESS_TABLE.lock();
+            pt.find(calling_pid).and_then(|p| p.controlling_tty.clone())
+        };
+        let (backend, maybe_pty_id) = match ctty {
+            Some(crate::process::ControllingTty::Console) => {
+                (FdBackend::DeviceTTY { tty_id: 0 }, None)
+            }
+            Some(crate::process::ControllingTty::Pty(id)) => {
+                let mut table = crate::pty::PTY_TABLE.lock();
+                match table.get_mut(id as usize).and_then(|s| s.as_mut()) {
+                    None => return NEG_ENXIO,
+                    Some(pair) => {
+                        pair.slave_refcount += 1;
+                    }
+                }
+                (FdBackend::PtySlave { pty_id: id }, Some(id))
+            }
+            None => return NEG_ENXIO,
+        };
+        let entry = FdEntry {
+            backend,
+            offset: 0,
+            readable,
+            writable,
+            cloexec: false,
+            nonblock: false,
+        };
+        return match alloc_fd(3, entry) {
+            Some(i) => i as u64,
+            None => {
+                if let Some(id) = maybe_pty_id {
+                    crate::pty::close_slave(id);
+                }
+                NEG_EMFILE
+            }
+        };
+    }
+
     let create = flags & O_CREAT != 0;
     let truncate = flags & O_TRUNC != 0;
     let append = flags & O_APPEND != 0;
@@ -8303,7 +8347,7 @@ fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
     });
     drop(table);
     if busy {
-        return (-16_i64) as u64;
+        return NEG_EBUSY;
     }
 
     match resolved_target.as_str() {
