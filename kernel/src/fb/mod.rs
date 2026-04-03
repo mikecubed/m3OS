@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
 use spin::Mutex;
 
@@ -805,6 +806,13 @@ impl FbConsole {
 
 static CONSOLE: Mutex<Option<FbConsole>> = Mutex::new(None);
 
+/// When `true`, framebuffer text output is suppressed (a graphical process owns
+/// the framebuffer directly).  Serial output is unaffected.
+static CONSOLE_YIELDED: AtomicBool = AtomicBool::new(false);
+
+/// PID of the process that currently owns the raw framebuffer (0 = none).
+static FB_OWNER_PID: AtomicU32 = AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -901,7 +909,65 @@ pub fn console_text_size() -> Option<(u16, u16)> {
 ///
 /// Does nothing if [`init`] has not been called yet.
 pub fn write_str(s: &str) {
+    if CONSOLE_YIELDED.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(ref mut console) = *CONSOLE.lock() {
         console.write_str(s);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47: framebuffer info helpers and console yield/restore
+// ---------------------------------------------------------------------------
+
+/// Returns `(width, height, stride, bytes_per_pixel, pixel_format)` or `None`
+/// if the framebuffer console has not been initialised.
+pub fn framebuffer_raw_info() -> Option<(usize, usize, usize, usize, PixelFormat)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| {
+        (
+            c.width,
+            c.height,
+            c.stride,
+            c.bytes_per_pixel,
+            c.pixel_format,
+        )
+    })
+}
+
+/// Returns `(buf_virt_addr, byte_len)` of the raw framebuffer, or `None`.
+pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| (c.buf as u64, c.byte_len))
+}
+
+/// Suppresses all framebuffer console output.
+///
+/// Called when a graphical process maps the framebuffer directly.  Serial
+/// output continues unaffected — only the pixel framebuffer is suppressed.
+pub fn yield_console(owner_pid: u32) {
+    FB_OWNER_PID.store(owner_pid, Ordering::Release);
+    CONSOLE_YIELDED.store(true, Ordering::Release);
+}
+
+/// Restores framebuffer console output after a graphical process exits.
+///
+/// Clears the framebuffer and resets the owner PID.
+pub fn restore_console() {
+    FB_OWNER_PID.store(0, Ordering::Release);
+    CONSOLE_YIELDED.store(false, Ordering::Release);
+    if let Some(ref mut console) = *CONSOLE.lock() {
+        let rows = console.rows();
+        let cols = console.cols();
+        if rows > 0 && cols > 0 {
+            console.clear_region(0, 0, cols, rows);
+        }
+    }
+}
+
+/// Returns the PID of the process currently owning the raw framebuffer
+/// (0 = no owner).
+pub fn fb_owner_pid() -> u32 {
+    FB_OWNER_PID.load(Ordering::Acquire)
 }

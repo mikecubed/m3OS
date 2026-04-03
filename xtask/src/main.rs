@@ -4529,6 +4529,7 @@ fn collect_ports_entries(
             files.push((child_prefix, path));
         }
     }
+}
 
 /// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
 ///
@@ -4589,7 +4590,6 @@ fn populate_doom_files(part_path: &Path, output_dir: &Path) {
     }
 
     let _ = output_dir; // suppress unused warning
-}
 }
 
 fn cmd_image(image_args: &ImageArgs) {
