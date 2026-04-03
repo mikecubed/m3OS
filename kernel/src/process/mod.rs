@@ -336,6 +336,12 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
     let table = PROCESS_TABLE.lock();
     let mut count = 0usize;
     for proc in table.iter() {
+        // Skip non-leader threads in a thread group — the leader's shared
+        // fd table will already be counted, so counting it again for every
+        // sibling thread would inflate the result.
+        if proc.thread_group.is_some() && proc.tid != proc.tgid {
+            continue;
+        }
         let snapshot = proc.fd_table_snapshot();
         for entry in snapshot.iter().flatten() {
             if matches!(

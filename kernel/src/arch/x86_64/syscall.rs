@@ -1489,7 +1489,7 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
                     let mut i = 0;
                     while i < waiters.len() && wake_ids.is_empty() {
                         if (waiters[i].bitset & FUTEX_BITSET_MATCH_ANY) != 0 {
-                            let w = waiters.swap_remove(i);
+                            let w = waiters.remove(i);
                             w.woken.store(true, core::sync::atomic::Ordering::Release);
                             wake_ids.push(w.tid);
                         } else {
@@ -9401,13 +9401,13 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                     let mut i = 0;
                     while i < waiters.len() && woken_count < max_wake {
                         if (waiters[i].bitset & bitset) != 0 {
-                            let w = waiters.swap_remove(i);
+                            let w = waiters.remove(i);
                             // Set the woken flag *before* calling wake_task so the
                             // waiter can detect the wake even if it has not blocked yet.
                             w.woken.store(true, core::sync::atomic::Ordering::Release);
                             wake_list.push(w.tid);
                             woken_count += 1;
-                            // Don't increment i — swap_remove moved the last element here.
+                            // Don't increment i — remove shifted elements down.
                         } else {
                             i += 1;
                         }
