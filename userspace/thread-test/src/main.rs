@@ -153,7 +153,7 @@ fn clone_thread(stack_top_addr: u64, entry: extern "C" fn() -> !, child_tid_ptr:
     unsafe {
         core::arch::asm!(
             // Align child stack to 16 bytes and push the entry fn pointer
-            "and rsi, ~15",
+            "and rsi, -16",
             "sub rsi, 8",
             "mov [rsi], r9",
 

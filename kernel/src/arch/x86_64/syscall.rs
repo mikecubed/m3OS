@@ -8867,7 +8867,7 @@ fn sys_clone_thread(
                     p.pgid,
                     p.cwd.clone(),
                     p.blocked_signals,
-                    p.signal_actions,
+                    p.signal_actions_snapshot(),
                     p.fs_base,
                     (p.uid, p.gid, p.euid, p.egid),
                     p.umask,
@@ -8876,7 +8876,7 @@ fn sys_clone_thread(
                     p.mappings.clone(),
                     p.exec_path.clone(),
                     p.cmdline.clone(),
-                    p.fd_table.clone(),
+                    p.fd_table_snapshot(),
                     p.thread_group.clone(),
                     p.shared_fd_table.clone(),
                     p.shared_signal_actions.clone(),
@@ -9377,6 +9377,13 @@ fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                     .unwrap_or(true)
             };
             if is_single_threaded {
+                let mut cur = [0u8; 4];
+                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                    return NEG_EFAULT;
+                }
+                if u32::from_ne_bytes(cur) as u64 != val {
+                    return NEG_EAGAIN;
+                }
                 let _ = crate::mm::user_mem::copy_to_user(uaddr, &0u32.to_ne_bytes());
                 return 0;
             }
