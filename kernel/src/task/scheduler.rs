@@ -483,7 +483,7 @@ pub fn mark_task_dead_by_pid(pid: u32) -> bool {
 }
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
-pub fn wake_task(id: TaskId) {
+pub fn wake_task(id: TaskId) -> bool {
     let enqueue = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
@@ -504,6 +504,9 @@ pub fn wake_task(id: TaskId) {
     };
     if let Some((core, idx)) = enqueue {
         enqueue_to_core(core, idx);
+        true
+    } else {
+        false
     }
 }
 

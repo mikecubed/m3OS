@@ -216,10 +216,8 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
         return None;
     }
     let mut fd_targets = Vec::new();
-    for (fd, entry) in proc.fd_table.iter().enumerate() {
-        if let Some(entry) = entry
-            && let Some(target) = fd_target(&entry.backend)
-        {
+    for (fd, entry) in proc.fd_entries() {
+        if let Some(target) = fd_target(&entry.backend) {
             fd_targets.push((fd, target));
         }
     }

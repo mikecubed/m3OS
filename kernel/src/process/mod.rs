@@ -84,7 +84,7 @@ fn alloc_pid() -> Pid {
 }
 
 /// Public wrapper for `alloc_pid` — used by `sys_clone_thread`.
-pub fn alloc_pid_pub() -> Pid {
+pub(crate) fn alloc_pid_pub() -> Pid {
     alloc_pid()
 }
 
@@ -219,7 +219,7 @@ pub fn close_cloexec_fds(pid: Pid) {
             Some(p) => p,
             None => return,
         };
-        for slot in proc.fd_table.iter_mut() {
+        proc.fd_for_each_mut(|_i, slot| {
             if let Some(entry) = slot
                 && entry.cloexec
             {
@@ -236,7 +236,7 @@ pub fn close_cloexec_fds(pid: Pid) {
                 }
                 *slot = None;
             }
-        }
+        });
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -287,7 +287,7 @@ pub fn close_all_fds_for(pid: Pid) {
             Some(p) => p,
             None => return,
         };
-        for slot in proc.fd_table.iter_mut() {
+        proc.fd_for_each_mut(|_i, slot| {
             if let Some(entry) = slot.take() {
                 match &entry.backend {
                     FdBackend::PipeRead { pipe_id } => readers.push(*pipe_id),
@@ -301,7 +301,7 @@ pub fn close_all_fds_for(pid: Pid) {
                     _ => {}
                 }
             }
-        }
+        });
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -330,13 +330,15 @@ pub fn close_all_fds_for(pid: Pid) {
 }
 
 /// Count open ext2-backed file descriptors referencing `inode_num`.
+/// Checks the shared fd table when present (thread groups), otherwise
+/// falls back to the per-process fd table.
 pub fn ext2_inode_open_count(inode_num: u32) -> usize {
     let table = PROCESS_TABLE.lock();
-    table
-        .iter()
-        .flat_map(|proc| proc.fd_table.iter().flatten())
-        .filter(|entry| {
-            matches!(
+    let mut count = 0usize;
+    for proc in table.iter() {
+        let snapshot = proc.fd_table_snapshot();
+        for entry in snapshot.iter().flatten() {
+            if matches!(
                 entry,
                 FdEntry {
                     backend: FdBackend::Ext2Disk {
@@ -344,9 +346,12 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
                     },
                     ..
                 } if *fd_inode == inode_num
-            )
-        })
-        .count()
+            ) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Create a default FD table with stdin(0), stdout(1), stderr(2) wired up.
@@ -674,6 +679,128 @@ impl Process {
                 .is_some_and(|end| addr >= m.start && addr < end)
         })
     }
+
+    // -----------------------------------------------------------------
+    // Shared fd table helpers (Phase 40 — threading)
+    // -----------------------------------------------------------------
+
+    /// Read an fd entry, preferring the shared fd table when present.
+    pub fn fd_get(&self, fd: usize) -> Option<FdEntry> {
+        if let Some(shared) = &self.shared_fd_table {
+            shared.lock().get(fd)?.clone()
+        } else {
+            self.fd_table.get(fd)?.clone()
+        }
+    }
+
+    /// Write an fd entry, preferring the shared fd table when present.
+    pub fn fd_set(&mut self, fd: usize, entry: Option<FdEntry>) {
+        if let Some(shared) = &self.shared_fd_table {
+            if fd < MAX_FDS {
+                shared.lock()[fd] = entry;
+            }
+        } else if fd < MAX_FDS {
+            self.fd_table[fd] = entry;
+        }
+    }
+
+    /// Allocate the lowest free fd slot (>= `min_fd`), returning the fd number.
+    pub fn fd_alloc(&mut self, min_fd: usize, entry: FdEntry) -> Option<usize> {
+        if let Some(shared) = &self.shared_fd_table {
+            let mut lock = shared.lock();
+            for i in min_fd..MAX_FDS {
+                if lock[i].is_none() {
+                    lock[i] = Some(entry);
+                    return Some(i);
+                }
+            }
+            None
+        } else {
+            for i in min_fd..MAX_FDS {
+                if self.fd_table[i].is_none() {
+                    self.fd_table[i] = Some(entry);
+                    return Some(i);
+                }
+            }
+            None
+        }
+    }
+
+    /// Snapshot the effective fd table (shared if present, else local).
+    pub fn fd_table_snapshot(&self) -> [Option<FdEntry>; MAX_FDS] {
+        if let Some(shared) = &self.shared_fd_table {
+            shared.lock().clone()
+        } else {
+            self.fd_table.clone()
+        }
+    }
+
+    /// Iterate over effective fd table entries for read-only enumeration.
+    /// Returns a snapshot as a `Vec` of `(fd_index, FdEntry)`.
+    pub fn fd_entries(&self) -> alloc::vec::Vec<(usize, FdEntry)> {
+        let table = if let Some(shared) = &self.shared_fd_table {
+            shared.lock().clone()
+        } else {
+            self.fd_table.clone()
+        };
+        table
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|e| (i, e.clone())))
+            .collect()
+    }
+
+    /// Iterate mutably over the effective fd table, calling `f` on each slot.
+    /// Used by close-on-exec and process cleanup.
+    pub fn fd_for_each_mut<F: FnMut(usize, &mut Option<FdEntry>)>(&mut self, mut f: F) {
+        if let Some(shared) = &self.shared_fd_table {
+            let mut lock = shared.lock();
+            for i in 0..MAX_FDS {
+                f(i, &mut lock[i]);
+            }
+        } else {
+            for i in 0..MAX_FDS {
+                f(i, &mut self.fd_table[i]);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared signal actions helpers (Phase 40 — threading)
+    // -----------------------------------------------------------------
+
+    /// Read a signal action, preferring the shared table when present.
+    pub fn sigaction_get(&self, sig: usize) -> SignalAction {
+        if sig >= 32 {
+            return SignalAction::Default;
+        }
+        if let Some(shared) = &self.shared_signal_actions {
+            shared.lock()[sig]
+        } else {
+            self.signal_actions[sig]
+        }
+    }
+
+    /// Write a signal action, preferring the shared table when present.
+    pub fn sigaction_set(&mut self, sig: usize, action: SignalAction) {
+        if sig >= 32 {
+            return;
+        }
+        if let Some(shared) = &self.shared_signal_actions {
+            shared.lock()[sig] = action;
+        } else {
+            self.signal_actions[sig] = action;
+        }
+    }
+
+    /// Snapshot all signal actions (shared if present, else local).
+    pub fn signal_actions_snapshot(&self) -> [SignalAction; 32] {
+        if let Some(shared) = &self.shared_signal_actions {
+            *shared.lock()
+        } else {
+            self.signal_actions
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,7 +827,7 @@ fn alloc_kernel_stack() -> u64 {
 }
 
 /// Public wrapper for `alloc_kernel_stack` — used by `sys_clone_thread`.
-pub fn alloc_kernel_stack_pub() -> u64 {
+pub(crate) fn alloc_kernel_stack_pub() -> u64 {
     alloc_kernel_stack()
 }
 
@@ -1022,12 +1149,8 @@ pub fn dequeue_signal(pid: Pid) -> Option<(u32, SignalDisposition)> {
     }
     proc.pending_signals &= !(1u64 << sig);
 
-    // Determine disposition.
-    let action = if sig < 32 {
-        proc.signal_actions[sig as usize]
-    } else {
-        SignalAction::Default
-    };
+    // Determine disposition (uses shared signal actions table if present).
+    let action = proc.sigaction_get(sig as usize);
 
     let disposition = match action {
         SignalAction::Ignore => {

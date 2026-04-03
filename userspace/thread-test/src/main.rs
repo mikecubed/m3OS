@@ -29,6 +29,8 @@ const THREAD_STACK_SIZE: usize = 4096;
 static SHARED_VALUE: AtomicU32 = AtomicU32::new(0);
 static CHILD_TID: AtomicU32 = AtomicU32::new(0);
 static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
+static CHILD_REPORTED_PID: AtomicU32 = AtomicU32::new(0);
+static CHILD_REPORTED_TID: AtomicU32 = AtomicU32::new(0);
 
 static MUTEX_WORD: AtomicU32 = AtomicU32::new(0);
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -102,6 +104,10 @@ fn mutex_unlock(word: &AtomicU32) {
 
 extern "C" fn thread_fn_basic() -> ! {
     SHARED_VALUE.store(42, Ordering::Release);
+    let my_pid = unsafe { syscall0(SYS_GETPID) } as u32;
+    let my_tid = unsafe { syscall0(SYS_GETTID) } as u32;
+    CHILD_REPORTED_PID.store(my_pid, Ordering::Release);
+    CHILD_REPORTED_TID.store(my_tid, Ordering::Release);
     unsafe { syscall1(SYS_EXIT, 0) };
     exit(1)
 }
@@ -200,6 +206,8 @@ fn test_basic_thread() -> bool {
 
     SHARED_VALUE.store(0, Ordering::Release);
     CHILD_TID.store(0, Ordering::Release);
+    CHILD_REPORTED_PID.store(0, Ordering::Release);
+    CHILD_REPORTED_TID.store(0, Ordering::Release);
 
     let parent_pid = unsafe { syscall0(SYS_GETPID) };
     let parent_tid = unsafe { syscall0(SYS_GETTID) };
@@ -233,12 +241,34 @@ fn test_basic_thread() -> bool {
         return false;
     }
 
+    // Verify child reported the same TGID (getpid) but different TID (gettid).
+    let child_pid = CHILD_REPORTED_PID.load(Ordering::Acquire) as u64;
+    let child_tid_reported = CHILD_REPORTED_TID.load(Ordering::Acquire) as u64;
+
+    if child_pid != parent_pid {
+        serial_print("FAIL (child getpid()=");
+        print_num(child_pid);
+        serial_print(" != parent getpid()=");
+        print_num(parent_pid);
+        serial_print(")\n");
+        return false;
+    }
+
+    if child_tid_reported == parent_tid {
+        serial_print("FAIL (child gettid() == parent gettid())\n");
+        return false;
+    }
+
     serial_print("PASS (parent_pid=");
     print_num(parent_pid);
     serial_print(", parent_tid=");
     print_num(parent_tid);
     serial_print(", child_tid=");
     print_num(child_tid);
+    serial_print(", child_getpid=");
+    print_num(child_pid);
+    serial_print(", child_gettid=");
+    print_num(child_tid_reported);
     serial_print(")\n");
     true
 }
@@ -293,8 +323,8 @@ fn test_futex_mutex() -> bool {
     true
 }
 
-fn test_exit_group() -> bool {
-    serial_print("thread-test: test 3 -- thread exit/exit_group... ");
+fn test_thread_exit() -> bool {
+    serial_print("thread-test: test 3 -- thread exit... ");
 
     CHILD_DONE.store(0, Ordering::Release);
 
@@ -343,7 +373,7 @@ pub extern "C" fn _start() -> ! {
         failed += 1;
     }
 
-    if test_exit_group() {
+    if test_thread_exit() {
         passed += 1;
     } else {
         failed += 1;
