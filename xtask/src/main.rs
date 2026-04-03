@@ -1861,7 +1861,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "tcc version",
-        timeout_secs: 15,
+        timeout_secs: 30,
         label: "verify TCC version",
     });
     steps.push(SmokeStep::Wait {

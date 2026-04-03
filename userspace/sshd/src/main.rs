@@ -45,16 +45,9 @@ fn main(_args: &[&str]) -> i32 {
     // B.1: Ensure /etc/ssh/ directory exists.
     ensure_ssh_dir();
 
-    // B.2/B.3: Load or generate the Ed25519 host key.
-    let host_key = match host_key::load_or_generate() {
-        Ok(k) => k,
-        Err(_) => {
-            write_str(STDOUT_FILENO, "sshd: failed to load/generate host key\n");
-            return 1;
-        }
-    };
-
-    // C.1: Bind and listen on port 22.
+    // C.1: Bind and listen on port 22 immediately — defer host key
+    // generation until the first connection so sshd doesn't compete
+    // with the login shell for CPU during boot.
     let listen_fd = match setup_listener(SSH_PORT) {
         Ok(fd) => fd,
         Err(_) => {
@@ -65,14 +58,13 @@ fn main(_args: &[&str]) -> i32 {
 
     write_str(STDOUT_FILENO, "sshd: listening on port 22\n");
 
-    // Accept loop.
-    accept_loop(listen_fd, &host_key);
+    // Accept loop (host key generated lazily on first connection).
+    accept_loop(listen_fd);
 }
 
 /// B.1: Create /etc/ssh/ with mode 0755 if it does not exist.
 fn ensure_ssh_dir() {
     let ret = mkdir(b"/etc\0", 0o755);
-    // Ignore EEXIST (-17).
     if ret < 0 && ret != -17 {
         write_str(STDOUT_FILENO, "sshd: warning: cannot create /etc\n");
     }
@@ -90,7 +82,6 @@ fn setup_listener(port: u16) -> Result<i32, ()> {
     }
     let fd = fd as i32;
 
-    // Set SO_REUSEADDR.
     let one: i32 = 1;
     let optval = unsafe {
         core::slice::from_raw_parts(&one as *const i32 as *const u8, core::mem::size_of::<i32>())
@@ -114,7 +105,11 @@ fn setup_listener(port: u16) -> Result<i32, ()> {
 }
 
 /// F.1: Accept connections in a loop, fork a child for each.
-fn accept_loop(listen_fd: i32, host_key: &host_key::HostKey) -> ! {
+/// Host key is generated lazily on first connection to avoid competing
+/// with the login shell during boot.
+fn accept_loop(listen_fd: i32) -> ! {
+    let mut host_key: Option<host_key::HostKey> = None;
+
     loop {
         // Reap finished children.
         let mut status: i32 = 0;
@@ -127,6 +122,18 @@ fn accept_loop(listen_fd: i32, host_key: &host_key::HostKey) -> ! {
         }
         let client_fd = client_fd as i32;
 
+        // Generate host key on first connection.
+        if host_key.is_none() {
+            match host_key::load_or_generate() {
+                Ok(k) => host_key = Some(k),
+                Err(_) => {
+                    write_str(STDOUT_FILENO, "sshd: failed to load/generate host key\n");
+                    close(client_fd);
+                    continue;
+                }
+            }
+        }
+
         let pid = fork();
         if pid < 0 {
             write_str(STDOUT_FILENO, "sshd: fork failed\n");
@@ -136,7 +143,7 @@ fn accept_loop(listen_fd: i32, host_key: &host_key::HostKey) -> ! {
         if pid == 0 {
             // Child: handle the SSH session.
             close(listen_fd);
-            let exit_code = session::run_session(client_fd, host_key);
+            let exit_code = session::run_session(client_fd, host_key.as_ref().unwrap());
             close(client_fd);
             syscall_lib::exit(exit_code);
         }
