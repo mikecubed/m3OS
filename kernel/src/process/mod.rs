@@ -83,6 +83,11 @@ fn alloc_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Public wrapper for `alloc_pid` — used by `sys_clone_thread`.
+pub fn alloc_pid_pub() -> Pid {
+    alloc_pid()
+}
+
 // ---------------------------------------------------------------------------
 // File descriptor table (Phase 14 — per-process)
 // ---------------------------------------------------------------------------
@@ -694,6 +699,11 @@ fn alloc_kernel_stack() -> u64 {
     top & !15
 }
 
+/// Public wrapper for `alloc_kernel_stack` — used by `sys_clone_thread`.
+pub fn alloc_kernel_stack_pub() -> u64 {
+    alloc_kernel_stack()
+}
+
 // ---------------------------------------------------------------------------
 // Process table
 // ---------------------------------------------------------------------------
@@ -1165,6 +1175,37 @@ pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r9: 0,
         user_r10: 0,
         user_rflags: 0x202, // IF set, reserved bit set — safe default
+    });
+}
+
+/// Push a fork context for a clone(CLONE_THREAD) child.
+///
+/// The child thread starts at `user_rip` (the return address from the
+/// clone syscall) with `user_rsp` set to the provided child stack.
+/// All caller-saved registers are inherited from the parent's syscall
+/// entry (since the thread shares the parent's address space, the
+/// register state is meaningful), but RSP is overridden to `child_stack`.
+pub fn push_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) {
+    let pc = crate::smp::per_core();
+    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+        pid,
+        user_rip,
+        user_rsp: child_stack,
+        user_rbx: pc.syscall_user_rbx,
+        user_rbp: pc.syscall_user_rbp,
+        user_r12: pc.syscall_user_r12,
+        user_r13: pc.syscall_user_r13,
+        user_r14: pc.syscall_user_r14,
+        user_r15: pc.syscall_user_r15,
+        // Caller-saved registers — zeroed for clone child since the
+        // clone wrapper (musl __clone) will set up its own context.
+        user_rdi: 0,
+        user_rsi: 0,
+        user_rdx: 0,
+        user_r8: 0,
+        user_r9: 0,
+        user_r10: 0,
+        user_rflags: pc.syscall_user_rflags,
     });
 }
 

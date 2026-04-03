@@ -1034,8 +1034,12 @@ pub extern "C" fn syscall_handler(
             let sv_ptr = per_core_syscall_arg3();
             sys_socketpair(arg0, arg1, arg2, sv_ptr)
         }
-        // Phase 21: clone stub — delegate plain fork (flags=SIGCHLD) to sys_fork
-        56 => sys_clone(arg0, user_rip, user_rsp),
+        // Phase 21/40: clone — fork or thread creation
+        56 => {
+            let child_tidptr = per_core_syscall_arg3(); // r10
+            let tls = crate::smp::per_core().syscall_user_r8;
+            sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
+        }
         57 => sys_fork(user_rip, user_rsp),
         59 => sys_execve(arg0, arg1, arg2),
         61 => sys_waitpid(arg0, arg1, arg2),
@@ -8529,25 +8533,333 @@ fn sys_access(path_ptr: u64) -> u64 {
 // clone(flags, ...) — syscall 56
 // ---------------------------------------------------------------------------
 
-/// Minimal clone stub: if flags indicate a plain fork (flags == SIGCHLD or 0),
-/// delegate to sys_fork. Otherwise return -ENOSYS.
-fn sys_clone(flags: u64, user_rip: u64, user_rsp: u64) -> u64 {
-    const SIGCHLD: u64 = 17;
-    const CLONE_VM: u64 = 0x100;
-    const CLONE_VFORK: u64 = 0x4000;
+// ---------------------------------------------------------------------------
+// Clone flags (Phase 40)
+// ---------------------------------------------------------------------------
+
+const SIGCHLD: u64 = 17;
+const CLONE_VM: u64 = 0x0000_0100;
+#[allow(dead_code)]
+const CLONE_FS: u64 = 0x0000_0200;
+#[allow(dead_code)]
+const CLONE_FILES: u64 = 0x0000_0400;
+#[allow(dead_code)]
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+const CLONE_THREAD: u64 = 0x0001_0000;
+const CLONE_VFORK: u64 = 0x0000_4000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+/// Parse clone(2) flags and dispatch to the appropriate implementation.
+///
+/// Linux clone ABI: flags (rdi), child_stack (rsi), parent_tidptr (rdx),
+/// child_tidptr (r10), tls (r8).
+fn sys_clone(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: u64,
+    child_tidptr: u64,
+    tls: u64,
+    user_rip: u64,
+    user_rsp: u64,
+) -> u64 {
+    // CLONE_THREAD requires CLONE_VM — threads must share address space.
+    if flags & CLONE_THREAD != 0 && flags & CLONE_VM == 0 {
+        log::warn!("sys_clone: CLONE_THREAD without CLONE_VM");
+        return NEG_EINVAL;
+    }
+
+    // Thread creation path (Phase 40).
+    if flags & CLONE_THREAD != 0 {
+        return sys_clone_thread(
+            flags,
+            child_stack,
+            parent_tidptr,
+            child_tidptr,
+            tls,
+            user_rip,
+        );
+    }
+
     // musl uses clone(SIGCHLD, NULL, ...) as a fork fallback.
     // Accept flags == SIGCHLD, flags == 0, or the CLONE_VM|CLONE_VFORK
     // combination used by musl's posix_spawn/system() — treat all as fork.
-    if flags == 0
-        || flags == SIGCHLD
-        || flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
-        || flags == (CLONE_VM | CLONE_VFORK)
+    let fork_flags =
+        flags & !(CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_PARENT_SETTID | CLONE_SETTLS);
+    if fork_flags == 0
+        || fork_flags == SIGCHLD
+        || fork_flags == (CLONE_VM | CLONE_VFORK | SIGCHLD)
+        || fork_flags == (CLONE_VM | CLONE_VFORK)
     {
         sys_fork(user_rip, user_rsp)
     } else {
         log::warn!("sys_clone: unsupported flags {flags:#x}");
         NEG_ENOSYS
     }
+}
+
+// ---------------------------------------------------------------------------
+// clone(CLONE_THREAD) — Phase 40, Track C
+// ---------------------------------------------------------------------------
+
+/// Create a new thread sharing the parent's address space.
+///
+/// The child thread:
+/// - gets a new PID/TID but shares the parent's TGID
+/// - shares the parent's page table (no CoW clone)
+/// - shares the parent's fd table and signal actions via Arc
+/// - gets its own kernel stack
+/// - starts executing in userspace at `user_rip` with RSP = `child_stack`
+fn sys_clone_thread(
+    flags: u64,
+    child_stack: u64,
+    parent_tidptr: u64,
+    child_tidptr: u64,
+    tls: u64,
+    user_rip: u64,
+) -> u64 {
+    use crate::process::{
+        PROCESS_TABLE, Process, ProcessState, ThreadGroup, alloc_kernel_stack_pub,
+    };
+    use alloc::sync::Arc;
+
+    let parent_pid = crate::process::current_pid();
+    log::info!(
+        "[p{}] clone_thread(flags={:#x}, child_stack={:#x})",
+        parent_pid,
+        flags,
+        child_stack
+    );
+
+    if child_stack == 0 {
+        log::warn!("sys_clone_thread: child_stack is NULL");
+        return NEG_EINVAL;
+    }
+
+    // Gather parent state under lock.
+    let parent_info = {
+        let table = PROCESS_TABLE.lock();
+        match table.find(parent_pid) {
+            Some(p) => {
+                let cr3 = match p.page_table_root {
+                    Some(cr3) => cr3,
+                    None => {
+                        log::warn!("sys_clone_thread: parent has no page table");
+                        return NEG_EINVAL;
+                    }
+                };
+                Some((
+                    cr3,
+                    p.tgid,
+                    p.ppid,
+                    p.brk_current,
+                    p.mmap_next,
+                    p.pgid,
+                    p.cwd.clone(),
+                    p.blocked_signals,
+                    p.signal_actions,
+                    p.fs_base,
+                    (p.uid, p.gid, p.euid, p.egid),
+                    p.umask,
+                    p.session_id,
+                    p.controlling_tty.clone(),
+                    p.mappings.clone(),
+                    p.exec_path.clone(),
+                    p.cmdline.clone(),
+                    p.fd_table.clone(),
+                    p.thread_group.clone(),
+                    p.shared_fd_table.clone(),
+                    p.shared_signal_actions.clone(),
+                ))
+            }
+            None => None,
+        }
+    };
+
+    let (
+        parent_cr3,
+        parent_tgid,
+        parent_ppid,
+        parent_brk,
+        parent_mmap,
+        parent_pgid,
+        parent_cwd,
+        parent_blocked_signals,
+        parent_signal_actions,
+        parent_fs_base,
+        parent_ids,
+        parent_umask,
+        parent_session_id,
+        parent_ctty,
+        parent_mappings,
+        parent_exec_path,
+        parent_cmdline,
+        parent_fds,
+        parent_thread_group,
+        parent_shared_fd,
+        parent_shared_sig,
+    ) = match parent_info {
+        Some(info) => info,
+        None => {
+            log::warn!("sys_clone_thread: parent {} not found", parent_pid);
+            return NEG_EINVAL;
+        }
+    };
+
+    // Allocate child PID (also serves as TID).
+    let child_pid = crate::process::alloc_pid_pub();
+    let child_tgid = parent_tgid;
+
+    // Create or join the ThreadGroup.
+    let thread_group = match parent_thread_group {
+        Some(tg) => {
+            // Parent already in a thread group — add child.
+            tg.members.lock().push(child_pid);
+            tg
+        }
+        None => {
+            // First thread creation — create a new group with parent as leader.
+            let tg = Arc::new(ThreadGroup {
+                leader_tid: parent_tgid,
+                members: spin::Mutex::new(alloc::vec![parent_tgid, child_pid]),
+            });
+            // Set the parent's thread_group under lock.
+            {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(p) = table.find_mut(parent_pid) {
+                    p.thread_group = Some(tg.clone());
+                }
+            }
+            tg
+        }
+    };
+
+    // Share fd table: create Arc from parent's fd_table if not already shared.
+    let shared_fd = match parent_shared_fd {
+        Some(arc) => arc,
+        None => {
+            let arc = Arc::new(spin::Mutex::new(parent_fds));
+            // Update parent to use shared fd table.
+            {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(p) = table.find_mut(parent_pid) {
+                    p.shared_fd_table = Some(arc.clone());
+                }
+            }
+            arc
+        }
+    };
+
+    // Share signal actions: same approach.
+    let shared_sig = match parent_shared_sig {
+        Some(arc) => arc,
+        None => {
+            let arc = Arc::new(spin::Mutex::new(parent_signal_actions));
+            {
+                let mut table = PROCESS_TABLE.lock();
+                if let Some(p) = table.find_mut(parent_pid) {
+                    p.shared_signal_actions = Some(arc.clone());
+                }
+            }
+            arc
+        }
+    };
+
+    // Allocate a NEW kernel stack for the child thread.
+    let kstack_top = alloc_kernel_stack_pub();
+
+    // Determine TLS: if CLONE_SETTLS, use the provided tls value.
+    let child_fs_base = if flags & CLONE_SETTLS != 0 {
+        tls
+    } else {
+        parent_fs_base
+    };
+
+    // Determine clear_child_tid.
+    let child_clear_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+        child_tidptr
+    } else {
+        0
+    };
+
+    // Build the child Process entry.
+    let child_proc = Process {
+        pid: child_pid,
+        tid: child_pid,
+        tgid: child_tgid,
+        clear_child_tid: child_clear_tid,
+        ppid: parent_ppid,
+        state: ProcessState::Ready,
+        page_table_root: Some(parent_cr3), // SHARED — same physical page table
+        kernel_stack_top: kstack_top,
+        entry_point: user_rip,
+        user_stack_top: child_stack,
+        exit_code: None,
+        stop_signal: 0,
+        stop_reported: false,
+        brk_current: parent_brk,
+        mmap_next: parent_mmap,
+        pgid: parent_pgid,
+        fd_table: {
+            // Copy current shared fd table snapshot for the local field.
+            // The actual sharing is via shared_fd_table Arc.
+            let lock = shared_fd.lock();
+            lock.clone()
+        },
+        pending_signals: 0,
+        blocked_signals: parent_blocked_signals,
+        signal_actions: {
+            let lock = shared_sig.lock();
+            *lock
+        },
+        alt_stack_base: 0,
+        alt_stack_size: 0,
+        alt_stack_flags: 0,
+        cwd: parent_cwd,
+        fs_base: child_fs_base,
+        uid: parent_ids.0,
+        gid: parent_ids.1,
+        euid: parent_ids.2,
+        egid: parent_ids.3,
+        umask: parent_umask,
+        session_id: parent_session_id,
+        controlling_tty: parent_ctty,
+        mappings: parent_mappings,
+        exec_path: parent_exec_path,
+        cmdline: parent_cmdline,
+        start_ticks: crate::arch::x86_64::interrupts::tick_count(),
+        thread_group: Some(thread_group),
+        shared_fd_table: Some(shared_fd),
+        shared_signal_actions: Some(shared_sig),
+    };
+
+    PROCESS_TABLE.lock().insert(child_proc);
+
+    // CLONE_PARENT_SETTID: write child TID to parent_tidptr in userspace.
+    if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(parent_tidptr, &tid_bytes);
+    }
+
+    // CLONE_CHILD_SETTID: write child TID to child_tidptr in userspace.
+    // Since we share the address space, we can write it now from the parent context.
+    if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
+        let tid_bytes = (child_pid as i32).to_ne_bytes();
+        let _ = crate::mm::user_mem::copy_to_user(child_tidptr, &tid_bytes);
+    }
+
+    // Push a fork context for the child thread. The child will start at
+    // user_rip (the return address from the clone syscall) with rax=0 and
+    // RSP = child_stack.
+    crate::process::push_fork_ctx_for_thread(child_pid, user_rip, child_stack);
+
+    // Spawn a kernel task for the child thread.
+    crate::task::spawn(crate::process::fork_child_trampoline, "clone-thread");
+
+    log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
+    child_pid as u64
 }
 
 // ---------------------------------------------------------------------------
