@@ -247,6 +247,15 @@ pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 /// Custom kernel meminfo syscall (Phase 33).
 pub const SYS_MEMINFO: u64 = 0x1001;
 
+/// Phase 47: framebuffer info syscall.
+pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1002;
+
+/// Phase 47: framebuffer mmap syscall.
+pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1003;
+
+/// Phase 47: raw scancode read syscall.
+pub const SYS_READ_SCANCODE: u64 = 0x1004;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -1242,6 +1251,30 @@ pub fn serial_print(s: &str) {
 /// Writes a text summary into `buf` and returns the number of bytes written.
 pub fn meminfo(buf: &mut [u8]) -> usize {
     unsafe { syscall2(SYS_MEMINFO, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
+}
+
+/// Retrieves framebuffer metadata into `buf` (must be ≥ 20 bytes).
+/// Returns 0 on success, negative errno on failure.
+pub fn framebuffer_info(buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall2(
+            SYS_FRAMEBUFFER_INFO,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// Maps the framebuffer into the calling process's address space.
+/// Returns the userspace virtual address of the mapped framebuffer.
+pub fn framebuffer_mmap() -> u64 {
+    unsafe { syscall0(SYS_FRAMEBUFFER_MMAP) }
+}
+
+/// Reads one raw PS/2 scancode from the keyboard ring buffer.
+/// Returns the scancode (0x01–0xFF), or 0 if no key is pending.
+pub fn read_scancode() -> u64 {
+    unsafe { syscall0(SYS_READ_SCANCODE) }
 }
 
 /// Write a string slice to a file descriptor.

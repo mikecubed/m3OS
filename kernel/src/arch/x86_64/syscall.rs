@@ -1208,6 +1208,11 @@ pub extern "C" fn syscall_handler(
         0x1000 => sys_debug_print(arg0, arg1),
         // Custom kernel meminfo (Phase 33 Track F)
         0x1001 => sys_meminfo(arg0, arg1),
+        // Phase 47 Track A: framebuffer info + mmap
+        0x1002 => sys_framebuffer_info(arg0, arg1),
+        0x1003 => sys_framebuffer_mmap(),
+        // Phase 47 Track B: raw scancode
+        0x1004 => sys_read_scancode(),
         _ => {
             // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -1521,6 +1526,12 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
 fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
+
+    // Phase 47 Track C: if this process owned the raw framebuffer, restore
+    // console output so the shell is visible again.
+    if crate::fb::fb_owner_pid() == pid {
+        crate::fb::restore_console();
+    }
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
@@ -6693,6 +6704,182 @@ impl core::fmt::Write for BufWriter<'_> {
         self.buf[self.pos..self.pos + len].copy_from_slice(&bytes[..len]);
         self.pos += len;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47 Track A: framebuffer info syscall (0x1002)
+//
+// Writes a packed FbInfo struct into a user-supplied buffer.
+// arg0 = user buffer pointer, arg1 = buffer length (must be >= 20 bytes)
+// Returns 0 on success, NEG_EINVAL on error.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct FbInfo {
+    width: u32,
+    height: u32,
+    stride: u32,
+    bpp: u32,
+    pixel_format: u32,
+}
+
+fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    const FB_INFO_SIZE: u64 = core::mem::size_of::<FbInfo>() as u64;
+
+    if buf_addr == 0 || buf_addr >= USER_LIMIT || buf_len < FB_INFO_SIZE {
+        return NEG_EINVAL;
+    }
+
+    let (width, height, stride, bpp, pixel_format) = match crate::fb::framebuffer_raw_info() {
+        Some(info) => info,
+        None => return NEG_EINVAL,
+    };
+
+    let pixel_format_val: u32 = match pixel_format {
+        bootloader_api::info::PixelFormat::Rgb => 0,
+        bootloader_api::info::PixelFormat::Bgr => 1,
+        _ => 2,
+    };
+
+    let info = FbInfo {
+        width: width as u32,
+        height: height as u32,
+        stride: stride as u32,
+        bpp: bpp as u32,
+        pixel_format: pixel_format_val,
+    };
+
+    // Safety: buf_addr validated to be non-null and within user address space.
+    unsafe {
+        core::ptr::write_unaligned(buf_addr as *mut FbInfo, info);
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47 Track A: framebuffer mmap syscall (0x1003)
+//
+// Maps the physical framebuffer into the calling process's address space.
+// Returns the userspace virtual address, or NEG_EINVAL on error.
+// ---------------------------------------------------------------------------
+
+fn sys_framebuffer_mmap() -> u64 {
+    let (buf_virt, byte_len) = match crate::fb::framebuffer_buf_addr() {
+        Some(v) => v,
+        None => return NEG_EINVAL,
+    };
+
+    let phys_off = crate::mm::phys_offset();
+    let buf_phys = buf_virt - phys_off;
+
+    let num_pages = (byte_len as u64).div_ceil(4096);
+    let total_size = num_pages * 4096;
+
+    // Build array of PhysFrame for each page of the framebuffer.
+    let mut frames = alloc::vec::Vec::new();
+    for i in 0..num_pages {
+        let phys_addr = x86_64::PhysAddr::new(buf_phys + i * 4096);
+        let frame = match x86_64::structures::paging::PhysFrame::<
+            x86_64::structures::paging::Size4KiB,
+        >::from_start_address(phys_addr)
+        {
+            Ok(f) => f,
+            Err(_) => return NEG_EINVAL,
+        };
+        frames.push(frame);
+    }
+
+    let pid = crate::process::current_pid();
+
+    // Determine the virtual address for the mapping in the process address space.
+    let virt_addr = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
+        };
+        if proc.mmap_next == 0 {
+            proc.mmap_next = ANON_MMAP_BASE;
+        }
+        // Round up to page boundary.
+        let base = (proc.mmap_next + 4095) & !4095;
+        proc.mmap_next = match base.checked_add(total_size) {
+            Some(v) => v,
+            None => return NEG_EINVAL,
+        };
+        base
+    };
+
+    // Get the process page table and map the frames.
+    let cr3_phys = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid).and_then(|p| p.page_table_root) {
+            Some(phys) => phys,
+            None => return NEG_EINVAL,
+        }
+    };
+
+    let cr3_frame = match x86_64::structures::paging::PhysFrame::<
+        x86_64::structures::paging::Size4KiB,
+    >::from_start_address(cr3_phys)
+    {
+        Ok(f) => f,
+        Err(_) => return NEG_EINVAL,
+    };
+
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+
+    use x86_64::structures::paging::PageTableFlags;
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
+        .is_err()
+    {
+        return NEG_EINVAL;
+    }
+
+    // Record the mapping in the process table.
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.mappings.push(crate::process::MemoryMapping {
+                start: virt_addr,
+                len: total_size,
+                prot: 3,  // PROT_READ | PROT_WRITE
+                flags: 1, // MAP_SHARED
+            });
+        }
+    }
+
+    // Yield the console: suppress text output while the process owns the fb.
+    crate::fb::yield_console(pid);
+
+    log::info!(
+        "[framebuffer_mmap] pid={} mapped {} pages @ {:#x}",
+        pid,
+        num_pages,
+        virt_addr
+    );
+    virt_addr
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47 Track B: raw scancode syscall (0x1004)
+//
+// Returns the next raw PS/2 scancode from the keyboard ring buffer,
+// or 0 if no scancode is available (non-blocking).
+// ---------------------------------------------------------------------------
+
+fn sys_read_scancode() -> u64 {
+    match super::interrupts::read_scancode() {
+        Some(sc) => sc as u64,
+        None => 0,
     }
 }
 
