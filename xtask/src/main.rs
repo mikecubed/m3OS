@@ -3302,6 +3302,25 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for make clean",
     });
 
+    // -----------------------------------------------------------------------
+    // 18. Phase 47 — verify /bin/doom is present in the ramdisk
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "ls /bin/doom\n",
+        label: "doom: list binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/bin/doom",
+        timeout_secs: 10,
+        label: "doom: verify /bin/doom exists in ramdisk",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "doom: prompt after ls",
+    });
+
     steps
 }
 
