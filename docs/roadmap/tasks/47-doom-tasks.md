@@ -13,12 +13,12 @@ frame rate and accept keyboard input for full gameplay.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Kernel framebuffer syscalls (`sys_framebuffer_info`, `sys_framebuffer_mmap`) | — | Planned |
-| B | Kernel raw scancode syscall (`sys_read_scancode`) | — | Planned |
-| C | Framebuffer console yield/restore (dual-mode console) | A | Planned |
-| D | doomgeneric platform layer (C userspace code) | A, B | Planned |
-| E | xtask build integration and WAD disk image | D | Planned |
-| F | Integration testing and documentation | A–E | Planned |
+| A | Kernel framebuffer syscalls (`sys_framebuffer_info`, `sys_framebuffer_mmap`) | — | Complete |
+| B | Kernel raw scancode syscall (`sys_read_scancode`) | — | Complete |
+| C | Framebuffer console yield/restore (dual-mode console) | A | Complete |
+| D | doomgeneric platform layer (C userspace code) | A, B | Complete |
+| E | xtask build integration and WAD disk image | D | Complete |
+| F | Integration testing and documentation | A–E | Complete |
 
 ---
 
