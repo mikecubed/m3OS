@@ -1,0 +1,12 @@
+[package]
+name = "crypto-test"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "crypto-test"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
+crypto-lib = { path = "../crypto-lib" }

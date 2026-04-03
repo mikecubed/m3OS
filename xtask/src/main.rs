@@ -138,6 +138,7 @@ fn build_userspace_bins() {
         ("pty-test", "pty-test", false),
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
+        ("crypto-test", "crypto-test", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -190,6 +191,7 @@ fn build_userspace_bins() {
         "cal", "tr", "sort", "tail", "ps", "du", "chown", "find",
         // Phase 41 Rust ports (batch 4 — complex)
         "cut", "diff", "sed", "xargs", "less", "patch",
+        "sha256sum", "genkey", // Phase 42: crypto utilities
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1046,6 +1048,8 @@ fn cmd_check() {
         "pty-test",
         "unix-socket-test",
         "thread-test",
+        "crypto-lib",
+        "crypto-test",
         "coreutils-rs",
     ];
     let mut clippy_args = vec![

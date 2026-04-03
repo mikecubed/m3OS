@@ -269,6 +269,9 @@ pub const SYS_CLOCK_GETTIME: u64 = 228;
 // Phase 32: File timestamp syscall
 pub const SYS_UTIMENSAT: u64 = 280;
 
+// Phase 42: getrandom
+pub const SYS_GETRANDOM: u64 = 318;
+
 // ===========================================================================
 // File flags and constants
 // ===========================================================================
@@ -1544,4 +1547,10 @@ pub fn format_datetime(dt: &DateTime, buf: &mut [u8]) -> usize {
 
     append(buf, &mut pos, b"\n");
     pos
+}
+
+/// Fill buffer with random bytes from the kernel's getrandom syscall.
+/// Returns the number of bytes written, or a negative errno on failure.
+pub fn getrandom(buf: &mut [u8]) -> isize {
+    unsafe { syscall3(SYS_GETRANDOM, buf.as_mut_ptr() as u64, buf.len() as u64, 0) as isize }
 }
