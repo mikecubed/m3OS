@@ -1637,8 +1637,15 @@ fn run_smoke_script(
                         if used_cleaned {
                             // Kernel log lines were interleaved — we can't
                             // precisely map cleaned positions back to raw
-                            // positions, so just clear the buffer.
-                            serial_buf.clear();
+                            // positions.  Drain up to the last newline to
+                            // avoid dropping post-match content (e.g., the
+                            // next prompt already in the buffer).
+                            if let Some(nl) = serial_buf.rfind('\n') {
+                                serial_buf.drain(..=nl);
+                            } else if serial_buf.len() > 4096 {
+                                let drain = serial_buf.len() - 4096;
+                                serial_buf.drain(..drain);
+                            }
                             break;
                         }
                         // Drain buffer up to end of match to avoid re-matching

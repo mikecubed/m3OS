@@ -11,31 +11,34 @@ const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 /// D.1: Check password against /etc/shadow.
 /// Returns Some((uid, gid, home, shell)) on success.
 pub fn check_password(username: &str, password: &str) -> Option<UserInfo> {
-    // Look up user in /etc/passwd.
+    // Look up user in /etc/passwd — do not return early if missing, to avoid
+    // a timing side channel that reveals whether a username exists.
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
         return None;
     }
 
-    let user_info = find_user(&passwd_buf[..passwd_len], username.as_bytes())?;
+    let user_info = find_user(&passwd_buf[..passwd_len], username.as_bytes());
 
-    // Verify password against /etc/shadow.
+    // Always read /etc/shadow and verify, even if the user wasn't found in
+    // passwd.  This equalizes the work done for existing vs non-existing users.
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
         return None;
     }
 
-    if !verify_shadow(
+    let password_ok = verify_shadow(
         &shadow_buf[..shadow_len],
         username.as_bytes(),
         password.as_bytes(),
-    ) {
+    );
+    if !password_ok {
         return None;
     }
 
-    Some(user_info)
+    user_info
 }
 
 /// D.2: Check if a public key is authorized for the given user.

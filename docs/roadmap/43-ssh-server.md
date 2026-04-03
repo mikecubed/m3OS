@@ -140,7 +140,6 @@ Each accepted TCP connection spawns a child process that:
 This mirrors the telnetd architecture from Phase 30, but with encryption and proper
 authentication wrapping the connection. Channel requests beyond basic interactive shell
 I/O — including `window-change` handling and signal forwarding — are deferred.
-authentication wrapping the connection.
 
 ### Authentication Against /etc/shadow and authorized_keys
 
@@ -157,7 +156,7 @@ the session ID — the private key never leaves the client.
 - Extends Phase 29 by allocating PTY pairs for SSH sessions (same mechanism as telnetd)
 - Extends Phase 30 by replacing the telnet protocol with encrypted SSH — the session
   lifecycle (accept → auth → PTY → shell → relay → cleanup) is structurally identical
-- Extends Phase 37 by using epoll for multiplexing socket and PTY I/O within each session
+- Extends Phase 37 by using poll for multiplexing socket and PTY I/O within each session
 - Extends Phase 42 by consuming Ed25519, X25519, ChaCha20-Poly1305, HMAC-SHA-256, and
   HKDF through the crypto-lib crate for all SSH cryptographic operations
 
