@@ -125,13 +125,14 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     flush_output(&mut runner, sock_fd);
                     let _ = runner.progress();
                     flush_output(&mut runner, sock_fd);
-                    break; // Still blocked — try again next iteration.
+                    break;
                 }
                 Ok(c) => {
                     sock_pending_buf.copy_within(c..sock_pending_len, 0);
                     sock_pending_len -= c;
                 }
                 Err(_) => {
+                    write_str(STDOUT_FILENO, "sshd: input pending error\n");
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
@@ -237,12 +238,15 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         loop {
             match runner.progress() {
                 Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
+                    write_str(STDOUT_FILENO, "sshd: hostkeys event\n");
                     if hostkeys.hostkeys(&[&host_key.key]).is_err() {
+                        write_str(STDOUT_FILENO, "sshd: hostkeys failed\n");
                         cleanup(shell_pid, pty_master, pty_slave);
                         return 1;
                     }
                 }
                 Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
+                    write_str(STDOUT_FILENO, "sshd: first auth\n");
                     let _ = first_auth.reject();
                 }
                 Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
@@ -339,6 +343,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 }
                 Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
+                    write_str(STDOUT_FILENO, "sshd: open session\n");
                     if !authenticated {
                         let _ = open_session
                             .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
@@ -351,17 +356,25 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                         Err(_) => {}
                     }
                 }
-                Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => match syscall_lib::openpty() {
-                    Ok((master, slave)) => {
-                        pty_master = Some(master);
-                        pty_slave = Some(slave);
-                        let _ = pty_req.succeed();
+                Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
+                    write_str(STDOUT_FILENO, "sshd: pty request\n");
+                    match syscall_lib::openpty() {
+                        Ok((master, slave)) => {
+                            write_str(STDOUT_FILENO, "sshd: pty allocated\n");
+                            pty_master = Some(master);
+                            pty_slave = Some(slave);
+                            let _ = pty_req.succeed();
+                        }
+                        Err(e) => {
+                            write_str(STDOUT_FILENO, "sshd: openpty failed (");
+                            syscall_lib::write_u64(STDOUT_FILENO, (-e) as u64);
+                            write_str(STDOUT_FILENO, ")\n");
+                            let _ = pty_req.fail();
+                        }
                     }
-                    Err(_) => {
-                        let _ = pty_req.fail();
-                    }
-                },
+                }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
+                    write_str(STDOUT_FILENO, "sshd: shell request\n");
                     // Only acknowledge success after the shell is actually spawned.
                     if shell_spawned {
                         let _ = shell_req.fail();
@@ -469,6 +482,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::None) => break,
                 Ok(_) => break,
                 Err(_) => {
+                    write_str(STDOUT_FILENO, "sshd: session progress error\n");
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
