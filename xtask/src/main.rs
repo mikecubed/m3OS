@@ -546,9 +546,20 @@ fn build_doom() {
     let initrd = root.join("kernel/initrd");
     let doom_bin = initrd.join("doom");
 
-    // Check cache: non-empty existing binary.
-    if doom_bin.exists() && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        println!("doom: using cached {}", doom_bin.display());
+    let commit_stamp = initrd.join("doom.commit");
+    let cached_commit = fs::read_to_string(&commit_stamp).unwrap_or_default();
+
+    // Cache hit: non-empty binary AND it was built from the current pinned commit.
+    // When DOOMGENERIC_COMMIT changes the stamp mismatch forces a rebuild.
+    if doom_bin.exists()
+        && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && cached_commit.trim() == DOOMGENERIC_COMMIT
+    {
+        println!(
+            "doom: using cached {} (commit {})",
+            doom_bin.display(),
+            DOOMGENERIC_COMMIT
+        );
         return;
     }
 
@@ -690,6 +701,8 @@ fn build_doom() {
     }
 
     println!("doom: built → kernel/initrd/doom");
+    // Record the commit so future runs can validate the binary cache.
+    let _ = fs::write(initrd.join("doom.commit"), DOOMGENERIC_COMMIT);
 }
 
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).

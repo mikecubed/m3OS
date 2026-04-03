@@ -974,8 +974,18 @@ pub fn try_yield_console(owner_pid: u32) -> bool {
             CONSOLE_YIELDED.store(true, Ordering::Release);
             true
         }
-        Err(current) if current == owner_pid => true, // re-entrant: already owned by us
-        Err(_) => false,                              // owned by another process
+        Err(current) if current == owner_pid => {
+            // Re-entrant: we already own the FB.  The original claim may still
+            // be waiting to acquire CONSOLE before setting CONSOLE_YIELDED=true,
+            // so ensure the flag is set before we return to avoid a window where
+            // write_str observes CONSOLE_YIELDED=false while we're the owner.
+            if !CONSOLE_YIELDED.load(Ordering::Acquire) {
+                let _guard = CONSOLE.lock();
+                CONSOLE_YIELDED.store(true, Ordering::Release);
+            }
+            true
+        }
+        Err(_) => false, // owned by another process
     }
 }
 
