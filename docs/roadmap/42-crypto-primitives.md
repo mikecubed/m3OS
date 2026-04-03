@@ -104,22 +104,24 @@ most but takes the longest. Reserve for stretch goals.
 
 A `no_std`-compatible Rust library crate that re-exports RustCrypto primitives with a
 thin wrapper API. Userspace binaries depend on this crate. It provides: `sha256()`,
-`hmac_sha256()`, `hkdf_expand()`, `aes256_encrypt()`/`decrypt()`,
+`hmac_sha256()`, `hkdf_extract()`/`hkdf_expand()`, `aes256_ctr_encrypt()`/`decrypt()`,
 `chacha20poly1305_seal()`/`open()`, `ed25519_keygen()`/`sign()`/`verify()`,
-`x25519_diffie_hellman()`, and `csprng_fill()`.
+`x25519_keygen()`/`x25519_diffie_hellman()`, and `csprng_init()`/`csprng_fill()`.
+Note: functions use output slices rather than `Vec<u8>` returns to avoid requiring alloc.
 
 ### CSPRNG Seeding Path
 
-The kernel's `getrandom` syscall provides entropy from RDRAND/RDSEED (or a fallback
-timer-jitter source). The userspace CSPRNG reads a 32-byte seed via `getrandom()`,
-initializes a ChaCha20 stream, and generates random bytes on demand. The CSPRNG is
-per-process (not shared across fork).
+The kernel's `getrandom` syscall currently provides entropy from a TSC-seeded PRNG
+(not cryptographically secure — hardening to RDRAND/RDSEED is deferred). The userspace
+CSPRNG reads a 32-byte seed via `getrandom()`, initializes a ChaCha20 stream, and
+generates random bytes on demand. The CSPRNG is per-process (not shared across fork).
 
 ### Key Storage
 
-Ed25519 keypairs are stored as raw files on the FAT32 filesystem. `genkey` writes
-`~/.ssh/id_ed25519` (private key, 64 bytes) and `~/.ssh/id_ed25519.pub` (public key,
-32 bytes). File permissions are enforced by the existing multi-user system from Phase 27.
+Ed25519 keypairs are stored as raw files on the filesystem. `genkey` writes
+`id_ed25519` (private key seed, 32 bytes) and `id_ed25519.pub` (public key, 32 bytes)
+in the current directory (or a directory specified with `-o <dir>`).
+File permissions are enforced by the existing multi-user system from Phase 27.
 
 ## How This Builds on Earlier Phases
 

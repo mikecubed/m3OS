@@ -151,7 +151,7 @@ session encryption keys. Without HKDF, key derivation would be ad-hoc and weak.
 
 **Acceptance:**
 - [x] `hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32]` extracts a pseudorandom key
-- [x] `hkdf_expand(prk: &[u8], info: &[u8], len: usize) -> Vec<u8>` expands to `len` bytes
+- [x] `hkdf_expand(prk: &[u8], info: &[u8], output: &mut [u8]) -> Result<(), CryptoError>` expands to output slice
 - [x] Matches RFC 5869 test case 1 (SHA-256, IKM=0x0b*22, salt=0x000102...0c)
 - [x] Matches RFC 5869 test case 2 (SHA-256, longer inputs)
 
@@ -171,8 +171,8 @@ hardware is not available (which is the case in our QEMU setup). It provides
 authenticated encryption — both confidentiality and integrity in a single operation.
 
 **Acceptance:**
-- [x] `chacha20poly1305_seal(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8>` encrypts and appends 16-byte auth tag
-- [x] `chacha20poly1305_open(key: &[u8; 32], nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, CryptoError>` decrypts and verifies tag
+- [x] `chacha20poly1305_seal(key, nonce, plaintext, aad, output) -> Result<usize, CryptoError>` encrypts in place and appends 16-byte auth tag
+- [x] `chacha20poly1305_open(key, nonce, ciphertext, aad, output) -> Result<usize, CryptoError>` decrypts and verifies tag
 - [x] Encrypt then decrypt round-trips produce the original plaintext
 - [x] Matches RFC 8439 Section 2.8.2 test vector
 - [x] Tampered ciphertext returns `Err(CryptoError::AuthenticationFailed)`
@@ -186,8 +186,8 @@ ChaCha20 is preferred in this project, AES support is needed for interoperabilit
 with systems that require it and for completeness of the crypto library.
 
 **Acceptance:**
-- [x] `aes256_ctr_encrypt(key: &[u8; 32], nonce: &[u8; 16], plaintext: &[u8]) -> Vec<u8>` encrypts
-- [x] `aes256_ctr_decrypt(key: &[u8; 32], nonce: &[u8; 16], ciphertext: &[u8]) -> Vec<u8>` decrypts
+- [x] `aes256_ctr_encrypt(key, nonce, plaintext, output) -> Result<(), CryptoError>` encrypts to output slice
+- [x] `aes256_ctr_decrypt(key, nonce, ciphertext, output) -> Result<(), CryptoError>` decrypts to output slice
 - [x] CTR mode: encrypt and decrypt are the same operation (XOR with keystream)
 - [x] Encrypt then decrypt round-trips produce the original plaintext
 - [x] Matches NIST SP 800-38A F.5.5 AES-256-CTR test vector
@@ -255,7 +255,7 @@ their own.
 ### F.1 — Build `sha256sum` utility
 
 **Files:**
-- `userspace/coreutils-rs/src/bin/sha256sum.rs`
+- `userspace/coreutils-rs/src/sha256sum.rs`
 - `userspace/coreutils-rs/Cargo.toml`
 
 **Symbol:** `main` (sha256sum binary)
@@ -273,7 +273,7 @@ hex output) and provides a practical tool for verifying file integrity inside th
 ### F.2 — Build `genkey` utility
 
 **Files:**
-- `userspace/coreutils-rs/src/bin/genkey.rs`
+- `userspace/coreutils-rs/src/genkey.rs`
 - `userspace/coreutils-rs/Cargo.toml`
 
 **Symbol:** `main` (genkey binary)
@@ -283,7 +283,7 @@ keypairs and validates the full path from CSPRNG → key generation → file I/O
 
 **Acceptance:**
 - [x] `genkey` generates an Ed25519 keypair
-- [x] Writes private key to `id_ed25519` (32-byte seed) in the current directory
+- [x] Writes private key seed to `id_ed25519` (32 bytes) in the current directory
 - [x] Writes public key to `id_ed25519.pub` (32-byte public key) in the current directory
 - [x] Prints the public key in hex to stdout
 - [x] Accepts optional `-o <path>` flag to specify output directory
