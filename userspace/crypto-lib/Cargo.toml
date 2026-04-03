@@ -1,0 +1,21 @@
+[package]
+name = "crypto-lib"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+chacha20poly1305 = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+syscall-lib = { path = "../syscall-lib" }

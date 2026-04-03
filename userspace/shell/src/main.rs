@@ -397,7 +397,6 @@ fn execute_external(
 
 /// Try to exec `cmd` by resolving it against PATH directories.
 /// If cmd starts with `/`, try it directly. Otherwise try each PATH dir.
-/// Also tries appending `.elf` for ramdisk backward compatibility.
 fn exec_with_path_resolution(
     cmd: &[u8],
     token_storage: &[[u8; MAX_PATH]; MAX_TOKENS],
@@ -433,15 +432,6 @@ fn exec_with_path_resolution(
         let plen = copy_min(&cmd[..cmd_len], &mut path_buf);
         path_buf[plen] = 0;
         execve(&path_buf[..plen + 1], &argv_ptrs[..argc + 1], &envp);
-        // Also try with .elf suffix.
-        if plen + 4 < MAX_PATH {
-            path_buf[plen] = b'.';
-            path_buf[plen + 1] = b'e';
-            path_buf[plen + 2] = b'l';
-            path_buf[plen + 3] = b'f';
-            path_buf[plen + 4] = 0;
-            execve(&path_buf[..plen + 5], &argv_ptrs[..argc + 1], &envp);
-        }
     } else {
         // Relative: search PATH.
         for dir in &PATH_DIRS {
@@ -456,20 +446,6 @@ fn exec_with_path_resolution(
                 let total = dir_len + 1 + cmd_len;
                 path_buf[total] = 0;
                 execve(&path_buf[..total + 1], &argv_ptrs[..argc + 1], &envp);
-            }
-
-            // dir/cmd.elf
-            if dir_len + 1 + cmd_len + 4 < MAX_PATH {
-                copy_bytes(dir, &mut path_buf, dir_len);
-                path_buf[dir_len] = b'/';
-                copy_bytes(&cmd[..cmd_len], &mut path_buf[dir_len + 1..], cmd_len);
-                let base = dir_len + 1 + cmd_len;
-                path_buf[base] = b'.';
-                path_buf[base + 1] = b'e';
-                path_buf[base + 2] = b'l';
-                path_buf[base + 3] = b'f';
-                path_buf[base + 4] = 0;
-                execve(&path_buf[..base + 5], &argv_ptrs[..argc + 1], &envp);
             }
         }
     }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib" }
+crypto-lib = { path = "../crypto-lib" }
 
 [[bin]]
 name = "true"
@@ -220,3 +221,12 @@ path = "src/less.rs"
 [[bin]]
 name = "patch"
 path = "src/patch.rs"
+
+# Phase 42: crypto utilities
+[[bin]]
+name = "sha256sum"
+path = "src/sha256sum.rs"
+
+[[bin]]
+name = "genkey"
+path = "src/genkey.rs"
