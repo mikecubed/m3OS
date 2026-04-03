@@ -88,6 +88,9 @@ fn read_line(buf: &mut [u8; MAX_LINE]) -> usize {
     }
 }
 
+/// Maximum pipeline stages supported.
+const MAX_PIPELINE_STAGES: usize = 8;
+
 /// Parse a command line and execute it.
 fn execute_line(line: &[u8]) {
     // Skip leading whitespace.
@@ -96,14 +99,10 @@ fn execute_line(line: &[u8]) {
         return;
     }
 
-    // Check for pipe.
-    if let Some(pipe_pos) = find_byte(line, b'|') {
-        let left = trim(&line[..pipe_pos]);
-        let right = trim(&line[pipe_pos + 1..]);
-        if !left.is_empty() && !right.is_empty() {
-            execute_pipeline(left, right);
-            return;
-        }
+    // Check for pipe — handle N-stage pipelines directly.
+    if find_byte(line, b'|').is_some() {
+        execute_pipeline_n(line);
+        return;
     }
 
     // Tokenize.
@@ -176,56 +175,128 @@ fn execute_line(line: &[u8]) {
     execute_external(&token_storage, &token_lens, cmd_argc, redir_out, redir_in);
 }
 
-/// Execute a two-stage pipeline: left | right.
-fn execute_pipeline(left: &[u8], right: &[u8]) {
-    let mut pipe_fds = [0i32; 2];
-    if pipe(&mut pipe_fds) < 0 {
-        write_str(STDERR_FILENO, "sh: pipe failed\n");
+/// Execute an N-stage pipeline: cmd1 | cmd2 | ... | cmdN.
+/// Uses the classic prev-read approach: creates each pipe just before forking
+/// the next stage, so fd numbering is simple and correct.
+fn execute_pipeline_n(line: &[u8]) {
+    // Collect command segments by splitting on '|'.
+    let mut segments: [&[u8]; MAX_PIPELINE_STAGES] = [b""; MAX_PIPELINE_STAGES];
+    let mut n_segs = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= line.len() {
+        let at_end = i == line.len();
+        let at_pipe = !at_end && line[i] == b'|';
+        if at_end || at_pipe {
+            let seg = trim(&line[start..i]);
+            if !seg.is_empty() && n_segs < MAX_PIPELINE_STAGES {
+                segments[n_segs] = seg;
+                n_segs += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+
+    if n_segs < 2 {
+        // Degenerate — just run the single segment.
+        if n_segs == 1 {
+            exec_simple_command(segments[0]);
+        }
         return;
     }
 
-    let read_fd = pipe_fds[0];
-    let write_fd = pipe_fds[1];
+    // Classic "prev_read" pipeline:
+    //   - For stage m, create a new pipe[m] if m < n_segs-1.
+    //   - Fork child: wire prev_read → stdin, cur_write → stdout.
+    //   - Parent closes write end and old read end; keeps new read end.
+    let mut pids: [i32; MAX_PIPELINE_STAGES] = [-1i32; MAX_PIPELINE_STAGES];
+    let mut prev_read: i32 = -1; // read end of the pipe that feeds this stage
 
-    // Fork left child.
-    let left_pid = fork();
-    if left_pid == 0 {
-        // Left child: stdout → write end of pipe.
-        close(read_fd);
-        dup2(write_fd, STDOUT_FILENO);
-        close(write_fd);
-        exec_simple_command(left);
-        exit(127);
+    let mut m = 0usize;
+    while m < n_segs {
+        // Create a new pipe for this stage's output (unless this is the last stage).
+        let cur_read: i32;
+        let cur_write: i32;
+        if m < n_segs - 1 {
+            let mut fds = [0i32; 2];
+            if pipe(&mut fds) < 0 {
+                write_str(STDERR_FILENO, "sh: pipe failed\n");
+                // Reap any children already started.
+                let mut k = 0usize;
+                while k < m {
+                    if pids[k] > 0 {
+                        let mut st = 0i32;
+                        waitpid(pids[k], &mut st, 0);
+                    }
+                    k += 1;
+                }
+                if prev_read >= 0 {
+                    close(prev_read);
+                }
+                return;
+            }
+            cur_read = fds[0];
+            cur_write = fds[1];
+        } else {
+            cur_read = -1;
+            cur_write = -1;
+        }
+
+        let pid = fork();
+        if pid == 0 {
+            // Child: set up stdin from previous pipe.
+            if prev_read >= 0 {
+                dup2(prev_read, STDIN_FILENO);
+                close(prev_read);
+            }
+            // Set up stdout to next pipe.
+            if cur_write >= 0 {
+                dup2(cur_write, STDOUT_FILENO);
+                close(cur_write);
+            }
+            // Close the read end of the new pipe (child doesn't need it).
+            if cur_read >= 0 {
+                close(cur_read);
+            }
+            exec_simple_command(segments[m]);
+            exit(127);
+        }
+
+        // Parent: close write end of new pipe and the old read end.
+        if cur_write >= 0 {
+            close(cur_write);
+        }
+        if prev_read >= 0 {
+            close(prev_read);
+        }
+
+        if pid < 0 {
+            write_str(STDERR_FILENO, "sh: fork failed\n");
+            // Close cur_read too since we won't use it.
+            if cur_read >= 0 {
+                close(cur_read);
+            }
+        }
+
+        pids[m] = pid as i32;
+        prev_read = cur_read;
+        m += 1;
     }
-    if left_pid < 0 {
-        write_str(STDERR_FILENO, "sh: fork failed\n");
-        close(read_fd);
-        close(write_fd);
-        return;
+
+    // Close the last read end (should be -1 for the last stage).
+    if prev_read >= 0 {
+        close(prev_read);
     }
 
-    // Fork right child.
-    let right_pid = fork();
-    if right_pid == 0 {
-        // Right child: stdin → read end of pipe.
-        close(write_fd);
-        dup2(read_fd, STDIN_FILENO);
-        close(read_fd);
-        exec_simple_command(right);
-        exit(127);
-    }
-
-    // Parent: close both pipe ends.
-    close(read_fd);
-    close(write_fd);
-
-    // Wait for children. If right fork failed, still reap the left child.
-    let mut status: i32 = 0;
-    waitpid(left_pid as i32, &mut status, 0);
-    if right_pid < 0 {
-        write_str(STDERR_FILENO, "sh: fork failed (right pipeline stage)\n");
-    } else {
-        waitpid(right_pid as i32, &mut status, 0);
+    // Wait for all children.
+    let mut r = 0usize;
+    while r < n_segs {
+        if pids[r] > 0 {
+            let mut status: i32 = 0;
+            waitpid(pids[r], &mut status, 0);
+        }
+        r += 1;
     }
 }
 

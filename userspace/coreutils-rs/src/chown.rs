@@ -3,7 +3,7 @@
 #![no_main]
 
 use syscall_lib::chown as sys_chown;
-use syscall_lib::{STDERR_FILENO, Stat, stat, write, write_str};
+use syscall_lib::{O_RDONLY, STDERR_FILENO, Stat, close, open, read, stat, write, write_str};
 
 syscall_lib::entry_point!(main);
 
@@ -22,6 +22,79 @@ fn parse_u32_bytes(s: &[u8]) -> Option<u32> {
         }
     }
     Some(v as u32)
+}
+
+/// Read a file into a stack buffer; returns bytes read.
+fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 {
+        return 0;
+    }
+    let fd = fd as i32;
+    let mut fill = 0usize;
+    loop {
+        let space = buf.len() - fill;
+        if space == 0 {
+            break;
+        }
+        let n = read(fd, &mut buf[fill..]);
+        if n <= 0 {
+            break;
+        }
+        fill += n as usize;
+    }
+    close(fd);
+    fill
+}
+
+/// Look up a name in a colon-delimited file (passwd or group).
+/// Returns the value of `id_field` (0-indexed) if field 0 matches `name`.
+fn lookup_id_by_name(file: &[u8], name: &[u8], id_field: usize) -> Option<u32> {
+    for line in file.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = [&[][..]; 8];
+        let mut nf = 0usize;
+        let mut start = 0usize;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b':' {
+                if nf < 8 {
+                    fields[nf] = &line[start..i];
+                    nf += 1;
+                }
+                start = i + 1;
+            }
+        }
+        if nf < 8 {
+            fields[nf] = &line[start..];
+            nf += 1;
+        }
+        if nf > id_field && fields[0] == name {
+            return parse_u32_bytes(fields[id_field]);
+        }
+    }
+    None
+}
+
+fn resolve_uid(spec: &[u8]) -> Option<u32> {
+    if let Some(v) = parse_u32_bytes(spec) {
+        return Some(v);
+    }
+    // Resolve name via /etc/passwd (uid is field 2).
+    let mut buf = [0u8; 2048];
+    let len = read_file(b"/etc/passwd\0", &mut buf);
+    lookup_id_by_name(&buf[..len], spec, 2)
+}
+
+fn resolve_gid(spec: &[u8]) -> Option<u32> {
+    if let Some(v) = parse_u32_bytes(spec) {
+        return Some(v);
+    }
+    // Resolve name via /etc/group (gid is field 2).
+    let mut buf = [0u8; 2048];
+    let len = read_file(b"/etc/group\0", &mut buf);
+    lookup_id_by_name(&buf[..len], spec, 2)
 }
 
 fn main(args: &[&str]) -> i32 {
@@ -43,10 +116,10 @@ fn main(args: &[&str]) -> i32 {
     let uid_spec: u32 = if user_part.is_empty() {
         u32::MAX
     } else {
-        match parse_u32_bytes(user_part) {
+        match resolve_uid(user_part) {
             Some(v) => v,
             None => {
-                write_str(STDERR_FILENO, "chown: invalid owner '");
+                write_str(STDERR_FILENO, "chown: unknown user '");
                 let _ = write(STDERR_FILENO, user_part);
                 write_str(STDERR_FILENO, "'\n");
                 return 1;
@@ -57,10 +130,10 @@ fn main(args: &[&str]) -> i32 {
     let gid_spec: u32 = if !has_colon || group_part.is_empty() {
         u32::MAX
     } else {
-        match parse_u32_bytes(group_part) {
+        match resolve_gid(group_part) {
             Some(v) => v,
             None => {
-                write_str(STDERR_FILENO, "chown: invalid group '");
+                write_str(STDERR_FILENO, "chown: unknown group '");
                 let _ = write(STDERR_FILENO, group_part);
                 write_str(STDERR_FILENO, "'\n");
                 return 1;

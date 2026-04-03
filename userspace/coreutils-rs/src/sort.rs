@@ -34,7 +34,9 @@ fn line_end(buf: &[u8], start: usize) -> usize {
 fn insertion_sort(starts: &mut [u32], buf: &[u8], numeric: bool, reverse: bool) {
     let n = starts.len();
     for i in 1..n {
-        let key_off = starts[i] as usize;
+        // Save the key value before the shifting loop overwrites starts[i].
+        let key_val = starts[i];
+        let key_off = key_val as usize;
         let key_end = line_end(buf, key_off);
         let key = &buf[key_off..key_end];
 
@@ -64,7 +66,8 @@ fn insertion_sort(starts: &mut [u32], buf: &[u8], numeric: bool, reverse: bool) 
                 break;
             }
         }
-        starts[j] = starts[i];
+        // Use the saved key value, not starts[i] which may have been overwritten.
+        starts[j] = key_val;
     }
 }
 
