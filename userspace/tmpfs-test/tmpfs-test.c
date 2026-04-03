@@ -59,6 +59,10 @@ static int read_file_into(const char *path, char *buf, size_t buf_size, ssize_t 
     return 0;
 }
 
+static long umount_fs(const char *target) {
+    return syscall(__NR_umount2, target, 0);
+}
+
 /* Test 1: create, write, close, reopen, read back */
 static void test_write_read_roundtrip(void) {
     const char *path = "/tmp/test.txt";
@@ -927,6 +931,77 @@ static void test_permissions_and_umask(void) {
     pass("permissions + umask");
 }
 
+/* Test 11: kernel log procfs node and umount permission/busy paths */
+static void test_kmsg_and_umount(void) {
+    char buf[4097];
+    ssize_t n = 0;
+    int fd = -1;
+
+    if (read_file_into("/proc/kmsg", buf, sizeof(buf), &n) != 0 || n <= 0) {
+        fail("procfs: kmsg", "could not read kernel log snapshot");
+        return;
+    }
+    if (strstr(buf, "m3OS") == NULL && strstr(buf, "[") == NULL) {
+        fail("procfs: kmsg content", "kernel log snapshot looked empty");
+        return;
+    }
+
+    if (chdir("/tmp") != 0) {
+        fail("umount: chdir", "could not move cwd off ext2 before unmount");
+        return;
+    }
+
+    fd = open("/etc/passwd", O_RDONLY);
+    if (fd < 0) {
+        fail("umount: open busy file", "could not open ext2 file for EBUSY check");
+        return;
+    }
+
+    errno = 0;
+    if (umount_fs("/") == 0 || errno != EBUSY) {
+        fail("umount: busy", "busy unmount did not fail with EBUSY");
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    pid_t child = fork();
+    if (child < 0) {
+        fail("umount: fork", "fork returned < 0");
+        return;
+    }
+    if (child == 0) {
+        if (setuid(1000) != 0) {
+            _exit(20);
+        }
+        errno = 0;
+        if (umount_fs("/") == 0 || errno != EPERM) {
+            _exit(21);
+        }
+        _exit(0);
+    }
+
+    int status = 0;
+    if (waitpid(child, &status, 0) < 0 || !WIFEXITED(status)) {
+        fail("umount: non-root", "waitpid failed");
+        return;
+    }
+    if (WEXITSTATUS(status) == 20) {
+        fail("umount: setuid", "setuid(1000) failed in child");
+        return;
+    }
+    if (WEXITSTATUS(status) == 21) {
+        fail("umount: non-root", "non-root umount did not fail with EPERM");
+        return;
+    }
+    if (WEXITSTATUS(status) != 0) {
+        fail("umount: non-root", "unexpected child exit status");
+        return;
+    }
+
+    pass("kmsg + umount");
+}
+
 /* Clean up test files */
 static void cleanup(void) {
     unlink("/tmp/test.txt");
@@ -977,6 +1052,7 @@ int main(void) {
     test_hard_links();
     test_procfs_and_devices();
     test_permissions_and_umask();
+    test_kmsg_and_umount();
     cleanup();
 
     printf("[tmpfs-test] results: %d passed, %d failed\n", /* DevSkim: ignore DS154189 — format string is a literal */

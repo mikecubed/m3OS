@@ -182,6 +182,14 @@ fn build_userspace_bins() {
         "env", "PROMPT", "ls", "ln", "readlink", // Phase 32: build tool utilities
         "touch", "stat", "wc", "ar", "install", "meminfo", // Phase 33: memory diagnostics
         "date", "uptime", // Phase 34: timekeeping utilities
+        // Phase 41 Rust ports (batch 1 — trivial)
+        "umount", "dmesg", "chmod", "mount", "kill", "tee",
+        // Phase 41 Rust ports (batch 2 — small)
+        "head", "file", "strings", "uniq", "free", "df", "hexdump",
+        // Phase 41 Rust ports (batch 3 — medium)
+        "cal", "tr", "sort", "tail", "ps", "du", "chown", "find",
+        // Phase 41 Rust ports (batch 4 — complex)
+        "cut", "diff", "sed", "xargs", "less", "patch",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1716,7 +1724,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 20,
+        timeout_secs: 30,
         label: "wait for shell prompt",
     });
 
@@ -2022,7 +2030,983 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     ));
 
     // -----------------------------------------------------------------------
-    // 9. make clean
+    // 9. Phase 41 initial tools: head, tail, tee, chmod, chown
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/head -n 1 /home/project/main.c\n",
+        label: "head: first line of main.c",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "#include",
+        timeout_secs: 10,
+        label: "verify head -n output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after head -n",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /home/project/main.c | /bin/head\n",
+        label: "head: default stdin mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "#include",
+        timeout_secs: 10,
+        label: "verify head default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after head stdin",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/tail -n 1 /etc/passwd\n",
+        label: "tail: last passwd line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify tail -n output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tail -n",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd | /bin/tail\n",
+        label: "tail: default stdin mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify tail default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tail stdin",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo teecheck | /bin/tee /tmp/tee-output\n",
+        label: "tee: write stdout and file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "teecheck",
+        timeout_secs: 10,
+        label: "verify tee stdout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee write",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/tee-output\n",
+        label: "tee: verify written file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "teecheck",
+        timeout_secs: 10,
+        label: "verify tee file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee file check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo appendcheck | /bin/tee -a /tmp/tee-output\n",
+        label: "tee: append mode",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "appendcheck",
+        timeout_secs: 10,
+        label: "verify tee append stdout",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee append",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/tee-output\n",
+        label: "tee: verify appended file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "appendcheck",
+        timeout_secs: 10,
+        label: "verify tee append file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tee append check",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/touch /tmp/permfile\n",
+        "send: touch permfile",
+        "wait: prompt after touch permfile",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/chmod 600 /tmp/permfile\n",
+        "send: chmod permfile",
+        "wait: prompt after chmod",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /tmp/permfile\n",
+        label: "stat: verify chmod result",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Access: (00600)",
+        timeout_secs: 10,
+        label: "verify chmod stat output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after chmod stat",
+    });
+    steps.extend(cmd_then_prompt(
+        "/bin/chown user:user /tmp/permfile\n",
+        "send: chown permfile",
+        "wait: prompt after chown",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/stat /tmp/permfile\n",
+        label: "stat: verify chown result",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Uid: 1000",
+        timeout_secs: 10,
+        label: "verify chown uid",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Gid: 1000",
+        timeout_secs: 10,
+        label: "verify chown gid",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after chown stat",
+    });
+
+    // -----------------------------------------------------------------------
+    // 10. Phase 41 text tools: sort, uniq, cut
+    // -----------------------------------------------------------------------
+    steps.extend(cmd_then_prompt(
+        "/bin/echo pear > /tmp/sort_words\n",
+        "sort fixture: write pear",
+        "prompt after writing pear",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo apple >> /tmp/sort_words\n",
+        "sort fixture: append apple",
+        "prompt after appending apple",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo orange >> /tmp/sort_words\n",
+        "sort fixture: append orange",
+        "prompt after appending orange",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort /tmp/sort_words | /bin/head -n 1\n",
+        label: "sort: verify first lexicographic line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "apple",
+        timeout_secs: 10,
+        label: "verify sort first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after first sort line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort /tmp/sort_words | /bin/head -n 2 | /bin/tail -n 1\n",
+        label: "sort: verify middle lexicographic line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "orange",
+        timeout_secs: 10,
+        label: "verify sort middle line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after middle sort line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 10 > /tmp/sort_nums\n",
+        "sort numeric fixture: write 10",
+        "prompt after writing 10",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 2 >> /tmp/sort_nums\n",
+        "sort numeric fixture: append 2",
+        "prompt after appending 2",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo 1 >> /tmp/sort_nums\n",
+        "sort numeric fixture: append 1",
+        "prompt after appending 1",
+        10,
+    ));
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 1\n",
+        label: "sort: verify first numeric line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "1",
+        timeout_secs: 10,
+        label: "verify numeric sort first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after first numeric line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 2 | /bin/tail -n 1\n",
+        label: "sort: verify middle numeric line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2",
+        timeout_secs: 10,
+        label: "verify numeric sort middle line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after middle numeric line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/sort_nums | /bin/sort -rn | /bin/head -n 1\n",
+        label: "sort: verify clustered pipeline first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "10",
+        timeout_secs: 10,
+        label: "verify clustered pipeline first line",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after clustered pipeline first line check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd /etc/passwd | /bin/sort | /bin/uniq -c\n",
+        label: "uniq: count adjacent duplicates",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "2 root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "verify uniq count output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after uniq",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cut -d: -f1 /etc/passwd\n",
+        label: "cut: passwd usernames",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root",
+        timeout_secs: 10,
+        label: "verify cut field output includes root",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user",
+        timeout_secs: 10,
+        label: "verify cut field output includes user",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cut field",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo abcdef | /bin/cut -c2-4\n",
+        label: "cut: character range",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "bcd",
+        timeout_secs: 10,
+        label: "verify cut character output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cut chars",
+    });
+
+    // -----------------------------------------------------------------------
+    // 11. Phase 41 text tools: tr, sed
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo HELLO | /bin/tr A-Z a-z\n",
+        label: "tr: translate uppercase to lowercase",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "hello",
+        timeout_secs: 10,
+        label: "verify tr translation output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tr translate",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo hello | /bin/tr -d '\\n' | /bin/wc -l\n",
+        label: "tr: delete newline",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "0",
+        timeout_secs: 10,
+        label: "verify tr delete newline output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after tr delete",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo foofoo | /bin/sed 's/foo/bar/'\n",
+        label: "sed: single substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "barfoo",
+        timeout_secs: 10,
+        label: "verify sed single substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed substitution",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo foofoo | /bin/sed 's/foo/bar/g'\n",
+        label: "sed: global substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "barbar",
+        timeout_secs: 10,
+        label: "verify sed global substitution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed global substitution",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd /etc/passwd /etc/passwd | /bin/sed -n '3,5p'\n",
+        label: "sed: print selected range",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sed range output includes line 3",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user:x:1000:1000:user:/home/user:/bin/ion",
+        timeout_secs: 10,
+        label: "verify sed range output includes line 4",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after sed range print",
+    });
+
+    // -----------------------------------------------------------------------
+    // 12. Phase 41 file tools: file, hexdump
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /bin/sh0\n",
+        label: "file: detect ELF binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/bin/sh0: ELF 64-bit",
+        timeout_secs: 10,
+        label: "verify file ELF output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file ELF",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /home/project/main.c\n",
+        label: "file: detect ASCII text",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c: ASCII text",
+        timeout_secs: 10,
+        label: "verify file text output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file text",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/file /dev/null\n",
+        label: "file: detect character special",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/dev/null: character special",
+        timeout_secs: 10,
+        label: "verify file char device output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after file char device",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/hexdump -n 16 /bin/sh0\n",
+        label: "hexdump: default output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "00000000",
+        timeout_secs: 10,
+        label: "verify hexdump offset",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "7f 45 4c 46",
+        timeout_secs: 10,
+        label: "verify hexdump ELF magic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hexdump default",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/hexdump -C -n 16 /bin/sh0\n",
+        label: "hexdump: canonical output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "00000000",
+        timeout_secs: 10,
+        label: "verify hexdump -C offset",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "7f 45 4c 46",
+        timeout_secs: 10,
+        label: "verify hexdump -C ELF magic",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "|.ELF",
+        timeout_secs: 10,
+        label: "verify hexdump -C ASCII gutter",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after hexdump canonical",
+    });
+
+    // -----------------------------------------------------------------------
+    // 13. Phase 41 file tools: du, df
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -s /home/project\n",
+        label: "du: summarize project directory",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project",
+        timeout_secs: 10,
+        label: "verify du summary path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du summary",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -h -s /home/project\n",
+        label: "du: human-readable summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "\t/home/project",
+        timeout_secs: 10,
+        label: "verify du human-readable path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du human-readable",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/du -h -s /home/project | /bin/cut -f1\n",
+        label: "du: isolate human-readable size field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "K",
+        timeout_secs: 10,
+        label: "verify du human-readable K-byte suffix",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after du human-readable size field",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/df\n",
+        label: "df: list mounted filesystems",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mounted on",
+        timeout_secs: 10,
+        label: "verify df header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: " /",
+        timeout_secs: 10,
+        label: "verify df root mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify df proc mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after df",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/df -h\n",
+        label: "df: human-readable output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mounted on",
+        timeout_secs: 10,
+        label: "verify df -h header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: " /",
+        timeout_secs: 10,
+        label: "verify df -h root mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify df -h proc mount",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after df -h",
+    });
+
+    // -----------------------------------------------------------------------
+    // 14. Phase 41 file tools: find, xargs
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c'\n",
+        label: "find: match C source files",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify find name match",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find name",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -type d\n",
+        label: "find: directories only",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project",
+        timeout_secs: 10,
+        label: "verify find directory output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find directories",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -type f\n",
+        label: "find: files only",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify find file output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after find files",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' | /bin/xargs /bin/grep main\n",
+        label: "xargs: grep matches from find",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main",
+        timeout_secs: 10,
+        label: "verify xargs grep output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs grep",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' -print0 | /bin/xargs -0 /bin/grep main\n",
+        label: "xargs: null-delimited grep",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "main",
+        timeout_secs: 10,
+        label: "verify xargs -0 output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs -0",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/find /home/project -name '*.c' | /bin/xargs -I ITEM /bin/echo file:ITEM\n",
+        label: "xargs: replacement string",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "file:/home/project/main.c",
+        timeout_secs: 10,
+        label: "verify xargs replacement output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after xargs replacement",
+    });
+
+    // -----------------------------------------------------------------------
+    // 15. Phase 41 system tools: ps, free, dmesg, mount, umount, kill
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ps -e\n",
+        label: "ps: list processes",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PID",
+        timeout_secs: 10,
+        label: "verify ps header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "ion",
+        timeout_secs: 10,
+        label: "verify ps shell entry",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after ps",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/free\n",
+        label: "free: memory summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mem:",
+        timeout_secs: 10,
+        label: "verify free output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after free",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/free -h\n",
+        label: "free: human-readable output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Mem:",
+        timeout_secs: 10,
+        label: "verify free -h output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after free -h",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/dmesg\n",
+        label: "dmesg: kernel log snapshot",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "execve(/bin/dmesg)",
+        timeout_secs: 10,
+        label: "verify dmesg output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 20,
+        label: "prompt after dmesg",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/mount\n",
+        label: "mount: list mounts",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "/proc",
+        timeout_secs: 10,
+        label: "verify mount output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after mount",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/umount /\n",
+        label: "umount: busy root error",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "busy",
+        timeout_secs: 10,
+        label: "verify umount busy error",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after umount busy",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/kill -l\n",
+        label: "kill: list signals",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "TERM",
+        timeout_secs: 10,
+        label: "verify kill -l output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after kill -l",
+    });
+
+    // -----------------------------------------------------------------------
+    // 16. Phase 41 developer tools: strings, cal, diff, patch, less
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/strings -n 4 /etc/passwd | /bin/head -n 1\n",
+        label: "strings: extract printable text",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0",
+        timeout_secs: 10,
+        label: "verify strings output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after strings",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cal 6 2025\n",
+        label: "cal: specific month",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "June 2025",
+        timeout_secs: 10,
+        label: "verify cal month header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Su Mo Tu We Th Fr Sa",
+        timeout_secs: 10,
+        label: "verify cal weekday header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cal month",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cal 2025 | /bin/grep December\n",
+        label: "cal: full year output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "December",
+        timeout_secs: 10,
+        label: "verify cal year output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after cal year",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo alpha > /tmp/diff-a\n",
+        label: "diff fixture: write alpha",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff fixture alpha",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo beta > /tmp/diff-b\n",
+        label: "diff fixture: write beta",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff fixture beta",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/diff /tmp/diff-a /tmp/diff-b > /tmp/change.diff ; /bin/cat /tmp/change.diff\n",
+        label: "diff: unified output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "--- /tmp/diff-a",
+        timeout_secs: 10,
+        label: "verify diff old header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "+++ /tmp/diff-b",
+        timeout_secs: 10,
+        label: "verify diff new header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "@@ -1 +1 @@",
+        timeout_secs: 10,
+        label: "verify diff hunk header",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after diff",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/patch < /tmp/change.diff\n",
+        label: "patch: apply unified diff",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "applied hunk 1",
+        timeout_secs: 10,
+        label: "verify patch apply output",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after patch",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /tmp/diff-a\n",
+        label: "patch: verify patched file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "beta",
+        timeout_secs: 10,
+        label: "verify patched file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "prompt after patched file check",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/less /etc/passwd\n",
+        label: "less: open pager",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:",
+        timeout_secs: 10,
+        label: "verify less initial content",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "\x1b[Bq",
+        label: "less: scroll once and quit",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after less",
+    });
+
+    // -----------------------------------------------------------------------
+    // 17. make clean
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {

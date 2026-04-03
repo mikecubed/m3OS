@@ -139,6 +139,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "coreutils-tests"
+version = "0.1.0"
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -347,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.39.0"
+version = "0.40.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -650,6 +654,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "thread-test"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

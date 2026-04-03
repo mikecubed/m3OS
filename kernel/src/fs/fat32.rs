@@ -822,3 +822,8 @@ pub fn mount_fat32(base_lba: u64) -> Result<(), Fat32Error> {
 pub fn is_mounted() -> bool {
     FAT32_VOLUME.lock().is_some()
 }
+
+pub fn unmount_fat32() {
+    *FAT32_VOLUME.lock() = None;
+    FAT32_PERMISSIONS.lock().clear();
+}

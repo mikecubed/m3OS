@@ -30,6 +30,8 @@ members = [
     "userspace/thread-test",
     # Rust coreutils (replacing C musl utilities)
     "userspace/coreutils-rs",
+    # coreutils host tests
+    "userspace/coreutils-tests",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",

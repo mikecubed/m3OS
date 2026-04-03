@@ -1,0 +1,8 @@
+[package]
+name = "coreutils-tests"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "coreutils_tests"
+path = "src/lib.rs"

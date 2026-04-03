@@ -98,6 +98,33 @@ static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install.elf");
 static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo.elf");
 static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test.elf");
 static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make.elf");
+static HEAD_ELF: &[u8] = include_bytes!("../../initrd/head.elf");
+static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail.elf");
+static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee.elf");
+static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod.elf");
+static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown.elf");
+static SORT_ELF: &[u8] = include_bytes!("../../initrd/sort.elf");
+static UNIQ_ELF: &[u8] = include_bytes!("../../initrd/uniq.elf");
+static CUT_ELF: &[u8] = include_bytes!("../../initrd/cut.elf");
+static TR_ELF: &[u8] = include_bytes!("../../initrd/tr.elf");
+static SED_ELF: &[u8] = include_bytes!("../../initrd/sed.elf");
+static FILE_ELF: &[u8] = include_bytes!("../../initrd/file.elf");
+static HEXDUMP_ELF: &[u8] = include_bytes!("../../initrd/hexdump.elf");
+static DU_ELF: &[u8] = include_bytes!("../../initrd/du.elf");
+static DF_ELF: &[u8] = include_bytes!("../../initrd/df.elf");
+static FIND_ELF: &[u8] = include_bytes!("../../initrd/find.elf");
+static XARGS_ELF: &[u8] = include_bytes!("../../initrd/xargs.elf");
+static FREE_ELF: &[u8] = include_bytes!("../../initrd/free.elf");
+static DMESG_ELF: &[u8] = include_bytes!("../../initrd/dmesg.elf");
+static MOUNT_ELF: &[u8] = include_bytes!("../../initrd/mount.elf");
+static UMOUNT_ELF: &[u8] = include_bytes!("../../initrd/umount.elf");
+static KILL_ELF: &[u8] = include_bytes!("../../initrd/kill.elf");
+static PS_ELF: &[u8] = include_bytes!("../../initrd/ps.elf");
+static STRINGS_ELF: &[u8] = include_bytes!("../../initrd/strings.elf");
+static CAL_ELF: &[u8] = include_bytes!("../../initrd/cal.elf");
+static DIFF_ELF: &[u8] = include_bytes!("../../initrd/diff.elf");
+static PATCH_ELF: &[u8] = include_bytes!("../../initrd/patch.elf");
+static LESS_ELF: &[u8] = include_bytes!("../../initrd/less.elf");
 // Phase 34: timekeeping utilities
 static DATE_ELF: &[u8] = include_bytes!("../../initrd/date.elf");
 static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime.elf");
@@ -135,6 +162,7 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: TMPFS_TEST_ELF,
         },
     ),
+    ("echo", RamdiskNode::File { content: ECHO_ELF }),
     ("echo.elf", RamdiskNode::File { content: ECHO_ELF }),
     ("true.elf", RamdiskNode::File { content: TRUE_ELF }),
     ("false.elf", RamdiskNode::File { content: FALSE_ELF }),
@@ -289,6 +317,90 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: MEMINFO_ELF,
         },
     ),
+    ("head", RamdiskNode::File { content: HEAD_ELF }),
+    ("head.elf", RamdiskNode::File { content: HEAD_ELF }),
+    ("tail", RamdiskNode::File { content: TAIL_ELF }),
+    ("tail.elf", RamdiskNode::File { content: TAIL_ELF }),
+    ("tee", RamdiskNode::File { content: TEE_ELF }),
+    ("tee.elf", RamdiskNode::File { content: TEE_ELF }),
+    ("chmod", RamdiskNode::File { content: CHMOD_ELF }),
+    ("chmod.elf", RamdiskNode::File { content: CHMOD_ELF }),
+    ("chown", RamdiskNode::File { content: CHOWN_ELF }),
+    ("chown.elf", RamdiskNode::File { content: CHOWN_ELF }),
+    ("sort", RamdiskNode::File { content: SORT_ELF }),
+    ("sort.elf", RamdiskNode::File { content: SORT_ELF }),
+    ("uniq", RamdiskNode::File { content: UNIQ_ELF }),
+    ("uniq.elf", RamdiskNode::File { content: UNIQ_ELF }),
+    ("cut", RamdiskNode::File { content: CUT_ELF }),
+    ("cut.elf", RamdiskNode::File { content: CUT_ELF }),
+    ("tr", RamdiskNode::File { content: TR_ELF }),
+    ("tr.elf", RamdiskNode::File { content: TR_ELF }),
+    ("sed", RamdiskNode::File { content: SED_ELF }),
+    ("sed.elf", RamdiskNode::File { content: SED_ELF }),
+    ("file", RamdiskNode::File { content: FILE_ELF }),
+    ("file.elf", RamdiskNode::File { content: FILE_ELF }),
+    (
+        "hexdump",
+        RamdiskNode::File {
+            content: HEXDUMP_ELF,
+        },
+    ),
+    (
+        "hexdump.elf",
+        RamdiskNode::File {
+            content: HEXDUMP_ELF,
+        },
+    ),
+    ("du", RamdiskNode::File { content: DU_ELF }),
+    ("du.elf", RamdiskNode::File { content: DU_ELF }),
+    ("df", RamdiskNode::File { content: DF_ELF }),
+    ("df.elf", RamdiskNode::File { content: DF_ELF }),
+    ("find", RamdiskNode::File { content: FIND_ELF }),
+    ("find.elf", RamdiskNode::File { content: FIND_ELF }),
+    ("xargs", RamdiskNode::File { content: XARGS_ELF }),
+    ("xargs.elf", RamdiskNode::File { content: XARGS_ELF }),
+    ("free", RamdiskNode::File { content: FREE_ELF }),
+    ("free.elf", RamdiskNode::File { content: FREE_ELF }),
+    ("dmesg", RamdiskNode::File { content: DMESG_ELF }),
+    ("dmesg.elf", RamdiskNode::File { content: DMESG_ELF }),
+    ("mount", RamdiskNode::File { content: MOUNT_ELF }),
+    ("mount.elf", RamdiskNode::File { content: MOUNT_ELF }),
+    (
+        "umount",
+        RamdiskNode::File {
+            content: UMOUNT_ELF,
+        },
+    ),
+    (
+        "umount.elf",
+        RamdiskNode::File {
+            content: UMOUNT_ELF,
+        },
+    ),
+    ("kill", RamdiskNode::File { content: KILL_ELF }),
+    ("kill.elf", RamdiskNode::File { content: KILL_ELF }),
+    ("ps", RamdiskNode::File { content: PS_ELF }),
+    ("ps.elf", RamdiskNode::File { content: PS_ELF }),
+    (
+        "strings",
+        RamdiskNode::File {
+            content: STRINGS_ELF,
+        },
+    ),
+    (
+        "strings.elf",
+        RamdiskNode::File {
+            content: STRINGS_ELF,
+        },
+    ),
+    ("cal", RamdiskNode::File { content: CAL_ELF }),
+    ("cal.elf", RamdiskNode::File { content: CAL_ELF }),
+    ("diff", RamdiskNode::File { content: DIFF_ELF }),
+    ("diff.elf", RamdiskNode::File { content: DIFF_ELF }),
+    ("patch", RamdiskNode::File { content: PATCH_ELF }),
+    ("patch.elf", RamdiskNode::File { content: PATCH_ELF }),
+    ("less", RamdiskNode::File { content: LESS_ELF }),
+    ("less.elf", RamdiskNode::File { content: LESS_ELF }),
     ("make", RamdiskNode::File { content: MAKE_ELF }),
     ("make.elf", RamdiskNode::File { content: MAKE_ELF }),
     // Phase 33: mmap/munmap leak test
@@ -605,6 +717,114 @@ static FLAT_FILES: &[FlatFile] = &[
     FlatFile {
         name: "readlink.elf",
         content: READLINK_ELF,
+    },
+    FlatFile {
+        name: "head.elf",
+        content: HEAD_ELF,
+    },
+    FlatFile {
+        name: "tail.elf",
+        content: TAIL_ELF,
+    },
+    FlatFile {
+        name: "tee.elf",
+        content: TEE_ELF,
+    },
+    FlatFile {
+        name: "chmod.elf",
+        content: CHMOD_ELF,
+    },
+    FlatFile {
+        name: "chown.elf",
+        content: CHOWN_ELF,
+    },
+    FlatFile {
+        name: "sort.elf",
+        content: SORT_ELF,
+    },
+    FlatFile {
+        name: "uniq.elf",
+        content: UNIQ_ELF,
+    },
+    FlatFile {
+        name: "cut.elf",
+        content: CUT_ELF,
+    },
+    FlatFile {
+        name: "tr.elf",
+        content: TR_ELF,
+    },
+    FlatFile {
+        name: "sed.elf",
+        content: SED_ELF,
+    },
+    FlatFile {
+        name: "file.elf",
+        content: FILE_ELF,
+    },
+    FlatFile {
+        name: "hexdump.elf",
+        content: HEXDUMP_ELF,
+    },
+    FlatFile {
+        name: "du.elf",
+        content: DU_ELF,
+    },
+    FlatFile {
+        name: "df.elf",
+        content: DF_ELF,
+    },
+    FlatFile {
+        name: "find.elf",
+        content: FIND_ELF,
+    },
+    FlatFile {
+        name: "xargs.elf",
+        content: XARGS_ELF,
+    },
+    FlatFile {
+        name: "free.elf",
+        content: FREE_ELF,
+    },
+    FlatFile {
+        name: "dmesg.elf",
+        content: DMESG_ELF,
+    },
+    FlatFile {
+        name: "mount.elf",
+        content: MOUNT_ELF,
+    },
+    FlatFile {
+        name: "umount.elf",
+        content: UMOUNT_ELF,
+    },
+    FlatFile {
+        name: "kill.elf",
+        content: KILL_ELF,
+    },
+    FlatFile {
+        name: "ps.elf",
+        content: PS_ELF,
+    },
+    FlatFile {
+        name: "strings.elf",
+        content: STRINGS_ELF,
+    },
+    FlatFile {
+        name: "cal.elf",
+        content: CAL_ELF,
+    },
+    FlatFile {
+        name: "diff.elf",
+        content: DIFF_ELF,
+    },
+    FlatFile {
+        name: "patch.elf",
+        content: PATCH_ELF,
+    },
+    FlatFile {
+        name: "less.elf",
+        content: LESS_ELF,
     },
 ];
 

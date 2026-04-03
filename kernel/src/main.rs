@@ -1212,7 +1212,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A.4: Verify the kernel heap grows automatically via the RetryAllocator
-    /// when the initial 4 MiB is exhausted.
+    /// when the initial heap is exhausted.
     #[test_case]
     fn heap_grows_on_oom() {
         use crate::mm::heap::{HEAP_INITIAL_SIZE, heap_stats};
@@ -1224,8 +1224,8 @@ mod tests {
         // Allocate a series of 256 KiB blocks to push past initial heap.
         let block_size = 256 * 1024;
         let mut blocks: Vec<Vec<u8>> = Vec::new();
-        // Allocate enough to exceed the initial 4 MiB.
-        let target = HEAP_INITIAL_SIZE + (1024 * 1024); // 5 MiB
+        // Allocate enough to exceed the initial heap by 1 MiB.
+        let target = HEAP_INITIAL_SIZE + (1024 * 1024);
         let mut total_allocated = 0usize;
         while total_allocated < target {
             let mut block = Vec::with_capacity(block_size);

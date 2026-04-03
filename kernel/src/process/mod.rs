@@ -141,7 +141,11 @@ pub enum FdBackend {
     /// /dev/full — reads return zero bytes, writes return ENOSPC (Phase 38).
     DevFull,
     /// Synthetic procfs file content, generated on read from kernel state.
-    Proc { path: String },
+    /// `/proc/kmsg` stores a per-fd snapshot so chunked reads stay stable.
+    Proc {
+        path: String,
+        snapshot: Option<Vec<u8>>,
+    },
     /// TTY device — reads from stdin buffer, writes to console (Phase 22).
     DeviceTTY { tty_id: u32 },
     /// PTY master — Phase 22 skeleton; read/write return ENOSYS (Phase 23+).

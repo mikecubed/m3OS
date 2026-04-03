@@ -55,7 +55,7 @@ pub fn path_node(abs_path: &str) -> Option<ProcfsNode> {
     let rel = path.strip_prefix("/proc/")?;
     let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
     match parts.as_slice() {
-        ["meminfo" | "stat" | "uptime" | "version" | "mounts"] => Some(ProcfsNode::File),
+        ["meminfo" | "kmsg" | "stat" | "uptime" | "version" | "mounts"] => Some(ProcfsNode::File),
         ["self"] => Some(ProcfsNode::Symlink(alloc::format!(
             "/proc/{}",
             current_pid()
@@ -125,6 +125,7 @@ pub fn read_file(abs_path: &str) -> Option<Vec<u8>> {
     let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
     let text = match parts.as_slice() {
         ["meminfo"] => render_meminfo(),
+        ["kmsg"] => render_kmsg(),
         ["stat"] => render_stat(),
         ["uptime"] => render_uptime(),
         ["version"] => render_version(),
@@ -144,6 +145,7 @@ pub fn list_dir(abs_path: &str) -> Option<Vec<(String, bool)>> {
         let mut entries = alloc::vec![
             (String::from("self"), false),
             (String::from("meminfo"), false),
+            (String::from("kmsg"), false),
             (String::from("stat"), false),
             (String::from("uptime"), false),
             (String::from("version"), false),
@@ -268,7 +270,7 @@ fn fd_target(backend: &FdBackend) -> Option<String> {
         FdBackend::DevZero => Some(String::from("/dev/zero")),
         FdBackend::DevUrandom => Some(String::from("/dev/urandom")),
         FdBackend::DevFull => Some(String::from("/dev/full")),
-        FdBackend::Proc { path } => Some(path.clone()),
+        FdBackend::Proc { path, .. } => Some(path.clone()),
         FdBackend::PtyMaster { pty_id } => Some(alloc::format!("/dev/ptmx:{pty_id}")),
         FdBackend::PtySlave { pty_id } => Some(alloc::format!("/dev/pts/{pty_id}")),
         FdBackend::Socket { handle } => Some(alloc::format!("socket:[{handle}]")),
@@ -333,6 +335,14 @@ fn render_mounts() -> String {
         out.push_str("/dev/vda1 /data vfat rw 0 0\n");
     }
     out
+}
+
+fn render_kmsg() -> String {
+    String::from_utf8_lossy(&crate::serial::dmesg_snapshot()).into_owned()
+}
+
+pub fn render_kmsg_bytes() -> Vec<u8> {
+    crate::serial::dmesg_snapshot()
 }
 
 fn render_status(proc: ProcessSnapshot) -> String {

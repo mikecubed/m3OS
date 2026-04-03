@@ -1,10 +1,30 @@
 # Phase 41 - Expanded Coreutils
 
+**Status:** Complete
+**Source Ref:** phase-41
+**Depends on:** Phase 14 (Shell and Tools) ✅, Phase 27 (User Accounts) ✅, Phase 38 (Filesystem Enhancements) ✅
+**Builds on:** Extends the minimal coreutils from Phase 14 with a comprehensive set of
+text processing, file inspection, system administration, and developer workflow tools.
+Phase 38's `/proc` filesystem and symlink/permissions infrastructure provide the kernel
+interfaces that the new system and file tools read from.
+**Primary Components:** userspace/coreutils, userspace/coreutils-rs, kernel/src/fs/procfs.rs, kernel/src/serial.rs, xtask/src/main.rs
+
 ## Milestone Goal
 
 The OS ships with a comprehensive set of Unix utilities sufficient for daily development
 work. Moving beyond the minimal set from Phase 14, this phase adds text processing,
 file inspection, and system administration tools that developers expect.
+
+## Why This Phase Exists
+
+After Phase 14, the OS has a working shell with basic tools (`cat`, `ls`, `grep`, `cp`,
+`mv`, `rm`, `echo`, `mkdir`, `rmdir`, `pwd`, `env`, `sleep`, `wc`, `touch`, `stat`).
+That set is enough for simple file manipulation but not for real development work.
+Developers expect text processing pipelines (`sort | uniq -c`), file search
+(`find | xargs`), system introspection (`ps`, `free`, `dmesg`), permission management
+(`chmod`, `chown`), and a pager (`less`). Without these, the OS feels like a demo rather
+than a usable environment. This phase closes that gap by shipping the expanded Unix toolset
+needed for daily development workflows.
 
 ## Learning Goals
 
@@ -37,7 +57,7 @@ file inspection, and system administration tools that developers expect.
 | `xargs` | Build commands from stdin | Port from sbase (~100 lines C) |
 | `du` | Disk usage | Write or port (~60 lines C) |
 | `df` | Filesystem free space | Write (~40 lines C) |
-| `ln` | Create links (hard/symlinks when supported) | Write (~30 lines C) |
+| `ln` | Create links (hard/symlinks when supported) | Reuse existing Rust coreutil |
 | `file` | Identify file type (basic) | Write (~100 lines C) |
 | `hexdump` / `xxd` | Hex dump of binary files | Write (~80 lines C) |
 
@@ -46,8 +66,8 @@ file inspection, and system administration tools that developers expect.
 | Tool | Purpose | Source |
 |---|---|---|
 | `ps` | List running processes | Write (reads kernel proc info) |
-| `kill` | Send signals to processes | Already exists via shell builtin; add standalone |
-| `uptime` | System uptime | Write (~20 lines C) |
+| `kill` | Send signals to processes | Write (thin wrapper over `kill(2)`) |
+| `uptime` | System uptime | Reuse existing Rust utility from Phase 34 |
 | `free` | Memory usage summary | Write (~30 lines C) |
 | `dmesg` | Kernel log buffer | Write (reads kernel ring buffer) |
 | `mount` / `umount` | Mount/unmount filesystems | Write (wraps mount syscall) |
@@ -61,7 +81,6 @@ file inspection, and system administration tools that developers expect.
 | `less` / `more` | Pager for viewing files | Port sbase more or write minimal pager |
 | `strings` | Extract printable strings from binaries | Write (~40 lines C) |
 | `cal` | Calendar display | Port from sbase (~60 lines C) |
-| `bc` | Calculator | Port sbase bc or write minimal version |
 
 ### Porting Strategy: sbase
 
@@ -80,27 +99,65 @@ syscalls as needed.
 
 ### Kernel Support (if needed)
 
-- `/proc` filesystem (or equivalent) for `ps`, `free`, `uptime` to read kernel state.
-  Alternatively, add dedicated syscalls for process listing and memory stats.
-- `symlink` / `readlink` syscalls if symlinks are added.
-- `fchmod` / `fchown` syscalls.
-- `pipe2` with O_CLOEXEC for better xargs/find support.
+- Kernel log ring buffer in `kernel/src/serial.rs` so `dmesg` can read boot messages.
+- `/proc/kmsg` virtual file in `kernel/src/fs/procfs.rs` to expose the ring buffer.
+- `sys_umount2()` syscall for the `umount` binary.
+- `pipe2` with O_CLOEXEC for better xargs/find support (stretch goal).
 
-## Prerequisites
+Note: `/proc` (Phase 38) already provides `meminfo`, `uptime`, `mounts`, and per-PID
+`status`/`cmdline`. The `chmod`/`chown`/`fchmod`/`fchown`/`mount`/`kill`/`link`/`symlink`
+syscalls also already exist in `syscall-lib`.
 
-| Phase | Why needed |
-|---|---|
-| Phase 14 (Shell and Tools) | Existing basic coreutils as foundation |
-| Phase 27 (User Accounts) | chmod/chown need UID/GID support |
-| Phase 31 (Compiler) | Can compile new tools inside the OS (stretch goal) |
+## Important Components and How They Work
+
+### sbase cross-compilation pipeline
+
+sbase tools are self-contained C files (30–400 lines each) with no dependencies beyond
+libc. The `xtask/src/main.rs` function `build_musl_bins()` already cross-compiles C
+sources with `musl-gcc -static` and copies the resulting ELFs to `kernel/initrd/`. New
+tools are added by appending `(source_path, binary_name)` tuples to its `bins` array.
+
+### `/proc` as the system introspection interface
+
+Phase 38 built a full procfs with per-PID directories, `/proc/meminfo`, `/proc/uptime`,
+`/proc/mounts`, and `/proc/stat`. System tools like `ps`, `free`, and `mount` (no args)
+read these virtual files using standard `open()`/`read()` calls — no custom syscalls needed.
+The `kernel/src/fs/procfs.rs` module generates file content on the fly from kernel data
+structures.
+
+### Permission and ownership syscalls
+
+The `chmod()`, `chown()`, `fchmod()`, and `fchown()` syscalls (and their `syscall-lib`
+wrappers) were implemented in Phase 27/38. The `chmod` and `chown` binaries are thin
+argument-parsing wrappers around these existing syscalls.
+
+### Phase 41 implementation notes
+
+- `ln` remained the existing Rust coreutil rather than adding a redundant C port.
+- `uptime` remained the Phase 34 Rust binary and stayed available on the default shell PATH.
+- `diff` and `patch` use a minimal unified-diff workflow that is sufficient for the validated
+  `diff file1 file2 > changes.diff && patch < changes.diff` round-trip.
+- `less` uses Phase 22 raw-mode terminal support for arrow keys, page navigation, forward search,
+  and `q` exit.
+- The larger Phase 41 initrd required increasing the boot-mapped kernel heap so the full smoke
+  workload stays stable with the added userspace tools.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 14 by adding ~30 tools to the original ~15 basic coreutils.
+- Reuses Phase 38's `/proc` filesystem for `ps`, `free`, `mount`, and `uptime` output.
+- Reuses Phase 27's UID/GID model and Phase 38's permission enforcement for `chmod`/`chown`.
+- Reuses Phase 22's termios raw mode for `less` keyboard input handling.
+- Reuses Phase 34's `clock_gettime()`/`gettimeofday()` for `cal` and `uptime`.
 
 ## Implementation Outline
 
 1. Set up sbase cross-compilation with musl on the host.
 2. Port text processing tools first (head, tail, sort, uniq — most immediately useful).
 3. Port file tools (find, xargs, tee).
-4. Write system tools (ps, free, uptime) — these need kernel info, so implement
-   a `/proc`-like interface or info syscalls.
+4. Build the system tools around existing procfs and syscall support: `ps`,
+   `free`, `mount`, and `uptime` read the Phase 38 `/proc` files, while new
+   kernel work stays limited to the `dmesg` ring buffer and `umount`.
 5. Port diff and patch — essential for development workflows.
 6. Port or write a pager (less/more).
 7. Port remaining tools.
@@ -113,12 +170,13 @@ syscalls as needed.
 - `find . -name "*.c" | xargs grep "main"` works.
 - `ps` shows running processes with PID, name, and status.
 - `free` shows total and available memory.
+- `uptime` reports time since boot via the existing Rust utility and is available from the default shell PATH.
 - `diff file1 file2` shows differences; `patch` can apply the diff.
 - `less` provides scrollable file viewing with search.
 
 ## Companion Task List
 
-- Phase 41 Task List — *not yet created*
+- [Phase 41 Task List](./tasks/41-expanded-coreutils-tasks.md)
 
 ## How Real OS Implementations Differ
 
@@ -134,6 +192,6 @@ is simpler to implement.
 
 - Full GNU coreutils compatibility
 - Locale and internationalization support
-- `/proc` filesystem (full implementation)
 - BusyBox-style multicall binary
 - man pages
+- `bc` calculator (complex parser; deferred to a later follow-up once the text and file toolchain lands)
