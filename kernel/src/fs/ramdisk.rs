@@ -142,6 +142,8 @@ static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test");
 static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test");
 static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum");
 static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey");
+// Phase 47: DOOM binary
+static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -356,6 +358,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: GENKEY_ELF,
         },
     ),
+    // Phase 47: DOOM
+    ("doom", RamdiskNode::File { content: DOOM_BIN }),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[

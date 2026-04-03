@@ -528,6 +528,127 @@ fn build_pdpmake() {
     println!("pdpmake: built → kernel/initrd/make");
 }
 
+/// Phase 47: Cross-compile doomgeneric + m3OS platform layer into a static DOOM binary.
+///
+/// Strategy: clone doomgeneric from GitHub into `target/doomgeneric-src/`, collect all
+/// `.c` files from `doomgeneric/src/`, add `userspace/doom/dg_m3os.c`, compile with
+/// `musl-gcc -static -O2`. Output: `kernel/initrd/doom`.
+///
+/// Gracefully creates an empty placeholder if musl-gcc is not available.
+fn build_doom() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    let doom_bin = initrd.join("doom");
+
+    // Check cache: non-empty existing binary.
+    if doom_bin.exists() && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("doom: using cached {}", doom_bin.display());
+        return;
+    }
+
+    // Clone doomgeneric source.
+    let dg_src = root.join("target/doomgeneric-src");
+    if !dg_src.join("doomgeneric").join("doomgeneric.c").exists() {
+        println!("doom: cloning doomgeneric from GitHub...");
+        let _ = fs::remove_dir_all(&dg_src);
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/ozkl/doomgeneric.git",
+                dg_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for doomgeneric");
+        if !status.success() {
+            eprintln!("warning: failed to clone doomgeneric — creating empty placeholder");
+            if !doom_bin.exists() {
+                fs::write(&doom_bin, b"").unwrap();
+            }
+            return;
+        }
+    }
+
+    // Collect all .c files from doomgeneric/src/ (the main engine sources).
+    let dg_game_src = dg_src.join("doomgeneric");
+    let mut c_files: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dg_game_src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "c") {
+                c_files.push(path.to_str().unwrap().to_string());
+            }
+        }
+    }
+
+    c_files.sort(); // deterministic build order
+    if c_files.is_empty() {
+        eprintln!("warning: no .c files found in doomgeneric source — creating empty placeholder");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    // Add the m3OS platform layer.
+    let platform = root.join("userspace/doom/dg_m3os.c");
+    if platform.exists() {
+        c_files.push(platform.to_str().unwrap().to_string());
+    } else {
+        eprintln!("warning: userspace/doom/dg_m3os.c not found — creating empty placeholder");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    // Detect musl cross-compiler.
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else {
+        "musl-gcc"
+    };
+
+    // Include path: point to the doomgeneric source so dg_m3os.c can
+    // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
+    let mut args = vec![
+        "-static".to_string(),
+        "-O2".to_string(),
+        format!("-I{}", dg_src.to_str().unwrap()),
+    ];
+    args.extend(c_files);
+    args.push("-o".to_string());
+    args.push(doom_bin.to_str().unwrap().to_string());
+
+    let status = match Command::new(cc).args(&args).status() {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found — skipping doom build");
+            if !doom_bin.exists() {
+                fs::write(&doom_bin, b"").unwrap();
+            }
+            return;
+        }
+        Err(e) => panic!("failed to run {cc} for doom: {e}"),
+    };
+    if !status.success() {
+        eprintln!("warning: doom build failed");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    println!("doom: built → kernel/initrd/doom");
+}
+
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
 ///
 /// Strategy: clone TCC source from repo.or.cz (or use cached clone in
@@ -878,6 +999,8 @@ fn build_kernel() -> PathBuf {
     build_ion();
     // Phase 32: cross-compile pdpmake (POSIX make).
     build_pdpmake();
+    // Phase 47: cross-compile DOOM.
+    build_doom();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -1052,6 +1175,7 @@ fn cmd_check() {
     build_musl_bins();
     build_ion();
     build_pdpmake();
+    build_doom();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -3558,6 +3682,9 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     // Phase 32: populate demo project for make/build-tools testing.
     populate_demo_project(&part_tmp, &root);
 
+    // Phase 47: place doom1.wad on the ext2 partition.
+    populate_doom_files(&part_tmp, output_dir);
+
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
         .args(["-n", "-f"])
@@ -3866,6 +3993,67 @@ fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
             output.status, stderr
         );
     }
+}
+
+/// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
+///
+/// The shareware doom1.wad is freely distributable and approximately 4 MB.
+/// To obtain it: copy doom1.wad to the repository root before building, or
+/// download it from https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad
+///
+/// If doom1.wad is not present, this function is a no-op.
+fn populate_doom_files(part_path: &Path, output_dir: &Path) {
+    let wad_src = workspace_root().join("doom1.wad");
+    if !wad_src.exists() {
+        // doom1.wad not present — skip without error.
+        println!("doom: doom1.wad not found at repo root — skipping WAD placement");
+        println!("doom: to enable, place doom1.wad in the repository root directory");
+        return;
+    }
+
+    let mut cmds = String::new();
+
+    // Create /usr/share/doom/ directory tree.
+    cmds.push_str("mkdir usr/share\n");
+    cmds.push_str("mkdir usr/share/doom\n");
+
+    // Write the WAD file.
+    cmds.push_str(&format!(
+        "write \"{}\" usr/share/doom/doom1.wad\n",
+        wad_src.display()
+    ));
+
+    // Set permissions.
+    cmds.push_str("sif usr/share mode 0x41ED\n");
+    cmds.push_str("sif usr/share/doom mode 0x41ED\n");
+    cmds.push_str("sif usr/share/doom/doom1.wad mode 0x81A4\n");
+
+    // Run debugfs.
+    let mut debugfs = Command::new("debugfs")
+        .args(["-w", part_path.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for doom files");
+
+    {
+        use std::io::Write as _;
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write debugfs commands");
+    }
+
+    let output = debugfs.wait_with_output().expect("debugfs wait");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("warning: debugfs populate_doom_files failed: {stderr}");
+    } else {
+        println!("doom: placed doom1.wad at /usr/share/doom/doom1.wad");
+    }
+
+    let _ = output_dir; // suppress unused warning
 }
 
 fn cmd_image(image_args: &ImageArgs) {
