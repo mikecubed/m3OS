@@ -419,6 +419,10 @@ pub fn block_current_on_reply() {
     block_current(TaskState::BlockedOnReply);
 }
 
+pub fn block_current_on_futex() {
+    block_current(TaskState::BlockedOnFutex);
+}
+
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
@@ -472,7 +476,8 @@ pub fn wake_task(id: TaskId) {
                 TaskState::BlockedOnRecv
                 | TaskState::BlockedOnSend
                 | TaskState::BlockedOnReply
-                | TaskState::BlockedOnNotif => {
+                | TaskState::BlockedOnNotif
+                | TaskState::BlockedOnFutex => {
                     sched.tasks[idx].state = TaskState::Ready;
                     Some((sched.tasks[idx].assigned_core, idx))
                 }

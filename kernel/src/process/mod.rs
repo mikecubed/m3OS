@@ -17,6 +17,8 @@
 
 #![allow(dead_code)]
 
+pub mod futex;
+
 extern crate alloc;
 
 use alloc::{collections::VecDeque, string::String, vec::Vec};
@@ -477,6 +479,9 @@ pub enum ProcessState {
 pub struct Process {
     /// This process's unique identifier.
     pub pid: Pid,
+    pub tid: u32,
+    pub tgid: u32,
+    pub clear_child_tid: u64,
     /// Parent PID.  0 means no parent (init or an orphan).
     pub ppid: Pid,
     /// Current lifecycle state.
@@ -590,6 +595,9 @@ impl Process {
         let pid = alloc_pid();
         Process {
             pid,
+            tid: pid,
+            tgid: pid,
+            clear_child_tid: 0,
             ppid: 0,
             state: ProcessState::Ready,
             page_table_root: None,
@@ -728,6 +736,9 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
     let pid = alloc_pid();
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: None,
@@ -783,6 +794,9 @@ pub fn spawn_process_with_cr3(
     let pid = alloc_pid();
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: Some(cr3),
@@ -842,6 +856,9 @@ pub fn spawn_process_with_cr3_and_fds(
     let pgid = if inherit_pgid != 0 { inherit_pgid } else { pid };
     let proc = Process {
         pid,
+        tid: pid,
+        tgid: pid,
+        clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
         page_table_root: Some(cr3),

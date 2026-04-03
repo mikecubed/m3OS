@@ -1092,11 +1092,14 @@ pub extern "C" fn syscall_handler(
         // Phase 24: mount(source, target, fstype)
         165 => sys_linux_mount(arg0, arg1, arg2),
         // Phase 19: gettid — returns PID (no threads, tid=pid)
-        186 => sys_getpid(),
+        186 => sys_gettid(),
         // Phase 19: tkill(tid, sig) — same as kill(tid, sig) (no threads)
         200 => sys_kill(arg0, arg1),
-        // Phase 21: futex stub — single-threaded OS, non-blocking (read/clear word, no yield)
-        202 => sys_futex(arg0, arg1, arg2),
+        // Phase 40: futex — real wait/wake queues
+        202 => {
+            let val3 = crate::smp::per_core().syscall_user_r9;
+            sys_futex(arg0, arg1, arg2, val3)
+        }
         // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
         203 => {
             // sched_setaffinity: read mask from user memory
@@ -1425,9 +1428,24 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
 // Phase 11 syscalls
 // ---------------------------------------------------------------------------
 
-/// `getpid()` — return the calling process's PID.
+/// `getpid()` — return the calling thread's thread-group ID (POSIX PID).
 fn sys_getpid() -> u64 {
-    crate::process::current_pid() as u64
+    let pid = crate::process::current_pid();
+    crate::process::PROCESS_TABLE
+        .lock()
+        .find(pid)
+        .map(|p| p.tgid as u64)
+        .unwrap_or(pid as u64)
+}
+
+/// `gettid()` — return the calling thread's unique thread ID.
+fn sys_gettid() -> u64 {
+    let pid = crate::process::current_pid();
+    crate::process::PROCESS_TABLE
+        .lock()
+        .find(pid)
+        .map(|p| p.tid as u64)
+        .unwrap_or(pid as u64)
 }
 
 /// `getppid()` — return the calling process's parent PID.
@@ -8697,39 +8715,129 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Minimal futex stub for single-threaded OS.
+/// Futex syscall — real wait/wake queues (Phase 40, Track D).
 ///
-/// In a single-threaded/cooperative OS, no other thread can change
-/// the futex word or wake a waiter. If FUTEX_WAIT sees *uaddr == val,
-/// the lock is deadlocked — we clear the word to 0 so the caller's
-/// next compare-and-swap succeeds and acquires the lock.
-fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
+/// Supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, and
+/// `FUTEX_WAKE_BITSET` operations with the `FUTEX_PRIVATE_FLAG`.
+fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
-    const FUTEX_PRIVATE: u64 = 128;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
 
-    let cmd = op & !FUTEX_PRIVATE; // strip PRIVATE flag
+    use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE, FutexWaiter};
+
+    let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
+    let cmd = op & !(FUTEX_PRIVATE_FLAG);
+
+    // Build the futex key: (page_table_root, uaddr).
+    // Private futexes use 0 as root; shared futexes use the real CR3.
+    let page_table_root = if is_private {
+        0u64
+    } else {
+        let pid = crate::process::current_pid();
+        crate::process::PROCESS_TABLE
+            .lock()
+            .find(pid)
+            .and_then(|p| p.page_table_root.map(|a| a.as_u64()))
+            .unwrap_or(0)
+    };
+    let key = (page_table_root, uaddr);
+
     match cmd {
-        FUTEX_WAIT => {
-            // Check *uaddr == val per the futex contract.
-            let mut cur = [0u8; 4];
-            if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
-                return NEG_EFAULT;
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let bitset = if cmd == FUTEX_WAIT_BITSET {
+                let bs = val3 as u32;
+                if bs == 0 {
+                    return NEG_EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
+
+            // Atomically: check *uaddr == val and enqueue waiter under the
+            // FUTEX_TABLE lock so no wake can be missed between the check
+            // and the block.
+            let tid = match crate::task::current_task_id() {
+                Some(id) => id,
+                None => return NEG_EAGAIN,
+            };
+
+            {
+                let mut table = FUTEX_TABLE.lock();
+
+                // Read the futex word from userspace.
+                let mut cur = [0u8; 4];
+                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                    return NEG_EFAULT;
+                }
+                let current_val = u32::from_ne_bytes(cur) as u64;
+                if current_val != val {
+                    return NEG_EAGAIN;
+                }
+
+                // Value matches — enqueue this thread as a waiter.
+                table
+                    .entry(key)
+                    .or_default()
+                    .push(FutexWaiter { tid, bitset });
             }
-            let current_val = u32::from_ne_bytes(cur) as u64;
-            if current_val != val {
-                return NEG_EAGAIN;
-            }
-            // Single-threaded deadlock: no other thread can wake us.
-            // Force-clear the futex word to 0 so the caller's next
-            // lock-acquire CAS (compare_exchange(0, tid)) succeeds.
-            let zero = 0u32.to_ne_bytes();
-            if crate::mm::user_mem::copy_to_user(uaddr, &zero).is_err() {
-                return NEG_EFAULT;
-            }
-            0 // pretend we were woken
+
+            // Block the current task (releases scheduler lock internally).
+            crate::task::block_current_on_futex();
+
+            // Woken — return success.
+            0
         }
-        FUTEX_WAKE => 1, // pretend one waiter woke up
-        _ => 0,          // unknown ops succeed silently
+
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let bitset = if cmd == FUTEX_WAKE_BITSET {
+                let bs = val3 as u32;
+                if bs == 0 {
+                    return NEG_EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
+
+            let max_wake = val as usize;
+            let mut woken = 0usize;
+
+            let to_wake = {
+                let mut table = FUTEX_TABLE.lock();
+                let mut wake_ids = alloc::vec::Vec::new();
+                if let Some(waiters) = table.get_mut(&key) {
+                    let mut i = 0;
+                    while i < waiters.len() && woken < max_wake {
+                        if (waiters[i].bitset & bitset) != 0 {
+                            let w = waiters.swap_remove(i);
+                            wake_ids.push(w.tid);
+                            woken += 1;
+                            // Don't increment i — swap_remove moved the last element here.
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    // Clean up empty entries.
+                    if waiters.is_empty() {
+                        table.remove(&key);
+                    }
+                }
+                wake_ids
+            };
+
+            // Wake the tasks outside the FUTEX_TABLE lock.
+            for tid in to_wake {
+                crate::task::wake_task(tid);
+            }
+
+            woken as u64
+        }
+
+        _ => 0, // Unknown ops succeed silently (Linux compat).
     }
 }
 
