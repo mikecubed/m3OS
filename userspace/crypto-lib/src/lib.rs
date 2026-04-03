@@ -15,8 +15,10 @@ pub mod symmetric;
 /// Error type for cryptographic operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
-    /// AEAD authentication tag verification failed.
+    /// AEAD authentication tag verification failed (decryption).
     AuthenticationFailed,
+    /// Encryption operation failed.
+    EncryptionFailed,
     /// Invalid key or parameter length.
     InvalidLength,
     /// CSPRNG seeding failed (getrandom returned insufficient bytes).
