@@ -6887,19 +6887,24 @@ fn sys_framebuffer_mmap() -> u64 {
 
     let pid = crate::process::current_pid();
 
-    // Reject if another process already holds the framebuffer; only one
-    // process at a time may own the raw framebuffer.
-    let owner = crate::fb::fb_owner_pid();
-    if owner != 0 && owner != pid {
+    // Atomically claim the framebuffer via compare-and-swap before touching
+    // page tables.  This eliminates the TOCTOU window that the old two-step
+    // check-then-store had: two racing processes can no longer both observe
+    // owner==0 and proceed to map.
+    if !crate::fb::try_yield_console(pid) {
         return NEG_EBUSY;
     }
 
     // Determine the virtual address for the mapping in the process address space.
+    // Release the console claim on any early error so another process can retry.
     let virt_addr = {
         let mut table = crate::process::PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
             Some(p) => p,
-            None => return NEG_EINVAL,
+            None => {
+                crate::fb::release_console_claim(pid);
+                return NEG_EINVAL;
+            }
         };
         if proc.mmap_next == 0 {
             proc.mmap_next = ANON_MMAP_BASE;
@@ -6910,7 +6915,10 @@ fn sys_framebuffer_mmap() -> u64 {
         const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
         let end = match base.checked_add(total_size) {
             Some(v) if v <= USER_SPACE_END => v,
-            _ => return NEG_EINVAL,
+            _ => {
+                crate::fb::release_console_claim(pid);
+                return NEG_EINVAL;
+            }
         };
         proc.mmap_next = end;
         base
@@ -6921,7 +6929,10 @@ fn sys_framebuffer_mmap() -> u64 {
         let table = crate::process::PROCESS_TABLE.lock();
         match table.find(pid).and_then(|p| p.page_table_root) {
             Some(phys) => phys,
-            None => return NEG_EINVAL,
+            None => {
+                crate::fb::release_console_claim(pid);
+                return NEG_EINVAL;
+            }
         }
     };
 
@@ -6930,7 +6941,10 @@ fn sys_framebuffer_mmap() -> u64 {
     >::from_start_address(cr3_phys)
     {
         Ok(f) => f,
-        Err(_) => return NEG_EINVAL,
+        Err(_) => {
+            crate::fb::release_console_claim(pid);
+            return NEG_EINVAL;
+        }
     };
 
     let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
@@ -6948,6 +6962,7 @@ fn sys_framebuffer_mmap() -> u64 {
     if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
         .is_err()
     {
+        crate::fb::release_console_claim(pid);
         return NEG_EINVAL;
     }
 
@@ -6964,8 +6979,8 @@ fn sys_framebuffer_mmap() -> u64 {
         }
     }
 
-    // Yield the console: suppress text output while the process owns the fb.
-    crate::fb::yield_console(pid);
+    // Ownership was claimed atomically at the top of this function via
+    // try_yield_console (compare_exchange).  No second store needed here.
 
     log::info!(
         "[framebuffer_mmap] pid={} mapped {} pages @ {:#x}",
