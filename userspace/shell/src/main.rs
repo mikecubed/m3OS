@@ -183,16 +183,24 @@ fn execute_pipeline_n(line: &[u8]) {
     let mut segments: [&[u8]; MAX_PIPELINE_STAGES] = [b""; MAX_PIPELINE_STAGES];
     let mut n_segs = 0usize;
     let mut start = 0usize;
+    let mut raw_count = 0usize;
     let mut i = 0usize;
     while i <= line.len() {
         let at_end = i == line.len();
         let at_pipe = !at_end && line[i] == b'|';
         if at_end || at_pipe {
             let seg = trim(&line[start..i]);
-            if !seg.is_empty() && n_segs < MAX_PIPELINE_STAGES {
-                segments[n_segs] = seg;
-                n_segs += 1;
+            raw_count += 1;
+            if seg.is_empty() {
+                write_str(STDERR_FILENO, "sh: syntax error: empty pipeline segment\n");
+                return;
             }
+            if raw_count > MAX_PIPELINE_STAGES {
+                write_str(STDERR_FILENO, "sh: too many pipeline stages\n");
+                return;
+            }
+            segments[n_segs] = seg;
+            n_segs += 1;
             start = i + 1;
         }
         i += 1;
@@ -273,10 +281,19 @@ fn execute_pipeline_n(line: &[u8]) {
 
         if pid < 0 {
             write_str(STDERR_FILENO, "sh: fork failed\n");
-            // Close cur_read too since we won't use it.
             if cur_read >= 0 {
                 close(cur_read);
             }
+            // Reap all children already forked.
+            let mut j = 0usize;
+            while j < m {
+                if pids[j] > 0 {
+                    let mut st = 0i32;
+                    waitpid(pids[j], &mut st, 0);
+                }
+                j += 1;
+            }
+            return;
         }
 
         pids[m] = pid as i32;
