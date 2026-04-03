@@ -718,15 +718,33 @@ fn build_doom() {
         }
     }
 
-    // Collect all .c files from doomgeneric/src/ (the main engine sources).
+    // Collect core engine .c files — skip all platform-specific implementations.
+    // The doomgeneric repo bundles SDL, Allegro, X11, Windows, etc. back-ends;
+    // we only want the engine core and will provide our own dg_m3os.c.
+    //
+    // Excluded patterns:
+    //   doomgeneric_*.c  — alternative platform back-ends (SDL, xlib, win, …)
+    //   i_sdl*.c         — SDL audio/music drivers
+    //   i_allegro*.c     — Allegro audio/music drivers
+    //   mus2mid.c        — standalone tool with its own main()
     let dg_game_src = dg_src.join("doomgeneric");
     let mut c_files: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir(&dg_game_src) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "c") {
-                c_files.push(path.to_str().unwrap().to_string());
+            if !path.extension().is_some_and(|e| e == "c") {
+                continue;
             }
+            let name = path.file_name().unwrap().to_str().unwrap_or("");
+            // Skip platform-specific back-ends and standalone tools.
+            if name.starts_with("doomgeneric_")
+                || name.starts_with("i_sdl")
+                || name.starts_with("i_allegro")
+                || name == "mus2mid.c"
+            {
+                continue;
+            }
+            c_files.push(path.to_str().unwrap().to_string());
         }
     }
 
@@ -766,10 +784,12 @@ fn build_doom() {
 
     // Include path: point to the doomgeneric source so dg_m3os.c can
     // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
+    // Disable optional SDL audio (FEATURE_SOUND) — m3OS has no audio yet.
     let mut args = vec![
         "-static".to_string(),
         "-O2".to_string(),
         format!("-I{}", dg_src.to_str().unwrap()),
+        "-UFEATURE_SOUND".to_string(),
     ];
     args.extend(c_files);
     args.push("-o".to_string());
@@ -4550,21 +4570,72 @@ fn collect_ports_entries(
     }
 }
 
-/// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
+/// Download doom1.wad (shareware, freely redistributable) into `dest`.
 ///
-/// The shareware doom1.wad is freely distributable and approximately 4 MB.
-/// To obtain it: copy doom1.wad to the repository root before building, or
-/// download it from https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad
-///
-/// If doom1.wad is not present, this function is a no-op.
-fn populate_doom_files(part_path: &Path, output_dir: &Path) {
-    let wad_src = workspace_root().join("doom1.wad");
-    if !wad_src.exists() {
-        // doom1.wad not present — skip without error.
-        println!("doom: doom1.wad not found at repo root — skipping WAD placement");
-        println!("doom: to enable, place doom1.wad in the repository root directory");
+/// Tries `curl` first, then `wget`. Prints a friendly message if neither
+/// tool is available so the user can download manually.
+fn fetch_doom_wad(dest: &Path) {
+    const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
+
+    println!("doom: doom1.wad not found — downloading shareware WAD (~4 MB)...");
+    println!("doom: source: {WAD_URL}");
+
+    // Try curl first.
+    let curl_ok = Command::new("curl")
+        .args(["-fsSL", "--output", dest.to_str().unwrap(), WAD_URL])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if curl_ok && dest.exists() {
+        println!("doom: downloaded → {}", dest.display());
         return;
     }
+
+    // Fall back to wget.
+    let wget_ok = Command::new("wget")
+        .args(["-q", "-O", dest.to_str().unwrap(), WAD_URL])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if wget_ok && dest.exists() {
+        println!("doom: downloaded → {}", dest.display());
+        return;
+    }
+
+    eprintln!(
+        "warning: could not download doom1.wad (curl/wget not available or download failed)\n\
+         To enable DOOM: place doom1.wad in the repository root or at target/doom1.wad\n\
+         Download: {WAD_URL}"
+    );
+    // Clean up any partial download.
+    let _ = fs::remove_file(dest);
+}
+
+/// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
+///
+/// The WAD is cached in target/doom1.wad (gitignored) and auto-downloaded on
+/// first use. The shareware doom1.wad is freely redistributable (~4 MB).
+fn populate_doom_files(part_path: &Path, output_dir: &Path) {
+    // Cache the WAD in target/ so it is never committed and persists across
+    // builds.  Also accept a manually placed doom1.wad at the repo root for
+    // users who already have it.
+    let wad_cached = workspace_root().join("target/doom1.wad");
+    let wad_root = workspace_root().join("doom1.wad");
+
+    let wad_src = if wad_cached.exists() {
+        wad_cached
+    } else if wad_root.exists() {
+        wad_root
+    } else {
+        fetch_doom_wad(&wad_cached);
+        if wad_cached.exists() {
+            wad_cached
+        } else {
+            return; // download failed; already warned
+        }
+    };
 
     let mut cmds = String::new();
 
