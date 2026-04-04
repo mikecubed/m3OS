@@ -10,4 +10,9 @@ extern crate alloc;
 pub mod executor;
 pub mod io;
 pub mod reactor;
+pub mod slab;
+pub mod sync;
 pub mod task;
+
+pub use executor::{block_on, spawn};
+pub use task::JoinHandle;

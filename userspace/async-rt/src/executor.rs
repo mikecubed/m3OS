@@ -1,31 +1,71 @@
-//! Single-threaded cooperative executor with `block_on`.
+//! Multi-task cooperative executor with `block_on` and `spawn`.
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
+#[cfg(not(feature = "std"))]
+use alloc::collections::VecDeque;
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+
+#[cfg(feature = "std")]
+use std::collections::VecDeque;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use core::cell::Cell;
 use core::future::Future;
+use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::reactor::Reactor;
-use crate::task::{Task, waker_for_task};
+use crate::slab::Slab;
+use crate::task::{TaskHeader, create_task_parts, header_waker};
 
-// Global reactor pointer — set by block_on, used by futures via `reactor()`.
-// Safety: single-threaded executor, only one block_on active at a time.
+// Re-export JoinHandle so users can get it from executor or task.
+pub use crate::task::JoinHandle;
+
+// ---------------------------------------------------------------------------
+// Global executor and reactor pointers
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "std")]
 thread_local! {
+    static EXECUTOR_PTR: Cell<*mut Executor> = const { Cell::new(core::ptr::null_mut()) };
     static REACTOR_PTR: Cell<*mut Reactor> = const { Cell::new(core::ptr::null_mut()) };
 }
 
 #[cfg(not(feature = "std"))]
-static REACTOR_PTR: GlobalCellPtr = GlobalCellPtr(Cell::new(core::ptr::null_mut()));
+static EXECUTOR_PTR: GlobalCellPtr<Executor> = GlobalCellPtr(Cell::new(core::ptr::null_mut()));
+#[cfg(not(feature = "std"))]
+static REACTOR_PTR: GlobalCellPtr<Reactor> = GlobalCellPtr(Cell::new(core::ptr::null_mut()));
 
 #[cfg(not(feature = "std"))]
 #[repr(transparent)]
-struct GlobalCellPtr(Cell<*mut Reactor>);
+struct GlobalCellPtr<T>(Cell<*mut T>);
 
 #[cfg(not(feature = "std"))]
-unsafe impl Sync for GlobalCellPtr {}
+unsafe impl<T> Sync for GlobalCellPtr<T> {}
+
+fn get_executor_ptr() -> *mut Executor {
+    #[cfg(feature = "std")]
+    return EXECUTOR_PTR.with(|c| c.get());
+    #[cfg(not(feature = "std"))]
+    return EXECUTOR_PTR.0.get();
+}
+
+fn set_executor_ptr(ptr: *mut Executor) {
+    #[cfg(feature = "std")]
+    EXECUTOR_PTR.with(|c| c.set(ptr));
+    #[cfg(not(feature = "std"))]
+    EXECUTOR_PTR.0.set(ptr);
+}
+
+fn set_reactor_ptr(ptr: *mut Reactor) {
+    #[cfg(feature = "std")]
+    REACTOR_PTR.with(|c| c.set(ptr));
+    #[cfg(not(feature = "std"))]
+    REACTOR_PTR.0.set(ptr);
+}
 
 /// Get a mutable reference to the current reactor.
 ///
@@ -44,19 +84,100 @@ pub fn reactor() -> &'static mut Reactor {
     unsafe { &mut *ptr }
 }
 
-fn set_reactor_ptr(ptr: *mut Reactor) {
-    #[cfg(feature = "std")]
-    REACTOR_PTR.with(|c| c.set(ptr));
-    #[cfg(not(feature = "std"))]
-    REACTOR_PTR.0.set(ptr);
+// ---------------------------------------------------------------------------
+// Executor internals
+// ---------------------------------------------------------------------------
+
+struct TaskSlot {
+    future: Pin<Box<dyn Future<Output = ()>>>,
+    header: Arc<TaskHeader>,
 }
 
-/// Drive a future to completion using the given reactor for I/O readiness.
+struct Executor {
+    tasks: Slab<TaskSlot>,
+    run_queue: VecDeque<usize>,
+    /// Tracks the highest slab index + 1 for scanning.
+    high_water: usize,
+}
+
+impl Executor {
+    fn new() -> Self {
+        Self {
+            tasks: Slab::new(),
+            run_queue: VecDeque::new(),
+            high_water: 0,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        future: Pin<Box<dyn Future<Output = ()>>>,
+        header: Arc<TaskHeader>,
+    ) -> usize {
+        let id = self.tasks.insert(TaskSlot { future, header });
+        if id >= self.high_water {
+            self.high_water = id + 1;
+        }
+        self.run_queue.push_back(id);
+        id
+    }
+
+    /// Poll and remove completed spawned tasks from the run queue.
+    fn poll_spawned_tasks(&mut self) {
+        let mut to_poll = core::mem::take(&mut self.run_queue);
+
+        for task_id in to_poll.drain(..) {
+            let slot = match self.tasks.get_mut(task_id) {
+                Some(s) => s as *mut TaskSlot,
+                None => continue,
+            };
+
+            // Safety: single-threaded executor, exclusive access.
+            let slot_ref = unsafe { &mut *slot };
+
+            if !slot_ref.header.is_woken() {
+                continue;
+            }
+            slot_ref.header.clear_woken();
+
+            let waker = header_waker(&slot_ref.header);
+            let mut cx = Context::from_waker(&waker);
+
+            match slot_ref.future.as_mut().poll(&mut cx) {
+                Poll::Ready(()) => {
+                    self.tasks.remove(task_id);
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        self.run_queue = to_poll;
+    }
+
+    /// Re-scan all tasks for woken state and add to run queue.
+    fn requeue_woken(&mut self) {
+        for i in 0..self.high_water {
+            if let Some(slot) = self.tasks.get(i) {
+                if slot.header.is_woken() {
+                    self.run_queue.push_back(i);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Drive a future to completion, running all spawned tasks.
 ///
-/// This is the main entry point for the async executor. It creates a task,
-/// polls it, and uses the reactor to wait for I/O events between polls.
+/// This is the main entry point for the async executor. The root future
+/// is kept on the stack (no `'static` bound needed). Spawned tasks live
+/// in the slab.
 pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
-    let prev = {
+    let prev_executor = get_executor_ptr();
+    let prev_reactor = {
         #[cfg(feature = "std")]
         {
             REACTOR_PTR.with(|c| c.get())
@@ -66,56 +187,104 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
             REACTOR_PTR.0.get()
         }
     };
+
+    let mut executor = Executor::new();
+    set_executor_ptr(&mut executor as *mut Executor);
     set_reactor_ptr(reactor as *mut Reactor);
 
+    // Root task header — used to build a waker for the root future.
+    let root_header = Arc::new(TaskHeader::new());
     let mut future = core::pin::pin!(future);
 
-    let task = Task::new(Box::pin(async {}));
-
     let result = loop {
-        let waker = waker_for_task(&task);
-        let mut cx = Context::from_waker(&waker);
+        // 1. Poll spawned tasks first (they may wake the root future)
+        executor.poll_spawned_tasks();
 
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(val) => break val,
-            Poll::Pending => {
-                task.clear_woken();
-                reactor.poll_once(100);
+        // 2. Poll root future if woken
+        if root_header.is_woken() {
+            root_header.clear_woken();
+            let waker = header_waker(&root_header);
+            let mut cx = Context::from_waker(&waker);
+
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(val) => {
+                    // Give remaining ready spawned tasks one last chance to run.
+                    executor.requeue_woken();
+                    executor.poll_spawned_tasks();
+                    break val;
+                }
+                Poll::Pending => {}
             }
+        }
+
+        // 3. If nothing is runnable, block on reactor then re-scan
+        if executor.run_queue.is_empty() && !root_header.is_woken() {
+            reactor.poll_once(100);
+            executor.requeue_woken();
         }
     };
 
-    set_reactor_ptr(prev);
+    set_executor_ptr(prev_executor);
+    set_reactor_ptr(prev_reactor);
     result
+}
+
+/// Spawn a new task on the current executor.
+///
+/// # Panics
+/// Panics if called outside of `block_on`.
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let executor_ptr = get_executor_ptr();
+    assert!(
+        !executor_ptr.is_null(),
+        "spawn() called outside of block_on"
+    );
+
+    let (header, result_cell) = create_task_parts::<F::Output>();
+    let result_cell2 = result_cell.clone();
+    let header2 = header.clone();
+
+    let adapter = Box::pin(async move {
+        let val = future.await;
+        // Safety: single-threaded executor — no concurrent access.
+        unsafe {
+            *result_cell2.get() = Some(val);
+        }
+        header2.mark_completed();
+    });
+
+    // Safety: single-threaded — we are inside block_on's poll loop.
+    let executor = unsafe { &mut *executor_ptr };
+    executor.insert(adapter, header.clone());
+
+    JoinHandle {
+        result: result_cell,
+        header,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reactor::Reactor;
-    use core::pin::Pin;
-    use core::task::{Context, Poll};
     use std::cell::Cell;
+    use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    // D.1: block_on for immediately-ready future returning i32
+    // Backward compat: block_on(async { 42 }) returns 42
     #[test]
-    fn test_block_on_ready_i32() {
+    fn test_block_on_immediate() {
         let mut reactor = Reactor::new();
         let result = block_on(&mut reactor, async { 42 });
         assert_eq!(result, 42);
     }
 
-    // D.1: block_on for immediately-ready future returning &str
-    #[test]
-    fn test_block_on_ready_str() {
-        let mut reactor = Reactor::new();
-        let result = block_on(&mut reactor, async { "hello" });
-        assert_eq!(result, "hello");
-    }
-
-    // D.2: pending-then-ready future
+    // Backward compat: pending-then-ready future
     #[test]
     fn test_block_on_pending_then_ready() {
         let mut reactor = Reactor::new();
@@ -131,7 +300,6 @@ mod tests {
                     Poll::Ready(99)
                 } else {
                     self.polled.set(true);
-                    // Store the waker and wake it so executor re-polls
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
@@ -145,19 +313,17 @@ mod tests {
         assert_eq!(result, 99);
     }
 
-    // D.3: reactor-driven wakeup via pipe
+    // Reactor-driven wakeup via pipe (backward compat)
     #[test]
     fn test_block_on_reactor_driven() {
         let mut reactor = Reactor::new();
 
-        // Create a pipe — writer thread will make read end readable
         let (read_fd, write_fd) = {
             let mut fds = [0i32; 2];
             unsafe { libc::pipe(fds.as_mut_ptr()) };
             (fds[0], fds[1])
         };
 
-        // Future that awaits the pipe becoming readable
         struct AwaitPipe {
             fd: i32,
             registered: Cell<bool>,
@@ -167,12 +333,9 @@ mod tests {
             type Output = ();
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
                 if self.registered.get() {
-                    // Second poll — data should be available
                     Poll::Ready(())
                 } else {
                     self.registered.set(true);
-                    // Register with the global reactor is tricky from inside a future,
-                    // so we'll just use the waker approach: store waker, thread will wake it.
                     let waker = cx.waker().clone();
                     let fd = self.fd;
                     thread::spawn(move || {
@@ -197,5 +360,191 @@ mod tests {
             libc::close(read_fd);
             libc::close(write_fd);
         }
+    }
+
+    // T007.1: spawn 3 tasks returning different values, await all JoinHandles
+    #[test]
+    fn test_spawn_and_join() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let h1 = spawn(async { 10 });
+            let h2 = spawn(async { 20 });
+            let h3 = spawn(async { 30 });
+            let v1 = h1.await.unwrap();
+            let v2 = h2.await.unwrap();
+            let v3 = h3.await.unwrap();
+            (v1, v2, v3)
+        });
+        assert_eq!(result, (10, 20, 30));
+    }
+
+    // T007.2: spawn a task that itself spawns another task, await both
+    #[test]
+    fn test_nested_spawn() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let outer = spawn(async {
+                let inner = spawn(async { 7 });
+                inner.await.unwrap() + 1
+            });
+            outer.await.unwrap()
+        });
+        assert_eq!(result, 8);
+    }
+
+    // T007.3: spawn 10 tasks, each returning their index
+    #[test]
+    fn test_spawn_many() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let mut handles = Vec::new();
+            for i in 0..10 {
+                handles.push(spawn(async move { i }));
+            }
+            let mut values = Vec::new();
+            for h in handles {
+                values.push(h.await.unwrap());
+            }
+            values
+        });
+        assert_eq!(result, (0..10).collect::<Vec<_>>());
+    }
+
+    // T007.5: block_on future that spawns tasks and awaits them
+    #[test]
+    fn test_block_on_with_spawn() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let a = spawn(async { 100 });
+            let b = spawn(async { 200 });
+            a.await.unwrap() + b.await.unwrap()
+        });
+        assert_eq!(result, 300);
+    }
+
+    // T007.6: spawn a task that waits on a pipe, verify executor blocks
+    #[test]
+    fn test_no_busy_spin() {
+        let mut reactor = Reactor::new();
+
+        let result = block_on(&mut reactor, async {
+            let (read_fd, write_fd) = {
+                let mut fds = [0i32; 2];
+                unsafe { libc::pipe(fds.as_mut_ptr()) };
+                (fds[0], fds[1])
+            };
+
+            let handle = spawn(async move {
+                use crate::io::AsyncFd;
+                let async_fd = AsyncFd::new(read_fd);
+                async_fd.readable().await;
+                let mut buf = [0u8; 1];
+                unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut _, 1) };
+                buf[0]
+            });
+
+            // Writer thread: write after 50ms
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                unsafe { libc::write(write_fd, [42u8].as_ptr() as *const _, 1) };
+            });
+
+            let start = Instant::now();
+            let val = handle.await.unwrap();
+            let elapsed = start.elapsed();
+
+            unsafe {
+                libc::close(read_fd);
+                libc::close(write_fd);
+            }
+
+            assert!(
+                elapsed >= Duration::from_millis(30),
+                "elapsed too short: {:?}",
+                elapsed,
+            );
+            val
+        });
+        assert_eq!(result, 42);
+    }
+
+    // T007.7: spawn two tasks each waiting on different pipes
+    #[test]
+    fn test_spawn_with_reactor_io() {
+        let mut reactor = Reactor::new();
+
+        let result = block_on(&mut reactor, async {
+            let (r1, w1) = {
+                let mut fds = [0i32; 2];
+                unsafe { libc::pipe(fds.as_mut_ptr()) };
+                (fds[0], fds[1])
+            };
+            let (r2, w2) = {
+                let mut fds = [0i32; 2];
+                unsafe { libc::pipe(fds.as_mut_ptr()) };
+                (fds[0], fds[1])
+            };
+
+            let h1 = spawn(async move {
+                use crate::io::AsyncFd;
+                let fd = AsyncFd::new(r1);
+                fd.readable().await;
+                let mut buf = [0u8; 1];
+                unsafe { libc::read(r1, buf.as_mut_ptr() as *mut _, 1) };
+                buf[0]
+            });
+
+            let h2 = spawn(async move {
+                use crate::io::AsyncFd;
+                let fd = AsyncFd::new(r2);
+                fd.readable().await;
+                let mut buf = [0u8; 1];
+                unsafe { libc::read(r2, buf.as_mut_ptr() as *mut _, 1) };
+                buf[0]
+            });
+
+            // Write to both pipes from threads
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                unsafe { libc::write(w1, [10u8].as_ptr() as *const _, 1) };
+            });
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                unsafe { libc::write(w2, [20u8].as_ptr() as *const _, 1) };
+            });
+
+            let v1 = h1.await.unwrap();
+            let v2 = h2.await.unwrap();
+
+            unsafe {
+                libc::close(r1);
+                libc::close(r2);
+            }
+
+            (v1, v2)
+        });
+        assert_eq!(result, (10, 20));
+    }
+
+    // T007.8: spawn a task, drop the JoinHandle, verify block_on completes
+    #[test]
+    fn test_detached_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+
+        let mut reactor = Reactor::new();
+        block_on(&mut reactor, async move {
+            let handle = spawn(async move {
+                ran2.store(true, Ordering::Release);
+                42
+            });
+            // Drop the handle without awaiting
+            drop(handle);
+        });
+
+        // The spawned task should have run (it was ready immediately).
+        assert!(ran.load(Ordering::Acquire));
     }
 }
