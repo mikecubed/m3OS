@@ -292,10 +292,40 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // without a required response, or complete the payload handling otherwise.
         let mut prev = self.resume_event.take();
         if prev.needs_resume() {
-            // The event's Drop impl should have already called its resume
-            // handler (e.g. reject/fail).  Clear `prev` so the payload
-            // check below doesn't consume the next pending packet.
-            debug!("Recovering from unhandled {:?} event", prev);
+            // Direct syscall write for diagnosis: "STK:N\n"
+            let idx: u8 = match &prev {
+                DispatchEvent::None => b'0',
+                DispatchEvent::Data(_) => b'1',
+                DispatchEvent::KexDone => b'2',
+                DispatchEvent::Progressed => b'3',
+                DispatchEvent::CliEvent(_) => b'4',
+                DispatchEvent::ServEvent(e) => match e {
+                    ServEventId::Hostkeys => b'H',
+                    ServEventId::PasswordAuth => b'P',
+                    ServEventId::PubkeyAuth { .. } => b'K',
+                    ServEventId::FirstAuth => b'F',
+                    ServEventId::OpenSession { .. } => b'O',
+                    ServEventId::SessionShell { .. } => b'S',
+                    ServEventId::SessionExec { .. } => b'X',
+                    ServEventId::SessionSubsystem { .. } => b'U',
+                    ServEventId::SessionPty { .. } => b'T',
+                    ServEventId::Environment { .. } => b'E',
+                    ServEventId::Defunct => b'D',
+                },
+            };
+            let msg: [u8; 6] = [b'S', b'T', b'K', b':', idx, b'\n'];
+            unsafe {
+                core::arch::asm!(
+                    "syscall",
+                    inlateout("rax") 1u64 => _,
+                    in("rdi") 1u64,
+                    in("rsi") msg.as_ptr() as u64,
+                    in("rdx") 6u64,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+            }
             prev = DispatchEvent::None;
         }
 
