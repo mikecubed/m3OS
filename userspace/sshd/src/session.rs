@@ -486,9 +486,14 @@ async fn progress_task(
                                 let _ = shell_req.fail();
                                 ProgressAction::Continue
                             } else if pid == 0 {
-                                // Child process.
-                                close(master);
-                                close(sock_fd);
+                                // Child process — close ALL inherited fds
+                                // except the PTY slave. The child inherits the
+                                // reactor self-pipe, socket, PTY master, etc.
+                                for fd in 3..64 {
+                                    if fd != slave {
+                                        close(fd);
+                                    }
+                                }
                                 spawn_shell(slave, &info);
                             } else {
                                 // Parent.
