@@ -145,5 +145,5 @@ always allocated even for non-PTY sessions.
 | Lazy PTY alloc | sshd workaround | Retained | PTY works when event is missed |
 | Break-after-resume | sshd pattern | Retained (simplified) | Correct event lifecycle |
 | Flush before progress | sshd pattern | Retained | Output reaches client |
-| Pending data buffers | sshd pattern | **Eliminated** (Phase 42b) | Was needed for sync backpressure |
+| Pending data buffers | sshd pattern | Retained | Sunset input buffer may not accept full read |
 | 200ms poll timeout | sshd pattern | **Eliminated** (Phase 42b) | Was needed for manual poll loop |

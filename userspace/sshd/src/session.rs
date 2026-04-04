@@ -39,8 +39,9 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut outbuf = alloc::vec![0u8; BUF_SIZE];
     let mut runner = Runner::new_server(&mut inbuf, &mut outbuf);
 
-    // Set socket to non-blocking for async I/O.
-    set_nonblocking(sock_fd);
+    // Socket stays blocking — the reactor tells us when data is available,
+    // and blocking writes ensure flush_output always completes. Only the PTY
+    // master is set to non-blocking (for select-like behavior).
 
     // Session state.
     let mut authenticated = false;
@@ -55,6 +56,13 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut sock_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 4096];
     let mut chan_buf = [0u8; 4096];
+
+    // Pending data buffers: carry unconsumed bytes across main loop iterations
+    // when sunset's input buffer is full (backpressure).
+    let mut sock_pending_buf = [0u8; 4096];
+    let mut sock_pending_len: usize = 0;
+    let mut pty_pending_buf = [0u8; 4096];
+    let mut pty_pending_len: usize = 0;
 
     loop {
         // Flush pending output.
@@ -75,48 +83,110 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         // Wait for socket or PTY readiness via the reactor.
         WaitIo::new(sock_fd, pty_master).await;
 
+        // Feed any pending bytes to sunset first.
+        while sock_pending_len > 0 {
+            match runner.input(&sock_pending_buf[..sock_pending_len]) {
+                Ok(0) => {
+                    flush_output(&mut runner, sock_fd);
+                    let _ = runner.progress();
+                    flush_output(&mut runner, sock_fd);
+                    break;
+                }
+                Ok(c) => {
+                    sock_pending_buf.copy_within(c..sock_pending_len, 0);
+                    sock_pending_len -= c;
+                }
+                Err(_) => {
+                    cleanup(shell_pid, pty_master, pty_slave);
+                    return 1;
+                }
+            }
+        }
+
         // Socket readable: feed bytes to sunset.
-        let n = syscall_lib::read(sock_fd, &mut sock_buf);
-        if n > 0 {
-            let mut consumed = 0;
-            while consumed < n as usize {
-                match runner.input(&sock_buf[consumed..n as usize]) {
+        if sock_pending_len == 0 {
+            let n = syscall_lib::read(sock_fd, &mut sock_buf);
+            if n > 0 {
+                let mut consumed = 0;
+                while consumed < n as usize {
+                    match runner.input(&sock_buf[consumed..n as usize]) {
+                        Ok(0) => {
+                            flush_output(&mut runner, sock_fd);
+                            let _ = runner.progress();
+                            flush_output(&mut runner, sock_fd);
+                            break;
+                        }
+                        Ok(c) => consumed += c,
+                        Err(_) => {
+                            cleanup(shell_pid, pty_master, pty_slave);
+                            return 1;
+                        }
+                    }
+                }
+                // Stash unconsumed bytes for next iteration.
+                if consumed < n as usize {
+                    let remaining = n as usize - consumed;
+                    let stash = remaining.min(sock_pending_buf.len());
+                    sock_pending_buf[..stash]
+                        .copy_from_slice(&sock_buf[consumed..consumed + stash]);
+                    sock_pending_len = stash;
+                }
+            } else if n == 0 {
+                // EOF on socket — remote closed.
+                break;
+            }
+            // n < 0: no data yet (shouldn't happen with blocking socket + reactor,
+            // but harmless — just continue to the event loop).
+        }
+
+        // Drain any pending PTY data into the channel first.
+        if let Some(ref ch) = chan_handle {
+            while pty_pending_len > 0 {
+                match runner.write_channel(
+                    ch,
+                    ChanData::Normal,
+                    &pty_pending_buf[..pty_pending_len],
+                ) {
                     Ok(0) => {
-                        flush_output(&mut runner, sock_fd);
-                        let _ = runner.progress();
                         flush_output(&mut runner, sock_fd);
                         break;
                     }
-                    Ok(c) => consumed += c,
-                    Err(_) => {
-                        cleanup(shell_pid, pty_master, pty_slave);
-                        return 1;
+                    Ok(w) => {
+                        pty_pending_buf.copy_within(w..pty_pending_len, 0);
+                        pty_pending_len -= w;
+                        flush_output(&mut runner, sock_fd);
                     }
+                    Err(_) => break,
                 }
             }
-        } else if n == 0 {
-            // EOF on socket — remote closed.
-            break;
         }
-        // n < 0 is EAGAIN (non-blocking) — no data available, continue.
 
         // PTY readable: read from PTY, send as channel data.
-        if let Some(pty_fd) = pty_master {
-            let n = syscall_lib::read(pty_fd, &mut pty_buf);
-            if n > 0 {
-                if let Some(ref ch) = chan_handle {
-                    let data = &pty_buf[..n as usize];
-                    let mut sent = 0;
-                    while sent < data.len() {
-                        match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
-                            Ok(0) => {
-                                flush_output(&mut runner, sock_fd);
-                                break;
+        if pty_pending_len == 0 {
+            if let Some(pty_fd) = pty_master {
+                let n = syscall_lib::read(pty_fd, &mut pty_buf);
+                if n > 0 {
+                    if let Some(ref ch) = chan_handle {
+                        let data = &pty_buf[..n as usize];
+                        let mut sent = 0;
+                        while sent < data.len() {
+                            match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
+                                Ok(0) => {
+                                    flush_output(&mut runner, sock_fd);
+                                    break;
+                                }
+                                Ok(w) => sent += w,
+                                Err(_) => break,
                             }
-                            Ok(w) => sent += w,
-                            Err(_) => break,
+                            flush_output(&mut runner, sock_fd);
                         }
-                        flush_output(&mut runner, sock_fd);
+                        // Stash unsent bytes for next iteration.
+                        if sent < data.len() {
+                            let remaining = data.len() - sent;
+                            let stash = remaining.min(pty_pending_buf.len());
+                            pty_pending_buf[..stash].copy_from_slice(&data[sent..sent + stash]);
+                            pty_pending_len = stash;
+                        }
                     }
                 }
             }
