@@ -16,6 +16,8 @@
 #include "doomgeneric/i_system.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -318,12 +320,45 @@ void DG_SetWindowTitle(const char *title)
     (void)title;
 }
 
+/* Default IWAD path on m3OS when none is supplied by the user */
+#define DEFAULT_IWAD_PATH  "/usr/share/doom/doom1.wad"
+
+/* -------------------------------------------------------------------------
+ * has_iwad_arg -- returns 1 if argv already contains "-iwad"
+ * ------------------------------------------------------------------------- */
+static int has_iwad_arg(int argc, char **argv)
+{
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-iwad") == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * main -- entry point: create the DOOM instance and tick forever
  * ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
+    /* Inject a default IWAD path so the user can just type "doom" without
+     * needing to be in the same directory as doom1.wad or pass -iwad. */
+    if (!has_iwad_arg(argc, argv)) {
+        char **new_argv = malloc((argc + 3) * sizeof(char *));
+        if (new_argv) {
+            int i;
+            new_argv[0] = argv[0];
+            new_argv[1] = (char *)"-iwad";
+            new_argv[2] = (char *)DEFAULT_IWAD_PATH;
+            for (i = 1; i < argc; i++)
+                new_argv[i + 2] = argv[i];
+            new_argv[argc + 2] = NULL;
+            argc += 2;
+            argv = new_argv;
+        }
+    }
+
     doomgeneric_Create(argc, argv);
 
     for (;;)
