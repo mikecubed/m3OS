@@ -563,7 +563,8 @@ fn flush_output(runner: &mut Runner<'_, Server>, sock_fd: i32) {
         // Write to socket first, then consume only what was sent.
         let written = write_all_count(sock_fd, &tmp[..chunk]);
         if written == 0 {
-            break; // Socket write failed — stop flushing.
+            write_str(STDOUT_FILENO, "sshd: flush blocked\n");
+            break;
         }
         runner.consume_output(written);
     }
