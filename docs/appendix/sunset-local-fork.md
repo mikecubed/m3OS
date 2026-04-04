@@ -2,7 +2,7 @@
 
 **Location:** `sunset-local/` (forked from `sunset` v0.4.0 on crates.io)
 **Workspace reference:** `Cargo.toml` → `sunset = { path = "sunset-local", default-features = false }`
-**Related phase:** Phase 43 (SSH Server), Phase 42b (Async Executor)
+**Related phase:** Phase 43 (SSH Server), Phase 42b+ (Async Executor)
 
 ## Why a Local Fork Exists
 
@@ -11,36 +11,30 @@ The [sunset](https://crates.io/crates/sunset) SSH library (v0.4.0) is an IO-less
 key exchange, encryption, authentication callbacks, and channel multiplexing without
 performing any I/O itself — the application feeds bytes in and reads bytes out.
 
-m3OS uses sunset as the protocol engine for `sshd` (Phase 43). As of Phase 42b, the
-sshd session handler uses a cooperative async executor (`async-rt`) to drive I/O
-readiness and sunset event processing. This eliminated the need for the BadUsage
-recovery patch (Patch 1), which was required by the previous synchronous event loop.
+m3OS uses sunset as the protocol engine for `sshd` (Phase 43). As of Phase 42b+, the
+sshd session handler uses a multi-task cooperative async executor (`async-rt`) that
+matches sunset's intended `sunset-async` architecture: separate I/O, progress, and
+channel relay tasks sharing the Runner behind an async Mutex.
 
-**Two patches remain:** the BadUsage recovery (Patch 1) and the SSH window/packet
-size configuration (Patch 2).
+**Only one patch remains:** the SSH window/packet size configuration (Patch 2).
 
-## Patch 1: BadUsage Recovery in `runner.rs`
+## Patch 1: BadUsage Recovery — ELIMINATED
 
-**Status:** Retained — still required even with the async executor.
+**Status:** Removed in Phase 42b+ (multi-task async executor).
 
-The async executor (Phase 42b) resolved the sync/async sequencing issues that caused
-most BadUsage errors, but one case remains: sunset's internal `Drop`-based resume
-handling fires for `SessionPty` events before our handler can process them. The Drop
-impl calls `resume_chanreq(false)` (rejecting the PTY request), and the resulting
-stale `resume_event` triggers `BadUsage` on the next `progress()` call.
+The BadUsage error occurred because the single-task event loop could not guarantee
+that event resume handlers were called before the next `progress()` call. Sunset's
+internal `Drop`-based resume handling would fire for events like `SessionPty` before
+our handler could process them, leaving `resume_event` in a stale state.
 
-This is a sunset library design issue, not a sync vs async problem — the event's Drop
-handler races with our explicit handler regardless of executor model. The recovery
-patch allows the session to continue past this, and the lazy PTY allocation at
-`SessionShell` time provides a working fallback.
+The multi-task executor eliminates this by matching `sunset-async`'s architecture:
+- The progress task acquires the async Mutex, calls `progress()`, handles the event,
+  and calls the resume method — all within a single lock scope.
+- The Mutex is released only after the event is fully handled.
+- When `progress()` is called again (after re-acquiring the Mutex), `resume_event`
+  is always clean.
 
-```rust
-// sunset-local/src/runner.rs, line 293-300
-let mut prev = self.resume_event.take();
-if prev.needs_resume() {
-    prev = DispatchEvent::None;
-}
-```
+The original upstream code (`return error::BadUsage.fail()`) has been restored.
 
 ## Patch 2: SSH Window and Packet Size in `config.rs`
 
@@ -73,56 +67,50 @@ pub const DEFAULT_MAX_PACKET: usize = 32000;
 32 KB is sufficient for interactive SSH sessions and provides reasonable throughput
 for the data relay between the PTY and the encrypted channel.
 
-### Decision (Phase 42b)
-
-**Keep the 32KB window size.** This is a throughput/correctness setting independent
-of async vs sync. The fork remains solely for this configuration change. Options
-considered:
-
-- **Keep 32KB (chosen):** Fork stays for this single config change.
-- **Upstream via Config API:** Would require sunset to expose window size as a
-  configurable parameter. No such API exists in v0.4.0.
-- **Accept 1KB:** Not viable — sessions stall or fail with realistic SSH clients.
-
 ### Impact
 
 Without this change, the SSH client reports `rwindow 1000 rmax 1000` during channel
 open, and the session may stall or drop packets under normal interactive use.
 
-## sshd Architecture (Phase 42b)
+## sshd Architecture (Phase 42b+)
 
-The sshd session handler uses the `async-rt` executor:
+The sshd session handler uses a three-task async architecture:
 
 ```rust
 pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut reactor = Reactor::new();
-    executor::block_on(&mut reactor, async_session(sock_fd, host_key))
+    async_rt::block_on(&mut reactor, async_session(sock_fd, host_key))
 }
 ```
 
-The async session:
-- Sets socket and PTY FDs to non-blocking via `set_nonblocking()`.
-- Registers FDs with the reactor for read readiness.
-- Yields to the executor between I/O and event processing.
-- Eliminates the manual poll() call, pending data buffers, and 200ms timeout.
+Three spawned tasks share the Runner via `Rc<async_rt::sync::Mutex<Runner>>`:
 
-### Remaining Workarounds
+1. **I/O task** — reads socket data, feeds to `runner.input()`, flushes
+   `runner.output_buf()` to socket. Uses reactor for socket readiness.
+2. **Progress task** — loops calling `runner.progress()`, handles all SSH events
+   (auth, channel open, PTY, shell) within the Mutex lock scope.
+3. **Channel relay task** — relays data between PTY and `runner.read_channel()`/
+   `runner.write_channel()`. Spawned when shell is established.
 
-#### Lazy PTY Allocation at Shell Request
+### Why Three Tasks Eliminates BadUsage
 
-The `SessionPty` event may still be consumed by sunset's internal `Drop`-based
-resume handling before reaching our handler. The PTY is allocated at `SessionShell`
-time as a fallback. This workaround is independent of async/sync.
-
-#### Flush Before Every Progress Call
+The key is that events from `progress()` borrow from the Runner, which is behind
+the Mutex. The progress task:
 
 ```rust
-flush_output(&mut runner, sock_fd);
-match runner.progress() { ... }
+let mut guard = mutex.lock().await;
+match guard.progress() {
+    Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
+        pty_req.succeed();  // resume called WITHIN the lock scope
+    }
+    // ...
+}
+// guard dropped here — lock released with clean resume_event
 ```
 
-Sunset needs output buffer space for protocol responses. This pattern remains even
-with the async executor.
+The event's resume method is called before the MutexGuard is dropped. When the
+progress task re-acquires the Mutex and calls `progress()` again, `resume_event`
+is always clean — no BadUsage.
 
 ## What Would Need to Change to Remove the Fork
 
@@ -137,20 +125,14 @@ sunset's public API. To remove this patch:
    limits. A similar feature could gate larger window/packet defaults.
 3. **Accept the 1000-byte limit.** Not viable for real SSH sessions.
 
-### Eliminating the Lazy PTY Workaround
-
-The lazy PTY allocation exists because `SessionPty` may not be delivered. This could
-be fixed by pre-allocating the PTY at channel open time, but that means the PTY is
-always allocated even for non-PTY sessions.
-
 ## Summary of Dependencies
 
 | Change | Type | Status | Required for |
 |---|---|---|---|
-| BadUsage recovery | sunset patch | Retained | Sunset Drop handler races with explicit handler |
-| Window size 32000 | sunset config | **Retained** | Reasonable SSH throughput |
-| Lazy PTY alloc | sshd workaround | Retained | PTY works when event is missed |
-| Break-after-resume | sshd pattern | Retained (simplified) | Correct event lifecycle |
-| Flush before progress | sshd pattern | Retained | Output reaches client |
-| Pending data buffers | sshd pattern | Retained | Sunset input buffer may not accept full read |
+| BadUsage recovery | sunset patch | **Eliminated** (Phase 42b+) | Was needed before multi-task executor |
+| Window size 32000 | sunset config | Retained | Reasonable SSH throughput |
+| Lazy PTY alloc | sshd workaround | Retained | PTY works when SessionPty event is missed |
+| Pending data buffers | sshd I/O task | Retained | Runner input buffer may not accept full read |
 | 200ms poll timeout | sshd pattern | **Eliminated** (Phase 42b) | Was needed for manual poll loop |
+| Break-after-resume | sshd pattern | **Eliminated** (Phase 42b+) | Was needed in single-task loop |
+| Flush before progress | sshd pattern | **Eliminated** (Phase 42b+) | I/O task handles flushing independently |
