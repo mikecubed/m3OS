@@ -18,6 +18,7 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use async_rt::executor;
+use async_rt::io::AsyncFd;
 use async_rt::reactor::Reactor;
 use async_rt::sync::{Mutex, Notify};
 use core::cell::RefCell;
@@ -40,6 +41,8 @@ const BUF_SIZE: usize = 36000;
 
 /// Maximum authentication attempts before disconnecting.
 const MAX_AUTH_ATTEMPTS: u32 = 6;
+const NEG_EAGAIN: isize = -11;
+const NEG_EINTR: isize = -4;
 
 // ---------------------------------------------------------------------------
 // Shared session state
@@ -83,6 +86,7 @@ type SharedRunner = Rc<Mutex<Runner<'static, Server>>>;
 type SharedState = Rc<RefCell<SessionState>>;
 type SharedChan = Rc<RefCell<Option<ChanHandle>>>;
 type SharedNotify = Rc<Notify>;
+type SharedOutputLock = Rc<Mutex<()>>;
 
 // ---------------------------------------------------------------------------
 // Yield-once helper
@@ -110,18 +114,23 @@ fn yield_once() -> YieldOnce {
 }
 
 // ---------------------------------------------------------------------------
-// WaitReadable helper
+// WaitWake helper
 // ---------------------------------------------------------------------------
 
-struct WaitReadable {
+/// Park the current task until some registered waker fires.
+///
+/// Callers pair this with non-blocking I/O and retry their own read/write work
+/// after wakeup, so the wake may come from the reactor or from runner/channel
+/// wakers that share the same task waker.
+struct WaitWake {
     fd: i32,
     registered: bool,
 }
 
-impl Future for WaitReadable {
+impl Future for WaitWake {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.registered {
+        if fd_is_readable(self.fd) || self.registered {
             Poll::Ready(())
         } else {
             self.registered = true;
@@ -137,6 +146,13 @@ impl Future for WaitReadable {
 
 /// Run a complete SSH session on the given client socket.
 pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
+    if set_nonblocking(sock_fd) < 0 {
+        write_str(
+            STDOUT_FILENO,
+            "sshd: failed to set client socket nonblocking\n",
+        );
+        return 1;
+    }
     let mut reactor = Reactor::new();
     executor::block_on(&mut reactor, async_session(sock_fd, host_key))
 }
@@ -161,6 +177,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let state: SharedState = Rc::new(RefCell::new(SessionState::new()));
     let chan: SharedChan = Rc::new(RefCell::new(None));
     let progress_notify: SharedNotify = Rc::new(Notify::new());
+    let output_lock: SharedOutputLock = Rc::new(Mutex::new(()));
 
     // Spawn the I/O task.
     let _io = executor::spawn(io_task(
@@ -168,6 +185,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         runner.clone(),
         state.clone(),
         progress_notify.clone(),
+        output_lock.clone(),
     ));
 
     // Spawn the progress task. Clone the host signing key so the spawned
@@ -180,6 +198,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         chan.clone(),
         host_sign_key,
         progress_notify.clone(),
+        output_lock.clone(),
     ));
 
     // Main loop: wait for session completion, check shell exit status.
@@ -199,9 +218,11 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 let has_chan = chan.borrow().is_some();
                 if let (Some(pty_fd), true) = (pty_master, has_chan) {
                     let mut buf = [0u8; 4096];
-                    drain_pty_locked(&runner, sock_fd, pty_fd, &chan, &mut buf).await;
+                    drain_pty_locked(&runner, sock_fd, pty_fd, &chan, &mut buf, &output_lock).await;
                 }
-                flush_output_locked(&runner, sock_fd).await;
+                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                    state.borrow_mut().exit_code = 1;
+                }
                 state.borrow_mut().shell_pid = None;
                 state.borrow_mut().session_done = true;
                 break;
@@ -229,6 +250,7 @@ async fn io_task(
     runner: SharedRunner,
     state: SharedState,
     progress_notify: SharedNotify,
+    output_lock: SharedOutputLock,
 ) {
     let mut sock_buf = [0u8; 4096];
     let mut pending = [0u8; 4096];
@@ -246,7 +268,11 @@ async fn io_task(
         }
 
         // --- Output direction: flush sunset output to socket ---
-        flush_output_locked(&runner, sock_fd).await;
+        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+            state.borrow_mut().session_done = true;
+            state.borrow_mut().exit_code = 1;
+            return;
+        }
 
         // --- Input direction: feed pending bytes to runner ---
         while pending_len > 0 {
@@ -294,7 +320,7 @@ async fn io_task(
         }
 
         // Wait for socket readable (incoming data) or output waker (outgoing data).
-        WaitReadable {
+        WaitWake {
             fd: sock_fd,
             registered: false,
         }
@@ -305,52 +331,51 @@ async fn io_task(
         }
 
         // Flush output first (handles the output_waker wakeup case).
-        flush_output_locked(&runner, sock_fd).await;
+        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+            state.borrow_mut().session_done = true;
+            state.borrow_mut().exit_code = 1;
+            return;
+        }
 
-        // Read from socket if data is available. Since the socket is blocking
-        // and we might have been woken by output_waker (not socket readiness),
-        // check with a zero-timeout poll before attempting a blocking read.
+        // Read from the client socket directly — it is non-blocking, so wakes
+        // from runner output or spurious polls are harmless retries.
         if pending_len == 0 {
-            let mut pfd = syscall_lib::PollFd {
-                fd: sock_fd,
-                events: syscall_lib::POLLIN,
-                revents: 0,
-            };
-            let ready = syscall_lib::poll(core::slice::from_mut(&mut pfd), 0);
-            if ready > 0 && (pfd.revents & syscall_lib::POLLIN) != 0 {
-                let n = syscall_lib::read(sock_fd, &mut sock_buf);
-                if n > 0 {
-                    let mut consumed = 0;
-                    while consumed < n as usize {
-                        let mut guard = runner.lock().await;
-                        match guard.input(&sock_buf[consumed..n as usize]) {
-                            Ok(0) => {
-                                drop(guard);
-                                progress_notify.signal();
-                                break;
-                            }
-                            Ok(c) => {
-                                consumed += c;
-                                drop(guard);
-                                progress_notify.signal();
-                            }
-                            Err(_) => {
-                                state.borrow_mut().session_done = true;
-                                state.borrow_mut().exit_code = 1;
-                                return;
-                            }
+            let n = syscall_lib::read(sock_fd, &mut sock_buf);
+            if n > 0 {
+                let mut consumed = 0;
+                while consumed < n as usize {
+                    let mut guard = runner.lock().await;
+                    match guard.input(&sock_buf[consumed..n as usize]) {
+                        Ok(0) => {
+                            drop(guard);
+                            progress_notify.signal();
+                            break;
+                        }
+                        Ok(c) => {
+                            consumed += c;
+                            drop(guard);
+                            progress_notify.signal();
+                        }
+                        Err(_) => {
+                            state.borrow_mut().session_done = true;
+                            state.borrow_mut().exit_code = 1;
+                            return;
                         }
                     }
-                    if consumed < n as usize {
-                        let remaining = n as usize - consumed;
-                        let stash = remaining.min(pending.len());
-                        pending[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
-                        pending_len = stash;
-                    }
-                } else if n == 0 {
-                    state.borrow_mut().session_done = true;
-                    return;
                 }
+                if consumed < n as usize {
+                    let remaining = n as usize - consumed;
+                    let stash = remaining.min(pending.len());
+                    pending[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
+                    pending_len = stash;
+                }
+            } else if n == 0 {
+                state.borrow_mut().session_done = true;
+                return;
+            } else if n != NEG_EAGAIN && n != NEG_EINTR {
+                state.borrow_mut().session_done = true;
+                state.borrow_mut().exit_code = 1;
+                return;
             }
         }
     }
@@ -384,13 +409,18 @@ async fn progress_task(
     chan: SharedChan,
     host_sign_key: sunset::SignKey,
     progress_notify: SharedNotify,
+    output_lock: SharedOutputLock,
 ) {
     loop {
         if state.borrow().session_done {
             return;
         }
 
-        flush_output_locked(&runner, sock_fd).await;
+        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+            state.borrow_mut().session_done = true;
+            state.borrow_mut().exit_code = 1;
+            return;
+        }
 
         // Acquire the runner lock, call progress(), handle the event
         // (including calling the resume method), then release the lock.
@@ -602,6 +632,7 @@ async fn progress_task(
                     state.clone(),
                     chan.clone(),
                     progress_notify.clone(),
+                    output_lock.clone(),
                 ));
             }
             ProgressAction::Fatal => {
@@ -615,7 +646,11 @@ async fn progress_task(
             }
         }
 
-        flush_output_locked(&runner, sock_fd).await;
+        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+            state.borrow_mut().session_done = true;
+            state.borrow_mut().exit_code = 1;
+            return;
+        }
     }
 }
 
@@ -630,6 +665,7 @@ async fn channel_relay_task(
     state: SharedState,
     chan: SharedChan,
     progress_notify: SharedNotify,
+    output_lock: SharedOutputLock,
 ) {
     let mut chan_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 4096];
@@ -638,7 +674,6 @@ async fn channel_relay_task(
     // Pending data from channel -> PTY that couldn't be written (EAGAIN).
     let mut pty_write_pending = [0u8; 4096];
     let mut pty_write_pending_len: usize = 0;
-
     // The relay task wakes on:
     //   - PTY readable (shell produced output) — via reactor
     //   - Channel data available (client typed something) — via channel_read_waker
@@ -707,7 +742,11 @@ async fn channel_relay_task(
                     Ok(0) => {
                         drop(guard);
                         drop(ch_ref);
-                        flush_output_locked(&runner, sock_fd).await;
+                        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                            state.borrow_mut().session_done = true;
+                            state.borrow_mut().exit_code = 1;
+                            return;
+                        }
                         break;
                     }
                     Ok(w) => {
@@ -715,7 +754,11 @@ async fn channel_relay_task(
                         pty_pending_len -= w;
                         drop(guard);
                         drop(ch_ref);
-                        flush_output_locked(&runner, sock_fd).await;
+                        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                            state.borrow_mut().session_done = true;
+                            state.borrow_mut().exit_code = 1;
+                            return;
+                        }
                         progress_notify.signal();
                     }
                     Err(_) => break,
@@ -739,14 +782,22 @@ async fn channel_relay_task(
                             Ok(0) => {
                                 drop(guard);
                                 drop(ch_ref);
-                                flush_output_locked(&runner, sock_fd).await;
+                                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                                    state.borrow_mut().session_done = true;
+                                    state.borrow_mut().exit_code = 1;
+                                    return;
+                                }
                                 break;
                             }
                             Ok(w) => {
                                 sent += w;
                                 drop(guard);
                                 drop(ch_ref);
-                                flush_output_locked(&runner, sock_fd).await;
+                                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                                    state.borrow_mut().session_done = true;
+                                    state.borrow_mut().exit_code = 1;
+                                    return;
+                                }
                                 progress_notify.signal();
                             }
                             Err(_) => break,
@@ -764,7 +815,11 @@ async fn channel_relay_task(
             }
         }
 
-        flush_output_locked(&runner, sock_fd).await;
+        if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+            state.borrow_mut().session_done = true;
+            state.borrow_mut().exit_code = 1;
+            return;
+        }
 
         if state.borrow().session_done {
             return;
@@ -787,7 +842,7 @@ async fn channel_relay_task(
             drop(ch_ref);
             drop(guard);
         }
-        WaitReadable {
+        WaitWake {
             fd: pty_fd,
             registered: false,
         }
@@ -807,6 +862,17 @@ impl Future for GetWaker {
 
 async fn get_current_waker() -> core::task::Waker {
     GetWaker.await
+}
+
+fn fd_is_readable(fd: i32) -> bool {
+    let mut pfd = syscall_lib::PollFd {
+        fd,
+        events: syscall_lib::POLLIN,
+        revents: 0,
+    };
+    let ready = syscall_lib::poll(core::slice::from_mut(&mut pfd), 0);
+    ready > 0
+        && (pfd.revents & (syscall_lib::POLLIN | syscall_lib::POLLHUP | syscall_lib::POLLERR)) != 0
 }
 
 // ---------------------------------------------------------------------------
@@ -874,26 +940,48 @@ fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
 // ---------------------------------------------------------------------------
 
 /// Flush sunset's output buffer to the socket, acquiring the mutex.
-async fn flush_output_locked(runner: &SharedRunner, sock_fd: i32) {
+async fn flush_output_locked(
+    runner: &SharedRunner,
+    sock_fd: i32,
+    output_lock: &SharedOutputLock,
+) -> bool {
+    let _flush_guard = output_lock.lock().await;
     loop {
         let mut guard = runner.lock().await;
         let out = guard.output_buf();
         if out.is_empty() {
-            break;
+            return true;
         }
         let mut tmp = [0u8; 4096];
         let chunk = out.len().min(tmp.len());
         tmp[..chunk].copy_from_slice(&out[..chunk]);
         drop(guard);
 
-        let written = write_all_count(sock_fd, &tmp[..chunk]);
-        if written == 0 {
-            break;
+        if write_all_nonblocking(sock_fd, &tmp[..chunk]).await.is_err() {
+            return false;
         }
 
         let mut guard = runner.lock().await;
-        guard.consume_output(written);
+        guard.consume_output(chunk);
     }
+}
+
+async fn write_all_nonblocking(fd: i32, data: &[u8]) -> Result<(), ()> {
+    let async_fd = AsyncFd::new(fd);
+    let mut written = 0usize;
+    while written < data.len() {
+        let n = syscall_lib::write(fd, &data[written..]);
+        if n > 0 {
+            written += n as usize;
+        } else if n == NEG_EINTR {
+            continue;
+        } else if n == NEG_EAGAIN {
+            async_fd.writable().await;
+        } else {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 /// Drain remaining PTY output through sunset and onto the socket, with locking.
@@ -903,6 +991,7 @@ async fn drain_pty_locked(
     pty_fd: i32,
     chan: &SharedChan,
     buf: &mut [u8],
+    output_lock: &SharedOutputLock,
 ) {
     loop {
         let n = syscall_lib::read(pty_fd, buf);
@@ -919,7 +1008,9 @@ async fn drain_pty_locked(
                     Ok(0) => {
                         drop(guard);
                         drop(ch_ref);
-                        flush_output_locked(runner, sock_fd).await;
+                        if !flush_output_locked(runner, sock_fd, output_lock).await {
+                            return;
+                        }
                         // Retry once.
                         let ch_ref2 = chan.borrow();
                         if let Some(ref ch2) = *ch_ref2 {
@@ -942,7 +1033,9 @@ async fn drain_pty_locked(
             } else {
                 break;
             }
-            flush_output_locked(runner, sock_fd).await;
+            if !flush_output_locked(runner, sock_fd, output_lock).await {
+                return;
+            }
         }
     }
 }
@@ -964,19 +1057,6 @@ fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<
     if let Some(fd) = pty_slave {
         close(fd);
     }
-}
-
-/// Write all bytes to a file descriptor. Returns number of bytes written.
-fn write_all_count(fd: i32, data: &[u8]) -> usize {
-    let mut written = 0;
-    while written < data.len() {
-        let n = syscall_lib::write(fd, &data[written..]);
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-    written
 }
 
 /// Build an environment string like "KEY=value\0".
@@ -1004,4 +1084,80 @@ fn build_env(prefix: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
 
     buf[pos] = 0;
     pos + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_rt::executor::block_on;
+    use std::thread;
+    use std::time::Duration;
+    use std::vec::Vec;
+
+    fn make_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        assert_eq!(syscall_lib::pipe(&mut fds), 0);
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn write_all_nonblocking_writes_immediately_when_fd_is_writable() {
+        let mut reactor = Reactor::new();
+        let (read_fd, write_fd) = make_pipe();
+
+        block_on(&mut reactor, async {
+            write_all_nonblocking(write_fd, b"hello async ssh")
+                .await
+                .unwrap();
+        });
+
+        let mut buf = [0u8; 32];
+        let n = syscall_lib::read(read_fd, &mut buf);
+        assert_eq!(n, 15);
+        assert_eq!(&buf[..n as usize], b"hello async ssh");
+
+        close(read_fd);
+        close(write_fd);
+    }
+
+    #[test]
+    fn write_all_nonblocking_waits_for_pipe_space() {
+        let mut reactor = Reactor::new();
+        let (read_fd, write_fd) = make_pipe();
+        assert_eq!(set_nonblocking(write_fd), 0);
+
+        let fill = [0xAAu8; 4096];
+        loop {
+            let n = syscall_lib::write(write_fd, &fill);
+            if n < 0 {
+                break;
+            }
+        }
+
+        let payload = b"ssh flush survives eagain";
+        let drainer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let mut drain = [0u8; 8192];
+            let _ = syscall_lib::read(read_fd, &mut drain);
+            read_fd
+        });
+
+        block_on(&mut reactor, async {
+            write_all_nonblocking(write_fd, payload).await.unwrap();
+        });
+
+        close(write_fd);
+        let read_fd = drainer.join().unwrap();
+        let mut out = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = syscall_lib::read(read_fd, &mut chunk);
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n as usize]);
+        }
+        assert!(out.ends_with(payload));
+        close(read_fd);
+    }
 }
