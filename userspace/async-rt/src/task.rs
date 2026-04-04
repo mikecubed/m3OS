@@ -8,6 +8,8 @@ use std::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
+#[cfg(not(feature = "std"))]
+use core::sync::atomic::AtomicI32;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -15,6 +17,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 // Self-pipe support (unchanged from Phase 0)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "std")]
 use core::cell::Cell;
 
 #[cfg(feature = "std")]
@@ -23,21 +26,14 @@ thread_local! {
 }
 
 #[cfg(not(feature = "std"))]
-static WAKE_PIPE_FD: GlobalCell = GlobalCell(Cell::new(-1));
-
-#[cfg(not(feature = "std"))]
-#[repr(transparent)]
-struct GlobalCell(Cell<i32>);
-
-#[cfg(not(feature = "std"))]
-unsafe impl Sync for GlobalCell {}
+static WAKE_PIPE_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Set the wake pipe write-end FD.
 pub fn set_wake_pipe_fd(fd: i32) {
     #[cfg(feature = "std")]
     WAKE_PIPE_FD.with(|c| c.set(fd));
     #[cfg(not(feature = "std"))]
-    WAKE_PIPE_FD.0.set(fd);
+    WAKE_PIPE_FD.store(fd, Ordering::Relaxed);
 }
 
 /// Get the wake pipe write-end FD.
@@ -45,7 +41,7 @@ pub fn get_wake_pipe_fd() -> i32 {
     #[cfg(feature = "std")]
     return WAKE_PIPE_FD.with(|c| c.get());
     #[cfg(not(feature = "std"))]
-    return WAKE_PIPE_FD.0.get();
+    return WAKE_PIPE_FD.load(Ordering::Relaxed);
 }
 
 /// Write a single byte to the self-pipe to unblock `poll()`.

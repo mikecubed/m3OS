@@ -108,8 +108,8 @@ fn find_user(passwd: &[u8], username: &[u8]) -> Option<UserInfo> {
         }
         let fields = split_colon(line)?;
         if fields[0] == username {
-            let uid = parse_u32(fields[2]);
-            let gid = parse_u32(fields[3]);
+            let uid = parse_u32(fields[2])?;
+            let gid = parse_u32(fields[3])?;
             let uname = core::str::from_utf8(fields[0]).ok()?;
             let home = core::str::from_utf8(fields[5]).ok()?;
             let shell = core::str::from_utf8(fields[6]).ok()?;
@@ -148,14 +148,20 @@ fn split_colon(line: &[u8]) -> Option<[&[u8]; 7]> {
     }
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+
     let mut n: u32 = 0;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        n = n.checked_mul(10)?;
+        n = n.checked_add((b - b'0') as u32)?;
     }
-    n
+    Some(n)
 }
 
 /// Verify password against /etc/shadow.

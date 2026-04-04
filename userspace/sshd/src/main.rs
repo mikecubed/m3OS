@@ -36,6 +36,8 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 const SSH_PORT: u16 = 22;
+/// Negated EEXIST errno returned by the kernel when a directory already exists.
+const NEG_EEXIST: isize = -17;
 
 syscall_lib::entry_point!(main);
 
@@ -65,11 +67,11 @@ fn main(_args: &[&str]) -> i32 {
 /// B.1: Create /etc/ssh/ with mode 0755 if it does not exist.
 fn ensure_ssh_dir() {
     let ret = mkdir(b"/etc\0", 0o755);
-    if ret < 0 && ret != -17 {
+    if ret < 0 && ret != NEG_EEXIST {
         write_str(STDOUT_FILENO, "sshd: warning: cannot create /etc\n");
     }
     let ret = mkdir(b"/etc/ssh\0", 0o755);
-    if ret < 0 && ret != -17 {
+    if ret < 0 && ret != NEG_EEXIST {
         write_str(STDOUT_FILENO, "sshd: warning: cannot create /etc/ssh\n");
     }
 }

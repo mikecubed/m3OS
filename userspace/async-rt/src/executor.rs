@@ -12,9 +12,12 @@ use std::collections::VecDeque;
 #[cfg(feature = "std")]
 use std::sync::Arc;
 
+#[cfg(feature = "std")]
 use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
+#[cfg(not(feature = "std"))]
+use core::sync::atomic::{AtomicPtr, Ordering};
 use core::task::{Context, Poll};
 
 use crate::reactor::Reactor;
@@ -35,36 +38,29 @@ thread_local! {
 }
 
 #[cfg(not(feature = "std"))]
-static EXECUTOR_PTR: GlobalCellPtr<Executor> = GlobalCellPtr(Cell::new(core::ptr::null_mut()));
+static EXECUTOR_PTR: AtomicPtr<Executor> = AtomicPtr::new(core::ptr::null_mut());
 #[cfg(not(feature = "std"))]
-static REACTOR_PTR: GlobalCellPtr<Reactor> = GlobalCellPtr(Cell::new(core::ptr::null_mut()));
-
-#[cfg(not(feature = "std"))]
-#[repr(transparent)]
-struct GlobalCellPtr<T>(Cell<*mut T>);
-
-#[cfg(not(feature = "std"))]
-unsafe impl<T> Sync for GlobalCellPtr<T> {}
+static REACTOR_PTR: AtomicPtr<Reactor> = AtomicPtr::new(core::ptr::null_mut());
 
 fn get_executor_ptr() -> *mut Executor {
     #[cfg(feature = "std")]
     return EXECUTOR_PTR.with(|c| c.get());
     #[cfg(not(feature = "std"))]
-    return EXECUTOR_PTR.0.get();
+    return EXECUTOR_PTR.load(Ordering::Relaxed);
 }
 
 fn set_executor_ptr(ptr: *mut Executor) {
     #[cfg(feature = "std")]
     EXECUTOR_PTR.with(|c| c.set(ptr));
     #[cfg(not(feature = "std"))]
-    EXECUTOR_PTR.0.set(ptr);
+    EXECUTOR_PTR.store(ptr, Ordering::Relaxed);
 }
 
 fn set_reactor_ptr(ptr: *mut Reactor) {
     #[cfg(feature = "std")]
     REACTOR_PTR.with(|c| c.set(ptr));
     #[cfg(not(feature = "std"))]
-    REACTOR_PTR.0.set(ptr);
+    REACTOR_PTR.store(ptr, Ordering::Relaxed);
 }
 
 /// Get a mutable reference to the current reactor.
@@ -78,7 +74,7 @@ pub fn reactor() -> &'static mut Reactor {
     #[cfg(feature = "std")]
     let ptr = REACTOR_PTR.with(|c| c.get());
     #[cfg(not(feature = "std"))]
-    let ptr = REACTOR_PTR.0.get();
+    let ptr = REACTOR_PTR.load(Ordering::Relaxed);
 
     assert!(!ptr.is_null(), "reactor() called outside of block_on");
     unsafe { &mut *ptr }
@@ -184,7 +180,7 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
         }
         #[cfg(not(feature = "std"))]
         {
-            REACTOR_PTR.0.get()
+            REACTOR_PTR.load(Ordering::Relaxed)
         }
     };
 

@@ -167,13 +167,11 @@ impl<T> Future for SendFuture<'_, T> {
         drop(buf);
 
         // Buffer is full — register our waker and return Pending.
+        // Only enqueue once; the waker remains valid across re-polls in
+        // a single-threaded executor (same TaskHeader-based waker each time).
         if !this.queued {
             inner.tx_waiters.borrow_mut().push_back(cx.waker().clone());
             this.queued = true;
-        } else {
-            // Update the waker in case it changed between polls.
-            // Replace the last entry we pushed (simplification: push a new one).
-            inner.tx_waiters.borrow_mut().push_back(cx.waker().clone());
         }
         Poll::Pending
     }
@@ -196,10 +194,7 @@ impl<T> Receiver<T> {
     /// Returns `Some(value)` when a message is available, or `None` when
     /// all senders have been dropped and the buffer is empty.
     pub fn recv(&self) -> RecvFuture<'_, T> {
-        RecvFuture {
-            receiver: self,
-            registered: false,
-        }
+        RecvFuture { receiver: self }
     }
 }
 
@@ -210,7 +205,6 @@ impl<T> Receiver<T> {
 /// Future returned by [`Receiver::recv`].
 pub struct RecvFuture<'a, T> {
     receiver: &'a Receiver<T>,
-    registered: bool,
 }
 
 impl<T> Future for RecvFuture<'_, T> {
@@ -238,7 +232,6 @@ impl<T> Future for RecvFuture<'_, T> {
 
         // Not closed, buffer empty — register waker and wait.
         *inner.rx_waker.borrow_mut() = Some(cx.waker().clone());
-        this.registered = true;
         Poll::Pending
     }
 }
@@ -388,5 +381,49 @@ mod tests {
             recv_handle.await.unwrap()
         });
         assert_eq!(result, 99);
+    }
+
+    // Verify that re-polling a blocked SendFuture does not enqueue duplicate
+    // wakers.  With a capacity-1 channel, fill the buffer, then spawn a
+    // sender that blocks.  Yield multiple times so the executor re-polls
+    // the blocked send.  Then drain one value — exactly one waker should
+    // fire, not N duplicates.
+    #[test]
+    fn test_send_no_duplicate_wakers() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let (tx, rx) = channel::<i32>(1);
+
+            // Fill the single-slot buffer.
+            tx.send(1).await.unwrap();
+
+            // Spawn a sender that will block (buffer full).
+            let tx2 = tx.clone();
+            let handle = spawn(async move {
+                tx2.send(2).await.unwrap();
+                42
+            });
+
+            // Yield several times — the executor re-polls the blocked
+            // SendFuture.  With the old code each re-poll would push
+            // another waker into tx_waiters; with the fix only one entry
+            // exists.
+            for _ in 0..10 {
+                core::future::poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Ready(())
+                })
+                .await;
+            }
+
+            // Drain one value — should wake exactly one sender.
+            let first = rx.recv().await.unwrap();
+            let completed = handle.await.unwrap();
+
+            // The channel should have exactly one value (the unblocked send).
+            let second = rx.recv().await.unwrap();
+            (first, second, completed)
+        });
+        assert_eq!(result, (1, 2, 42));
     }
 }
