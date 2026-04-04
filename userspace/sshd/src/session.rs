@@ -221,6 +221,12 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
     let mut pending = [0u8; 4096];
     let mut pending_len: usize = 0;
 
+    // The I/O task must wake on EITHER:
+    //   - Socket readable (client sent data) — via reactor
+    //   - Runner has output to send (channel data packetized) — via output_waker
+    //
+    // We register both wakers before yielding, so either event wakes this task.
+
     loop {
         if state.borrow().session_done {
             return;
@@ -234,8 +240,6 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
             let mut guard = runner.lock().await;
             match guard.input(&pending[..pending_len]) {
                 Ok(0) => {
-                    // Runner's input buffer is full — yield to let the
-                    // progress task drain it, then retry next iteration.
                     drop(guard);
                     yield_once().await;
                     break;
@@ -253,7 +257,16 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
             }
         }
 
-        // Wait for socket to become readable.
+        // Register output_waker so we wake when runner has output to send.
+        // Also register socket for read readiness.
+        {
+            let waker = get_current_waker().await;
+            let mut guard = runner.lock().await;
+            guard.set_output_waker(&waker);
+            drop(guard);
+        }
+
+        // Wait for socket readable (incoming data) or output waker (outgoing data).
         WaitReadable {
             fd: sock_fd,
             registered: false,
@@ -264,43 +277,70 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
             return;
         }
 
-        // Read from socket.
+        // Try to read from socket (non-destructive if no data — socket is blocking
+        // but the reactor confirmed readability, OR we were woken by output_waker
+        // in which case the socket may not be readable — that's fine, read will
+        // return EAGAIN... wait, socket is blocking. We need to be careful.)
+        //
+        // Since the socket is blocking and we might have been woken by output_waker
+        // (not socket readiness), we must NOT do a blocking read unconditionally.
+        // Instead, check if the socket is actually readable by doing a non-blocking
+        // poll check, or set the socket non-blocking.
+        //
+        // Simplest fix: always try to read with a non-blocking check first.
+        // But the socket is blocking. So we need to only read if the wakeup was
+        // from the socket, not from the output waker.
+        //
+        // Alternative: just flush output first, then read if socket has data.
+        // The flush handles the output waker case. The read handles the socket case.
+        // If we were woken by output waker, flush sends data, and the next iteration
+        // starts with flush again (in case more output appeared).
+
+        // Flush output first (handles the output_waker wakeup case).
+        flush_output_locked(&runner, sock_fd).await;
+
+        // Now try to read from socket. Since the socket is blocking, we only
+        // read if we know data is available. Use a zero-timeout poll to check.
         if pending_len == 0 {
-            let n = syscall_lib::read(sock_fd, &mut sock_buf);
-            if n > 0 {
-                let mut consumed = 0;
-                while consumed < n as usize {
-                    let mut guard = runner.lock().await;
-                    match guard.input(&sock_buf[consumed..n as usize]) {
-                        Ok(0) => {
-                            // Runner's input buffer is full — yield to let
-                            // the progress task drain it. Stash unconsumed
-                            // bytes below.
-                            drop(guard);
-                            yield_once().await;
-                            break;
-                        }
-                        Ok(c) => {
-                            consumed += c;
-                            drop(guard);
-                        }
-                        Err(_) => {
-                            state.borrow_mut().session_done = true;
-                            state.borrow_mut().exit_code = 1;
-                            return;
+            let mut pfd = syscall_lib::PollFd {
+                fd: sock_fd,
+                events: syscall_lib::POLLIN,
+                revents: 0,
+            };
+            let ready = syscall_lib::poll(core::slice::from_mut(&mut pfd), 0);
+            if ready > 0 && (pfd.revents & syscall_lib::POLLIN) != 0 {
+                let n = syscall_lib::read(sock_fd, &mut sock_buf);
+                if n > 0 {
+                    let mut consumed = 0;
+                    while consumed < n as usize {
+                        let mut guard = runner.lock().await;
+                        match guard.input(&sock_buf[consumed..n as usize]) {
+                            Ok(0) => {
+                                drop(guard);
+                                yield_once().await;
+                                break;
+                            }
+                            Ok(c) => {
+                                consumed += c;
+                                drop(guard);
+                            }
+                            Err(_) => {
+                                state.borrow_mut().session_done = true;
+                                state.borrow_mut().exit_code = 1;
+                                return;
+                            }
                         }
                     }
+                    if consumed < n as usize {
+                        let remaining = n as usize - consumed;
+                        let stash = remaining.min(pending.len());
+                        pending[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
+                        pending_len = stash;
+                    }
+                } else if n == 0 {
+                    state.borrow_mut().session_done = true;
+                    return;
                 }
-                // Stash unconsumed bytes.
-                if consumed < n as usize {
-                    let remaining = n as usize - consumed;
-                    let stash = remaining.min(pending.len());
-                    pending[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
-                    pending_len = stash;
-                }
-            } else if n == 0 {
-                state.borrow_mut().session_done = true;
-                return;
             }
         }
     }
