@@ -11,8 +11,8 @@ const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 /// D.1: Check password against /etc/shadow.
 /// Returns Some((uid, gid, home, shell)) on success.
 pub fn check_password(username: &str, password: &str) -> Option<UserInfo> {
-    // Look up user in /etc/passwd — do not return early if missing, to avoid
-    // a timing side channel that reveals whether a username exists.
+    // Look up the passwd entry without returning early on a missing user so
+    // both paths still pay for the passwd + shadow reads and password check.
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
@@ -22,7 +22,8 @@ pub fn check_password(username: &str, password: &str) -> Option<UserInfo> {
     let user_info = find_user(&passwd_buf[..passwd_len], username.as_bytes());
 
     // Always read /etc/shadow and verify, even if the user wasn't found in
-    // passwd.  This equalizes the work done for existing vs non-existing users.
+    // passwd. This reduces the observable work difference between existing and
+    // non-existing users, though it is not a strict constant-time guarantee.
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {

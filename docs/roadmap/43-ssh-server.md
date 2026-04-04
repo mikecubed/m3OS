@@ -6,6 +6,10 @@
 **Builds on:** Uses the crypto-lib from Phase 42 (Ed25519, X25519, ChaCha20-Poly1305, SHA-256) for all cryptographic operations; reuses the PTY pair infrastructure from Phase 29 and the telnetd session architecture from Phase 30; authenticates against /etc/shadow from Phase 27; uses poll-based I/O multiplexing from Phase 37 for per-session socket/PTY relay
 **Primary Components:** userspace sshd binary, sunset SSH library integration, host key management, authorized_keys support
 
+The appendix SSH hang analyses are historical bring-up notes for a branch-local
+regression that was fixed during Phase 43 review; they are not the current
+status of the shipped implementation.
+
 ## Milestone Goal
 
 An SSH server runs inside the OS, providing encrypted remote shell access. Users can

@@ -4,6 +4,10 @@
 **Branch:** `docs/phase-43-task-list`  
 **Related note:** [`sshd-multi-task-debug.md`](./sshd-multi-task-debug.md)
 
+> **Historical note:** This analysis captures the suspected root cause before the
+> final session fix landed later the same day. Keep it as debugging context, not
+> as the current status of Phase 43.
+
 ## Executive conclusion
 
 The strongest branch-local explanation for the post-authentication hang is **missing write-readiness wakeup handling in the PTY relay path**, not a missing `progress()` call and not a missing socket flush.

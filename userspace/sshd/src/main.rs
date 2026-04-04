@@ -16,8 +16,8 @@ mod session;
 use core::alloc::Layout;
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
-    AF_INET, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO, WNOHANG, accept, close, fork,
-    listen, mkdir, socket, waitpid, write_str,
+    AF_INET, NEG_EEXIST, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO, WNOHANG, accept,
+    close, fork, listen, mkdir, socket, waitpid, write_str,
 };
 
 #[global_allocator]
@@ -36,8 +36,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 const SSH_PORT: u16 = 22;
-/// Negated EEXIST errno returned by the kernel when a directory already exists.
-const NEG_EEXIST: isize = -17;
 
 syscall_lib::entry_point!(main);
 

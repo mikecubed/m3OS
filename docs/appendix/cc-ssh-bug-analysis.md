@@ -5,6 +5,10 @@
 **Predecessors**: [`sshd-multi-task-debug.md`](./sshd-multi-task-debug.md), [`sshd-hang-analysis.md`](./sshd-hang-analysis.md)
 **Method**: Static analysis of session code, executor, mutex, reactor, sunset-local fork, and upstream sunset-async architecture research. Synthesises findings from two independent analyses.
 
+> **Historical note:** This appendix records the debugging hypotheses that were
+> under consideration before the shipped sshd/session fixes. Treat it as
+> archived analysis rather than the current implementation status.
+
 ## Executive Summary
 
 Shell output never reaches the SSH client after authentication. Pressing a key occasionally nudges data through.

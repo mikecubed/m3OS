@@ -1,8 +1,8 @@
-# SSHD Multi-Task Architecture — Debug Handoff Document
+# SSHD Multi-Task Architecture — Historical Debug Handoff
 
 **Date**: 2026-04-04
 **Branch**: `docs/phase-43-task-list`
-**Status**: SSH sessions complete KEX, auth, PTY allocation, and shell spawn. Shell runs correctly (ion executes, PROMPT works). But shell output never reaches the SSH client — the session appears to hang after authentication.
+**Status**: Historical investigation note. The post-auth shell-output hang described here was fixed later on `2026-04-04`; this document captures the branch-local state before that fix landed.
 
 ## What Works
 

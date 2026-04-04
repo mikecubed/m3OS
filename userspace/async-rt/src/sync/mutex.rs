@@ -78,11 +78,13 @@ impl<'a, T> Future for MutexLockFuture<'a, T> {
             self.queued = true;
             Poll::Pending
         } else {
-            // Re-enqueue waker — the previous one was consumed by guard Drop.
-            self.mutex
-                .waiters
-                .borrow_mut()
-                .push_back(cx.waker().clone());
+            // Re-register only after our previous queue entry has actually been
+            // consumed. This preserves the requeue-after-contention behavior
+            // without letting repeated polls grow the waiter list unboundedly.
+            let mut waiters = self.mutex.waiters.borrow_mut();
+            if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
+                waiters.push_back(cx.waker().clone());
+            }
             Poll::Pending
         }
     }
@@ -375,5 +377,35 @@ mod tests {
         });
         // A wrote 1 + 10 + 10 = 21, B added 100 = 121
         assert_eq!(result, 121);
+    }
+
+    #[test]
+    fn test_no_duplicate_waiters_on_repoll() {
+        let mut reactor = Reactor::new();
+        block_on(&mut reactor, async {
+            let m = Rc::new(Mutex::new(0u32));
+
+            let m_holder = m.clone();
+            let holder = spawn(async move {
+                let _guard = m_holder.lock().await;
+                for _ in 0..5 {
+                    Yield::new().await;
+                }
+            });
+
+            let m_waiter = m.clone();
+            let waiter = spawn(async move {
+                let _guard = m_waiter.lock().await;
+            });
+
+            for _ in 0..3 {
+                Yield::new().await;
+            }
+
+            assert_eq!(m.waiters.borrow().len(), 1);
+
+            holder.await.unwrap();
+            waiter.await.unwrap();
+        });
     }
 }

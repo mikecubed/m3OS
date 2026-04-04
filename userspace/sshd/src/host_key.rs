@@ -37,10 +37,10 @@ fn load_host_key() -> Result<HostKey, ()> {
     let fd = fd as i32;
 
     let mut seed = [0u8; 32];
-    let n = syscall_lib::read(fd, &mut seed);
+    let ok = read_exact(fd, &mut seed);
     close(fd);
 
-    if n != 32 {
+    if !ok {
         return Err(());
     }
 
@@ -114,4 +114,16 @@ fn to_hex_char(nibble: u8) -> u8 {
     } else {
         b'a' + nibble - 10
     }
+}
+
+fn read_exact(fd: i32, buf: &mut [u8]) -> bool {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = syscall_lib::read(fd, &mut buf[filled..]);
+        if n <= 0 {
+            return false;
+        }
+        filled += n as usize;
+    }
+    true
 }

@@ -30,7 +30,7 @@ jobs:
         with:
           directory-to-scan: .
           should-scan-archives: false
-          ignore-globs: "sunset-local/**"
+          ignore-globs: "sunset-local/docs/**,sunset-local/testing/**"
 
       - name: Upload DevSkim scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
