@@ -451,8 +451,11 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
-                    let _ = env_req.fail();
-                    continue; // Process next event immediately.
+                    write_str(STDOUT_FILENO, "sshd: ev:env\n");
+                    if env_req.fail().is_err() {
+                        write_str(STDOUT_FILENO, "sshd: env:ERR\n");
+                    }
+                    continue;
                 }
                 Ok(Event::Serv(ServEvent::Defunct)) => {
                     cleanup(shell_pid, pty_master, pty_slave);
