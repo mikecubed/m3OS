@@ -334,6 +334,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev:open\n");
                     if !authenticated {
                         let _ = open_session
                             .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
@@ -348,6 +349,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev:pty\n");
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
                             pty_master = Some(master);
@@ -361,6 +363,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
+                    write_str(STDOUT_FILENO, "sshd: ev:shell\n");
                     if shell_spawned {
                         let _ = shell_req.fail();
                     } else if let (Some(master), Some(slave), Some(info)) =
@@ -457,11 +460,13 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
                 Ok(Event::Serv(ServEvent::PollAgain) | Event::Progressed) => continue,
                 Ok(Event::None) => break,
-                Ok(_) => break,
+                Ok(other) => {
+                    write_str(STDOUT_FILENO, "sshd: unhandled event\n");
+                    drop(other);
+                    break;
+                }
                 Err(_) => {
-                    // Sunset returns BadUsage when internal state is
-                    // temporarily inconsistent (e.g. pending output).
-                    // Break and let the outer loop flush + retry.
+                    write_str(STDOUT_FILENO, "sshd: progress err\n");
                     break;
                 }
             }
