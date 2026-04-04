@@ -4648,8 +4648,8 @@ fn collect_ports_entries(
 /// Tries `curl` first, then `wget`.
 fn fetch_doom_wad(dest: &Path) {
     const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
-    // SHA-256 of the canonical shareware doom1.wad (v1.9).
-    const WAD_SHA256: &str = "90facab21eede7981a9d4b8d6e0cfe2b4a5af2f64fc23a3b6d7cdfd9c6c0ddf5";
+    // SHA-256 of doom1.wad from distro.ibiblio.org (verified 2026-04-04).
+    const WAD_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
 
     if std::env::var("M3OS_DOWNLOAD_WAD").as_deref() != Ok("1") {
         eprintln!(
