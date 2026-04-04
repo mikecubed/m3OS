@@ -2,33 +2,40 @@
 //!
 //! Provides encrypted remote shell access using the sunset IO-less SSH library.
 //! Architecture mirrors telnetd: accept loop → fork per connection → PTY + shell relay.
-#![no_std]
-#![no_main]
-#![feature(alloc_error_handler)]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), feature(alloc_error_handler))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod auth;
 mod getrandom_impl;
 mod host_key;
 mod session;
 
+#[cfg(not(test))]
 use core::alloc::Layout;
+#[cfg(not(test))]
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
-    AF_INET, NEG_EEXIST, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO, WNOHANG, accept,
-    close, fork, listen, mkdir, socket, waitpid, write_str,
+    AF_INET, NEG_EEXIST, POLLIN, PollFd, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO,
+    WNOHANG, accept, close, fork, listen, mkdir, poll, socket, waitpid, write_str,
 };
 
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     syscall_lib::write(2, b"sshd: out of memory\n");
     syscall_lib::exit(1)
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::write(2, b"sshd: PANIC\n");
@@ -36,10 +43,12 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 const SSH_PORT: u16 = 22;
+const LISTENER_POLL_TIMEOUT_MS: i32 = 1000;
 
-syscall_lib::entry_point!(main);
+#[cfg(not(test))]
+syscall_lib::entry_point!(program_main);
 
-fn main(_args: &[&str]) -> i32 {
+fn program_main(_args: &[&str]) -> i32 {
     write_str(STDOUT_FILENO, "sshd: starting\n");
 
     // B.1: Ensure /etc/ssh/ directory exists.
@@ -111,13 +120,14 @@ fn accept_loop(listen_fd: i32) -> ! {
     let mut host_key: Option<host_key::HostKey> = None;
 
     loop {
-        // Reap finished children.
-        let mut status: i32 = 0;
-        while waitpid(-1, &mut status, WNOHANG) > 0 {}
+        reap_finished_children();
+
+        if !wait_for_listener(listen_fd, LISTENER_POLL_TIMEOUT_MS) {
+            continue;
+        }
 
         let client_fd = accept(listen_fd, None);
         if client_fd < 0 {
-            syscall_lib::nanosleep(1);
             continue;
         }
         let client_fd = client_fd as i32;
@@ -149,5 +159,78 @@ fn accept_loop(listen_fd: i32) -> ! {
         }
         // Parent: close client fd and continue accepting.
         close(client_fd);
+    }
+}
+
+fn reap_finished_children() {
+    let mut status: i32 = 0;
+    while waitpid(-1, &mut status, WNOHANG) > 0 {}
+}
+
+fn wait_for_listener(_listen_fd: i32, _timeout_ms: i32) -> bool {
+    let mut pfd = PollFd {
+        fd: _listen_fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let ready = poll(core::slice::from_mut(&mut pfd), _timeout_ms);
+    ready > 0 && (pfd.revents & POLLIN) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    fn make_listener() -> i32 {
+        let fd = socket(AF_INET as i32, SOCK_STREAM as i32, 0);
+        assert!(fd >= 0);
+        let fd = fd as i32;
+
+        let one: i32 = 1;
+        let optval = unsafe {
+            core::slice::from_raw_parts(
+                &one as *const i32 as *const u8,
+                core::mem::size_of::<i32>(),
+            )
+        };
+        assert_eq!(
+            syscall_lib::setsockopt(fd, SOL_SOCKET as i32, SO_REUSEADDR as i32, optval),
+            0
+        );
+
+        let addr = syscall_lib::SockaddrIn::new([127, 0, 0, 1], 0);
+        assert_eq!(syscall_lib::bind(fd, &addr), 0);
+        assert_eq!(listen(fd, 1), 0);
+        fd
+    }
+
+    #[test]
+    fn wait_for_listener_times_out_without_connections() {
+        let fd = make_listener();
+        assert!(!wait_for_listener(fd, 20));
+        close(fd);
+    }
+
+    #[test]
+    fn wait_for_listener_reports_ready_socket() {
+        let fd = make_listener();
+        let mut addr = syscall_lib::SockaddrIn::new([0, 0, 0, 0], 0);
+        assert_eq!(syscall_lib::getsockname(fd, &mut addr), 0);
+        let port = addr.port();
+
+        let connector = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        });
+
+        assert!(wait_for_listener(fd, 500));
+        let client_fd = accept(fd, None);
+        assert!(client_fd >= 0);
+        close(client_fd as i32);
+        close(fd);
+        connector.join().unwrap();
     }
 }

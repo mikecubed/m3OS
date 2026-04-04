@@ -30,19 +30,7 @@ pub fn load_or_generate() -> Result<HostKey, ()> {
 
 /// B.3: Load existing host key from /etc/ssh/ssh_host_ed25519_key.
 fn load_host_key() -> Result<HostKey, ()> {
-    let fd = open(HOST_KEY_PATH, O_RDONLY, 0);
-    if fd < 0 {
-        return Err(());
-    }
-    let fd = fd as i32;
-
-    let mut seed = [0u8; 32];
-    let ok = read_exact(fd, &mut seed);
-    close(fd);
-
-    if !ok {
-        return Err(());
-    }
+    let seed = read_seed_file(HOST_KEY_PATH)?;
 
     // Reconstruct the dalek SigningKey from the seed.
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
@@ -116,6 +104,30 @@ fn to_hex_char(nibble: u8) -> u8 {
     }
 }
 
+fn read_seed_file(path: &[u8]) -> Result<[u8; 32], ()> {
+    let fd = open(path, O_RDONLY, 0);
+    if fd < 0 {
+        return Err(());
+    }
+    let fd = fd as i32;
+
+    let mut seed = [0u8; 32];
+    let ok = read_exact(fd, &mut seed);
+    let mut trailing = [0u8; 1];
+    let extra = if ok {
+        syscall_lib::read(fd, &mut trailing)
+    } else {
+        -1
+    };
+    close(fd);
+
+    if !ok || extra != 0 {
+        return Err(());
+    }
+
+    Ok(seed)
+}
+
 fn read_exact(fd: i32, buf: &mut [u8]) -> bool {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -126,4 +138,56 @@ fn read_exact(fd: i32, buf: &mut [u8]) -> bool {
         filled += n as usize;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "m3os-sshd-host-key-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        path
+    }
+
+    fn path_cstring(path: &PathBuf) -> CString {
+        CString::new(path.as_os_str().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn read_seed_file_accepts_exact_seed() {
+        let path = temp_path("exact");
+        let seed = [0x5au8; 32];
+        fs::write(&path, seed).unwrap();
+
+        let c_path = path_cstring(&path);
+        let loaded = read_seed_file(c_path.as_bytes_with_nul()).unwrap();
+        assert_eq!(loaded, seed);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_seed_file_rejects_trailing_bytes() {
+        let path = temp_path("trailing");
+        let mut bytes = vec![0x11u8; 33];
+        bytes[32] = 0x22;
+        fs::write(&path, &bytes).unwrap();
+
+        let c_path = path_cstring(&path);
+        assert!(read_seed_file(c_path.as_bytes_with_nul()).is_err());
+
+        fs::remove_file(path).unwrap();
+    }
 }
