@@ -292,28 +292,11 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // without a required response, or complete the payload handling otherwise.
         let mut prev = self.resume_event.take();
         if prev.needs_resume() {
-            // Log the stuck event type
-            let idx: u8 = match &prev {
-                DispatchEvent::ServEvent(e) => match e {
-                    ServEventId::Environment { .. } => b'E',
-                    ServEventId::SessionPty { .. } => b'T',
-                    _ => b'?',
-                },
-                _ => b'_',
-            };
-            let msg: [u8; 6] = [b'S', b'T', b'K', b':', idx, b'\n'];
-            unsafe {
-                core::arch::asm!(
-                    "syscall",
-                    inlateout("rax") 1u64 => _,
-                    in("rdi") 1u64,
-                    in("rsi") msg.as_ptr() as u64,
-                    in("rdx") 6u64,
-                    lateout("rcx") _,
-                    lateout("r11") _,
-                    options(nostack),
-                );
-            }
+            // m3OS patch: recover from BadUsage instead of aborting.
+            // The event's Drop impl already called its default resume
+            // handler.  Clear prev so done_payload() isn't called on
+            // the wrong packet.
+            debug!("Recovering from unhandled {:?} event", prev);
             prev = DispatchEvent::None;
         }
 
@@ -797,23 +780,6 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         let prev_event = self.resume_event.take();
         trace!("resume chanreq {prev_event:?} {success}");
         Self::check_chanreq(&prev_event);
-
-        let has_payload = self.traf_in.payload().is_some();
-        // Log: "RCR:Y\n" or "RCR:N\n"
-        let msg: [u8; 6] =
-            [b'R', b'C', b'R', b':', if has_payload { b'Y' } else { b'N' }, b'\n'];
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") 1u64 => _,
-                in("rdi") 1u64,
-                in("rsi") msg.as_ptr() as u64,
-                in("rdx") 6u64,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack),
-            );
-        }
 
         let mut s = self.traf_out.sender(&mut self.keys);
         let (payload, _seq) = self.traf_in.payload().trap()?;

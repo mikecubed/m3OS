@@ -115,7 +115,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 
         let ret = poll(&mut pfds_arr[..nfds], 200);
         if ret < 0 {
-            write_str(STDOUT_FILENO, "sshd: poll error\n");
             break;
         }
 
@@ -143,7 +142,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         if sock_pending_len == 0 && (pfds_arr[0].revents & POLLIN) != 0 {
             let n = syscall_lib::read(sock_fd, &mut sock_buf);
             if n <= 0 {
-                write_str(STDOUT_FILENO, "sshd: sock read eof\n");
                 break;
             }
             let mut consumed = 0;
@@ -172,7 +170,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         }
 
         if (pfds_arr[0].revents & (POLLHUP | POLLERR)) != 0 && (pfds_arr[0].revents & POLLIN) == 0 {
-            write_str(STDOUT_FILENO, "sshd: sock hup\n");
             break;
         }
 
@@ -251,9 +248,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
-                    if let Err(_) = first_auth.reject() {
-                        write_str(STDOUT_FILENO, "sshd: first_auth reject failed\n");
-                    }
+                    let _ = first_auth.reject();
                     break;
                 }
                 Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
@@ -266,11 +261,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                                 Some(info) => {
                                     authenticated = true;
                                     user_info = Some(info);
-                                    if let Err(_) = pw_auth.allow() {
-                                        write_str(STDOUT_FILENO, "sshd: allow() failed\n");
-                                        cleanup(shell_pid, pty_master, pty_slave);
-                                        return 1;
-                                    }
+                                    let _ = pw_auth.allow();
                                     true
                                 }
                                 None => {
@@ -331,7 +322,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
-                    write_str(STDOUT_FILENO, "sshd: ev:open\n");
                     if !authenticated {
                         let _ = open_session
                             .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
@@ -346,7 +336,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
-                    write_str(STDOUT_FILENO, "sshd: ev:pty\n");
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
                             pty_master = Some(master);
@@ -360,7 +349,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
-                    write_str(STDOUT_FILENO, "sshd: ev:shell\n");
                     // Allocate PTY if not already done (the SessionPty event
                     // may have been consumed internally by sunset before we
                     // could handle it).
@@ -457,10 +445,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
-                    write_str(STDOUT_FILENO, "sshd: ev:env\n");
-                    if env_req.fail().is_err() {
-                        write_str(STDOUT_FILENO, "sshd: env:ERR\n");
-                    }
+                    let _ = env_req.fail();
                     continue;
                 }
                 Ok(Event::Serv(ServEvent::Defunct)) => {
@@ -469,13 +454,8 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
                 Ok(Event::Serv(ServEvent::PollAgain) | Event::Progressed) => continue,
                 Ok(Event::None) => break,
-                Ok(other) => {
-                    write_str(STDOUT_FILENO, "sshd: unhandled event\n");
-                    drop(other);
-                    break;
-                }
+                Ok(_) => break,
                 Err(_) => {
-                    write_str(STDOUT_FILENO, "sshd: progress err\n");
                     break;
                 }
             }
@@ -577,7 +557,6 @@ fn flush_output(runner: &mut Runner<'_, Server>, sock_fd: i32) {
         // Write to socket first, then consume only what was sent.
         let written = write_all_count(sock_fd, &tmp[..chunk]);
         if written == 0 {
-            write_str(STDOUT_FILENO, "sshd: flush blocked\n");
             break;
         }
         runner.consume_output(written);

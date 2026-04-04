@@ -5,7 +5,7 @@
 
 // Tests use std as it's easier
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
-// #![forbid(unsafe_code)] // temporarily disabled for diagnostic logging
+#![forbid(unsafe_code)]
 // avoids headscratching
 #![deny(unused_must_use)]
 // Static allocations hit this inherently.
