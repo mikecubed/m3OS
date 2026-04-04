@@ -290,12 +290,13 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // Any previous Event must have been dropped to be able to call progress()
         // again, since it borrows from Runner. We can check if it was dropped
         // without a required response, or complete the payload handling otherwise.
-        let prev = self.resume_event.take();
+        let mut prev = self.resume_event.take();
         if prev.needs_resume() {
             // The event's Drop impl should have already called its resume
-            // handler (e.g. reject/fail).  Just continue processing — the
-            // payload was already handled or zeroized by the resume call.
+            // handler (e.g. reject/fail).  Clear `prev` so the payload
+            // check below doesn't consume the next pending packet.
             debug!("Recovering from unhandled {:?} event", prev);
+            prev = DispatchEvent::None;
         }
 
         // Another event may be pending from the same payload, emit it.
