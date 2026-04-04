@@ -239,228 +239,242 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         }
 
         loop_count += 1;
-        // Drive sunset: call progress() once per outer-loop iteration.
-        // After handling an event (which calls a resume function), we must
-        // return to the outer loop so new socket data can be read and flushed
-        // before calling progress() again.  Calling progress() repeatedly
-        // without I/O triggers BadUsage in sunset.
-        flush_output(&mut runner, sock_fd);
-        match runner.progress() {
-            Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
-                if hostkeys.hostkeys(&[&host_key.key]).is_err() {
-                    cleanup(shell_pid, pty_master, pty_slave);
-                    return 1;
+        // Drive sunset event loop.  Flush output before each progress()
+        // call, and break out after any event that calls a resume function
+        // (allow/reject/accept/succeed/fail) to avoid calling progress()
+        // with stale internal state.
+        loop {
+            flush_output(&mut runner, sock_fd);
+            match runner.progress() {
+                Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
+                    if hostkeys.hostkeys(&[&host_key.key]).is_err() {
+                        cleanup(shell_pid, pty_master, pty_slave);
+                        return 1;
+                    }
+                    break;
                 }
-            }
-            Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
-                if let Err(_) = first_auth.reject() {
-                    write_str(STDOUT_FILENO, "sshd: first_auth reject failed\n");
+                Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
+                    if let Err(_) = first_auth.reject() {
+                        write_str(STDOUT_FILENO, "sshd: first_auth reject failed\n");
+                    }
+                    break;
                 }
-            }
-            Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
-                auth_attempts += 1;
-                let ok = match (pw_auth.username(), pw_auth.password()) {
-                    (Ok(u), Ok(p)) => {
-                        let u = String::from(u);
-                        let p = String::from(p);
-                        match auth::check_password(&u, &p) {
-                            Some(info) => {
-                                authenticated = true;
-                                user_info = Some(info);
-                                if let Err(_) = pw_auth.allow() {
-                                    write_str(STDOUT_FILENO, "sshd: allow() failed\n");
-                                    cleanup(shell_pid, pty_master, pty_slave);
-                                    return 1;
+                Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
+                    auth_attempts += 1;
+                    let ok = match (pw_auth.username(), pw_auth.password()) {
+                        (Ok(u), Ok(p)) => {
+                            let u = String::from(u);
+                            let p = String::from(p);
+                            match auth::check_password(&u, &p) {
+                                Some(info) => {
+                                    authenticated = true;
+                                    user_info = Some(info);
+                                    if let Err(_) = pw_auth.allow() {
+                                        write_str(STDOUT_FILENO, "sshd: allow() failed\n");
+                                        cleanup(shell_pid, pty_master, pty_slave);
+                                        return 1;
+                                    }
+                                    true
                                 }
-                                true
+                                None => {
+                                    let _ = pw_auth.reject();
+                                    false
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = pw_auth.reject();
+                            false
+                        }
+                    };
+                    if !ok && auth_attempts >= MAX_AUTH_ATTEMPTS {
+                        cleanup(shell_pid, pty_master, pty_slave);
+                        return 1;
+                    }
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::PubkeyAuth(pk_auth))) => {
+                    let is_real = pk_auth.real();
+                    let mut rejected = false;
+                    let username = pk_auth.username().ok().map(String::from);
+                    let pubkey = pk_auth.pubkey().ok();
+                    let pk_bytes: Option<&[u8]> = pubkey.as_ref().and_then(|pk| match pk {
+                        sunset::PubKey::Ed25519(ed_pk) => Some(ed_pk.key.0.as_slice()),
+                        _ => None,
+                    });
+                    match (username.as_deref(), pk_bytes) {
+                        (Some(u), Some(kb)) => match auth::check_pubkey(u, kb) {
+                            Some(info) => {
+                                if is_real {
+                                    authenticated = true;
+                                    user_info = Some(info);
+                                }
+                                let _ = pk_auth.allow();
                             }
                             None => {
-                                let _ = pw_auth.reject();
-                                false
+                                if is_real {
+                                    auth_attempts += 1;
+                                }
+                                let _ = pk_auth.reject();
+                                rejected = true;
                             }
-                        }
-                    }
-                    _ => {
-                        let _ = pw_auth.reject();
-                        false
-                    }
-                };
-                if !ok && auth_attempts >= MAX_AUTH_ATTEMPTS {
-                    cleanup(shell_pid, pty_master, pty_slave);
-                    return 1;
-                }
-            }
-            Ok(Event::Serv(ServEvent::PubkeyAuth(pk_auth))) => {
-                let is_real = pk_auth.real();
-                let mut rejected = false;
-                let username = pk_auth.username().ok().map(String::from);
-                let pubkey = pk_auth.pubkey().ok();
-                let pk_bytes: Option<&[u8]> = pubkey.as_ref().and_then(|pk| match pk {
-                    sunset::PubKey::Ed25519(ed_pk) => Some(ed_pk.key.0.as_slice()),
-                    _ => None,
-                });
-                match (username.as_deref(), pk_bytes) {
-                    (Some(u), Some(kb)) => match auth::check_pubkey(u, kb) {
-                        Some(info) => {
-                            if is_real {
-                                authenticated = true;
-                                user_info = Some(info);
-                            }
-                            let _ = pk_auth.allow();
-                        }
-                        None => {
+                        },
+                        _ => {
                             if is_real {
                                 auth_attempts += 1;
                             }
                             let _ = pk_auth.reject();
                             rejected = true;
                         }
-                    },
-                    _ => {
-                        if is_real {
-                            auth_attempts += 1;
-                        }
-                        let _ = pk_auth.reject();
-                        rejected = true;
                     }
+                    if rejected && auth_attempts >= MAX_AUTH_ATTEMPTS {
+                        cleanup(shell_pid, pty_master, pty_slave);
+                        return 1;
+                    }
+                    break;
                 }
-                if rejected && auth_attempts >= MAX_AUTH_ATTEMPTS {
+                Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
+                    if !authenticated {
+                        let _ = open_session
+                            .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
+                    } else {
+                        match open_session.accept() {
+                            Ok(handle) => {
+                                chan_handle = Some(handle);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
+                    match syscall_lib::openpty() {
+                        Ok((master, slave)) => {
+                            pty_master = Some(master);
+                            pty_slave = Some(slave);
+                            let _ = pty_req.succeed();
+                        }
+                        Err(_) => {
+                            let _ = pty_req.fail();
+                        }
+                    }
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
+                    if shell_spawned {
+                        let _ = shell_req.fail();
+                    } else if let (Some(master), Some(slave), Some(info)) =
+                        (pty_master, pty_slave, &user_info)
+                    {
+                        let pid = fork();
+                        if pid < 0 {
+                            write_str(STDOUT_FILENO, "sshd: shell fork failed\n");
+                            let _ = shell_req.fail();
+                        } else if pid == 0 {
+                            close(master);
+                            close(sock_fd);
+                            if setsid() < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setsid failed\n");
+                                exit(1);
+                            }
+                            if syscall_lib::ioctl(slave, TIOCSCTTY, 0) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: TIOCSCTTY failed\n");
+                                exit(1);
+                            }
+                            if dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: dup2 failed\n");
+                                exit(1);
+                            }
+                            if slave > 2 {
+                                close(slave);
+                            }
+                            if syscall_lib::setgid(info.gid) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setgid failed\n");
+                                exit(1);
+                            }
+                            if syscall_lib::setuid(info.uid) < 0 {
+                                write_str(STDOUT_FILENO, "sshd: setuid failed\n");
+                                exit(1);
+                            }
+                            let home_bytes = info.home.as_bytes();
+                            let mut home_env = [0u8; 128];
+                            let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
+                            let mut user_env = [0u8; 128];
+                            let ue_len =
+                                build_env(b"USER=", info.username.as_bytes(), &mut user_env);
+                            let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
+                            let env_term: &[u8] = b"TERM=xterm\0";
+                            let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
+                            let envp: [*const u8; 6] = [
+                                env_path.as_ptr(),
+                                home_env[..he_len].as_ptr(),
+                                env_term.as_ptr(),
+                                env_editor.as_ptr(),
+                                user_env[..ue_len].as_ptr(),
+                                core::ptr::null(),
+                            ];
+                            let mut shell_path = [0u8; 128];
+                            let shell_bytes = info.shell.as_bytes();
+                            let slen = shell_bytes.len().min(shell_path.len() - 1);
+                            shell_path[..slen].copy_from_slice(&shell_bytes[..slen]);
+                            shell_path[slen] = 0;
+                            let argv: [*const u8; 2] =
+                                [shell_path[..slen + 1].as_ptr(), core::ptr::null()];
+                            let ret = syscall_lib::execve(&shell_path[..slen + 1], &argv, &envp);
+                            if ret < 0 {
+                                let sh0: &[u8] = b"/bin/sh0\0";
+                                let argv2: [*const u8; 2] = [sh0.as_ptr(), core::ptr::null()];
+                                syscall_lib::execve(sh0, &argv2, &envp);
+                            }
+                            exit(1);
+                        } else {
+                            close(slave);
+                            pty_slave = None;
+                            shell_pid = Some(pid);
+                            shell_spawned = true;
+                            let _ = shell_req.succeed();
+                        }
+                    } else {
+                        let _ = shell_req.fail();
+                    }
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::SessionExec(exec_req))) => {
+                    let _ = exec_req.fail();
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::SessionSubsystem(sub_req))) => {
+                    let _ = sub_req.fail();
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
+                    let _ = env_req.fail();
+                    break;
+                }
+                Ok(Event::Serv(ServEvent::Defunct)) => {
+                    cleanup(shell_pid, pty_master, pty_slave);
+                    return 0;
+                }
+                Ok(Event::Serv(ServEvent::PollAgain) | Event::Progressed) => continue,
+                Ok(Event::None) => break,
+                Ok(_) => break,
+                Err(e) => {
+                    write_str(STDOUT_FILENO, "sshd: err@");
+                    syscall_lib::write_u64(STDOUT_FILENO, loop_count as u64);
+                    write_str(STDOUT_FILENO, ": ");
+                    struct W;
+                    impl core::fmt::Write for W {
+                        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                            syscall_lib::write(STDOUT_FILENO, s.as_bytes());
+                            Ok(())
+                        }
+                    }
+                    let _ = core::fmt::write(&mut W, format_args!("{:?}\n", e));
                     cleanup(shell_pid, pty_master, pty_slave);
                     return 1;
                 }
             }
-            Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
-                if !authenticated {
-                    let _ =
-                        open_session.reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
-                } else {
-                    match open_session.accept() {
-                        Ok(handle) => {
-                            chan_handle = Some(handle);
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-            Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => match syscall_lib::openpty() {
-                Ok((master, slave)) => {
-                    pty_master = Some(master);
-                    pty_slave = Some(slave);
-                    let _ = pty_req.succeed();
-                }
-                Err(_) => {
-                    let _ = pty_req.fail();
-                }
-            },
-            Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
-                if shell_spawned {
-                    let _ = shell_req.fail();
-                } else if let (Some(master), Some(slave), Some(info)) =
-                    (pty_master, pty_slave, &user_info)
-                {
-                    let pid = fork();
-                    if pid < 0 {
-                        write_str(STDOUT_FILENO, "sshd: shell fork failed\n");
-                        let _ = shell_req.fail();
-                    } else if pid == 0 {
-                        close(master);
-                        close(sock_fd);
-                        if setsid() < 0 {
-                            write_str(STDOUT_FILENO, "sshd: setsid failed\n");
-                            exit(1);
-                        }
-                        if syscall_lib::ioctl(slave, TIOCSCTTY, 0) < 0 {
-                            write_str(STDOUT_FILENO, "sshd: TIOCSCTTY failed\n");
-                            exit(1);
-                        }
-                        if dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0 {
-                            write_str(STDOUT_FILENO, "sshd: dup2 failed\n");
-                            exit(1);
-                        }
-                        if slave > 2 {
-                            close(slave);
-                        }
-                        if syscall_lib::setgid(info.gid) < 0 {
-                            write_str(STDOUT_FILENO, "sshd: setgid failed\n");
-                            exit(1);
-                        }
-                        if syscall_lib::setuid(info.uid) < 0 {
-                            write_str(STDOUT_FILENO, "sshd: setuid failed\n");
-                            exit(1);
-                        }
-                        let home_bytes = info.home.as_bytes();
-                        let mut home_env = [0u8; 128];
-                        let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
-                        let mut user_env = [0u8; 128];
-                        let ue_len = build_env(b"USER=", info.username.as_bytes(), &mut user_env);
-                        let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
-                        let env_term: &[u8] = b"TERM=xterm\0";
-                        let env_editor: &[u8] = b"EDITOR=/bin/edit\0";
-                        let envp: [*const u8; 6] = [
-                            env_path.as_ptr(),
-                            home_env[..he_len].as_ptr(),
-                            env_term.as_ptr(),
-                            env_editor.as_ptr(),
-                            user_env[..ue_len].as_ptr(),
-                            core::ptr::null(),
-                        ];
-                        let mut shell_path = [0u8; 128];
-                        let shell_bytes = info.shell.as_bytes();
-                        let slen = shell_bytes.len().min(shell_path.len() - 1);
-                        shell_path[..slen].copy_from_slice(&shell_bytes[..slen]);
-                        shell_path[slen] = 0;
-                        let argv: [*const u8; 2] =
-                            [shell_path[..slen + 1].as_ptr(), core::ptr::null()];
-                        let ret = syscall_lib::execve(&shell_path[..slen + 1], &argv, &envp);
-                        if ret < 0 {
-                            let sh0: &[u8] = b"/bin/sh0\0";
-                            let argv2: [*const u8; 2] = [sh0.as_ptr(), core::ptr::null()];
-                            syscall_lib::execve(sh0, &argv2, &envp);
-                        }
-                        exit(1);
-                    } else {
-                        close(slave);
-                        pty_slave = None;
-                        shell_pid = Some(pid);
-                        shell_spawned = true;
-                        let _ = shell_req.succeed();
-                    }
-                } else {
-                    let _ = shell_req.fail();
-                }
-            }
-            Ok(Event::Serv(ServEvent::SessionExec(exec_req))) => {
-                let _ = exec_req.fail();
-            }
-            Ok(Event::Serv(ServEvent::SessionSubsystem(sub_req))) => {
-                let _ = sub_req.fail();
-            }
-            Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
-                let _ = env_req.fail();
-            }
-            Ok(Event::Serv(ServEvent::Defunct)) => {
-                cleanup(shell_pid, pty_master, pty_slave);
-                return 0;
-            }
-            Ok(Event::Serv(ServEvent::PollAgain) | Event::Progressed) => {}
-            Ok(Event::None) => {}
-            Ok(_) => {}
-            Err(e) => {
-                write_str(STDOUT_FILENO, "sshd: err@");
-                syscall_lib::write_u64(STDOUT_FILENO, loop_count as u64);
-                write_str(STDOUT_FILENO, ": ");
-                struct W;
-                impl core::fmt::Write for W {
-                    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                        syscall_lib::write(STDOUT_FILENO, s.as_bytes());
-                        Ok(())
-                    }
-                }
-                let _ = core::fmt::write(&mut W, format_args!("{:?}\n", e));
-                cleanup(shell_pid, pty_master, pty_slave);
-                return 1;
-            }
-        }
+        } // end inner event loop
 
         // Flush any responses generated by the event loop (e.g. pty-req
         // success, shell success) before we poll — the client is waiting
