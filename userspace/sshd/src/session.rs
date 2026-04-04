@@ -364,6 +364,15 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
                     write_str(STDOUT_FILENO, "sshd: ev:shell\n");
+                    // Allocate PTY if not already done (the SessionPty event
+                    // may have been consumed internally by sunset before we
+                    // could handle it).
+                    if pty_master.is_none() {
+                        if let Ok((m, s)) = syscall_lib::openpty() {
+                            pty_master = Some(m);
+                            pty_slave = Some(s);
+                        }
+                    }
                     if shell_spawned {
                         let _ = shell_req.fail();
                     } else if let (Some(master), Some(slave), Some(info)) =
