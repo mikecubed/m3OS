@@ -266,6 +266,7 @@ Read before making significant changes:
 | `docs/roadmap/39-unix-domain-sockets.md` | Before touching Unix domain sockets, AF_UNIX, socketpair, or `kernel/src/net/unix.rs` |
 | `docs/roadmap/42-crypto-primitives.md` | Before touching crypto-lib, sha256sum, genkey, or RustCrypto integration |
 | `docs/roadmap/43-ssh-server.md` | Before touching sshd, sunset integration, host keys, or SSH authentication |
+| `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
