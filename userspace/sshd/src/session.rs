@@ -65,6 +65,8 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut pty_buf = [0u8; 4096];
     let mut chan_buf = [0u8; 4096];
 
+    let mut loop_count: u32 = 0;
+
     // Pending data buffers: carry unconsumed bytes across main loop iterations
     // when sunset or the channel cannot accept more data (backpressure).
     let mut sock_pending_buf = [0u8; 4096];
@@ -236,6 +238,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             break;
         }
 
+        loop_count += 1;
         // Drive sunset: call progress() once per outer-loop iteration.
         // After handling an event (which calls a resume function), we must
         // return to the outer loop so new socket data can be read and flushed
@@ -250,7 +253,9 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
             }
             Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
-                let _ = first_auth.reject();
+                if let Err(_) = first_auth.reject() {
+                    write_str(STDOUT_FILENO, "sshd: first_auth reject failed\n");
+                }
             }
             Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
                 auth_attempts += 1;
@@ -262,7 +267,11 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                             Some(info) => {
                                 authenticated = true;
                                 user_info = Some(info);
-                                let _ = pw_auth.allow();
+                                if let Err(_) = pw_auth.allow() {
+                                    write_str(STDOUT_FILENO, "sshd: allow() failed\n");
+                                    cleanup(shell_pid, pty_master, pty_slave);
+                                    return 1;
+                                }
                                 true
                             }
                             None => {
@@ -437,7 +446,9 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             Ok(Event::None) => {}
             Ok(_) => {}
             Err(e) => {
-                write_str(STDOUT_FILENO, "sshd: err: ");
+                write_str(STDOUT_FILENO, "sshd: err@");
+                syscall_lib::write_u64(STDOUT_FILENO, loop_count as u64);
+                write_str(STDOUT_FILENO, ": ");
                 struct W;
                 impl core::fmt::Write for W {
                     fn write_str(&mut self, s: &str) -> core::fmt::Result {
