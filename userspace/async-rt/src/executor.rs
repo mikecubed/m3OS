@@ -217,7 +217,13 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
             }
         }
 
-        // 3. If nothing is runnable, block on reactor then re-scan
+        // 3. Always do a non-blocking I/O check so tasks waiting on FD
+        //    readiness are not starved by tasks that yield_once (which
+        //    immediately re-wake themselves).
+        reactor.poll_once(0);
+        executor.requeue_woken();
+
+        // 4. If nothing is runnable, block on reactor until an event arrives.
         if executor.run_queue.is_empty() && !root_header.is_woken() {
             reactor.poll_once(100);
             executor.requeue_woken();
