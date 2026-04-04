@@ -65,8 +65,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut pty_buf = [0u8; 4096];
     let mut chan_buf = [0u8; 4096];
 
-    let mut loop_count: u32 = 0;
-
     // Pending data buffers: carry unconsumed bytes across main loop iterations
     // when sunset or the channel cannot accept more data (backpressure).
     let mut sock_pending_buf = [0u8; 4096];
@@ -238,7 +236,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             break;
         }
 
-        loop_count += 1;
         // Drive sunset event loop.  Flush output before each progress()
         // call, and break out after any event that calls a resume function
         // (allow/reject/accept/succeed/fail) to avoid calling progress()
