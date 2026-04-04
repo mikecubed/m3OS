@@ -290,7 +290,7 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // Any previous Event must have been dropped to be able to call progress()
         // again, since it borrows from Runner. We can check if it was dropped
         // without a required response, or complete the payload handling otherwise.
-        let mut prev = self.resume_event.take();
+        let prev = self.resume_event.take();
         if prev.needs_resume() {
             return error::BadUsage.fail();
         }
