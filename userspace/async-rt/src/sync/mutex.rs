@@ -35,6 +35,17 @@ impl<T> Mutex<T> {
         }
     }
 
+    /// Try to acquire the lock without blocking.
+    /// Returns `Some(MutexGuard)` if the lock was not held, `None` otherwise.
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        if self.locked.get() {
+            None
+        } else {
+            self.locked.set(true);
+            Some(MutexGuard { mutex: self })
+        }
+    }
+
     /// Returns a future that resolves to a `MutexGuard` once the lock is acquired.
     pub fn lock(&self) -> MutexLockFuture<'_, T> {
         MutexLockFuture {

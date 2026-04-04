@@ -578,16 +578,20 @@ async fn channel_relay_task(
     let mut pty_pending = [0u8; 4096];
     let mut pty_pending_len: usize = 0;
 
+    // PTY master is non-blocking. The relay task must wake on EITHER:
+    //   - PTY readable (shell produced output) — via reactor
+    //   - Channel data available (client typed something) — via sunset waker
+    //
+    // We capture the task's waker and register it with both the reactor
+    // (for PTY readiness) and sunset (for channel read readiness). When
+    // either source has data, the task wakes and handles both directions.
+
     loop {
         if state.borrow().session_done {
             return;
         }
 
-        // --- Direction 1: runner channel -> PTY (SSH client typing -> shell) ---
-        //
-        // We borrow the ChanHandle from shared state for the duration of the
-        // synchronous runner calls. The RefCell borrow is released before any
-        // await point.
+        // --- Direction 1: runner channel -> PTY (client keystrokes -> shell) ---
         {
             let ch_ref = chan.borrow();
             if let Some(ref ch) = *ch_ref {
@@ -596,9 +600,6 @@ async fn channel_relay_task(
                     match guard.read_channel(ch, ChanData::Normal, &mut chan_buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            // Must drop the guard and chan_ref before writing
-                            // to avoid holding borrows across a blocking call.
-                            // But write_all is synchronous and does not await.
                             write_all(pty_fd, &chan_buf[..n]);
                         }
                         Err(_) => break,
@@ -607,9 +608,9 @@ async fn channel_relay_task(
             }
         }
 
-        // --- Direction 2: PTY -> runner channel (shell output -> SSH client) ---
+        // --- Direction 2: PTY -> runner channel (shell output -> client) ---
 
-        // Drain pending PTY data.
+        // Drain pending PTY data first.
         while pty_pending_len > 0 {
             let ch_ref = chan.borrow();
             if let Some(ref ch) = *ch_ref {
@@ -628,27 +629,14 @@ async fn channel_relay_task(
                         drop(ch_ref);
                         flush_output_locked(&runner, sock_fd).await;
                     }
-                    Err(_) => {
-                        break;
-                    }
+                    Err(_) => break,
                 }
             } else {
                 break;
             }
         }
 
-        // Wait for PTY to become readable.
-        WaitReadable {
-            fd: pty_fd,
-            registered: false,
-        }
-        .await;
-
-        if state.borrow().session_done {
-            return;
-        }
-
-        // Read from PTY.
+        // Read PTY (non-blocking). May return EAGAIN if no data.
         if pty_pending_len == 0 {
             let n = syscall_lib::read(pty_fd, &mut pty_buf);
             if n > 0 {
@@ -671,15 +659,12 @@ async fn channel_relay_task(
                                 drop(ch_ref);
                                 flush_output_locked(&runner, sock_fd).await;
                             }
-                            Err(_) => {
-                                break;
-                            }
+                            Err(_) => break,
                         }
                     } else {
                         break;
                     }
                 }
-                // Stash unsent bytes.
                 if sent < data.len() {
                     let remaining = data.len() - sent;
                     let stash = remaining.min(pty_pending.len());
@@ -690,7 +675,69 @@ async fn channel_relay_task(
         }
 
         flush_output_locked(&runner, sock_fd).await;
+
+        if state.borrow().session_done {
+            return;
+        }
+
+        // Register for BOTH wakeup sources before yielding:
+        //   1. PTY readable — reactor register_read
+        //   2. Channel data — sunset set_channel_read_waker
+        // Both use the same task waker, so either source wakes the task.
+        WaitPtyOrChannel {
+            pty_fd,
+            runner: &runner,
+            chan: &chan,
+            registered: false,
+        }
+        .await;
     }
+}
+
+/// Future that registers for both PTY readiness (reactor) and channel data
+/// readiness (sunset waker), then yields once. Wakes when either has data.
+struct WaitPtyOrChannel<'a> {
+    pty_fd: i32,
+    runner: &'a SharedRunner,
+    chan: &'a SharedChan,
+    registered: bool,
+}
+
+impl<'a> Future for WaitPtyOrChannel<'a> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.registered {
+            return Poll::Ready(());
+        }
+        self.registered = true;
+
+        // Register PTY fd for read readiness with the reactor.
+        executor::reactor().register_read(self.pty_fd, cx.waker().clone());
+
+        // Register the same waker as sunset's channel read waker.
+        // If the runner mutex is not contended (likely — I/O and progress tasks
+        // yield frequently), we can set the waker. If contended, we skip it
+        // and rely on the reactor + poll_once(0) to catch channel data on the
+        // next iteration.
+        let ch_ref = self.chan.borrow();
+        if let Some(ref ch) = *ch_ref {
+            // Try to set the channel read waker. We use the Mutex's try_lock
+            // (fast path: if not locked, set waker; if locked, skip).
+            if let Some(mut guard) = try_lock_mutex(self.runner) {
+                guard.set_channel_read_waker(ch, ChanData::Normal, cx.waker());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+/// Try to lock the async mutex synchronously (non-blocking).
+/// Returns Some(guard) if the lock is not currently held, None otherwise.
+fn try_lock_mutex<'a, T>(
+    mutex: &'a async_rt::sync::Mutex<T>,
+) -> Option<async_rt::sync::MutexGuard<'a, T>> {
+    mutex.try_lock()
 }
 
 // ---------------------------------------------------------------------------
