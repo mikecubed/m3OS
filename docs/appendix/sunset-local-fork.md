@@ -16,24 +16,31 @@ sshd session handler uses a cooperative async executor (`async-rt`) to drive I/O
 readiness and sunset event processing. This eliminated the need for the BadUsage
 recovery patch (Patch 1), which was required by the previous synchronous event loop.
 
-**Only one patch remains:** the SSH window/packet size configuration (Patch 2).
+**Two patches remain:** the BadUsage recovery (Patch 1) and the SSH window/packet
+size configuration (Patch 2).
 
-## Patch 1: BadUsage Recovery — ELIMINATED
+## Patch 1: BadUsage Recovery in `runner.rs`
 
-**Status:** Removed in Phase 42b (async executor refactor).
+**Status:** Retained — still required even with the async executor.
 
-The BadUsage error occurred because the synchronous event loop violated sunset's
-expected async sequencing — `resume_event` remained set between `progress()` calls
-due to timing interactions with sunset's internal payload state machine. The async
-executor drives `progress()` and I/O as cooperating tasks with proper yield points,
-matching sunset's intended usage pattern. The `resume_event` stickiness no longer
-occurs because:
+The async executor (Phase 42b) resolved the sync/async sequencing issues that caused
+most BadUsage errors, but one case remains: sunset's internal `Drop`-based resume
+handling fires for `SessionPty` events before our handler can process them. The Drop
+impl calls `resume_chanreq(false)` (rejecting the PTY request), and the resulting
+stale `resume_event` triggers `BadUsage` on the next `progress()` call.
 
-1. The session yields to the executor between I/O and event processing.
-2. FDs are set to non-blocking, preventing the event loop from blocking mid-sequence.
-3. The reactor-driven poll replaces the manual 200ms poll timeout.
+This is a sunset library design issue, not a sync vs async problem — the event's Drop
+handler races with our explicit handler regardless of executor model. The recovery
+patch allows the session to continue past this, and the lazy PTY allocation at
+`SessionShell` time provides a working fallback.
 
-The original upstream code (`return error::BadUsage.fail()`) has been restored.
+```rust
+// sunset-local/src/runner.rs, line 293-300
+let mut prev = self.resume_event.take();
+if prev.needs_resume() {
+    prev = DispatchEvent::None;
+}
+```
 
 ## Patch 2: SSH Window and Packet Size in `config.rs`
 
@@ -140,7 +147,7 @@ always allocated even for non-PTY sessions.
 
 | Change | Type | Status | Required for |
 |---|---|---|---|
-| BadUsage recovery | sunset patch | **Eliminated** (Phase 42b) | Was needed for sync event loop |
+| BadUsage recovery | sunset patch | Retained | Sunset Drop handler races with explicit handler |
 | Window size 32000 | sunset config | **Retained** | Reasonable SSH throughput |
 | Lazy PTY alloc | sshd workaround | Retained | PTY works when event is missed |
 | Break-after-resume | sshd pattern | Retained (simplified) | Correct event lifecycle |
