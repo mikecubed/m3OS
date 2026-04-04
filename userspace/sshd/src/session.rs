@@ -459,11 +459,10 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::None) => break,
                 Ok(_) => break,
                 Err(_) => {
-                    write_str(STDOUT_FILENO, "sshd: err@");
-                    syscall_lib::write_u64(STDOUT_FILENO, loop_count as u64);
-                    write_str(STDOUT_FILENO, "\n");
-                    cleanup(shell_pid, pty_master, pty_slave);
-                    return 1;
+                    // Sunset returns BadUsage when internal state is
+                    // temporarily inconsistent (e.g. pending output).
+                    // Break and let the outer loop flush + retry.
+                    break;
                 }
             }
         } // end inner event loop
