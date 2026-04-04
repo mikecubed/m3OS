@@ -2,39 +2,21 @@
 //!
 //! Manages the lifecycle of a single SSH connection: key exchange, authentication,
 //! channel management, PTY allocation, shell spawning, and data relay.
+//!
+//! Uses the async-rt executor to drive I/O readiness and sunset event processing.
 
 extern crate alloc;
 
 use alloc::string::String;
+use async_rt::executor;
+use async_rt::reactor::Reactor;
 use sunset::{ChanData, ChanHandle, Event, Runner, ServEvent, Server};
-use syscall_lib::{STDOUT_FILENO, WNOHANG, close, dup2, exit, fork, setsid, waitpid, write_str};
+use syscall_lib::{
+    STDOUT_FILENO, WNOHANG, close, dup2, exit, fork, set_nonblocking, setsid, waitpid, write_str,
+};
 
 use crate::auth;
 use crate::host_key::HostKey;
-
-/// Poll syscall (syscall 7).
-const SYS_POLL: u64 = 7;
-const POLLIN: i16 = 0x001;
-const POLLHUP: i16 = 0x010;
-const POLLERR: i16 = 0x008;
-
-#[repr(C)]
-struct PollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
-fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
-    unsafe {
-        syscall_lib::syscall3(
-            SYS_POLL,
-            fds.as_mut_ptr() as u64,
-            fds.len() as u64,
-            timeout_ms as u64,
-        ) as isize
-    }
-}
 
 /// Ioctl constants for PTY/terminal control.
 const TIOCSCTTY: usize = 0x540E;
@@ -47,9 +29,18 @@ const MAX_AUTH_ATTEMPTS: u32 = 6;
 
 /// C.2/E.4: Run a complete SSH session on the given client socket.
 pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
+    let mut reactor = Reactor::new();
+    executor::block_on(&mut reactor, async_session(sock_fd, host_key))
+}
+
+/// Async session handler — driven by the executor's reactor.
+async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut inbuf = alloc::vec![0u8; BUF_SIZE];
     let mut outbuf = alloc::vec![0u8; BUF_SIZE];
     let mut runner = Runner::new_server(&mut inbuf, &mut outbuf);
+
+    // Set socket to non-blocking for async I/O.
+    set_nonblocking(sock_fd);
 
     // Session state.
     let mut authenticated = false;
@@ -65,13 +56,6 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let mut pty_buf = [0u8; 4096];
     let mut chan_buf = [0u8; 4096];
 
-    // Pending data buffers: carry unconsumed bytes across main loop iterations
-    // when sunset or the channel cannot accept more data (backpressure).
-    let mut sock_pending_buf = [0u8; 4096];
-    let mut sock_pending_len: usize = 0;
-    let mut pty_pending_buf = [0u8; 4096];
-    let mut pty_pending_len: usize = 0;
-
     loop {
         // Flush pending output.
         flush_output(&mut runner, sock_fd);
@@ -82,68 +66,18 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let ret = waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
                 shell_pid = None;
-                // Drain remaining PTY output before exiting.
                 drain_pty(&mut runner, sock_fd, pty_master, &chan_handle, &mut pty_buf);
                 flush_output(&mut runner, sock_fd);
                 break;
             }
         }
 
-        // Build poll set.
-        let mut pfds_arr = [
-            PollFd {
-                fd: sock_fd,
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: -1,
-                events: 0,
-                revents: 0,
-            },
-        ];
-        let nfds = if let Some(pty_fd) = pty_master {
-            pfds_arr[1] = PollFd {
-                fd: pty_fd,
-                events: POLLIN,
-                revents: 0,
-            };
-            2
-        } else {
-            1
-        };
-
-        let ret = poll(&mut pfds_arr[..nfds], 200);
-        if ret < 0 {
-            break;
-        }
-
-        // Feed any pending bytes to sunset first.
-        while sock_pending_len > 0 {
-            match runner.input(&sock_pending_buf[..sock_pending_len]) {
-                Ok(0) => {
-                    flush_output(&mut runner, sock_fd);
-                    let _ = runner.progress();
-                    flush_output(&mut runner, sock_fd);
-                    break;
-                }
-                Ok(c) => {
-                    sock_pending_buf.copy_within(c..sock_pending_len, 0);
-                    sock_pending_len -= c;
-                }
-                Err(_) => {
-                    cleanup(shell_pid, pty_master, pty_slave);
-                    return 1;
-                }
-            }
-        }
+        // Wait for socket or PTY readiness via the reactor.
+        WaitIo::new(sock_fd, pty_master).await;
 
         // Socket readable: feed bytes to sunset.
-        if sock_pending_len == 0 && (pfds_arr[0].revents & POLLIN) != 0 {
-            let n = syscall_lib::read(sock_fd, &mut sock_buf);
-            if n <= 0 {
-                break;
-            }
+        let n = syscall_lib::read(sock_fd, &mut sock_buf);
+        if n > 0 {
             let mut consumed = 0;
             while consumed < n as usize {
                 match runner.input(&sock_buf[consumed..n as usize]) {
@@ -151,7 +85,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                         flush_output(&mut runner, sock_fd);
                         let _ = runner.progress();
                         flush_output(&mut runner, sock_fd);
-                        break; // Stash remainder below.
+                        break;
                     }
                     Ok(c) => consumed += c,
                     Err(_) => {
@@ -160,83 +94,35 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     }
                 }
             }
-            // Stash unconsumed bytes for next iteration.
-            if consumed < n as usize {
-                let remaining = n as usize - consumed;
-                let stash = remaining.min(sock_pending_buf.len());
-                sock_pending_buf[..stash].copy_from_slice(&sock_buf[consumed..consumed + stash]);
-                sock_pending_len = stash;
-            }
-        }
-
-        if (pfds_arr[0].revents & (POLLHUP | POLLERR)) != 0 && (pfds_arr[0].revents & POLLIN) == 0 {
+        } else if n == 0 {
+            // EOF on socket — remote closed.
             break;
         }
-
-        // Drain any pending PTY data into the channel first.
-        if let Some(ref ch) = chan_handle {
-            while pty_pending_len > 0 {
-                match runner.write_channel(
-                    ch,
-                    ChanData::Normal,
-                    &pty_pending_buf[..pty_pending_len],
-                ) {
-                    Ok(0) => {
-                        flush_output(&mut runner, sock_fd);
-                        break; // Still blocked — try again next iteration.
-                    }
-                    Ok(w) => {
-                        pty_pending_buf.copy_within(w..pty_pending_len, 0);
-                        pty_pending_len -= w;
-                        flush_output(&mut runner, sock_fd);
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
+        // n < 0 is EAGAIN (non-blocking) — no data available, continue.
 
         // PTY readable: read from PTY, send as channel data.
-        if pty_pending_len == 0 && nfds > 1 && (pfds_arr[1].revents & POLLIN) != 0 {
-            if let Some(pty_fd) = pty_master {
-                let n = syscall_lib::read(pty_fd, &mut pty_buf);
-                if n > 0 {
-                    if let Some(ref ch) = chan_handle {
-                        let data = &pty_buf[..n as usize];
-                        let mut sent = 0;
-                        while sent < data.len() {
-                            match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
-                                Ok(0) => {
-                                    flush_output(&mut runner, sock_fd);
-                                    break; // Stash remainder below.
-                                }
-                                Ok(w) => sent += w,
-                                Err(_) => break,
+        if let Some(pty_fd) = pty_master {
+            let n = syscall_lib::read(pty_fd, &mut pty_buf);
+            if n > 0 {
+                if let Some(ref ch) = chan_handle {
+                    let data = &pty_buf[..n as usize];
+                    let mut sent = 0;
+                    while sent < data.len() {
+                        match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
+                            Ok(0) => {
+                                flush_output(&mut runner, sock_fd);
+                                break;
                             }
-                            flush_output(&mut runner, sock_fd);
+                            Ok(w) => sent += w,
+                            Err(_) => break,
                         }
-                        // Stash unsent bytes for next iteration.
-                        if sent < data.len() {
-                            let remaining = data.len() - sent;
-                            let stash = remaining.min(pty_pending_buf.len());
-                            pty_pending_buf[..stash].copy_from_slice(&data[sent..sent + stash]);
-                            pty_pending_len = stash;
-                        }
+                        flush_output(&mut runner, sock_fd);
                     }
                 }
             }
         }
 
-        if nfds > 1 && (pfds_arr[1].revents & POLLHUP) != 0 {
-            // PTY closed — drain any remaining output before exiting.
-            drain_pty(&mut runner, sock_fd, pty_master, &chan_handle, &mut pty_buf);
-            flush_output(&mut runner, sock_fd);
-            break;
-        }
-
-        // Drive sunset event loop.  Flush output before each progress()
-        // call, and break out after any event that calls a resume function
-        // (allow/reject/accept/succeed/fail) to avoid calling progress()
-        // with stale internal state.
+        // Drive sunset event loop.
         loop {
             flush_output(&mut runner, sock_fd);
             match runner.progress() {
@@ -338,6 +224,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
+                            set_nonblocking(master);
                             pty_master = Some(master);
                             pty_slave = Some(slave);
                             let _ = pty_req.succeed();
@@ -349,11 +236,10 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                     break;
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
-                    // Allocate PTY if not already done (the SessionPty event
-                    // may have been consumed internally by sunset before we
-                    // could handle it).
+                    // Allocate PTY if not already done.
                     if pty_master.is_none() {
                         if let Ok((m, s)) = syscall_lib::openpty() {
+                            set_nonblocking(m);
                             pty_master = Some(m);
                             pty_slave = Some(s);
                         }
@@ -461,9 +347,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             }
         } // end inner event loop
 
-        // Flush any responses generated by the event loop (e.g. pty-req
-        // success, shell success) before we poll — the client is waiting
-        // for these replies and will disconnect if they don't arrive.
+        // Flush any responses generated by the event loop.
         flush_output(&mut runner, sock_fd);
 
         // Read channel data from sunset and write to PTY.
@@ -484,9 +368,46 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     0
 }
 
+/// A future that registers socket (and optional PTY) FDs with the reactor,
+/// yields once to let the executor call poll_once(), then completes.
+struct WaitIo {
+    sock_fd: i32,
+    pty_fd: Option<i32>,
+    registered: bool,
+}
+
+impl WaitIo {
+    fn new(sock_fd: i32, pty_fd: Option<i32>) -> Self {
+        Self {
+            sock_fd,
+            pty_fd,
+            registered: false,
+        }
+    }
+}
+
+impl core::future::Future for WaitIo {
+    type Output = ();
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.registered {
+            core::task::Poll::Ready(())
+        } else {
+            self.registered = true;
+            let reactor = executor::reactor();
+            reactor.register_read(self.sock_fd, cx.waker().clone());
+            if let Some(pty_fd) = self.pty_fd {
+                reactor.register_read(pty_fd, cx.waker().clone());
+            }
+            core::task::Poll::Pending
+        }
+    }
+}
+
 /// Drain remaining PTY output through sunset and onto the socket.
-/// Called when the shell has exited or the PTY reports POLLHUP so that
-/// the last bytes of output are not truncated on the client.
 fn drain_pty(
     runner: &mut Runner<'_, Server>,
     sock_fd: i32,
@@ -502,7 +423,6 @@ fn drain_pty(
         Some(h) => h,
         None => return,
     };
-    // Read until EOF (read returns 0 or error).
     loop {
         let n = syscall_lib::read(pty_fd, buf);
         if n <= 0 {
@@ -514,7 +434,6 @@ fn drain_pty(
             match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
                 Ok(0) => {
                     flush_output(runner, sock_fd);
-                    // One more attempt after flush.
                     match runner.write_channel(ch, ChanData::Normal, &data[sent..]) {
                         Ok(0) | Err(_) => break,
                         Ok(w) => sent += w,
@@ -554,7 +473,6 @@ fn flush_output(runner: &mut Runner<'_, Server>, sock_fd: i32) {
         let mut tmp = [0u8; 4096];
         let chunk = len.min(tmp.len());
         tmp[..chunk].copy_from_slice(&out[..chunk]);
-        // Write to socket first, then consume only what was sent.
         let written = write_all_count(sock_fd, &tmp[..chunk]);
         if written == 0 {
             break;
@@ -596,7 +514,7 @@ fn build_env(prefix: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
     }
 
     let mut pos = 0;
-    let max = buf.len() - 1; // Reserve 1 byte for NUL.
+    let max = buf.len() - 1;
 
     for &b in prefix {
         if pos < max {
@@ -611,6 +529,6 @@ fn build_env(prefix: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
         }
     }
 
-    buf[pos] = 0; // Always NUL-terminate.
+    buf[pos] = 0;
     pos + 1
 }

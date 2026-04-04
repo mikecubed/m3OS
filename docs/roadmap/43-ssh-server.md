@@ -145,8 +145,9 @@ I/O — including `window-change` handling and signal forwarding — are deferre
 
 Password auth reads the user's hashed password from `/etc/shadow` (Phase 27), hashes
 the provided password, and compares. Public key auth reads `~/.ssh/authorized_keys`,
-parses each line for an Ed25519 public key, and verifies the client's signature over
-the session ID — the private key never leaves the client.
+parses each non-comment line as a hex-encoded 32-byte Ed25519 public key (64 hex
+characters per line, not OpenSSH `ssh-ed25519 AAAA...` format), and verifies the
+client's signature over the session ID — the private key never leaves the client.
 
 ## How This Builds on Earlier Phases
 

@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 syscall-lib = { path = "../syscall-lib", features = ["alloc"] }
 crypto-lib = { path = "../crypto-lib" }
+async-rt = { path = "../async-rt", default-features = false, features = ["alloc"] }
 sunset = { workspace = true }
 getrandom = { workspace = true }
 ed25519-dalek = { workspace = true }

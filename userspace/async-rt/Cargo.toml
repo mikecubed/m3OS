@@ -1,0 +1,16 @@
+[package]
+name = "async-rt"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+std = ["libc"]
+alloc = ["syscall-lib"]
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib", optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+libc = "0.2"

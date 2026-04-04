@@ -322,11 +322,58 @@ pub const SHUT_RD: i32 = 0;
 pub const SHUT_WR: i32 = 1;
 pub const SHUT_RDWR: i32 = 2;
 
+// Poll syscall number
+pub const SYS_POLL: u64 = 7;
+
 // Poll events
 pub const POLLIN: i16 = 0x001;
 pub const POLLOUT: i16 = 0x004;
 pub const POLLERR: i16 = 0x008;
 pub const POLLHUP: i16 = 0x010;
+pub const POLLNVAL: i16 = 0x020;
+
+/// Poll file descriptor entry, matching Linux `struct pollfd` layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Wrapper for the `poll()` syscall.
+/// Returns the number of ready file descriptors, 0 on timeout, or negative errno.
+pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
+    unsafe {
+        syscall3(
+            SYS_POLL,
+            fds.as_mut_ptr() as u64,
+            fds.len() as u64,
+            timeout_ms as u64,
+        ) as isize
+    }
+}
+
+// fcntl constants
+pub const SYS_FCNTL: u64 = 72;
+pub const F_GETFL: u64 = 3;
+pub const F_SETFL: u64 = 4;
+pub const O_NONBLOCK: u64 = 0x800;
+
+/// Wrapper for the `fcntl()` syscall.
+pub fn fcntl(fd: i32, cmd: u64, arg: u64) -> isize {
+    unsafe { syscall3(SYS_FCNTL, fd as u64, cmd, arg) as isize }
+}
+
+/// Set the `O_NONBLOCK` flag on a file descriptor.
+/// Returns 0 on success, or negative errno on failure.
+pub fn set_nonblocking(fd: i32) -> isize {
+    let flags = fcntl(fd, F_GETFL, 0);
+    if flags < 0 {
+        return flags;
+    }
+    fcntl(fd, F_SETFL, (flags as u64) | O_NONBLOCK)
+}
 
 /// IPv4 socket address, matching Linux `struct sockaddr_in` layout.
 /// `sin_port` is stored in network byte order (big-endian).

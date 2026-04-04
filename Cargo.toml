@@ -34,6 +34,8 @@ members = [
     "userspace/crypto-test",
     # Phase 43 SSH server
     "userspace/sshd",
+    # Phase 42b async executor
+    "userspace/async-rt",
     # Rust coreutils (replacing C musl utilities)
     "userspace/coreutils-rs",
     # coreutils host tests

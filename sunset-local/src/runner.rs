@@ -292,12 +292,7 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // without a required response, or complete the payload handling otherwise.
         let mut prev = self.resume_event.take();
         if prev.needs_resume() {
-            // m3OS patch: recover from BadUsage instead of aborting.
-            // The event's Drop impl already called its default resume
-            // handler.  Clear prev so done_payload() isn't called on
-            // the wrong packet.
-            debug!("Recovering from unhandled {:?} event", prev);
-            prev = DispatchEvent::None;
+            return error::BadUsage.fail();
         }
 
         // Another event may be pending from the same payload, emit it.
