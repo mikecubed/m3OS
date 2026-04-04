@@ -254,7 +254,7 @@ async fn io_task(
             match guard.input(&pending[..pending_len]) {
                 Ok(0) => {
                     drop(guard);
-                    yield_once().await;
+                    progress_notify.signal();
                     break;
                 }
                 Ok(c) => {
@@ -271,13 +271,26 @@ async fn io_task(
             }
         }
 
-        // Register output_waker so we wake when runner has output to send.
-        // Also register socket for read readiness.
-        {
+        // Arm runner wakers before sleeping. If we already have buffered socket
+        // data, wake when sunset is ready to accept more input again; otherwise
+        // we can strand pending handshake bytes waiting on socket readability.
+        let should_wait = {
             let waker = get_current_waker().await;
             let mut guard = runner.lock().await;
+            let mut input_ready = false;
+            if pending_len > 0 {
+                if guard.is_input_ready() {
+                    input_ready = true;
+                } else {
+                    guard.set_input_waker(&waker);
+                }
+            }
             guard.set_output_waker(&waker);
-            drop(guard);
+            !input_ready
+        };
+
+        if !should_wait {
+            continue;
         }
 
         // Wait for socket readable (incoming data) or output waker (outgoing data).
@@ -313,7 +326,7 @@ async fn io_task(
                         match guard.input(&sock_buf[consumed..n as usize]) {
                             Ok(0) => {
                                 drop(guard);
-                                yield_once().await;
+                                progress_notify.signal();
                                 break;
                             }
                             Ok(c) => {
