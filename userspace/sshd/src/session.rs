@@ -234,14 +234,10 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
             let mut guard = runner.lock().await;
             match guard.input(&pending[..pending_len]) {
                 Ok(0) => {
+                    // Runner's input buffer is full — yield to let the
+                    // progress task drain it, then retry next iteration.
                     drop(guard);
-                    flush_output_locked(&runner, sock_fd).await;
-                    // Drive one progress cycle to make room.
-                    {
-                        let mut g = runner.lock().await;
-                        let _ = g.progress();
-                    }
-                    flush_output_locked(&runner, sock_fd).await;
+                    yield_once().await;
                     break;
                 }
                 Ok(c) => {
@@ -277,13 +273,11 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
                     let mut guard = runner.lock().await;
                     match guard.input(&sock_buf[consumed..n as usize]) {
                         Ok(0) => {
+                            // Runner's input buffer is full — yield to let
+                            // the progress task drain it. Stash unconsumed
+                            // bytes below.
                             drop(guard);
-                            flush_output_locked(&runner, sock_fd).await;
-                            {
-                                let mut g = runner.lock().await;
-                                let _ = g.progress();
-                            }
-                            flush_output_locked(&runner, sock_fd).await;
+                            yield_once().await;
                             break;
                         }
                         Ok(c) => {
