@@ -685,64 +685,41 @@ async fn channel_relay_task(
             return;
         }
 
-        // Register for BOTH wakeup sources before yielding:
-        //   1. PTY readable — reactor register_read
-        //   2. Channel data — sunset set_channel_read_waker
-        // Both use the same task waker, so either source wakes the task.
-        WaitPtyOrChannel {
-            pty_fd,
-            runner: &runner,
-            chan: &chan,
+        // Wait for PTY readable. Also register the sunset channel read
+        // waker so the task wakes when the SSH client sends data too.
+        {
+            let mut guard = runner.lock().await;
+            let ch_ref = chan.borrow();
+            if let Some(ref ch) = *ch_ref {
+                // Create a temporary waker that signals the self-pipe.
+                // We can't get cx.waker() here (outside poll), so we
+                // use the task header directly via a yield trick.
+                let waker = get_current_waker().await;
+                guard.set_channel_read_waker(ch, ChanData::Normal, &waker);
+            }
+            drop(ch_ref);
+            drop(guard);
+        }
+        WaitReadable {
+            fd: pty_fd,
             registered: false,
         }
         .await;
     }
 }
 
-/// Future that registers for both PTY readiness (reactor) and channel data
-/// readiness (sunset waker), then yields once. Wakes when either has data.
-struct WaitPtyOrChannel<'a> {
-    pty_fd: i32,
-    runner: &'a SharedRunner,
-    chan: &'a SharedChan,
-    registered: bool,
-}
+/// Capture the current task's waker. Returns immediately on first poll.
+struct GetWaker;
 
-impl<'a> Future for WaitPtyOrChannel<'a> {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.registered {
-            return Poll::Ready(());
-        }
-        self.registered = true;
-
-        // Register PTY fd for read readiness with the reactor.
-        executor::reactor().register_read(self.pty_fd, cx.waker().clone());
-
-        // Register the same waker as sunset's channel read waker.
-        // If the runner mutex is not contended (likely — I/O and progress tasks
-        // yield frequently), we can set the waker. If contended, we skip it
-        // and rely on the reactor + poll_once(0) to catch channel data on the
-        // next iteration.
-        let ch_ref = self.chan.borrow();
-        if let Some(ref ch) = *ch_ref {
-            // Try to set the channel read waker. We use the Mutex's try_lock
-            // (fast path: if not locked, set waker; if locked, skip).
-            if let Some(mut guard) = try_lock_mutex(self.runner) {
-                guard.set_channel_read_waker(ch, ChanData::Normal, cx.waker());
-            }
-        }
-
-        Poll::Pending
+impl Future for GetWaker {
+    type Output = core::task::Waker;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<core::task::Waker> {
+        Poll::Ready(cx.waker().clone())
     }
 }
 
-/// Try to lock the async mutex synchronously (non-blocking).
-/// Returns Some(guard) if the lock is not currently held, None otherwise.
-fn try_lock_mutex<'a, T>(
-    mutex: &'a async_rt::sync::Mutex<T>,
-) -> Option<async_rt::sync::MutexGuard<'a, T>> {
-    mutex.try_lock()
+async fn get_current_waker() -> core::task::Waker {
+    GetWaker.await
 }
 
 // ---------------------------------------------------------------------------
