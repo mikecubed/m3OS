@@ -452,7 +452,7 @@ pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
                 }
                 Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
                     let _ = env_req.fail();
-                    break;
+                    continue; // Process next event immediately.
                 }
                 Ok(Event::Serv(ServEvent::Defunct)) => {
                     cleanup(shell_pid, pty_master, pty_slave);
