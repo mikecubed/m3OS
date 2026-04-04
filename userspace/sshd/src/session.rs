@@ -19,7 +19,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use async_rt::executor;
 use async_rt::reactor::Reactor;
-use async_rt::sync::Mutex;
+use async_rt::sync::{Mutex, Notify};
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
@@ -82,6 +82,7 @@ impl SessionState {
 type SharedRunner = Rc<Mutex<Runner<'static, Server>>>;
 type SharedState = Rc<RefCell<SessionState>>;
 type SharedChan = Rc<RefCell<Option<ChanHandle>>>;
+type SharedNotify = Rc<Notify>;
 
 // ---------------------------------------------------------------------------
 // Yield-once helper
@@ -159,9 +160,15 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let runner: SharedRunner = Rc::new(Mutex::new(runner));
     let state: SharedState = Rc::new(RefCell::new(SessionState::new()));
     let chan: SharedChan = Rc::new(RefCell::new(None));
+    let progress_notify: SharedNotify = Rc::new(Notify::new());
 
     // Spawn the I/O task.
-    let _io = executor::spawn(io_task(sock_fd, runner.clone(), state.clone()));
+    let _io = executor::spawn(io_task(
+        sock_fd,
+        runner.clone(),
+        state.clone(),
+        progress_notify.clone(),
+    ));
 
     // Spawn the progress task. Clone the host signing key so the spawned
     // task owns it ('static bound required by spawn).
@@ -172,6 +179,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         state.clone(),
         chan.clone(),
         host_sign_key,
+        progress_notify.clone(),
     ));
 
     // Main loop: wait for session completion, check shell exit status.
@@ -216,7 +224,12 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
 // Task 1: I/O Task — socket ↔ runner input/output
 // ---------------------------------------------------------------------------
 
-async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
+async fn io_task(
+    sock_fd: i32,
+    runner: SharedRunner,
+    state: SharedState,
+    progress_notify: SharedNotify,
+) {
     let mut sock_buf = [0u8; 4096];
     let mut pending = [0u8; 4096];
     let mut pending_len: usize = 0;
@@ -248,6 +261,7 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
                     pending.copy_within(c..pending_len, 0);
                     pending_len -= c;
                     drop(guard);
+                    progress_notify.signal();
                 }
                 Err(_) => {
                     state.borrow_mut().session_done = true;
@@ -277,30 +291,12 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
             return;
         }
 
-        // Try to read from socket (non-destructive if no data — socket is blocking
-        // but the reactor confirmed readability, OR we were woken by output_waker
-        // in which case the socket may not be readable — that's fine, read will
-        // return EAGAIN... wait, socket is blocking. We need to be careful.)
-        //
-        // Since the socket is blocking and we might have been woken by output_waker
-        // (not socket readiness), we must NOT do a blocking read unconditionally.
-        // Instead, check if the socket is actually readable by doing a non-blocking
-        // poll check, or set the socket non-blocking.
-        //
-        // Simplest fix: always try to read with a non-blocking check first.
-        // But the socket is blocking. So we need to only read if the wakeup was
-        // from the socket, not from the output waker.
-        //
-        // Alternative: just flush output first, then read if socket has data.
-        // The flush handles the output waker case. The read handles the socket case.
-        // If we were woken by output waker, flush sends data, and the next iteration
-        // starts with flush again (in case more output appeared).
-
         // Flush output first (handles the output_waker wakeup case).
         flush_output_locked(&runner, sock_fd).await;
 
-        // Now try to read from socket. Since the socket is blocking, we only
-        // read if we know data is available. Use a zero-timeout poll to check.
+        // Read from socket if data is available. Since the socket is blocking
+        // and we might have been woken by output_waker (not socket readiness),
+        // check with a zero-timeout poll before attempting a blocking read.
         if pending_len == 0 {
             let mut pfd = syscall_lib::PollFd {
                 fd: sock_fd,
@@ -323,6 +319,7 @@ async fn io_task(sock_fd: i32, runner: SharedRunner, state: SharedState) {
                             Ok(c) => {
                                 consumed += c;
                                 drop(guard);
+                                progress_notify.signal();
                             }
                             Err(_) => {
                                 state.borrow_mut().session_done = true;
@@ -373,6 +370,7 @@ async fn progress_task(
     state: SharedState,
     chan: SharedChan,
     host_sign_key: sunset::SignKey,
+    progress_notify: SharedNotify,
 ) {
     loop {
         if state.borrow().session_done {
@@ -580,7 +578,7 @@ async fn progress_task(
             ProgressAction::Continue => {}
             ProgressAction::LoopContinue => continue,
             ProgressAction::Yield => {
-                yield_once().await;
+                progress_notify.wait().await;
                 continue;
             }
             ProgressAction::SpawnRelay(pty_master) => {
@@ -590,6 +588,7 @@ async fn progress_task(
                     runner.clone(),
                     state.clone(),
                     chan.clone(),
+                    progress_notify.clone(),
                 ));
             }
             ProgressAction::Fatal => {
@@ -617,19 +616,20 @@ async fn channel_relay_task(
     runner: SharedRunner,
     state: SharedState,
     chan: SharedChan,
+    progress_notify: SharedNotify,
 ) {
     let mut chan_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 4096];
     let mut pty_pending = [0u8; 4096];
     let mut pty_pending_len: usize = 0;
+    // Pending data from channel -> PTY that couldn't be written (EAGAIN).
+    let mut pty_write_pending = [0u8; 4096];
+    let mut pty_write_pending_len: usize = 0;
 
-    // PTY master is non-blocking. The relay task must wake on EITHER:
+    // The relay task wakes on:
     //   - PTY readable (shell produced output) — via reactor
-    //   - Channel data available (client typed something) — via sunset waker
-    //
-    // We capture the task's waker and register it with both the reactor
-    // (for PTY readiness) and sunset (for channel read readiness). When
-    // either source has data, the task wakes and handles both directions.
+    //   - Channel data available (client typed something) — via channel_read_waker
+    //   - Channel write capacity returned (backpressure cleared) — via channel_write_waker
 
     loop {
         if state.borrow().session_done {
@@ -637,7 +637,20 @@ async fn channel_relay_task(
         }
 
         // --- Direction 1: runner channel -> PTY (client keystrokes -> shell) ---
-        {
+
+        // First, drain any pending PTY write data from a previous EAGAIN.
+        while pty_write_pending_len > 0 {
+            let n = syscall_lib::write(pty_fd, &pty_write_pending[..pty_write_pending_len]);
+            if n > 0 {
+                let w = n as usize;
+                pty_write_pending.copy_within(w..pty_write_pending_len, 0);
+                pty_write_pending_len -= w;
+            } else {
+                break; // EAGAIN or error — retry next iteration
+            }
+        }
+
+        if pty_write_pending_len == 0 {
             let ch_ref = chan.borrow();
             if let Some(ref ch) = *ch_ref {
                 let mut guard = runner.lock().await;
@@ -645,7 +658,24 @@ async fn channel_relay_task(
                     match guard.read_channel(ch, ChanData::Normal, &mut chan_buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            write_all(pty_fd, &chan_buf[..n]);
+                            let mut written = 0;
+                            while written < n {
+                                let w = syscall_lib::write(pty_fd, &chan_buf[written..n]);
+                                if w > 0 {
+                                    written += w as usize;
+                                } else {
+                                    break; // EAGAIN
+                                }
+                            }
+                            // Stash unwritten data for retry.
+                            if written < n {
+                                let remaining = n - written;
+                                let stash = remaining.min(pty_write_pending.len());
+                                pty_write_pending[..stash]
+                                    .copy_from_slice(&chan_buf[written..written + stash]);
+                                pty_write_pending_len = stash;
+                                break;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -673,6 +703,7 @@ async fn channel_relay_task(
                         drop(guard);
                         drop(ch_ref);
                         flush_output_locked(&runner, sock_fd).await;
+                        progress_notify.signal();
                     }
                     Err(_) => break,
                 }
@@ -703,6 +734,7 @@ async fn channel_relay_task(
                                 drop(guard);
                                 drop(ch_ref);
                                 flush_output_locked(&runner, sock_fd).await;
+                                progress_notify.signal();
                             }
                             Err(_) => break,
                         }
@@ -725,17 +757,19 @@ async fn channel_relay_task(
             return;
         }
 
-        // Wait for PTY readable. Also register the sunset channel read
-        // waker so the task wakes when the SSH client sends data too.
+        // Register wakers before sleeping. The relay must wake on:
+        //   - PTY readability (reactor)
+        //   - Channel read readiness (client sent data)
+        //   - Channel write readiness (backpressure cleared, if we have pending data)
         {
+            let waker = get_current_waker().await;
             let mut guard = runner.lock().await;
             let ch_ref = chan.borrow();
             if let Some(ref ch) = *ch_ref {
-                // Create a temporary waker that signals the self-pipe.
-                // We can't get cx.waker() here (outside poll), so we
-                // use the task header directly via a yield trick.
-                let waker = get_current_waker().await;
                 guard.set_channel_read_waker(ch, ChanData::Normal, &waker);
+                if pty_pending_len > 0 {
+                    guard.set_channel_write_waker(ch, ChanData::Normal, &waker);
+                }
             }
             drop(ch_ref);
             drop(guard);
@@ -916,18 +950,6 @@ fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<
     }
     if let Some(fd) = pty_slave {
         close(fd);
-    }
-}
-
-/// Write all bytes to a file descriptor, handling partial writes.
-fn write_all(fd: i32, data: &[u8]) {
-    let mut written = 0;
-    while written < data.len() {
-        let n = syscall_lib::write(fd, &data[written..]);
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
     }
 }
 

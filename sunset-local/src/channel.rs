@@ -839,7 +839,7 @@ impl Channel {
 
     pub fn wake_write(&mut self, dt: Option<ChanData>, is_client: bool) {
         if dt == Some(ChanData::Normal) || dt.is_none() {
-            if let Some(w) = self.read_waker.take() {
+            if let Some(w) = self.write_waker.take() {
                 w.wake()
             }
         }

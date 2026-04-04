@@ -78,7 +78,11 @@ impl<'a, T> Future for MutexLockFuture<'a, T> {
             self.queued = true;
             Poll::Pending
         } else {
-            // Already queued — waker is in the queue, just stay pending.
+            // Re-enqueue waker — the previous one was consumed by guard Drop.
+            self.mutex
+                .waiters
+                .borrow_mut()
+                .push_back(cx.waker().clone());
             Poll::Pending
         }
     }
@@ -323,5 +327,53 @@ mod tests {
             let guard = m.lock().await;
             assert_eq!(*guard, 99);
         });
+    }
+
+    // T009.6: Waiter woken by guard drop, re-polled while lock re-acquired,
+    // still eventually acquires.  Exercises the re-enqueue fix in the third
+    // branch of MutexLockFuture::poll.
+    #[test]
+    fn test_waker_requeue_after_contention() {
+        let mut reactor = Reactor::new();
+        let result = block_on(&mut reactor, async {
+            let m = Rc::new(Mutex::new(0u32));
+
+            // Task A: grabs the lock, yields (so B tries and gets queued),
+            // then drops and immediately re-grabs in a loop (simulating
+            // flush_output_locked).  B's waker gets consumed by the first
+            // drop, but A re-acquires before B polls.
+            let m_a = m.clone();
+            let h_a = spawn(async move {
+                // First acquisition — hold across a yield so B contends.
+                let mut guard = m_a.lock().await;
+                *guard = 1;
+                Yield::new().await;
+                drop(guard);
+
+                // Immediately re-acquire twice (simulates flush loop).
+                for _ in 0..2 {
+                    let mut guard = m_a.lock().await;
+                    *guard += 10;
+                    // No yield — synchronous drop, just like flush_output_locked.
+                }
+            });
+
+            // Task B: tries to lock — will contend with A.
+            let m_b = m.clone();
+            let h_b = spawn(async move {
+                let mut guard = m_b.lock().await;
+                // Should see A's final value.
+                assert!(*guard >= 21);
+                *guard += 100;
+            });
+
+            h_a.await.unwrap();
+            h_b.await.unwrap();
+
+            let guard = m.lock().await;
+            *guard
+        });
+        // A wrote 1 + 10 + 10 = 21, B added 100 = 121
+        assert_eq!(result, 121);
     }
 }
