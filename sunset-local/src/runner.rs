@@ -292,26 +292,14 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         // without a required response, or complete the payload handling otherwise.
         let mut prev = self.resume_event.take();
         if prev.needs_resume() {
-            // Direct syscall write for diagnosis: "STK:N\n"
+            // Log the stuck event type
             let idx: u8 = match &prev {
-                DispatchEvent::None => b'0',
-                DispatchEvent::Data(_) => b'1',
-                DispatchEvent::KexDone => b'2',
-                DispatchEvent::Progressed => b'3',
-                DispatchEvent::CliEvent(_) => b'4',
                 DispatchEvent::ServEvent(e) => match e {
-                    ServEventId::Hostkeys => b'H',
-                    ServEventId::PasswordAuth => b'P',
-                    ServEventId::PubkeyAuth { .. } => b'K',
-                    ServEventId::FirstAuth => b'F',
-                    ServEventId::OpenSession { .. } => b'O',
-                    ServEventId::SessionShell { .. } => b'S',
-                    ServEventId::SessionExec { .. } => b'X',
-                    ServEventId::SessionSubsystem { .. } => b'U',
-                    ServEventId::SessionPty { .. } => b'T',
                     ServEventId::Environment { .. } => b'E',
-                    ServEventId::Defunct => b'D',
+                    ServEventId::SessionPty { .. } => b'T',
+                    _ => b'?',
                 },
+                _ => b'_',
             };
             let msg: [u8; 6] = [b'S', b'T', b'K', b':', idx, b'\n'];
             unsafe {
@@ -809,6 +797,23 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         let prev_event = self.resume_event.take();
         trace!("resume chanreq {prev_event:?} {success}");
         Self::check_chanreq(&prev_event);
+
+        let has_payload = self.traf_in.payload().is_some();
+        // Log: "RCR:Y\n" or "RCR:N\n"
+        let msg: [u8; 6] =
+            [b'R', b'C', b'R', b':', if has_payload { b'Y' } else { b'N' }, b'\n'];
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") 1u64 => _,
+                in("rdi") 1u64,
+                in("rsi") msg.as_ptr() as u64,
+                in("rdx") 6u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
 
         let mut s = self.traf_out.sender(&mut self.keys);
         let (payload, _seq) = self.traf_in.payload().trap()?;
