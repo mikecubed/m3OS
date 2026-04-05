@@ -102,7 +102,11 @@ impl Future for ReadableFuture {
             Poll::Ready(())
         } else {
             executor::reactor().register_read(self.fd, cx.waker().clone());
-            Poll::Pending
+            if check_fd_readable(self.fd) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
     }
 }
@@ -120,7 +124,11 @@ impl Future for WritableFuture {
             Poll::Ready(())
         } else {
             executor::reactor().register_write(self.fd, cx.waker().clone());
-            Poll::Pending
+            if check_fd_writable(self.fd) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
     }
 }

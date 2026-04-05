@@ -89,31 +89,6 @@ type SharedNotify = Rc<Notify>;
 type SharedOutputLock = Rc<Mutex<()>>;
 
 // ---------------------------------------------------------------------------
-// Yield-once helper
-// ---------------------------------------------------------------------------
-
-struct YieldOnce {
-    done: bool,
-}
-
-impl Future for YieldOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.done {
-            Poll::Ready(())
-        } else {
-            self.done = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
-fn yield_once() -> YieldOnce {
-    YieldOnce { done: false }
-}
-
-// ---------------------------------------------------------------------------
 // WaitWake helper
 // ---------------------------------------------------------------------------
 
@@ -135,7 +110,11 @@ impl Future for WaitWake {
         } else {
             self.registered = true;
             executor::reactor().register_read(self.fd, cx.waker().clone());
-            Poll::Pending
+            if fd_is_readable(self.fd) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         }
     }
 }
@@ -177,6 +156,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let state: SharedState = Rc::new(RefCell::new(SessionState::new()));
     let chan: SharedChan = Rc::new(RefCell::new(None));
     let progress_notify: SharedNotify = Rc::new(Notify::new());
+    let session_notify: SharedNotify = Rc::new(Notify::new());
     let output_lock: SharedOutputLock = Rc::new(Mutex::new(()));
 
     // Spawn the I/O task.
@@ -185,6 +165,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         runner.clone(),
         state.clone(),
         progress_notify.clone(),
+        session_notify.clone(),
         output_lock.clone(),
     ));
 
@@ -198,6 +179,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
         chan.clone(),
         host_sign_key,
         progress_notify.clone(),
+        session_notify.clone(),
         output_lock.clone(),
     ));
 
@@ -229,7 +211,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             }
         }
 
-        yield_once().await;
+        session_notify.wait().await;
     }
 
     let exit_code = state.borrow().exit_code;
@@ -250,6 +232,7 @@ async fn io_task(
     runner: SharedRunner,
     state: SharedState,
     progress_notify: SharedNotify,
+    session_notify: SharedNotify,
     output_lock: SharedOutputLock,
 ) {
     let mut sock_buf = [0u8; 4096];
@@ -271,6 +254,7 @@ async fn io_task(
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
+            session_notify.signal();
             return;
         }
 
@@ -281,6 +265,7 @@ async fn io_task(
                 Ok(0) => {
                     drop(guard);
                     progress_notify.signal();
+                    session_notify.signal();
                     break;
                 }
                 Ok(c) => {
@@ -288,10 +273,12 @@ async fn io_task(
                     pending_len -= c;
                     drop(guard);
                     progress_notify.signal();
+                    session_notify.signal();
                 }
                 Err(_) => {
                     state.borrow_mut().session_done = true;
                     state.borrow_mut().exit_code = 1;
+                    session_notify.signal();
                     return;
                 }
             }
@@ -334,6 +321,7 @@ async fn io_task(
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
+            session_notify.signal();
             return;
         }
 
@@ -349,16 +337,19 @@ async fn io_task(
                         Ok(0) => {
                             drop(guard);
                             progress_notify.signal();
+                            session_notify.signal();
                             break;
                         }
                         Ok(c) => {
                             consumed += c;
                             drop(guard);
                             progress_notify.signal();
+                            session_notify.signal();
                         }
                         Err(_) => {
                             state.borrow_mut().session_done = true;
                             state.borrow_mut().exit_code = 1;
+                            session_notify.signal();
                             return;
                         }
                     }
@@ -371,10 +362,12 @@ async fn io_task(
                 }
             } else if n == 0 {
                 state.borrow_mut().session_done = true;
+                session_notify.signal();
                 return;
             } else if n != NEG_EAGAIN && n != NEG_EINTR {
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().exit_code = 1;
+                session_notify.signal();
                 return;
             }
         }
@@ -409,6 +402,7 @@ async fn progress_task(
     chan: SharedChan,
     host_sign_key: sunset::SignKey,
     progress_notify: SharedNotify,
+    session_notify: SharedNotify,
     output_lock: SharedOutputLock,
 ) {
     loop {
@@ -419,6 +413,7 @@ async fn progress_task(
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
+            session_notify.signal();
             return;
         }
 
@@ -632,16 +627,19 @@ async fn progress_task(
                     state.clone(),
                     chan.clone(),
                     progress_notify.clone(),
+                    session_notify.clone(),
                     output_lock.clone(),
                 ));
             }
             ProgressAction::Fatal => {
                 state.borrow_mut().session_done = true;
                 state.borrow_mut().exit_code = 1;
+                session_notify.signal();
                 return;
             }
             ProgressAction::Defunct => {
                 state.borrow_mut().session_done = true;
+                session_notify.signal();
                 return;
             }
         }
@@ -649,8 +647,10 @@ async fn progress_task(
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
+            session_notify.signal();
             return;
         }
+        session_notify.signal();
     }
 }
 
@@ -665,6 +665,7 @@ async fn channel_relay_task(
     state: SharedState,
     chan: SharedChan,
     progress_notify: SharedNotify,
+    session_notify: SharedNotify,
     output_lock: SharedOutputLock,
 ) {
     let mut chan_buf = [0u8; 4096];
@@ -745,6 +746,7 @@ async fn channel_relay_task(
                         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
                             state.borrow_mut().session_done = true;
                             state.borrow_mut().exit_code = 1;
+                            session_notify.signal();
                             return;
                         }
                         break;
@@ -757,9 +759,11 @@ async fn channel_relay_task(
                         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
                             state.borrow_mut().session_done = true;
                             state.borrow_mut().exit_code = 1;
+                            session_notify.signal();
                             return;
                         }
                         progress_notify.signal();
+                        session_notify.signal();
                     }
                     Err(_) => break,
                 }
@@ -785,6 +789,7 @@ async fn channel_relay_task(
                                 if !flush_output_locked(&runner, sock_fd, &output_lock).await {
                                     state.borrow_mut().session_done = true;
                                     state.borrow_mut().exit_code = 1;
+                                    session_notify.signal();
                                     return;
                                 }
                                 break;
@@ -796,9 +801,11 @@ async fn channel_relay_task(
                                 if !flush_output_locked(&runner, sock_fd, &output_lock).await {
                                     state.borrow_mut().session_done = true;
                                     state.borrow_mut().exit_code = 1;
+                                    session_notify.signal();
                                     return;
                                 }
                                 progress_notify.signal();
+                                session_notify.signal();
                             }
                             Err(_) => break,
                         }
@@ -818,6 +825,7 @@ async fn channel_relay_task(
         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
             state.borrow_mut().session_done = true;
             state.borrow_mut().exit_code = 1;
+            session_notify.signal();
             return;
         }
 
@@ -829,18 +837,34 @@ async fn channel_relay_task(
         //   - PTY readability (reactor)
         //   - Channel read readiness (client sent data)
         //   - Channel write readiness (backpressure cleared, if we have pending data)
-        {
+        let should_wait = {
             let waker = get_current_waker().await;
             let mut guard = runner.lock().await;
             let ch_ref = chan.borrow();
+            let mut channel_read_ready = false;
+            let mut channel_write_ready = false;
             if let Some(ref ch) = *ch_ref {
-                guard.set_channel_read_waker(ch, ChanData::Normal, &waker);
+                channel_read_ready = matches!(
+                    guard.read_channel_ready(),
+                    Some((num, ChanData::Normal, len)) if num == ch.num() && len > 0
+                );
+                if !channel_read_ready {
+                    guard.set_channel_read_waker(ch, ChanData::Normal, &waker);
+                }
                 if pty_pending_len > 0 {
-                    guard.set_channel_write_waker(ch, ChanData::Normal, &waker);
+                    match guard.write_channel_ready(ch, ChanData::Normal) {
+                        Ok(Some(len)) if len > 0 => channel_write_ready = true,
+                        Ok(Some(_)) => guard.set_channel_write_waker(ch, ChanData::Normal, &waker),
+                        Ok(None) | Err(_) => channel_write_ready = true,
+                    }
                 }
             }
             drop(ch_ref);
             drop(guard);
+            !(channel_read_ready || channel_write_ready || fd_is_readable(pty_fd))
+        };
+        if !should_wait {
+            continue;
         }
         WaitWake {
             fd: pty_fd,
