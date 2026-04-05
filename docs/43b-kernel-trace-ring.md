@@ -88,8 +88,11 @@ timestamping (via `tick_count()`) and core-ID tagging automatically. When the
 - GPF handler (both ring-0 and ring-3 paths)
 - Double fault handler
 
-It iterates all online cores, merges their ring snapshots into a single
-timeline sorted by tick, and prints each entry via `_panic_print`.
+It iterates all online cores and prints each core's ring independently
+(oldest to newest) via `_panic_print`. No heap allocation is performed —
+the non-allocating `for_each_chronological()` API is used instead of
+`snapshot()`. Entries are not merged or sorted across cores; each core's
+events appear as a contiguous block.
 
 ### `sys_ktrace` Syscall (`kernel/src/arch/x86_64/syscall.rs`)
 

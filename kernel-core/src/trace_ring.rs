@@ -94,11 +94,15 @@ pub enum TraceEvent {
 /// A single trace ring entry: timestamp + core ID + event.
 ///
 /// `#[repr(C)]` ensures a stable, deterministic layout for sys_ktrace.
+/// Explicit `_pad` fields are zeroed on construction to prevent leaking
+/// uninitialized kernel memory through padding bytes.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct TraceEntry {
     pub tick: u64,
     pub core: u8,
+    /// Explicit padding — always zero. Prevents uninit bytes in the ABI.
+    pub _pad: [u8; 7],
     pub event: TraceEvent,
 }
 
@@ -106,6 +110,7 @@ impl TraceEntry {
     pub const EMPTY: Self = Self {
         tick: 0,
         core: 0,
+        _pad: [0; 7],
         event: TraceEvent::Dispatch {
             task_idx: 0,
             core: 0,
@@ -158,6 +163,36 @@ impl<const N: usize> TraceRing<N> {
         out
     }
 
+    /// Iterate entries in chronological order without allocating.
+    ///
+    /// Calls `f` for each entry from oldest to newest. Safe for use in
+    /// panic/fault context where the heap may be corrupted.
+    pub fn for_each_chronological(&self, mut f: impl FnMut(&TraceEntry)) {
+        if self.count == 0 {
+            return;
+        }
+        let start = if self.count < N { 0 } else { self.write_idx };
+        for i in 0..self.count {
+            f(&self.buf[(start + i) % N]);
+        }
+    }
+
+    /// Copy entries in chronological order into `dst`, returning the count written.
+    ///
+    /// Does not allocate. Suitable for `sys_ktrace` where entries must be
+    /// copied into a caller-provided buffer.
+    pub fn copy_into(&self, dst: &mut [TraceEntry]) -> usize {
+        if self.count == 0 {
+            return 0;
+        }
+        let start = if self.count < N { 0 } else { self.write_idx };
+        let n = self.count.min(dst.len());
+        for (i, slot) in dst.iter_mut().enumerate().take(n) {
+            *slot = self.buf[(start + i) % N];
+        }
+        n
+    }
+
     /// Number of entries currently in the ring.
     pub fn len(&self) -> usize {
         self.count
@@ -183,6 +218,7 @@ mod tests {
         TraceEntry {
             tick,
             core: 0,
+            _pad: [0; 7],
             event: TraceEvent::Dispatch {
                 task_idx: tick as u32,
                 core: 0,
@@ -259,6 +295,7 @@ mod tests {
         ring.push(TraceEntry {
             tick: 1,
             core: 0,
+            _pad: [0; 7],
             event: TraceEvent::ForkCtxPublish {
                 pid: 42,
                 rip: 0x1000,
@@ -268,6 +305,7 @@ mod tests {
         ring.push(TraceEntry {
             tick: 2,
             core: 1,
+            _pad: [0; 7],
             event: TraceEvent::RecvBlock { task_idx: 3, ep: 7 },
         });
         let snap = ring.snapshot();
@@ -284,5 +322,35 @@ mod tests {
             snap[1].event,
             TraceEvent::RecvBlock { task_idx: 3, ep: 7 }
         ));
+    }
+
+    #[test]
+    fn for_each_chronological_matches_snapshot() {
+        let mut ring = TraceRing::<8>::new();
+        for i in 0..12 {
+            ring.push(make_entry(i));
+        }
+        let snap = ring.snapshot();
+        let mut collected = Vec::new();
+        ring.for_each_chronological(|e| collected.push(e.tick));
+        assert_eq!(collected.len(), snap.len());
+        for (i, entry) in snap.iter().enumerate() {
+            assert_eq!(collected[i], entry.tick);
+        }
+    }
+
+    #[test]
+    fn copy_into_fills_dst() {
+        let mut ring = TraceRing::<8>::new();
+        for i in 0..10 {
+            ring.push(make_entry(i));
+        }
+        let mut dst = [TraceEntry::EMPTY; 4];
+        let n = ring.copy_into(&mut dst);
+        assert_eq!(n, 4);
+        // Should get the 4 oldest of the 8 entries (ticks 2..=5)
+        for i in 0..4 {
+            assert_eq!(dst[i].tick, (2 + i) as u64);
+        }
     }
 }

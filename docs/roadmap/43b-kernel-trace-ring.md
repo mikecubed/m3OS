@@ -79,9 +79,12 @@ compiles to a no-op.
 
 ### dump_trace_rings() (`kernel/src/trace.rs`)
 
-Iterates all online cores via `get_core_data()`, snapshots each ring, merges
-into a Vec sorted by tick, and prints each entry. Uses `_panic_print` (the
-deadlock-safe serial path) since it runs from panic/fault context.
+Iterates all online cores via `get_core_data()` and prints each core's
+entries in chronological order using the non-allocating
+`for_each_chronological()` API. No heap allocation — safe for use when the
+heap is corrupted. Uses `_panic_print` (the deadlock-safe serial path)
+since it runs from panic/fault context. Entries are printed per-core, not
+merged across cores.
 
 ### PerCoreData.trace_ring (`kernel/src/smp/mod.rs`)
 

@@ -25,6 +25,7 @@ pub fn trace_event(event: TraceEvent) {
         (*ring_ptr).push(TraceEntry {
             tick,
             core: core_id,
+            _pad: [0; 7],
             event,
         });
     }
@@ -61,13 +62,15 @@ pub fn dump_trace_rings() {
             // Safety: UnsafeCell grants interior mutability. We only read.
             // In panic context, a concurrent writer on another core could
             // produce a torn entry, but this is acceptable for crash diagnostics.
+            // Uses for_each_chronological() to avoid heap allocation.
             let ring_ptr = data.trace_ring.get();
-            let snap = unsafe { (*ring_ptr).snapshot() };
-            for entry in &snap {
-                any_events = true;
-                _panic_print(format_args!("  [{}] core={} ", entry.tick, entry.core));
-                print_trace_event(&entry.event);
-                _panic_print(format_args!("\n"));
+            unsafe {
+                (*ring_ptr).for_each_chronological(|entry| {
+                    any_events = true;
+                    _panic_print(format_args!("  [{}] core={} ", entry.tick, entry.core));
+                    print_trace_event(&entry.event);
+                    _panic_print(format_args!("\n"));
+                });
             }
         }
     }

@@ -12450,20 +12450,29 @@ fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     // We only read; the owning core may concurrently write (at most one
     // torn entry, which is acceptable for diagnostic data).
     let ring_ptr = data.trace_ring.get();
-    let snap = unsafe { (*ring_ptr).snapshot() };
 
     let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
     let max_entries = (buf_len as usize) / entry_size;
-    let write_count = snap.len().min(max_entries);
+
+    if max_entries == 0 {
+        return 0;
+    }
+
+    // Use a fixed stack buffer to avoid heap allocation. Cap at 64 entries
+    // per call; callers can call again for more.
+    const MAX_BATCH: usize = 64;
+    let batch = max_entries.min(MAX_BATCH);
+    let mut tmp = [kernel_core::trace_ring::TraceEntry::EMPTY; MAX_BATCH];
+    let write_count = unsafe { (*ring_ptr).copy_into(&mut tmp[..batch]) };
 
     if write_count == 0 {
         return 0;
     }
 
-    // Serialize entries as raw bytes into the userspace buffer.
-    let src_bytes = unsafe {
-        core::slice::from_raw_parts(snap.as_ptr() as *const u8, write_count * entry_size)
-    };
+    // TraceEntry uses #[repr(C)] with explicit padding fields zeroed on
+    // construction, so raw byte reinterpretation is safe — no uninit bytes.
+    let src_bytes =
+        unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, write_count * entry_size) };
 
     if crate::mm::user_mem::copy_to_user(buf_ptr, src_bytes).is_err() {
         return u64::MAX;
