@@ -2133,8 +2133,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         10,
     ));
     steps.extend(cmd_then_prompt(
-        "/bin/ln -s /././././././././././././././././././././././././././././././etc/passwd /phase38-passwd-link\n",
-        "send: ln -s /etc/passwd /phase38-passwd-link",
+        "/bin/ln -s /etc/../etc/passwd /phase38-passwd-link\n",
+        "send: ln -s /etc/../etc/passwd /phase38-passwd-link",
         "wait: prompt after ext2 symlink create",
         10,
     ));
@@ -2158,7 +2158,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "readlink: verify ext2 symlink target",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "/etc/passwd",
+        pattern: "/etc/../etc/passwd",
         timeout_secs: 10,
         label: "verify ext2 readlink output",
     });
