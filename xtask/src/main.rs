@@ -4610,10 +4610,13 @@ fn run_smoke_steps_with_capture(
                     let stripped = strip_ansi(serial_buf);
                     let cleaned = strip_kernel_logs(&stripped);
 
-                    // Check for kernel panic/fault in serial output.
+                    // Check for kernel-level crash indicators in serial output.
+                    // Use specific patterns to avoid matching handled userspace
+                    // faults like "[int] userspace page fault: pid=N — process killed".
                     if cleaned.contains("KERNEL PANIC")
-                        || cleaned.contains("page fault")
+                        || cleaned.contains("kernel page fault")
                         || cleaned.contains("DOUBLE FAULT")
+                        || cleaned.contains("=== CRASH DIAGNOSTICS ===")
                     {
                         return Err(format!(
                             "kernel crash detected during step {}/{} ({label})",
