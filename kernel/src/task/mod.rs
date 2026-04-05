@@ -66,6 +66,18 @@ pub use scheduler::{
 };
 
 // ---------------------------------------------------------------------------
+// Panic diagnostics support
+// ---------------------------------------------------------------------------
+
+/// Try to acquire the scheduler lock without blocking.
+///
+/// Returns `None` if the lock is already held (e.g. during a panic while
+/// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
+pub fn try_lock_scheduler() -> Option<spin::MutexGuard<'static, scheduler::Scheduler>> {
+    scheduler::SCHEDULER.try_lock()
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -185,6 +197,15 @@ impl Task {
             fork_ctx: None,
             _stack: Some(stack),
         }
+    }
+
+    /// Return the base and top addresses of this task's kernel stack, if allocated.
+    pub fn stack_bounds(&self) -> Option<(u64, u64)> {
+        self._stack.as_ref().map(|s| {
+            let base = s.as_ptr() as u64;
+            let top = base + KERNEL_STACK_SIZE as u64;
+            (base, top)
+        })
     }
 }
 

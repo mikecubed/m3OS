@@ -1,6 +1,6 @@
 # Phase 43a — Crash Diagnostics & Assertions: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-43a
 **Depends on:** Phase 35 (True SMP Multitasking) ✅, Phase 43 (SSH Server) ✅
 **Goal:** Make every kernel crash self-diagnosing by enriching the panic handler and
@@ -13,13 +13,13 @@ as an opaque `RIP=0x4` fault.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Enriched panic handler | — | Planned |
-| B | Enriched fault handlers (page fault, GPF, double fault) | A | Planned |
-| C | Scheduler boundary assertions | — | Planned |
-| D | Fork boundary assertions | C | Planned |
-| E | IPC boundary assertions | C | Planned |
-| F | Stack bounds validation | C, D | Planned |
-| G | Validation and documentation | A–F | Planned |
+| A | Enriched panic handler | — | Complete |
+| B | Enriched fault handlers (page fault, GPF, double fault) | A | Complete |
+| C | Scheduler boundary assertions | — | Complete |
+| D | Fork boundary assertions | C | Complete |
+| E | IPC boundary assertions | C | Complete |
+| F | Stack bounds validation | C, D | Complete |
+| G | Validation and documentation | A–F | Complete |
 
 ---
 

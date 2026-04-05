@@ -140,6 +140,11 @@ impl Endpoint {
 /// `label = u64::MAX` on error.  Use this when the server needs the data
 /// payload; use [`recv`] when only the label is needed.
 pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
+    debug_assert!(
+        (ep_id.0 as usize) < MAX_ENDPOINTS,
+        "recv_msg: ep_id {} out of range",
+        ep_id.0
+    );
     let action = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
@@ -236,7 +241,12 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
-            let _ = scheduler::wake_task(receiver);
+            let woke = scheduler::wake_task(receiver);
+            debug_assert!(
+                woke,
+                "send: wake_task failed for receiver {:?} on ep {}",
+                receiver, ep_id.0
+            );
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -327,7 +337,8 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(caller: TaskId, reply_msg: Message) {
     scheduler::deliver_message(caller, reply_msg);
-    let _ = scheduler::wake_task(caller);
+    let woke = scheduler::wake_task(caller);
+    debug_assert!(woke, "reply: wake_task failed for caller {:?}", caller);
 }
 
 /// Reply to the current caller and immediately receive the next message.

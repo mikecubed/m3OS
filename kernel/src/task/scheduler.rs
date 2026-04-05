@@ -28,7 +28,7 @@ use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message};
 // Statics
 // ---------------------------------------------------------------------------
 
-pub(super) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub(crate) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
 // Per-core helpers
@@ -73,7 +73,7 @@ fn set_current_task_idx(idx: Option<usize>) {
 // Scheduler struct
 // ---------------------------------------------------------------------------
 
-pub(super) struct Scheduler {
+pub struct Scheduler {
     tasks: Vec<Task>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
@@ -88,6 +88,13 @@ impl Scheduler {
             last_run: 0,
             idle_tasks: [const { None }; crate::smp::MAX_CORES],
         }
+    }
+
+    /// Return a reference to the task at the given index, if in range.
+    ///
+    /// Used by `panic_diag` to inspect the current task without panicking.
+    pub fn get_task(&self, idx: usize) -> Option<&Task> {
+        self.tasks.get(idx)
     }
 
     /// Return the index of the task with the given [`TaskId`], if present.
@@ -177,6 +184,18 @@ impl Scheduler {
 
             if let Some(pos) = best_pos {
                 let idx = q.remove(pos).unwrap();
+                debug_assert!(
+                    self.tasks[idx].state == TaskState::Ready,
+                    "pick_next: local queue task idx={} not Ready (state={:?})",
+                    idx,
+                    self.tasks[idx].state
+                );
+                debug_assert!(
+                    self.tasks[idx].affinity_mask & core_bit != 0,
+                    "pick_next: local queue task idx={} not allowed on core {}",
+                    idx,
+                    core_id
+                );
                 self.last_run = idx;
                 return Some((self.tasks[idx].saved_rsp, idx));
             }
@@ -206,6 +225,18 @@ impl Scheduler {
                         self.tasks[idx].state = TaskState::Dead;
                         continue;
                     }
+                    debug_assert!(
+                        self.tasks[idx].state == TaskState::Ready,
+                        "pick_next: global fallback task idx={} not Ready (state={:?})",
+                        idx,
+                        self.tasks[idx].state
+                    );
+                    debug_assert!(
+                        self.tasks[idx].affinity_mask & core_bit != 0,
+                        "pick_next: global fallback task idx={} not allowed on core {}",
+                        idx,
+                        core_id
+                    );
                     self.last_run = idx;
                     return Some((self.tasks[idx].saved_rsp, idx));
                 }
@@ -216,6 +247,12 @@ impl Scheduler {
         if let Some(idle_idx) = self.idle_tasks[core_id as usize]
             && self.tasks[idle_idx].state == TaskState::Ready
         {
+            debug_assert!(
+                self.tasks[idle_idx].saved_rsp != 0,
+                "pick_next: idle task idx={} has zero saved_rsp on core {}",
+                idle_idx,
+                core_id
+            );
             return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
         }
 
@@ -292,6 +329,12 @@ fn least_loaded_core(sched: &Scheduler) -> u8 {
 
 /// Enqueue a task index into a specific core's run queue and signal it.
 fn enqueue_to_core(core_id: u8, idx: usize) {
+    debug_assert!(
+        (core_id as usize) < crate::smp::MAX_CORES,
+        "enqueue_to_core: core_id={} exceeds MAX_CORES={}",
+        core_id,
+        crate::smp::MAX_CORES
+    );
     if let Some(data) = crate::smp::get_core_data(core_id) {
         data.run_queue.lock().push_back(idx);
         data.reschedule.store(true, Ordering::Relaxed);
@@ -333,6 +376,10 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut sched = SCHEDULER.lock();
     task.assigned_core = current_core;
     task.fork_ctx = Some(ctx);
+    debug_assert!(
+        task.fork_ctx.is_some(),
+        "spawn_fork_task: fork_ctx missing after set"
+    );
     let idx = sched.tasks.len();
     sched.tasks.push(task);
     drop(sched);
@@ -431,6 +478,12 @@ pub fn yield_now() {
             Some(i) => i,
             None => return,
         };
+        debug_assert!(
+            idx < sched.tasks.len(),
+            "yield_now: task idx={} out of bounds (len={})",
+            idx,
+            sched.tasks.len()
+        );
         accumulate_ticks(&mut sched, idx);
         // Keep state as Running — the scheduler will set Ready + enqueue AFTER
         // switch_context saves the RSP. This prevents the global fallback from
@@ -444,6 +497,11 @@ pub fn yield_now() {
     PENDING_SWITCH_OUT[my_core].store(idx as i32, Ordering::Release);
     PENDING_REENQUEUE[my_core].store(idx as i32, Ordering::Release);
     let sched_rsp = per_core_scheduler_rsp();
+    debug_assert!(
+        sched_rsp != 0,
+        "yield_now: scheduler RSP is zero on core {}",
+        my_core
+    );
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -491,6 +549,12 @@ fn block_current(state: TaskState) {
             Some(i) => i,
             None => return,
         };
+        debug_assert!(
+            sched.tasks[idx].state == TaskState::Running,
+            "block_current: task idx={} was {:?} before block, expected Running",
+            idx,
+            sched.tasks[idx].state
+        );
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
@@ -501,6 +565,11 @@ fn block_current(state: TaskState) {
         .store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
+    debug_assert!(
+        sched_rsp != 0,
+        "block_current: scheduler RSP is zero on core {}",
+        crate::smp::per_core().core_id
+    );
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -653,6 +722,12 @@ pub fn wake_task(id: TaskId) -> bool {
     let (enqueue, woke) = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
+            debug_assert!(
+                idx < sched.tasks.len(),
+                "wake_task: idx={} out of bounds (len={})",
+                idx,
+                sched.tasks.len()
+            );
             match sched.tasks[idx].state {
                 TaskState::BlockedOnRecv
                 | TaskState::BlockedOnSend
@@ -752,6 +827,12 @@ pub fn run() -> ! {
         }
         interrupts::enable();
 
+        debug_assert!(
+            per_core_scheduler_rsp() != 0,
+            "core {}: scheduler RSP is zero",
+            core_id
+        );
+
         // Drain notification waiters (only BSP does this to avoid contention).
         if core_id == 0 {
             crate::ipc::notification::drain_pending_waiters();
@@ -774,6 +855,12 @@ pub fn run() -> ! {
             let mut sched = SCHEDULER.lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
                 sched.tasks[idx].state = TaskState::Running;
+                debug_assert!(
+                    sched.tasks[idx].state == TaskState::Running,
+                    "dispatch: task idx={} not Running after mark on core {}",
+                    idx,
+                    core_id
+                );
                 sched.tasks[idx].start_tick = crate::arch::x86_64::interrupts::tick_count();
                 set_current_task_idx(Some(idx));
                 Some((rsp, idx))
@@ -786,6 +873,12 @@ pub fn run() -> ! {
             Some(t) => t,
             None => continue,
         };
+        debug_assert!(
+            task_rsp != 0,
+            "dispatch: task {} has zero saved_rsp on core {}",
+            _task_idx,
+            core_id
+        );
 
         // Restore per-core process context for the dispatched task.
         // Read the task's PID and update: current_pid, CR3, TSS.RSP0,
@@ -824,6 +917,24 @@ pub fn run() -> ! {
             }
         }
 
+        // F.1: Validate saved_rsp falls within the task's kernel stack.
+        {
+            let sched = SCHEDULER.lock();
+            if let Some(task) = sched.get_task(_task_idx)
+                && let Some((base, top)) = task.stack_bounds()
+            {
+                debug_assert!(
+                    task_rsp >= base && task_rsp <= top,
+                    "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
+                    _task_idx,
+                    task_rsp,
+                    base,
+                    top,
+                    core_id
+                );
+            }
+        }
+
         // Switch to the task.
         unsafe {
             switch_context(per_core_scheduler_rsp_ptr(), task_rsp);
@@ -839,9 +950,28 @@ pub fn run() -> ! {
             let saved_rsp = take_per_core_switch_save_rsp(core_id as usize);
             let enqueue = {
                 let mut sched = SCHEDULER.lock();
+                debug_assert!(
+                    sidx < sched.tasks.len(),
+                    "dispatch: switched task sidx={} out of bounds (len={}) on core {}",
+                    sidx,
+                    sched.tasks.len(),
+                    core_id
+                );
                 if sidx < sched.tasks.len() {
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
+                    // F.2: Validate saved_rsp after yield/block save.
+                    if let Some((base, top)) = task.stack_bounds() {
+                        debug_assert!(
+                            saved_rsp >= base && saved_rsp <= top,
+                            "dispatch: saved task sidx={} rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
+                            sidx,
+                            saved_rsp,
+                            base,
+                            top,
+                            core_id
+                        );
+                    }
                     task.switching_out = false;
 
                     let wake_after_switch = task.wake_after_switch;
