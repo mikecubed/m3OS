@@ -59,9 +59,9 @@ pub use scheduler::{
     block_current_on_recv, block_current_on_reply, block_current_on_send,
     block_current_unless_woken, current_task_id, deliver_message, insert_cap, mark_current_dead,
     mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run, server_endpoint,
-    set_server_endpoint, signal_reschedule, spawn, spawn_idle, spawn_idle_for_core,
-    spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_message,
-    task_cap, wake_task, yield_now,
+    set_server_endpoint, signal_reschedule, spawn, spawn_fork_task, spawn_idle,
+    spawn_idle_for_core, spawn_on_current_core, sys_nice, sys_sched_getaffinity,
+    sys_sched_setaffinity, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,15 @@ pub struct Task {
     pub system_ticks: u64,
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
+    /// True while the task is returning to the scheduler and its kernel stack
+    /// pointer has not been safely published yet.
+    pub switching_out: bool,
+    /// Set by a wakeup that arrives while `switching_out` is true so the
+    /// scheduler can enqueue the task after `switch_context` completes.
+    pub wake_after_switch: bool,
+    /// Userspace register frame restored by `fork_child_trampoline`, if this
+    /// task was spawned to finish a fork/clone handoff.
+    fork_ctx: Option<crate::process::ForkChildCtx>,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
@@ -170,6 +179,9 @@ impl Task {
             user_ticks: 0,
             system_ticks: 0,
             start_tick: 0,
+            switching_out: false,
+            wake_after_switch: false,
+            fork_ctx: None,
             _stack: Some(stack),
         }
     }

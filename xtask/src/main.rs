@@ -1832,6 +1832,54 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for shell prompt",
     });
 
+    // Fork/wait regression: nested fork + pipe + waitpid flow that mirrors
+    // ion spawning PROMPT and draining its output before reaping it.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fork-test\n",
+        label: "run nested fork regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "fork-test: PASS",
+        timeout_secs: 20,
+        label: "verify nested fork regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after nested fork regression",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/pty-test\n",
+        label: "run PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: ion_prompt",
+        timeout_secs: 20,
+        label: "verify PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: dual_ion_prompts",
+        timeout_secs: 20,
+        label: "verify dual PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: dual_ion_supervisors",
+        timeout_secs: 20,
+        label: "verify dual PTY supervisor regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pty-test: 11 passed, 0 failed",
+        timeout_secs: 20,
+        label: "verify PTY test summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after PTY regression",
+    });
+
     // -----------------------------------------------------------------------
     // 2. Basic coreutils sanity
     // -----------------------------------------------------------------------

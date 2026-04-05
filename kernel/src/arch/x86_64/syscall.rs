@@ -2754,11 +2754,10 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
-    // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
-    crate::process::push_fork_ctx(child_pid, user_rip, user_rsp);
-
-    // Spawn a kernel task for the child; it will enter ring 3 on first dispatch.
-    crate::task::spawn(crate::process::fork_child_trampoline, "fork-child");
+    crate::task::spawn_fork_task(
+        crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
+        "fork-child",
+    );
 
     log::info!("[p{}] fork() → child pid {}", parent_pid, child_pid);
     child_pid as u64
@@ -9213,13 +9212,10 @@ fn sys_clone_thread(
         let _ = crate::mm::user_mem::copy_to_user(child_tidptr, &tid_bytes);
     }
 
-    // Push a fork context for the child thread. The child will start at
-    // user_rip (the return address from the clone syscall) with rax=0 and
-    // RSP = child_stack.
-    crate::process::push_fork_ctx_for_thread(child_pid, user_rip, child_stack);
-
-    // Spawn a kernel task for the child thread.
-    crate::task::spawn(crate::process::fork_child_trampoline, "clone-thread");
+    crate::task::spawn_fork_task(
+        crate::process::make_fork_ctx_for_thread(child_pid, user_rip, child_stack),
+        "clone-thread",
+    );
 
     log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64

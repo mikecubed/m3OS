@@ -307,8 +307,10 @@ fn spawn_userspace_init() {
     );
     log::info!("[init] /sbin/init registered as pid {}", pid);
 
-    process::push_fork_ctx_zeroed(pid, loaded.entry, user_rsp);
-    task::spawn(process::fork_child_trampoline, "userspace-init");
+    task::spawn_fork_task(
+        process::make_fork_ctx_zeroed(pid, loaded.entry, user_rsp),
+        "userspace-init",
+    );
 }
 
 /// Console server: receives IPC write requests, logs to serial, replies with ack.

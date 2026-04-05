@@ -6,12 +6,17 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{close, exit, fork, ioctl, open, read, write, write_str};
+use syscall_lib::{
+    POLLERR, POLLHUP, POLLIN, PollFd, WNOHANG, close, dup2, execve, exit, fork, ioctl, kill, open,
+    pipe, poll, read, setsid, waitpid, write, write_str,
+};
 
 /// TIOCGPTN — get PTY number.
 const TIOCGPTN: usize = 0x80045430;
 /// TIOCSPTLCK — lock/unlock PTY slave.
 const TIOCSPTLCK: usize = 0x40045431;
+/// TIOCSCTTY — set controlling terminal.
+const TIOCSCTTY: usize = 0x540E;
 
 fn print(s: &[u8]) {
     let _ = write(1, s);
@@ -49,6 +54,222 @@ fn pts_path(pty_num: u32) -> [u8; 16] {
     }
     path[9 + len] = 0;
     path
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn spawn_ion_shell() -> Result<(i32, i32), ()> {
+    let (mfd, sfd) = syscall_lib::openpty().map_err(|_| ())?;
+    let pid = fork();
+    if pid < 0 {
+        close(mfd);
+        close(sfd);
+        return Err(());
+    }
+
+    if pid == 0 {
+        close(mfd);
+        if setsid() < 0 {
+            exit(1);
+        }
+        if ioctl(sfd, TIOCSCTTY, 0) < 0 {
+            exit(2);
+        }
+        if dup2(sfd, 0) < 0 || dup2(sfd, 1) < 0 || dup2(sfd, 2) < 0 {
+            exit(3);
+        }
+        if sfd > 2 {
+            close(sfd);
+        }
+
+        let shell = b"/bin/ion\0";
+        let env_home = b"HOME=/root\0";
+        let env_user = b"USER=root\0";
+        let env_path = b"PATH=/bin:/sbin:/usr/bin\0";
+        let env_term = b"TERM=xterm\0";
+        let argv = [shell.as_ptr(), core::ptr::null()];
+        let envp = [
+            env_home.as_ptr(),
+            env_user.as_ptr(),
+            env_path.as_ptr(),
+            env_term.as_ptr(),
+            core::ptr::null(),
+        ];
+        let _ = execve(shell, &argv, &envp);
+        exit(127);
+    }
+
+    close(sfd);
+    Ok((mfd, pid as i32))
+}
+
+fn wait_for_prompt(mfd: i32, timeout_polls: usize) -> Result<bool, ()> {
+    let mut captured = [0u8; 512];
+    let mut captured_len = 0usize;
+
+    for _ in 0..timeout_polls {
+        let mut pfd = PollFd {
+            fd: mfd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ready = poll(core::slice::from_mut(&mut pfd), 100);
+        if ready < 0 {
+            return Err(());
+        }
+        if ready == 0 {
+            continue;
+        }
+        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0 {
+            continue;
+        }
+
+        let mut chunk = [0u8; 128];
+        let n = read(mfd, &mut chunk);
+        if n < 0 {
+            return Err(());
+        }
+        if n == 0 {
+            break;
+        }
+
+        let n = n as usize;
+        let copy = core::cmp::min(n, captured.len().saturating_sub(captured_len));
+        if copy > 0 {
+            captured[captured_len..captured_len + copy].copy_from_slice(&chunk[..copy]);
+            captured_len += copy;
+        }
+        let view = &captured[..captured_len];
+        if contains_bytes(view, b"m3os") && contains_bytes(view, b"# ") {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn cleanup_shell(mfd: i32, pid: i32, request_exit: bool) -> i32 {
+    if request_exit {
+        let _ = write(mfd, b"exit\n");
+    }
+    close(mfd);
+
+    let mut status = 0i32;
+    let waited = waitpid(pid, &mut status, WNOHANG);
+    if waited == 0 {
+        let _ = kill(pid, 1);
+        let _ = waitpid(pid, &mut status, 0);
+    }
+    status
+}
+
+fn wait_for_pipe_byte(fd: i32, timeout_polls: usize) -> Result<Option<u8>, ()> {
+    for _ in 0..timeout_polls {
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ready = poll(core::slice::from_mut(&mut pfd), 100);
+        if ready < 0 {
+            return Err(());
+        }
+        if ready == 0 {
+            continue;
+        }
+        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0 {
+            continue;
+        }
+
+        let mut byte = [0u8; 1];
+        let n = read(fd, &mut byte);
+        if n < 0 {
+            return Err(());
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(byte[0]));
+    }
+
+    Ok(None)
+}
+
+fn spawn_ion_supervisor() -> Result<(i32, i32, i32), ()> {
+    let mut ready_pipe = [0i32; 2];
+    let mut hold_pipe = [0i32; 2];
+    if pipe(&mut ready_pipe) < 0 {
+        return Err(());
+    }
+    if pipe(&mut hold_pipe) < 0 {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return Err(());
+    }
+
+    let pid = fork();
+    if pid < 0 {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        close(hold_pipe[0]);
+        close(hold_pipe[1]);
+        return Err(());
+    }
+
+    if pid == 0 {
+        close(ready_pipe[0]);
+        close(hold_pipe[1]);
+
+        let exit_code = match spawn_ion_shell() {
+            Ok((mfd, shell_pid)) => {
+                let ready = matches!(wait_for_prompt(mfd, 50), Ok(true));
+                let status = [if ready { b'1' } else { b'0' }];
+                let _ = write(ready_pipe[1], &status);
+                close(ready_pipe[1]);
+
+                if ready {
+                    let mut buf = [0u8; 1];
+                    let _ = read(hold_pipe[0], &mut buf);
+                }
+                close(hold_pipe[0]);
+
+                let shell_status = cleanup_shell(mfd, shell_pid, ready);
+                if ready && ((shell_status >> 8) & 0xFF) == 0 {
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(_) => {
+                let _ = write(ready_pipe[1], b"E");
+                close(ready_pipe[1]);
+                close(hold_pipe[0]);
+                2
+            }
+        };
+        exit(exit_code);
+    }
+
+    close(ready_pipe[1]);
+    close(hold_pipe[0]);
+    Ok((ready_pipe[0], hold_pipe[1], pid as i32))
+}
+
+fn cleanup_supervisor(ready_fd: i32, hold_fd: i32, pid: i32) -> i32 {
+    close(ready_fd);
+    close(hold_fd);
+
+    let mut status = 0i32;
+    let waited = waitpid(pid, &mut status, WNOHANG);
+    if waited == 0 {
+        let _ = kill(pid, 1);
+        let _ = waitpid(pid, &mut status, 0);
+    }
+    status
 }
 
 /// Test 1: Open /dev/ptmx and verify we get a valid master FD.
@@ -340,6 +561,147 @@ fn test_master_close_eof() -> bool {
     }
 }
 
+/// Test 9: Spawn ion on a PTY and verify the initial prompt is emitted.
+fn test_ion_prompt() -> bool {
+    match spawn_ion_shell() {
+        Ok((mfd, pid)) => match wait_for_prompt(mfd, 50) {
+            Ok(saw_prompt) => {
+                let status = cleanup_shell(mfd, pid, saw_prompt);
+                if saw_prompt && ((status >> 8) & 0xFF) == 0 {
+                    ok(b"ion_prompt");
+                    true
+                } else {
+                    fail(b"ion_prompt: prompt not observed");
+                    false
+                }
+            }
+            Err(_) => {
+                let _ = cleanup_shell(mfd, pid, false);
+                fail(b"ion_prompt: poll/read failed");
+                false
+            }
+        },
+        Err(_) => {
+            fail(b"ion_prompt: openpty failed");
+            false
+        }
+    }
+}
+
+/// Test 10: Two PTY-backed ion shells should both reach a prompt without
+/// needing input in the first session to unblock the second.
+fn test_dual_ion_prompts() -> bool {
+    let (mfd_a, pid_a) = match spawn_ion_shell() {
+        Ok(shell) => shell,
+        Err(_) => {
+            fail(b"dual_ion_prompts: first openpty failed");
+            return false;
+        }
+    };
+
+    let first_ready = match wait_for_prompt(mfd_a, 50) {
+        Ok(ready) => ready,
+        Err(_) => {
+            let _ = cleanup_shell(mfd_a, pid_a, false);
+            fail(b"dual_ion_prompts: first prompt poll/read failed");
+            return false;
+        }
+    };
+    if !first_ready {
+        let _ = cleanup_shell(mfd_a, pid_a, false);
+        fail(b"dual_ion_prompts: first prompt not observed");
+        return false;
+    }
+
+    let (mfd_b, pid_b) = match spawn_ion_shell() {
+        Ok(shell) => shell,
+        Err(_) => {
+            let _ = cleanup_shell(mfd_a, pid_a, true);
+            fail(b"dual_ion_prompts: second openpty failed");
+            return false;
+        }
+    };
+
+    let second_ready = match wait_for_prompt(mfd_b, 50) {
+        Ok(ready) => ready,
+        Err(_) => {
+            let _ = cleanup_shell(mfd_b, pid_b, false);
+            let _ = cleanup_shell(mfd_a, pid_a, true);
+            fail(b"dual_ion_prompts: second prompt poll/read failed");
+            return false;
+        }
+    };
+
+    let status_b = cleanup_shell(mfd_b, pid_b, second_ready);
+    let status_a = cleanup_shell(mfd_a, pid_a, true);
+
+    if second_ready && ((status_a >> 8) & 0xFF) == 0 && ((status_b >> 8) & 0xFF) == 0 {
+        ok(b"dual_ion_prompts");
+        true
+    } else {
+        fail(b"dual_ion_prompts: second prompt not observed");
+        false
+    }
+}
+
+/// Test 11: Two independent PTY session-supervisor processes should both
+/// reach a prompt without activity in the first session.
+fn test_dual_ion_supervisors() -> bool {
+    let (ready_a, hold_a, pid_a) = match spawn_ion_supervisor() {
+        Ok(supervisor) => supervisor,
+        Err(_) => {
+            fail(b"dual_ion_supervisors: first supervisor spawn failed");
+            return false;
+        }
+    };
+
+    let first_ready = match wait_for_pipe_byte(ready_a, 60) {
+        Ok(Some(b'1')) => true,
+        Ok(Some(_)) | Ok(None) => false,
+        Err(_) => {
+            let _ = cleanup_supervisor(ready_a, hold_a, pid_a);
+            fail(b"dual_ion_supervisors: first supervisor poll/read failed");
+            return false;
+        }
+    };
+    if !first_ready {
+        let _ = cleanup_supervisor(ready_a, hold_a, pid_a);
+        fail(b"dual_ion_supervisors: first prompt not observed");
+        return false;
+    }
+
+    let (ready_b, hold_b, pid_b) = match spawn_ion_supervisor() {
+        Ok(supervisor) => supervisor,
+        Err(_) => {
+            let _ = cleanup_supervisor(ready_a, hold_a, pid_a);
+            fail(b"dual_ion_supervisors: second supervisor spawn failed");
+            return false;
+        }
+    };
+
+    let second_ready = match wait_for_pipe_byte(ready_b, 60) {
+        Ok(Some(b'1')) => true,
+        Ok(Some(_)) | Ok(None) => false,
+        Err(_) => {
+            let _ = cleanup_supervisor(ready_b, hold_b, pid_b);
+            let _ = cleanup_supervisor(ready_a, hold_a, pid_a);
+            fail(b"dual_ion_supervisors: second supervisor poll/read failed");
+            return false;
+        }
+    };
+
+    let status_b = cleanup_supervisor(ready_b, hold_b, pid_b);
+    let status_a = cleanup_supervisor(ready_a, hold_a, pid_a);
+
+    if second_ready && ((status_a >> 8) & 0xFF) == 0 && ((status_b >> 8) & 0xFF) == 0 {
+        ok(b"dual_ion_supervisors");
+        true
+    } else {
+        fail(b"dual_ion_supervisors: second prompt not observed");
+        false
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     write_str(1, "pty-test: Phase 29 PTY subsystem tests\n");
@@ -347,7 +709,7 @@ pub extern "C" fn _start() -> ! {
     let mut passed = 0u32;
     let mut failed = 0u32;
 
-    let tests: [fn() -> bool; 8] = [
+    let tests: [fn() -> bool; 11] = [
         test_ptmx_open,
         test_tiocgptn,
         test_slave_open,
@@ -356,6 +718,9 @@ pub extern "C" fn _start() -> ! {
         test_s2m_io,
         test_multiple_ptys,
         test_master_close_eof,
+        test_ion_prompt,
+        test_dual_ion_prompts,
+        test_dual_ion_supervisors,
     ];
 
     for test in &tests {
