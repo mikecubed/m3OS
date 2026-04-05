@@ -28,7 +28,7 @@ use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message};
 // Statics
 // ---------------------------------------------------------------------------
 
-pub(crate) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub(super) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
 // Per-core helpers
@@ -924,7 +924,7 @@ pub fn run() -> ! {
                 && let Some((base, top)) = task.stack_bounds()
             {
                 debug_assert!(
-                    task_rsp >= base && task_rsp <= top,
+                    task_rsp >= base && task_rsp < top,
                     "dispatch: task {} saved_rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
                     _task_idx,
                     task_rsp,
@@ -963,7 +963,7 @@ pub fn run() -> ! {
                     // F.2: Validate saved_rsp after yield/block save.
                     if let Some((base, top)) = task.stack_bounds() {
                         debug_assert!(
-                            saved_rsp >= base && saved_rsp <= top,
+                            saved_rsp >= base && saved_rsp < top,
                             "dispatch: saved task sidx={} rsp={:#x} outside stack [{:#x}..{:#x}] on core {}",
                             sidx,
                             saved_rsp,

@@ -14,6 +14,13 @@ use crate::smp::{self, MAX_CORES};
 // Register snapshot
 // ---------------------------------------------------------------------------
 
+/// Scratch storage for RBX/RBP capture.  LLVM reserves these registers so they
+/// cannot appear as `lateout` operands.  Using `sym` to reference these statics
+/// avoids allocating a GPR for the destination address (which could itself be
+/// assigned to RBX/RBP, clobbering the value before the store).
+static mut SNAP_RBX: u64 = 0;
+static mut SNAP_RBP: u64 = 0;
+
 /// Captured CPU register state at panic time.
 struct RegisterSnapshot {
     rax: u64,
@@ -45,12 +52,10 @@ struct RegisterSnapshot {
 /// (file:line) is the best proxy for the faulting instruction.
 fn capture_registers() -> RegisterSnapshot {
     let rax: u64;
-    let mut rbx: u64 = 0;
     let rcx: u64;
     let rdx: u64;
     let rsi: u64;
     let rdi: u64;
-    let mut rbp: u64 = 0;
     let rsp: u64;
     let r8: u64;
     let r9: u64;
@@ -62,16 +67,17 @@ fn capture_registers() -> RegisterSnapshot {
     let r15: u64;
     let rflags: u64;
 
-    // Capture all GPRs atomically.  rbx and rbp are reserved by LLVM and
-    // cannot appear as lateout operands, so we store them to memory inside
-    // the asm block.  All other GPRs use lateout constraints in a single
-    // block so LLVM cannot clobber uncaptured registers between statements.
+    // Capture all GPRs in a single asm block.  rbx/rbp are LLVM-reserved and
+    // cannot be lateout operands.  We store them via RIP-relative addressing
+    // using `sym` so that no GPR is allocated for the destination address
+    // (which could itself land on rbx/rbp and clobber the value before the
+    // store).  All other GPRs use lateout in the same block.
     unsafe {
         core::arch::asm!(
-            "mov [{0}], rbx",
-            "mov [{1}], rbp",
-            in(reg) &mut rbx as *mut u64,
-            in(reg) &mut rbp as *mut u64,
+            "mov [rip + {rbx_slot}], rbx",
+            "mov [rip + {rbp_slot}], rbp",
+            rbx_slot = sym SNAP_RBX,
+            rbp_slot = sym SNAP_RBP,
             lateout("rax") rax,
             lateout("rcx") rcx,
             lateout("rdx") rdx,
@@ -90,6 +96,10 @@ fn capture_registers() -> RegisterSnapshot {
         core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
         core::arch::asm!("pushfq; pop {}", out(reg) rflags);
     }
+    // Safety: SNAP_RBX/SNAP_RBP were written by the asm block above.
+    // This is only called from panic/fault context (single-threaded).
+    let rbx = unsafe { SNAP_RBX };
+    let rbp = unsafe { SNAP_RBP };
 
     let cr2 = x86_64::registers::control::Cr2::read_raw();
     let cr3 = {
