@@ -165,6 +165,10 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
         Some(pending) => {
             // A sender was waiting — deliver message to ourselves.
             scheduler::deliver_message(receiver, pending.msg);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
+                task_idx: receiver.0 as u32,
+                ep: ep_id.0 as u32,
+            });
             if pending.wants_reply {
                 // Insert a one-shot reply cap; sender stays blocked awaiting reply().
                 // If the table is full, deliver an explicit error reply so the
@@ -183,6 +187,10 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
         }
         None => {
             // Block; sender will call deliver_message + wake_task on us.
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RecvBlock {
+                task_idx: receiver.0 as u32,
+                ep: ep_id.0 as u32,
+            });
             scheduler::block_current_on_recv_unless_message();
         }
     }
@@ -190,7 +198,13 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
     // None here is always an IPC/scheduler bug: the sender must call
     // deliver_message before calling wake_task.
     match scheduler::take_message(receiver) {
-        Some(msg) => msg,
+        Some(msg) => {
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RecvWake {
+                task_idx: receiver.0 as u32,
+                ep: ep_id.0 as u32,
+            });
+            msg
+        }
         None => {
             debug_assert!(
                 false,
@@ -241,6 +255,10 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
+                task_idx: receiver.0 as u32,
+                ep: ep_id.0 as u32,
+            });
             // Best-effort wake: the receiver may still be Running if send()
             // races between the receiver enqueueing itself and actually
             // blocking.  In that case wake_task() correctly returns false
@@ -250,6 +268,10 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
+                task_idx: sender.0 as u32,
+                ep: ep_id.0 as u32,
+            });
             scheduler::block_current_on_send();
         }
     }
@@ -309,6 +331,10 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         }
     }
     // Block waiting for reply regardless of whether server was already waiting.
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::CallBlock {
+        task_idx: caller.0 as u32,
+        ep: ep_id.0 as u32,
+    });
     scheduler::block_current_on_reply_unless_message();
     // Woken by reply() — reply message was delivered into our slot.
     match scheduler::take_message(caller) {
@@ -337,6 +363,10 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(caller: TaskId, reply_msg: Message) {
     scheduler::deliver_message(caller, reply_msg);
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ReplyDeliver {
+        caller_idx: caller.0 as u32,
+        ep: 0,
+    });
     // Can legitimately race with the caller still transitioning into its
     // reply-blocked state.  If that happens, the reply is already pending
     // and the caller will observe it and skip blocking.

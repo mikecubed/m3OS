@@ -1,6 +1,6 @@
 # Phase 43b — Kernel Trace Ring: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-43b
 **Depends on:** Phase 43a (Crash Diagnostics) ✅
 **Goal:** Add a per-core lockless trace ring that records fork, scheduler, and IPC
@@ -13,15 +13,15 @@ feature-gated so it compiles out for release builds.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Trace ring data structure (kernel-core, host-testable) | — | Planned |
-| B | Trace event enum and encoding | A | Planned |
-| C | Scheduler path instrumentation | A, B | Planned |
-| D | Fork path instrumentation | A, B | Planned |
-| E | IPC path instrumentation | A, B | Planned |
-| F | Panic/fault auto-dump integration | A, B, Phase 43a | Planned |
-| G | `sys_ktrace` syscall | A, B | Planned |
-| H | Feature gate and compile-out | A–G | Planned |
-| I | Validation and documentation | All | Planned |
+| A | Trace ring data structure (kernel-core, host-testable) | — | ✅ Done |
+| B | Trace event enum and encoding | A | ✅ Done |
+| C | Scheduler path instrumentation | A, B | ✅ Done |
+| D | Fork path instrumentation | A, B | ✅ Done |
+| E | IPC path instrumentation | A, B | ✅ Done |
+| F | Panic/fault auto-dump integration | A, B, Phase 43a | ✅ Done |
+| G | `sys_ktrace` syscall | A, B | ✅ Done |
+| H | Feature gate and compile-out | A–G | ✅ Done |
+| I | Validation and documentation | All | ✅ Done |
 
 ---
 

@@ -29,6 +29,7 @@ mod stdin;
 mod task;
 #[cfg(test)]
 mod testing;
+mod trace;
 mod tty;
 
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
@@ -1177,6 +1178,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         }
         serial::_panic_print(format_args!("  {}\n", info.message()));
         panic_diag::dump_crash_context();
+        trace::dump_trace_rings();
         hlt_loop();
     }
 }

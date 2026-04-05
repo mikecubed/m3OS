@@ -450,6 +450,7 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
         panic_diag::dump_crash_context();
+        crate::trace::dump_trace_rings();
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -487,6 +488,7 @@ extern "x86-interrupt" fn page_fault_handler(
         cr3_frame.start_address().as_u64()
     ));
     panic_diag::dump_crash_context();
+    crate::trace::dump_trace_rings();
     crate::hlt_loop();
 }
 
@@ -523,6 +525,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             _err, selector_idx, table, external
         ));
         panic_diag::dump_crash_context();
+        crate::trace::dump_trace_rings();
         // Store the PID and redirect to the kill trampoline (same pattern as
         // page_fault_handler — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -551,6 +554,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         _err, selector_idx, table, external
     ));
     panic_diag::dump_crash_context();
+    crate::trace::dump_trace_rings();
     crate::hlt_loop();
 }
 
@@ -561,6 +565,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
         stack_frame.stack_pointer.as_u64()
     ));
     panic_diag::dump_crash_context();
+    crate::trace::dump_trace_rings();
     crate::hlt_loop();
 }
 

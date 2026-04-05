@@ -1208,6 +1208,9 @@ pub extern "C" fn syscall_handler(
         0x1000 => sys_debug_print(arg0, arg1),
         // Custom kernel meminfo (Phase 33 Track F)
         0x1001 => sys_meminfo(arg0, arg1),
+        // Custom kernel trace ring read (Phase 43b Track G)
+        #[cfg(feature = "trace")]
+        0x1002 => sys_ktrace(arg0, arg1, arg2),
         _ => {
             // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -12411,4 +12414,55 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// sys_ktrace — Phase 43b Track G
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "trace")]
+/// Read trace ring entries from a specific core into a userspace buffer.
+///
+/// Arguments:
+///   - `core_id`: which core's trace ring to read
+///   - `buf_ptr`: userspace buffer address
+///   - `buf_len`: size of the userspace buffer in bytes
+///
+/// Returns the number of entries written, or `u64::MAX` on error.
+fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let core_id = core_id as u8;
+    if core_id >= crate::smp::core_count() {
+        return u64::MAX;
+    }
+    if buf_ptr == 0 || buf_len == 0 {
+        return 0;
+    }
+
+    let data = match crate::smp::get_core_data(core_id) {
+        Some(d) => d,
+        None => return u64::MAX,
+    };
+
+    // Safety: trace ring is lockless, single-writer. We only read.
+    let data_ptr = data as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+    let snap = unsafe { (*data_ptr).trace_ring.snapshot() };
+
+    let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
+    let max_entries = (buf_len as usize) / entry_size;
+    let write_count = snap.len().min(max_entries);
+
+    if write_count == 0 {
+        return 0;
+    }
+
+    // Serialize entries as raw bytes into the userspace buffer.
+    let src_bytes = unsafe {
+        core::slice::from_raw_parts(snap.as_ptr() as *const u8, write_count * entry_size)
+    };
+
+    if crate::mm::user_mem::copy_to_user(buf_ptr, src_bytes).is_err() {
+        return u64::MAX;
+    }
+
+    write_count as u64
 }

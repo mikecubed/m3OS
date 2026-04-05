@@ -1212,9 +1212,9 @@ pub fn send_sigchld_to_parent(child_pid: Pid) {
 
 /// Context passed from `sys_fork` to `fork_child_trampoline`.
 pub(crate) struct ForkChildCtx {
-    pid: Pid,
-    user_rip: u64,
-    user_rsp: u64,
+    pub(crate) pid: Pid,
+    pub(crate) user_rip: u64,
+    pub(crate) user_rsp: u64,
     // Callee-saved registers from the parent at syscall entry.
     user_rbx: u64,
     user_rbp: u64,
@@ -1363,6 +1363,12 @@ pub fn fork_child_trampoline() -> ! {
     let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
 
+    let task_idx = crate::task::scheduler::get_current_task_idx().unwrap_or(0) as u32;
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTrampolineEnter {
+        pid: ctx.pid,
+        task_idx,
+    });
+
     debug_assert!(
         ctx.user_rip != 0,
         "fork_child_trampoline: user_rip is zero for pid {}",
@@ -1426,6 +1432,11 @@ pub fn fork_child_trampoline() -> ! {
     // For kernel-spawned processes (init, p11 tests), the callee-saved
     // registers are zeroed which is safe — execve replaces them immediately.
     // For fork() children, these are the parent's actual register values.
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTrampolineExit {
+        pid: ctx.pid,
+        rip: ctx.user_rip,
+        rsp: ctx.user_rsp,
+    });
     unsafe {
         crate::arch::enter_userspace_fork(
             ctx.user_rip,

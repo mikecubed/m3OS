@@ -337,6 +337,10 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
     );
     if let Some(data) = crate::smp::get_core_data(core_id) {
         data.run_queue.lock().push_back(idx);
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
+            task_idx: idx as u32,
+            core: core_id,
+        });
         data.reschedule.store(true, Ordering::Relaxed);
     }
 }
@@ -372,6 +376,9 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
 /// directly to the task instead of a global queue.
 pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) -> u8 {
     let current_core = crate::smp::per_core().core_id;
+    let fork_pid = ctx.pid;
+    let fork_rip = ctx.user_rip;
+    let fork_rsp = ctx.user_rsp;
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     task.assigned_core = current_core;
@@ -384,6 +391,16 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     sched.tasks.push(task);
     drop(sched);
 
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkCtxPublish {
+        pid: fork_pid,
+        rip: fork_rip,
+        rsp: fork_rsp,
+    });
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTaskSpawned {
+        pid: fork_pid,
+        task_idx: idx as u32,
+        core: current_core,
+    });
     enqueue_to_core(current_core, idx);
 
     current_core
@@ -502,6 +519,10 @@ pub fn yield_now() {
         "yield_now: scheduler RSP is zero on core {}",
         my_core
     );
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::YieldNow {
+        task_idx: idx as u32,
+        core: my_core as u8,
+    });
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -561,15 +582,20 @@ fn block_current(state: TaskState) {
         set_current_task_idx(None);
         idx
     };
-    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
-        .store(idx as i32, Ordering::Release);
+    let core = crate::smp::per_core().core_id;
+    PENDING_SWITCH_OUT[core as usize].store(idx as i32, Ordering::Release);
     per_core_reschedule().store(true, Ordering::Relaxed);
     let sched_rsp = per_core_scheduler_rsp();
     debug_assert!(
         sched_rsp != 0,
         "block_current: scheduler RSP is zero on core {}",
-        crate::smp::per_core().core_id
+        core
     );
+    crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::BlockCurrent {
+        task_idx: idx as u32,
+        core,
+        new_state: state as u8,
+    });
     unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
 }
 
@@ -749,6 +775,11 @@ pub fn wake_task(id: TaskId) -> bool {
         }
     };
     if let Some((core, idx)) = enqueue {
+        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
+            task_idx: idx as u32,
+            state_before: 0, // already transitioned to Ready
+            core,
+        });
         enqueue_to_core(core, idx);
         true
     } else {
@@ -863,6 +894,11 @@ pub fn run() -> ! {
                 );
                 sched.tasks[idx].start_tick = crate::arch::x86_64::interrupts::tick_count();
                 set_current_task_idx(Some(idx));
+                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
+                    task_idx: idx as u32,
+                    core: core_id,
+                    rsp,
+                });
                 Some((rsp, idx))
             } else {
                 None
@@ -998,6 +1034,11 @@ pub fn run() -> ! {
                     None
                 }
             };
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SwitchOut {
+                task_idx: sidx as u32,
+                core: core_id,
+                saved_rsp,
+            });
             if let Some((target_core, idx)) = enqueue {
                 enqueue_to_core(target_core, idx);
             }
