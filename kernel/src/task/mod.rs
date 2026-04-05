@@ -69,7 +69,7 @@ pub use scheduler::{
 // Constants
 // ---------------------------------------------------------------------------
 
-pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 4; // 16 KiB
+pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 
 // ---------------------------------------------------------------------------
 // Task ID

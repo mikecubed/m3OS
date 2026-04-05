@@ -121,7 +121,6 @@ impl Scheduler {
         // Their stack memory is released here to avoid leaks.
         for task in &mut self.tasks {
             if task.state == TaskState::Dead && !task.switching_out && task.saved_rsp != 0 {
-                // Drop the stack allocation to free memory.
                 let _ = task._stack.take();
                 // Mark as drained so we don't try to free again.
                 task.saved_rsp = 0;
@@ -158,6 +157,17 @@ impl Scheduler {
                     q.remove(i);
                     continue;
                 }
+                if self.tasks[idx].saved_rsp == 0 {
+                    log::error!(
+                        "[sched] dropping ready task idx={} pid={} name={} with zero saved_rsp",
+                        idx,
+                        self.tasks[idx].pid,
+                        self.tasks[idx].name
+                    );
+                    self.tasks[idx].state = TaskState::Dead;
+                    q.remove(i);
+                    continue;
+                }
                 if self.tasks[idx].priority < best_prio {
                     best_prio = self.tasks[idx].priority;
                     best_pos = Some(i);
@@ -186,6 +196,16 @@ impl Scheduler {
                 if self.tasks[idx].state == TaskState::Ready
                     && self.tasks[idx].affinity_mask & core_bit != 0
                 {
+                    if self.tasks[idx].saved_rsp == 0 {
+                        log::error!(
+                            "[sched] dropping globally-scanned ready task idx={} pid={} name={} with zero saved_rsp",
+                            idx,
+                            self.tasks[idx].pid,
+                            self.tasks[idx].name
+                        );
+                        self.tasks[idx].state = TaskState::Dead;
+                        continue;
+                    }
                     self.last_run = idx;
                     return Some((self.tasks[idx].saved_rsp, idx));
                 }
@@ -823,11 +843,22 @@ pub fn run() -> ! {
                     let task = &mut sched.tasks[sidx];
                     task.saved_rsp = saved_rsp;
                     task.switching_out = false;
-                    if task.wake_after_switch {
-                        task.wake_after_switch = false;
-                        task.state = TaskState::Ready;
-                        Some((task.assigned_core, sidx))
-                    } else if pending == switched {
+
+                    let wake_after_switch = task.wake_after_switch;
+                    let blocked = matches!(
+                        task.state,
+                        TaskState::BlockedOnRecv
+                            | TaskState::BlockedOnSend
+                            | TaskState::BlockedOnReply
+                            | TaskState::BlockedOnNotif
+                            | TaskState::BlockedOnFutex
+                    );
+                    let reenqueue_after_yield =
+                        pending == switched && task.state == TaskState::Running;
+
+                    task.wake_after_switch = false;
+
+                    if (wake_after_switch && blocked) || reenqueue_after_yield {
                         task.state = TaskState::Ready;
                         Some((task.assigned_core, sidx))
                     } else {
