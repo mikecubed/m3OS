@@ -4526,6 +4526,8 @@ fn run_regression_test(
             *arg = "user,id=net0".to_string();
         }
     }
+    // Snapshot mode: don't persist disk writes across regression runs.
+    args.push("-snapshot".to_string());
 
     let mut child = Command::new("qemu-system-x86_64")
         .args(&args)
@@ -4638,8 +4640,15 @@ fn run_smoke_steps_with_capture(
                         break;
                     }
 
-                    // Detect QEMU exit (serial pipe closed).
-                    if rx.try_recv().is_err() && child.try_wait().ok().flatten().is_some() {
+                    // Detect QEMU exit without probing the serial channel
+                    // again — a second try_recv() here could consume a pending
+                    // chunk and hide the last serial output before exit.
+                    if child.try_wait().ok().flatten().is_some() {
+                        // Drain any remaining serial output before reporting.
+                        while let Ok(chunk) = rx.try_recv() {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
                         return Err(format!(
                             "QEMU exited unexpectedly at step {}/{} ({label})",
                             i + 1,
@@ -4969,6 +4978,8 @@ fn run_regression_with_steps(
             *arg = "user,id=net0".to_string();
         }
     }
+    // Snapshot mode: don't persist disk writes across stress iterations.
+    args.push("-snapshot".to_string());
 
     let mut child = Command::new("qemu-system-x86_64")
         .args(&args)

@@ -19,6 +19,10 @@ mod loom_tests {
 
     /// Simplified IPC endpoint model: one sender, one receiver.
     /// Verifies that send + recv with concurrent wake never loses a message.
+    ///
+    /// The receiver re-checks the message after publishing BLOCKED_ON_RECV
+    /// to avoid the lost-wakeup window where the sender delivers between
+    /// the initial check and the state transition.
     #[test]
     fn send_recv_no_lost_message() {
         loom::model(|| {
@@ -35,9 +39,15 @@ mod loom_tests {
                 // Try to receive — if no message yet, block.
                 if msg_recv.load(Ordering::Acquire) == 0 {
                     state_recv.store(BLOCKED_ON_RECV, Ordering::Release);
-                    // Spin until woken (state changed back to READY).
-                    while state_recv.load(Ordering::Acquire) == BLOCKED_ON_RECV {
-                        loom::thread::yield_now();
+                    // Re-check message after publishing blocked state to close
+                    // the lost-wakeup window.
+                    if msg_recv.load(Ordering::Acquire) != 0 {
+                        state_recv.store(READY, Ordering::Release);
+                    } else {
+                        // Spin until woken (state changed back to READY).
+                        while state_recv.load(Ordering::Acquire) == BLOCKED_ON_RECV {
+                            loom::thread::yield_now();
+                        }
                     }
                 }
                 // Must have a message now.
@@ -66,6 +76,9 @@ mod loom_tests {
 
     /// Call + reply: caller sends and blocks; server receives and replies.
     /// Verifies the caller always receives the reply.
+    ///
+    /// The caller re-checks the reply message after publishing BLOCKED_ON_RECV
+    /// to close the lost-wakeup window.
     #[test]
     fn call_reply_always_delivers() {
         loom::model(|| {
@@ -87,8 +100,14 @@ mod loom_tests {
                 rq.store(1, Ordering::Release);
                 // Block waiting for reply.
                 cs.store(BLOCKED_ON_RECV, Ordering::Release);
-                while cs.load(Ordering::Acquire) == BLOCKED_ON_RECV {
-                    loom::thread::yield_now();
+                // Re-check reply after publishing blocked state to close the
+                // lost-wakeup window.
+                if rm.load(Ordering::Acquire) == 42 {
+                    cs.store(READY, Ordering::Release);
+                } else {
+                    while cs.load(Ordering::Acquire) == BLOCKED_ON_RECV {
+                        loom::thread::yield_now();
+                    }
                 }
                 // Must have reply.
                 assert_eq!(rm.load(Ordering::Acquire), 42, "caller woke without reply");
