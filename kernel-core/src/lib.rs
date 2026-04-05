@@ -12,5 +12,6 @@ pub mod pipe;
 pub mod pty;
 pub mod slab;
 pub mod time;
+pub mod trace_ring;
 pub mod tty;
 pub mod types;

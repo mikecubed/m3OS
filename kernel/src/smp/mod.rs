@@ -128,6 +128,12 @@ pub struct PerCoreData {
     /// Fork child entry context — per-core so each core can handle `fork()`
     /// independently without corrupting another core's saved context.
     pub fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx,
+
+    // ----- Phase 43b: per-core trace ring -----
+    /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
+    /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
+    #[cfg(feature = "trace")]
+    pub trace_ring: core::cell::UnsafeCell<kernel_core::trace_ring::TraceRing<256>>,
 }
 
 // Safety: PerCoreData is only accessed by its owning core (via gs_base) or
@@ -400,6 +406,8 @@ pub fn init_bsp_per_core() {
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
+        #[cfg(feature = "trace")]
+        trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
 
     // Fill self-pointer and store in global array.
@@ -507,6 +515,8 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
+        #[cfg(feature = "trace")]
+        trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
 
     unsafe {

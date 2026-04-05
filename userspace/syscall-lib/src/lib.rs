@@ -247,6 +247,9 @@ pub const SYS_DEBUG_PRINT: u64 = 0x1000;
 /// Custom kernel meminfo syscall (Phase 33).
 pub const SYS_MEMINFO: u64 = 0x1001;
 
+/// Custom kernel trace ring read syscall (Phase 43b).
+pub const SYS_KTRACE: u64 = 0x1002;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -1242,6 +1245,25 @@ pub fn serial_print(s: &str) {
 /// Writes a text summary into `buf` and returns the number of bytes written.
 pub fn meminfo(buf: &mut [u8]) -> usize {
     unsafe { syscall2(SYS_MEMINFO, buf.as_mut_ptr() as u64, buf.len() as u64) as usize }
+}
+
+/// Read trace ring entries from a specific core into a byte buffer.
+///
+/// Returns the number of `TraceEntry`-sized records written on success.
+/// Returns `u64::MAX` on invalid core ID or null buffer pointer.
+/// Returns `0` when `buf` is zero-length.
+///
+/// If the kernel is built without the `trace` feature, syscall `0x1002` is
+/// not registered and this returns the raw `-ENOSYS` value as `u64`.
+pub fn ktrace(core_id: u32, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall3(
+            SYS_KTRACE,
+            core_id as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
 }
 
 /// Write a string slice to a file descriptor.

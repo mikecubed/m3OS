@@ -1208,6 +1208,9 @@ pub extern "C" fn syscall_handler(
         0x1000 => sys_debug_print(arg0, arg1),
         // Custom kernel meminfo (Phase 33 Track F)
         0x1001 => sys_meminfo(arg0, arg1),
+        // Custom kernel trace ring read (Phase 43b Track G)
+        #[cfg(feature = "trace")]
+        0x1002 => sys_ktrace(arg0, arg1, arg2),
         _ => {
             // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -12411,4 +12414,69 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// sys_ktrace — Phase 43b Track G
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "trace")]
+/// Read trace ring entries from a specific core into a userspace buffer.
+///
+/// Arguments:
+///   - `core_id`: which core's trace ring to read
+///   - `buf_ptr`: userspace buffer address
+///   - `buf_len`: size of the userspace buffer in bytes
+///
+/// Returns the number of entries written, or `u64::MAX` on error.
+fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let core_id = core_id as u8;
+    if core_id >= crate::smp::core_count() {
+        return u64::MAX;
+    }
+    if buf_ptr == 0 {
+        return u64::MAX;
+    }
+    if buf_len == 0 {
+        return 0;
+    }
+
+    let data = match crate::smp::get_core_data(core_id) {
+        Some(d) => d,
+        None => return u64::MAX,
+    };
+
+    // Safety: trace_ring is wrapped in UnsafeCell for interior mutability.
+    // We only read; the owning core may concurrently write (at most one
+    // torn entry, which is acceptable for diagnostic data).
+    let ring_ptr = data.trace_ring.get();
+
+    let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
+    let max_entries = (buf_len as usize) / entry_size;
+
+    if max_entries == 0 {
+        return 0;
+    }
+
+    // Use a fixed stack buffer to avoid heap allocation. Cap at 64 entries
+    // per call; callers can call again for more.
+    const MAX_BATCH: usize = 64;
+    let batch = max_entries.min(MAX_BATCH);
+    let mut tmp = [kernel_core::trace_ring::TraceEntry::EMPTY; MAX_BATCH];
+    let write_count = unsafe { (*ring_ptr).copy_into(&mut tmp[..batch]) };
+
+    if write_count == 0 {
+        return 0;
+    }
+
+    // TraceEntry uses #[repr(C)] with explicit padding fields zeroed on
+    // construction, so raw byte reinterpretation is safe — no uninit bytes.
+    let src_bytes =
+        unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, write_count * entry_size) };
+
+    if crate::mm::user_mem::copy_to_user(buf_ptr, src_bytes).is_err() {
+        return u64::MAX;
+    }
+
+    write_count as u64
 }
