@@ -73,7 +73,7 @@ fn set_current_task_idx(idx: Option<usize>) {
 // Scheduler struct
 // ---------------------------------------------------------------------------
 
-pub struct Scheduler {
+pub(crate) struct Scheduler {
     tasks: Vec<Task>,
     /// Index of the last non-idle task that was dispatched (for round-robin).
     last_run: usize,
@@ -93,7 +93,7 @@ impl Scheduler {
     /// Return a reference to the task at the given index, if in range.
     ///
     /// Used by `panic_diag` to inspect the current task without panicking.
-    pub fn get_task(&self, idx: usize) -> Option<&Task> {
+    pub(crate) fn get_task(&self, idx: usize) -> Option<&Task> {
         self.tasks.get(idx)
     }
 

@@ -18,6 +18,15 @@ use crate::smp::{self, MAX_CORES};
 /// cannot appear as `lateout` operands.  Using `sym` to reference these statics
 /// avoids allocating a GPR for the destination address (which could itself be
 /// assigned to RBX/RBP, clobbering the value before the store).
+///
+/// SMP note: these are shared globals, so concurrent panics on different cores
+/// could race on these values.  Making them per-core would require knowing the
+/// core ID inside the asm block (or passing a pointer via `in(reg)`, which
+/// reintroduces the register-clobber problem).  In practice, the panic handler
+/// halts the faulting core immediately after the dump and serial output from
+/// concurrent panics is already interleaved.  Worst case: rbx/rbp values in
+/// one core's dump may reflect another core's registers; all other 13 GPRs
+/// remain correct.
 static mut SNAP_RBX: u64 = 0;
 static mut SNAP_RBP: u64 = 0;
 
