@@ -45,12 +45,12 @@ struct RegisterSnapshot {
 /// (file:line) is the best proxy for the faulting instruction.
 fn capture_registers() -> RegisterSnapshot {
     let rax: u64;
-    let rbx: u64;
+    let mut rbx: u64 = 0;
     let rcx: u64;
     let rdx: u64;
     let rsi: u64;
     let rdi: u64;
-    let rbp: u64;
+    let mut rbp: u64 = 0;
     let rsp: u64;
     let r8: u64;
     let r9: u64;
@@ -62,23 +62,32 @@ fn capture_registers() -> RegisterSnapshot {
     let r15: u64;
     let rflags: u64;
 
+    // Capture all GPRs atomically.  rbx and rbp are reserved by LLVM and
+    // cannot appear as lateout operands, so we store them to memory inside
+    // the asm block.  All other GPRs use lateout constraints in a single
+    // block so LLVM cannot clobber uncaptured registers between statements.
     unsafe {
-        core::arch::asm!("mov {}, rax", out(reg) rax);
-        core::arch::asm!("mov {}, rbx", out(reg) rbx);
-        core::arch::asm!("mov {}, rcx", out(reg) rcx);
-        core::arch::asm!("mov {}, rdx", out(reg) rdx);
-        core::arch::asm!("mov {}, rsi", out(reg) rsi);
-        core::arch::asm!("mov {}, rdi", out(reg) rdi);
-        core::arch::asm!("mov {}, rbp", out(reg) rbp);
-        core::arch::asm!("mov {}, rsp", out(reg) rsp);
-        core::arch::asm!("mov {}, r8", out(reg) r8);
-        core::arch::asm!("mov {}, r9", out(reg) r9);
-        core::arch::asm!("mov {}, r10", out(reg) r10);
-        core::arch::asm!("mov {}, r11", out(reg) r11);
-        core::arch::asm!("mov {}, r12", out(reg) r12);
-        core::arch::asm!("mov {}, r13", out(reg) r13);
-        core::arch::asm!("mov {}, r14", out(reg) r14);
-        core::arch::asm!("mov {}, r15", out(reg) r15);
+        core::arch::asm!(
+            "mov [{0}], rbx",
+            "mov [{1}], rbp",
+            in(reg) &mut rbx as *mut u64,
+            in(reg) &mut rbp as *mut u64,
+            lateout("rax") rax,
+            lateout("rcx") rcx,
+            lateout("rdx") rdx,
+            lateout("rsi") rsi,
+            lateout("rdi") rdi,
+            lateout("r8") r8,
+            lateout("r9") r9,
+            lateout("r10") r10,
+            lateout("r11") r11,
+            lateout("r12") r12,
+            lateout("r13") r13,
+            lateout("r14") r14,
+            lateout("r15") r15,
+            options(nostack, preserves_flags),
+        );
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
         core::arch::asm!("pushfq; pop {}", out(reg) rflags);
     }
 

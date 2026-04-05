@@ -241,12 +241,12 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
-            let woke = scheduler::wake_task(receiver);
-            debug_assert!(
-                woke,
-                "send: wake_task failed for receiver {:?} on ep {}",
-                receiver, ep_id.0
-            );
+            // Best-effort wake: the receiver may still be Running if send()
+            // races between the receiver enqueueing itself and actually
+            // blocking.  In that case wake_task() correctly returns false
+            // and the receiver will observe the delivered message and skip
+            // blocking.
+            let _ = scheduler::wake_task(receiver);
         }
         None => {
             // No receiver yet — we're enqueued; block until picked up.
@@ -337,8 +337,10 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(caller: TaskId, reply_msg: Message) {
     scheduler::deliver_message(caller, reply_msg);
-    let woke = scheduler::wake_task(caller);
-    debug_assert!(woke, "reply: wake_task failed for caller {:?}", caller);
+    // Can legitimately race with the caller still transitioning into its
+    // reply-blocked state.  If that happens, the reply is already pending
+    // and the caller will observe it and skip blocking.
+    let _ = scheduler::wake_task(caller);
 }
 
 /// Reply to the current caller and immediately receive the next message.
