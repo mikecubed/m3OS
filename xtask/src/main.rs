@@ -647,6 +647,33 @@ fn build_doom() {
     //   i_allegro*.c     — Allegro audio/music drivers
     //   mus2mid.c        — standalone tool with its own main()
     let dg_game_src = dg_src.join("doomgeneric");
+
+    // Apply local patches — copy any files from userspace/doom/patches/ into
+    // the doomgeneric source tree, overwriting the upstreamed originals.
+    // This runs after git checkout so our patches survive the forced reset.
+    let patches_dir = root.join("userspace/doom/patches");
+    if patches_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&patches_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.extension().is_some_and(|e| e == "c" || e == "h") {
+                    let dst = dg_game_src.join(src.file_name().unwrap());
+                    fs::copy(&src, &dst).unwrap_or_else(|e| {
+                        eprintln!(
+                            "doom: failed to apply patch {:?}: {e}",
+                            src.file_name().unwrap()
+                        );
+                        0
+                    });
+                    println!(
+                        "doom: applied patch {}",
+                        src.file_name().unwrap().to_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+
     let mut c_files: Vec<String> = Vec::new();
     if let Ok(entries) = fs::read_dir(&dg_game_src) {
         for entry in entries.flatten() {
@@ -3408,6 +3435,33 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         pattern: "# ",
         timeout_secs: 5,
         label: "doom: prompt after ls",
+    });
+
+    // -----------------------------------------------------------------------
+    // 19. Phase 47 — run doom and capture debug output before crash
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/doom -iwad /usr/share/doom/doom1.wad 2>&1\n",
+        label: "doom: launch with iwad, redirect stderr",
+    });
+    // Wait for I_InitGraphics to complete (proof WAD loaded OK)
+    steps.push(SmokeStep::Wait {
+        pattern: "I_InitGraphics:",
+        timeout_secs: 30,
+        label: "doom: wait for graphics init",
+    });
+    // Capture the DBG line just before the crash
+    steps.push(SmokeStep::Wait {
+        pattern: "DBG W_CacheLumpNum:",
+        timeout_secs: 10,
+        label: "doom: capture W_CacheLumpNum debug trace",
+    });
+    // Wait for the shell prompt to return after crash
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "doom: prompt after crash",
     });
 
     steps
