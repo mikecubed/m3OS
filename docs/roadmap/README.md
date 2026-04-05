@@ -118,6 +118,11 @@ flowchart TD
     P29 --> P43
     P27 --> P43
     P37 --> P43
+    P43 --> P43a["Phase 43a<br/>Crash Diagnostics"]
+    P43a --> P43b["Phase 43b<br/>Kernel Trace Ring"]
+    P43a --> P43c["Phase 43c<br/>Regression & Stress"]
+    P43b --> P43c
+
     P12 --> P44["Phase 44<br/>Rust Cross-Compilation"]
     P24 --> P44
     P31 --> P45["Phase 45<br/>Ports System"]
@@ -224,6 +229,9 @@ flowchart TD
 | 41 | Expanded Coreutils | head, tail, sort, find, diff, ps, less | Complete | `phase-41` | [Phase 41](./41-expanded-coreutils.md) | [Tasks](./tasks/41-expanded-coreutils-tasks.md) |
 | 42 | Crypto Primitives | RustCrypto crypto-lib, sha256sum, genkey | Complete | `phase-42` | [Phase 42](./42-crypto-primitives.md) | [Tasks](./tasks/42-crypto-primitives-tasks.md) |
 | 43 | SSH | SSH server (sunset IO-less SSH library) | Complete | `phase-43` | [Phase 43](./43-ssh-server.md) | [Tasks](./tasks/43-ssh-server-tasks.md) |
+| 43a | Crash Diagnostics | Enriched panic/fault handlers, scheduler/fork/IPC assertions | Planned | `phase-43a` | — | [Tasks](./tasks/43a-crash-diagnostics-tasks.md) |
+| 43b | Kernel Trace Ring | Per-core lockless trace ring, auto-dump on crash, sys_ktrace | Planned | `phase-43b` | — | [Tasks](./tasks/43b-kernel-trace-ring-tasks.md) |
+| 43c | Regression & Stress | xtask regression/stress commands, CI tiers, proptest/loom | Planned | `phase-43c` | — | [Tasks](./tasks/43c-regression-stress-ci-tasks.md) |
 | 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | Planned | `phase-44` | [Phase 44](./44-rust-cross-compilation.md) | *not yet created* |
 | 45 | Ports System | Source-based package building and installation | Planned | `phase-45` | [Phase 45](./45-ports-system.md) | *not yet created* |
 | 46 | System Services | Service manager, syslog, cron, shutdown | Planned | `phase-46` | [Phase 46](./46-system-services.md) | *not yet created* |
