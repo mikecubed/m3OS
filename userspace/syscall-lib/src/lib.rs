@@ -1298,7 +1298,6 @@ pub fn ktrace(core_id: u32, buf: &mut [u8]) -> u64 {
     }
 }
 
-
 /// Retrieves framebuffer metadata into `buf` (must be ≥ 20 bytes).
 /// Returns 0 on success, negative errno on failure.
 pub fn framebuffer_info(buf: &mut [u8]) -> isize {

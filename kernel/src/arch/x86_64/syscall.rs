@@ -6527,7 +6527,6 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         }
     }
 
-
     if freed_count > 0 {
         log::info!(
             "[munmap] freed {} pages @ {:#x} (len={:#x})",

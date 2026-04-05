@@ -217,28 +217,6 @@ STlib_initMultIcon
 
 
 
-/* Max index we allow before treating it as corruption.  42 faces + 6 keys +
-   generous headroom for other multi-icon widgets.                          */
-#define MULTICON_MAX_INUM 128
-
-static int multicon_guard(st_multicon_t *mi, int inum, const char *where)
-{
-    uintptr_t p_addr = (uintptr_t)(void *)mi->p;
-    /* Valid mi->p must be a non-null BSS pointer in the ELF image range
-       (roughly 0x400000–0x600000 for a musl static build of this size). */
-    if (p_addr < 0x400000u || p_addr > 0x600000u) {
-        STL_FMT("GUARD[%s] mi=%p p=%p CORRUPT(not in BSS) inum=%d oldinum=%d\n",
-                where, (void*)mi, (void*)mi->p, inum, mi->oldinum);
-        return 1; /* bad */
-    }
-    if (inum < 0 || inum >= MULTICON_MAX_INUM) {
-        STL_FMT("GUARD[%s] mi=%p p=%p inum=%d OOB oldinum=%d\n",
-                where, (void*)mi, (void*)mi->p, inum, mi->oldinum);
-        return 1; /* bad */
-    }
-    return 0; /* ok */
-}
-
 void
 STlib_updateMultIcon
 ( st_multicon_t*	mi,
@@ -253,10 +231,6 @@ STlib_updateMultIcon
     {
 	if (mi->oldinum != -1)
 	{
-	    if (multicon_guard(mi, mi->oldinum, "oldpatch")) {
-		mi->oldinum = -1;
-		goto draw_new;
-	    }
 	    patch_t *oldpatch = mi->p[mi->oldinum];
 	    if (oldpatch == NULL) {
 		STL_FMT("STlib_updateMultIcon: NULL oldpatch mi=%p p=%p oldinum=%d inum=%d\n",
@@ -276,21 +250,15 @@ STlib_updateMultIcon
 	}
 draw_new:
 	{
-	    int _inum = *mi->inum;
-	    if (multicon_guard(mi, _inum, "newpatch")) {
-		mi->oldinum = _inum;
-		return;
-	    }
-	    patch_t *newpatch = mi->p[_inum];
+	    patch_t *newpatch = mi->p[*mi->inum];
 	    if (newpatch == NULL) {
 		STL_FMT("STlib_updateMultIcon: NULL newpatch mi=%p p=%p inum=%d\n",
-		        (void*)mi, (void*)mi->p, _inum);
+		        (void*)mi, (void*)mi->p, *mi->inum);
 	    } else {
 		V_DrawPatch(mi->x, mi->y, newpatch);
 	    }
-	    mi->oldinum = _inum;
-	    return;
 	}
+	mi->oldinum = *mi->inum;
     }
 }
 
