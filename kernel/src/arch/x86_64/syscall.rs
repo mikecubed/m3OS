@@ -12434,7 +12434,10 @@ fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     if core_id >= crate::smp::core_count() {
         return u64::MAX;
     }
-    if buf_ptr == 0 || buf_len == 0 {
+    if buf_ptr == 0 {
+        return u64::MAX;
+    }
+    if buf_len == 0 {
         return 0;
     }
 
@@ -12443,9 +12446,11 @@ fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
         None => return u64::MAX,
     };
 
-    // Safety: trace ring is lockless, single-writer. We only read.
-    let data_ptr = data as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-    let snap = unsafe { (*data_ptr).trace_ring.snapshot() };
+    // Safety: trace_ring is wrapped in UnsafeCell for interior mutability.
+    // We only read; the owning core may concurrently write (at most one
+    // torn entry, which is acceptable for diagnostic data).
+    let ring_ptr = data.trace_ring.get();
+    let snap = unsafe { (*ring_ptr).snapshot() };
 
     let entry_size = core::mem::size_of::<kernel_core::trace_ring::TraceEntry>();
     let max_entries = (buf_len as usize) / entry_size;

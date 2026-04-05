@@ -3,7 +3,11 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 /// Structured kernel trace events for scheduler, fork, and IPC paths.
+///
+/// `#[repr(C)]` ensures a stable, deterministic layout for cross-boundary
+/// use (sys_ktrace copies entries to userspace as raw bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub enum TraceEvent {
     // --- Scheduler ---
     Dispatch {
@@ -88,7 +92,10 @@ pub enum TraceEvent {
 }
 
 /// A single trace ring entry: timestamp + core ID + event.
+///
+/// `#[repr(C)]` ensures a stable, deterministic layout for sys_ktrace.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct TraceEntry {
     pub tick: u64,
     pub core: u8,

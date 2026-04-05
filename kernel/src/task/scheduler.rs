@@ -760,12 +760,16 @@ pub fn wake_task(id: TaskId) -> bool {
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex => {
+                    let prev_state = sched.tasks[idx].state as u8;
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
                         (None, true)
                     } else {
                         sched.tasks[idx].state = TaskState::Ready;
-                        (Some((sched.tasks[idx].assigned_core, idx)), true)
+                        (
+                            Some((sched.tasks[idx].assigned_core, idx, prev_state)),
+                            true,
+                        )
                     }
                 }
                 _ => (None, false),
@@ -774,10 +778,10 @@ pub fn wake_task(id: TaskId) -> bool {
             (None, false)
         }
     };
-    if let Some((core, idx)) = enqueue {
+    if let Some((core, idx, prev_state)) = enqueue {
         crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::WakeTask {
             task_idx: idx as u32,
-            state_before: 0, // already transitioned to Ready
+            state_before: prev_state,
             core,
         });
         enqueue_to_core(core, idx);
