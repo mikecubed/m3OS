@@ -1,15 +1,27 @@
-name: PR Check
+name: Nightly Stress Tests
 
 on:
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'  # 3 AM UTC daily
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of stress iterations'
+        required: false
+        default: '50'
+      test:
+        description: 'Stress test name (fork-overlap, pty-overlap, ssh-overlap)'
+        required: false
+        default: 'ssh-overlap'
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
-  check:
+  stress:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -44,22 +56,16 @@ jobs:
           key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
           restore-keys: ${{ runner.os }}-tcc-
 
-      - name: Lint (clippy + fmt)
-        run: cargo xtask check
-
-      - name: Smoke test (boot + login + TCC compile)
+      - name: Run stress test
         run: |
-          # Delete cached disk.img so it is regenerated with TCC files.
-          rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 120
+          TEST="${{ github.event.inputs.test || 'ssh-overlap' }}"
+          ITERS="${{ github.event.inputs.iterations || '50' }}"
+          cargo xtask stress --test "$TEST" --iterations "$ITERS" --timeout 90 --continue-on-failure
 
-      - name: Regression tests (fork-overlap, ipc-wake, pty-overlap)
-        run: cargo xtask regression --timeout 90
-
-      - name: Upload regression artifacts on failure
+      - name: Upload stress artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: regression-artifacts
-          path: target/regression/
+          name: stress-artifacts
+          path: target/stress/
           retention-days: 14
