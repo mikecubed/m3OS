@@ -439,7 +439,7 @@ pub fn set_current_task_pid(pid: u32) {
     }
 }
 
-pub(crate) fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
+pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
     SCHEDULER.lock().tasks[idx].fork_ctx.take()
 }

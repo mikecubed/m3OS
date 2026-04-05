@@ -57,8 +57,13 @@ fn nested_prompt_like_test() {
         if inner_pid == 0 {
             close(fds[0]);
             let payload = b"prompt-ready";
-            if write(fds[1], payload) != payload.len() as isize {
-                fail("fork-test: nested write failed\n", 7)
+            let mut written = 0usize;
+            while written < payload.len() {
+                let n = write(fds[1], &payload[written..]);
+                if n <= 0 {
+                    fail("fork-test: nested write failed\n", 7)
+                }
+                written += n as usize;
             }
             close(fds[1]);
             exit(0)
@@ -66,9 +71,20 @@ fn nested_prompt_like_test() {
 
         close(fds[1]);
 
+        let expected = b"prompt-ready";
         let mut buf = [0u8; 32];
-        let first = read(fds[0], &mut buf);
-        if first != 12 || &buf[..12] != b"prompt-ready" {
+        let mut total = 0usize;
+        while total < expected.len() {
+            let n = read(fds[0], &mut buf[total..]);
+            if n < 0 {
+                fail("fork-test: nested read failed\n", 8)
+            }
+            if n == 0 {
+                fail("fork-test: nested read unexpected EOF\n", 8)
+            }
+            total += n as usize;
+        }
+        if &buf[..total] != expected {
             fail("fork-test: nested read payload failed\n", 8)
         }
 

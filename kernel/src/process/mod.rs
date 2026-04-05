@@ -1343,13 +1343,13 @@ pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64
 /// CR3 if set, updates the kernel stack in TSS/MSR, sets `CURRENT_PID`, then
 /// enters ring 3 at the forked RIP with rax=0.
 pub fn fork_child_trampoline() -> ! {
-    let ctx = crate::task::scheduler::take_current_task_fork_ctx()
+    let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
 
     set_current_pid(ctx.pid);
 
     // Store PID in the current task so the scheduler can restore it on re-dispatch.
-    crate::task::scheduler::set_current_task_pid(ctx.pid);
+    crate::task::set_current_task_pid(ctx.pid);
 
     // Look up page table root and kernel stack for this process.
     let (cr3_phys, kstack_top) = {

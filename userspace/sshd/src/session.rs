@@ -99,18 +99,24 @@ type SharedOutputLock = Rc<Mutex<()>>;
 /// wakers that share the same task waker.
 struct WaitWake {
     fd: i32,
+    events: i16,
     registered: bool,
 }
 
 impl Future for WaitWake {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if fd_is_readable(self.fd) || self.registered {
+        if fd_has_events(self.fd, self.events) || self.registered {
             Poll::Ready(())
         } else {
             self.registered = true;
-            executor::reactor().register_read(self.fd, cx.waker().clone());
-            if fd_is_readable(self.fd) {
+            if (self.events & syscall_lib::POLLIN) != 0 {
+                executor::reactor().register_read(self.fd, cx.waker().clone());
+            }
+            if (self.events & syscall_lib::POLLOUT) != 0 {
+                executor::reactor().register_write(self.fd, cx.waker().clone());
+            }
+            if fd_has_events(self.fd, self.events) {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -309,6 +315,7 @@ async fn io_task(
         // Wait for socket readable (incoming data) or output waker (outgoing data).
         WaitWake {
             fd: sock_fd,
+            events: syscall_lib::POLLIN,
             registered: false,
         }
         .await;
@@ -607,7 +614,7 @@ async fn progress_task(
                 }
                 Ok(Event::None) => ProgressAction::Yield,
                 Ok(_) => ProgressAction::Continue,
-                Err(_) => ProgressAction::Continue,
+                Err(_) => ProgressAction::Fatal,
             }
             // guard is dropped here — Event temporaries are gone
         };
@@ -819,6 +826,19 @@ async fn channel_relay_task(
                     pty_pending[..stash].copy_from_slice(&data[sent..sent + stash]);
                     pty_pending_len = stash;
                 }
+            } else if pty_should_close(
+                n,
+                fd_poll_revents(pty_fd, pty_wait_events(pty_write_pending_len > 0)),
+            ) {
+                if !flush_output_locked(&runner, sock_fd, &output_lock).await {
+                    state.borrow_mut().session_done = true;
+                    state.borrow_mut().exit_code = 1;
+                    session_notify.signal();
+                    return;
+                }
+                state.borrow_mut().session_done = true;
+                session_notify.signal();
+                return;
             }
         }
 
@@ -861,13 +881,17 @@ async fn channel_relay_task(
             }
             drop(ch_ref);
             drop(guard);
-            !(channel_read_ready || channel_write_ready || fd_is_readable(pty_fd))
+            !(channel_read_ready
+                || channel_write_ready
+                || fd_is_readable(pty_fd)
+                || (pty_write_pending_len > 0 && fd_is_writable(pty_fd)))
         };
         if !should_wait {
             continue;
         }
         WaitWake {
             fd: pty_fd,
+            events: pty_wait_events(pty_write_pending_len > 0),
             registered: false,
         }
         .await;
@@ -889,14 +913,38 @@ async fn get_current_waker() -> core::task::Waker {
 }
 
 fn fd_is_readable(fd: i32) -> bool {
+    fd_has_events(fd, syscall_lib::POLLIN)
+}
+
+fn fd_is_writable(fd: i32) -> bool {
+    fd_has_events(fd, syscall_lib::POLLOUT)
+}
+
+fn fd_has_events(fd: i32, events: i16) -> bool {
+    (fd_poll_revents(fd, events) & (events | syscall_lib::POLLHUP | syscall_lib::POLLERR)) != 0
+}
+
+fn fd_poll_revents(fd: i32, events: i16) -> i16 {
     let mut pfd = syscall_lib::PollFd {
         fd,
-        events: syscall_lib::POLLIN,
+        events,
         revents: 0,
     };
     let ready = syscall_lib::poll(core::slice::from_mut(&mut pfd), 0);
-    ready > 0
-        && (pfd.revents & (syscall_lib::POLLIN | syscall_lib::POLLHUP | syscall_lib::POLLERR)) != 0
+    if ready > 0 { pfd.revents } else { 0 }
+}
+
+fn pty_wait_events(has_pending_write: bool) -> i16 {
+    if has_pending_write {
+        syscall_lib::POLLIN | syscall_lib::POLLOUT
+    } else {
+        syscall_lib::POLLIN
+    }
+}
+
+fn pty_should_close(read_result: isize, revents: i16) -> bool {
+    read_result == 0
+        || (read_result < 0 && (revents & (syscall_lib::POLLHUP | syscall_lib::POLLERR)) != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,5 +1231,23 @@ mod tests {
         }
         assert!(out.ends_with(payload));
         close(read_fd);
+    }
+
+    #[test]
+    fn pty_wait_events_adds_pollout_for_pending_write_backpressure() {
+        assert_eq!(pty_wait_events(false), syscall_lib::POLLIN);
+        assert_eq!(
+            pty_wait_events(true),
+            syscall_lib::POLLIN | syscall_lib::POLLOUT
+        );
+    }
+
+    #[test]
+    fn pty_should_close_on_eof_or_hup_err() {
+        assert!(pty_should_close(0, 0));
+        assert!(pty_should_close(-1, syscall_lib::POLLHUP));
+        assert!(pty_should_close(-1, syscall_lib::POLLERR));
+        assert!(!pty_should_close(-1, 0));
+        assert!(!pty_should_close(-11, 0));
     }
 }
