@@ -4,6 +4,7 @@ use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
+use crate::panic_diag;
 use crate::serial::_panic_print;
 
 use super::gdt;
@@ -430,6 +431,25 @@ extern "x86-interrupt" fn page_fault_handler(
             err,
             stack_frame.instruction_pointer.as_u64()
         ));
+        _panic_print(format_args!(
+            "[int] RSP={:#x}\n",
+            stack_frame.stack_pointer.as_u64()
+        ));
+        if crate::smp::is_per_core_ready() {
+            let task_idx = crate::smp::per_core()
+                .current_task_idx
+                .load(Ordering::Relaxed);
+            if let Some(guard) = crate::task::try_lock_scheduler()
+                && task_idx >= 0
+                && let Some(task) = guard.get_task(task_idx as usize)
+            {
+                _panic_print(format_args!(
+                    "[int] task[{}]: state={:?} saved_rsp=0x{:016x}\n",
+                    task_idx, task.state, task.saved_rsp
+                ));
+            }
+        }
+        panic_diag::dump_crash_context();
         // Store the PID for the trampoline. Safe: interrupts are disabled
         // during exception handling on a single CPU.
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -461,6 +481,12 @@ extern "x86-interrupt" fn page_fault_handler(
         "[int] kernel page fault: addr={:?} err={:?}\n{:?}\n",
         addr, err, stack_frame
     ));
+    let (cr3_frame, _) = x86_64::registers::control::Cr3::read_raw();
+    _panic_print(format_args!(
+        "[int] KERNEL page fault — CR3=0x{:016x}\n",
+        cr3_frame.start_address().as_u64()
+    ));
+    panic_diag::dump_crash_context();
     crate::hlt_loop();
 }
 
@@ -475,6 +501,28 @@ extern "x86-interrupt" fn general_protection_fault_handler(
             "[int] userspace GPF: pid={} — process killed\n{:?}\n",
             pid, stack_frame
         ));
+        if crate::smp::is_per_core_ready() {
+            let task_idx = crate::smp::per_core()
+                .current_task_idx
+                .load(Ordering::Relaxed);
+            if let Some(guard) = crate::task::try_lock_scheduler()
+                && task_idx >= 0
+                && let Some(task) = guard.get_task(task_idx as usize)
+            {
+                _panic_print(format_args!(
+                    "[int] pid={} task[{}]: state={:?}\n",
+                    pid, task_idx, task.state
+                ));
+            }
+        }
+        let selector_idx = _err >> 3;
+        let table = (_err >> 1) & 3;
+        let external = _err & 1;
+        _panic_print(format_args!(
+            "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
+            _err, selector_idx, table, external
+        ));
+        panic_diag::dump_crash_context();
         // Store the PID and redirect to the kill trampoline (same pattern as
         // page_fault_handler — no blocking allowed inside an ISR).
         FAULT_KILL_PID.store(pid, Ordering::Relaxed);
@@ -495,11 +543,24 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         return;
     }
     _panic_print(format_args!("[int] GPF: {:?}\n", stack_frame));
+    let selector_idx = _err >> 3;
+    let table = (_err >> 1) & 3;
+    let external = _err & 1;
+    _panic_print(format_args!(
+        "[int] GPF error_code={:#x} (selector_idx={}, table={}, external={})\n",
+        _err, selector_idx, table, external
+    ));
+    panic_diag::dump_crash_context();
     crate::hlt_loop();
 }
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _err: u64) -> ! {
     _panic_print(format_args!("[int] DOUBLE FAULT: {:?}\n", stack_frame));
+    _panic_print(format_args!(
+        "[int] IST RSP={:#x}\n",
+        stack_frame.stack_pointer.as_u64()
+    ));
+    panic_diag::dump_crash_context();
     crate::hlt_loop();
 }
 

@@ -1242,6 +1242,23 @@ pub(crate) struct ForkChildCtx {
 /// syscall entry. For kernel-spawned processes (p11 launcher), they're
 /// zeroed.
 pub(crate) fn make_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) -> ForkChildCtx {
+    debug_assert!(
+        user_rip != 0,
+        "make_fork_ctx: user_rip is zero for pid {}",
+        pid
+    );
+    debug_assert!(
+        user_rsp != 0,
+        "make_fork_ctx: user_rsp is zero for pid {}",
+        pid
+    );
+    debug_assert!(
+        user_rip < 0x0000_8000_0000_0000,
+        "make_fork_ctx: non-canonical user_rip {:#x} for pid {}",
+        user_rip,
+        pid
+    );
+
     // Read ALL saved user registers from per-core data.
     // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
     // so the fork child must restore all of them.
@@ -1346,6 +1363,17 @@ pub fn fork_child_trampoline() -> ! {
     let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
 
+    debug_assert!(
+        ctx.user_rip != 0,
+        "fork_child_trampoline: user_rip is zero for pid {}",
+        ctx.pid
+    );
+    debug_assert!(
+        ctx.user_rsp != 0,
+        "fork_child_trampoline: user_rsp is zero for pid {}",
+        ctx.pid
+    );
+
     set_current_pid(ctx.pid);
 
     // Store PID in the current task so the scheduler can restore it on re-dispatch.
@@ -1357,6 +1385,12 @@ pub fn fork_child_trampoline() -> ! {
         let p = table.find(ctx.pid).expect("fork child: process not found");
         (p.page_table_root, p.kernel_stack_top)
     };
+
+    debug_assert!(
+        cr3_phys.is_some(),
+        "fork_child_trampoline: pid {} has no page table",
+        ctx.pid
+    );
 
     // Update TSS.RSP0 and per-core SYSCALL_STACK_TOP for this process's kernel stack.
     crate::smp::set_current_core_kernel_stack(kstack_top);

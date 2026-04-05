@@ -2634,6 +2634,11 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     };
 
+    debug_assert!(
+        child_cr3.start_address().as_u64() != 0,
+        "sys_fork: child_cr3 is zero"
+    );
+
     // CoW-clone user-accessible pages: share physical frames between parent
     // and child, clearing WRITABLE so writes trigger page faults.
     let phys_off = crate::mm::phys_offset();
@@ -2728,6 +2733,15 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         parent_mmap,
         parent_fds,
         parent_pgid,
+    );
+
+    debug_assert!(
+        crate::process::PROCESS_TABLE
+            .lock()
+            .find(child_pid)
+            .is_some(),
+        "sys_fork: child pid {} not in PROCESS_TABLE after insert",
+        child_pid
     );
 
     // Inherit parent's cwd, signal mask, and signal actions in the child.

@@ -16,6 +16,7 @@ mod fs;
 mod ipc;
 mod mm;
 mod net;
+mod panic_diag;
 mod pci;
 mod pipe;
 mod process;
@@ -1175,6 +1176,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             serial::_panic_print(format_args!("KERNEL PANIC at unknown location\n"));
         }
         serial::_panic_print(format_args!("  {}\n", info.message()));
+        panic_diag::dump_crash_context();
         hlt_loop();
     }
 }
