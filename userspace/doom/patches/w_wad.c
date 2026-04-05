@@ -32,7 +32,7 @@ static int dbg_fd = -1;
 static void dbg_open(void)
 {
     if (dbg_fd < 0)
-        dbg_fd = open("/tmp/doom_dbg.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        dbg_fd = open("/tmp/doom_dbg.txt", O_CREAT | O_WRONLY | O_APPEND, 0644);
 }
 
 static void dbg_write(const char *msg)
