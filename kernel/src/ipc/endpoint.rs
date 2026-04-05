@@ -363,9 +363,11 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
 /// The reply capability must have been removed by the caller before invoking.
 pub fn reply(caller: TaskId, reply_msg: Message) {
     scheduler::deliver_message(caller, reply_msg);
+    // ep is u32::MAX because reply() operates on a caller TaskId, not an
+    // endpoint — the reply capability was already consumed by the caller.
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ReplyDeliver {
         caller_idx: caller.0 as u32,
-        ep: 0,
+        ep: u32::MAX,
     });
     // Can legitimately race with the caller still transitioning into its
     // reply-blocked state.  If that happens, the reply is already pending

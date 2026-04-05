@@ -1363,7 +1363,11 @@ pub fn fork_child_trampoline() -> ! {
     let ctx = crate::task::take_current_task_fork_ctx()
         .expect("fork_child_trampoline: missing task-local fork context");
 
-    let task_idx = crate::task::scheduler::get_current_task_idx().unwrap_or(0) as u32;
+    // u32::MAX sentinel if task index is unexpectedly unset (should not happen
+    // since this runs as a scheduled task, but avoids a misleading 0).
+    let task_idx = crate::task::scheduler::get_current_task_idx()
+        .map(|i| i as u32)
+        .unwrap_or(u32::MAX);
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkTrampolineEnter {
         pid: ctx.pid,
         task_idx,
