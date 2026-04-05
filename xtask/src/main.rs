@@ -106,7 +106,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner|sign>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -4278,13 +4278,13 @@ fn cmd_runner(kernel_binary: PathBuf) {
 #[derive(Debug, Clone)]
 struct RegressionArgs {
     test_name: Option<String>,
-    timeout_secs: u64,
+    timeout_secs: Option<u64>,
     display: bool,
 }
 
 fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
     let mut test_name = None;
-    let mut timeout_secs = 60u64;
+    let mut timeout_secs = None;
     let mut display = false;
     let mut index = 0;
 
@@ -4300,11 +4300,12 @@ fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
             }
             "--timeout" => {
                 index += 1;
-                timeout_secs = args
-                    .get(index)
-                    .ok_or("--timeout requires a value")?
-                    .parse()
-                    .map_err(|_| "invalid --timeout value")?;
+                timeout_secs = Some(
+                    args.get(index)
+                        .ok_or("--timeout requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --timeout value")?,
+                );
             }
             "--display" => display = true,
             other => return Err(format!("unknown regression flag: {other}")),
@@ -4483,11 +4484,7 @@ fn cmd_regression(args: &RegressionArgs) {
     let mut failed = 0usize;
 
     for test in &tests_to_run {
-        let timeout = if args.timeout_secs != 60 {
-            args.timeout_secs
-        } else {
-            test.timeout_secs
-        };
+        let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
         print!("  {}: ", test.name);
         match run_regression_test(test, &uefi_image, &ovmf, timeout, args.display) {
             Ok(serial_log) => {
@@ -4625,7 +4622,21 @@ fn run_smoke_steps_with_capture(
                         ));
                     }
 
-                    if cleaned.contains(pattern) || stripped.contains(pattern) {
+                    if let Some(pos) = cleaned.find(pattern) {
+                        // Drain buffer up to end of matched pattern to prevent
+                        // later steps from re-matching earlier output.
+                        let drain_to = pos + pattern.len();
+                        // Find corresponding position in raw serial_buf. The
+                        // cleaned/stripped text may be shorter, so cap at buf len.
+                        let raw_drain = drain_to.min(serial_buf.len());
+                        *serial_buf = serial_buf[raw_drain..].to_string();
+                        break;
+                    } else if stripped.contains(pattern) {
+                        if let Some(pos) = stripped.find(pattern) {
+                            let drain_to = pos + pattern.len();
+                            let raw_drain = drain_to.min(serial_buf.len());
+                            *serial_buf = serial_buf[raw_drain..].to_string();
+                        }
                         break;
                     }
 
@@ -4649,18 +4660,30 @@ fn run_smoke_steps_with_capture(
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // Trim buffer to avoid unbounded growth.
+                // Trim buffer to avoid unbounded growth. Use char_indices
+                // to find a safe UTF-8 boundary.
                 if serial_buf.len() > 64 * 1024 {
-                    let keep = serial_buf.len() - 48 * 1024;
-                    *serial_buf = serial_buf[keep..].to_string();
+                    let target = serial_buf.len() - 48 * 1024;
+                    let boundary = serial_buf[target..]
+                        .char_indices()
+                        .next()
+                        .map(|(i, _)| target + i)
+                        .unwrap_or(serial_buf.len());
+                    *serial_buf = serial_buf[boundary..].to_string();
                 }
             }
-            SmokeStep::Send { input, label: _ } => {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(input.as_bytes());
-                    let _ = stdin.flush();
-                }
+            SmokeStep::Send { input, label } => {
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| format!("no stdin at step {}/{} ({label})", i + 1, total))?;
+                use std::io::Write;
+                stdin.write_all(input.as_bytes()).map_err(|e| {
+                    format!("write failed at step {}/{} ({label}): {e}", i + 1, total)
+                })?;
+                stdin.flush().map_err(|e| {
+                    format!("flush failed at step {}/{} ({label}): {e}", i + 1, total)
+                })?;
             }
             SmokeStep::Sleep { millis } => {
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
@@ -4702,7 +4725,7 @@ fn extract_trace_dump(test_name: &str, serial_log: &str) {
 struct StressArgs {
     test_name: Option<String>,
     iterations: usize,
-    timeout_secs: u64,
+    timeout_secs: Option<u64>,
     seed: Option<u64>,
     continue_on_failure: bool,
     display: bool,
@@ -4711,7 +4734,7 @@ struct StressArgs {
 fn parse_stress_args(args: &[String]) -> Result<StressArgs, String> {
     let mut test_name = None;
     let mut iterations = 100usize;
-    let mut timeout_secs = 60u64;
+    let mut timeout_secs: Option<u64> = None;
     let mut seed = None;
     let mut continue_on_failure = false;
     let mut display = false;
@@ -4737,11 +4760,12 @@ fn parse_stress_args(args: &[String]) -> Result<StressArgs, String> {
             }
             "--timeout" => {
                 index += 1;
-                timeout_secs = args
-                    .get(index)
-                    .ok_or("--timeout requires a value")?
-                    .parse()
-                    .map_err(|_| "invalid --timeout value")?;
+                timeout_secs = Some(
+                    args.get(index)
+                        .ok_or("--timeout requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --timeout value")?,
+                );
             }
             "--seed" => {
                 index += 1;
@@ -4774,7 +4798,9 @@ struct StressTest {
     name: &'static str,
     #[allow(dead_code)]
     description: &'static str,
-    /// Steps to run via the smoke-script engine.
+    /// Steps to run via the smoke-script engine. The `u64` parameter is the
+    /// per-iteration seed — currently unused by guest steps (timing variation
+    /// requires guest-side support, deferred to a future phase).
     guest_steps: fn(u64) -> Vec<SmokeStep>,
     timeout_secs: u64,
 }
@@ -4869,7 +4895,10 @@ fn cmd_stress(args: &StressArgs) {
     });
     println!(
         "stress: test={} iterations={} seed={} timeout={}s",
-        test.name, args.iterations, seed, args.timeout_secs
+        test.name,
+        args.iterations,
+        seed,
+        args.timeout_secs.unwrap_or(test.timeout_secs)
     );
 
     let kernel_binary = build_kernel();
@@ -4881,11 +4910,7 @@ fn cmd_stress(args: &StressArgs) {
 
     for i in 0..args.iterations {
         let iter_seed = seed.wrapping_add(i as u64);
-        let timeout = if args.timeout_secs != 60 {
-            args.timeout_secs
-        } else {
-            test.timeout_secs
-        };
+        let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
 
         print!("  [{}/{}] ", i + 1, args.iterations);
         let steps = (test.guest_steps)(iter_seed);

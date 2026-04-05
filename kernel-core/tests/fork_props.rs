@@ -1,7 +1,9 @@
 //! Property-based tests for fork context handoff invariants.
 //!
 //! Tests an extracted model of the fork child context queue to verify
-//! FIFO ordering and PID uniqueness under concurrent push/pop.
+//! FIFO ordering, nonzero PIDs, and context integrity under varied
+//! interleaved push/pop sequences. (Single-threaded proptest — concurrent
+//! multi-threaded testing would require loom.)
 
 use proptest::prelude::*;
 use std::collections::VecDeque;
