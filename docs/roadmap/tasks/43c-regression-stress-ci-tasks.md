@@ -20,7 +20,7 @@ mapping that runs regressions on every PR and stress tests nightly.
 | E | `cargo xtask stress` command and framework | A | ✅ Done |
 | F | Dual-session SSH overlap stress | E | ✅ Done |
 | G | Automatic artifact capture | A, E | ✅ Done |
-| H | Seed-based timing randomization | E | ✅ Done |
+| H | Seed-based iteration/reproducibility (guest-side timing variation deferred) | E | ✅ Done |
 | I | CI tier mapping | A, E | ✅ Done |
 | J | Host-side proptest/loom integration | — | ✅ Done |
 | K | Validation and documentation | All | ✅ Done |

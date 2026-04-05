@@ -4708,26 +4708,47 @@ fn run_smoke_steps_with_capture(
     Ok(())
 }
 
-/// Save a text artifact for a regression or stress test.
+/// Save a text artifact to a directory under `target/`.
+fn save_artifact(dir: &Path, filename: &str, content: &str) {
+    if let Err(err) = fs::create_dir_all(dir) {
+        eprintln!(
+            "failed to create artifact directory {}: {err}",
+            dir.display()
+        );
+        return;
+    }
+    let path = dir.join(filename);
+    if let Err(err) = fs::write(&path, content) {
+        eprintln!("failed to write artifact {}: {err}", path.display());
+    }
+}
+
 fn save_regression_artifact(test_name: &str, content: &str, filename: &str) {
     let dir = workspace_root()
         .join("target")
         .join("regression")
         .join(test_name);
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join(filename);
-    let _ = fs::write(&path, content);
+    save_artifact(&dir, filename, content);
 }
 
-/// Extract the trace ring dump section from serial output, if present.
+/// Extract a marked section from serial output and save it.
+fn extract_marked_section(
+    serial_log: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<String> {
+    let start = serial_log.find(start_marker)?;
+    let end = serial_log[start..].find(end_marker)?;
+    Some(serial_log[start..start + end + end_marker.len()].to_string())
+}
+
 fn extract_trace_dump(test_name: &str, serial_log: &str) {
-    let start_marker = "=== TRACE RING DUMP ===";
-    let end_marker = "=== END TRACE RING DUMP ===";
-    if let Some(start) = serial_log.find(start_marker) {
-        if let Some(end) = serial_log[start..].find(end_marker) {
-            let trace = &serial_log[start..start + end + end_marker.len()];
-            save_regression_artifact(test_name, trace, "trace.log");
-        }
+    if let Some(trace) = extract_marked_section(
+        serial_log,
+        "=== TRACE RING DUMP ===",
+        "=== END TRACE RING DUMP ===",
+    ) {
+        save_regression_artifact(test_name, &trace, "trace.log");
     }
 }
 
@@ -5015,19 +5036,16 @@ fn run_regression_with_steps(
 
 fn save_stress_artifact(subdir: &str, content: &str, filename: &str) {
     let dir = workspace_root().join("target").join("stress").join(subdir);
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join(filename);
-    let _ = fs::write(&path, content);
+    save_artifact(&dir, filename, content);
 }
 
 fn extract_stress_trace_dump(subdir: &str, serial_log: &str) {
-    let start_marker = "=== TRACE RING DUMP ===";
-    let end_marker = "=== END TRACE RING DUMP ===";
-    if let Some(start) = serial_log.find(start_marker) {
-        if let Some(end) = serial_log[start..].find(end_marker) {
-            let trace = &serial_log[start..start + end + end_marker.len()];
-            save_stress_artifact(subdir, trace, "trace.log");
-        }
+    if let Some(trace) = extract_marked_section(
+        serial_log,
+        "=== TRACE RING DUMP ===",
+        "=== END TRACE RING DUMP ===",
+    ) {
+        save_stress_artifact(subdir, &trace, "trace.log");
     }
 }
 
