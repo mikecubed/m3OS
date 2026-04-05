@@ -87,6 +87,8 @@ static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser");
 static ID_ELF: &[u8] = include_bytes!("../../initrd/id");
 static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami");
 static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd");
+// Phase 43: SSH server
+static SSHD_ELF: &[u8] = include_bytes!("../../initrd/sshd");
 // Phase 32: build tools and utilities
 static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch");
 static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat");
@@ -230,6 +232,8 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
             content: TELNETD_ELF,
         },
     ),
+    // Phase 43: SSH server
+    ("sshd", RamdiskNode::File { content: SSHD_ELF }),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),

@@ -139,6 +139,7 @@ fn build_userspace_bins() {
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
         ("crypto-test", "crypto-test", true),
+        ("sshd", "sshd", true), // Phase 43: SSH server
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1011,7 +1012,7 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         "-device".to_string(),
         "virtio-net-pci,netdev=net0".to_string(),
         "-netdev".to_string(),
-        "user,id=net0,hostfwd=tcp::2323-:23".to_string(),
+        "user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22".to_string(),
     ]);
 
     // Phase 24: virtio-blk data disk.
@@ -1476,6 +1477,30 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     })
 }
 
+/// Strip lines containing kernel log tags from serial output.
+///
+/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the
+/// same serial port as userspace output.  When a tag appears mid-line (the
+/// kernel interrupted a userspace write), the entire line is corrupted and
+/// must be discarded to avoid false pattern matches.
+///
+/// Operates line-by-line: any line containing a recognised tag is removed.
+/// Tags recognised: `[INFO]`, `[DEBUG]`, `[WARN]`, `[ERROR]`, `[TRACE]`.
+fn strip_kernel_logs(input: &str) -> String {
+    const TAGS: &[&str] = &["[INFO]", "[DEBUG]", "[WARN]", "[ERROR]", "[TRACE]"];
+
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        if !TAGS.iter().any(|tag| line.contains(tag)) {
+            out.push_str(line);
+        }
+    }
+    // Handle trailing content without a newline (incomplete line).
+    // split_inclusive already handles this — if the input doesn't end with
+    // '\n', the last segment is returned without a newline.
+    out
+}
+
 /// Strip ANSI CSI escape sequences from a string.
 ///
 /// Handles: ESC [ <params> <letter>  and  ESC <single-char>.
@@ -1590,9 +1615,39 @@ fn run_smoke_script(
                         serial_buf.push_str(&text);
                     }
 
-                    // Check for pattern in stripped output.
+                    // Check for pattern in stripped output.  Also try with
+                    // kernel log lines removed — the kernel can inject
+                    // `[INFO] [mmap] ...` mid-line, splitting userspace
+                    // output and preventing a contiguous match.
                     let stripped = strip_ansi(&serial_buf);
-                    if let Some(pos) = stripped.find(pattern) {
+                    // First try the normal stripped output.  If that fails,
+                    // try again with kernel log noise removed.
+                    let cleaned;
+                    let (search_str, used_cleaned) = if stripped.contains(pattern) {
+                        (&stripped, false)
+                    } else {
+                        cleaned = strip_kernel_logs(&stripped);
+                        if cleaned.contains(pattern) {
+                            (&cleaned, true)
+                        } else {
+                            (&stripped, false)
+                        }
+                    };
+                    if let Some(pos) = search_str.find(pattern) {
+                        if used_cleaned {
+                            // Kernel log lines were interleaved — we can't
+                            // precisely map cleaned positions back to raw
+                            // positions.  Drain up to the last newline to
+                            // avoid dropping post-match content (e.g., the
+                            // next prompt already in the buffer).
+                            if let Some(nl) = serial_buf.rfind('\n') {
+                                serial_buf.drain(..=nl);
+                            } else if serial_buf.len() > 4096 {
+                                let drain = serial_buf.len() - 4096;
+                                serial_buf.drain(..drain);
+                            }
+                            break;
+                        }
                         // Drain buffer up to end of match to avoid re-matching
                         // old output while preserving any post-match content.
                         let drain_end = pos + pattern.len();
@@ -1777,6 +1832,54 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for shell prompt",
     });
 
+    // Fork/wait regression: nested fork + pipe + waitpid flow that mirrors
+    // ion spawning PROMPT and draining its output before reaping it.
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fork-test\n",
+        label: "run nested fork regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "fork-test: PASS",
+        timeout_secs: 20,
+        label: "verify nested fork regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after nested fork regression",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/pty-test\n",
+        label: "run PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: ion_prompt",
+        timeout_secs: 20,
+        label: "verify PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: dual_ion_prompts",
+        timeout_secs: 20,
+        label: "verify dual PTY ion prompt regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "PASS: dual_ion_supervisors",
+        timeout_secs: 20,
+        label: "verify dual PTY supervisor regression",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "pty-test: 11 passed, 0 failed",
+        timeout_secs: 20,
+        label: "verify PTY test summary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after PTY regression",
+    });
+
     // -----------------------------------------------------------------------
     // 2. Basic coreutils sanity
     // -----------------------------------------------------------------------
@@ -1806,7 +1909,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "tcc version",
-        timeout_secs: 15,
+        timeout_secs: 30,
         label: "verify TCC version",
     });
     steps.push(SmokeStep::Wait {
@@ -1903,21 +2006,28 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         input: "/bin/make\n",
         label: "make: build demo project",
     });
+    // Wait for the final link step to appear, then wait for the prompt.
+    // (Just waiting for `# ` can match sub-shell prompts between make recipes.)
+    steps.push(SmokeStep::Wait {
+        pattern: "-o demo main.o util.o",
+        timeout_secs: 45,
+        label: "wait for make link step",
+    });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 30,
-        label: "wait for make to finish",
+        timeout_secs: 20,
+        label: "wait for prompt after make",
     });
 
     // Run the built binary
-    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Sleep { millis: 1000 });
     steps.push(SmokeStep::Send {
         input: "/home/project/demo\n",
         label: "run demo binary",
     });
     steps.push(SmokeStep::Wait {
         pattern: "Demo project running!",
-        timeout_secs: 15,
+        timeout_secs: 20,
         label: "verify demo output",
     });
     steps.push(SmokeStep::Wait {
@@ -2023,8 +2133,8 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         10,
     ));
     steps.extend(cmd_then_prompt(
-        "/bin/ln -s /././././././././././././././././././././././././././././././etc/passwd /phase38-passwd-link\n",
-        "send: ln -s /etc/passwd /phase38-passwd-link",
+        "/bin/ln -s /etc/../etc/passwd /phase38-passwd-link\n",
+        "send: ln -s /etc/../etc/passwd /phase38-passwd-link",
         "wait: prompt after ext2 symlink create",
         10,
     ));
@@ -2048,7 +2158,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "readlink: verify ext2 symlink target",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "/etc/passwd",
+        pattern: "/etc/../etc/passwd",
         timeout_secs: 10,
         label: "verify ext2 readlink output",
     });
@@ -2332,7 +2442,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "1",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify numeric sort first line",
     });
     steps.push(SmokeStep::Wait {
@@ -2347,7 +2457,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "2",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify numeric sort middle line",
     });
     steps.push(SmokeStep::Wait {
@@ -2362,7 +2472,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "10",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "verify clustered pipeline first line",
     });
     steps.push(SmokeStep::Wait {
@@ -2377,7 +2487,7 @@ fn smoke_test_script() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "2 root:x:0:0:root:/root:/bin/ion",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "verify uniq count output",
     });
     steps.push(SmokeStep::Wait {

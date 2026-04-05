@@ -21,7 +21,7 @@ pub mod futex;
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
@@ -1211,7 +1211,7 @@ pub fn send_sigchld_to_parent(child_pid: Pid) {
 // ---------------------------------------------------------------------------
 
 /// Context passed from `sys_fork` to `fork_child_trampoline`.
-struct ForkChildCtx {
+pub(crate) struct ForkChildCtx {
     pid: Pid,
     user_rip: u64,
     user_rsp: u64,
@@ -1236,17 +1236,12 @@ struct ForkChildCtx {
     user_rflags: u64,
 }
 
-/// Queue of fork-child contexts, consumed by `fork_child_trampoline`.
-///
-/// Uses a `VecDeque` for O(1) pop-from-front semantics.
-static FORK_CHILD_QUEUE: Mutex<VecDeque<ForkChildCtx>> = Mutex::new(VecDeque::new());
-
-/// Push a fork-child context so `fork_child_trampoline` can consume it.
+/// Build a fork-child context for `fork_child_trampoline`.
 ///
 /// For fork() calls, the registers are read from the statics saved at
 /// syscall entry. For kernel-spawned processes (p11 launcher), they're
 /// zeroed.
-pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
+pub(crate) fn make_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) -> ForkChildCtx {
     // Read ALL saved user registers from per-core data.
     // The Linux syscall ABI preserves all regs except RAX/RCX/R11,
     // so the fork child must restore all of them.
@@ -1266,7 +1261,7 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
         pc.syscall_user_r10,
         pc.syscall_user_rflags,
     );
-    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+    ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
@@ -1283,15 +1278,15 @@ pub fn push_fork_ctx(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r9: r9,
         user_r10: r10,
         user_rflags: rflags,
-    });
+    }
 }
 
-/// Like [`push_fork_ctx`], but zeros all caller-saved registers.
+/// Like [`make_fork_ctx`], but zeros all caller-saved registers.
 ///
 /// Use this for kernel-spawned processes (not from `sys_fork`) where the
 /// `SYSCALL_USER_*` statics contain stale values from a previous syscall.
-pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
-    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+pub(crate) fn make_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) -> ForkChildCtx {
+    ForkChildCtx {
         pid,
         user_rip,
         user_rsp,
@@ -1308,19 +1303,19 @@ pub fn push_fork_ctx_zeroed(pid: Pid, user_rip: u64, user_rsp: u64) {
         user_r9: 0,
         user_r10: 0,
         user_rflags: 0x202, // IF set, reserved bit set — safe default
-    });
+    }
 }
 
-/// Push a fork context for a clone(CLONE_THREAD) child.
+/// Build a fork context for a clone(CLONE_THREAD) child.
 ///
 /// The child thread starts at `user_rip` (the return address from the
 /// clone syscall) with `user_rsp` set to the provided child stack.
 /// Callee-saved registers are inherited from the parent's syscall entry.
 /// Caller-saved registers (rdi, rsi, rdx, r8, r9, r10) are zeroed
 /// because the clone wrapper sets up its own context.
-pub fn push_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) {
+pub(crate) fn make_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) -> ForkChildCtx {
     let pc = crate::smp::per_core();
-    FORK_CHILD_QUEUE.lock().push_back(ForkChildCtx {
+    ForkChildCtx {
         pid,
         user_rip,
         user_rsp: child_stack,
@@ -1339,25 +1334,22 @@ pub fn push_fork_ctx_for_thread(pid: Pid, user_rip: u64, child_stack: u64) {
         user_r9: 0,
         user_r10: 0,
         user_rflags: pc.syscall_user_rflags,
-    });
+    }
 }
 
 /// Kernel-task entry point for a fork child.
 ///
-/// Pops the next fork context from `FORK_CHILD_QUEUE`, switches the process's
+/// Takes the fork context attached to the current task, switches the process's
 /// CR3 if set, updates the kernel stack in TSS/MSR, sets `CURRENT_PID`, then
 /// enters ring 3 at the forked RIP with rax=0.
 pub fn fork_child_trampoline() -> ! {
-    // Pop the context set up by sys_fork / run_elf_and_report.
-    let ctx = FORK_CHILD_QUEUE
-        .lock()
-        .pop_front()
-        .expect("fork_child_trampoline: FORK_CHILD_QUEUE is empty — missing push_fork_ctx");
+    let ctx = crate::task::take_current_task_fork_ctx()
+        .expect("fork_child_trampoline: missing task-local fork context");
 
     set_current_pid(ctx.pid);
 
     // Store PID in the current task so the scheduler can restore it on re-dispatch.
-    crate::task::scheduler::set_current_task_pid(ctx.pid);
+    crate::task::set_current_task_pid(ctx.pid);
 
     // Look up page table root and kernel stack for this process.
     let (cr3_phys, kstack_top) = {

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.42.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, and a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.43.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, and a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities.
 
 ## Build & Run
 
@@ -103,6 +103,7 @@ userspace/
   crypto-lib/             # Cryptography library (Phase 42)
   crypto-test/            # Crypto integration test (Phase 42)
   telnetd/                # Telnet server daemon (Phase 30)
+  sshd/                   # SSH server daemon (Phase 43)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
   coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey
   demo-project/           # Multi-file C demo project for make testing (Phase 32)
@@ -264,6 +265,8 @@ Read before making significant changes:
 | `docs/34-timekeeping.md` | Before touching RTC, clock_gettime, gettimeofday, or time conversion |
 | `docs/roadmap/39-unix-domain-sockets.md` | Before touching Unix domain sockets, AF_UNIX, socketpair, or `kernel/src/net/unix.rs` |
 | `docs/roadmap/42-crypto-primitives.md` | Before touching crypto-lib, sha256sum, genkey, or RustCrypto integration |
+| `docs/roadmap/43-ssh-server.md` | Before touching sshd, sunset integration, host keys, or SSH authentication |
+| `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
 Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.

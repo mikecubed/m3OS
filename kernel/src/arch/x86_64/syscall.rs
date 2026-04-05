@@ -173,7 +173,7 @@ fn basename(path: &str) -> &str {
 }
 
 fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
-    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" {
+    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" || abs_path == "/dev/pts" {
         return Ok(PathNodeKind::Dir);
     }
     if let Some(node) = crate::fs::procfs::path_node(abs_path) {
@@ -653,6 +653,7 @@ fn statfs_path_exists(abs_path: &str) -> bool {
         return true;
     }
     if abs_path == "/dev"
+        || abs_path == "/dev/pts"
         || abs_path == "/dev/null"
         || abs_path == "/dev/zero"
         || abs_path == "/dev/urandom"
@@ -2753,11 +2754,10 @@ fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         }
     }
 
-    // Push the fork context so fork_child_trampoline can find the right RIP/RSP.
-    crate::process::push_fork_ctx(child_pid, user_rip, user_rsp);
-
-    // Spawn a kernel task for the child; it will enter ring 3 on first dispatch.
-    crate::task::spawn(crate::process::fork_child_trampoline, "fork-child");
+    crate::task::spawn_fork_task(
+        crate::process::make_fork_ctx(child_pid, user_rip, user_rsp),
+        "fork-child",
+    );
 
     log::info!("[p{}] fork() → child pid {}", parent_pid, child_pid);
     child_pid as u64
@@ -4948,7 +4948,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         };
         return match alloc_fd(3, entry) {
             Some(i) => {
-                log::info!("[open] {} → fd {} (dir)", name, i);
+                log::debug!("[open] {} → fd {} (dir)", name, i);
                 i as u64
             }
             None => NEG_EMFILE,
@@ -5031,7 +5031,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
         };
         match alloc_fd(3, entry) {
             Some(i) => {
-                log::info!("[open] {} → fd {} (tmpfs)", name, i);
+                log::debug!("[open] {} → fd {} (tmpfs)", name, i);
                 return i as u64;
             }
             None => {
@@ -5073,7 +5073,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                             return match alloc_fd(3, fd_entry) {
                                 Some(i) => {
-                                    log::info!("[open] {} → fd {} (fat32 dir)", name, i);
+                                    log::debug!("[open] {} → fd {} (fat32 dir)", name, i);
                                     i as u64
                                 }
                                 None => NEG_EMFILE,
@@ -5136,7 +5136,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                         return match alloc_fd(3, fd_entry) {
                             Some(i) => {
-                                log::info!("[open] {} → fd {} (fat32)", name, i);
+                                log::debug!("[open] {} → fd {} (fat32)", name, i);
                                 i as u64
                             }
                             None => NEG_EMFILE,
@@ -5185,7 +5185,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
 
                                 return match alloc_fd(3, fd_entry) {
                                     Some(i) => {
-                                        log::info!("[open] {} → fd {} (fat32 new)", name, i);
+                                        log::debug!("[open] {} → fd {} (fat32 new)", name, i);
                                         i as u64
                                     }
                                     None => NEG_EMFILE,
@@ -5265,7 +5265,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
                     };
                     return match alloc_fd(3, fd_entry) {
                         Some(i) => {
-                            log::info!("[open] {} → fd {} (fat32 /etc alias)", name, i);
+                            log::debug!("[open] {} → fd {} (fat32 /etc alias)", name, i);
                             i as u64
                         }
                         None => NEG_EMFILE,
@@ -5290,7 +5290,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     };
     match alloc_fd(3, entry) {
         Some(i) => {
-            log::info!("[open] {} → fd {}", name, i);
+            log::debug!("[open] {} → fd {}", name, i);
             i as u64
         }
         None => {
@@ -5573,7 +5573,7 @@ fn open_ext2_file(
 
             match alloc_fd(3, fd_entry) {
                 Some(i) => {
-                    log::info!("[open] {} → fd {} (ext2)", name, i);
+                    log::debug!("[open] {} → fd {} (ext2)", name, i);
                     i as u64
                 }
                 None => NEG_EMFILE,
@@ -5613,7 +5613,7 @@ fn open_ext2_file(
                     };
                     match alloc_fd(3, fd_entry) {
                         Some(i) => {
-                            log::info!("[open] {} → fd {} (ext2 new)", name, i);
+                            log::debug!("[open] {} → fd {} (ext2 new)", name, i);
                             i as u64
                         }
                         None => NEG_EMFILE,
@@ -5889,7 +5889,7 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if crate::fs::ramdisk::ramdisk_lookup(abs_path).is_some() {
         return Some((0, 0, 0o755));
     }
-    if abs_path == "/dev" {
+    if abs_path == "/dev" || abs_path == "/dev/pts" {
         return Some((0, 0, 0o755));
     }
     if abs_path == "/dev/null"
@@ -6299,7 +6299,6 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
-    log::info!("[mmap] anon {}×4K @ {:#x}", pages, base);
     base
 }
 
@@ -6354,7 +6353,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             }
         }
     }
-    let freed_count = unmapped_addrs.len();
+    let _freed_count = unmapped_addrs.len();
 
     // SMP TLB shootdown: invalidate only pages that were actually unmapped.
     for &page_addr in &unmapped_addrs {
@@ -6405,15 +6404,6 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             });
             proc.mappings.extend(new_mappings);
         }
-    }
-
-    if freed_count > 0 {
-        log::info!(
-            "[munmap] freed {} pages @ {:#x} (len={:#x})",
-            freed_count,
-            addr,
-            len
-        );
     }
 
     0
@@ -6790,7 +6780,7 @@ fn sys_linux_brk(addr: u64) -> u64 {
         }
     }
 
-    log::info!("[brk] extended to {:#x} ({} pages)", new_brk, pages_needed);
+    // Omit per-call log to avoid flooding serial during high-alloc workloads.
     new_brk
 }
 
@@ -9222,13 +9212,10 @@ fn sys_clone_thread(
         let _ = crate::mm::user_mem::copy_to_user(child_tidptr, &tid_bytes);
     }
 
-    // Push a fork context for the child thread. The child will start at
-    // user_rip (the return address from the clone syscall) with rax=0 and
-    // RSP = child_stack.
-    crate::process::push_fork_ctx_for_thread(child_pid, user_rip, child_stack);
-
-    // Spawn a kernel task for the child thread.
-    crate::task::spawn(crate::process::fork_child_trampoline, "clone-thread");
+    crate::task::spawn_fork_task(
+        crate::process::make_fork_ctx_for_thread(child_pid, user_rip, child_stack),
+        "clone-thread",
+    );
 
     log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64

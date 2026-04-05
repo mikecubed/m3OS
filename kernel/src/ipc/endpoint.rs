@@ -178,7 +178,7 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
         }
         None => {
             // Block; sender will call deliver_message + wake_task on us.
-            scheduler::block_current_on_recv();
+            scheduler::block_current_on_recv_unless_message();
         }
     }
     // After waking (or immediate delivery), consume the pending message.
@@ -299,7 +299,7 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
         }
     }
     // Block waiting for reply regardless of whether server was already waiting.
-    scheduler::block_current_on_reply();
+    scheduler::block_current_on_reply_unless_message();
     // Woken by reply() — reply message was delivered into our slot.
     match scheduler::take_message(caller) {
         Some(msg) => msg,
