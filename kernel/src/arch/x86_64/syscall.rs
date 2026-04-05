@@ -736,6 +736,16 @@ fn per_core_syscall_arg3() -> u64 {
     crate::smp::per_core().syscall_arg3
 }
 
+/// Read the per-core R8 saved at SYSCALL entry (syscall arg4 = fd for mmap).
+fn per_core_syscall_user_r8() -> u64 {
+    crate::smp::per_core().syscall_user_r8
+}
+
+/// Read the per-core R9 saved at SYSCALL entry (syscall arg5 = offset for mmap).
+fn per_core_syscall_user_r9() -> u64 {
+    crate::smp::per_core().syscall_user_r9
+}
+
 /// Read the per-core `syscall_stack_top`.
 pub(crate) fn per_core_syscall_stack_top() -> u64 {
     crate::smp::per_core().syscall_stack_top
@@ -6312,8 +6322,93 @@ fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 // ---------------------------------------------------------------------------
 // T018: mmap(addr, len, prot, flags[from SYSCALL_ARG3], fd, offset)
 //
-// Only MAP_PRIVATE|MAP_ANONYMOUS (flags 0x22) with fd=-1 is supported.
+// Supports MAP_PRIVATE|MAP_ANONYMOUS and file-backed MAP_PRIVATE|MAP_SHARED.
+// File-backed mappings use Strategy A (eager loading): all pages are
+// immediately faulted in at mmap time.
 // ---------------------------------------------------------------------------
+
+/// Read `buf.len()` bytes from process `pid`'s fd `fd` at file byte `offset`
+/// into the kernel buffer `buf`.  Does **not** advance the fd's offset.
+/// Returns the number of bytes actually read, or a negative errno on error.
+fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Result<usize, i64> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let entry = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(p) => p.fd_get(fd),
+            None => return Err(NEG_EBADF as i64),
+        }
+    };
+    let entry = match entry {
+        Some(e) => e,
+        None => return Err(NEG_EBADF as i64),
+    };
+    match &entry.backend {
+        FdBackend::Ramdisk {
+            content_addr,
+            content_len,
+        } => {
+            if offset >= *content_len {
+                return Ok(0);
+            }
+            let available = content_len - offset;
+            let to_read = buf.len().min(available);
+            // SAFETY: content_addr is a static ramdisk pointer (lives for 'static).
+            let src = unsafe {
+                core::slice::from_raw_parts((*content_addr + offset) as *const u8, to_read)
+            };
+            buf[..to_read].copy_from_slice(src);
+            Ok(to_read)
+        }
+        FdBackend::Tmpfs { path } => {
+            let path = path.clone();
+            let tmpfs = crate::fs::tmpfs::TMPFS.lock();
+            match tmpfs.read_file(&path, offset, buf.len()) {
+                Ok(data) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Err(crate::fs::tmpfs::TmpfsError::NotFound) => Err(NEG_ENOENT as i64),
+                Err(_) => Err(NEG_EIO as i64),
+            }
+        }
+        FdBackend::Fat32Disk {
+            start_cluster,
+            file_size,
+            ..
+        } => {
+            let start_cluster = *start_cluster;
+            let file_size = *file_size;
+            if start_cluster < 2 || offset >= file_size as usize {
+                return Ok(0);
+            }
+            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+            match vol.as_ref() {
+                Some(v) => v
+                    .read_file(start_cluster, file_size, offset, buf)
+                    .map_err(|_| NEG_EIO as i64),
+                None => Err(NEG_EIO as i64),
+            }
+        }
+        FdBackend::Ext2Disk { inode_num, .. } => {
+            let inode_num = *inode_num;
+            let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+            match vol.as_ref() {
+                Some(v) => match v.read_inode(inode_num) {
+                    Ok(inode) => v
+                        .read_file_data(&inode, offset as u64, buf)
+                        .map_err(|_| NEG_EIO as i64),
+                    Err(_) => Err(NEG_EIO as i64),
+                },
+                None => Err(NEG_EIO as i64),
+            }
+        }
+        _ => Err(NEG_EINVAL as i64),
+    }
+}
 
 fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // Read flags from SYSCALL_ARG3 (r10 at syscall entry).
@@ -6322,16 +6417,18 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_ANONYMOUS: u64 = 0x20;
-    if flags & MAP_ANONYMOUS == 0 {
-        log::warn!(
-            "[mmap] non-anonymous mmap not supported (flags={:#x})",
-            flags
-        );
-        return NEG_EINVAL;
-    }
-    // Mask prot and flags to supported bits only.
+
+    // Mask prot to supported bits only.
     const PROT_MASK: u64 = 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
     let prot = prot & PROT_MASK;
+
+    if flags & MAP_ANONYMOUS == 0 {
+        // File-backed mmap — Strategy A (eager loading).
+        let fd = per_core_syscall_user_r8() as usize;
+        let file_offset = per_core_syscall_user_r9() as usize;
+        return sys_mmap_file_backed(addr_hint, len, prot, flags, fd, file_offset);
+    }
+
     let flags = flags & (MAP_PRIVATE | MAP_ANONYMOUS);
 
     let len = if len == 0 {
@@ -6401,8 +6498,169 @@ fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// T019: munmap(addr, len) — Phase 33: reclaim frames + TLB shootdown
+// File-backed mmap — Strategy A: eager loading.
+//
+// Allocates physical frames, reads the file data into them, maps them into
+// the process page table, and records a VMA entry.  munmap/process teardown
+// will free the frames via the normal frame-allocator path.
 // ---------------------------------------------------------------------------
+
+fn sys_mmap_file_backed(
+    _addr_hint: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: usize,
+    file_offset: usize,
+) -> u64 {
+    if len == 0 || fd >= crate::process::MAX_FDS {
+        return NEG_EINVAL;
+    }
+
+    let pages = len.div_ceil(4096);
+    let total_size = match pages.checked_mul(4096) {
+        Some(s) => s,
+        None => return NEG_EINVAL,
+    };
+    if total_size > 0x0000_8000_0000_0000 {
+        return NEG_EINVAL;
+    }
+
+    use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
+
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    let mut pt_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        pt_flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        pt_flags |= PageTableFlags::NO_EXECUTE;
+    }
+
+    let pid = crate::process::current_pid();
+    let phys_off = crate::mm::phys_offset();
+
+    // Claim a virtual address range.
+    let base = {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
+        };
+        if proc.mmap_next == 0 {
+            proc.mmap_next = ANON_MMAP_BASE;
+        }
+        let b = proc.mmap_next;
+        let end = match b.checked_add(total_size) {
+            Some(v) if v <= 0x0000_8000_0000_0000 => v,
+            _ => return NEG_EINVAL,
+        };
+        proc.mmap_next = end;
+        b
+    };
+
+    // Get the process CR3 for the mapper.
+    let cr3_phys = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid).and_then(|p| p.page_table_root) {
+            Some(phys) => phys,
+            None => return NEG_EINVAL,
+        }
+    };
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => return NEG_EINVAL,
+    };
+
+    // Allocate frames, fill from file, map into page table.
+    let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
+    let mut page_buf = alloc::vec![0u8; 4096];
+
+    for i in 0..pages {
+        let frame = match crate::mm::frame_allocator::allocate_frame() {
+            Some(f) => f,
+            None => {
+                log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
+                // Roll back already-allocated frames.
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(proc) = table.find_mut(pid) {
+                    proc.mmap_next = base;
+                }
+                return NEG_ENOMEM;
+            }
+        };
+
+        // Zero the frame then fill from file.
+        let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
+        unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
+
+        let read_offset = file_offset + (i as usize) * 4096;
+        match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
+            Ok(n) if n > 0 => unsafe {
+                core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
+            },
+            Ok(_) => {} // EOF or past-end page — leave zeroed
+            Err(e) => {
+                // I/O error — clean up and abort.
+                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                for f in &mapped_frames {
+                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                }
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                if let Some(proc) = table.find_mut(pid) {
+                    proc.mmap_next = base;
+                }
+                return e as u64;
+            }
+        }
+
+        mapped_frames.push(frame);
+    }
+
+    // Map all frames into the process page table.
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+    if unsafe {
+        crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
+    }
+    .is_err()
+    {
+        for f in &mapped_frames {
+            crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+        }
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.mmap_next = base;
+        }
+        return NEG_EINVAL;
+    }
+
+    // Record the VMA.
+    {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            proc.mappings.push(crate::process::MemoryMapping {
+                start: base,
+                len: total_size,
+                prot,
+                flags,
+            });
+        }
+    }
+
+    log::info!(
+        "[mmap_file] fd={} off={} {}×4K @ {:#x}",
+        fd,
+        file_offset,
+        pages,
+        base
+    );
+    base
+}
 
 fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     // Validate: page-aligned address and non-zero length.
@@ -6470,7 +6728,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
             }
         }
     }
-    let _freed_count = unmapped_addrs.len();
+    let freed_count = unmapped_addrs.len();
 
     // SMP TLB shootdown: invalidate only pages that were actually unmapped.
     for &page_addr in &unmapped_addrs {
