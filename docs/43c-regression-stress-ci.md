@@ -81,7 +81,8 @@ cargo xtask stress --test ssh-overlap --seed 1712345678 --iterations 1
 
 ### Artifact Capture
 
-On failure, artifacts are saved automatically:
+Serial logs are saved on every run (pass or fail). Trace ring dumps
+are extracted into separate files when a kernel crash is detected:
 
 ```
 target/regression/<test-name>/serial.log    # Full serial output

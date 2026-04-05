@@ -4608,12 +4608,14 @@ fn run_smoke_steps_with_capture(
                     let cleaned = strip_kernel_logs(&stripped);
 
                     // Check for kernel-level crash indicators in serial output.
-                    // Use specific patterns to avoid matching handled userspace
-                    // faults like "[int] userspace page fault: pid=N — process killed".
+                    // Only match ring-0 crashes, not handled ring-3 faults:
+                    // - "userspace page fault" + "CRASH DIAGNOSTICS" = handled (process killed)
+                    // - "kernel page fault" = ring-0 crash (OS halts)
+                    // - "KERNEL PANIC" = explicit kernel panic
+                    // - "DOUBLE FAULT" = unrecoverable double fault
                     if cleaned.contains("KERNEL PANIC")
                         || cleaned.contains("kernel page fault")
                         || cleaned.contains("DOUBLE FAULT")
-                        || cleaned.contains("=== CRASH DIAGNOSTICS ===")
                     {
                         return Err(format!(
                             "kernel crash detected during step {}/{} ({label})",
@@ -4622,22 +4624,27 @@ fn run_smoke_steps_with_capture(
                         ));
                     }
 
-                    if let Some(pos) = cleaned.find(pattern) {
-                        // Drain buffer up to end of matched pattern to prevent
-                        // later steps from re-matching earlier output.
-                        let drain_to = pos + pattern.len();
-                        // Find corresponding position in raw serial_buf. The
-                        // cleaned/stripped text may be shorter, so cap at buf len.
-                        let raw_drain = drain_to.min(serial_buf.len());
-                        *serial_buf = serial_buf[raw_drain..].to_string();
-                        break;
-                    } else if stripped.contains(pattern) {
-                        if let Some(pos) = stripped.find(pattern) {
-                            let drain_to = pos + pattern.len();
-                            let raw_drain = drain_to.min(serial_buf.len());
-                            *serial_buf = serial_buf[raw_drain..].to_string();
+                    if cleaned.contains(pattern) || stripped.contains(pattern) {
+                        // Drain buffer up to last newline to prevent later
+                        // steps from re-matching earlier output. We can't map
+                        // cleaned/stripped offsets back to raw serial_buf offsets
+                        // (ANSI stripping + log filtering change positions), so
+                        // drain to the last newline which is safe and conservative.
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        } else if serial_buf.len() > 4096 {
+                            serial_buf.drain(..serial_buf.len() - 4096);
                         }
                         break;
+                    }
+
+                    // Detect QEMU exit (serial pipe closed).
+                    if rx.try_recv().is_err() && child.try_wait().ok().flatten().is_some() {
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {}/{} ({label})",
+                            i + 1,
+                            total
+                        ));
                     }
 
                     if std::time::Instant::now() >= deadline {
@@ -4660,16 +4667,14 @@ fn run_smoke_steps_with_capture(
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
 
-                // Trim buffer to avoid unbounded growth. Use char_indices
-                // to find a safe UTF-8 boundary.
+                // Trim buffer to avoid unbounded growth.
                 if serial_buf.len() > 64 * 1024 {
-                    let target = serial_buf.len() - 48 * 1024;
-                    let boundary = serial_buf[target..]
-                        .char_indices()
-                        .next()
-                        .map(|(i, _)| target + i)
+                    let keep_from = serial_buf.len() - 48 * 1024;
+                    // Find next char boundary at or after keep_from.
+                    let boundary = (keep_from..serial_buf.len())
+                        .find(|&i| serial_buf.is_char_boundary(i))
                         .unwrap_or(serial_buf.len());
-                    *serial_buf = serial_buf[boundary..].to_string();
+                    serial_buf.drain(..boundary);
                 }
             }
             SmokeStep::Send { input, label } => {
@@ -4821,7 +4826,7 @@ fn stress_tests() -> Vec<StressTest> {
         },
         StressTest {
             name: "ssh-overlap",
-            description: "Dual-session SSH overlap (boot + login + dual fork-test)",
+            description: "Boot + login + fork-test + pty-test back-to-back (SMP-sensitive paths)",
             guest_steps: |_seed| ssh_overlap_steps(),
             timeout_secs: 90,
         },

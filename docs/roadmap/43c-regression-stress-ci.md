@@ -10,7 +10,8 @@
 
 A layered test infrastructure that catches SMP race conditions through focused
 QEMU regression tests, looped stress tests with automatic artifact capture,
-seed-based timing randomization for reproducibility, host-side property and
+seed-based iteration for reproducibility (guest-side timing variation deferred),
+host-side property and
 concurrency testing for extracted scheduler/fork/IPC models, and CI tier mapping
 that runs regressions on every PR and stress tests nightly.
 
@@ -47,9 +48,10 @@ QEMU instance for clean state.
 
 ### Artifact Capture
 
-On failure, serial logs are saved to `target/regression/<name>/serial.log`
-or `target/stress/<name>/<iteration>/serial.log`. Trace ring dumps from
-Phase 43b are extracted into separate `trace.log` files.
+Serial logs are saved to `target/regression/<name>/serial.log` or
+`target/stress/<name>/<iteration>/serial.log` on every run (pass or fail).
+Trace ring dumps from Phase 43b are extracted into separate `trace.log`
+files when a kernel crash is detected.
 
 ### Host-Side Property Testing
 
