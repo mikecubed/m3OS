@@ -23,26 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-
-/* Debug log: write directly via write() so output survives a SIGSEGV. */
-static int dbg_fd = -1;
-
-static void dbg_open(void)
-{
-    if (dbg_fd < 0)
-        dbg_fd = open("/tmp/doom_dbg.txt", O_CREAT | O_WRONLY | O_APPEND, 0644);
-}
-
-static void dbg_write(const char *msg)
-{
-    if (dbg_fd < 0) dbg_open();
-    if (dbg_fd >= 0) { write(dbg_fd, msg, strlen(msg)); fsync(dbg_fd); }
-}
-
-#define DBG_FMT(fmt, ...) \
-    do { char _b[512]; snprintf(_b, sizeof(_b), fmt, ##__VA_ARGS__); dbg_write(_b); } while(0)
 
 #include "doomtype.h"
 
@@ -411,12 +391,6 @@ void *W_CacheLumpNum(int lumpnum, int tag)
 
     lump = &lumpinfo[lumpnum];
 
-    DBG_FMT("WCLN lump=%d name=%.8s wad=%p mapped=%p cache=%p size=%d pos=%d\n",
-            lumpnum, lump->name,
-            (void*)lump->wad_file,
-            lump->wad_file ? (void*)lump->wad_file->mapped : NULL,
-            (void*)lump->cache, lump->size, lump->position);
-
     // Get the pointer to return.  If the lump is in a memory-mapped
     // file, we can just return a pointer to within the memory-mapped
     // region.  If the lump is in an ordinary file, we may already
@@ -427,7 +401,6 @@ void *W_CacheLumpNum(int lumpnum, int tag)
         // Memory mapped file, return from the mmapped region.
 
         result = lump->wad_file->mapped + lump->position;
-        DBG_FMT("WCLN   -> mmap result=%p\n", (void*)result);
     }
     else if (lump->cache != NULL)
     {
@@ -435,20 +408,16 @@ void *W_CacheLumpNum(int lumpnum, int tag)
 
         result = lump->cache;
         Z_ChangeTag(lump->cache, tag);
-        DBG_FMT("WCLN   -> cached result=%p\n", (void*)result);
     }
     else
     {
         // Not yet loaded, so load it now
 
         lump->cache = Z_Malloc(W_LumpLength(lumpnum), tag, &lump->cache);
-        DBG_FMT("WCLN   -> zmalloc cache=%p\n", (void*)lump->cache);
 	W_ReadLump (lumpnum, lump->cache);
         result = lump->cache;
-        DBG_FMT("WCLN   -> readlump result=%p\n", (void*)result);
     }
-
-    DBG_FMT("WCLN   -> return %p\n", (void*)result);
+	
     return result;
 }
 
