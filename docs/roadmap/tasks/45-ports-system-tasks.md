@@ -153,7 +153,7 @@ deletes the installed files, then removes the tracking entry.
 - [x] Reports an error if the port is not currently installed
 - [x] Warns if other installed ports depend on the port being removed
 
-### B.6 �� Implement `port clean <name>` subcommand
+### B.6 — Implement `port clean <name>` subcommand
 
 **File:** `ports/port.sh`
 **Symbol:** `cmd_clean`

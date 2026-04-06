@@ -47,12 +47,15 @@ all of this.
 
 ### Port Lifecycle
 
+The `port install <name>` command drives the full lifecycle internally by
+running make targets in sequence:
+
 ```
-port fetch    → copy bundled source to work directory
-port patch    → apply m3os-specific patches
-port build    → compile with tcc/make
-port install  → copy binaries to /usr/local/bin, libs to /usr/local/lib
-port clean    → remove build artifacts
+make fetch    → copy bundled source to work directory
+make patch    → apply m3os-specific patches
+make build    → compile with tcc/make
+make install  → copy binaries to /usr/local/bin, libs to /usr/local/lib
+make clean    → remove build artifacts (via `port clean`)
 ```
 
 ### Package Manager (`port` command)

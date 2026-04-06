@@ -1,7 +1,7 @@
 /*
- * bc - arbitrary precision calculator for m3OS
+ * bc - integer calculator for m3OS
  *
- * A minimal implementation supporting basic arithmetic operations.
+ * A minimal implementation supporting basic integer arithmetic.
  * Reads expressions from stdin (one per line) and prints results.
  * Supports: +, -, *, /, % on integers.
  */

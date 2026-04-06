@@ -16,6 +16,7 @@ PORTS_DIR="/usr/ports"
 DB_DIR="/var/db/ports"
 INSTALLED_DB="$DB_DIR/installed"
 PREFIX="/usr/local"
+_DEP_STACK=""  # Circular dependency detection
 
 # --- Utility functions ---
 
@@ -163,8 +164,16 @@ resolve_deps() {
 
     if [ -n "$DEPS" ]; then
         for _dep in $DEPS; do
+            # Circular dependency detection
+            case " $_DEP_STACK " in
+                *" $_dep "*)
+                    echo "Error: circular dependency detected: $_DEP_STACK -> $_dep"
+                    exit 1
+                    ;;
+            esac
             if ! is_installed "$_dep"; then
                 echo ">>> Installing dependency: $_dep"
+                _DEP_STACK="$_DEP_STACK $_dep"
                 cmd_install "$_dep"
                 if [ $? -ne 0 ]; then
                     echo "Error: failed to install dependency '$_dep'"
@@ -309,6 +318,14 @@ cmd_remove() {
                 echo "  removed $_file"
             fi
         done < "$_manifest"
+        # Clean up empty directories under $PREFIX
+        while read _file; do
+            _dir=$(dirname "$_file")
+            while [ "$_dir" != "$PREFIX" ] && [ "$_dir" != "/" ]; do
+                rmdir "$_dir" 2>/dev/null || break
+                _dir=$(dirname "$_dir")
+            done
+        done < "$_manifest"
         rm "$_manifest"
     else
         echo "Warning: no manifest found for $_name, cannot remove files"
@@ -372,7 +389,7 @@ generate_manifest() {
         # Find lines only in the after list (newly installed files)
         _new_files=""
         while read _file; do
-            if ! grep -q "^${_file}$" /tmp/port_before_sorted 2>/dev/null; then
+            if ! grep -Fxq "$_file" /tmp/port_before_sorted 2>/dev/null; then
                 _new_files="$_new_files
 $_file"
             fi

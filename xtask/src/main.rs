@@ -4193,6 +4193,12 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
 
     let mut cmds = String::new();
 
+    // Ensure parent directories exist (debugfs mkdir requires parents).
+    let parent_dirs = ["usr", "usr/bin"];
+    for d in &parent_dirs {
+        cmds.push_str(&format!("mkdir {d}\n"));
+    }
+
     // Create infrastructure directories.
     let infra_dirs = [
         "usr/local",
@@ -4245,8 +4251,10 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
         cmds.push_str("sif usr/bin/port mode 0x81ED\n");
     }
 
-    // /var/db/ports writable.
-    cmds.push_str("sif var/db/ports mode 0x41FF\n");
+    // /var/db/ports owned by root with standard permissions.
+    cmds.push_str("sif var/db/ports mode 0x41ED\n");
+    cmds.push_str("sif var/db/ports uid 0\n");
+    cmds.push_str("sif var/db/ports gid 0\n");
 
     cmds.push_str("q\n");
 

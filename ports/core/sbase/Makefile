@@ -26,7 +26,7 @@ patch:
 build:
 	@for util in $(SBASE_UTILS); do \
 		echo "Building $$util..."; \
-		cd $(WORKDIR) && tcc -o $$util $$util.c || true; \
+		cd $(WORKDIR) && tcc -o $$util $$util.c || exit $$?; \
 	done
 
 install:
