@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.44.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities, and Rust cross-compilation support for musl-linked std programs (hello-rust, sysinfo-rust, httpd-rust, calc-rust, todo-rust) with a custom x86_64-m3os target spec.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.44.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities, Rust cross-compilation support for musl-linked std programs (hello-rust, sysinfo-rust, httpd-rust, calc-rust, todo-rust) with a custom x86_64-m3os target spec, and a BSD-style ports system for building and installing third-party software from source (Lua, zlib, bc, sbase, mandoc) with dependency resolution and package tracking.
 
 ## Build & Run
 
@@ -117,6 +117,24 @@ userspace/
   httpd-rust/             # Minimal HTTP server via std::net (Phase 44)
   calc-rust/              # Interactive calculator via std::io (Phase 44)
   todo-rust/              # Persistent todo list via std::fs (Phase 44)
+```
+
+### Ports Tree Layout (Phase 45)
+
+```
+ports/
+  port.sh                 # port command (installed at /usr/bin/port)
+  lang/lua/               # Lua 5.4.7 scripting language port
+  lib/zlib/               # zlib 1.3.1 compression library port
+  math/bc/                # bc calculator port
+  core/sbase/             # suckless Unix tools port (basename, seq, rev, etc.)
+  doc/mandoc/             # man page formatter port
+  util/minizip/           # zlib-dependent test port
+  <category>/<program>/
+    Portfile              # metadata: NAME, VERSION, DESCRIPTION, CATEGORY, DEPS
+    Makefile              # targets: fetch, patch, build, install, clean
+    src/                  # bundled source code
+    patches/              # m3OS-specific patches
 ```
 
 ### Kernel Source Layout
@@ -276,6 +294,7 @@ Read before making significant changes:
 | `docs/43b-kernel-trace-ring.md` | Before touching trace_ring, trace events, per-core trace rings, or sys_ktrace |
 | `docs/43c-regression-stress-ci.md` | Before touching xtask regression/stress commands, CI workflows, or proptest/loom tests |
 | `docs/roadmap/44-rust-cross-compilation.md` | Before touching musl Rust cross-compilation, xtask musl Rust builds, or custom target specs |
+| `docs/roadmap/45-ports-system.md` | Before touching ports tree, port command, Portfile format, or xtask ports integration |
 | `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 

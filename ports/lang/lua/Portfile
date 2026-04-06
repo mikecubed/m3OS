@@ -1,0 +1,8 @@
+NAME=lua
+VERSION=5.4.7
+DESCRIPTION="Lightweight scripting language"
+CATEGORY=lang
+DEPS=
+URL=https://www.lua.org/ftp/lua-5.4.7.tar.gz
+SHA256=placeholder
+MAINTAINER=m3os
