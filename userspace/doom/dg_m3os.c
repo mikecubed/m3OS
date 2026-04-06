@@ -132,6 +132,13 @@ void DG_Init(void)
     g_y_offset = ((int)g_fb_info.height - DOOMGENERIC_RESY) / 2;
     if (g_x_offset < 0) g_x_offset = 0;
     if (g_y_offset < 0) g_y_offset = 0;
+
+    /* Debug: log actual framebuffer geometry so we can diagnose rendering issues */
+    fprintf(stderr, "DG_Init: fb w=%u h=%u stride=%u bpp=%u fmt=%u virt=0x%lx\n",
+            g_fb_info.width, g_fb_info.height, g_fb_info.stride,
+            g_fb_info.bpp, g_fb_info.pixel_format, (unsigned long)g_fb_ptr);
+    fprintf(stderr, "DG_Init: DOOM canvas %dx%d  offset (%d,%d)\n",
+            DOOMGENERIC_RESX, DOOMGENERIC_RESY, g_x_offset, g_y_offset);
 }
 
 /* -------------------------------------------------------------------------
