@@ -19,13 +19,21 @@ fn save_todos(todos: &[String]) {
         contents + "\n"
     };
     if let Err(e) = fs::write(TODO_FILE, contents) {
-        eprintln!("todo: failed to write {TODO_FILE}: {e}");
+        eprintln!("{}: failed to write {TODO_FILE}: {e}", prog_name());
         process::exit(1);
     }
 }
 
+fn prog_name() -> String {
+    env::args()
+        .next()
+        .and_then(|s| s.rsplit('/').next().map(String::from))
+        .unwrap_or_else(|| "todo-rust".to_string())
+}
+
 fn print_usage() {
-    println!("Usage: todo <command> [args]");
+    let name = prog_name();
+    println!("Usage: {name} <command> [args]");
     println!();
     println!("Commands:");
     println!("  add <text>   Add a new todo item");
@@ -44,7 +52,7 @@ fn cmd_add(text: &str) {
 fn cmd_list() {
     let todos = load_todos();
     if todos.is_empty() {
-        println!("No todos yet. Use 'todo add <text>' to add one.");
+        println!("No todos yet. Use '{} add <text>' to add one.", prog_name());
         return;
     }
     for (i, item) in todos.iter().enumerate() {
@@ -56,14 +64,14 @@ fn cmd_done(num_str: &str) {
     let num: usize = match num_str.parse() {
         Ok(n) if n >= 1 => n,
         _ => {
-            eprintln!("todo: invalid number: {num_str}");
+            eprintln!("{}: invalid number: {num_str}", prog_name());
             process::exit(1);
         }
     };
 
     let mut todos = load_todos();
     if num > todos.len() {
-        eprintln!("todo: no item #{num} (only {} items)", todos.len());
+        eprintln!("{}: no item #{num} (only {} items)", prog_name(), todos.len());
         process::exit(1);
     }
 
@@ -93,7 +101,7 @@ fn main() {
     match args[1].as_str() {
         "add" => {
             if args.len() < 3 {
-                eprintln!("todo: 'add' requires text argument");
+                eprintln!("{}: 'add' requires text argument", prog_name());
                 process::exit(1);
             }
             let text = args[2..].join(" ");
@@ -102,14 +110,14 @@ fn main() {
         "list" => cmd_list(),
         "done" => {
             if args.len() < 3 {
-                eprintln!("todo: 'done' requires a number argument");
+                eprintln!("{}: 'done' requires a number argument", prog_name());
                 process::exit(1);
             }
             cmd_done(&args[2]);
         }
         "help" => print_usage(),
         other => {
-            eprintln!("todo: unknown command: {other}");
+            eprintln!("{}: unknown command: {other}", prog_name());
             print_usage();
             process::exit(1);
         }
