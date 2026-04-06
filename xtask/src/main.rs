@@ -155,7 +155,9 @@ fn build_userspace_bins() {
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
         ("crypto-test", "crypto-test", true),
-        ("sshd", "sshd", true), // Phase 43: SSH server
+        ("sshd", "sshd", true),        // Phase 43: SSH server
+        ("syslogd", "syslogd", false), // Phase 46: system logger
+        ("crond", "crond", false),     // Phase 46: cron daemon
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -254,6 +256,16 @@ fn build_userspace_bins() {
         "patch",
         "sha256sum",
         "genkey", // Phase 42: crypto utilities
+        // Phase 46: system services commands
+        "service",
+        "logger",
+        "shutdown",
+        "reboot",
+        "hostname",
+        "who",
+        "w",
+        "last",
+        "crontab",
     ];
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -3741,13 +3753,30 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let shadow_content = "root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
+    // Phase 46: service definition files.
+    let sshd_conf = "name=sshd\ncommand=/bin/sshd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
+    let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
+    let syslogd_conf = "name=syslogd\ncommand=/bin/syslogd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
+    let crond_conf = "name=crond\ncommand=/bin/crond\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
+    let hostname_content = "m3os\n";
+
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");
     let shadow_tmp = output_dir.join("_tmp_shadow");
     let group_tmp = output_dir.join("_tmp_group");
+    let sshd_conf_tmp = output_dir.join("_tmp_sshd_conf");
+    let telnetd_conf_tmp = output_dir.join("_tmp_telnetd_conf");
+    let syslogd_conf_tmp = output_dir.join("_tmp_syslogd_conf");
+    let crond_conf_tmp = output_dir.join("_tmp_crond_conf");
+    let hostname_tmp = output_dir.join("_tmp_hostname");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
+    fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
+    fs::write(&telnetd_conf_tmp, telnetd_conf).expect("write temp telnetd.conf");
+    fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
+    fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
+    fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
 
     // Standard Unix root filesystem directories and files.
     // debugfs mode values: S_IFDIR|perm or S_IFREG|perm
@@ -3791,6 +3820,26 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          sif var mode 0x41ED\n\
          sif var uid 0\n\
          sif var gid 0\n\
+         mkdir var/log\n\
+         sif var/log mode 0x41ED\n\
+         sif var/log uid 0\n\
+         sif var/log gid 0\n\
+         mkdir var/run\n\
+         sif var/run mode 0x41ED\n\
+         sif var/run uid 0\n\
+         sif var/run gid 0\n\
+         mkdir var/spool\n\
+         sif var/spool mode 0x41ED\n\
+         sif var/spool uid 0\n\
+         sif var/spool gid 0\n\
+         mkdir var/spool/cron\n\
+         sif var/spool/cron mode 0x41ED\n\
+         sif var/spool/cron uid 0\n\
+         sif var/spool/cron gid 0\n\
+         mkdir etc/services.d\n\
+         sif etc/services.d mode 0x41ED\n\
+         sif etc/services.d uid 0\n\
+         sif etc/services.d gid 0\n\
          sif dev mode 0x41ED\n\
          sif dev uid 0\n\
          sif dev gid 0\n\
@@ -3803,10 +3852,35 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          sif etc/group mode 0x81A4\n\
          sif etc/group uid 0\n\
          sif etc/group gid 0\n\
+         write \"{sshd_conf}\" etc/services.d/sshd.conf\n\
+         sif etc/services.d/sshd.conf mode 0x81A4\n\
+         sif etc/services.d/sshd.conf uid 0\n\
+         sif etc/services.d/sshd.conf gid 0\n\
+         write \"{telnetd_conf}\" etc/services.d/telnetd.conf\n\
+         sif etc/services.d/telnetd.conf mode 0x81A4\n\
+         sif etc/services.d/telnetd.conf uid 0\n\
+         sif etc/services.d/telnetd.conf gid 0\n\
+         write \"{syslogd_conf}\" etc/services.d/syslogd.conf\n\
+         sif etc/services.d/syslogd.conf mode 0x81A4\n\
+         sif etc/services.d/syslogd.conf uid 0\n\
+         sif etc/services.d/syslogd.conf gid 0\n\
+         write \"{crond_conf}\" etc/services.d/crond.conf\n\
+         sif etc/services.d/crond.conf mode 0x81A4\n\
+         sif etc/services.d/crond.conf uid 0\n\
+         sif etc/services.d/crond.conf gid 0\n\
+         write \"{hostname}\" etc/hostname\n\
+         sif etc/hostname mode 0x81A4\n\
+         sif etc/hostname uid 0\n\
+         sif etc/hostname gid 0\n\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
+        sshd_conf = sshd_conf_tmp.display(),
+        telnetd_conf = telnetd_conf_tmp.display(),
+        syslogd_conf = syslogd_conf_tmp.display(),
+        crond_conf = crond_conf_tmp.display(),
+        hostname = hostname_tmp.display(),
     );
 
     let mut debugfs = Command::new("debugfs")
@@ -3837,6 +3911,11 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let _ = fs::remove_file(&passwd_tmp);
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
+    let _ = fs::remove_file(&sshd_conf_tmp);
+    let _ = fs::remove_file(&telnetd_conf_tmp);
+    let _ = fs::remove_file(&syslogd_conf_tmp);
+    let _ = fs::remove_file(&crond_conf_tmp);
+    let _ = fs::remove_file(&hostname_tmp);
 }
 
 /// Phase 31: Populate TCC, musl headers/libraries, and test files into the

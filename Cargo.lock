@@ -323,6 +323,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crond"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -798,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.45.0"
+version = "0.46.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1660,6 +1667,13 @@ dependencies = [
 [[package]]
 name = "syscall-lib"
 version = "0.1.0"
+
+[[package]]
+name = "syslogd"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
 
 [[package]]
 name = "tempfile"
