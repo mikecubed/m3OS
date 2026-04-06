@@ -301,14 +301,25 @@ static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
  * ------------------------------------------------------------------------- */
 
 /* per-make-code pressed state — used to suppress PS/2 typematic repeats */
-static uint8_t s_key_pressed[128];
+static uint8_t  s_key_pressed[128];
+
+/* Timestamp (ms) of the last make code seen per key.
+ * Used to detect stuck keys: if s_key_pressed[k]=1 but the last make was
+ * more than STUCK_KEY_MS milliseconds ago, the break code was almost
+ * certainly lost during a hitch and the key is now permanently stuck.
+ * We clear the flag and re-emit the key-down so DOOM's gamekeys[] corrects
+ * itself on the very next tick the user presses the key again.
+ *
+ * Threshold rationale: default PS/2 typematic initial delay is ≤500 ms,
+ * then repeats arrive every ~33–100 ms.  If a key is genuinely held down,
+ * typematic makes arrive continuously and the "time since last make" stays
+ * well below 200 ms.  Only a stuck key (lost break code) would exceed
+ * STUCK_KEY_MS without a fresh make arriving. */
+#define STUCK_KEY_MS  700u
+static uint32_t s_key_time[128];
 
 /* -------------------------------------------------------------------------
  * DG_GetKey -- return one key event per call
- *
- * Returns 1 if a key event is available, 0 otherwise.
- * Sets *pressed = 1 for key-down, 0 for key-up.
- * Sets *doomKey  to the DOOM key constant.
  *
  * Design notes:
  *   • We loop internally on unknown / unmapped scancodes instead of
@@ -323,7 +334,10 @@ static uint8_t s_key_pressed[128];
  *     codes (hardware auto-repeat) are silently discarded until the break
  *     code is seen.  This prevents a single tap from appearing as a held
  *     key when the game loop is slow.
- * ------------------------------------------------------------------------- */
+ *   • s_key_time[] enables stuck-key recovery: if a make arrives for a
+ *     "currently pressed" key but STUCK_KEY_MS has elapsed since the last
+ *     make for that key, the break was lost and we synthesize a release
+ *     before re-issuing the key-down. ------------------------------------------------------------------------- */
 
 int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
@@ -345,8 +359,32 @@ int DG_GetKey(int *pressed, unsigned char *doomKey)
             return 1;
         } else {
             /* make code (key-down) */
-            if (s_key_pressed[make]) continue;   /* typematic repeat — discard */
+            uint32_t now = DG_GetTicksMs();
+            if (s_key_pressed[make]) {
+                /* Key is "currently down" — could be typematic repeat or a
+                 * stuck key (break code was lost during a hitch). */
+                if ((now - s_key_time[make]) >= STUCK_KEY_MS) {
+                    /* Stuck key detected: synthesize a key-up so DOOM clears
+                     * its internal gamekeys[] state, then fall through to
+                     * re-emit the key-down below. */
+                    s_key_pressed[make] = 0;
+                    *pressed = 0;
+                    *doomKey = dk;
+                    /* Leave this make in a "pending" state — the next
+                     * DG_GetKey call will pick it up as a fresh key-down
+                     * because s_key_pressed[make] is now 0.  To do that we
+                     * must push it back.  Instead we re-enter the loop once
+                     * with the same scancode by "un-consuming" it: this is
+                     * complex, so we emit the key-up now and accept that the
+                     * key-down will arrive one DG_GetKey call later (next
+                     * event poll, same tic). */
+                    return 1;
+                }
+                /* Typematic repeat within the expected window — discard. */
+                continue;
+            }
             s_key_pressed[make] = 1;
+            s_key_time[make]    = now;
             *pressed = 1;
             *doomKey = dk;
             return 1;

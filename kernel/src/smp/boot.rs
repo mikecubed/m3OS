@@ -529,10 +529,12 @@ fn ap_lapic_init_from(lapic_base: usize, tpm: u32) {
         core::ptr::write_volatile((lapic_base + 0x0F0) as *mut u32, spur | 0x1FF);
         core::ptr::write_volatile((lapic_base + 0x080) as *mut u32, 0); // TPR = 0
 
-        // LAPIC timer: periodic, vector 32, 10 ms period.
+        // LAPIC timer: periodic, vector 32, 1 ms period — matches BSP.
+        // Keeping the period consistent ensures fair scheduling quanta across
+        // all cores and prevents TICK_COUNT from advancing faster than 1 kHz.
         core::ptr::write_volatile((lapic_base + 0x320) as *mut u32, 32 | (1 << 17));
         core::ptr::write_volatile((lapic_base + 0x3E0) as *mut u32, 0x03); // divide-by-16
-        let init_count = (tpm as u64 * 10).min(u32::MAX as u64) as u32;
+        let init_count = (tpm as u64).min(u32::MAX as u64) as u32;
         core::ptr::write_volatile((lapic_base + 0x380) as *mut u32, init_count);
     }
 }

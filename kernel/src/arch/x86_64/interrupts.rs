@@ -620,7 +620,12 @@ pub fn tick_count() -> u64 {
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Only the BSP increments the global tick counter. APs have their own
+    // per-1ms LAPIC timers that drive the scheduler but must not skew the
+    // global wall-clock tick count (which nanosleep and uptime rely on).
+    if crate::smp::is_bsp() {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
     crate::task::signal_reschedule();
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();

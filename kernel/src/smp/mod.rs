@@ -601,3 +601,12 @@ pub fn get_core_data(core_id: u8) -> Option<&'static PerCoreData> {
 pub fn bsp_apic_id() -> u8 {
     BSP_APIC_ID.load(Ordering::Relaxed)
 }
+
+/// Returns `true` if the calling core is the Bootstrap Processor (core 0).
+#[inline]
+pub fn is_bsp() -> bool {
+    // Fast path: compare current LAPIC ID against the recorded BSP LAPIC ID.
+    // This is safe to call from interrupt context.
+    let apic_id = crate::arch::x86_64::apic::current_lapic_id();
+    apic_id == BSP_APIC_ID.load(Ordering::Relaxed)
+}

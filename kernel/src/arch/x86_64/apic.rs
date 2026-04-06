@@ -72,6 +72,13 @@ pub fn lapic_eoi() {
     }
 }
 
+/// Return the LAPIC ID of the calling core (bits 24-31 of the ID register).
+///
+/// Safe to call from any context including interrupt handlers.
+pub fn current_lapic_id() -> u8 {
+    unsafe { (lapic_read(LAPIC_ID) >> 24) as u8 }
+}
+
 /// Enable the Local APIC, set the spurious-interrupt vector, and zero TPR.
 fn lapic_init() {
     unsafe {

@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -21,6 +22,11 @@ use spin::Mutex;
 // ---------------------------------------------------------------------------
 // Ext2Volume (P28-T019)
 // ---------------------------------------------------------------------------
+
+/// Maximum number of ext2 blocks held in the read cache.
+/// At 4 KiB per block this is a 4 MiB budget — enough to absorb most of a
+/// typical IWAD after the first pass, eliminating repeated VirtIO round-trips.
+const BLOCK_CACHE_MAX: usize = 1024;
 
 /// A mounted ext2 volume backed by virtio-blk sectors.
 pub struct Ext2Volume {
@@ -36,6 +42,9 @@ pub struct Ext2Volume {
     sectors_per_block: u32,
     /// Raw superblock bytes (for writeback).
     superblock_raw: Vec<u8>,
+    /// Read-through block cache: block_num → data.
+    /// Bounded to BLOCK_CACHE_MAX entries; no eviction (fill-and-hold).
+    block_cache: Mutex<BTreeMap<u32, Vec<u8>>>,
 }
 
 /// Global mounted ext2 volume (set by mount_ext2).
@@ -84,6 +93,7 @@ impl Ext2Volume {
             block_size,
             sectors_per_block,
             superblock_raw: sb_raw,
+            block_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -96,17 +106,39 @@ impl Ext2Volume {
         self.base_lba + (block_num as u64) * (self.sectors_per_block as u64)
     }
 
-    /// Read an ext2 block from disk.
+    /// Read an ext2 block, serving from the in-memory cache when possible.
+    ///
+    /// The cache is bounded by BLOCK_CACHE_MAX entries (fill-and-hold, no
+    /// eviction). Once full, new blocks are served from disk without caching.
+    /// This asymptotically eliminates repeated VirtIO round-trips for hot
+    /// blocks such as WAD lumps, directory entries, and inode tables.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
+        // Fast path: cache hit (lock released before any I/O).
+        {
+            let cache = self.block_cache.lock();
+            if let Some(cached) = cache.get(&block_num) {
+                return Ok(cached.clone());
+            }
+        }
+        // Cache miss: read from VirtIO-blk.
         let lba = self.block_to_lba(block_num);
         let mut buf = vec![0u8; self.block_size as usize];
         crate::blk::read_sectors(lba, self.sectors_per_block as usize, &mut buf)
             .map_err(|_| Ext2Error::IoError)?;
+        // Store in cache if budget allows.
+        {
+            let mut cache = self.block_cache.lock();
+            if cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, buf.clone());
+            }
+        }
         Ok(buf)
     }
 
-    /// Write an ext2 block to disk.
+    /// Write an ext2 block to disk and invalidate the cache entry.
     fn write_block(&self, block_num: u32, data: &[u8]) -> Result<(), Ext2Error> {
+        // Invalidate before write so stale data is never served.
+        self.block_cache.lock().remove(&block_num);
         let lba = self.block_to_lba(block_num);
         crate::blk::write_sectors(lba, self.sectors_per_block as usize, data)
             .map_err(|_| Ext2Error::IoError)
