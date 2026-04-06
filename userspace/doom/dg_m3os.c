@@ -362,25 +362,33 @@ int DG_GetKey(int *pressed, unsigned char *doomKey)
             uint32_t now = DG_GetTicksMs();
             if (s_key_pressed[make]) {
                 /* Key is "currently down" — could be typematic repeat or a
-                 * stuck key (break code was lost during a hitch). */
+                 * stuck key (break code was lost during a hitch).
+                 *
+                 * Distinguish them with the timestamp:
+                 *   • If the key is genuinely held, the PS/2 hardware sends
+                 *     typematic make codes every ~33–100 ms after the initial
+                 *     500 ms delay.  These makes refresh s_key_time, so
+                 *     (now - s_key_time) stays well below STUCK_KEY_MS.
+                 *   • If the break code was lost (stuck key), no further makes
+                 *     arrive for that key until the user presses it again.
+                 *     s_key_time grows stale and (now - s_key_time) eventually
+                 *     exceeds STUCK_KEY_MS, triggering recovery.
+                 *
+                 * IMPORTANT: always refresh s_key_time even when discarding,
+                 * so that legitimate holds never false-trigger the recovery. */
                 if ((now - s_key_time[make]) >= STUCK_KEY_MS) {
                     /* Stuck key detected: synthesize a key-up so DOOM clears
-                     * its internal gamekeys[] state, then fall through to
-                     * re-emit the key-down below. */
+                     * its internal gamekeys[] state.  The real key-down will
+                     * be delivered on the next DG_GetKey call (this scancode
+                     * is still in the caller's loop). */
                     s_key_pressed[make] = 0;
                     *pressed = 0;
                     *doomKey = dk;
-                    /* Leave this make in a "pending" state — the next
-                     * DG_GetKey call will pick it up as a fresh key-down
-                     * because s_key_pressed[make] is now 0.  To do that we
-                     * must push it back.  Instead we re-enter the loop once
-                     * with the same scancode by "un-consuming" it: this is
-                     * complex, so we emit the key-up now and accept that the
-                     * key-down will arrive one DG_GetKey call later (next
-                     * event poll, same tic). */
                     return 1;
                 }
-                /* Typematic repeat within the expected window — discard. */
+                /* Typematic repeat within window — discard, but refresh time
+                 * so a legitimately-held key never trips the stuck-key check. */
+                s_key_time[make] = now;
                 continue;
             }
             s_key_pressed[make] = 1;
