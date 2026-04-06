@@ -31,16 +31,32 @@ fn main(args: &[&str]) -> i32 {
             i += 2;
             msg_start = i;
         } else if args[i] == "-p" && i + 1 < args.len() {
-            // Parse numeric priority.
-            let mut val = 0u8;
-            for &b in args[i + 1].as_bytes() {
-                if b.is_ascii_digit() {
-                    val = val.wrapping_mul(10).wrapping_add(b - b'0');
-                }
+            // Parse numeric priority with checked arithmetic.
+            let p_bytes = args[i + 1].as_bytes();
+            if p_bytes.is_empty() || !p_bytes.iter().all(|b| b.is_ascii_digit()) {
+                write_str(STDERR_FILENO, "logger: invalid priority value\n");
+                return 1;
             }
-            if val > 0 {
-                priority = val;
+            let mut val = 0u16;
+            let mut overflow = false;
+            for &b in p_bytes {
+                val = match val
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((b - b'0') as u16))
+                {
+                    Some(v) => v,
+                    None => {
+                        overflow = true;
+                        break;
+                    }
+                };
             }
+            if overflow || val > 191 {
+                // Max valid syslog priority: facility 23 * 8 + severity 7 = 191
+                write_str(STDERR_FILENO, "logger: priority out of range (0-191)\n");
+                return 1;
+            }
+            priority = val as u8;
             i += 2;
             msg_start = i;
         } else {

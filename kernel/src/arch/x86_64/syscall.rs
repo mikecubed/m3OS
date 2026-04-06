@@ -2484,7 +2484,7 @@ fn sys_reboot(cmd: u64) -> u64 {
         REBOOT_CMD_HALT | REBOOT_CMD_POWER_OFF => {
             log::info!("sys_reboot: System halting...");
             kernel_shutdown();
-            // ACPI shutdown via QEMU debug exit port (power-off)
+            // QEMU isa-debug-exit device (port 0xf4) — terminates the emulator.
             unsafe {
                 x86_64::instructions::port::Port::new(0xf4).write(0x10_u32);
             }

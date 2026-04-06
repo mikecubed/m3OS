@@ -129,8 +129,9 @@ fn send_command(cmd: &str, name: &str) -> i32 {
         write_str(STDERR_FILENO, "service: failed to send command to init\n");
         return 1;
     }
-    // Init polls /var/run/init.cmd in its main loop, so writing the command
-    // file is enough to queue the request safely.
+    // Init polls /var/run/init.cmd in its main loop. Note: this is a
+    // last-writer-wins mechanism — rapid successive commands may clobber
+    // each other. For single-operator use this is acceptable.
     write_str(STDOUT_FILENO, "service: ");
     write_str(STDOUT_FILENO, cmd);
     write_str(STDOUT_FILENO, " ");

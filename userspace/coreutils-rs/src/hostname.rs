@@ -43,10 +43,17 @@ fn main(args: &[&str]) -> i32 {
             let data = &buf[..n as usize];
             // Trim trailing newline.
             let end = data.iter().position(|&b| b == b'\n').unwrap_or(n as usize);
-            let name = unsafe { core::str::from_utf8_unchecked(&data[..end]) };
-            write_str(STDOUT_FILENO, name);
-            write_str(STDOUT_FILENO, "\n");
-            return 0;
+            match core::str::from_utf8(&data[..end]) {
+                Ok(name) => {
+                    write_str(STDOUT_FILENO, name);
+                    write_str(STDOUT_FILENO, "\n");
+                    return 0;
+                }
+                Err(_) => {
+                    write_str(STDERR_FILENO, "hostname: invalid UTF-8 in /etc/hostname\n");
+                    return 1;
+                }
+            }
         }
     }
 

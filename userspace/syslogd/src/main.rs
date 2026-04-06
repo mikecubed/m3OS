@@ -78,10 +78,15 @@ fn open_log_file(path: &[u8]) -> i32 {
 }
 
 fn open_kmsg() -> i32 {
-    // O_RDONLY = 0
-    let fd = syscall_lib::open(b"/dev/kmsg\0", 0, 0);
+    // Try /proc/kmsg first (kernel log snapshot), fall back to /dev/kmsg.
+    let fd = syscall_lib::open(b"/proc/kmsg\0", 0, 0);
+    let fd = if fd < 0 {
+        syscall_lib::open(b"/dev/kmsg\0", 0, 0)
+    } else {
+        fd
+    };
     if fd < 0 {
-        // Not fatal -- kernel may not expose /dev/kmsg.
+        // Not fatal -- kernel may not expose either path.
         return -1;
     }
     // Set non-blocking so reads don't stall the main loop.
