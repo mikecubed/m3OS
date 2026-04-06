@@ -119,7 +119,7 @@ Extend the `cargo xtask` build system to:
 
 ## Companion Task List
 
-- Phase 44 Task List — *not yet created*
+- [Phase 44 Task List](./tasks/44-rust-cross-compilation-tasks.md)
 
 ## How Real OS Implementations Differ
 
