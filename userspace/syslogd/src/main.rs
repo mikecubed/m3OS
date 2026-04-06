@@ -117,7 +117,14 @@ fn setup_socket() -> Option<i32> {
 
     // Set non-blocking so the inner drain loop breaks on -EAGAIN
     // instead of blocking when no more datagrams are pending.
-    syscall_lib::set_nonblocking(fd as i32);
+    if syscall_lib::set_nonblocking(fd as i32) < 0 {
+        syscall_lib::write_str(
+            STDOUT_FILENO,
+            "syslogd: warning: cannot set /dev/log non-blocking\n",
+        );
+        syscall_lib::close(fd as i32);
+        return None;
+    }
 
     Some(fd as i32)
 }
@@ -207,13 +214,15 @@ fn parse_priority(msg: &[u8]) -> (&[u8], &[u8]) {
         while i < msg.len() && i < 5 {
             if msg[i] == b'>' {
                 // Parse the numeric priority.
-                let num = parse_u32(&msg[1..i]);
                 let body = if i + 1 < msg.len() {
                     &msg[i + 1..]
                 } else {
                     b""
                 };
-                return (priority_name(num), body);
+                return match parse_u32(&msg[1..i]) {
+                    Some(num) => (priority_name(num), body),
+                    None => (b"user.info", body), // malformed priority → default
+                };
             }
             i += 1;
         }
@@ -222,14 +231,22 @@ fn parse_priority(msg: &[u8]) -> (&[u8], &[u8]) {
     (b"user.info", msg)
 }
 
-fn parse_u32(bytes: &[u8]) -> u32 {
+fn parse_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
     let mut val: u32 = 0;
     for &b in bytes {
-        if b >= b'0' && b <= b'9' {
-            val = val.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if b < b'0' || b > b'9' {
+            return None;
         }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    val
+    // Syslog priorities are 0-191 (facility 0-23 * 8 + severity 0-7).
+    if val > 191 {
+        return None;
+    }
+    Some(val)
 }
 
 /// Map a syslog priority value to a short facility.severity tag.

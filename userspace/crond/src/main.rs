@@ -124,13 +124,18 @@ fn parse_u32(s: &[u8]) -> (u32, usize) {
 }
 
 /// Parse a single time field token.
+/// Returns `TimeField::Any` for tokens that cannot be parsed (invalid input
+/// is silently treated as a wildcard rather than crashing).
 fn parse_time_field(token: &[u8]) -> TimeField {
     if token.is_empty() {
         return TimeField::Any;
     }
     if token[0] == b'*' {
         if token.len() >= 3 && token[1] == b'/' {
-            let (step, _) = parse_u32(&token[2..]);
+            let (step, consumed) = parse_u32(&token[2..]);
+            if consumed == 0 || consumed != token.len() - 2 {
+                return TimeField::Any; // malformed → wildcard
+            }
             return TimeField::Step(step);
         }
         return TimeField::Any;
@@ -148,13 +153,20 @@ fn parse_time_field(token: &[u8]) -> TimeField {
         i += 1;
     }
     if has_dash && dash_pos > 0 && dash_pos + 1 < token.len() {
-        let (lo, _) = parse_u32(&token[..dash_pos]);
-        let (hi, _) = parse_u32(&token[dash_pos + 1..]);
-        return TimeField::Range(lo, hi);
+        let (lo, lo_consumed) = parse_u32(&token[..dash_pos]);
+        let (hi, hi_consumed) = parse_u32(&token[dash_pos + 1..]);
+        if lo_consumed == dash_pos && hi_consumed == token.len() - dash_pos - 1 && lo_consumed > 0 {
+            return TimeField::Range(lo, hi);
+        }
+        return TimeField::Any; // malformed range → wildcard
     }
-    // Plain number
-    let (val, _) = parse_u32(token);
-    TimeField::Exact(val)
+    // Plain number — must consume the entire token.
+    let (val, consumed) = parse_u32(token);
+    if consumed == token.len() && consumed > 0 {
+        TimeField::Exact(val)
+    } else {
+        TimeField::Any // non-numeric → wildcard
+    }
 }
 
 // ---------------------------------------------------------------------------
