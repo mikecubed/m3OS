@@ -4368,8 +4368,13 @@ fn fork_overlap_steps() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "fork-test pass",
     });
-    // Run it a second time to exercise repeated fork paths.
-    steps.push(SmokeStep::Sleep { millis: 200 });
+    // Wait for shell prompt before sending the second command to avoid
+    // delivering input while the previous process is still attached.
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "shell prompt after fork-test",
+    });
     steps.push(SmokeStep::Send {
         input: "/bin/fork-test\n",
         label: "run fork-test (2nd)",
@@ -4406,16 +4411,11 @@ fn pty_overlap_steps() -> Vec<SmokeStep> {
         input: "/bin/pty-test\n",
         label: "run pty-test",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "pty-test:",
-        timeout_secs: 60,
-        label: "pty-test complete",
-    });
-    // Wait for the final "N passed, 0 failed" line — any failures
-    // mean the test didn't fully pass.
+    // Wait directly for the summary line — avoids matching the initial
+    // "pty-test: Phase 29..." banner before the test finishes.
     steps.push(SmokeStep::Wait {
         pattern: "passed, 0 failed",
-        timeout_secs: 5,
+        timeout_secs: 60,
         label: "pty-test 0 failures",
     });
     steps
@@ -4877,7 +4877,13 @@ fn ssh_overlap_steps() -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "fork-test pass",
     });
-    steps.push(SmokeStep::Sleep { millis: 200 });
+    // Wait for shell prompt before sending pty-test to avoid delivering
+    // input while fork-test's shell cleanup is still in progress.
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "shell prompt after fork-test",
+    });
     steps.push(SmokeStep::Send {
         input: "/bin/pty-test\n",
         label: "run pty-test",
