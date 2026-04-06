@@ -2466,6 +2466,13 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     let start = crate::arch::x86_64::interrupts::tick_count();
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
+    // Always yield at least once so sub-10ms sleeps (e.g. DOOM's 1ms tick)
+    // do not become tight busy-spins that starve other tasks.
+    crate::task::yield_now();
+    restore_caller_context(pid, saved_user_rsp);
+    if has_pending_signal() {
+        return NEG_EINTR;
+    }
     while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
         crate::task::yield_now();
         restore_caller_context(pid, saved_user_rsp);
@@ -7075,15 +7082,41 @@ const FB_MAPPING_FLAG: u64 = 1 << 32;
 fn sys_framebuffer_mmap() -> u64 {
     let (buf_virt, byte_len) = match crate::fb::framebuffer_buf_addr() {
         Some(v) => v,
-        None => return NEG_EINVAL,
+        None => {
+            log::warn!("[fb_mmap] framebuffer_buf_addr() returned None — FB not initialised");
+            return NEG_EINVAL;
+        }
     };
 
-    let phys_off = crate::mm::phys_offset();
-    // checked_sub guards against buf_virt < phys_off (would underflow to a
-    // spurious physical address and map arbitrary memory into userspace).
-    let buf_phys = match buf_virt.checked_sub(phys_off) {
-        Some(v) if v % 4096 == 0 => v,
-        _ => return NEG_EINVAL,
+    // Translate the kernel virtual address of the framebuffer to its physical
+    // address by walking the kernel page tables.  The bootloader may map the
+    // framebuffer at a UEFI-provided virtual address that is NOT inside the
+    // phys_off direct-map region, so `buf_virt - phys_off` would compute the
+    // wrong physical address and cause PhysFrame::from_start_address to fail.
+    let buf_phys = {
+        use x86_64::structures::paging::Translate;
+        // SAFETY: get_mapper() must not alias another live OffsetPageTable.
+        // We create and immediately drop this mapper (before the user mapper
+        // created below) so there is no aliasing of the same page table.
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        match mapper.translate_addr(x86_64::VirtAddr::new(buf_virt)) {
+            Some(phys) => {
+                let pa = phys.as_u64();
+                if pa % 4096 != 0 {
+                    log::warn!("[fb_mmap] FB phys addr {:#x} not page-aligned", pa);
+                    return NEG_EINVAL;
+                }
+                pa
+            }
+            None => {
+                log::warn!(
+                    "[fb_mmap] translate_addr({:#x}) failed — FB virt not mapped?",
+                    buf_virt
+                );
+                return NEG_EINVAL;
+            }
+        }
+        // mapper dropped here — no aliasing with the user mapper created below
     };
 
     let num_pages = (byte_len as u64).div_ceil(4096);
@@ -7098,7 +7131,13 @@ fn sys_framebuffer_mmap() -> u64 {
         >::from_start_address(phys_addr)
         {
             Ok(f) => f,
-            Err(_) => return NEG_EINVAL,
+            Err(_) => {
+                log::warn!(
+                    "[fb_mmap] PhysFrame::from_start_address({:#x}) failed",
+                    phys_addr
+                );
+                return NEG_EINVAL;
+            }
         };
         frames.push(frame);
     }
