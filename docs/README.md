@@ -1,8 +1,9 @@
-# m³OS — Toy Bootable OS in Rust
+# m³OS — Bootable OS in Rust
 
-A toy bootable operating system built in Rust, following a **microkernel architecture**
-targeting **x86_64**. Designed for learning, with the eventual goal of running a real
-userspace shell and programs.
+A serious, still-maturing bootable operating system built in Rust, following a
+**microkernel-inspired architecture** targeting **x86_64**. Designed for
+learning and experimentation, with a real userspace, networking, remote access,
+and a roadmap toward stronger service isolation and broader platform support.
 
 ## Documentation Index
 
@@ -84,6 +85,7 @@ userspace shell and programs.
 | Document | Description |
 |---|---|
 | [Project Evaluation](./evaluation/README.md) | Repo-wide review of current state, security, usability gaps, GUI path, and Rust OS comparisons |
+| [Evaluation Roadmap](./evaluation/roadmap/README.md) | Release-oriented path to 1.0 and beyond, tied back to the official implementation roadmap |
 
 ## Quick Start
 

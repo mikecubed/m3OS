@@ -1,6 +1,9 @@
 # m³OS
 
-A toy bootable operating system written in Rust, targeting **x86_64** with a **microkernel architecture**. Built for learning OS fundamentals, with the goal of eventually running a real userspace shell.
+A serious, still-maturing bootable operating system written in Rust, targeting
+**x86_64** with a **microkernel-inspired architecture**. Built for learning and
+experimentation, with a real userspace, networking, remote access, and a
+roadmap toward stronger service isolation and broader platform support.
 
 ## Quick Start
 

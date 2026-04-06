@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-Redox OS has the richest set of userspace Rust hardware drivers in the hobby-OS ecosystem: ~30 drivers covering storage, networking, USB, graphics, audio, and input. They are well-structured, Rust-native, and BSD-licensed. But **direct code reuse is not realistic without substantial infrastructure work in m3OS first**, and even then, only the hardware-logic cores of Redox drivers are portable—not the system integration glue.
+Redox OS has the richest set of userspace Rust hardware drivers in the hobby-OS ecosystem: ~30 drivers covering storage, networking, USB, graphics, audio, and input. They are well-structured, Rust-native, and MIT-licensed. But **direct code reuse is not realistic without substantial infrastructure work in m3OS first**, and even then, only the hardware-logic cores of Redox drivers are portable—not the system integration glue.
 
 The practical strategy is:
 

@@ -41,6 +41,7 @@ flowchart LR
 | [usability-roadmap.md](./usability-roadmap.md) | What it takes to become usable headless, then usable desktop |
 | [gui-strategy.md](./gui-strategy.md) | Options and recommended path toward a Redox-like GUI stack |
 | [rust-os-comparison.md](./rust-os-comparison.md) | Comparison with Redox and other Rust OS projects |
+| [roadmap/README.md](./roadmap/README.md) | Release-oriented road to 1.0 and beyond, grouping the official implementation phases into security, architecture, hardware, operations, and GUI horizons |
 
 ## Key conclusions
 
@@ -55,6 +56,12 @@ The hardware and driver analysis is split intentionally:
 
 - [hardware-driver-strategy.md](./hardware-driver-strategy.md) is the **project-level recommendation**: what donor ecosystems to use, what to avoid, and what real-hardware roadmap makes sense.
 - [redox-driver-porting.md](./redox-driver-porting.md) is the **Redox-specific deep dive**: what infrastructure Redox drivers assume, which classes are most portable, and why a full Redox compatibility shim is not the right first move.
+
+The concrete 1.0-and-beyond planning overlay lives in
+[roadmap/README.md](./roadmap/README.md). That subdirectory does **not** replace
+the official `docs/roadmap/` implementation phases; it groups them into a
+release-oriented sequence for security, microkernel convergence, hardware
+enablement, operability, and the optional GUI/local-system milestone.
 
 ## The microkernel question
 
