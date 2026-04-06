@@ -8,8 +8,8 @@ The current repo is closer to "graphics-capable kernel substrate" than to "deskt
 
 - `kernel/src/fb/mod.rs` implements a framebuffer text console
 - `docs/09-framebuffer-and-shell.md` already hints at moving framebuffer ownership to a dedicated display server later
-- `docs/roadmap/47-doom.md` proposes raw framebuffer access for a single graphical app
-- `docs/roadmap/48-mouse-input.md` and `docs/roadmap/49-audio.md` are still planned, not integrated
+- `docs/roadmap/55-graphics-bring-up.md` now treats single-app or early graphical bring-up as its own milestone
+- `docs/roadmap/56-display-and-input-architecture.md` and `docs/roadmap/57-audio-and-local-session.md` define the later display, input, audio, and session work more explicitly
 - Phase 46 now supplies a real service/logging/admin baseline that later display/session services can reuse
 
 ## Why this needs detailed planning
@@ -113,6 +113,11 @@ This matches m3OS better than a Wayland-first approach because:
 
 ## Practical staged plan
 
+In the official roadmap, this staged GUI path now maps roughly to **Phase 55**
+(graphics bring-up), **Phase 56** (display and input architecture),
+**Phase 57** (audio and local session), and the **Phase 58** release decision
+about whether 1.0 includes the local-system branch or remains headless-first.
+
 ### Phase A: single-app graphics proof
 
 Purpose: prove that graphical applications can run at all.
@@ -193,7 +198,7 @@ That does **not** mean m3OS needs to clone Redox exactly. It does mean the short
 
 The best path is:
 
-1. use Phase 47-style DOOM or raw-framebuffer work as a **graphics bring-up milestone**
+1. use Phase 55-style DOOM or raw-framebuffer work as a **graphics bring-up milestone**
 2. immediately follow with **input abstraction**
 3. then design and build a **userspace display server/compositor**
 4. only after that consider higher-level compatibility layers or larger GUI toolkits

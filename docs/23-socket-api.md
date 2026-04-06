@@ -178,7 +178,7 @@ binary proved the socket layer works.
 - Only `AF_INET` is supported. Phase 39 (Unix Domain Sockets) adds
   `AF_UNIX`.
 - No TLS or encryption. Phase 42 (Crypto and TLS) adds `rustls`.
-- No DNS resolution. Phase 51 (Networking and GitHub) adds DNS.
+- No DNS resolution. Phase 60 (Networking and GitHub) adds DNS.
 
 ## Related Roadmap Docs
 

@@ -5,11 +5,16 @@
 [R08 — Hardware Substrate](./R08-hardware-substrate.md),
 [R09 — Display and Input Architecture](./R09-display-and-input-architecture.md)  
 **Official roadmap phases covered:** [Phase 43c](../../roadmap/43c-regression-stress-ci.md),
-[Phase 49](../../roadmap/49-audio.md),
-[Phase 50](../../roadmap/50-cross-compiled-toolchains.md),
-[Phase 51](../../roadmap/51-networking-and-github.md),
-[Phase 52](../../roadmap/52-nodejs.md),
-[Phase 53](../../roadmap/53-claude-code.md)  
+[Phase 52](../../roadmap/52-headless-hardening.md),
+[Phase 54](../../roadmap/54-hardware-substrate.md),
+[Phase 55](../../roadmap/55-graphics-bring-up.md),
+[Phase 56](../../roadmap/56-display-and-input-architecture.md),
+[Phase 57](../../roadmap/57-audio-and-local-session.md),
+[Phase 58](../../roadmap/58-release-1-0-gate.md),
+[Phase 59](../../roadmap/59-cross-compiled-toolchains.md),
+[Phase 60](../../roadmap/60-networking-and-github.md),
+[Phase 61](../../roadmap/61-nodejs.md),
+[Phase 62](../../roadmap/62-claude-code.md)
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Rust OS Comparison](../rust-os-comparison.md),
 [GUI Strategy](../gui-strategy.md)
@@ -108,8 +113,8 @@ that enforces its architectural direction and knows its support boundaries.
 - [Path to a Usable State](../usability-roadmap.md)
 - [m3OS Compared with Redox and Other Rust OS Projects](../rust-os-comparison.md)
 - [GUI Strategy](../gui-strategy.md)
-- [Phase 50 — Cross-Compiled Toolchains](../../roadmap/50-cross-compiled-toolchains.md)
-- [Phase 53 — Claude Code](../../roadmap/53-claude-code.md)
+- [Phase 58 — Release 1.0 Gate](../../roadmap/58-release-1-0-gate.md)
+- [Phase 62 — Claude Code](../../roadmap/62-claude-code.md)
 
 ## Open Questions
 

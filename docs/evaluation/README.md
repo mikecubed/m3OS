@@ -49,7 +49,7 @@ flowchart LR
 1. **As a serious microkernel-style OS project, m3OS is already substantial.** It goes far beyond "boot a kernel" tutorials and already demonstrates SMP, paging, process isolation, SSH, Unix sockets, PTYs, ext2, and a substantial userspace.
 2. **As a secure multi-user system, it is not ready.** The current `setuid`/`setgid` behavior, entropy story, telnet default, and baked-in credentials are enough to block that claim.
 3. **As a managed headless/reference system, it is materially stronger after Phase 46.** The service model, logging, cron, and admin surface are now real, but security fixes, packaging/runtime polish, and targeted regression reliability still need work.
-4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, raw input, mouse, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack; a Phase 47-style single-app graphics milestone would improve bring-up, not solve the display-server/compositor gap.
+4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, input, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack; a Phase 55-style graphics bring-up milestone would improve bring-up, not solve the display-server/compositor gap.
 5. **As a documented microkernel design, the architecture is ahead of the implementation.** The project already has the right foundational primitives — ring-3 processes, per-process address spaces, capability-based IPC, notifications, and a strong roadmap story — but core services still live in ring 0 and several IPC/data paths still assume a shared kernel address space.
 6. **As a real-hardware platform, the next bottleneck is driver strategy rather than just ambition.** m3OS has enough kernel substrate to begin real-hardware bringup, but it needs a deliberate sourcing strategy: public specs first, Redox as the closest reusable Rust codebase, BSD as a permissive reference, and Linux primarily as a behavior/quirk reference rather than a donor.
 
@@ -97,7 +97,7 @@ Concrete reasons that framing is more accurate:
 
 ## Evaluation inputs
 
-- Repository docs: `README.md`, `docs/README.md`, `docs/roadmap/README.md`, `docs/appendix/architecture-and-syscalls.md`, `docs/43c-regression-stress-ci.md`, `docs/09-framebuffer-and-shell.md`, `docs/roadmap/46-system-services.md`, `docs/roadmap/47-doom.md`, `docs/roadmap/48-mouse-input.md`, `docs/roadmap/49-audio.md`
+- Repository docs: `README.md`, `docs/README.md`, `docs/roadmap/README.md`, `docs/appendix/architecture-and-syscalls.md`, `docs/43c-regression-stress-ci.md`, `docs/09-framebuffer-and-shell.md`, `docs/roadmap/46-system-services.md`, `docs/roadmap/54-hardware-substrate.md`, `docs/roadmap/55-graphics-bring-up.md`, `docs/roadmap/56-display-and-input-architecture.md`, `docs/roadmap/57-audio-and-local-session.md`
 - Source tree: `kernel/`, `kernel-core/`, `userspace/`, `xtask/`
 - Review tracks: architecture (Sonnet 4.6), security (GPT-5.4), comparative positioning (Opus 4.6), scouting/runtime passes (Haiku 4.5, GPT-4.1)
 - Evaluation-session validation: `cargo xtask check`, `cargo xtask smoke-test`, and `cargo xtask regression --test fork-overlap`

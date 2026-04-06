@@ -5,9 +5,8 @@
 **Official roadmap phases covered:** [Phase 15](../../roadmap/15-hardware-discovery.md),
 [Phase 16](../../roadmap/16-network.md),
 [Phase 24](../../roadmap/24-persistent-storage.md),
-[Phase 47](../../roadmap/47-doom.md),
-[Phase 48](../../roadmap/48-mouse-input.md),
-[Phase 49](../../roadmap/49-audio.md)  
+[Phase 54](../../roadmap/54-hardware-substrate.md),
+[Phase 56](../../roadmap/56-display-and-input-architecture.md)
 **Primary evaluation docs:** [Hardware Driver Strategy](../hardware-driver-strategy.md),
 [Redox Driver Porting](../redox-driver-porting.md),
 [GUI Strategy](../gui-strategy.md)
@@ -44,7 +43,7 @@ flowchart TD
 | Bus/platform | Legacy PCI discovery and QEMU-friendly assumptions dominate | PCIe-era helpers, cleaner BAR mapping, stronger interrupt and DMA discipline | IOMMU awareness and wider platform maturity |
 | Storage | VirtIO-first | NVMe on a reference machine or equivalent serious real-hardware path | AHCI and broader storage matrix |
 | Networking | VirtIO-first | Intel e1000/e1000e-class support on reference hardware | Realtek and other NIC families |
-| Input | Keyboard story exists, mouse is planned | Minimal pointing-device support that fits the GUI plan | USB HID and richer input devices |
+| Input | Keyboard story exists, richer pointing-device support is still planned | Minimal pointing-device support that fits the GUI plan | USB HID and richer input devices |
 | Audio/GPU | Not a release blocker yet | Clear scope line around what is and is not needed for 1.0 | Audio, richer display, later GPU work |
 
 ## Detailed workstreams
@@ -99,7 +98,8 @@ benefits both the headless/admin path and the later local desktop path.
 - [Hardware Driver Strategy](../hardware-driver-strategy.md)
 - [Redox Driver Porting](../redox-driver-porting.md)
 - [Phase 15 — Hardware Discovery](../../roadmap/15-hardware-discovery.md)
-- [Phase 48 — Mouse Input](../../roadmap/48-mouse-input.md)
+- [Phase 54 — Hardware Substrate](../../roadmap/54-hardware-substrate.md)
+- [Phase 56 — Display and Input Architecture](../../roadmap/56-display-and-input-architecture.md)
 
 ## Open Questions
 

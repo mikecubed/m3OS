@@ -262,7 +262,7 @@ Python code.
 **Current state:** The kernel already implements `getrandom()` (syscall 318)
 but currently seeds it from `_rdtsc()` via a simple xorshift PRNG. For
 crypto-quality randomness, this needs upgrading to a ChaCha20 CSPRNG seeded
-from RDRAND/RDSEED (planned for Phase 51). For non-crypto use (`import random`),
+from RDRAND/RDSEED (planned for Phase 47). For non-crypto use (`import random`),
 the current implementation is sufficient.
 
 ---

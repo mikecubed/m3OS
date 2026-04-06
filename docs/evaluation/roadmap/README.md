@@ -136,7 +136,7 @@ If you care mostly about one axis:
 - **Security and operating posture:** `R01`, `R04`, `R06`
 - **Microkernel convergence:** `R02`, `R03`, `R05`, `R07`
 - **Real hardware:** `R08`
-- **GUI / Redox-like local system:** `R09`, `R10`
+- **GUI / Redox-like local system:** `R09`, plus the optional local-system branch inside `R10`
 
 ## Relationship to the existing implementation roadmap
 
@@ -150,10 +150,15 @@ Examples:
   part of **R04** and **R06**
 - [Phase 44 — Rust Cross-Compilation](../../roadmap/44-rust-cross-compilation.md)
   is primarily part of **R06**
-- [Phases 47–49](../../roadmap/47-doom.md) are primarily part of **R09** and
-  **R10**
-- [Phases 50–53](../../roadmap/50-cross-compiled-toolchains.md) are mostly
-  **post-1.0 growth**, not early release blockers
+- [Phases 47–53](../../roadmap/47-security-foundation.md) are the main
+  implementation breakdown of **R01** through **R07**
+- [Phases 54–57](../../roadmap/54-hardware-substrate.md) cover the official
+  hardware and local-system branch for **R08**, **R09**, and the optional GUI
+  path discussed in **R10**
+- [Phase 58](../../roadmap/58-release-1-0-gate.md) is the explicit official
+  implementation of the **R10** release gate
+- [Phases 59–62](../../roadmap/59-cross-compiled-toolchains.md) are explicitly
+  **post-1.0 growth**, not hidden early release blockers
 
 Because phases 1-46 are already complete, missing behavior in those areas should
 usually be read as a quality gap in the shipped base or as explicit later-phase

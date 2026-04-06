@@ -10,7 +10,8 @@
 [Phase 44](../../roadmap/44-rust-cross-compilation.md),
 [Phase 45](../../roadmap/45-ports-system.md),
 [Phase 46](../../roadmap/46-system-services.md),
-[Phase 51](../../roadmap/51-networking-and-github.md)  
+[Phase 52](../../roadmap/52-headless-hardening.md),
+[Phase 58](../../roadmap/58-release-1-0-gate.md)
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Security Review](../security-review.md),
 [Current State](../current-state.md)
@@ -49,7 +50,7 @@ flowchart TD
 | P1 hardening | Good crypto and diagnostics work exists, but security polish is incomplete | SSH, auth-file handling, and default hygiene are materially stronger | More advanced sandboxing and policy controls |
 | Rust userspace | Rust std path is in the current base, but it still needs to become the boring/default workflow | Rust std becomes the normal guest development path | Bigger toolchains and richer ecosystem support |
 | Packaging | Ports exist in the current base, but reliability and failure modes still matter | Ports and images are predictable enough for routine use | Package feeds, larger repos, dependency breadth |
-| Networking for operators | Basic networking exists, but operator-friendly client workflows are incomplete | Outbound-friendly basics such as DNS/DHCP and sane admin flows | Full HTTPS-heavy tooling and larger online ecosystem |
+| Remote/outbound boundary | Basic networking exists, but 1.0 release scope is not the same thing as broad client-network tooling | Make the supported remote/admin workflows explicit and keep non-essential outbound tooling out of the release gate | Full HTTPS-heavy tooling and larger online ecosystem |
 | Validation | Diagnostics are already strong | Smoke/regression/stress become trusted release gates | Wider hardware CI and richer telemetry |
 
 ## Detailed workstreams
@@ -59,7 +60,7 @@ flowchart TD
 | P1 security hardening | Improve SSH hardening, auth-file update discipline, and secret hygiene | The system should not plateau immediately after the P0 fixes |
 | Rust std workflow | Treat the Rust std cross-compilation path as the normal way to add serious new userspace and close remaining rough edges | This is the highest-leverage developer experience improvement |
 | Ports reliability | Make the shipped build, fetch, and install behavior deterministic and observable | A platform without reliable packaging feels fragile |
-| Operator networking | Add the minimum client-networking and outbound workflows the headless story needs | Real systems must resolve names and reach services sanely |
+| Remote-scope discipline | Decide which outbound workflows are true release needs and which are post-1.0 conveniences | Honest support boundaries are part of hardening |
 | Validation and diagnostics | Tie crash diagnostics, trace rings, smoke tests, regressions, and stress runs into release discipline | Passing validation should mean something concrete |
 
 ## How This Differs from Linux, Redox, and production systems
@@ -94,8 +95,8 @@ software, diagnose failures, and trust the validation story enough to ship.
   materially satisfied
 - Rust std-based guest programs are part of the normal documented workflow
 - Ports and image-building behavior are deterministic enough for repeated use
-- DNS/DHCP or equivalent outbound operator networking basics exist where the
-  release story depends on them
+- The release docs explicitly describe which remote/outbound workflows are
+  supported at 1.0 and which are deferred
 - Smoke, regression, and stress results are treated as meaningful release gates
 - Security documentation and operator documentation match the shipped behavior
 

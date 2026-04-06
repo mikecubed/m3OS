@@ -56,7 +56,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | Document | Description |
 |---|---|
 | [Roadmap Guide](./roadmap/README.md) | Detailed learning-first milestones with per-phase pages and Mermaid diagrams |
-| [Roadmap Task Lists](./roadmap/tasks/README.md) | Actionable per-phase task breakdowns paired with the roadmap milestones |
+| [Roadmap Task Lists](./roadmap/tasks/README.md) | Actionable per-phase task breakdowns for implemented and near-term phases; later phases add task docs when implementation planning begins |
 
 ### Appendix (cross-cutting and historical)
 

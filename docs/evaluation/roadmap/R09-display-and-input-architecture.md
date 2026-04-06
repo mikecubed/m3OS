@@ -5,9 +5,9 @@
 [R08 — Hardware Substrate](./R08-hardware-substrate.md)  
 **Official roadmap phases covered:** [Phase 9](../../roadmap/09-framebuffer-and-shell.md),
 [Phase 46](../../roadmap/46-system-services.md),
-[Phase 47](../../roadmap/47-doom.md),
-[Phase 48](../../roadmap/48-mouse-input.md),
-[Phase 49](../../roadmap/49-audio.md)  
+[Phase 55](../../roadmap/55-graphics-bring-up.md),
+[Phase 56](../../roadmap/56-display-and-input-architecture.md),
+[Phase 57](../../roadmap/57-audio-and-local-session.md)
 **Primary evaluation docs:** [GUI Strategy](../gui-strategy.md),
 [Path to a Proper Microkernel Design](../microkernel-path.md),
 [Usability Roadmap](../usability-roadmap.md)
@@ -97,9 +97,9 @@ headless release and any Redox-like desktop ambition.
 
 - [GUI Strategy](../gui-strategy.md)
 - [Usability Roadmap](../usability-roadmap.md)
-- [Phase 47 — DOOM](../../roadmap/47-doom.md)
-- [Phase 48 — Mouse Input](../../roadmap/48-mouse-input.md)
-- [Phase 49 — Audio](../../roadmap/49-audio.md)
+- [Phase 55 — Graphics Bring-Up](../../roadmap/55-graphics-bring-up.md)
+- [Phase 56 — Display and Input Architecture](../../roadmap/56-display-and-input-architecture.md)
+- [Phase 57 — Audio and Local Session](../../roadmap/57-audio-and-local-session.md)
 
 ## Open Questions
 

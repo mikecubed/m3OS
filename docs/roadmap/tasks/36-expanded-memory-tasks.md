@@ -183,8 +183,8 @@ These are configuration-only changes that enable testing with larger workloads.
 
 **File:** `xtask/src/main.rs`
 **Symbol:** `qemu_args`
-**Why it matters:** 256 MB is insufficient for cross-compiled toolchains that rely
-on demand paging. 1 GB provides headroom for Phase 50 workloads.
+**Why it matters:** 256 MB is insufficient for larger cross-compiled toolchains
+that rely on demand paging. 1 GB provides headroom for Phase 59 workloads.
 
 **Acceptance:**
 - [x] QEMU `-m` argument changed from `256` to `1024`

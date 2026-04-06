@@ -94,8 +94,8 @@ This is the main reason the current system reads as "microkernel-aimed" rather t
 | Networking | Solid system infrastructure, still not full product networking | `docs/16-network.md`, `docs/23-socket-api.md`, `docs/39-unix-domain-sockets.md`, `kernel/src/net/` |
 | Userspace tooling | Far beyond the kernel-demo stage | `userspace/`, `userspace/coreutils-rs/`, `docs/32-build-tools.md`, `docs/45-ports-system.md` |
 | Service model | Real Phase 46 baseline, but still not the same thing as a clean graph of restartable ring-3 core services | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
-| Graphics/UI | Text console only | `docs/09-framebuffer-and-shell.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/47-doom.md` |
-| Hardware breadth | Still QEMU-centric | `kernel/src/blk/`, `kernel/src/net/virtio_net.rs`, `docs/roadmap/48-mouse-input.md`, `docs/roadmap/49-audio.md` |
+| Graphics/UI | Text console only | `docs/09-framebuffer-and-shell.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/55-graphics-bring-up.md`, `docs/roadmap/56-display-and-input-architecture.md` |
+| Hardware breadth | Still QEMU-centric | `kernel/src/blk/`, `kernel/src/net/virtio_net.rs`, `docs/roadmap/54-hardware-substrate.md`, `docs/roadmap/57-audio-and-local-session.md` |
 
 ## Why m3OS is already more than "just a toy"
 
