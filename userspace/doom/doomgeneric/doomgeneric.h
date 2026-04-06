@@ -3,9 +3,14 @@
 
 #include <stdint.h>
 
-/* doomgeneric screen dimensions */
-#define DOOMGENERIC_RESX 320
-#define DOOMGENERIC_RESY 200
+/* doomgeneric screen dimensions
+ *
+ * Set to match the m3OS/QEMU framebuffer (1280×800).  doomgeneric's
+ * I_FinishUpdate will scale the native 320×200 canvas by a factor of
+ * 4 in each dimension before calling DG_DrawFrame, which blits the
+ * result directly to the physical framebuffer. */
+#define DOOMGENERIC_RESX 1280
+#define DOOMGENERIC_RESY 800
 
 /* The screen buffer — doomgeneric writes ARGB pixels (0xAARRGGBB) here.
  * The platform layer reads from this buffer in DG_DrawFrame. */
