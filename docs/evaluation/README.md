@@ -34,6 +34,8 @@ flowchart LR
 | Document | Focus |
 |---|---|
 | [current-state.md](./current-state.md) | Architecture reality check, subsystem maturity, and validation snapshot |
+| [hardware-driver-strategy.md](./hardware-driver-strategy.md) | Feasibility of reusing Redox or other OS drivers, translation-layer tradeoffs, and the recommended real-hardware support path |
+| [redox-driver-porting.md](./redox-driver-porting.md) | Deep dive on what parts of Redox's userspace drivers are realistically portable to m3OS and what infrastructure must exist first |
 | [microkernel-path.md](./microkernel-path.md) | Detailed deficiencies in the current microkernel implementation and a staged path toward a properly enforced userspace-service architecture |
 | [security-review.md](./security-review.md) | Security posture, immediate blockers, and hardening backlog |
 | [usability-roadmap.md](./usability-roadmap.md) | What it takes to become usable headless, then usable desktop |
@@ -47,6 +49,12 @@ flowchart LR
 3. **As a headless development or demo environment, it is close.** The live smoke path is strong, but service supervision, logging, packaging polish, and targeted regression reliability still need work.
 4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, raw input, mouse, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack.
 5. **As a documented microkernel design, the architecture is ahead of the implementation.** The project already has the right foundational primitives — ring-3 processes, per-process address spaces, capability-based IPC, notifications, and a strong roadmap story — but core services still live in ring 0 and several IPC/data paths still assume a shared kernel address space.
+6. **As a real-hardware platform, the next bottleneck is driver strategy rather than just ambition.** m3OS has enough kernel substrate to begin real-hardware bringup, but it needs a deliberate sourcing strategy: public specs first, Redox as the closest reusable Rust codebase, BSD as a permissive reference, and Linux primarily as a behavior/quirk reference rather than a donor.
+
+The hardware and driver analysis is split intentionally:
+
+- [hardware-driver-strategy.md](./hardware-driver-strategy.md) is the **project-level recommendation**: what donor ecosystems to use, what to avoid, and what real-hardware roadmap makes sense.
+- [redox-driver-porting.md](./redox-driver-porting.md) is the **Redox-specific deep dive**: what infrastructure Redox drivers assume, which classes are most portable, and why a full Redox compatibility shim is not the right first move.
 
 ## The microkernel question
 
