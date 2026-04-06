@@ -142,6 +142,12 @@ static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test");
 static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test");
 static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum");
 static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey");
+// Phase 44: musl-linked Rust std programs
+static HELLO_RUST_ELF: &[u8] = include_bytes!("../../initrd/hello-rust");
+static SYSINFO_RUST_ELF: &[u8] = include_bytes!("../../initrd/sysinfo-rust");
+static HTTPD_RUST_ELF: &[u8] = include_bytes!("../../initrd/httpd-rust");
+static CALC_RUST_ELF: &[u8] = include_bytes!("../../initrd/calc-rust");
+static TODO_RUST_ELF: &[u8] = include_bytes!("../../initrd/todo-rust");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -354,6 +360,37 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "genkey",
         RamdiskNode::File {
             content: GENKEY_ELF,
+        },
+    ),
+    // Phase 44: musl-linked Rust std programs
+    (
+        "hello-rust",
+        RamdiskNode::File {
+            content: HELLO_RUST_ELF,
+        },
+    ),
+    (
+        "sysinfo-rust",
+        RamdiskNode::File {
+            content: SYSINFO_RUST_ELF,
+        },
+    ),
+    (
+        "httpd-rust",
+        RamdiskNode::File {
+            content: HTTPD_RUST_ELF,
+        },
+    ),
+    (
+        "calc-rust",
+        RamdiskNode::File {
+            content: CALC_RUST_ELF,
+        },
+    ),
+    (
+        "todo-rust",
+        RamdiskNode::File {
+            content: TODO_RUST_ELF,
         },
     ),
 ];

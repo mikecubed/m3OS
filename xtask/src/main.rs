@@ -359,6 +359,126 @@ fn build_musl_bins() {
     }
 }
 
+/// Phase 44: Cross-compile musl-linked Rust userspace programs and copy them into kernel/initrd/.
+///
+/// Each crate is built individually via `--manifest-path` (they are NOT workspace members).
+/// Uses `x86_64-unknown-linux-musl` target with prebuilt std (no `-Zbuild-std`).
+/// Gracefully skips crates that don't exist yet and handles missing musl target.
+fn build_musl_rust_bins() {
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    fs::create_dir_all(&initrd).unwrap_or_else(|e| {
+        panic!(
+            "failed to create initrd directory {}: {e}",
+            initrd.display()
+        );
+    });
+
+    let crates: &[&str] = &[
+        "hello-rust",
+        "sysinfo-rust",
+        "httpd-rust",
+        "calc-rust",
+        "todo-rust",
+    ];
+
+    // Ensure placeholder files exist for every crate so that the kernel's
+    // include_bytes! in ramdisk.rs always finds them, even if the musl target
+    // is not installed or individual crates are missing.
+    for name in crates {
+        let dst = initrd.join(name);
+        if !dst.exists() {
+            if let Err(e) = File::create(&dst) {
+                eprintln!("warning: failed to create placeholder kernel/initrd/{name}: {e}");
+            }
+        }
+    }
+
+    // Check musl target availability once before the build loop so a single
+    // crate-specific error doesn't skip the rest.
+    let musl_target_available = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("x86_64-unknown-linux-musl"))
+        .unwrap_or(false);
+
+    if !musl_target_available {
+        eprintln!(
+            "warning: x86_64-unknown-linux-musl target not installed — \
+             skipping all musl Rust builds. Run: rustup target add x86_64-unknown-linux-musl"
+        );
+        return;
+    }
+
+    for name in crates {
+        let manifest = root.join(format!("userspace/{name}/Cargo.toml"));
+        if !manifest.exists() {
+            eprintln!("warning: userspace/{name}/Cargo.toml not found — skipping");
+            continue;
+        }
+
+        println!("musl-rust: building {name} for x86_64-unknown-linux-musl...");
+        let status = match Command::new(env!("CARGO"))
+            .current_dir(&root)
+            .args([
+                "build",
+                "--manifest-path",
+                manifest.to_str().expect("non-UTF-8 path"),
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--release",
+            ])
+            // Produce non-PIE static binaries (ET_EXEC) so the kernel's ELF
+            // loader doesn't conflict with musl's self-relocating CRT startup.
+            .env(
+                "RUSTFLAGS",
+                "-C relocation-model=static -C target-feature=+crt-static",
+            )
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: failed to run cargo build for {name}: {e}");
+                continue;
+            }
+        };
+
+        if !status.success() {
+            eprintln!("warning: musl Rust build failed for {name} — skipping");
+            continue;
+        }
+
+        let built = root.join(format!(
+            "userspace/{name}/target/x86_64-unknown-linux-musl/release/{name}"
+        ));
+        let dst = initrd.join(name);
+
+        // Strip debug symbols to reduce binary size; fall back to plain copy.
+        let strip_status = Command::new("strip")
+            .args(["-o", dst.to_str().unwrap(), built.to_str().unwrap()])
+            .status();
+        match strip_status {
+            Ok(s) if s.success() => {}
+            _ => {
+                // Fallback: copy without stripping.
+                fs::copy(&built, &dst).unwrap_or_else(|e| {
+                    panic!("failed to copy {name} to initrd: {e}");
+                });
+            }
+        }
+
+        // Print binary size for visibility.
+        if let Ok(meta) = fs::metadata(&dst) {
+            println!(
+                "musl-rust: {name} → kernel/initrd/{name} ({} bytes)",
+                meta.len()
+            );
+        } else {
+            println!("musl-rust: {name} → kernel/initrd/{name}");
+        }
+    }
+}
+
 /// Cross-compile ion shell for musl and place it in kernel/initrd/.
 ///
 /// Strategy: clone ion from GitHub (or use cached clone in target/ion-src/),
@@ -889,6 +1009,8 @@ fn build_kernel() -> PathBuf {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    // Phase 44: cross-compile musl-linked Rust userspace programs.
+    build_musl_rust_bins();
     // Phase 31: cross-compile TCC (result used during disk image creation).
     build_tcc();
     build_ion();
@@ -1066,6 +1188,8 @@ fn cmd_check() {
     let root = workspace_root();
     build_userspace_bins();
     build_musl_bins();
+    // Phase 44: cross-compile musl-linked Rust userspace programs.
+    build_musl_rust_bins();
     build_ion();
     build_pdpmake();
 
