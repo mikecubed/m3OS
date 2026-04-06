@@ -402,6 +402,12 @@ fn build_musl_rust_bins() {
                 "x86_64-unknown-linux-musl",
                 "--release",
             ])
+            // Produce non-PIE static binaries (ET_EXEC) so the kernel's ELF
+            // loader doesn't conflict with musl's self-relocating CRT startup.
+            .env(
+                "RUSTFLAGS",
+                "-C relocation-model=static -C target-feature=+crt-static",
+            )
             .status()
         {
             Ok(s) => s,
