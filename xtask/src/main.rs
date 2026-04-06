@@ -382,6 +382,16 @@ fn build_musl_rust_bins() {
         "todo-rust",
     ];
 
+    // Ensure placeholder files exist for every crate so that the kernel's
+    // include_bytes! in ramdisk.rs always finds them, even if the musl target
+    // is not installed or individual crates are missing.
+    for name in crates {
+        let dst = initrd.join(name);
+        if !dst.exists() {
+            let _ = File::create(&dst);
+        }
+    }
+
     let mut musl_target_checked = false;
 
     for name in crates {

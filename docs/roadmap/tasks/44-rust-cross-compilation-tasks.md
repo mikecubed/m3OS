@@ -1,6 +1,6 @@
 # Phase 44 — Rust Cross-Compilation Pipeline: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-44
 **Depends on:** Phase 12 (POSIX Compat) ✅, Phase 14 (Shell and Tools) ✅, Phase 24 (Persistent Storage) ✅
 **Goal:** Enable Rust programs cross-compiled on the host (via

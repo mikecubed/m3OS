@@ -25,12 +25,7 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: text/html\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     HTML_BODY.len(),
                     HTML_BODY,
                 );
