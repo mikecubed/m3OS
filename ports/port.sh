@@ -164,24 +164,26 @@ resolve_deps() {
 
     if [ -n "$DEPS" ]; then
         for _dep in $DEPS; do
-            # Circular dependency detection
+            if is_installed "$_dep"; then
+                echo ">>> Dependency '$_dep' already installed"
+                continue
+            fi
+            # Circular dependency detection (only when about to recurse)
             case " $_DEP_STACK " in
                 *" $_dep "*)
                     echo "Error: circular dependency detected: $_DEP_STACK -> $_dep"
                     exit 1
                     ;;
             esac
-            if ! is_installed "$_dep"; then
-                echo ">>> Installing dependency: $_dep"
-                _DEP_STACK="$_DEP_STACK $_dep"
-                cmd_install "$_dep"
-                if [ $? -ne 0 ]; then
-                    echo "Error: failed to install dependency '$_dep'"
-                    exit 1
-                fi
-            else
-                echo ">>> Dependency '$_dep' already installed"
+            echo ">>> Installing dependency: $_dep"
+            _saved_stack="$_DEP_STACK"
+            _DEP_STACK="$_DEP_STACK $_dep"
+            cmd_install "$_dep"
+            if [ $? -ne 0 ]; then
+                echo "Error: failed to install dependency '$_dep'"
+                exit 1
             fi
+            _DEP_STACK="$_saved_stack"
         done
     fi
 }
@@ -225,7 +227,8 @@ cmd_install() {
     ensure_db
 
     # Snapshot files before install (for manifest generation)
-    find $PREFIX -type f > /tmp/port_before 2>/dev/null
+    # Use $DB_DIR with PID for unique, root-owned temp files
+    find $PREFIX -type f > "$DB_DIR/port_before.$$" 2>/dev/null
 
     # Run the build lifecycle
     echo "==> Fetching source..."
@@ -258,7 +261,7 @@ cmd_install() {
     fi
 
     # Generate manifest: find new files added during install
-    find $PREFIX -type f > /tmp/port_after 2>/dev/null
+    find $PREFIX -type f > "$DB_DIR/port_after.$$" 2>/dev/null
     generate_manifest "$NAME"
 
     # Record in installed database
@@ -383,19 +386,21 @@ generate_manifest() {
 
     # Compare before and after snapshots
     # Files in "after" but not in "before" are newly installed
-    if [ -f /tmp/port_before ] && [ -f /tmp/port_after ]; then
-        sort /tmp/port_before > /tmp/port_before_sorted
-        sort /tmp/port_after > /tmp/port_after_sorted
+    _before="$DB_DIR/port_before.$$"
+    _after="$DB_DIR/port_after.$$"
+    if [ -f "$_before" ] && [ -f "$_after" ]; then
+        sort "$_before" > "$_before.sorted"
+        sort "$_after" > "$_after.sorted"
         # Find lines only in the after list (newly installed files)
         _new_files=""
         while read _file; do
-            if ! grep -Fxq "$_file" /tmp/port_before_sorted 2>/dev/null; then
+            if ! grep -Fxq "$_file" "$_before.sorted" 2>/dev/null; then
                 _new_files="$_new_files
 $_file"
             fi
-        done < /tmp/port_after_sorted
+        done < "$_after.sorted"
         echo "$_new_files" | sed '/^$/d' > "$_manifest"
-        rm -f /tmp/port_before /tmp/port_after /tmp/port_before_sorted /tmp/port_after_sorted
+        rm -f "$_before" "$_after" "$_before.sorted" "$_after.sorted"
     else
         # Fallback: empty manifest
         echo "" > "$_manifest"

@@ -14,7 +14,7 @@
 #include <ctype.h>
 
 static void print_bold(const char *s) {
-    /* Terminal bold via overstriking: c\bc */
+    /* Print text as-is (no terminal formatting in this minimal version) */
     while (*s && *s != '\n') {
         putchar(*s);
         s++;

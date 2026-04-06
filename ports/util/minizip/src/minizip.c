@@ -1,9 +1,9 @@
 /*
- * minizip - simple zlib compression test utility for m3OS
+ * minizip - zlib compression test utility for m3OS
  *
  * Demonstrates linking against the zlib port's libz.a.
- * Compresses stdin to stdout using zlib deflate, or tests that
- * zlib is properly linked by printing the version.
+ * Performs a compress/decompress round-trip on a test string
+ * to verify that zlib is properly linked and functional.
  */
 
 #include <stdio.h>
