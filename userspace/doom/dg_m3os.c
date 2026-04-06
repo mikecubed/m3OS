@@ -291,28 +291,57 @@ static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
  * Sets *doomKey  to the DOOM key constant.
  * ------------------------------------------------------------------------- */
 
+/* per-make-code pressed state — used to suppress PS/2 typematic repeats */
+static uint8_t s_key_pressed[128];
+
+/* -------------------------------------------------------------------------
+ * DG_GetKey -- return one key event per call
+ *
+ * Returns 1 if a key event is available, 0 otherwise.
+ * Sets *pressed = 1 for key-down, 0 for key-up.
+ * Sets *doomKey  to the DOOM key constant.
+ *
+ * Design notes:
+ *   • We loop internally on unknown / unmapped scancodes instead of
+ *     returning 0, so that a 0xE0 extended prefix does not break the
+ *     I_GetEvent drain loop and leave the following real scancode stuck
+ *     in the ring buffer until the next tick.
+ *   • 0xE0 prefix bytes: bit 7 is set (0xE0 = 1110_0000), so they are
+ *     treated as break codes for make 0x60 — unknown, skipped.  The
+ *     real key byte that follows is handled normally.
+ *   • s_key_pressed[] de-duplicates PS/2 typematic repeats: a make code
+ *     is only forwarded on the first occurrence; subsequent identical make
+ *     codes (hardware auto-repeat) are silently discarded until the break
+ *     code is seen.  This prevents a single tap from appearing as a held
+ *     key when the game loop is slow.
+ * ------------------------------------------------------------------------- */
+
 int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
-    long sc = syscall0(SYS_READ_SCANCODE);
-    if (sc == 0) return 0;
+    while (1) {
+        long sc = syscall0(SYS_READ_SCANCODE);
+        if (sc == 0) return 0;   /* ring buffer empty */
 
-    uint8_t raw = (uint8_t)(sc & 0xFF);
-
-    if (raw & 0x80) {
-        /* Break code (key-up): make code = raw & 0x7F */
+        uint8_t raw  = (uint8_t)(sc & 0xFF);
         uint8_t make = raw & 0x7F;
         unsigned char dk;
-        if (!ps2_to_doom(make, &dk)) return 0;
-        *pressed  = 0;
-        *doomKey  = dk;
-        return 1;
-    } else {
-        /* Make code (key-down) */
-        unsigned char dk;
-        if (!ps2_to_doom(raw, &dk)) return 0;
-        *pressed  = 1;
-        *doomKey  = dk;
-        return 1;
+
+        if (!ps2_to_doom(make, &dk)) continue;   /* unknown key — drain & retry */
+
+        if (raw & 0x80) {
+            /* break code (key-up) */
+            s_key_pressed[make] = 0;
+            *pressed = 0;
+            *doomKey = dk;
+            return 1;
+        } else {
+            /* make code (key-down) */
+            if (s_key_pressed[make]) continue;   /* typematic repeat — discard */
+            s_key_pressed[make] = 1;
+            *pressed = 1;
+            *doomKey = dk;
+            return 1;
+        }
     }
 }
 
