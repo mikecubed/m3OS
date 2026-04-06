@@ -218,20 +218,29 @@ uint32_t DG_GetTicksMs(void)
  * PS/2 Set 1 scancode to DOOM key mapping
  * ------------------------------------------------------------------------- */
 
-/* DOOM key constants (from doomkeys.h) */
+/* DOOM key constants — must match doomkeys.h exactly so the engine's
+ * default key bindings (key_fire = KEY_FIRE, key_use = KEY_USE, etc.)
+ * line up with what DG_GetKey emits. */
 #define KEY_ENTER       13
+#define KEY_ESCAPE      27
+#define KEY_TAB         0x09
+#define KEY_BACKSPACE   0x7f
+/* Arrow / navigation */
 #define KEY_RIGHTARROW  0xae
 #define KEY_LEFTARROW   0xac
 #define KEY_UPARROW     0xad
 #define KEY_DOWNARROW   0xaf
-#define KEY_FIRE        0xa0
+/* Modifier physical key codes (0x80 + PS/2 make code) */
+#define KEY_RSHIFT      (0x80+0x36)   /* = 0xB6 */
+#define KEY_RCTRL       (0x80+0x1d)   /* = 0x9D */
+#define KEY_RALT        (0x80+0x38)   /* = 0xB8 */
+/* Abstract action buttons — these are what key_fire / key_use / key_strafe
+ * are initialised to in m_controls.c; DG_GetKey must emit these values
+ * for the default bindings to fire. */
+#define KEY_FIRE        0xa3
 #define KEY_USE         0xa2
-#define KEY_ESCAPE      27
-#define KEY_RSHIFT      0x80
-#define KEY_RCTRL       0x82
-#define KEY_RALT        0x84
-#define KEY_TAB         0x09
-#define KEY_BACKSPACE   0x7f
+#define KEY_STRAFE_L    0xa0
+#define KEY_STRAFE_R    0xa1
 
 static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
 {
@@ -241,8 +250,8 @@ static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
     case 0x50: *doom_key = KEY_DOWNARROW;  return 1;
     case 0x4B: *doom_key = KEY_LEFTARROW;  return 1;
     case 0x4D: *doom_key = KEY_RIGHTARROW; return 1;
-    case 0x1D: *doom_key = KEY_RCTRL;      return 1;  /* Ctrl = fire */
-    case 0x39: *doom_key = ' ';            return 1;  /* Space = use/open */
+    case 0x1D: *doom_key = KEY_FIRE;        return 1;  /* Ctrl = fire */
+    case 0x39: *doom_key = KEY_USE;         return 1;  /* Space = use/open */
     case 0x1C: *doom_key = KEY_ENTER;      return 1;  /* Enter */
     case 0x01: *doom_key = KEY_ESCAPE;     return 1;  /* Escape */
     case 0x0F: *doom_key = KEY_TAB;        return 1;  /* Tab = automap */
