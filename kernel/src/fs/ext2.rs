@@ -112,24 +112,40 @@ impl Ext2Volume {
     /// eviction). Once full, new blocks are served from disk without caching.
     /// This asymptotically eliminates repeated VirtIO round-trips for hot
     /// blocks such as WAD lumps, directory entries, and inode tables.
+    ///
+    /// Implementation note: the result buffer is always pre-allocated *before*
+    /// acquiring the cache spinlock.  This prevents the heap allocator from
+    /// being invoked while holding a spinlock, avoiding potential contention
+    /// between the allocator lock and the cache lock.
     fn read_block(&self, block_num: u32) -> Result<Vec<u8>, Ext2Error> {
-        // Fast path: cache hit (lock released before any I/O).
+        // Pre-allocate the result buffer outside any lock so the heap
+        // allocator is never called while a spinlock is held.
+        let mut buf = vec![0u8; self.block_size as usize];
+
+        // Cache hit: memcpy cached data into the pre-allocated buffer.
         {
             let cache = self.block_cache.lock();
             if let Some(cached) = cache.get(&block_num) {
-                return Ok(cached.clone());
+                buf.copy_from_slice(cached);
+                return Ok(buf);
             }
         }
+
         // Cache miss: read from VirtIO-blk.
-        let lba = self.block_to_lba(block_num);
-        let mut buf = vec![0u8; self.block_size as usize];
-        crate::blk::read_sectors(lba, self.sectors_per_block as usize, &mut buf)
-            .map_err(|_| Ext2Error::IoError)?;
-        // Store in cache if budget allows.
+        crate::blk::read_sectors(
+            self.block_to_lba(block_num),
+            self.sectors_per_block as usize,
+            &mut buf,
+        )
+        .map_err(|_| Ext2Error::IoError)?;
+
+        // Clone buf for the cache entry (allocation outside the lock), then
+        // take the lock only to insert the already-allocated entry.
+        let cached_copy = buf.clone();
         {
             let mut cache = self.block_cache.lock();
             if cache.len() < BLOCK_CACHE_MAX {
-                cache.insert(block_num, buf.clone());
+                cache.insert(block_num, cached_copy);
             }
         }
         Ok(buf)
