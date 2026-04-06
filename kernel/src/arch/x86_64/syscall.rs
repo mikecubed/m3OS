@@ -2466,13 +2466,14 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
         return NEG_EINVAL;
     }
-    // Each PIT tick is ~10ms (100 Hz). Convert seconds+nsec to ticks.
-    let ticks = (secs as u64).saturating_mul(100) + (nsecs as u64) / 10_000_000;
+    // Convert seconds+nsec to ticks using the current TICKS_PER_SEC constant.
+    let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
+        + (nsecs as u64) / (1_000_000_000 / TICKS_PER_SEC);
     let start = crate::arch::x86_64::interrupts::tick_count();
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
-    // Always yield at least once so sub-10ms sleeps (e.g. DOOM's 1ms tick)
-    // do not become tight busy-spins that starve other tasks.
+    // Always yield at least once so sub-1ms sleeps do not become tight
+    // busy-spins that starve other tasks.
     crate::task::yield_now();
     restore_caller_context(pid, saved_user_rsp);
     if has_pending_signal() {
@@ -10040,18 +10041,44 @@ fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
 // gettimeofday(tv) — syscall 96
 // ---------------------------------------------------------------------------
 
-/// LAPIC ticks per second (~100 Hz timer = 10ms per tick).
-pub(crate) const TICKS_PER_SEC: u64 = 100;
+/// LAPIC ticks per second (~1000 Hz timer = 1ms per tick).
+pub(crate) const TICKS_PER_SEC: u64 = 1000;
+
+/// Read the current time as (seconds, microseconds) since Unix epoch,
+/// using TSC for sub-millisecond precision.
+///
+/// Falls back to tick-counter coarse time if TSC calibration is not yet done
+/// (should only happen during very early boot).
+#[inline]
+fn tsc_now_us() -> (u64, u64) {
+    let boot_epoch = crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
+    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+    if tsc_per_ms == 0 {
+        // TSC not calibrated yet — fall back to tick counter.
+        let ticks = crate::arch::x86_64::interrupts::tick_count();
+        let sec = boot_epoch + ticks / TICKS_PER_SEC;
+        let us = (ticks % TICKS_PER_SEC) * (1_000_000 / TICKS_PER_SEC);
+        return (sec, us);
+    }
+    let boot_tsc = crate::arch::x86_64::apic::boot_tsc();
+    let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let elapsed_tsc = now_tsc.wrapping_sub(boot_tsc);
+    // elapsed_ms = elapsed_tsc / tsc_per_ms
+    let elapsed_ms = elapsed_tsc / tsc_per_ms;
+    // sub-ms fraction in microseconds
+    let frac_us = (elapsed_tsc % tsc_per_ms) * 1_000 / tsc_per_ms;
+    let total_us = elapsed_ms * 1_000 + frac_us;
+    let sec = boot_epoch + total_us / 1_000_000;
+    let us = total_us % 1_000_000;
+    (sec, us)
+}
 
 /// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
 fn sys_gettimeofday(tv_ptr: u64) -> u64 {
     if tv_ptr == 0 {
         return NEG_EFAULT;
     }
-    let boot_epoch = crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
-    let ticks = crate::arch::x86_64::interrupts::tick_count();
-    let tv_sec = boot_epoch + ticks / TICKS_PER_SEC;
-    let tv_usec = (ticks % TICKS_PER_SEC) * (1_000_000 / TICKS_PER_SEC);
+    let (tv_sec, tv_usec) = tsc_now_us();
     // struct timeval: tv_sec (i64) + tv_usec (i64) = 16 bytes
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&(tv_sec as i64).to_ne_bytes());
@@ -10078,19 +10105,34 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
     if tp_ptr == 0 {
         return NEG_EFAULT;
     }
-    let ticks = crate::arch::x86_64::interrupts::tick_count();
     let (secs, nsecs) = match clk_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
-            let boot_epoch =
-                crate::rtc::BOOT_EPOCH_SECS.load(core::sync::atomic::Ordering::Relaxed);
-            let s = boot_epoch + ticks / TICKS_PER_SEC;
-            let ns = (ticks % TICKS_PER_SEC) * (1_000_000_000 / TICKS_PER_SEC);
-            (s, ns)
+            let (s, us) = tsc_now_us();
+            (s, us * 1_000)
         }
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
-            let s = ticks / TICKS_PER_SEC;
-            let ns = (ticks % TICKS_PER_SEC) * (1_000_000_000 / TICKS_PER_SEC);
-            (s, ns)
+            // Monotonic: elapsed since boot (no wall-clock epoch).
+            let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+            if tsc_per_ms == 0 {
+                let ticks = crate::arch::x86_64::interrupts::tick_count();
+                let s = ticks / TICKS_PER_SEC;
+                let ns = (ticks % TICKS_PER_SEC) * (1_000_000_000 / TICKS_PER_SEC);
+                (s, ns)
+            } else {
+                let boot_tsc = crate::arch::x86_64::apic::boot_tsc();
+                let now_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+                let elapsed_tsc = now_tsc.wrapping_sub(boot_tsc);
+                // Use checked_div to satisfy clippy.
+                let elapsed_ms = elapsed_tsc.checked_div(tsc_per_ms).unwrap_or(0);
+                let frac_ns = elapsed_tsc
+                    .checked_rem(tsc_per_ms)
+                    .and_then(|r| r.checked_mul(1_000_000))
+                    .and_then(|v| v.checked_div(tsc_per_ms))
+                    .unwrap_or(0);
+                let s = elapsed_ms / 1_000;
+                let ns = (elapsed_ms % 1_000) * 1_000_000 + frac_ns;
+                (s, ns)
+            }
         }
         _ => return NEG_EINVAL,
     };

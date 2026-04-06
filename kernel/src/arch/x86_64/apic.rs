@@ -316,6 +316,24 @@ fn ioapic_init() {
 static IOAPIC_MAX_REDIR: Once<u32> = Once::new();
 static LAPIC_TICKS_PER_MS: Once<u32> = Once::new();
 
+/// TSC value captured at the moment the LAPIC timer calibration completed.
+static BOOT_TSC: Once<u64> = Once::new();
+
+/// Invariant TSC ticks per millisecond, calibrated against PIT channel 2.
+static TSC_PER_MS: Once<u64> = Once::new();
+
+/// Return the TSC value at kernel boot (end of LAPIC calibration).
+#[inline]
+pub fn boot_tsc() -> u64 {
+    *BOOT_TSC.get().unwrap_or(&0)
+}
+
+/// Return invariant TSC ticks per millisecond.
+#[inline]
+pub fn tsc_per_ms() -> u64 {
+    *TSC_PER_MS.get().unwrap_or(&0)
+}
+
 /// Return the BSP-calibrated LAPIC timer ticks per millisecond.
 ///
 /// Used by APs to configure their LAPIC timers without re-calibrating.
@@ -358,12 +376,19 @@ fn calibrate_lapic_timer() -> u32 {
         // Re-trigger PIT channel 2 by toggling the gate.
         let gate = pit_gate.read();
         pit_gate.write(gate & 0xFE); // gate low — resets the counter
+
+        // Snapshot TSC just before the countdown starts.
+        let tsc_start = core::arch::x86_64::_rdtsc();
+
         pit_gate.write(gate | 0x01); // gate high — starts countdown
 
         // Spin until PIT channel 2 output goes high (bit 5 of port 0x61).
         while pit_gate.read() & 0x20 == 0 {
             core::hint::spin_loop();
         }
+
+        // Snapshot TSC immediately after the 10ms window ends.
+        let tsc_end = core::arch::x86_64::_rdtsc();
 
         // Read how many LAPIC timer ticks elapsed.
         let remaining = lapic_read(LAPIC_TIMER_CURRENT_COUNT);
@@ -374,11 +399,27 @@ fn calibrate_lapic_timer() -> u32 {
 
         // elapsed ticks in ~10 ms with divide-by-16 → ticks_per_ms = elapsed / 10.
         let ticks_per_ms = elapsed / 10;
+
+        // TSC ticks in ~10 ms → tsc_per_ms = delta / 10.
+        let tsc_delta = tsc_end.wrapping_sub(tsc_start);
+        let tsc_per_ms_val = tsc_delta / 10;
+
         log::info!(
             "[apic] LAPIC timer calibration: {} ticks in ~10ms, {} ticks/ms (div16)",
             elapsed,
             ticks_per_ms
         );
+        log::info!(
+            "[apic] TSC calibration: {} ticks in ~10ms, {} ticks/ms",
+            tsc_delta,
+            tsc_per_ms_val
+        );
+
+        // Store TSC calibration results.  Record the TSC *after* the window so
+        // that boot_tsc() represents a known-good reference point.
+        TSC_PER_MS.call_once(|| tsc_per_ms_val);
+        BOOT_TSC.call_once(|| tsc_end);
+
         ticks_per_ms
     }
 }
@@ -516,8 +557,8 @@ pub fn init() {
         let tpm = calibrate_lapic_timer();
         LAPIC_TICKS_PER_MS.call_once(|| tpm);
 
-        // 4. Start LAPIC timer (10 ms periodic → 100 Hz).
-        if !start_lapic_timer(10) {
+        // 4. Start LAPIC timer (1 ms periodic → 1000 Hz).
+        if !start_lapic_timer(1) {
             log::error!("[apic] LAPIC timer failed to start; staying on PIC");
             return;
         }
