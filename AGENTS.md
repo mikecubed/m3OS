@@ -269,6 +269,7 @@ Read before making significant changes:
 | `docs/43a-crash-diagnostics.md` | Before touching panic_diag, fault handler diagnostics, or scheduler/fork/IPC assertions |
 | `docs/43b-kernel-trace-ring.md` | Before touching trace_ring, trace events, per-core trace rings, or sys_ktrace |
 | `docs/43c-regression-stress-ci.md` | Before touching xtask regression/stress commands, CI workflows, or proptest/loom tests |
+| `docs/roadmap/44-rust-cross-compilation.md` | Before touching musl Rust cross-compilation, xtask musl Rust builds, or custom target specs |
 | `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 

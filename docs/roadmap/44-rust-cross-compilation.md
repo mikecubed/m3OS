@@ -1,5 +1,14 @@
 # Phase 44 - Rust Cross-Compilation Pipeline
 
+**Status:** Planned
+**Source Ref:** phase-44
+**Depends on:** Phase 12 (POSIX Compat) ✅, Phase 14 (Shell and Tools) ✅, Phase 24 (Persistent Storage) ✅
+**Builds on:** Extends Phase 12's Linux syscall ABI compatibility layer to run Rust
+`std` programs compiled against musl, and extends the xtask build system to handle
+a second Rust compilation target alongside the existing `x86_64-unknown-none` path.
+**Primary Components:** musl Rust target, custom x86_64-m3os target spec, xtask
+build integration, demonstration programs
+
 ## Milestone Goal
 
 Rust programs compiled on the host run natively inside the OS. A documented toolchain
@@ -14,6 +23,18 @@ Rust program compiles inside the OS itself.
 - See the difference between `std` programs (full libc) and `no_std` programs
   (bare syscalls) on a non-Linux OS.
 - Experience building a custom Rust target specification.
+
+## Why This Phase Exists
+
+The OS already runs musl-linked C programs and `#![no_std]` Rust programs, but
+there is no way to write Rust programs that use the full standard library (`std::fs`,
+`std::net`, `std::io`) and run them inside the OS. Developers writing userspace
+programs face a choice between C (with musl and full libc) or Rust (with `no_std`
+and raw syscalls). This phase bridges that gap by enabling musl-linked Rust `std`
+programs, which get the ergonomics of Rust's standard library while reusing the
+Linux syscall ABI that Phase 12 already provides. It also formalizes a custom
+`x86_64-m3os` target spec for `no_std` Rust programs that want to identify the OS
+at compile time via `#[cfg(target_os = "m3os")]`.
 
 ## Feature Scope
 
@@ -88,13 +109,47 @@ Extend the `cargo xtask` build system to:
 - Include Rust binaries in the disk image alongside C binaries.
 - Support both musl-linked and no_std Rust targets.
 
-## Prerequisites
+## Important Components and How They Work
 
-| Phase | Why needed |
-|---|---|
-| Phase 12 (POSIX Compat) | Linux syscall ABI for musl-linked binaries |
-| Phase 14 (Shell and Tools) | Run Rust programs from the shell |
-| Phase 24 (Persistent Storage) | Store Rust programs on disk |
+### x86_64-unknown-linux-musl target
+
+The standard Rust target for statically-linked Linux binaries. Programs compiled
+with this target use musl libc and make Linux syscalls, which the kernel's Phase 12
+compatibility layer handles. This is the primary compilation path for Rust `std`
+programs. The target is pre-built (no `-Zbuild-std` needed), which simplifies the
+build compared to the kernel's `x86_64-unknown-none` target.
+
+### Custom x86_64-m3os.json target specification
+
+A JSON target spec that produces the same code as `x86_64-unknown-none` but sets
+`"os": "m3os"`. This enables `#[cfg(target_os = "m3os")]` for conditional
+compilation in shared crates. Programs compiled for this target use `#![no_std]`
+and call m3OS syscalls directly via the `syscall-lib` crate.
+
+### xtask build integration (build_musl_rust_bins)
+
+A new function in xtask that manages cross-compilation of musl-linked Rust crates.
+It invokes `cargo build --target x86_64-unknown-linux-musl --release`, strips the
+resulting binaries, and copies them to `kernel/initrd/` for inclusion in the disk
+image. This follows the same pattern as the existing `build_ion()` function.
+
+### Demonstration programs
+
+Five Rust `std` programs that exercise different areas of the standard library:
+`hello-rust` (basic validation), `sysinfo-rust` (`std::fs`), `httpd-rust`
+(`std::net`), `calc-rust` (`std::io`), and `todo-rust` (`std::fs` persistence).
+Each validates a different syscall path through musl to the kernel.
+
+## How This Builds on Earlier Phases
+
+- Extends Phase 12 by running Rust `std` programs through the same Linux syscall
+  ABI that already supports musl-linked C programs.
+- Extends Phase 14 by adding Rust binaries that can be launched from the shell
+  alongside existing C and `no_std` Rust programs.
+- Extends Phase 24 by using persistent disk storage for todo data and other file
+  I/O from Rust programs.
+- Extends the xtask build system (used since Phase 1) with a third compilation
+  path for musl-linked Rust binaries.
 
 ## Implementation Outline
 
