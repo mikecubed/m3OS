@@ -77,6 +77,22 @@ fn main() {
             });
             cmd_sign(&sign_args);
         }
+        Some("regression") => {
+            let regression_args = parse_regression_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_regression(&regression_args);
+        }
+        Some("stress") => {
+            let stress_args = parse_stress_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_stress(&stress_args);
+        }
         Some(other) => {
             eprintln!("Unknown subcommand: {other}");
             eprintln!("Usage: {}", usage());
@@ -90,7 +106,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|runner|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -4253,6 +4269,790 @@ fn cmd_run_gui() {
 fn cmd_runner(kernel_binary: PathBuf) {
     let uefi_image = create_uefi_image(&kernel_binary);
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 43c: Regression test framework (Track A)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct RegressionArgs {
+    test_name: Option<String>,
+    timeout_secs: Option<u64>,
+    display: bool,
+}
+
+fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
+    let mut test_name = None;
+    let mut timeout_secs = None;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--test" => {
+                index += 1;
+                test_name = Some(
+                    args.get(index)
+                        .ok_or("--test requires a value")?
+                        .to_string(),
+                );
+            }
+            "--timeout" => {
+                index += 1;
+                timeout_secs = Some(
+                    args.get(index)
+                        .ok_or("--timeout requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --timeout value")?,
+                );
+            }
+            "--display" => display = true,
+            other => return Err(format!("unknown regression flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(RegressionArgs {
+        test_name,
+        timeout_secs,
+        display,
+    })
+}
+
+/// A registered regression test with QEMU configuration and pass/fail patterns.
+struct RegressionTest {
+    name: &'static str,
+    #[allow(dead_code)]
+    description: &'static str,
+    /// Steps to run via the smoke-script engine after booting to a shell.
+    guest_steps: fn() -> Vec<SmokeStep>,
+    /// How long the entire regression gets before being killed.
+    timeout_secs: u64,
+}
+
+/// Return the list of registered regression tests.
+fn regression_tests() -> Vec<RegressionTest> {
+    vec![
+        RegressionTest {
+            name: "fork-overlap",
+            description: "Rapid concurrent fork() from multiple parents",
+            guest_steps: fork_overlap_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "ipc-wake",
+            description: "Overlapping IPC send/recv/call/reply cycles",
+            guest_steps: ipc_wake_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "pty-overlap",
+            description: "Overlapping PTY allocation and shell spawning",
+            guest_steps: pty_overlap_steps,
+            timeout_secs: 90,
+        },
+    ]
+}
+
+/// Guest steps for the fork-overlap regression: boot, login, run fork-test.
+fn fork_overlap_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fork-test\n",
+        label: "run fork-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "fork-test: PASS",
+        timeout_secs: 30,
+        label: "fork-test pass",
+    });
+    // Wait for shell prompt before sending the second command to avoid
+    // delivering input while the previous process is still attached.
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "shell prompt after fork-test",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fork-test\n",
+        label: "run fork-test (2nd)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "fork-test: PASS",
+        timeout_secs: 30,
+        label: "fork-test pass (2nd)",
+    });
+    steps
+}
+
+/// Guest steps for the IPC wake regression: boot, login, run unix-socket-test.
+fn ipc_wake_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/unix-socket-test\n",
+        label: "run unix-socket-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "All tests passed!",
+        timeout_secs: 30,
+        label: "unix-socket-test pass",
+    });
+    steps
+}
+
+/// Guest steps for the PTY overlap regression: boot, login, run pty-test.
+fn pty_overlap_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/pty-test\n",
+        label: "run pty-test",
+    });
+    // Wait directly for the summary line — avoids matching the initial
+    // "pty-test: Phase 29..." banner before the test finishes.
+    steps.push(SmokeStep::Wait {
+        pattern: "passed, 0 failed",
+        timeout_secs: 60,
+        label: "pty-test 0 failures",
+    });
+    steps
+}
+
+/// Common boot + login steps shared by all regression tests.
+fn boot_and_login_steps() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "login:",
+            timeout_secs: 60,
+            label: "boot to login prompt",
+        },
+        SmokeStep::Sleep { millis: 200 },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "username",
+        },
+        SmokeStep::Wait {
+            pattern: "Password:",
+            timeout_secs: 10,
+            label: "password prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 10,
+            label: "shell prompt",
+        },
+    ]
+}
+
+fn cmd_regression(args: &RegressionArgs) {
+    let all_tests = regression_tests();
+    let tests_to_run: Vec<&RegressionTest> = if let Some(name) = &args.test_name {
+        let found = all_tests.iter().find(|t| t.name == name);
+        match found {
+            Some(t) => vec![t],
+            None => {
+                eprintln!("Unknown regression test: {name}");
+                eprintln!(
+                    "Available: {}",
+                    all_tests
+                        .iter()
+                        .map(|t| t.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        all_tests.iter().collect()
+    };
+
+    println!("regression: running {} test(s)", tests_to_run.len());
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    let ovmf = find_ovmf();
+
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    for test in &tests_to_run {
+        let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+        print!("  {}: ", test.name);
+        match run_regression_test(test, &uefi_image, &ovmf, timeout, args.display) {
+            Ok(serial_log) => {
+                println!("PASS");
+                save_regression_artifact(test.name, &serial_log, "serial.log");
+                passed += 1;
+            }
+            Err((msg, serial_log)) => {
+                println!("FAIL: {msg}");
+                save_regression_artifact(test.name, &serial_log, "serial.log");
+                extract_trace_dump(test.name, &serial_log);
+                failed += 1;
+            }
+        }
+    }
+
+    println!("\nregression: {} passed, {} failed", passed, failed);
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn run_regression_test(
+    test: &RegressionTest,
+    uefi_image: &Path,
+    ovmf: &Path,
+    timeout_secs: u64,
+    display: bool,
+) -> Result<String, (String, String)> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    // Strip hostfwd to avoid port conflicts.
+    for arg in args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Snapshot mode: don't persist disk writes across regression runs.
+    args.push("-snapshot".to_string());
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let steps = (test.guest_steps)();
+    let global_timeout = std::time::Duration::from_secs(timeout_secs);
+
+    // Capture serial output by running the smoke-script engine.
+    // We wrap the result and capture the serial log regardless.
+    let stdout = child.stdout.take().expect("no stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+
+    let result = run_smoke_steps_with_capture(
+        &mut child,
+        &steps,
+        global_timeout,
+        &rx,
+        &mut serial_buf,
+        global_start,
+    );
+
+    // Kill QEMU if still running.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok(()) => Ok(serial_buf),
+        Err(msg) => Err((msg, serial_buf)),
+    }
+}
+
+/// Like `run_smoke_script` but uses an already-split stdout reader + buffer
+/// so the caller retains the serial log.
+fn run_smoke_steps_with_capture(
+    child: &mut std::process::Child,
+    steps: &[SmokeStep],
+    global_timeout: std::time::Duration,
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    serial_buf: &mut String,
+    global_start: std::time::Instant,
+) -> Result<(), String> {
+    let total = steps.len();
+
+    for (i, step) in steps.iter().enumerate() {
+        if global_start.elapsed() > global_timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "global timeout ({global_timeout:?}) exceeded at step {}/{}",
+                i + 1,
+                total
+            ));
+        }
+
+        match step {
+            SmokeStep::Wait {
+                pattern,
+                timeout_secs,
+                label,
+            } => {
+                let step_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        let text = String::from_utf8_lossy(&chunk);
+                        serial_buf.push_str(&text);
+                    }
+
+                    let stripped = strip_ansi(serial_buf);
+                    let cleaned = strip_kernel_logs(&stripped);
+
+                    // Check for kernel-level crash indicators in serial output.
+                    // Only match ring-0 crashes, not handled ring-3 faults:
+                    // - "userspace page fault" + "CRASH DIAGNOSTICS" = handled (process killed)
+                    // - "kernel page fault" = ring-0 crash (OS halts)
+                    // - "KERNEL PANIC" = explicit kernel panic
+                    // - "DOUBLE FAULT" = unrecoverable double fault
+                    if cleaned.contains("KERNEL PANIC")
+                        || cleaned.contains("kernel page fault")
+                        || cleaned.contains("DOUBLE FAULT")
+                    {
+                        return Err(format!(
+                            "kernel crash detected during step {}/{} ({label})",
+                            i + 1,
+                            total
+                        ));
+                    }
+
+                    if cleaned.contains(pattern) || stripped.contains(pattern) {
+                        // Drain buffer up to last newline to prevent later
+                        // steps from re-matching earlier output. We can't map
+                        // cleaned/stripped offsets back to raw serial_buf offsets
+                        // (ANSI stripping + log filtering change positions), so
+                        // drain to the last newline which is safe and conservative.
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        } else if serial_buf.len() > 4096 {
+                            serial_buf.drain(..serial_buf.len() - 4096);
+                        }
+                        break;
+                    }
+
+                    // Detect QEMU exit without probing the serial channel
+                    // again — a second try_recv() here could consume a pending
+                    // chunk and hide the last serial output before exit.
+                    if child.try_wait().ok().flatten().is_some() {
+                        // Drain any remaining serial output before reporting.
+                        while let Ok(chunk) = rx.try_recv() {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {}/{} ({label})",
+                            i + 1,
+                            total
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines: String = serial_buf
+                            .lines()
+                            .rev()
+                            .take(30)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(format!(
+                            "timeout waiting for '{pattern}' at step {}/{} ({label})\nLast serial output:\n{last_lines}",
+                            i + 1,
+                            total
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // Trim buffer to avoid unbounded growth.
+                if serial_buf.len() > 64 * 1024 {
+                    let keep_from = serial_buf.len() - 48 * 1024;
+                    // Find next char boundary at or after keep_from.
+                    let boundary = (keep_from..serial_buf.len())
+                        .find(|&i| serial_buf.is_char_boundary(i))
+                        .unwrap_or(serial_buf.len());
+                    serial_buf.drain(..boundary);
+                }
+            }
+            SmokeStep::Send { input, label } => {
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| format!("no stdin at step {}/{} ({label})", i + 1, total))?;
+                use std::io::Write;
+                stdin.write_all(input.as_bytes()).map_err(|e| {
+                    format!("write failed at step {}/{} ({label}): {e}", i + 1, total)
+                })?;
+                stdin.flush().map_err(|e| {
+                    format!("flush failed at step {}/{} ({label}): {e}", i + 1, total)
+                })?;
+            }
+            SmokeStep::Sleep { millis } => {
+                std::thread::sleep(std::time::Duration::from_millis(*millis));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Save a text artifact to a directory under `target/`.
+fn save_artifact(dir: &Path, filename: &str, content: &str) {
+    if let Err(err) = fs::create_dir_all(dir) {
+        eprintln!(
+            "failed to create artifact directory {}: {err}",
+            dir.display()
+        );
+        return;
+    }
+    let path = dir.join(filename);
+    if let Err(err) = fs::write(&path, content) {
+        eprintln!("failed to write artifact {}: {err}", path.display());
+    }
+}
+
+fn save_regression_artifact(test_name: &str, content: &str, filename: &str) {
+    let dir = workspace_root()
+        .join("target")
+        .join("regression")
+        .join(test_name);
+    save_artifact(&dir, filename, content);
+}
+
+/// Extract a marked section from serial output and save it.
+fn extract_marked_section(
+    serial_log: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<String> {
+    let start = serial_log.find(start_marker)?;
+    let end = serial_log[start..].find(end_marker)?;
+    Some(serial_log[start..start + end + end_marker.len()].to_string())
+}
+
+fn extract_trace_dump(test_name: &str, serial_log: &str) {
+    if let Some(trace) = extract_marked_section(
+        serial_log,
+        "=== TRACE RING DUMP ===",
+        "=== END TRACE RING DUMP ===",
+    ) {
+        save_regression_artifact(test_name, &trace, "trace.log");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 43c: Stress test framework (Track E)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct StressArgs {
+    test_name: Option<String>,
+    iterations: usize,
+    timeout_secs: Option<u64>,
+    seed: Option<u64>,
+    continue_on_failure: bool,
+    display: bool,
+}
+
+fn parse_stress_args(args: &[String]) -> Result<StressArgs, String> {
+    let mut test_name = None;
+    let mut iterations = 100usize;
+    let mut timeout_secs: Option<u64> = None;
+    let mut seed = None;
+    let mut continue_on_failure = false;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--test" => {
+                index += 1;
+                test_name = Some(
+                    args.get(index)
+                        .ok_or("--test requires a value")?
+                        .to_string(),
+                );
+            }
+            "--iterations" => {
+                index += 1;
+                iterations = args
+                    .get(index)
+                    .ok_or("--iterations requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --iterations value")?;
+            }
+            "--timeout" => {
+                index += 1;
+                timeout_secs = Some(
+                    args.get(index)
+                        .ok_or("--timeout requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --timeout value")?,
+                );
+            }
+            "--seed" => {
+                index += 1;
+                seed = Some(
+                    args.get(index)
+                        .ok_or("--seed requires a value")?
+                        .parse()
+                        .map_err(|_| "invalid --seed value")?,
+                );
+            }
+            "--continue-on-failure" => continue_on_failure = true,
+            "--display" => display = true,
+            other => return Err(format!("unknown stress flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(StressArgs {
+        test_name,
+        iterations,
+        timeout_secs,
+        seed,
+        continue_on_failure,
+        display,
+    })
+}
+
+/// A registered stress test scenario.
+struct StressTest {
+    name: &'static str,
+    #[allow(dead_code)]
+    description: &'static str,
+    /// Steps to run via the smoke-script engine. The `u64` parameter is the
+    /// per-iteration seed — currently unused by guest steps (timing variation
+    /// requires guest-side support, deferred to a future phase).
+    guest_steps: fn(u64) -> Vec<SmokeStep>,
+    timeout_secs: u64,
+}
+
+fn stress_tests() -> Vec<StressTest> {
+    vec![
+        StressTest {
+            name: "fork-overlap",
+            description: "Repeated fork-test runs",
+            guest_steps: |_seed| fork_overlap_steps(),
+            timeout_secs: 60,
+        },
+        StressTest {
+            name: "pty-overlap",
+            description: "Repeated PTY allocation and shell spawning",
+            guest_steps: |_seed| pty_overlap_steps(),
+            timeout_secs: 90,
+        },
+        StressTest {
+            name: "ssh-overlap",
+            description: "Boot + login + fork-test + pty-test back-to-back (SMP-sensitive paths)",
+            guest_steps: |_seed| ssh_overlap_steps(),
+            timeout_secs: 90,
+        },
+    ]
+}
+
+/// Guest steps for SSH overlap stress: exercises dual fork paths with pty-test.
+fn ssh_overlap_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    // Run fork-test and pty-test back to back to stress overlapping paths.
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/fork-test\n",
+        label: "run fork-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "fork-test: PASS",
+        timeout_secs: 30,
+        label: "fork-test pass",
+    });
+    // Wait for shell prompt before sending pty-test to avoid delivering
+    // input while fork-test's shell cleanup is still in progress.
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "shell prompt after fork-test",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/pty-test\n",
+        label: "run pty-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "passed, 0 failed",
+        timeout_secs: 60,
+        label: "pty-test pass",
+    });
+    steps
+}
+
+fn cmd_stress(args: &StressArgs) {
+    let all_tests = stress_tests();
+    let test = if let Some(name) = &args.test_name {
+        match all_tests.iter().find(|t| t.name == name) {
+            Some(t) => t,
+            None => {
+                eprintln!("Unknown stress test: {name}");
+                eprintln!(
+                    "Available: {}",
+                    all_tests
+                        .iter()
+                        .map(|t| t.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("stress: --test <name> is required");
+        eprintln!(
+            "Available: {}",
+            all_tests
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::process::exit(1);
+    };
+
+    // Seed: use provided or generate random.
+    let seed = args.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    });
+    println!(
+        "stress: test={} iterations={} seed={} timeout={}s",
+        test.name,
+        args.iterations,
+        seed,
+        args.timeout_secs.unwrap_or(test.timeout_secs)
+    );
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    let ovmf = find_ovmf();
+
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    for i in 0..args.iterations {
+        let iter_seed = seed.wrapping_add(i as u64);
+        let timeout = args.timeout_secs.unwrap_or(test.timeout_secs);
+
+        print!("  [{}/{}] ", i + 1, args.iterations);
+        let steps = (test.guest_steps)(iter_seed);
+        match run_regression_with_steps(&steps, &uefi_image, &ovmf, timeout, args.display) {
+            Ok(serial_log) => {
+                println!("PASS");
+                let dir = format!("{}/{}", test.name, i + 1);
+                save_stress_artifact(&dir, &serial_log, "serial.log");
+                passed += 1;
+            }
+            Err((msg, serial_log)) => {
+                println!("FAIL: {msg}");
+                let dir = format!("{}/{}", test.name, i + 1);
+                save_stress_artifact(&dir, &serial_log, "serial.log");
+                extract_stress_trace_dump(&dir, &serial_log);
+                failed += 1;
+                if !args.continue_on_failure {
+                    println!(
+                        "stress: stopping on first failure (use --continue-on-failure to keep going)"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    println!(
+        "\nstress: {} passed, {} failed (seed={})",
+        passed, failed, seed
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn run_regression_with_steps(
+    steps: &[SmokeStep],
+    uefi_image: &Path,
+    ovmf: &Path,
+    timeout_secs: u64,
+    display: bool,
+) -> Result<String, (String, String)> {
+    let display_mode = if display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    for arg in args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+    // Snapshot mode: don't persist disk writes across stress iterations.
+    args.push("-snapshot".to_string());
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to launch QEMU");
+
+    let global_timeout = std::time::Duration::from_secs(timeout_secs);
+    let stdout = child.stdout.take().expect("no stdout pipe");
+    let rx = spawn_serial_reader(stdout);
+    let mut serial_buf = String::new();
+    let global_start = std::time::Instant::now();
+
+    let result = run_smoke_steps_with_capture(
+        &mut child,
+        steps,
+        global_timeout,
+        &rx,
+        &mut serial_buf,
+        global_start,
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match result {
+        Ok(()) => Ok(serial_buf),
+        Err(msg) => Err((msg, serial_buf)),
+    }
+}
+
+fn save_stress_artifact(subdir: &str, content: &str, filename: &str) {
+    let dir = workspace_root().join("target").join("stress").join(subdir);
+    save_artifact(&dir, filename, content);
+}
+
+fn extract_stress_trace_dump(subdir: &str, serial_log: &str) {
+    if let Some(trace) = extract_marked_section(
+        serial_log,
+        "=== TRACE RING DUMP ===",
+        "=== END TRACE RING DUMP ===",
+    ) {
+        save_stress_artifact(subdir, &trace, "trace.log");
+    }
 }
 
 #[cfg(test)]

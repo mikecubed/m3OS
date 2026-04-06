@@ -53,3 +53,14 @@ jobs:
           # Delete cached disk.img so it is regenerated with TCC files.
           rm -f target/x86_64-unknown-none/release/disk.img
           cargo xtask smoke-test --timeout 120
+
+      - name: Regression tests (fork-overlap, ipc-wake, pty-overlap)
+        run: cargo xtask regression --timeout 90
+
+      - name: Upload regression artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-artifacts
+          path: target/regression/
+          retention-days: 14

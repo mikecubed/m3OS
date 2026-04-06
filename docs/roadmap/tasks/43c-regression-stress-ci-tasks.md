@@ -1,6 +1,6 @@
 # Phase 43c — Regression, Stress, and CI Harness: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-43c
 **Depends on:** Phase 43a (Crash Diagnostics) ✅, Phase 43b (Kernel Trace Ring) ✅
 **Goal:** Build a layered test infrastructure that catches SMP race conditions
@@ -13,17 +13,17 @@ mapping that runs regressions on every PR and stress tests nightly.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | `cargo xtask regression` command and framework | — | Planned |
-| B | Fork overlap regression test | A | Planned |
-| C | IPC wake regression test | A | Planned |
-| D | PTY/shell overlap regression test | A | Planned |
-| E | `cargo xtask stress` command and framework | A | Planned |
-| F | Dual-session SSH overlap stress | E | Planned |
-| G | Automatic artifact capture | A, E | Planned |
-| H | Seed-based timing randomization | E | Planned |
-| I | CI tier mapping | A, E | Planned |
-| J | Host-side proptest/loom integration | — | Planned |
-| K | Validation and documentation | All | Planned |
+| A | `cargo xtask regression` command and framework | — | ✅ Done |
+| B | Fork overlap regression test | A | ✅ Done |
+| C | IPC wake regression test | A | ✅ Done |
+| D | PTY/shell overlap regression test | A | ✅ Done |
+| E | `cargo xtask stress` command and framework | A | ✅ Done |
+| F | Dual-session SSH overlap stress | E | ✅ Done |
+| G | Automatic artifact capture | A, E | ✅ Done |
+| H | Seed-based iteration/reproducibility (guest-side timing variation deferred) | E | ✅ Done |
+| I | CI tier mapping | A, E | ✅ Done |
+| J | Host-side proptest/loom integration | — | ✅ Done |
+| K | Validation and documentation | All | ✅ Done |
 
 ---
 

@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 
+[dev-dependencies]
+proptest = "1"
+loom = "0.7"
+
 [features]
 default = ["std"]
 std = []
