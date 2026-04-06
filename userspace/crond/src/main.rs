@@ -650,13 +650,8 @@ fn main(_args: &[&str]) -> i32 {
         reap_children();
 
         // Sleep until roughly the next minute boundary.
-        // Compute seconds remaining in the current minute.
         let secs_into_minute = (sec % 60) as u64;
-        let sleep_secs = if secs_into_minute < 59 {
-            60 - secs_into_minute
-        } else {
-            60
-        };
+        let sleep_secs = 60u64.saturating_sub(secs_into_minute).max(1);
         nanosleep(sleep_secs);
     }
 }

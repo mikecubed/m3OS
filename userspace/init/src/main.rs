@@ -30,8 +30,8 @@ const MAX_NAME: usize = 32;
 const MAX_CMD: usize = 64;
 const BUF_SIZE: usize = 512;
 
-const SIGTERM: i32 = 15;
-const SIGKILL: i32 = 9;
+const SIGTERM: i32 = syscall_lib::SIGTERM;
+const SIGKILL: i32 = syscall_lib::SIGKILL;
 
 const LOGIN_PATH: &[u8] = b"/bin/login\0";
 const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
@@ -526,7 +526,15 @@ fn parse_u32(val: &[u8]) -> u32 {
     let mut i = 0;
     while i < val.len() {
         if val[i] >= b'0' && val[i] <= b'9' {
-            result = result.wrapping_mul(10).wrapping_add((val[i] - b'0') as u32);
+            result = match result
+                .checked_mul(10)
+                .and_then(|v| v.checked_add((val[i] - b'0') as u32))
+            {
+                Some(v) => v,
+                None => return 0, // overflow → default
+            };
+        } else {
+            return 0; // non-digit → default
         }
         i += 1;
     }
