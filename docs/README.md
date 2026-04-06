@@ -79,6 +79,12 @@ userspace shell and programs.
 | [Claude Code Roadmap](./claude-code-roadmap.md) | Claude Code on m3OS strategy |
 | [Rust Crate Acceleration](./rust-crate-acceleration.md) | Rust crate porting strategy |
 
+### Evaluation
+
+| Document | Description |
+|---|---|
+| [Project Evaluation](./evaluation/README.md) | Repo-wide review of current state, security, usability gaps, GUI path, and Rust OS comparisons |
+
 ## Quick Start
 
 ```bash
