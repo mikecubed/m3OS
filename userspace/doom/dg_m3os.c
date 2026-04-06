@@ -89,8 +89,13 @@ syscall0(long nr)
 /* -------------------------------------------------------------------------
  * DG_Init -- called once by the engine at startup
  *
- * Retrieves framebuffer metadata, maps the framebuffer into this process's
- * address space, and computes scaling parameters for DG_DrawFrame.
+ * Retrieves framebuffer metadata and maps the framebuffer into this
+ * process's address space.
+ *
+ * NOTE: doomgeneric's I_FinishUpdate already scales the 320×200 DOOM
+ * frame to DOOMGENERIC_RESX × DOOMGENERIC_RESY (640×400) before calling
+ * DG_DrawFrame.  DG_DrawFrame therefore does a 1:1 blit of DG_ScreenBuffer
+ * to the framebuffer — no further scaling is applied here.
  * ------------------------------------------------------------------------- */
 
 void DG_Init(void)
@@ -119,17 +124,12 @@ void DG_Init(void)
     }
     g_fb_ptr = (uint8_t *)fb_virt;
 
-    /* Compute nearest-neighbour scale and centering offsets */
-    int sx = (int)g_fb_info.width  / DOOMGENERIC_RESX;
-    int sy = (int)g_fb_info.height / DOOMGENERIC_RESY;
-    g_scale = (sx < sy) ? sx : sy;
-    if (g_scale < 1) g_scale = 1;
-
-    g_x_offset = ((int)g_fb_info.width  - DOOMGENERIC_RESX * g_scale) / 2;
-    g_y_offset = ((int)g_fb_info.height - DOOMGENERIC_RESY * g_scale) / 2;
-    /* Clamp: if the framebuffer is smaller than the scaled DOOM canvas the
-     * offsets go negative, which would cause out-of-bounds writes in
-     * DG_DrawFrame.  A zero offset is safe and simply clips the image. */
+    /* g_scale is unused (DG_DrawFrame is a 1:1 blit); set to 1 for clarity.
+     * Compute centering offsets in case the physical framebuffer is larger
+     * than DOOMGENERIC_RESX × DOOMGENERIC_RESY. */
+    g_scale = 1;
+    g_x_offset = ((int)g_fb_info.width  - DOOMGENERIC_RESX) / 2;
+    g_y_offset = ((int)g_fb_info.height - DOOMGENERIC_RESY) / 2;
     if (g_x_offset < 0) g_x_offset = 0;
     if (g_y_offset < 0) g_y_offset = 0;
 }
@@ -137,50 +137,48 @@ void DG_Init(void)
 /* -------------------------------------------------------------------------
  * DG_DrawFrame -- called by the engine after every rendered frame
  *
- * Blits DOOM's 320x200 ARGB buffer to the native-resolution framebuffer
- * using nearest-neighbour scaling and optional R/B swap for BGR displays.
+ * Direct blit of DG_ScreenBuffer to the native framebuffer.
+ *
+ * doomgeneric's I_FinishUpdate has already scaled the 320×200 DOOM canvas
+ * to DOOMGENERIC_RESX × DOOMGENERIC_RESY (640×400) in DG_ScreenBuffer
+ * before calling this function.  We do NOT apply additional scaling here;
+ * doing so would cause a 4× total scale and display only the upper-left
+ * quarter of the scene.
+ *
+ * For BGR framebuffers the DG_ScreenBuffer bytes are already in [B,G,R,A]
+ * order and can be memcpy'd directly.  For RGB framebuffers the R and B
+ * channels must be swapped per pixel.
  * ------------------------------------------------------------------------- */
 
 void DG_DrawFrame(void)
 {
     if (!g_fb_ptr) return;
 
-    const int scale      = g_scale;
-    const int x_off      = g_x_offset;
-    const int y_off      = g_y_offset;
-    const uint32_t pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per fb row */
-    const int bgr        = (g_fb_info.pixel_format == 1);    /* BGR display? */
+    const uint32_t fb_pitch = g_fb_info.stride * g_fb_info.bpp; /* bytes per FB row */
+    const int      bgr      = (g_fb_info.pixel_format == 1);
+    /* Clip to the smaller of the DOOM canvas and the physical framebuffer. */
+    const int      copy_w   = (DOOMGENERIC_RESX < (int)g_fb_info.width)
+                               ? DOOMGENERIC_RESX : (int)g_fb_info.width;
+    const int      copy_h   = (DOOMGENERIC_RESY < (int)g_fb_info.height)
+                               ? DOOMGENERIC_RESY : (int)g_fb_info.height;
 
-    for (int sy = 0; sy < DOOMGENERIC_RESY; sy++) {
-        const uint32_t *src_row = DG_ScreenBuffer + sy * DOOMGENERIC_RESX;
+    for (int sy = 0; sy < copy_h; sy++) {
+        const uint32_t *src = DG_ScreenBuffer + sy * DOOMGENERIC_RESX;
+        uint8_t        *dst = g_fb_ptr
+                            + (uint32_t)(g_y_offset + sy) * fb_pitch
+                            + (uint32_t) g_x_offset       * g_fb_info.bpp;
 
-        for (int sx = 0; sx < DOOMGENERIC_RESX; sx++) {
-            uint32_t pixel = src_row[sx];
-
-            /* On LE the u32 bytes are [B, G, R, A].
-             * BGR framebuffer expects [B, G, R, ...] — memcpy as-is.
-             * RGB framebuffer expects [R, G, B, ...] — swap R and B. */
-            if (!bgr) {
+        if (bgr) {
+            /* BGR display: DG_ScreenBuffer bytes are [B,G,R,A] — copy as-is */
+            memcpy(dst, src, (size_t)copy_w * g_fb_info.bpp);
+        } else {
+            /* RGB display: swap R and B channels in each pixel */
+            for (int sx = 0; sx < copy_w; sx++) {
+                uint32_t pixel = src[sx];
                 uint8_t r = (pixel >> 16) & 0xFF;
                 uint8_t b = (pixel >>  0) & 0xFF;
                 pixel = (pixel & 0xFF00FF00u) | (b << 16) | r;
-            }
-
-            /* Write a scale x scale block of pixels */
-            for (int ry = 0; ry < scale; ry++) {
-                int fb_row = y_off + sy * scale + ry;
-                /* Bounds guard: skip rows outside the framebuffer height. */
-                if ((unsigned)fb_row >= g_fb_info.height) continue;
-                int fb_col = x_off + sx * scale;
-                /* Bounds guard: skip columns outside the framebuffer width. */
-                if ((unsigned)fb_col >= g_fb_info.width)  continue;
-                uint8_t *dst = g_fb_ptr
-                             + (uint32_t)fb_row * pitch
-                             + (uint32_t)fb_col * g_fb_info.bpp;
-                for (int rx = 0; rx < scale; rx++) {
-                    if ((unsigned)(fb_col + rx) >= g_fb_info.width) break;
-                    memcpy(dst + rx * g_fb_info.bpp, &pixel, g_fb_info.bpp);
-                }
+                memcpy(dst + sx * g_fb_info.bpp, &pixel, g_fb_info.bpp);
             }
         }
     }
