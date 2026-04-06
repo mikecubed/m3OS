@@ -1,8 +1,9 @@
 //! System logging daemon for m3OS (Phase 46).
 //!
 //! Binds a Unix domain socket at `/dev/log`, receives syslog messages from
-//! userspace clients, drains kernel messages from `/dev/kmsg`, and writes
-//! formatted log lines to `/var/log/messages` and `/var/log/kern.log`.
+//! userspace clients, drains kernel messages from `/proc/kmsg` (falling back
+//! to `/dev/kmsg`), and writes formatted log lines to `/var/log/messages`
+//! and `/var/log/kern.log`.
 #![no_std]
 #![no_main]
 
@@ -113,6 +114,10 @@ fn setup_socket() -> Option<i32> {
         syscall_lib::close(fd as i32);
         return None;
     }
+
+    // Set non-blocking so the inner drain loop breaks on -EAGAIN
+    // instead of blocking when no more datagrams are pending.
+    syscall_lib::set_nonblocking(fd as i32);
 
     Some(fd as i32)
 }

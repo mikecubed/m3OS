@@ -1120,12 +1120,12 @@ fn spawn_login() -> i32 {
 // signal delivery is serialized by the kernel.
 // ---------------------------------------------------------------------------
 
-static mut SIGTERM_RECEIVED: bool = false;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigterm_handler(_sig: i32) {
-    unsafe {
-        SIGTERM_RECEIVED = true;
-    }
+    SIGTERM_RECEIVED.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,7 +1185,7 @@ pub extern "C" fn _start() -> ! {
     // Main reap loop.
     loop {
         // Check for SIGTERM (shutdown request).
-        let sigterm = unsafe { SIGTERM_RECEIVED };
+        let sigterm = SIGTERM_RECEIVED.load(Ordering::Acquire);
         if sigterm {
             write_str(
                 STDOUT_FILENO,

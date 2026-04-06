@@ -24,9 +24,6 @@ const MAX_LINE_LEN: usize = 512;
 const MAX_CMD_LEN: usize = 256;
 const MAX_FILE_SIZE: usize = 4096;
 const MAX_USERNAME_LEN: usize = 32;
-const SIGHUP: usize = 1;
-
-const O_RDONLY: u64 = 0;
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 
 // ---------------------------------------------------------------------------
@@ -109,11 +106,18 @@ impl CronEntry {
 // ---------------------------------------------------------------------------
 
 /// Parse a decimal integer from a byte slice, returning (value, bytes_consumed).
+/// Uses checked arithmetic to reject overflow rather than wrapping silently.
 fn parse_u32(s: &[u8]) -> (u32, usize) {
     let mut val: u32 = 0;
     let mut i = 0;
     while i < s.len() && s[i] >= b'0' && s[i] <= b'9' {
-        val = val * 10 + (s[i] - b'0') as u32;
+        val = match val
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((s[i] - b'0') as u32))
+        {
+            Some(v) => v,
+            None => return (0, 0), // overflow → treat as parse failure
+        };
         i += 1;
     }
     (val, i)
@@ -291,7 +295,7 @@ fn parse_line(line: &[u8], len: usize) -> Option<CronEntry> {
 
 /// Read a file into a buffer. Returns number of bytes read, or 0 on failure.
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
-    let fd = open(path, O_RDONLY, 0);
+    let fd = open(path, syscall_lib::O_RDONLY, 0);
     if fd < 0 {
         return 0;
     }
@@ -553,7 +557,11 @@ fn main(_args: &[&str]) -> i32 {
         sa_restorer: 0,
         sa_mask: 0,
     };
-    let _ = rt_sigaction(SIGHUP, &sa as *const SigAction, core::ptr::null_mut());
+    let _ = rt_sigaction(
+        syscall_lib::SIGHUP as usize,
+        &sa as *const SigAction,
+        core::ptr::null_mut(),
+    );
 
     // Open syslog socket
     let log_fd = open_syslog();
