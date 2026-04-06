@@ -104,7 +104,7 @@ once an HTTP client is ported.
 
 ## Companion Task List
 
-- Phase 45 Task List — *not yet created*
+- [Phase 45 Task List](./tasks/45-ports-system-tasks.md)
 
 ## How Real OS Implementations Differ
 
