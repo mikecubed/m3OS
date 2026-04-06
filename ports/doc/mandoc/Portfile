@@ -1,0 +1,8 @@
+NAME=mandoc
+VERSION=1.14.6
+DESCRIPTION="Man page compiler and viewer"
+CATEGORY=doc
+DEPS=
+URL=https://mandoc.bsd.lv/snapshots/mandoc-1.14.6.tar.gz
+SHA256=placeholder
+MAINTAINER=m3os

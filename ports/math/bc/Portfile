@@ -1,0 +1,6 @@
+NAME=bc
+VERSION=1.0
+DESCRIPTION="Integer calculator"
+CATEGORY=math
+DEPS=
+MAINTAINER=m3os

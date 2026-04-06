@@ -233,7 +233,7 @@ flowchart TD
 | 43b | Kernel Trace Ring | Per-core lockless trace ring, auto-dump on crash, sys_ktrace | Complete | `phase-43b` | [Phase 43b](./43b-kernel-trace-ring.md) | [Tasks](./tasks/43b-kernel-trace-ring-tasks.md) |
 | 43c | Regression & Stress | xtask regression/stress commands, CI tiers, proptest/loom | Complete | `phase-43c` | [Phase 43c](./43c-regression-stress-ci.md) | [Tasks](./tasks/43c-regression-stress-ci-tasks.md) |
 | 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | In Progress | `phase-44` | [Phase 44](./44-rust-cross-compilation.md) | [Tasks](./tasks/44-rust-cross-compilation-tasks.md) |
-| 45 | Ports System | Source-based package building and installation | Planned | `phase-45` | [Phase 45](./45-ports-system.md) | *not yet created* |
+| 45 | Ports System | Source-based package building and installation | Complete | `phase-45` | [Phase 45](./45-ports-system.md) | [Tasks](./tasks/45-ports-system-tasks.md) |
 | 46 | System Services | Service manager, syslog, cron, shutdown | Planned | `phase-46` | [Phase 46](./46-system-services.md) | *not yet created* |
 
 ### Showcase Phases (planned)

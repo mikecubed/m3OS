@@ -1,0 +1,6 @@
+NAME=sbase
+VERSION=0.1
+DESCRIPTION="Suckless Unix tools"
+CATEGORY=core
+DEPS=
+MAINTAINER=m3os

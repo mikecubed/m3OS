@@ -1016,6 +1016,8 @@ fn build_kernel() -> PathBuf {
     build_ion();
     // Phase 32: cross-compile pdpmake (POSIX make).
     build_pdpmake();
+    // Phase 45: fetch port sources for bundling into the disk image.
+    fetch_port_sources();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -3698,6 +3700,10 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     // Phase 32: populate demo project for make/build-tools testing.
     populate_demo_project(&part_tmp, &root);
 
+    // Phase 45: populate ports tree and bundled source into /usr/ports/.
+    let ports_src = root.join("target/ports-src");
+    populate_ports_tree(&part_tmp, &root, &ports_src);
+
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
         .args(["-n", "-f"])
@@ -4005,6 +4011,318 @@ fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
             "Warning: debugfs (demo) exited with {}: {}",
             output.status, stderr
         );
+    }
+}
+
+/// Phase 45: Fetch Lua source code for the ports system.
+/// Downloads and extracts Lua 5.4.7 to `target/ports-src/lang/lua/src/`.
+fn fetch_lua_source(ports_src: &Path) {
+    let lua_dir = ports_src.join("lang/lua/src");
+    if lua_dir.join("lua.c").exists() {
+        println!("ports: Lua source already cached");
+        return;
+    }
+
+    let lua_tar = ports_src.join("lua-5.4.7.tar.gz");
+    println!("ports: downloading Lua 5.4.7...");
+    let status = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-o",
+            lua_tar.to_str().unwrap(),
+            "https://www.lua.org/ftp/lua-5.4.7.tar.gz",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("warning: failed to download Lua source — skipping Lua port");
+            return;
+        }
+    }
+
+    // Extract to a temp dir, then move the src/ files.
+    let extract_dir = ports_src.join("lua-extract");
+    let _ = fs::remove_dir_all(&extract_dir);
+    fs::create_dir_all(&extract_dir).unwrap();
+    let status = Command::new("tar")
+        .args([
+            "xzf",
+            lua_tar.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tar");
+    if !status.success() {
+        eprintln!("warning: failed to extract Lua source");
+        return;
+    }
+
+    // Lua extracts to lua-5.4.7/src/ — copy the src/ contents.
+    let lua_src_extracted = extract_dir.join("lua-5.4.7/src");
+    if lua_src_extracted.is_dir() {
+        fs::create_dir_all(&lua_dir).unwrap();
+        for entry in fs::read_dir(&lua_src_extracted).unwrap() {
+            let entry = entry.unwrap();
+            let dest = lua_dir.join(entry.file_name());
+            fs::copy(entry.path(), &dest).unwrap();
+        }
+        println!("ports: Lua source extracted to {}", lua_dir.display());
+    }
+    let _ = fs::remove_dir_all(&extract_dir);
+    let _ = fs::remove_file(&lua_tar);
+}
+
+/// Phase 45: Fetch zlib source code for the ports system.
+/// Downloads and extracts zlib 1.3.1 to `target/ports-src/lib/zlib/src/`.
+fn fetch_zlib_source(ports_src: &Path) {
+    let zlib_dir = ports_src.join("lib/zlib/src");
+    if zlib_dir.join("zlib.h").exists() {
+        println!("ports: zlib source already cached");
+        return;
+    }
+
+    let zlib_tar = ports_src.join("zlib-1.3.1.tar.gz");
+    println!("ports: downloading zlib 1.3.1...");
+    let status = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-o",
+            zlib_tar.to_str().unwrap(),
+            "https://zlib.net/zlib-1.3.1.tar.gz",
+        ])
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("warning: failed to download zlib source — skipping zlib port");
+            return;
+        }
+    }
+
+    let extract_dir = ports_src.join("zlib-extract");
+    let _ = fs::remove_dir_all(&extract_dir);
+    fs::create_dir_all(&extract_dir).unwrap();
+    let status = Command::new("tar")
+        .args([
+            "xzf",
+            zlib_tar.to_str().unwrap(),
+            "-C",
+            extract_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tar");
+    if !status.success() {
+        eprintln!("warning: failed to extract zlib source");
+        return;
+    }
+
+    // zlib extracts to zlib-1.3.1/ — copy all .c and .h files.
+    let zlib_extracted = extract_dir.join("zlib-1.3.1");
+    if zlib_extracted.is_dir() {
+        fs::create_dir_all(&zlib_dir).unwrap();
+        for entry in fs::read_dir(&zlib_extracted).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".c") || name_str.ends_with(".h") {
+                let dest = zlib_dir.join(&name);
+                fs::copy(entry.path(), &dest).unwrap();
+            }
+        }
+        println!("ports: zlib source extracted to {}", zlib_dir.display());
+    }
+    let _ = fs::remove_dir_all(&extract_dir);
+    let _ = fs::remove_file(&zlib_tar);
+}
+
+/// Phase 45: Fetch all port sources for bundling into the disk image.
+fn fetch_port_sources() -> PathBuf {
+    let root = workspace_root();
+    let ports_src = root.join("target/ports-src");
+    fs::create_dir_all(&ports_src).unwrap();
+    fetch_lua_source(&ports_src);
+    fetch_zlib_source(&ports_src);
+    ports_src
+}
+
+/// Phase 45: Populate the ports tree into `/usr/ports/` on the ext2 partition.
+///
+/// Mirrors the host-side `ports/` directory (Portfiles, Makefiles, patches) and
+/// downloaded source files into the ext2 image. Also installs the `port` command
+/// at `/usr/bin/port` and creates `/usr/local/` and `/var/db/ports/` directories.
+fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path) {
+    let ports_dir = workspace_root.join("ports");
+    if !ports_dir.is_dir() {
+        return;
+    }
+
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+
+    // Collect port metadata files (Portfiles, Makefiles, patches, .gitkeep).
+    collect_ports_entries(&ports_dir, "usr/ports", &mut dirs, &mut files);
+
+    // Collect downloaded source files into the port tree.
+    // Source files go to usr/ports/<category>/<name>/src/
+    if ports_src.is_dir() {
+        for category in &["lang", "lib", "math", "core", "doc", "util"] {
+            let cat_dir = ports_src.join(category);
+            if !cat_dir.is_dir() {
+                continue;
+            }
+            for port_entry in fs::read_dir(&cat_dir).unwrap().flatten() {
+                if !port_entry.path().is_dir() {
+                    continue;
+                }
+                let port_name = port_entry.file_name();
+                let src_dir = port_entry.path().join("src");
+                if src_dir.is_dir() {
+                    let prefix =
+                        format!("usr/ports/{}/{}/src", category, port_name.to_string_lossy());
+                    collect_staging_entries(&src_dir, &prefix, &mut dirs, &mut files);
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return;
+    }
+
+    let mut cmds = String::new();
+
+    // Ensure parent directories exist (debugfs mkdir requires parents).
+    let parent_dirs = ["usr", "usr/bin"];
+    for d in &parent_dirs {
+        cmds.push_str(&format!("mkdir {d}\n"));
+    }
+
+    // Create infrastructure directories.
+    let infra_dirs = [
+        "usr/local",
+        "usr/local/bin",
+        "usr/local/lib",
+        "usr/local/include",
+        "var/db",
+        "var/db/ports",
+    ];
+    for d in &infra_dirs {
+        cmds.push_str(&format!("mkdir {d}\n"));
+    }
+
+    // Create port tree directories (sorted so parents come before children).
+    dirs.sort();
+    dirs.dedup();
+    for dir in &dirs {
+        cmds.push_str(&format!("mkdir {dir}\n"));
+    }
+
+    // Write files.
+    for (ext2_path, host_path) in &files {
+        cmds.push_str(&format!("write \"{}\" {ext2_path}\n", host_path.display()));
+    }
+
+    // Install port.sh as /usr/bin/port.
+    let port_script = ports_dir.join("port.sh");
+    if port_script.exists() {
+        cmds.push_str(&format!(
+            "write \"{}\" usr/bin/port\n",
+            port_script.display()
+        ));
+    }
+
+    // Set permissions: parent dirs 0755, owned by root.
+    for d in &parent_dirs {
+        cmds.push_str(&format!("sif {d} mode 0x41ED\n"));
+        cmds.push_str(&format!("sif {d} uid 0\n"));
+        cmds.push_str(&format!("sif {d} gid 0\n"));
+    }
+
+    // Set permissions: infrastructure dirs 0755.
+    for d in &infra_dirs {
+        cmds.push_str(&format!("sif {d} mode 0x41ED\n"));
+    }
+
+    // Port tree directories 0755.
+    for dir in &dirs {
+        cmds.push_str(&format!("sif {dir} mode 0x41ED\n"));
+    }
+
+    // Files: Makefiles and source 0644, port script executable 0755.
+    for (ext2_path, _) in &files {
+        cmds.push_str(&format!("sif {ext2_path} mode 0x81A4\n"));
+    }
+    if port_script.exists() {
+        cmds.push_str("sif usr/bin/port mode 0x81ED\n");
+    }
+
+    // /var/db/ports owned by root with standard permissions.
+    cmds.push_str("sif var/db/ports mode 0x41ED\n");
+    cmds.push_str("sif var/db/ports uid 0\n");
+    cmds.push_str("sif var/db/ports gid 0\n");
+
+    cmds.push_str("q\n");
+
+    println!(
+        "ports: populating ext2 with {} dirs, {} files + port command",
+        dirs.len() + infra_dirs.len(),
+        files.len() + 1
+    );
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(part_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for ports population");
+    {
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write ports debugfs commands");
+    }
+    let debugfs_output = debugfs.wait_with_output().expect("debugfs wait");
+    if !debugfs_output.status.success() {
+        let stderr = String::from_utf8_lossy(&debugfs_output.stderr);
+        eprintln!(
+            "Warning: debugfs (ports) exited with {}: {}",
+            debugfs_output.status, stderr
+        );
+    }
+}
+
+/// Collect port tree entries (Portfiles, Makefiles, patches) from the ports
+/// directory, skipping the port.sh script (installed separately).
+fn collect_ports_entries(
+    dir: &Path,
+    prefix: &str,
+    dirs: &mut Vec<String>,
+    files: &mut Vec<(String, PathBuf)>,
+) {
+    dirs.push(prefix.to_string());
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip port.sh (installed at /usr/bin/port separately), work dirs,
+        // and .git files.
+        if name_str == "port.sh" || name_str == "work" || name_str.starts_with('.') {
+            continue;
+        }
+        let child_prefix = format!("{prefix}/{name_str}");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_ports_entries(&path, &child_prefix, dirs, files);
+        } else {
+            files.push((child_prefix, path));
+        }
     }
 }
 
