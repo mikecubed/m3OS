@@ -1,6 +1,6 @@
 # Release Phase R06 — Hardening and Operational Polish
 
-**Status:** Proposed  
+**Status:** In Progress<br>
 **Depends on:** [R01 — Security Foundation](./R01-security-foundation.md),
 [R04 — Service Model](./R04-service-model.md),
 [R05 — First Service Extractions](./R05-first-service-extractions.md)  
@@ -27,6 +27,12 @@ This phase is where the project earns the right to say "the headless/reference
 system is trustworthy enough to operate deliberately," even if the desktop story
 is still later.
 
+Completed Phases 44-46 mean this phase starts from a stronger baseline than the
+original evaluation assumed: Rust `std` binaries run, ports exist, and the
+system already has a managed-service/logging layer. The work here is therefore
+about hardening shipped capabilities and deciding which remaining gaps are true
+release blockers.
+
 ```mermaid
 flowchart TD
     A["Security floor repaired"] --> B["Managed services"]
@@ -41,8 +47,8 @@ flowchart TD
 | Area | Current state | Required in this phase | Later extension |
 |---|---|---|---|
 | P1 hardening | Good crypto and diagnostics work exists, but security polish is incomplete | SSH, auth-file handling, and default hygiene are materially stronger | More advanced sandboxing and policy controls |
-| Rust userspace | Rust std path is in progress | Rust std becomes the normal guest development path | Bigger toolchains and richer ecosystem support |
-| Packaging | Ports exist, but reliability and failure modes still matter | Ports and images are predictable enough for routine use | Package feeds, larger repos, dependency breadth |
+| Rust userspace | Rust std path is in the current base, but it still needs to become the boring/default workflow | Rust std becomes the normal guest development path | Bigger toolchains and richer ecosystem support |
+| Packaging | Ports exist in the current base, but reliability and failure modes still matter | Ports and images are predictable enough for routine use | Package feeds, larger repos, dependency breadth |
 | Networking for operators | Basic networking exists, but operator-friendly client workflows are incomplete | Outbound-friendly basics such as DNS/DHCP and sane admin flows | Full HTTPS-heavy tooling and larger online ecosystem |
 | Validation | Diagnostics are already strong | Smoke/regression/stress become trusted release gates | Wider hardware CI and richer telemetry |
 
@@ -51,8 +57,8 @@ flowchart TD
 | Track | What changes | Why now |
 |---|---|---|
 | P1 security hardening | Improve SSH hardening, auth-file update discipline, and secret hygiene | The system should not plateau immediately after the P0 fixes |
-| Rust std workflow | Finish and document the Rust std cross-compilation path as the normal way to add serious new userspace | This is the highest-leverage developer experience improvement |
-| Ports reliability | Make build, fetch, and install behavior deterministic and observable | A platform without reliable packaging feels fragile |
+| Rust std workflow | Treat the Rust std cross-compilation path as the normal way to add serious new userspace and close remaining rough edges | This is the highest-leverage developer experience improvement |
+| Ports reliability | Make the shipped build, fetch, and install behavior deterministic and observable | A platform without reliable packaging feels fragile |
 | Operator networking | Add the minimum client-networking and outbound workflows the headless story needs | Real systems must resolve names and reach services sanely |
 | Validation and diagnostics | Tie crash diagnostics, trace rings, smoke tests, regressions, and stress runs into release discipline | Passing validation should mean something concrete |
 

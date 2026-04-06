@@ -1,6 +1,6 @@
 # m3OS Evaluation
 
-This directory captures a repo-wide evaluation of m3OS as of this review pass: what is already strong, what is still missing, what blocks a safer and more usable system, and what a realistic GUI path would look like.
+This directory captures a repo-wide evaluation of m3OS as of this review pass, updated against the current base through Phase 46 / `v0.46.0`: what is already strong, what is still missing, what blocks a safer and more usable system, and what a realistic GUI path would look like. Because phases 1-46 are now the shipped base, anything still rough in that scope should be read as a maturity gap in current behavior, not as hidden future work.
 
 ## Executive verdict
 
@@ -12,13 +12,14 @@ The project's strongest assets are:
 - a large, real syscall and userspace surface in `kernel/` and `userspace/`
 - a strong `kernel-core/` split for host-testable logic
 - unusually good diagnostics and validation infrastructure for a project of this size
+- a real userspace service-management, logging, and admin baseline from Phase 46
 
 The biggest blockers are:
 
 - security-critical trust failures around identity and entropy
 - a broad ring-0 trusted computing base despite the documented microkernel ideal
 - an unfinished path from "microkernel design" to "properly enforced userspace-service architecture"
-- missing service-management/logging polish for a "server-ish" usable state
+- remaining security and operational hardening despite the new service-management/logging baseline
 - no real GUI stack beyond a framebuffer text console
 - QEMU-first driver coverage and limited packaging/runtime maturity
 
@@ -47,8 +48,8 @@ flowchart LR
 
 1. **As a serious microkernel-style OS project, m3OS is already substantial.** It goes far beyond "boot a kernel" tutorials and already demonstrates SMP, paging, process isolation, SSH, Unix sockets, PTYs, ext2, and a substantial userspace.
 2. **As a secure multi-user system, it is not ready.** The current `setuid`/`setgid` behavior, entropy story, telnet default, and baked-in credentials are enough to block that claim.
-3. **As a headless development or demo environment, it is close.** The live smoke path is strong, but service supervision, logging, packaging polish, and targeted regression reliability still need work.
-4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, raw input, mouse, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack.
+3. **As a managed headless/reference system, it is materially stronger after Phase 46.** The service model, logging, cron, and admin surface are now real, but security fixes, packaging/runtime polish, and targeted regression reliability still need work.
+4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, raw input, mouse, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack; a Phase 47-style single-app graphics milestone would improve bring-up, not solve the display-server/compositor gap.
 5. **As a documented microkernel design, the architecture is ahead of the implementation.** The project already has the right foundational primitives — ring-3 processes, per-process address spaces, capability-based IPC, notifications, and a strong roadmap story — but core services still live in ring 0 and several IPC/data paths still assume a shared kernel address space.
 6. **As a real-hardware platform, the next bottleneck is driver strategy rather than just ambition.** m3OS has enough kernel substrate to begin real-hardware bringup, but it needs a deliberate sourcing strategy: public specs first, Redox as the closest reusable Rust codebase, BSD as a permissive reference, and Linux primarily as a behavior/quirk reference rather than a donor.
 
@@ -90,6 +91,7 @@ Concrete reasons that framing is more accurate:
 | Multi-user login and permissions | `docs/27-user-accounts.md`, `userspace/login/`, `userspace/passwd/` |
 | Serious VM and SMP work | `docs/25-smp.md`, `docs/33-kernel-memory.md`, `docs/36-expanded-memory.md`, `kernel/src/smp/`, `kernel/src/mm/` |
 | Remote administration | `docs/roadmap/43-ssh-server.md`, `userspace/sshd/`, `userspace/init/src/main.rs` |
+| Managed services and logs | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
 | Guest-side build and packaging work | `docs/31-compiler-bootstrap.md`, `docs/32-build-tools.md`, `docs/45-ports-system.md` |
 | Real validation infrastructure | `docs/43c-regression-stress-ci.md`, `xtask/src/main.rs` |
 

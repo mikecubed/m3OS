@@ -1,6 +1,6 @@
 # Release Phase R04 — Service Model
 
-**Status:** Proposed  
+**Status:** In Progress<br>
 **Depends on:** [R01 — Security Foundation](./R01-security-foundation.md),
 [R03 — IPC Completion](./R03-ipc-completion.md)  
 **Official roadmap phases covered:** [Phase 20](../../roadmap/20-userspace-init-shell.md),
@@ -25,6 +25,14 @@ This phase exists to create that model before the first serious server
 extractions. Otherwise each new service invents its own lifecycle, and the
 microkernel story produces complexity without operability.
 
+Phase 46 already delivers the first real answer to this problem on current
+main: PID 1 now parses service definitions, starts services in dependency order,
+reaps children, restarts managed daemons, coordinates shutdown, and works with
+`syslogd`, `crond`, and admin commands. The release question is no longer
+whether m3OS needs a service model; it already has one. The remaining question
+is how much that model must mature before it can host extracted microkernel
+services and anchor a release story.
+
 ```mermaid
 flowchart TD
     A["PID 1 / init"] --> B["service definitions"]
@@ -40,20 +48,20 @@ flowchart TD
 
 | Area | Current state | Required in this phase | Later extension |
 |---|---|---|---|
-| Startup | Services can be started, but lifecycle is not systematized | Declarative service definitions and dependency order | More advanced activation models |
-| Recovery | Crash handling is limited or ad hoc | Restart-on-failure semantics and service status reporting | Sandboxing, backoff policies, service health probes |
-| Logging | Diagnostics exist, but service logging is incomplete | Central logging path and sane operator visibility | Structured journaling and rotation |
-| Shutdown | Reboot/shutdown is not yet a first-class service concern | Ordered service drain and clean restart/halt | Richer operational controls |
+| Startup | Phase 46 PID 1 plus `/etc/services.d` gives the system an explicit startup graph | Extracted core services and broader coverage fit that graph cleanly | More advanced activation models |
+| Recovery | Restart and status behavior exist for managed daemons | Restart-on-failure semantics and service status reporting are trusted for long-lived and later extracted services | Sandboxing, backoff policies, service health probes |
+| Logging | `syslogd` and admin tooling now exist in the base | Central logging path and sane operator visibility hold up as the service graph expands | Structured journaling and rotation |
+| Shutdown | Ordered shutdown/reboot paths now exist | Ordered service drain and clean restart/halt are trusted across the service graph | Richer operational controls |
 
 ## Detailed workstreams
 
 | Track | What changes | Why now |
 |---|---|---|
-| Service definitions | Make service configuration explicit and readable by PID 1 | Later phases need predictable system composition |
-| Supervision | Add restart policy, exit classification, and status reporting | A microkernel without restartability loses most of its benefit |
-| Logging | Create a central log sink for services and operators | Operability matters before the service count grows |
-| Shutdown and reboot | Let the service manager coordinate orderly termination | Real systems need controlled teardown, not just abrupt stop |
-| Admin surface | Add minimal `service`, `shutdown`, `reboot`, and status tooling | Operators need one coherent control path |
+| Service definitions | Stabilize and extend service configuration for PID 1 | Later phases need predictable system composition |
+| Supervision | Use the shipped restart policy, exit classification, and status reporting as the backbone for later extracted services | A microkernel without restartability loses most of its benefit |
+| Logging | Harden the central log sink for services and operators | Operability matters before the service count grows |
+| Shutdown and reboot | Prove that the service manager coordinates orderly termination across a wider service set | Real systems need controlled teardown, not just abrupt stop |
+| Admin surface | Keep `service`, `shutdown`, `reboot`, and status tooling stable enough for operators and future tooling | Operators need one coherent control path |
 
 ## How This Differs from Linux, Redox, and production systems
 
@@ -78,8 +86,8 @@ about without treating every bug as a kernel bug.
 ## What This Phase Unlocks
 
 After this phase, the project can move real services into ring 3 without losing
-basic operability. That is the bridge between IPC work and architectural
-extraction.
+basic operability. Phase 46 already provides the first half of that bridge; this
+phase is about making it strong enough for architectural extraction.
 
 ## Acceptance Criteria
 

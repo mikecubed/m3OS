@@ -34,6 +34,7 @@ flowchart LR
 | Modern SSH primitives | Better than many hobby OSes that stop at plaintext remote shells | `docs/roadmap/43-ssh-server.md`, `userspace/sshd/`, `userspace/crypto-lib/` |
 | Secure Boot signing path | Good host-side supply-chain and real-hardware groundwork | `docs/10-secure-boot.md`, `scripts/gen-secure-boot-keys.sh`, `xtask/src/main.rs` |
 | Strong user-memory validation and guarded ELF loading | Reduces a large class of user-pointer and mapping mistakes | `kernel/src/mm/user_mem.rs`, `docs/11-elf-loader-and-process-model.md` |
+| Managed service/logging baseline | Phase 46 adds PID 1 supervision plus `syslogd` and admin tooling in the current base | Operational visibility and controlled shutdown are no longer purely aspirational | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs` |
 
 ## P0: blockers to fix before claiming a safer multi-user system
 
@@ -101,4 +102,4 @@ Until the P0 items are fixed:
 - do **not** present it as a safely network-exposed general-purpose system
 - prefer smoke-tested local/QEMU use over unattended deployment
 
-Once the P0 items are fixed and Phase 46-style service/logging work exists, m3OS can reasonably claim a **safer headless system**. Desktop-grade security is a later conversation and depends on the GUI/input/session architecture as much as on the kernel.
+Phase 46 means the service/logging/admin baseline now exists, so once the P0 items are fixed m3OS can reasonably claim a **safer headless system**. Desktop-grade security is a later conversation and depends on the GUI/input/session architecture as much as on the kernel.

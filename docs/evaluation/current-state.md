@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-m3OS is best understood as a **well-structured, heavily documented, QEMU-first Rust OS with microkernel ambitions and a surprisingly deep userspace**.
+m3OS is best understood as a **well-structured, heavily documented, QEMU-first Rust OS with microkernel ambitions, a surprisingly deep userspace, and a now-real service-management/logging layer**.
 
 The central architectural truth is:
 
@@ -10,6 +10,10 @@ The central architectural truth is:
 - **the shipped system currently concentrates much more policy and functionality in ring 0**
 
 That tension does not make the project bad. It makes the project **pragmatic**. But it does shape what "usable", "secure", and "GUI-ready" should mean.
+
+Phase 46 materially improves the headless story by adding a real userspace service manager, logging daemon, cron daemon, and admin commands. That is a meaningful maturity jump, but it does **not** by itself narrow the kernel or resolve the security floor.
+
+A useful framing change after `v0.46.0` is that phases 1-46 are the shipped base. If something expected from that scope still feels rough, it is best described as a quality or integration gap in current behavior, not as pre-46 roadmap debt hiding elsewhere.
 
 ```mermaid
 flowchart TB
@@ -36,6 +40,7 @@ flowchart TB
 | Syscall/userspace surface | `kernel/src/arch/x86_64/syscall.rs`, `userspace/`, and `userspace/coreutils-rs/` provide real breadth | m3OS is beyond a kernel demo and into OS territory |
 | SMP and VM | `kernel/src/smp/`, `kernel/src/mm/`, `docs/25-smp.md`, `docs/33-kernel-memory.md`, `docs/36-expanded-memory.md` | The project has already crossed major "serious OS" milestones |
 | Diagnostics/testing | `docs/43c-regression-stress-ci.md`, trace-ring and crash-diag docs | Failures are observable, not opaque |
+| System operations baseline | Phase 46 adds a real PID 1 service manager, service definitions, `syslogd`, `crond`, and admin commands | The headless/reference-system story is now built on shipped lifecycle plumbing rather than aspiration |
 
 ## Architectural reality check
 
@@ -88,7 +93,7 @@ This is the main reason the current system reads as "microkernel-aimed" rather t
 | Storage/filesystems | Strong for a project at this maturity | `docs/24-persistent-storage.md`, `docs/28-ext2-filesystem.md`, `kernel/src/fs/` |
 | Networking | Solid system infrastructure, still not full product networking | `docs/16-network.md`, `docs/23-socket-api.md`, `docs/39-unix-domain-sockets.md`, `kernel/src/net/` |
 | Userspace tooling | Far beyond the kernel-demo stage | `userspace/`, `userspace/coreutils-rs/`, `docs/32-build-tools.md`, `docs/45-ports-system.md` |
-| Service model | Still incomplete for a system you would leave running | `docs/roadmap/46-system-services.md` |
+| Service model | Real Phase 46 baseline, but still not the same thing as a clean graph of restartable ring-3 core services | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
 | Graphics/UI | Text console only | `docs/09-framebuffer-and-shell.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/47-doom.md` |
 | Hardware breadth | Still QEMU-centric | `kernel/src/blk/`, `kernel/src/net/virtio_net.rs`, `docs/roadmap/48-mouse-input.md`, `docs/roadmap/49-audio.md` |
 
@@ -145,6 +150,6 @@ Also noted during that run: the ports fetch path emitted a `zlib` source-downloa
 
 1. **Close the security blockers** in [security-review.md](./security-review.md).
 2. **Decide how serious the project is about enforcing the microkernel boundary** in [microkernel-path.md](./microkernel-path.md), because that choice affects storage, networking, GUI, and long-term security all at once.
-3. **Finish the "system operations" layer** in [usability-roadmap.md](./usability-roadmap.md): services, logging, shutdown/reboot, packaging polish.
+3. **Harden and validate the shipped "system operations" layer** in [usability-roadmap.md](./usability-roadmap.md): services, logging, shutdown/reboot, packaging polish.
 4. **Pick a graphics direction before adding more graphics APIs** in [gui-strategy.md](./gui-strategy.md).
 5. **Keep m3OS honest about its niche** in [rust-os-comparison.md](./rust-os-comparison.md): it should lean into being a serious reference OS with unusually strong pedagogy rather than pretending to be a near-term Redox replacement.

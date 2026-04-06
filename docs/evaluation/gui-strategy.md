@@ -10,6 +10,7 @@ The current repo is closer to "graphics-capable kernel substrate" than to "deskt
 - `docs/09-framebuffer-and-shell.md` already hints at moving framebuffer ownership to a dedicated display server later
 - `docs/roadmap/47-doom.md` proposes raw framebuffer access for a single graphical app
 - `docs/roadmap/48-mouse-input.md` and `docs/roadmap/49-audio.md` are still planned, not integrated
+- Phase 46 now supplies a real service/logging/admin baseline that later display/session services can reuse
 
 ## Why this needs detailed planning
 
@@ -37,7 +38,7 @@ Why:
 3. the graphics path forces the project to solve real shared-buffer and input-routing problems instead of relying on kernel-pointer shortcuts
 4. the same infrastructure needed for a real display server is useful for other serverized subsystems
 
-That means GUI work is not separate from microkernel work. It is one of the cleanest paths into it. The broader migration context is in [microkernel-path.md](./microkernel-path.md).
+That means GUI work is not separate from microkernel work. It is one of the cleanest paths into it. Phase 46 improves the starting point because the project already has PID 1 supervision and logging in userspace, which makes it easier to treat a future display server as a real managed service. The broader migration context is in [microkernel-path.md](./microkernel-path.md).
 
 ## Starting point
 
@@ -192,7 +193,7 @@ That does **not** mean m3OS needs to clone Redox exactly. It does mean the short
 
 The best path is:
 
-1. use the Phase 47 DOOM work as a **graphics bring-up milestone**
+1. use Phase 47-style DOOM or raw-framebuffer work as a **graphics bring-up milestone**
 2. immediately follow with **input abstraction**
 3. then design and build a **userspace display server/compositor**
 4. only after that consider higher-level compatibility layers or larger GUI toolkits

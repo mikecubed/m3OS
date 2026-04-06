@@ -78,9 +78,11 @@ later." Some defects invalidate the claim you want to make today.
 ## What This Phase Unlocks
 
 After this phase, m3OS can start talking about a **safer headless system**
-without immediately contradicting itself. That in turn makes later work on
-service management, packaging, and hardware support more meaningful, because the
-foundation is no longer obviously compromised.
+without immediately contradicting itself. Because the Phase 46
+service/logging/admin baseline already exists, fixing these items would
+immediately make the current headless platform much more defensible. That in
+turn makes later work on service management, packaging, and hardware support
+more meaningful, because the foundation is no longer obviously compromised.
 
 ## Acceptance Criteria
 

@@ -9,6 +9,8 @@ This document separates four different claims that are often blurred together:
 
 m3OS already satisfies the first two in a meaningful way. The work ahead is about making the latter two explicit and staged.
 
+Phase 46 changes Stage 1 significantly: service supervision, logging, cron, and admin tooling now exist in the current base. Stage 1 is therefore less about inventing a service model and more about hardening, validating, and learning to rely on the shipped one.
+
 ## Stage model
 
 ```mermaid
@@ -18,9 +20,9 @@ flowchart TD
     S2 --> S3["Stage 3<br/>Broader developer platform"]
 
     S1 --> SEC["P0 security fixes"]
-    S1 --> SERV["Phase 46 services/logging"]
-    S1 --> R44["Finish Phase 44 Rust std path"]
-    S1 --> PKG["Ports/package polish"]
+    S1 --> SERV["Phase 46 baseline<br/>service model + logging"]
+    S1 --> R44["Shipped Phase 44<br/>Rust std path"]
+    S1 --> PKG["Shipped Phase 45<br/>ports baseline"]
     S1 --> NET["DNS/DHCP/client-networking basics"]
 
     S2 --> DISP["Display server/compositor"]
@@ -70,17 +72,19 @@ Evidence for that claim:
 | Work item | Why it matters | Evidence |
 |---|---|---|
 | Fix the P0 security issues | Without this, remote access and user isolation are not trustworthy | [security-review.md](./security-review.md) |
-| Finish service supervision, logging, shutdown/reboot | Real systems need PID 1 to manage daemons, logs, and lifecycle | `docs/roadmap/46-system-services.md` |
-| Finish and stabilize the Rust std path | This is the easiest path to writing more serious userspace in Rust | `docs/roadmap/44-rust-cross-compilation.md` |
-| Improve packaging/ports reliability | Tooling that silently skips sources or drifts is not a stable user story | `docs/45-ports-system.md`, validation-session zlib fetch issue |
+| Harden and validate the shipped service supervision, logging, shutdown/reboot layer | Real systems need PID 1 to manage daemons, logs, and lifecycle, and m3OS now has that baseline | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
+| Stabilize the shipped Rust std path | This is the easiest path to writing more serious userspace in Rust, and it is already part of the base | `docs/roadmap/44-rust-cross-compilation.md` |
+| Improve packaging/ports reliability | Tooling that silently skips sources or drifts is not a stable user story, even when the ports system already exists | `docs/45-ports-system.md`, validation-session zlib fetch issue |
 | Add basic client-networking support | DNS, DHCP, and easier outbound tooling matter for real use | `docs/16-network.md`, `docs/roadmap/51-networking-and-github.md` |
+
+Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly security and maturity gaps in shipped systems, not the absence of the service layer itself.
 
 ### Detailed Stage 1 work breakdown
 
 | Track | Needed outcome | Why it belongs in Stage 1 |
 |---|---|---|
 | Security | root boundary actually means something | No amount of service polish matters if any process can become root |
-| Operations | services, logs, reboot/shutdown | This is the difference between a shell session and a real system |
+| Operations | turn the shipped Phase 46 supervisor/logging stack into something safe to rely on unattended | This is the difference between a shell session and a real system |
 | Packaging/tooling | reproducible ports and Rust std path | This is the difference between a demo image and an extensible environment |
 | Networking | outbound-friendly client networking | Headless systems need to fetch, resolve, and communicate outward reliably |
 | Architecture | ring-3-safe IPC and service boundaries | If proper microkernel design remains a real goal, this work cannot stay deferred forever |

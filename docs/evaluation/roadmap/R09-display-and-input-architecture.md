@@ -23,6 +23,11 @@ This phase exists to build the smallest credible graphical architecture that is
 consistent with the rest of the roadmap: a userspace-owned display/input model
 rather than a pile of special-case kernel code.
 
+Phase 46 helps here indirectly: the project now has a real userspace
+supervision/logging baseline that future display and session services can
+reuse. What it does **not** provide is the display model itself; that still
+belongs entirely to this phase.
+
 ```mermaid
 flowchart TB
     APP1["GUI app A"] --> DISP["Display server / compositor"]
@@ -38,14 +43,14 @@ flowchart TB
 |---|---|---|---|
 | Display | Raw framebuffer text console | One userspace process owns composition and presentation | Richer desktop polish and graphics acceleration |
 | Input | Keyboard-centric, limited pointing-device story | Unified keyboard/mouse event model routed through userspace | USB HID, touch, richer devices |
-| Application model | Single-console worldview | Multiple clients can coexist under a compositor | Toolkit, richer apps, session polish |
+| Application model | Single-console worldview, albeit with a stronger service/session baseline from Phase 46 | Multiple clients can coexist under a compositor | Toolkit, richer apps, session polish |
 | Audio | Planned but not central yet | Scoped clearly as part of the local-system story | Full audio server and richer media behavior |
 
 ## Detailed workstreams
 
 | Track | What changes | Why now |
 |---|---|---|
-| Graphics proof | Use DOOM-class or raw-framebuffer apps as an early proof that userspace graphics can work | Good architectural experiments need visible feedback |
+| Graphics proof | Use DOOM-class or other raw-framebuffer apps as an early proof that userspace graphics can work | Good architectural experiments need visible feedback |
 | Input event model | Unify keyboard and mouse events into one routable userspace model | Multiple apps need a clear focus and event story |
 | Display server | One process owns the framebuffer and composes multiple clients | This is the key GUI boundary |
 | Client protocol | Define how apps submit buffers, receive events, and manage windows | Good GUI architecture needs a protocol, not ad hoc calls |

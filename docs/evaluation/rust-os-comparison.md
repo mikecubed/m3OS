@@ -33,7 +33,7 @@ quadrantChart
 
 | Project | Primary target | Architecture | GUI story | Where it leads | What m3OS can learn |
 |---|---|---|---|---|---|
-| **m3OS** | Serious QEMU-first general OS / reference system | Microkernel-inspired, currently broad ring-0 implementation | No GUI yet; framebuffer text console and roadmap items only | Documentation, pedagogical structure, diagnostics, fast comprehension | Finish the missing product layers and decide how far to enforce the microkernel boundary |
+| **m3OS** | Serious QEMU-first general OS / reference system | Microkernel-inspired, currently broad ring-0 implementation | No real GUI yet; framebuffer console, stronger service/ops baseline, and planned graphics milestones only | Documentation, pedagogical structure, diagnostics, fast comprehension | Finish the missing product layers and decide how far to enforce the microkernel boundary |
 | **Redox** | General-purpose Rust OS | True userspace-service-oriented microkernel ecosystem | Orbital desktop, GUI app ecosystem, broader desktop story | Desktop, package ecosystem, real hardware progress, windowing | A GUI needs a display server/compositor, not just raw framebuffer access |
 | **Tock** | Embedded/IoT MCU OS | MPU-based embedded OS with capsules/apps | None | Isolation model for resource-constrained systems | Strong threat-model discipline and component boundaries |
 | **Hubris** | Production embedded firmware | Static-task embedded OS | None | Operational rigor, narrowly scoped trusted computing base | Scope discipline and explicit security posture |
@@ -63,13 +63,14 @@ Official references:
 | Documentation and roadmap | `docs/roadmap/README.md` plus per-phase task docs are unusually systematic |
 | Host-testable kernel logic | `kernel-core/` is a real structural win |
 | Explicit diagnostics/testing narrative | crash diagnostics, trace rings, smoke/regression/stress story are very visible |
+| Headless/reference-system baseline | Phase 46 adds a real service manager, logging daemon, cron, and admin commands |
 | Learning clarity | The system is easier to read as a single coherent journey |
 
 ### Practical synthesis
 
 If someone asks "Is m3OS closer to Redox or to blog_os?", the honest answer is:
 
-**architecturally and functionally it is much closer to Redox than to tutorial kernels, but operationally it is still much earlier than Redox.**
+**architecturally and functionally it is much closer to Redox than to tutorial kernels, but operationally it is still much earlier than Redox.** Phase 46 improves that operational comparison on the headless side, but it does not erase the remaining desktop, hardware, or microkernel-enforcement gap.
 
 ### Microkernel enforcement comparison
 

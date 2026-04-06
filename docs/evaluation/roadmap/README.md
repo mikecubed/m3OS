@@ -11,6 +11,12 @@ The core judgment behind this roadmap is simple:
 **early work should narrow the kernel, fix the security floor, complete the
 service model, and only then broaden the hardware and desktop story.**
 
+Completed Phases 44-46 already change the starting point for this overlay: Rust
+`std`, ports, and a real service/logging/admin baseline are now part of the
+shipped base. Those areas are no longer hypothetical earlier-phase work; they
+are current capabilities that still need hardening, integration, and clear
+release boundaries.
+
 ## What this directory is and is not
 
 | Question | Official roadmap | Evaluation roadmap |
@@ -53,9 +59,9 @@ desktop scope in early and distort the earlier phases.
 | Security | Real mechanisms, but P0 trust failures remain | Trust floor repaired; SSH and account model are credible | Stronger isolation, sandboxing, richer auth |
 | Architecture | Strong microkernel primitives, broad ring-0 reality | IPC/service model is real enough to enforce the direction | Deeper serverization of storage, networking, and POSIX policy |
 | Hardware | QEMU/VirtIO-heavy | Narrow real-hardware story on a reference matrix | Broader device classes and hardware coverage |
-| Operations | Good smoke path, incomplete service lifecycle model | Managed services, logs, shutdown/reboot, release gates | More mature observability and packaging |
+| Operations | Phase 46 service lifecycle/logging baseline exists, but hardening and release confidence are incomplete | Managed services, logs, shutdown/reboot, release gates | More mature observability and packaging |
 | GUI | Framebuffer text console only | Optional minimal compositor/terminal/launcher if 1.0 aims beyond headless | Broader desktop session, audio, richer apps |
-| Toolchains | Rust std path in progress; ports exist | Rust std is normal, ports are reliable | Bigger runtimes, package feeds, broader ecosystem |
+| Toolchains | Rust std and ports are in the current base, but maturity and predictability still vary | Rust std is normal, ports are reliable | Bigger runtimes, package feeds, broader ecosystem |
 
 ## Phase dependency map
 
@@ -149,6 +155,13 @@ Examples:
 - [Phases 50–53](../../roadmap/50-cross-compiled-toolchains.md) are mostly
   **post-1.0 growth**, not early release blockers
 
+Because phases 1-46 are already complete, missing behavior in those areas should
+usually be read as a quality gap in the shipped base or as explicit later-phase
+scope, not as unscheduled pre-46 work hiding between roadmap lines.
+
 That distinction matters because a good release plan is **not** just a list of
 future features. It is an argument about ordering, risk, and what the project is
 trying to prove.
+
+As of `v0.46.0`, R04 is materially underway in the current base, and R06 already
+starts from completed Phases 43c-46 rather than blank space.

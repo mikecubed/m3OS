@@ -23,6 +23,10 @@ This phase exists to prove that the project can route IRQ-driven events through
 the kernel, deliver them to ring-3 services, and recover from failures without
 rebooting the whole OS.
 
+Because Phase 46 now provides a real supervisor/logging baseline, these
+extractions can build on an existing service model instead of inventing
+lifecycle management from scratch.
+
 ```mermaid
 flowchart LR
     IRQ["IRQ / hardware event"] --> K["Kernel notifier"]

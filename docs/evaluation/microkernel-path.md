@@ -20,6 +20,8 @@ That gap is not cosmetic. It is the difference between:
 - "the kernel could eventually host userspace services"
 - and "the kernel is already small because it has no choice"
 
+Phase 46 narrows one operational gap: m3OS now has a real userspace service manager, logging daemon, restart behavior, and admin surface for ordinary daemons. That improves the system story, but it does **not** yet convert the kernel-resident console/input/storage/network services into restartable ring-3 servers.
+
 ```mermaid
 flowchart LR
     subgraph Current["Current shape"]
@@ -81,7 +83,7 @@ These are the concrete ways the current repo still falls short of a properly enf
 | Filesystem, networking, TTY, PTY, procfs, and related policy still live in ring 0 | `kernel/src/fs/`, `kernel/src/net/`, `kernel/src/tty.rs`, `kernel/src/pty.rs`, `kernel/src/signal.rs` | The kernel TCB is much larger than the documented architecture suggests |
 | POSIX/Linux ABI policy is concentrated in the kernel | `kernel/src/arch/x86_64/syscall.rs` is still the giant compatibility/policy surface | This makes the kernel the place where policy keeps accumulating |
 | Future userspace service crates are still commented out | `Cargo.toml` lists `userspace/console_server`, `userspace/vfs_server`, `userspace/fat_server`, and `userspace/kbd_server` as future work | The workspace structure itself reflects that the serverized design is still aspirational |
-| Service lifecycle and restartability are incomplete | `docs/07-core-servers.md` describes a static registry without deregistration or restart policy; `docs/roadmap/46-system-services.md` is still planned | A real microkernel needs restartable userspace services, not one-shot kernel tasks |
+| Core-service lifecycle and restartability are still incomplete | Phase 46 provides supervision for ordinary userspace daemons, but the kernel-resident services that matter most for the microkernel claim are not yet extracted into that model | A real microkernel needs restartable userspace services, not one-shot kernel tasks |
 | The native IPC model is not yet the dominant application-facing path | most real userland behavior currently routes through Linux-style syscalls instead of service IPC | The more POSIX policy stays in the kernel, the harder it becomes to fully enforce userspace services later |
 
 ## The hardest design question: POSIX compatibility in a microkernel
@@ -143,7 +145,7 @@ This is the real prerequisite for the rest.
 - replace kernel-pointer payload conventions with grant/mapping or validated copy paths
 - fix service-registry syscalls so they are ring-3-safe
 - define a stable message/buffer contract for strings, file blocks, framebuffer spans, and packet buffers
-- introduce supervisor-friendly service registration, death handling, and restart semantics
+- connect service registration, death handling, and restart semantics to the existing Phase 46 supervisor so extracted services can actually be managed
 
 **Why this stage matters**
 
