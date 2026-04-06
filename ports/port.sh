@@ -230,12 +230,19 @@ cmd_install() {
     # Use $DB_DIR with PID for unique, root-owned temp files
     find $PREFIX -type f > "$DB_DIR/port_before.$$" 2>/dev/null
 
+    # Helper to clean up temp snapshot files on failure
+    _install_cleanup() {
+        rm -f "$DB_DIR/port_before.$$" "$DB_DIR/port_after.$$" \
+              "$DB_DIR/port_before.$$.sorted" "$DB_DIR/port_after.$$.sorted"
+    }
+
     # Run the build lifecycle
     echo "==> Fetching source..."
     cd "$_portdir"
     make fetch
     if [ $? -ne 0 ]; then
         echo "Error: fetch failed for $NAME"
+        _install_cleanup
         exit 1
     fi
 
@@ -243,6 +250,7 @@ cmd_install() {
     make patch
     if [ $? -ne 0 ]; then
         echo "Error: patch failed for $NAME"
+        _install_cleanup
         exit 1
     fi
 
@@ -250,6 +258,7 @@ cmd_install() {
     make build
     if [ $? -ne 0 ]; then
         echo "Error: build failed for $NAME"
+        _install_cleanup
         exit 1
     fi
 
@@ -257,6 +266,7 @@ cmd_install() {
     make install PREFIX=$PREFIX
     if [ $? -ne 0 ]; then
         echo "Error: install failed for $NAME"
+        _install_cleanup
         exit 1
     fi
 

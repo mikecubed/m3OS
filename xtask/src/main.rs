@@ -4233,6 +4233,13 @@ fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path
         ));
     }
 
+    // Set permissions: parent dirs 0755, owned by root.
+    for d in &parent_dirs {
+        cmds.push_str(&format!("sif {d} mode 0x41ED\n"));
+        cmds.push_str(&format!("sif {d} uid 0\n"));
+        cmds.push_str(&format!("sif {d} gid 0\n"));
+    }
+
     // Set permissions: infrastructure dirs 0755.
     for d in &infra_dirs {
         cmds.push_str(&format!("sif {d} mode 0x41ED\n"));
