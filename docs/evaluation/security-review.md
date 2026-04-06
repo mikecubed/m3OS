@@ -68,6 +68,19 @@ That does not make the architecture wrong. It means the **implementation maturit
 
 Because m3OS already has remote access, multi-user state, meaningful filesystems, and a real userspace, the consequences of security shortcuts are no longer hypothetical. A project can still be early and serious at the same time; in m3OS's case, seriousness means the current shortcuts now deserve first-class attention.
 
+## Why the microkernel gap is also a security gap
+
+The current microkernel deficiencies are not just architectural purity issues. They materially affect security.
+
+| Microkernel deficiency | Security consequence |
+|---|---|
+| Filesystem, networking, and terminal policy remain in ring 0 | Bugs in those paths remain kernel bugs, not isolated-service bugs |
+| Core service tasks still run in the kernel address space | Crash containment and restartability are weaker than the docs imply |
+| Some IPC/data paths still assume shared kernel addresses | Transitional shortcuts become boundary bugs once more code moves to ring 3 |
+| The syscall compatibility surface remains huge and centralized | The kernel attack surface stays broader than a properly narrowed microkernel would require |
+
+This is why "move more services out of ring 0" is not merely an architectural cleanup item. It is also part of the long-term hardening path. The staged architecture answer is in [microkernel-path.md](./microkernel-path.md).
+
 ## Recommended hardening sequence
 
 ```mermaid
@@ -77,6 +90,7 @@ flowchart TD
     C --> D["P1 SSH hardening<br/>rate limiting + privilege separation"]
     D --> E["P1 account/filesystem hardening<br/>atomic shadow updates, sticky-bit semantics"]
     E --> F["P2 TCB reduction<br/>move more services out of ring 0"]
+    F --> G["P3 proper server isolation<br/>enforced microkernel boundary"]
 ```
 
 ## Practical policy recommendation

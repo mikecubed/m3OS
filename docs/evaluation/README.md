@@ -17,6 +17,7 @@ The biggest blockers are:
 
 - security-critical trust failures around identity and entropy
 - a broad ring-0 trusted computing base despite the documented microkernel ideal
+- an unfinished path from "microkernel design" to "properly enforced userspace-service architecture"
 - missing service-management/logging polish for a "server-ish" usable state
 - no real GUI stack beyond a framebuffer text console
 - QEMU-first driver coverage and limited packaging/runtime maturity
@@ -33,6 +34,7 @@ flowchart LR
 | Document | Focus |
 |---|---|
 | [current-state.md](./current-state.md) | Architecture reality check, subsystem maturity, and validation snapshot |
+| [microkernel-path.md](./microkernel-path.md) | Detailed deficiencies in the current microkernel implementation and a staged path toward a properly enforced userspace-service architecture |
 | [security-review.md](./security-review.md) | Security posture, immediate blockers, and hardening backlog |
 | [usability-roadmap.md](./usability-roadmap.md) | What it takes to become usable headless, then usable desktop |
 | [gui-strategy.md](./gui-strategy.md) | Options and recommended path toward a Redox-like GUI stack |
@@ -44,6 +46,20 @@ flowchart LR
 2. **As a secure multi-user system, it is not ready.** The current `setuid`/`setgid` behavior, entropy story, telnet default, and baked-in credentials are enough to block that claim.
 3. **As a headless development or demo environment, it is close.** The live smoke path is strong, but service supervision, logging, packaging polish, and targeted regression reliability still need work.
 4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, raw input, mouse, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack.
+5. **As a documented microkernel design, the architecture is ahead of the implementation.** The project already has the right foundational primitives — ring-3 processes, per-process address spaces, capability-based IPC, notifications, and a strong roadmap story — but core services still live in ring 0 and several IPC/data paths still assume a shared kernel address space.
+
+## The microkernel question
+
+The most important architectural question in this evaluation pack is not whether m3OS has strong microkernel ideas — it clearly does. The real question is whether the project wants to **fully enforce** those ideas in the implementation.
+
+That distinction matters because "microkernel-inspired" and "properly enforced microkernel" are not the same thing:
+
+| State | What it means in practice |
+|---|---|
+| **Microkernel-inspired** | the project uses capabilities, IPC, notifications, and ring-3 processes, but still keeps major policy and services in the kernel |
+| **Properly enforced microkernel** | the kernel is narrow by construction, while filesystems, drivers, network stacks, and higher-level system services run outside ring 0 |
+
+[microkernel-path.md](./microkernel-path.md) is the detailed answer to that question. It names the current deficiencies, explains why they matter, and lays out a realistic migration path that does not require a destructive rewrite.
 
 ## Why this is already beyond "toy OS" territory
 

@@ -33,7 +33,7 @@ quadrantChart
 
 | Project | Primary target | Architecture | GUI story | Where it leads | What m3OS can learn |
 |---|---|---|---|---|---|
-| **m3OS** | Educational QEMU-first general OS | Microkernel-inspired, currently broad ring-0 implementation | No GUI yet; framebuffer text console and roadmap items only | Documentation, pedagogical structure, diagnostics, fast comprehension | Stay honest about niche and finish the missing product layers |
+| **m3OS** | Serious QEMU-first general OS / reference system | Microkernel-inspired, currently broad ring-0 implementation | No GUI yet; framebuffer text console and roadmap items only | Documentation, pedagogical structure, diagnostics, fast comprehension | Finish the missing product layers and decide how far to enforce the microkernel boundary |
 | **Redox** | General-purpose Rust OS | True userspace-service-oriented microkernel ecosystem | Orbital desktop, GUI app ecosystem, broader desktop story | Desktop, package ecosystem, real hardware progress, windowing | A GUI needs a display server/compositor, not just raw framebuffer access |
 | **Tock** | Embedded/IoT MCU OS | MPU-based embedded OS with capsules/apps | None | Isolation model for resource-constrained systems | Strong threat-model discipline and component boundaries |
 | **Hubris** | Production embedded firmware | Static-task embedded OS | None | Operational rigor, narrowly scoped trusted computing base | Scope discipline and explicit security posture |
@@ -70,6 +70,20 @@ Official references:
 If someone asks "Is m3OS closer to Redox or to blog_os?", the honest answer is:
 
 **architecturally and functionally it is much closer to Redox than to tutorial kernels, but operationally it is still much earlier than Redox.**
+
+### Microkernel enforcement comparison
+
+One of the most useful ways to compare the Rust OS projects is not "who uses the word microkernel?" but "who actually enforces the boundary in the shipped system?"
+
+| Project | Boundary story |
+|---|---|
+| **m3OS** | Strong microkernel design language and real IPC primitives, but many core services and large amounts of policy still remain in ring 0 |
+| **Redox** | Much closer to an actually enforced userspace-service system, especially around the desktop and service ecosystem |
+| **Tock** | Embedded rather than desktop-oriented, but very disciplined about boundary design inside its target domain |
+| **Hubris** | Not a desktop OS, but highly disciplined about scope, trust boundaries, and operational constraints |
+| **Theseus** | Pursues a different structural answer altogether rather than classic microkernel enforcement |
+
+This is why Redox remains the most important comparison point for m3OS specifically. The long-form answer for m3OS is in [microkernel-path.md](./microkernel-path.md).
 
 ## Why m3OS is already beyond the "toy OS" label
 

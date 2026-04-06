@@ -64,6 +64,20 @@ The single-file syscall layer is already a maintenance boundary problem. It is n
 
 Before adding graphics, audio, or more runtime/toolchain surface, splitting this area into subsystem-specific syscall modules would reduce risk.
 
+### 4. The microkernel deficiencies are concrete, not abstract
+
+The microkernel gap is visible in specific repo seams, not just in high-level rhetoric.
+
+| Deficiency | Concrete evidence | Architectural effect |
+|---|---|---|
+| Core services still live in the kernel | `kernel/src/main.rs` spawns `console_server_task`, `kbd_server_task`, `fat_server_task`, and `vfs_server_task` | The system keeps service logic inside the trusted kernel address space |
+| Service IPC still depends on shared-address-space shortcuts | `kernel/src/ipc/mod.rs` documents kernel-task IPC assumptions for service registration; `kernel/src/main.rs` passes kernel pointers in console IPC | A true ring-3 server conversion cannot be finished until these assumptions are removed |
+| Bulk data path is unfinished | `docs/06-ipc.md` still defers page-capability grants and bulk transfers | Filesystems, graphics, and networking still lack a clean microkernel-grade data path |
+| Filesystem and network policy remain ring-0 code | `kernel/src/fs/`, `kernel/src/net/`, `kernel/src/tty.rs`, `kernel/src/pty.rs` | The kernel blast radius remains much larger than the docs imply |
+| Future server crates are still not active workspace members | `Cargo.toml` comments out `userspace/console_server`, `userspace/vfs_server`, `userspace/fat_server`, and `userspace/kbd_server` | The intended service topology is still only partially realized |
+
+This is the main reason the current system reads as "microkernel-aimed" rather than "properly enforced microkernel." The detailed migration plan is in [microkernel-path.md](./microkernel-path.md).
+
 ## Subsystem maturity snapshot
 
 | Subsystem | Current state | Evidence |
@@ -130,6 +144,7 @@ Also noted during that run: the ports fetch path emitted a `zlib` source-downloa
 ## What matters most next
 
 1. **Close the security blockers** in [security-review.md](./security-review.md).
-2. **Finish the "system operations" layer** in [usability-roadmap.md](./usability-roadmap.md): services, logging, shutdown/reboot, packaging polish.
-3. **Pick a graphics direction before adding more graphics APIs** in [gui-strategy.md](./gui-strategy.md).
-4. **Keep m3OS honest about its niche** in [rust-os-comparison.md](./rust-os-comparison.md): it should lean into being a serious reference OS with unusually strong pedagogy rather than pretending to be a near-term Redox replacement.
+2. **Decide how serious the project is about enforcing the microkernel boundary** in [microkernel-path.md](./microkernel-path.md), because that choice affects storage, networking, GUI, and long-term security all at once.
+3. **Finish the "system operations" layer** in [usability-roadmap.md](./usability-roadmap.md): services, logging, shutdown/reboot, packaging polish.
+4. **Pick a graphics direction before adding more graphics APIs** in [gui-strategy.md](./gui-strategy.md).
+5. **Keep m3OS honest about its niche** in [rust-os-comparison.md](./rust-os-comparison.md): it should lean into being a serious reference OS with unusually strong pedagogy rather than pretending to be a near-term Redox replacement.

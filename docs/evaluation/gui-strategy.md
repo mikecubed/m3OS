@@ -26,6 +26,19 @@ A GUI effort here is not "just add windows." A serious desktop path touches mult
 | App conventions | clipboard, file chooser, settings, notifications, window controls |
 | Packaging/runtime | enough ecosystem to ship graphical apps without heroic per-app effort |
 
+## Why GUI work is also microkernel work
+
+The display stack is not just a user-facing feature area. For m3OS, it is also the most natural place to **start enforcing the microkernel boundary more seriously**.
+
+Why:
+
+1. a display server is naturally a userspace service
+2. focus, composition, and window policy obviously do not belong in ring 0
+3. the graphics path forces the project to solve real shared-buffer and input-routing problems instead of relying on kernel-pointer shortcuts
+4. the same infrastructure needed for a real display server is useful for other serverized subsystems
+
+That means GUI work is not separate from microkernel work. It is one of the cleanest paths into it. The broader migration context is in [microkernel-path.md](./microkernel-path.md).
+
 ## Starting point
 
 ```mermaid
@@ -94,7 +107,8 @@ This matches m3OS better than a Wayland-first approach because:
 1. Unix domain sockets already exist (`docs/roadmap/39-unix-domain-sockets.md`).
 2. `mmap`, `munmap`, and related VM machinery already exist (`docs/33-kernel-memory.md`, `docs/36-expanded-memory.md`).
 3. The project already documents a microkernel philosophy where high-level services belong outside the kernel.
-4. A Redox-like path is philosophically closer to a small custom display server than to pulling in a large Linux graphics stack early.
+4. The display server is one of the easiest places to turn that philosophy into an enforced boundary.
+5. A Redox-like path is philosophically closer to a small custom display server than to pulling in a large Linux graphics stack early.
 
 ## Practical staged plan
 
@@ -128,6 +142,7 @@ Suggested scope:
 - clients submit buffers or damage rectangles
 - the server composites and presents
 - basic focus, stacking order, and pointer routing live in userspace
+- the shared-buffer path should be designed in a way that can later serve storage and networking too, rather than becoming a graphics-only special case
 
 ### Phase D: desktop usability layer
 

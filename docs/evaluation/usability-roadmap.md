@@ -33,6 +33,18 @@ flowchart TD
     S3 --> TOOL["Toolchains and larger runtimes"]
 ```
 
+## Cross-cutting architectural track: microkernel convergence
+
+The usability stages are not the whole story. If the project wants to become a **properly enforced microkernel** rather than a microkernel-inspired OS with a broad kernel, there is a second long-running track underneath them.
+
+| Horizon | Microkernel work | Why it intersects usability |
+|---|---|---|
+| Near-term | make IPC/data paths ring-3-safe, decompose syscall policy, stop adding new high-level kernel policy | otherwise every new subsystem deepens the current ring-0 bias |
+| Mid-term | move console/input/display and then storage services outward | these migrations are the first real tests of enforced service isolation |
+| Long-term | move networking and more POSIX policy outward, narrow the kernel permanently | this is what turns the architecture docs from aspiration into reality |
+
+The detailed version of that path is in [microkernel-path.md](./microkernel-path.md). The important usability point is that this is **not** a separate academic concern: it affects security, restartability, and how future GUI and driver work should be shaped.
+
 ## Stage 0: what m3OS already is
 
 ### Reasonable current claim
@@ -71,6 +83,7 @@ Evidence for that claim:
 | Operations | services, logs, reboot/shutdown | This is the difference between a shell session and a real system |
 | Packaging/tooling | reproducible ports and Rust std path | This is the difference between a demo image and an extensible environment |
 | Networking | outbound-friendly client networking | Headless systems need to fetch, resolve, and communicate outward reliably |
+| Architecture | ring-3-safe IPC and service boundaries | If proper microkernel design remains a real goal, this work cannot stay deferred forever |
 
 ### Readiness criteria
 
@@ -102,6 +115,7 @@ Call Stage 1 achieved only when all of these are true:
 | Input | keyboard and mouse as routable events | Needed for multiple windows and apps |
 | Session | graphical login/startup/focus/launch | A desktop needs lifecycle, not just pixels |
 | Applications | at least a terminal plus one native GUI app | Otherwise the GUI remains only a technology demo |
+| Architecture | display server as real userspace service | The GUI path is also the cleanest opportunity to enforce a microkernel boundary |
 
 ### Readiness criteria
 
@@ -136,6 +150,7 @@ That phase likely forces design choices that can be postponed today:
 | Runtime/distribution | dynamic-linking or equally disciplined alternative | Large static-only runtimes do not scale gracefully |
 | Hardware | less QEMU dependence | Broader adoption and credibility |
 | Ecosystem | git, package install, richer languages | This is where m3OS starts behaving like a platform |
+| Architecture | serverized storage/networking and narrower kernel claim | This is where the project either becomes a proper microkernel or settles into a broad-kernel design |
 
 ## Recommended priority order
 
