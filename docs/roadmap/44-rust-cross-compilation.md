@@ -63,19 +63,37 @@ makes syscalls that our kernel handles.
 ### Path 2: Custom Rust target (no_std)
 
 For programs that want to use our native syscall ABI directly (not the Linux compat
-layer), create a custom target specification:
+layer), create a custom target specification.
+
+The custom target spec lives at `x86_64-m3os.json` in the project root. It produces
+functionally identical code to `x86_64-unknown-none` — the only semantic difference
+is `"os": "m3os"`, which enables `#[cfg(target_os = "m3os")]` for conditional
+compilation. Existing `no_std` crates do **not** need to migrate; both targets work.
 
 ```json
 {
-    "llvm-target": "x86_64-unknown-none",
-    "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128",
+    "llvm-target": "x86_64-unknown-none-elf",
+    "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
     "arch": "x86_64",
     "os": "m3os",
-    "env": "musl",
+    "target-endian": "little",
+    "target-pointer-width": "64",
+    "target-c-int-width": "32",
+    "linker-flavor": "gnu-lld",
     "linker": "rust-lld",
     "panic-strategy": "abort",
     "disable-redzone": true,
-    "features": "-mmx,-sse"
+    "features": "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float",
+    "executables": true,
+    "has-thread-local": false,
+    "position-independent-executables": false,
+    "static-position-independent-executables": false,
+    "relocation-model": "static",
+    "code-model": "kernel",
+    "max-atomic-width": 64,
+    "plt-by-default": false,
+    "stack-probes": { "kind": "inline" },
+    "pre-link-args": { "gnu-lld": ["--gc-sections"] }
 }
 ```
 
@@ -121,10 +139,24 @@ build compared to the kernel's `x86_64-unknown-none` target.
 
 ### Custom x86_64-m3os.json target specification
 
-A JSON target spec that produces the same code as `x86_64-unknown-none` but sets
-`"os": "m3os"`. This enables `#[cfg(target_os = "m3os")]` for conditional
-compilation in shared crates. Programs compiled for this target use `#![no_std]`
-and call m3OS syscalls directly via the `syscall-lib` crate.
+The file `x86_64-m3os.json` at the project root defines a custom Rust compilation
+target for m3OS. It is derived from the built-in `x86_64-unknown-none` target
+(verified via `rustc --print target-spec-json -Z unstable-options --target x86_64-unknown-none`)
+with one key change: `"os": "m3os"`.
+
+- Produces the exact same machine code as `x86_64-unknown-none` — same LLVM target
+  (`x86_64-unknown-none-elf`), same data layout, same code model (`kernel`), same
+  feature flags (`-mmx,-sse,+soft-float`), same panic strategy (`abort`).
+- The primary value is `#[cfg(target_os = "m3os")]` for conditional compilation.
+  This lets shared crates include m3os-specific code paths without affecting builds
+  for other targets.
+- Preserves all critical kernel conventions: `disable-redzone: true` (required for
+  interrupt safety), SIMD disabled (avoids FPU state in context switches),
+  `panic-strategy: abort` (no unwinding in kernel).
+- Existing `no_std` crates do **not** need to migrate — any crate that compiles for
+  `x86_64-unknown-none` also compiles for `x86_64-m3os.json` without changes.
+- Programs compiled for this target use `#![no_std]` and call m3OS syscalls directly
+  via the `syscall-lib` crate.
 
 ### xtask build integration (build_musl_rust_bins)
 
