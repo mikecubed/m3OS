@@ -27,9 +27,9 @@
  * m3OS custom syscall numbers
  * ------------------------------------------------------------------------- */
 
-#define SYS_FRAMEBUFFER_INFO  0x1002
-#define SYS_FRAMEBUFFER_MMAP  0x1003
-#define SYS_READ_SCANCODE     0x1004
+#define SYS_FRAMEBUFFER_INFO  0x1005
+#define SYS_FRAMEBUFFER_MMAP  0x1006
+#define SYS_READ_SCANCODE     0x1007
 
 /* -------------------------------------------------------------------------
  * Framebuffer info struct -- must match the kernel FbInfo layout exactly
