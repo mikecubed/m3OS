@@ -229,8 +229,8 @@ m3OS's TTY subsystem.
 **Symbol:** `todo-rust`
 **Why it matters:** A persistent todo list validates file I/O round-tripping: reading
 a data file, modifying it in memory, and writing it back. This exercises `std::fs`
-write paths (create, truncate, write) that go through VFS → FAT32 to persistent
-disk storage (Phase 24).
+write paths (create, truncate, write) through the VFS layer to the disk-backed
+mount at `/data` (FAT32 via Phase 24), so todos survive reboots.
 
 **Acceptance:**
 - [ ] `todo add "Buy milk"` appends to a todo file

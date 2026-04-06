@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::process;
 
-const TODO_FILE: &str = "/tmp/todos.txt";
+const TODO_FILE: &str = "/data/todos.txt";
 
 fn load_todos() -> Vec<String> {
     match fs::read_to_string(TODO_FILE) {

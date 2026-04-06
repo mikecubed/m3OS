@@ -388,11 +388,27 @@ fn build_musl_rust_bins() {
     for name in crates {
         let dst = initrd.join(name);
         if !dst.exists() {
-            let _ = File::create(&dst);
+            if let Err(e) = File::create(&dst) {
+                eprintln!("warning: failed to create placeholder kernel/initrd/{name}: {e}");
+            }
         }
     }
 
-    let mut musl_target_checked = false;
+    // Check musl target availability once before the build loop so a single
+    // crate-specific error doesn't skip the rest.
+    let musl_target_available = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("x86_64-unknown-linux-musl"))
+        .unwrap_or(false);
+
+    if !musl_target_available {
+        eprintln!(
+            "warning: x86_64-unknown-linux-musl target not installed — \
+             skipping all musl Rust builds. Run: rustup target add x86_64-unknown-linux-musl"
+        );
+        return;
+    }
 
     for name in crates {
         let manifest = root.join(format!("userspace/{name}/Cargo.toml"));
@@ -428,18 +444,9 @@ fn build_musl_rust_bins() {
         };
 
         if !status.success() {
-            if !musl_target_checked {
-                eprintln!(
-                    "warning: musl Rust build failed for {name} — the x86_64-unknown-linux-musl \
-                     target may not be installed. Run: rustup target add x86_64-unknown-linux-musl"
-                );
-                eprintln!("warning: skipping all remaining musl Rust builds");
-                return;
-            }
             eprintln!("warning: musl Rust build failed for {name} — skipping");
             continue;
         }
-        musl_target_checked = true;
 
         let built = root.join(format!(
             "userspace/{name}/target/x86_64-unknown-linux-musl/release/{name}"
