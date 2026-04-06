@@ -18,7 +18,12 @@ fn main(args: &[&str]) -> i32 {
     // Check for -h (halt, default), -r (reboot — use the reboot command instead).
     let halt = !(args.len() > 1 && args[1] == "-r");
 
-    write_str(STDOUT_FILENO, "System is going down for halt...\n");
+    let message = if halt {
+        "System is going down for halt...\n"
+    } else {
+        "System is going down for reboot...\n"
+    };
+    write_str(STDOUT_FILENO, message);
 
     // Signal init to begin orderly shutdown.
     syscall_lib::kill(1, syscall_lib::SIGTERM);

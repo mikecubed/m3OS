@@ -74,8 +74,8 @@ A minimal cron daemon:
 - Standard cron format: `minute hour day month weekday command`
 - Execute commands at scheduled times.
 - Special strings: `@reboot`, `@hourly`, `@daily`
-- `crontab -e` to edit the current user's crontab (uses `$EDITOR`).
-- `crontab -l` to list scheduled jobs.
+- `crontab -l` to list scheduled jobs and `crontab -r` to remove them.
+- Interactive `crontab -e` editing is deferred.
 
 ### System Administration Commands
 
@@ -122,8 +122,8 @@ a reverse topological sort, shutdown iteratively finds a running service whose
 dependents are all already stopped, stops it, and repeats. This is O(n^2) but
 correct and avoids maintaining a separate sorted list.
 
-The `service` command communicates with init (via signals or a control socket) to
-request start/stop/restart operations and query status.
+The `service` command communicates with init through `/var/run/init.cmd`, which
+PID 1 polls in its main loop to process start/stop/restart requests.
 
 ### syslogd
 

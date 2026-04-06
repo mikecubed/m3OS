@@ -2511,17 +2511,21 @@ fn sys_reboot(cmd: u64) -> u64 {
 }
 
 /// Sync filesystems and quiesce I/O before halt/restart.
+///
+/// Note: this performs a best-effort flush of the ext2 volume by acquiring
+/// the volume lock (which prevents concurrent writes) and then dropping it.
+/// There is no cross-core barrier stopping other CPUs from issuing new I/O
+/// after the lock is released — a full SMP quiesce would require an IPI
+/// halt sequence, which is not yet implemented.
 fn kernel_shutdown() {
     log::info!("kernel_shutdown: syncing filesystems...");
     // Flush ext2 volume if mounted.
     if crate::fs::ext2::is_mounted() {
-        // The ext2 write-back happens through the block cache; dropping the
-        // volume lock after a final metadata flush is the best we can do.
         let _vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        // Holding the lock ensures no concurrent writes; the block driver
-        // will flush on drop if applicable.
+        // Holding the lock ensures no concurrent writes while we hold it;
+        // the block driver will flush on drop if applicable.
     }
-    log::info!("kernel_shutdown: sync complete, halting.");
+    log::info!("kernel_shutdown: filesystem sync complete.");
 }
 
 // ---------------------------------------------------------------------------

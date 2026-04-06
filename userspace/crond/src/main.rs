@@ -23,20 +23,22 @@ const MAX_ENTRIES: usize = 32;
 const MAX_LINE_LEN: usize = 512;
 const MAX_CMD_LEN: usize = 256;
 const MAX_FILE_SIZE: usize = 4096;
+const MAX_USERNAME_LEN: usize = 32;
 const SIGHUP: usize = 1;
 
 const O_RDONLY: u64 = 0;
+const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 
 // ---------------------------------------------------------------------------
-// Global reload flag (set by SIGHUP handler)
+// Global reload flag (set by SIGHUP handler, read/cleared by main loop)
 // ---------------------------------------------------------------------------
 
-static mut RELOAD_FLAG: bool = false;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static RELOAD_FLAG: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sighup_handler(_sig: i32) {
-    unsafe {
-        RELOAD_FLAG = true;
-    }
+    RELOAD_FLAG.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +340,46 @@ fn parse_crontab(
     count
 }
 
+fn load_user_crontabs_from_passwd(
+    passwd: &[u8],
+    entries: &mut [CronEntry; MAX_ENTRIES],
+    mut count: usize,
+    file_buf: &mut [u8; MAX_FILE_SIZE],
+) -> usize {
+    const PREFIX: &[u8] = b"/var/spool/cron/";
+
+    for line in passwd.split(|&b| b == b'\n') {
+        if line.is_empty() || count >= MAX_ENTRIES {
+            break;
+        }
+
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let username = &line[..colon];
+        if username.is_empty() || username.len() > MAX_USERNAME_LEN {
+            continue;
+        }
+
+        let total = PREFIX.len() + username.len() + 1;
+        let mut path = [0u8; 128];
+        if total > path.len() {
+            continue;
+        }
+
+        path[..PREFIX.len()].copy_from_slice(PREFIX);
+        path[PREFIX.len()..PREFIX.len() + username.len()].copy_from_slice(username);
+        path[total - 1] = 0;
+
+        let n = read_file(&path[..total], file_buf);
+        if n > 0 {
+            count = parse_crontab(file_buf, n, entries, count);
+        }
+    }
+
+    count
+}
+
 /// Load all crontab files (system + per-user).
 fn load_all_crontabs(
     entries: &mut [CronEntry; MAX_ENTRIES],
@@ -351,18 +393,10 @@ fn load_all_crontabs(
         count = parse_crontab(file_buf, n, entries, count);
     }
 
-    // Per-user crontabs: try root and common usernames.
-    // Without readdir, we probe a fixed set of names.
-    const USER_CRONTABS: &[&[u8]] = &[
-        b"/var/spool/cron/root\0",
-        b"/var/spool/cron/admin\0",
-        b"/var/spool/cron/user\0",
-    ];
-    for path in USER_CRONTABS {
-        let n = read_file(path, file_buf);
-        if n > 0 {
-            count = parse_crontab(file_buf, n, entries, count);
-        }
+    let mut passwd_buf = [0u8; 2048];
+    let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
+    if passwd_len > 0 {
+        count = load_user_crontabs_from_passwd(&passwd_buf[..passwd_len], entries, count, file_buf);
     }
 
     count
@@ -552,11 +586,7 @@ fn main(_args: &[&str]) -> i32 {
     // Main loop: check every 60 seconds
     loop {
         // Check for SIGHUP reload
-        let should_reload = unsafe { RELOAD_FLAG };
-        if should_reload {
-            unsafe {
-                RELOAD_FLAG = false;
-            }
+        if RELOAD_FLAG.swap(false, Ordering::AcqRel) {
             entries = [CronEntry::empty(); MAX_ENTRIES];
             count = load_all_crontabs(&mut entries, &mut file_buf);
             syslog_msg(log_fd, b"reloaded crontab files");

@@ -22,14 +22,21 @@ fn main(_args: &[&str]) -> i32 {
         let n = syscall_lib::read(fd as i32, &mut buf);
         syscall_lib::close(fd as i32);
         if n > 0 {
-            let text = unsafe { core::str::from_utf8_unchecked(&buf[..n as usize]) };
-            for line in text.split('\n') {
-                if !line.is_empty() {
-                    write_str(STDOUT_FILENO, line);
-                    write_str(STDOUT_FILENO, "\n");
+            match core::str::from_utf8(&buf[..n as usize]) {
+                Ok(text) => {
+                    for line in text.split('\n') {
+                        if !line.is_empty() {
+                            write_str(STDOUT_FILENO, line);
+                            write_str(STDOUT_FILENO, "\n");
+                        }
+                    }
+                    return 0;
+                }
+                Err(_) => {
+                    write_str(syscall_lib::STDERR_FILENO, "last: invalid UTF-8 in wtmp\n");
+                    return 1;
                 }
             }
-            return 0;
         }
     }
 

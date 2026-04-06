@@ -110,8 +110,10 @@ crond reads crontab files at startup and enters a sleep loop:
 - Special strings: `@reboot` (run once at daemon start), `@hourly` (`0 * * * *`),
   `@daily` (`0 0 * * *`)
 
-crond handles SIGHUP to reload crontab files without restart, allowing the
-`crontab` command to edit files and signal the daemon to pick up changes.
+crond handles SIGHUP to reload crontab files without restart, allowing crontab
+changes to be picked up without bouncing the daemon. The current `crontab`
+utility supports listing and removing per-user files; interactive editing is
+still deferred.
 
 ### Kernel Shutdown Path
 

@@ -60,7 +60,13 @@ fn cmd_list() -> i32 {
     );
     // Status file format: one line per service: name status pid restart_count
     let data = &buf[..n as usize];
-    let text = unsafe { core::str::from_utf8_unchecked(data) };
+    let text = match core::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => {
+            write_str(STDERR_FILENO, "service: invalid UTF-8 in status file\n");
+            return 1;
+        }
+    };
     for line in text.split('\n') {
         if line.is_empty() {
             continue;
@@ -79,7 +85,13 @@ fn cmd_status(name: &str) -> i32 {
         return 1;
     }
     let data = &buf[..n as usize];
-    let text = unsafe { core::str::from_utf8_unchecked(data) };
+    let text = match core::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => {
+            write_str(STDERR_FILENO, "service: invalid UTF-8 in status file\n");
+            return 1;
+        }
+    };
     for line in text.split('\n') {
         if let Some(rest) = line.strip_prefix(name)
             && (rest.starts_with(' ') || rest.starts_with('\t'))
@@ -117,8 +129,8 @@ fn send_command(cmd: &str, name: &str) -> i32 {
         write_str(STDERR_FILENO, "service: failed to send command to init\n");
         return 1;
     }
-    // Signal init (PID 1) with SIGUSR1 to process the command.
-    syscall_lib::kill(1, syscall_lib::SIGUSR1);
+    // Init polls /var/run/init.cmd in its main loop, so writing the command
+    // file is enough to queue the request safely.
     write_str(STDOUT_FILENO, "service: ");
     write_str(STDOUT_FILENO, cmd);
     write_str(STDOUT_FILENO, " ");

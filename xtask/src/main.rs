@@ -3854,14 +3854,24 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          sif etc/group gid 0\n\
          write \"{sshd_conf}\" etc/services.d/sshd.conf\n\
          sif etc/services.d/sshd.conf mode 0x81A4\n\
+         sif etc/services.d/sshd.conf uid 0\n\
+         sif etc/services.d/sshd.conf gid 0\n\
          write \"{telnetd_conf}\" etc/services.d/telnetd.conf\n\
          sif etc/services.d/telnetd.conf mode 0x81A4\n\
+         sif etc/services.d/telnetd.conf uid 0\n\
+         sif etc/services.d/telnetd.conf gid 0\n\
          write \"{syslogd_conf}\" etc/services.d/syslogd.conf\n\
          sif etc/services.d/syslogd.conf mode 0x81A4\n\
+         sif etc/services.d/syslogd.conf uid 0\n\
+         sif etc/services.d/syslogd.conf gid 0\n\
          write \"{crond_conf}\" etc/services.d/crond.conf\n\
          sif etc/services.d/crond.conf mode 0x81A4\n\
+         sif etc/services.d/crond.conf uid 0\n\
+         sif etc/services.d/crond.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
+         sif etc/hostname uid 0\n\
+         sif etc/hostname gid 0\n\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),

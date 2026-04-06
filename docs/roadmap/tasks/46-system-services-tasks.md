@@ -403,15 +403,16 @@ command signal crond to re-read its files without a restart.
 **File:** `userspace/coreutils-rs/src/crontab.rs`
 **Symbol:** `main` (crontab command)
 **Why it matters:** `crontab` is the user interface for managing scheduled jobs.
-`-l` lists the current user's crontab, `-e` opens it in `$EDITOR` for editing,
-and `-r` removes it. After editing, it signals crond (SIGHUP) to reload.
+The current minimal implementation focuses on inspecting and removing per-user
+crontabs: `-l` lists the current user's crontab and `-r` removes it. Interactive
+editing via `$EDITOR` is deferred.
 
 **Acceptance:**
 - [ ] `crontab -l` prints the current user's crontab from `/var/spool/cron/<user>`
-- [ ] `crontab -e` opens the crontab in `$EDITOR` (defaults to `edit`)
-- [ ] After editing, sends SIGHUP to crond to trigger reload
 - [ ] `crontab -r` removes the current user's crontab
+- [ ] After removal, sends SIGHUP to crond to trigger reload
 - [ ] Root can manage other users' crontabs: `crontab -u <user> -l`
+- [ ] Documentation notes that interactive `crontab -e` editing remains deferred
 
 ---
 
