@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.45.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities, Rust cross-compilation support for musl-linked std programs (hello-rust, sysinfo-rust, httpd-rust, calc-rust, todo-rust) with a custom x86_64-m3os target spec, and a BSD-style ports system for building and installing third-party software from source (Lua, zlib, bc, sbase, mandoc, minizip) with dependency resolution and package tracking.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.46.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities, Rust cross-compilation support for musl-linked std programs (hello-rust, sysinfo-rust, httpd-rust, calc-rust, todo-rust) with a custom x86_64-m3os target spec, a BSD-style ports system for building and installing third-party software from source (Lua, zlib, bc, sbase, mandoc, minizip) with dependency resolution and package tracking, and a data-driven service manager (enhanced init) with dependency-ordered boot, automatic restart with max_restart cap, system logging (syslogd via /dev/log Unix socket), cron scheduling (crond with standard crontab format), orderly shutdown/reboot via sys_reboot syscall, and administration commands (service, logger, shutdown, reboot, hostname, who, w, last, crontab).
 
 ## Build & Run
 
@@ -104,8 +104,10 @@ userspace/
   crypto-test/            # Crypto integration test (Phase 42)
   telnetd/                # Telnet server daemon (Phase 30)
   sshd/                   # SSH server daemon (Phase 43)
+  syslogd/                # System logging daemon (Phase 46)
+  crond/                  # Cron scheduler daemon (Phase 46)
   coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
-  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey
+  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey, service, logger, shutdown, reboot, hostname, who, w, last, crontab
   demo-project/           # Multi-file C demo project for make testing (Phase 32)
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
@@ -295,6 +297,7 @@ Read before making significant changes:
 | `docs/43c-regression-stress-ci.md` | Before touching xtask regression/stress commands, CI workflows, or proptest/loom tests |
 | `docs/roadmap/44-rust-cross-compilation.md` | Before touching musl Rust cross-compilation, xtask musl Rust builds, or custom target specs |
 | `docs/roadmap/45-ports-system.md` | Before touching ports tree, port command, Portfile format, or xtask ports integration |
+| `docs/roadmap/46-system-services.md` | Before touching init service manager, syslogd, crond, service command, or sys_reboot |
 | `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 

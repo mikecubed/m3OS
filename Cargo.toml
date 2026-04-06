@@ -40,6 +40,10 @@ members = [
     "userspace/coreutils-rs",
     # coreutils host tests
     "userspace/coreutils-tests",
+    # Phase 46 syslogd
+    "userspace/syslogd",
+    # Phase 46 crond
+    "userspace/crond",
     # Future userspace servers:
     # "userspace/console_server",
     # "userspace/vfs_server",

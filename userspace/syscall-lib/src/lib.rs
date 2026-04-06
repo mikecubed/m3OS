@@ -470,10 +470,15 @@ pub const SEEK_END: usize = 2;
 // Signal numbers
 // ===========================================================================
 
+pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
+pub const SIGKILL: i32 = 9;
+pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;
 pub const SIGTSTP: i32 = 20;
+pub const SIGUSR1: i32 = 10;
+pub const SIGUSR2: i32 = 12;
 pub const SIGWINCH: i32 = 28;
 
 // ===========================================================================
@@ -971,6 +976,24 @@ pub fn nanosleep(seconds: u64) -> isize {
     //   bytes 8..16: tv_nsec (i64)
     let ts: [i64; 2] = [seconds as i64, 0];
     unsafe { syscall2(SYS_NANOSLEEP, ts.as_ptr() as u64, 0) as isize }
+}
+
+// ===========================================================================
+// High-level wrappers — Reboot (Phase 46)
+// ===========================================================================
+
+pub const SYS_REBOOT: u64 = 169;
+
+/// Reboot command: halt / power-off the system.
+pub const REBOOT_CMD_HALT: u64 = 0xCDEF0123;
+/// Reboot command: restart the system.
+pub const REBOOT_CMD_RESTART: u64 = 0x01234567;
+/// Reboot command: power off the system.
+pub const REBOOT_CMD_POWER_OFF: u64 = 0x4321FEDC;
+
+/// Request system reboot or halt. Only UID 0 may call this.
+pub fn reboot(cmd: u64) -> isize {
+    unsafe { syscall1(SYS_REBOOT, cmd) as isize }
 }
 
 // ===========================================================================

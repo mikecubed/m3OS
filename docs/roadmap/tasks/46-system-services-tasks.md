@@ -1,6 +1,6 @@
 # Phase 46 — System Services: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-46
 **Depends on:** Phase 19 (Signals) ✅, Phase 24 (Persistent Storage) ✅, Phase 27 (User Accounts) ✅, Phase 29 (PTY) ✅, Phase 30 (Telnet) ✅, Phase 34 (Real-Time Clock) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 43 (SSH) ✅
 **Goal:** A unified service manager (enhanced init), system logging daemon, cron
@@ -12,14 +12,14 @@ scheduled tasks, and clean shutdown.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Service definition format and init parsing | — | Planned |
-| B | Service lifecycle, PID table, and state machine | A | Planned |
-| C | `service` command | A, B | Planned |
-| D | System logging (`syslogd` + `logger`) | — | Planned |
-| E | Scheduled tasks (`crond` + `crontab`) | — | Planned |
-| F | Kernel shutdown/reboot support | — | Planned |
-| G | System administration commands | D, F | Planned |
-| H | Integration testing and documentation | A–G | Planned |
+| A | Service definition format and init parsing | — | ✅ Done |
+| B | Service lifecycle, PID table, and state machine | A | ✅ Done |
+| C | `service` command | A, B | ✅ Done |
+| D | System logging (`syslogd` + `logger`) | — | ✅ Done |
+| E | Scheduled tasks (`crond` + `crontab`) | — | ✅ Done |
+| F | Kernel shutdown/reboot support | — | ✅ Done |
+| G | System administration commands | D, F | ✅ Done |
+| H | Integration testing and documentation | A–G | ✅ Done |
 
 ---
 

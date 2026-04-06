@@ -230,3 +230,40 @@ path = "src/sha256sum.rs"
 [[bin]]
 name = "genkey"
 path = "src/genkey.rs"
+
+# Phase 46: system services commands
+[[bin]]
+name = "service"
+path = "src/service.rs"
+
+[[bin]]
+name = "logger"
+path = "src/logger.rs"
+
+[[bin]]
+name = "shutdown"
+path = "src/shutdown.rs"
+
+[[bin]]
+name = "reboot"
+path = "src/reboot_cmd.rs"
+
+[[bin]]
+name = "hostname"
+path = "src/hostname.rs"
+
+[[bin]]
+name = "who"
+path = "src/who.rs"
+
+[[bin]]
+name = "w"
+path = "src/w.rs"
+
+[[bin]]
+name = "last"
+path = "src/last.rs"
+
+[[bin]]
+name = "crontab"
+path = "src/crontab.rs"
