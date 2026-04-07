@@ -2,15 +2,21 @@
 
 ## Security verdict
 
-**m3OS should not yet be treated as a safe multi-user or internet-facing OS.**
+**m3OS has addressed its critical trust-floor issues but should still be treated
+as a development and evaluation environment, not a production-hardened system.**
 
-It has real security mechanisms: Rust-heavy implementation, capability-based IPC, permission checks, `/etc/shadow`, Secure Boot signing support, and SSH with modern primitives. But several issues currently dominate the threat model more than those strengths help:
+Phase 48 closed the most severe security gaps:
 
-- unconditional `setuid` / `setgid`
-- TSC-seeded pseudo-random output behind `getrandom()`
-- telnet enabled by default at boot
-- baked-in default credentials
+- ~~unconditional `setuid` / `setgid`~~ → kernel-enforced privilege checks
+- ~~TSC-seeded pseudo-random output~~ → RDRAND-backed entropy with TSC mixing
+- ~~telnet enabled by default~~ → telnet is opt-in (`--enable-telnet`)
+- ~~baked-in default credentials~~ → locked accounts with first-boot setup
+- ~~single-iteration SHA-256~~ → 10,000-round iterated hashing with random salts
+
+Remaining concerns:
 - a broader ring-0 trusted computing base than the documented microkernel ideal
+- no privilege separation for network daemons (sshd runs as root)
+- no sandboxing or namespace isolation
 
 ```mermaid
 flowchart LR
@@ -36,15 +42,15 @@ flowchart LR
 | Strong user-memory validation and guarded ELF loading | Reduces a large class of user-pointer and mapping mistakes | `kernel/src/mm/user_mem.rs`, `docs/11-elf-loader-and-process-model.md` |
 | Managed service/logging baseline | Phase 46 adds PID 1 supervision plus `syslogd` and admin tooling in the current base | Operational visibility and controlled shutdown are no longer purely aspirational | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs` |
 
-## P0: blockers to fix before claiming a safer multi-user system
+## P0: resolved by Phase 48
 
-| Issue | Why it is severe | Evidence | Recommended fix |
-|---|---|---|---|
-| `setuid` / `setgid` are unconditional | Any process can become root; the user/account model collapses | `kernel/src/arch/x86_64/syscall.rs` | Enforce kernel-side credential rules immediately and remove userspace-trust assumptions |
-| `getrandom()` is TSC-seeded pseudo-random output | Weakens SSH host keys, user keys, salts, and any future TLS/session secrets | `kernel/src/arch/x86_64/syscall.rs`, `docs/roadmap/42-crypto-primitives.md`, `userspace/crypto-lib/src/random.rs` | Add a real entropy pipeline before treating crypto as trustworthy |
-| `telnetd` starts by default | Plaintext remote access is exposed at boot next to SSH | `userspace/init/src/main.rs`, `docs/30-telnet-server.md` | Make telnet opt-in only, or remove it from the default boot path |
-| Default credentials are baked into the image | `root/root` and `user/user` are unacceptable once remote access exists | `docs/27-user-accounts.md`, `xtask/src/main.rs` | Force first-boot password setup or image-time secret injection |
-| Password hashing is plain SHA-256 with deterministic salts | Weak against offline cracking and does not reflect modern password storage practice | `docs/27-user-accounts.md`, `userspace/syscall-lib/src/sha256.rs` | Move to Argon2id, scrypt, bcrypt, or at least PBKDF2 with random salts |
+| Issue | Resolution | Phase 48 Track |
+|---|---|---|
+| `setuid`/`setgid` were unconditional | Kernel-enforced POSIX privilege checks in `kernel-core::cred` | Track B |
+| `getrandom()` was TSC-seeded | RDRAND-backed seeding with TSC mixing, reseeding every 256 bytes | Track C |
+| `telnetd` started by default | Removed from default image; opt-in via `--enable-telnet` | Track F |
+| Default credentials baked into image | Locked-account markers with first-boot password setup | Track E |
+| Password hashing was plain SHA-256 | 10,000-round iterated SHA-256 with random salts | Track D |
 
 ## P1: important hardening work after P0
 
@@ -96,10 +102,14 @@ flowchart TD
 
 ## Practical policy recommendation
 
-Until the P0 items are fixed:
+With Phase 48's P0 fixes in place:
 
-- treat m3OS as a **controlled development and evaluation environment**
-- do **not** present it as a safely network-exposed general-purpose system
-- prefer smoke-tested local/QEMU use over unattended deployment
+- m3OS can reasonably claim a **safer headless development system**
+- the identity model is no longer advisory — credential transitions are kernel-enforced
+- entropy quality is materially improved for SSH keys and password salts
+- default boot no longer exposes plaintext remote access
 
-Phase 46 means the service/logging/admin baseline now exists, so once the P0 items are fixed m3OS can reasonably claim a **safer headless system**. Desktop-grade security is a later conversation and depends on the GUI/input/session architecture as much as on the kernel.
+Remaining cautions:
+- do **not** treat m3OS as production-hardened — the ring-0 TCB is still broad
+- privilege separation for network daemons is not yet implemented
+- prefer controlled QEMU use over unattended network deployment

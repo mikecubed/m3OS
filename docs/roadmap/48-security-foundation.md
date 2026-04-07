@@ -1,6 +1,6 @@
 # Phase 48 - Security Foundation
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-48
 **Depends on:** Phase 27 (User Accounts) ✅, Phase 30 (Telnet Server) ✅, Phase 42 (Crypto Primitives) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅
 **Builds on:** Turns the already-shipped login, SSH, crypto, and service-management baseline into a system that can make a credible headless security claim instead of relying on trusted-demo assumptions
@@ -115,7 +115,7 @@ The combination of init defaults, account provisioning, and remote-access config
 
 ## Companion Task List
 
-- Phase 48 task list — defer until implementation planning begins.
+- [Phase 48 task list](./tasks/48-security-foundation-tasks.md)
 
 ## How Real OS Implementations Differ
 

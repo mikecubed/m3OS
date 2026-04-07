@@ -221,6 +221,12 @@ flowchart TD
 |---|---|---|---|---|
 | 47 | DOOM | Complete | `phase-47` | [Tasks](./47-doom-tasks.md) |
 
+### Convergence and Release-Critical Phases
+
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 48 | Security Foundation | Complete | `phase-48` | [Tasks](./48-security-foundation-tasks.md) |
+
 ### Future Task Docs
 Task docs for Phases **48 and later** are intentionally deferred until closer to implementation time.
 
