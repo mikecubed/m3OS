@@ -1,8 +1,8 @@
-# Phase 54 - Hardware Substrate
+# Phase 55 - Hardware Substrate
 
 **Status:** Planned
-**Source Ref:** phase-54
-**Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 16 (Network) ✅, Phase 24 (Persistent Storage) ✅, Phase 53 (Deep Serverization) ✅
+**Source Ref:** phase-55
+**Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 16 (Network) ✅, Phase 24 (Persistent Storage) ✅, Phase 54 (Deep Serverization) ✅
 **Builds on:** Extends the QEMU/VirtIO-first system into a narrow, testable real-hardware story without abandoning the userspace-service direction established by the earlier convergence phases
 **Primary Components:** kernel/src/pci, kernel/src/blk, kernel/src/net, docs/evaluation/hardware-driver-strategy.md, docs/evaluation/redox-driver-porting.md, xtask/src/main.rs
 
@@ -54,7 +54,7 @@ Choose a small set of named machines or configurations and document how the phas
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Service-boundary readiness | Phase 53 has already narrowed the kernel enough that new drivers do not immediately widen the TCB again | Pull missing boundary or ownership cleanup into this phase |
+| Service-boundary readiness | Phase 54 has already narrowed the kernel enough that new drivers do not immediately widen the TCB again | Pull missing boundary or ownership cleanup into this phase |
 | Donor-source readiness | Specs, Redox references, and any BSD/Linux behavioral references are identified for the chosen drivers | Add the missing source-analysis work before implementation starts |
 | Validation environment | The reference machines, QEMU configs, or lab setup are documented and reproducible | Add the missing bring-up tooling or notes to this phase |
 | Release posture | The project has an agreed narrow hardware promise for the milestone | Add the missing support-matrix work instead of leaving hardware claims vague |
@@ -76,7 +76,7 @@ A hardware phase is only finished if the project can reproduce the bring-up and 
 ## How This Builds on Earlier Phases
 
 - Builds on the original hardware-discovery, storage, and networking phases by moving from virtual-first success to a bounded real-hardware story.
-- Depends on Phase 53 so hardware support is layered on top of a narrower architecture instead of widening the kernel again by convenience.
+- Depends on Phase 54 so hardware support is layered on top of a narrower architecture instead of widening the kernel again by convenience.
 - Creates the substrate later reused by graphics, input, and audio work.
 
 ## Implementation Outline
@@ -90,7 +90,7 @@ A hardware phase is only finished if the project can reproduce the bring-up and 
 
 ## Learning Documentation Requirement
 
-- Create `docs/54-hardware-substrate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/55-hardware-substrate.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the hardware-access layer, donor strategy, reference matrix, and how the chosen drivers fit into the system architecture.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -99,7 +99,7 @@ A hardware phase is only finished if the project can reproduce the bring-up and 
 - Update `docs/15-hardware-discovery.md`, `docs/16-network.md`, `docs/24-persistent-storage.md`, and `docs/README.md`.
 - Update `docs/evaluation/hardware-driver-strategy.md`, `docs/evaluation/redox-driver-porting.md`, and `docs/evaluation/roadmap/R08-hardware-substrate.md`.
 - Update `README.md`, `docs/roadmap/README.md`, and any setup or validation docs that describe supported hardware.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.54.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.55.0`.
 
 ## Acceptance Criteria
 
@@ -111,7 +111,7 @@ A hardware phase is only finished if the project can reproduce the bring-up and 
 
 ## Companion Task List
 
-- Phase 54 task list — defer until implementation planning begins.
+- Phase 55 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

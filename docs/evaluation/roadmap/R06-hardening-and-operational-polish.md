@@ -10,7 +10,7 @@
 [Phase 44](../../roadmap/44-rust-cross-compilation.md),
 [Phase 45](../../roadmap/45-ports-system.md),
 [Phase 46](../../roadmap/46-system-services.md),
-[Phase 52](../../roadmap/52-headless-hardening.md),
+[Phase 53](../../roadmap/53-headless-hardening.md),
 [Phase 58](../../roadmap/58-release-1-0-gate.md)
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Security Review](../security-review.md),

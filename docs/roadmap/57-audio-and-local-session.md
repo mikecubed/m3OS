@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-57
-**Depends on:** Phase 54 (Hardware Substrate) ✅, Phase 55 (Graphics Bring-Up) ✅, Phase 56 (Display and Input Architecture) ✅
+**Depends on:** Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅, Phase 56 (Display and Input Architecture) ✅
 **Builds on:** Extends the first graphical architecture into a minimally complete local-system story by adding audio output and a coherent graphical session flow
 **Primary Components:** kernel or userspace audio driver path, future audio device API, display/session services, userspace terminal or launcher, docs/29-pty-subsystem.md
 
@@ -54,7 +54,7 @@ The local session needs a clear stop, restart, and fallback path just like the h
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
 | Display/session baseline | Phase 56's display and input architecture is already stable and documented | Pull missing session or compositor work into this phase |
-| Hardware baseline | Phase 54 identifies and validates the supported audio target or fallback environment | Add the missing hardware-driver or validation work here |
+| Hardware baseline | Phase 55 identifies and validates the supported audio target or fallback environment | Add the missing hardware-driver or validation work here |
 | Recovery baseline | The service/session model can recover from local-session failure | Add missing fallback or restart behavior before closing |
 | Scope discipline | The phase defines the minimum useful local-system story and what remains later | Add the missing non-goals and support-boundary documentation |
 
@@ -74,7 +74,8 @@ The first useful local client is the difference between a graphical stack and a 
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 54's hardware strategy for the first supported audio target.
+- Builds on Phase 55's hardware strategy for the first supported audio target.
+- Uses the Phase 47 graphics proof as the earlier validation that full-screen graphical workloads already run on the system.
 - Extends Phase 56's display/input model into a minimally complete local-session experience.
 - Prepares the optional local-system branch that the release gate can either include or defer explicitly.
 

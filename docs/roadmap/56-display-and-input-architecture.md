@@ -2,8 +2,8 @@
 
 **Status:** Planned
 **Source Ref:** phase-56
-**Depends on:** Phase 46 (System Services) ✅, Phase 51 (First Service Extractions) ✅, Phase 54 (Hardware Substrate) ✅, Phase 55 (Graphics Bring-Up) ✅
-**Builds on:** Turns the single-app graphics proof into a real userspace-owned display/input architecture with explicit ownership, event routing, and crash boundaries
+**Depends on:** Phase 46 (System Services) ✅, Phase 52 (First Service Extractions) ✅, Phase 47 (DOOM) ✅, Phase 55 (Hardware Substrate) ✅
+**Builds on:** Turns the single-app DOOM graphics proof into a real userspace-owned display/input architecture with explicit ownership, event routing, and crash boundaries
 **Primary Components:** future userspace display server, input services, kernel/src/fb, kernel input/interrupt mediation, docs/09-framebuffer-and-shell.md, docs/29-pty-subsystem.md
 
 ## Milestone Goal
@@ -12,7 +12,7 @@ m3OS gains a real display and input model: one userspace-owned display service c
 
 ## Why This Phase Exists
 
-A desktop is not "framebuffer plus mouse." It is a policy system for ownership, composition, input routing, focus, and recovery. The graphics bring-up phase proves that pixels can be drawn; it does not solve how multiple applications share the display or how the system recovers from UI-service failures.
+A desktop is not "framebuffer plus mouse." It is a policy system for ownership, composition, input routing, focus, and recovery. The DOOM milestone proves that pixels can be drawn by a real graphical userspace program; it does not solve how multiple applications share the display or how the system recovers from UI-service failures.
 
 This phase exists to design and implement the first genuine graphical architecture for m3OS.
 
@@ -54,10 +54,10 @@ The graphical stack must fit the existing service model. This includes startup, 
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Graphics bring-up baseline | Phase 55 proves userspace graphics and console handoff already work | Add missing graphics-substrate work here |
-| Service-model baseline | Phase 46 and Phase 51 provide a reliable supervision and restart pattern for the UI services | Add missing service integration or restart semantics |
+| Graphics bring-up baseline | Phase 47 proves userspace graphics and console handoff already work | Add missing graphics-substrate work here |
+| Service-model baseline | Phase 46 and Phase 52 provide a reliable supervision and restart pattern for the UI services | Add missing service integration or restart semantics |
 | Hardware/input baseline | The chosen mouse or input path exists on the supported targets or is explicitly pulled into this phase | Add the missing input-driver work rather than leaving it as an implicit dependency |
-| Buffer transport baseline | The Phase 49 transport model is strong enough for surface or buffer exchange | Add the missing buffer/grant work needed by the display server |
+| Buffer transport baseline | The Phase 50 transport model is strong enough for surface or buffer exchange | Add the missing buffer/grant work needed by the display server |
 
 ## Important Components and How They Work
 
@@ -75,9 +75,9 @@ The client protocol defines the long-term shape of the GUI stack more than any s
 
 ## How This Builds on Earlier Phases
 
-- Builds on the graphical proof from Phase 55 by turning one-app graphics into a multi-client architecture.
-- Reuses the service and restart model from Phases 46 and 51 so the UI stack remains supervised and recoverable.
-- Depends on the hardware and transport groundwork from Phases 49 and 54 to avoid graphics-only special cases.
+- Builds on the graphical proof from Phase 47 by turning one-app graphics into a multi-client architecture.
+- Reuses the service and restart model from Phases 46 and 52 so the UI stack remains supervised and recoverable.
+- Depends on the hardware and transport groundwork from Phases 50 and 55 to avoid graphics-only special cases.
 
 ## Implementation Outline
 

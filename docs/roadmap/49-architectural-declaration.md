@@ -1,8 +1,8 @@
-# Phase 48 - Architectural Declaration
+# Phase 49 - Architectural Declaration
 
 **Status:** Planned
-**Source Ref:** phase-48
-**Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 11 (Process Model) ✅, Phase 12 (POSIX Compat) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 47 (Security Foundation) ✅
+**Source Ref:** phase-49
+**Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 11 (Process Model) ✅, Phase 12 (POSIX Compat) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 48 (Security Foundation) ✅
 **Builds on:** Converts the project's documented microkernel intent into an implementation contract that constrains future work instead of remaining only a design aspiration
 **Primary Components:** docs/appendix/architecture-and-syscalls.md, docs/roadmap/README.md, kernel/src/arch/x86_64/syscall.rs, kernel/src/main.rs, kernel/src/fs, kernel/src/net
 
@@ -77,7 +77,7 @@ The current kernel-resident "servers" and policy-heavy modules are the migration
 - Builds on Phase 6 by treating IPC as a real architectural primitive rather than an isolated subsystem.
 - Reinterprets the original Core Server and VFS phases through the lens of actual ownership boundaries.
 - Builds on the process and POSIX-compat layers from Phases 11 and 12 by classifying which compatibility behavior should stay thin and which should move outward later.
-- Depends on the repaired security floor from Phase 47 so later architecture claims are not undermined by basic trust failures.
+- Depends on the repaired security floor from Phase 48 so later architecture claims are not undermined by basic trust failures.
 
 ## Implementation Outline
 
@@ -91,7 +91,7 @@ The current kernel-resident "servers" and policy-heavy modules are the migration
 
 ## Learning Documentation Requirement
 
-- Create `docs/48-architectural-declaration.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/49-architectural-declaration.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the current-versus-target architecture split, the mechanism/policy distinction, the syscall refactor plan, and why this phase matters before deeper serverization.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -100,7 +100,7 @@ The current kernel-resident "servers" and policy-heavy modules are the migration
 - Update `docs/appendix/architecture-and-syscalls.md`, `docs/README.md`, and `docs/roadmap/README.md` so they reflect the new ownership contract.
 - Update `docs/evaluation/current-state.md`, `docs/evaluation/microkernel-path.md`, and `docs/evaluation/roadmap/R02-architectural-declaration.md` to point at the official implementation phase.
 - Update any contributor or review guidance that discusses what belongs in the kernel.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.48.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.49.0`.
 
 ## Acceptance Criteria
 
@@ -112,7 +112,7 @@ The current kernel-resident "servers" and policy-heavy modules are the migration
 
 ## Companion Task List
 
-- Phase 48 task list — defer until implementation planning begins.
+- Phase 49 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

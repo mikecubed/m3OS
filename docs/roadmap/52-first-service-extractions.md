@@ -1,8 +1,8 @@
-# Phase 51 - First Service Extractions
+# Phase 52 - First Service Extractions
 
 **Status:** Planned
-**Source Ref:** phase-51
-**Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 49 (IPC Completion) ✅, Phase 50 (Service Model Maturity) ✅
+**Source Ref:** phase-52
+**Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅
 **Builds on:** Uses the finished IPC path and matured service model to move the first genuinely important kernel-resident services into restartable ring-3 processes
 **Primary Components:** userspace/console_server, userspace/kbd_server, userspace/init, kernel/src/main.rs, kernel/src/ipc, docs/07-core-servers.md, docs/09-framebuffer-and-shell.md
 
@@ -53,8 +53,8 @@ Record the latency, complexity, and debugging cost of the new boundary. This pha
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| IPC transport readiness | Phase 49 capability and bulk-data paths are strong enough for extracted console/input traffic | Pull the missing transport cleanup into this phase |
-| Service-model readiness | Phase 50 supervision, restart, and status behavior can host extracted services | Add the missing lifecycle work before extracting anything important |
+| IPC transport readiness | Phase 50 capability and bulk-data paths are strong enough for extracted console/input traffic | Pull the missing transport cleanup into this phase |
+| Service-model readiness | Phase 51 supervision, restart, and status behavior can host extracted services | Add the missing lifecycle work before extracting anything important |
 | Device mediation boundary | The kernel side of keyboard/framebuffer mediation is narrow enough to hand events or buffers outward cleanly | Add the missing mediation or notification work |
 | Service crate readiness | Userspace service crates, build wiring, and init integration are ready for real use | Add the missing workspace/initrd/service-registration work to the phase |
 
@@ -70,13 +70,13 @@ Keyboard and related input events should arrive in a form that allows userspace 
 
 ### Supervisor integration and restart path
 
-The extracted services must be declared, supervised, and observable through the same Phase 50 service model the rest of the system uses.
+The extracted services must be declared, supervised, and observable through the same Phase 51 service model the rest of the system uses.
 
 ## How This Builds on Earlier Phases
 
 - Builds directly on the early core-server and framebuffer model from Phases 7 and 9.
-- Depends on Phase 49 to remove the transport shortcuts that made earlier "service" code kernel-only in practice.
-- Depends on Phase 50 to give extracted services a credible lifecycle and admin surface.
+- Depends on Phase 50 to remove the transport shortcuts that made earlier "service" code kernel-only in practice.
+- Depends on Phase 51 to give extracted services a credible lifecycle and admin surface.
 - Prepares the architectural pattern later reused by storage, networking, and the display stack.
 
 ## Implementation Outline
@@ -91,7 +91,7 @@ The extracted services must be declared, supervised, and observable through the 
 
 ## Learning Documentation Requirement
 
-- Create `docs/51-first-service-extractions.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/52-first-service-extractions.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain what stayed in the kernel, what moved to userspace, how restartability works, and what the first extraction taught the project about later serverization.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -100,19 +100,19 @@ The extracted services must be declared, supervised, and observable through the 
 - Update `docs/07-core-servers.md`, `docs/09-framebuffer-and-shell.md`, `docs/README.md`, and `docs/roadmap/README.md`.
 - Update `docs/evaluation/microkernel-path.md`, `docs/evaluation/roadmap/R05-first-service-extractions.md`, and any diagrams that still show the extracted services as kernel tasks.
 - Update init/build wiring docs if new userspace service crates become active workspace members.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.51.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.52.0`.
 
 ## Acceptance Criteria
 
 - At least one previously kernel-resident core service runs as a real supervised ring-3 process.
-- The extracted service uses the Phase 49 IPC path without shared-address-space shortcuts.
+- The extracted service uses the Phase 50 IPC path without shared-address-space shortcuts.
 - Restarting or crashing the extracted service does not require a full machine reboot to recover basic functionality.
 - The service graph, build system, and docs all describe the extracted service as part of the normal system model.
 - Boundary measurements and trade-offs are written down for later phases.
 
 ## Companion Task List
 
-- Phase 51 task list — defer until implementation planning begins.
+- Phase 52 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

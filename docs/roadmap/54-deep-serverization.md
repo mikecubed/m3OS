@@ -1,8 +1,8 @@
-# Phase 53 - Deep Serverization
+# Phase 54 - Deep Serverization
 
 **Status:** Planned
-**Source Ref:** phase-53
-**Depends on:** Phase 16 (Network) ✅, Phase 18 (Directory and VFS) ✅, Phase 23 (Socket API) ✅, Phase 24 (Persistent Storage) ✅, Phase 28 (ext2 Filesystem) ✅, Phase 38 (Filesystem Enhancements) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 49 (IPC Completion) ✅, Phase 51 (First Service Extractions) ✅, Phase 52 (Headless Hardening) ✅
+**Source Ref:** phase-54
+**Depends on:** Phase 16 (Network) ✅, Phase 18 (Directory and VFS) ✅, Phase 23 (Socket API) ✅, Phase 24 (Persistent Storage) ✅, Phase 28 (ext2 Filesystem) ✅, Phase 38 (Filesystem Enhancements) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 50 (IPC Completion) ✅, Phase 52 (First Service Extractions) ✅, Phase 53 (Headless Hardening) ✅
 **Builds on:** Extends the first extracted-service pattern from console/input into the policy-heavy subsystems that most strongly determine whether m3OS is really becoming a microkernel-style OS
 **Primary Components:** kernel/src/fs, kernel/src/net, kernel/src/arch/x86_64/syscall.rs, userspace/vfs_server, userspace/fat_server, docs/08-storage-and-vfs.md, docs/16-network.md
 
@@ -53,9 +53,9 @@ Keep existing applications working while the real work moves behind service call
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Transport readiness | Phase 49 bulk-data and capability-grant semantics work for storage and network payloads | Add the missing transport pieces before extraction |
-| Extraction pattern readiness | Phase 51 provides a proven ring-3 service pattern and restart model | Add the missing supervisor or reconnect behavior |
-| Headless baseline | Phase 52 support boundaries and validation gates are stable enough to absorb subsystem movement | Add the missing release-discipline work instead of assuming it |
+| Transport readiness | Phase 50 bulk-data and capability-grant semantics work for storage and network payloads | Add the missing transport pieces before extraction |
+| Extraction pattern readiness | Phase 52 provides a proven ring-3 service pattern and restart model | Add the missing supervisor or reconnect behavior |
+| Headless baseline | Phase 53 support boundaries and validation gates are stable enough to absorb subsystem movement | Add the missing release-discipline work instead of assuming it |
 | Facade design | The kernel/object model for open files, sockets, and handles is explicit enough to thin safely | Add the missing handle-facade work to this phase |
 
 ## Important Components and How They Work
@@ -74,9 +74,9 @@ Existing applications will still enter through a Linux-like syscall ABI. The key
 
 ## How This Builds on Earlier Phases
 
-- Uses the transport model completed in Phase 49 for the first large subsystem migrations.
-- Extends the service-extraction pattern validated in Phase 51 into more complex domains.
-- Builds on Phase 52 so the project can explain these migrations inside a stable headless/reference-system story.
+- Uses the transport model completed in Phase 50 for the first large subsystem migrations.
+- Extends the service-extraction pattern validated in Phase 52 into more complex domains.
+- Builds on Phase 53 so the project can explain these migrations inside a stable headless/reference-system story.
 - Prepares the ground for real hardware work and any later graphical stack by reducing the kernel blast radius.
 
 ## Implementation Outline
@@ -90,7 +90,7 @@ Existing applications will still enter through a Linux-like syscall ABI. The key
 
 ## Learning Documentation Requirement
 
-- Create `docs/53-deep-serverization.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/54-deep-serverization.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the storage, namespace, and network boundary decisions; the thin kernel facade; and the specific call/data paths that changed.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -99,7 +99,7 @@ Existing applications will still enter through a Linux-like syscall ABI. The key
 - Update `docs/08-storage-and-vfs.md`, `docs/16-network.md`, `docs/18-directory-vfs.md`, `docs/23-socket-api.md`, `docs/28-ext2-filesystem.md`, and `docs/38-filesystem-enhancements.md`.
 - Update `docs/evaluation/microkernel-path.md`, `docs/evaluation/current-state.md`, and `docs/evaluation/roadmap/R07-deep-serverization.md`.
 - Update `docs/appendix/architecture-and-syscalls.md` and `docs/roadmap/README.md` so the architecture docs and official roadmap reflect the real service boundaries.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.53.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.54.0`.
 
 ## Acceptance Criteria
 
@@ -111,7 +111,7 @@ Existing applications will still enter through a Linux-like syscall ABI. The key
 
 ## Companion Task List
 
-- Phase 53 task list — defer until implementation planning begins.
+- Phase 54 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

@@ -150,9 +150,12 @@ Examples:
   part of **R04** and **R06**
 - [Phase 44 — Rust Cross-Compilation](../../roadmap/44-rust-cross-compilation.md)
   is primarily part of **R06**
-- [Phases 47–53](../../roadmap/47-security-foundation.md) are the main
+- [Phase 47 — DOOM](../../roadmap/47-doom.md) is the in-flight graphical proof
+  point that mainly informs **R09** and the optional local-system branch in
+  **R10**
+- [Phases 48–54](../../roadmap/48-security-foundation.md) are the main
   implementation breakdown of **R01** through **R07**
-- [Phases 54–57](../../roadmap/54-hardware-substrate.md) cover the official
+- [Phases 55–57](../../roadmap/55-hardware-substrate.md) cover the official
   hardware and local-system branch for **R08**, **R09**, and the optional GUI
   path discussed in **R10**
 - [Phase 58](../../roadmap/58-release-1-0-gate.md) is the explicit official

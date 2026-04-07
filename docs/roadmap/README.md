@@ -134,27 +134,32 @@ flowchart TD
     P34 --> P46
     P39 --> P46
 
+    %% In-flight graphics proof phase
+    P9 --> P47["Phase 47<br/>DOOM"]
+    P12 --> P47
+    P24 --> P47
+    P46 --> P47
+
     %% Convergence and release-critical phases
-    P46 --> P47["Phase 47<br/>Security Foundation"]
-    P47 --> P48["Phase 48<br/>Architectural Declaration"]
-    P48 --> P49["Phase 49<br/>IPC Completion"]
-    P46 --> P50["Phase 50<br/>Service Model Maturity"]
-    P49 --> P50
-    P50 --> P51["Phase 51<br/>First Service Extractions"]
-    P47 --> P52["Phase 52<br/>Headless Hardening"]
-    P50 --> P52
-    P51 --> P52
-    P51 --> P53["Phase 53<br/>Deep Serverization"]
+    P46 --> P48["Phase 48<br/>Security Foundation"]
+    P48 --> P49["Phase 49<br/>Architectural Declaration"]
+    P49 --> P50["Phase 50<br/>IPC Completion"]
+    P46 --> P51["Phase 51<br/>Service Model Maturity"]
+    P50 --> P51
+    P51 --> P52["Phase 52<br/>First Service Extractions"]
+    P48 --> P53["Phase 53<br/>Headless Hardening"]
+    P51 --> P53
     P52 --> P53
+    P52 --> P54["Phase 54<br/>Deep Serverization"]
+    P53 --> P54
 
     %% Hardware, local-system, and release gate phases
-    P53 --> P54["Phase 54<br/>Hardware Substrate"]
-    P54 --> P55["Phase 55<br/>Graphics Bring-Up"]
-    P55 --> P56["Phase 56<br/>Display and Input Architecture"]
-    P54 --> P56
+    P54 --> P55["Phase 55<br/>Hardware Substrate"]
+    P47 --> P56["Phase 56<br/>Display and Input Architecture"]
+    P55 --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
-    P52 --> P58["Phase 58<br/>Release 1.0 Gate"]
-    P54 --> P58
+    P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
+    P55 --> P58
     P57 -.->|optional local-system branch| P58
 
     %% Post-1.0 platform growth
@@ -246,24 +251,29 @@ flowchart TD
 | 45 | Ports System | Source-based package building and installation | Complete | `phase-45` | [Phase 45](./45-ports-system.md) | [Tasks](./tasks/45-ports-system-tasks.md) |
 | 46 | System Services | Service manager, syslog, cron, shutdown | Complete | `phase-46` | [Phase 46](./46-system-services.md) | [Tasks](./tasks/46-system-services-tasks.md) |
 
+### Graphics Proof Phase (in progress)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 47 | DOOM | A real full-screen graphical program runs and proves the graphics substrate under load | In Progress | `phase-47` | [Phase 47](./47-doom.md) | Deferred until implementation planning |
+
 ### Convergence and Release-Critical Phases (planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 47 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Planned | `phase-47` | [Phase 47](./47-security-foundation.md) | Deferred until implementation planning |
-| 48 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Planned | `phase-48` | [Phase 48](./48-architectural-declaration.md) | Deferred until implementation planning |
-| 49 | IPC Completion | Finish capability grants, bulk data transport, and ring-3-safe service contracts | Planned | `phase-49` | [Phase 49](./49-ipc-completion.md) | Deferred until implementation planning |
-| 50 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | Planned | `phase-50` | [Phase 50](./50-service-model-maturity.md) | Deferred until implementation planning |
-| 51 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-51` | [Phase 51](./51-first-service-extractions.md) | Deferred until implementation planning |
-| 52 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-52` | [Phase 52](./52-headless-hardening.md) | Deferred until implementation planning |
-| 53 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-53` | [Phase 53](./53-deep-serverization.md) | Deferred until implementation planning |
+| 48 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Planned | `phase-48` | [Phase 48](./48-security-foundation.md) | Deferred until implementation planning |
+| 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Planned | `phase-49` | [Phase 49](./49-architectural-declaration.md) | Deferred until implementation planning |
+| 50 | IPC Completion | Finish capability grants, bulk data transport, and ring-3-safe service contracts | Planned | `phase-50` | [Phase 50](./50-ipc-completion.md) | Deferred until implementation planning |
+| 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | Planned | `phase-51` | [Phase 51](./51-service-model-maturity.md) | Deferred until implementation planning |
+| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-52` | [Phase 52](./52-first-service-extractions.md) | Deferred until implementation planning |
+| 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
+| 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
 
 ### Hardware, Local-System, and Release Phases (planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 54 | Hardware Substrate | A narrow, real-hardware support story exists on a reference matrix | Planned | `phase-54` | [Phase 54](./54-hardware-substrate.md) | Deferred until implementation planning |
-| 55 | Graphics Bring-Up | A real full-screen graphical application runs through a durable framebuffer contract | Planned | `phase-55` | [Phase 55](./55-graphics-bring-up.md) | Deferred until implementation planning |
+| 55 | Hardware Substrate | A narrow, real-hardware support story exists on a reference matrix | Planned | `phase-55` | [Phase 55](./55-hardware-substrate.md) | Deferred until implementation planning |
 | 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Planned | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | Deferred until implementation planning |
 | 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Planned | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | Deferred until implementation planning |
 | 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |

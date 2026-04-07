@@ -5,9 +5,9 @@
 [R08 — Hardware Substrate](./R08-hardware-substrate.md),
 [R09 — Display and Input Architecture](./R09-display-and-input-architecture.md)  
 **Official roadmap phases covered:** [Phase 43c](../../roadmap/43c-regression-stress-ci.md),
-[Phase 52](../../roadmap/52-headless-hardening.md),
-[Phase 54](../../roadmap/54-hardware-substrate.md),
-[Phase 55](../../roadmap/55-graphics-bring-up.md),
+[Phase 47](../../roadmap/47-doom.md),
+[Phase 53](../../roadmap/53-headless-hardening.md),
+[Phase 55](../../roadmap/55-hardware-substrate.md),
 [Phase 56](../../roadmap/56-display-and-input-architecture.md),
 [Phase 57](../../roadmap/57-audio-and-local-session.md),
 [Phase 58](../../roadmap/58-release-1-0-gate.md),

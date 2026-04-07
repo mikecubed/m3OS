@@ -30,7 +30,7 @@ flowchart TD
         UNIX["Phase 39: Unix Sockets"]
         THREAD["Phase 40: Threading"]
         SVC["Phase 46: Services"]
-        GFX["Phase 55: Graphics Bring-Up"]
+        DOOM["Phase 47: DOOM"]
         DISP["Phase 56: Display/Input"]
         AUDIO["Phase 57: Audio/Local Session"]
     end
@@ -359,14 +359,17 @@ syscall implementations. No crate provides these.
 use. Write your own -- it's straightforward init/fork/waitpid/setsid code.
 Model after runit (~2000 lines C) for simplicity.
 
-### Phase 55 -- Graphics Bring-Up
+### Phase 47 -- DOOM
 **Why no crate:** Uses doomgeneric (C), which requires implementing 4
 platform functions. The Rust ecosystem has no DOOM port that would be easier.
 The current plan (cross-compile doomgeneric with musl) is the right approach.
 
 ### Phase 56 -- Display and Input Architecture
-**Why no crate:** PS/2 mouse is hardware register programming (IRQ 12,
-3-byte packets). ~100 lines of driver code. No crate needed.
+**Why no crate:** The hard parts are compositor ownership, client protocol
+design, buffer exchange, and input routing. No crate can supply that OS-specific
+architecture. Even the narrow PS/2 mouse slice is just straightforward hardware
+register programming (IRQ 12, 3-byte packets), not something a crate will solve
+for you.
 
 ### Phase 57 -- Audio and Local Session
 **Why no crate:** `cpal` and `rodio` talk to host OS audio APIs (ALSA,
@@ -426,7 +429,7 @@ flowchart TD
 - git (C codebase, but could use Rust transport helper for HTTPS)
 - pdpmake (already done, Phase 32)
 - ion shell (already done, Phase 21)
-- doomgeneric (Phase 55)
+- doomgeneric (Phase 47)
 
 ---
 

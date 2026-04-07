@@ -1,8 +1,8 @@
-# Phase 50 - Service Model Maturity
+# Phase 51 - Service Model Maturity
 
 **Status:** Planned
-**Source Ref:** phase-50
-**Depends on:** Phase 39 (Unix Domain Sockets) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅, Phase 47 (Security Foundation) ✅, Phase 49 (IPC Completion) ✅
+**Source Ref:** phase-51
+**Depends on:** Phase 39 (Unix Domain Sockets) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 50 (IPC Completion) ✅
 **Builds on:** Hardens and extends the Phase 46 service manager, logging, and admin surface so later extracted services can be supervised like real first-class system components
 **Primary Components:** userspace/init, userspace/syslogd, userspace/crond, userspace/coreutils-rs, kernel/src/arch/x86_64/syscall.rs, docs/46-system-services.md
 
@@ -55,8 +55,8 @@ Turn controlled teardown into a reliable contract rather than an optimistic best
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
 | Phase 46 baseline | PID 1 supervision, syslogd, crond, and admin commands are working on current main | Pull baseline bug fixes or missing admin paths into this phase |
-| Security baseline | Phase 47 defaults and privilege rules are in place so the service model is not built on unsafe assumptions | Add missing service-identity or default-hardening work here |
-| IPC/service control path | Phase 49 is strong enough to support extracted services and future control channels | Add the missing control-path cleanup before calling the model mature |
+| Security baseline | Phase 48 defaults and privilege rules are in place so the service model is not built on unsafe assumptions | Add missing service-identity or default-hardening work here |
+| IPC/service control path | Phase 50 is strong enough to support extracted services and future control channels | Add the missing control-path cleanup before calling the model mature |
 | Operator workflow | Boot, inspect, stop, restart, and shut down services through one coherent path | Add missing status or log-surface work to close the gap |
 
 ## Important Components and How They Work
@@ -77,8 +77,8 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 
 - Extends Phase 46 by treating its current service/logging/admin baseline as real infrastructure rather than a one-off milestone.
 - Builds on Phase 39 by reusing Unix-domain communication where local control paths benefit from it.
-- Depends on Phase 47 so service defaults and identities are not built on a broken security floor.
-- Depends on Phase 49 so the matured service model can later host genuine ring-3 system services.
+- Depends on Phase 48 so service defaults and identities are not built on a broken security floor.
+- Depends on Phase 50 so the matured service model can later host genuine ring-3 system services.
 
 ## Implementation Outline
 
@@ -92,7 +92,7 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 
 ## Learning Documentation Requirement
 
-- Create `docs/50-service-model-maturity.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/51-service-model-maturity.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the service-definition contract, the state machine, restart behavior, logging model, and how this phase differs from the simpler Phase 46 baseline.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -101,7 +101,7 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 - Update `docs/46-system-services.md`, `docs/README.md`, `docs/roadmap/README.md`, and any service-graph diagrams or admin workflow documentation.
 - Update `docs/evaluation/usability-roadmap.md`, `docs/evaluation/roadmap/R04-service-model.md`, and `docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`.
 - Update any initrd/default-service docs if service configuration or boot policy changes.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.50.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.51.0`.
 
 ## Acceptance Criteria
 
@@ -113,7 +113,7 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 
 ## Companion Task List
 
-- Phase 50 task list — defer until implementation planning begins.
+- Phase 51 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

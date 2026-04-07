@@ -1,8 +1,8 @@
-# Phase 49 - IPC Completion
+# Phase 50 - IPC Completion
 
 **Status:** Planned
-**Source Ref:** phase-49
-**Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 48 (Architectural Declaration) ✅
+**Source Ref:** phase-50
+**Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 49 (Architectural Declaration) ✅
 **Builds on:** Turns the existing capability and rendezvous primitives into a transport model that can support real ring-3 services without shared-address-space shortcuts
 **Primary Components:** kernel/src/ipc, kernel-core/src/ipc, kernel/src/main.rs, kernel/src/arch/x86_64/syscall.rs, docs/06-ipc.md
 
@@ -53,7 +53,7 @@ Make the expected `recv -> handle -> reply_recv` pattern concrete enough that la
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Ownership contract | Phase 48 explicitly defines which later services will rely on the transport model | Add the missing service inventory before declaring IPC complete |
+| Ownership contract | Phase 49 explicitly defines which later services will rely on the transport model | Add the missing service inventory before declaring IPC complete |
 | Existing shortcut inventory | All shared-pointer and kernel-task assumptions in current service paths are enumerated | Pull any un-audited paths into this phase |
 | Bulk-data target set | The transport design covers strings, file blocks, packets, and framebuffer-sized payloads | Add the missing payload contract instead of leaving a subsystem-specific hole |
 | Failure model | Restart, disconnect, and reply/receive semantics are documented for supervised services | Add the missing lifecycle semantics needed by later phases |
@@ -77,7 +77,7 @@ Real userspace services need a stable discovery story and a simple server loop. 
 - Finishes the IPC direction introduced in Phase 6 by covering the data path, not just the control path.
 - Reworks the early Core Server and Storage/VFS phases so their service model can survive ring-3 extraction.
 - Builds on Phase 39 by aligning local socket-style service communication with the native capability/IPC model.
-- Depends on the architecture contract from Phase 48 to know which later services must be supported.
+- Depends on the architecture contract from Phase 49 to know which later services must be supported.
 
 ## Implementation Outline
 
@@ -91,7 +91,7 @@ Real userspace services need a stable discovery story and a simple server loop. 
 
 ## Learning Documentation Requirement
 
-- Create `docs/49-ipc-completion.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/50-ipc-completion.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain capability grants, bulk-data paths, registry behavior, service loops, and the specific shortcuts that were removed in this phase.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -100,7 +100,7 @@ Real userspace services need a stable discovery story and a simple server loop. 
 - Update `docs/06-ipc.md`, `docs/07-core-servers.md`, `docs/08-storage-and-vfs.md`, and `docs/appendix/architecture-and-syscalls.md` to match the finished transport model.
 - Update `docs/evaluation/microkernel-path.md` and `docs/evaluation/roadmap/R03-ipc-completion.md` so the evaluation overlay points at the official implementation milestone.
 - Update `docs/roadmap/README.md` and any transport-related diagrams or subsystem docs that describe the old assumptions.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.49.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.50.0`.
 
 ## Acceptance Criteria
 
@@ -112,7 +112,7 @@ Real userspace services need a stable discovery story and a simple server loop. 
 
 ## Companion Task List
 
-- Phase 49 task list — defer until implementation planning begins.
+- Phase 50 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

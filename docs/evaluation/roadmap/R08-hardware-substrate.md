@@ -5,7 +5,7 @@
 **Official roadmap phases covered:** [Phase 15](../../roadmap/15-hardware-discovery.md),
 [Phase 16](../../roadmap/16-network.md),
 [Phase 24](../../roadmap/24-persistent-storage.md),
-[Phase 54](../../roadmap/54-hardware-substrate.md),
+[Phase 55](../../roadmap/55-hardware-substrate.md),
 [Phase 56](../../roadmap/56-display-and-input-architecture.md)
 **Primary evaluation docs:** [Hardware Driver Strategy](../hardware-driver-strategy.md),
 [Redox Driver Porting](../redox-driver-porting.md),
@@ -98,7 +98,7 @@ benefits both the headless/admin path and the later local desktop path.
 - [Hardware Driver Strategy](../hardware-driver-strategy.md)
 - [Redox Driver Porting](../redox-driver-porting.md)
 - [Phase 15 — Hardware Discovery](../../roadmap/15-hardware-discovery.md)
-- [Phase 54 — Hardware Substrate](../../roadmap/54-hardware-substrate.md)
+- [Phase 55 — Hardware Substrate](../../roadmap/55-hardware-substrate.md)
 - [Phase 56 — Display and Input Architecture](../../roadmap/56-display-and-input-architecture.md)
 
 ## Open Questions

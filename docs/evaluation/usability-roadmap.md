@@ -74,7 +74,7 @@ Evidence for that claim:
 | Harden and validate the shipped service supervision, logging, shutdown/reboot layer | Real systems need PID 1 to manage daemons, logs, and lifecycle, and m3OS now has that baseline | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
 | Stabilize the shipped Rust std path | This is the easiest path to writing more serious userspace in Rust, and it is already part of the base | `docs/roadmap/44-rust-cross-compilation.md` |
 | Improve packaging/ports reliability | Tooling that silently skips sources or drifts is not a stable user story, even when the ports system already exists | `docs/45-ports-system.md`, validation-session zlib fetch issue |
-| Make the remote/outbound support boundary explicit | A defensible 1.0 can stay headless/reference-focused, but it cannot be vague about what outbound workflows are in or out | `docs/16-network.md`, `docs/roadmap/52-headless-hardening.md`, `docs/roadmap/58-release-1-0-gate.md` |
+| Make the remote/outbound support boundary explicit | A defensible 1.0 can stay headless/reference-focused, but it cannot be vague about what outbound workflows are in or out | `docs/16-network.md`, `docs/roadmap/53-headless-hardening.md`, `docs/roadmap/58-release-1-0-gate.md` |
 
 Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly security and maturity gaps in shipped systems, not the absence of the service layer itself.
 
@@ -105,7 +105,7 @@ Call Stage 1 achieved only when all of these are true:
 
 | Work item | Why it matters | Evidence |
 |---|---|---|
-| Replace "graphics = raw framebuffer text console" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/09-framebuffer-and-shell.md`, `docs/roadmap/55-graphics-bring-up.md`, `docs/roadmap/56-display-and-input-architecture.md` |
+| Replace "graphics = raw framebuffer text console" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/09-framebuffer-and-shell.md`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
 | Add mouse input and event abstraction | A desktop cannot stay keyboard-only | `docs/roadmap/56-display-and-input-architecture.md` |
 | Add audio output | Even a minimal desktop needs media and UI feedback | `docs/roadmap/57-audio-and-local-session.md` |
 | Add a session/launcher/app model | Desktop usability is more than drawing pixels | `docs/roadmap/46-system-services.md`, GUI gaps in [gui-strategy.md](./gui-strategy.md) |

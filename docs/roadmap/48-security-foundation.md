@@ -1,7 +1,7 @@
-# Phase 47 - Security Foundation
+# Phase 48 - Security Foundation
 
 **Status:** Planned
-**Source Ref:** phase-47
+**Source Ref:** phase-48
 **Depends on:** Phase 27 (User Accounts) ✅, Phase 30 (Telnet Server) ✅, Phase 42 (Crypto Primitives) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅
 **Builds on:** Turns the already-shipped login, SSH, crypto, and service-management baseline into a system that can make a credible headless security claim instead of relying on trusted-demo assumptions
 **Primary Components:** kernel/src/arch/x86_64/syscall.rs, userspace/login, userspace/passwd, userspace/init, userspace/sshd, userspace/crypto-lib, xtask/src/main.rs
@@ -93,7 +93,7 @@ The combination of init defaults, account provisioning, and remote-access config
 
 ## Learning Documentation Requirement
 
-- Create `docs/47-security-foundation.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/48-security-foundation.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain why the old trust model was insufficient, how credential transitions and entropy work now, which files own the final policy, and how this phase differs from later sandboxing or isolation work.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -102,7 +102,7 @@ The combination of init defaults, account provisioning, and remote-access config
 - Update `README.md`, `docs/README.md`, and `docs/roadmap/README.md` to describe the new security baseline honestly.
 - Update `docs/27-user-accounts.md`, `docs/42-crypto-primitives.md`, `docs/43-ssh-server.md`, and `docs/evaluation/security-review.md` to reflect the shipped behavior.
 - If new boot/default-service behavior changes setup or image expectations, update `setup.sh`, image notes, and any relevant initrd documentation.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.47.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.48.0`.
 
 ## Acceptance Criteria
 
@@ -115,7 +115,7 @@ The combination of init defaults, account provisioning, and remote-access config
 
 ## Companion Task List
 
-- Phase 47 task list — defer until implementation planning begins.
+- Phase 48 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 

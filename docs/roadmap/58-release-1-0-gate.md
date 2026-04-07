@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-58
-**Depends on:** Phase 52 (Headless Hardening) ✅, Phase 54 (Hardware Substrate) ✅
+**Depends on:** Phase 53 (Headless Hardening) ✅, Phase 55 (Hardware Substrate) ✅
 **Builds on:** Converts the convergence, hardening, and hardware work into an explicit release promise, while giving the project a disciplined place to decide whether the local-system branch is in scope for 1.0 or deferred to 1.x
 **Primary Components:** docs/roadmap/README.md, README.md, docs/README.md, xtask validation flows, release and support-matrix documentation
 
@@ -35,7 +35,7 @@ Tie the supported promise to repeatable validation. The release process should s
 
 ### Headless versus local-system decision
 
-Make an explicit decision: either ship a headless/reference 1.0 on the strength of the earlier convergence phases, or include the optional local-system branch only if Phases 55-57 are complete enough to support the broader promise.
+Make an explicit decision: either ship a headless/reference 1.0 on the strength of the earlier convergence phases, or include the optional local-system branch only if Phase 47 and Phases 56-57 are complete enough to support the broader promise.
 
 ### Documentation and versioning discipline
 
@@ -54,8 +54,8 @@ Align the top-level docs, roadmap, learning-doc index, support notes, and versio
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Headless baseline | Phase 52 and Phase 54 are complete enough for a defensible headless/reference release | Pull missing validation or support-boundary work into this phase |
-| Optional GUI baseline | If 1.0 is meant to include a local-system milestone, Phases 55-57 are complete enough to justify it | Otherwise explicitly defer the local-system branch to 1.x |
+| Headless baseline | Phase 53 and Phase 55 are complete enough for a defensible headless/reference release | Pull missing validation or support-boundary work into this phase |
+| Optional GUI baseline | If 1.0 is meant to include a local-system milestone, Phase 47 and Phases 56-57 are complete enough to justify it | Otherwise explicitly defer the local-system branch to 1.x |
 | Release-evidence baseline | The project can name the exact tests, targets, and docs that prove the claim | Add the missing release-gate automation or manual checklist items |
 | Versioning baseline | The project agrees that the kernel crate version tracks the roadmap phase number even if the public release language says "1.0" | Add the missing versioning documentation and cross-reference updates |
 
@@ -75,8 +75,8 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 52's headless hardening and Phase 54's hardware promise as the minimum 1.0 foundation.
-- Optionally includes the local-system milestones from Phases 55-57 if the project chooses the broader release target.
+- Builds on Phase 53's headless hardening and Phase 55's hardware promise as the minimum 1.0 foundation.
+- Optionally includes the local-system milestones from Phase 47 and Phases 56-57 if the project chooses the broader release target.
 - Creates the stable boundary after which later ecosystem work can clearly be called 1.x growth instead of hidden release debt.
 
 ## Implementation Outline

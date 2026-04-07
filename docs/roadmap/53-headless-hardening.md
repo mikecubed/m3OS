@@ -1,8 +1,8 @@
-# Phase 52 - Headless Hardening
+# Phase 53 - Headless Hardening
 
 **Status:** Planned
-**Source Ref:** phase-52
-**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 47 (Security Foundation) ✅, Phase 50 (Service Model Maturity) ✅, Phase 51 (First Service Extractions) ✅
+**Source Ref:** phase-53
+**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅
 **Builds on:** Turns the now-shipped Rust std, ports, services, and first extracted-service work into a trustworthy headless/reference-system baseline with explicit validation and support boundaries
 **Primary Components:** xtask/src/main.rs, kernel-core, userspace/init, userspace/coreutils-rs, ports, docs/43c-regression-stress-ci.md, docs/45-ports-system.md
 
@@ -54,8 +54,8 @@ Write down what the headless/reference system promises and what it still does no
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Security floor | Phase 47 fixes are complete and validated in the normal boot/admin flow | Pull missing hardening or smoke coverage into this phase |
-| Service lifecycle | Phase 50 supervision and Phase 51 extraction behavior are stable enough for operator use | Add missing restart, status, or recovery work |
+| Security floor | Phase 48 fixes are complete and validated in the normal boot/admin flow | Pull missing hardening or smoke coverage into this phase |
+| Service lifecycle | Phase 51 supervision and Phase 52 extraction behavior are stable enough for operator use | Add missing restart, status, or recovery work |
 | Tooling baseline | Phase 44 and 45 flows are reproducible enough for the release story | Pull missing packaging or runtime cleanup into this phase |
 | Validation story | Regression, stress, and smoke tests cover the workflows being claimed | Add the missing release-gate coverage instead of hand-waving it |
 
@@ -78,7 +78,7 @@ Release quality is partly about saying no. The phase should clearly define what 
 - Builds on Phase 43c by turning validation infrastructure into explicit release gates.
 - Builds on Phases 44 and 45 by treating Rust std support and ports as part of the real supported environment.
 - Builds on Phases 46, 50, and 51 by turning the service model and extracted-service story into an operator-facing system.
-- Depends on Phase 47 so headless readiness is not built on an unsafe trust floor.
+- Depends on Phase 48 so headless readiness is not built on an unsafe trust floor.
 
 ## Implementation Outline
 
@@ -91,7 +91,7 @@ Release quality is partly about saying no. The phase should clearly define what 
 
 ## Learning Documentation Requirement
 
-- Create `docs/52-headless-hardening.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Create `docs/53-headless-hardening.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
 - Explain the supported headless workflows, release gates, operator model, and which capabilities are intentionally out of scope for this milestone.
 - Link the learning doc from `docs/README.md` when this phase lands.
 
@@ -100,7 +100,7 @@ Release quality is partly about saying no. The phase should clearly define what 
 - Update `README.md`, `docs/README.md`, `docs/roadmap/README.md`, `docs/43c-regression-stress-ci.md`, and `docs/45-ports-system.md`.
 - Update `docs/evaluation/usability-roadmap.md`, `docs/evaluation/current-state.md`, and `docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`.
 - Update any setup or image documentation that describes the supported development or operator workflow.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.52.0`.
+- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.53.0`.
 
 ## Acceptance Criteria
 
@@ -112,7 +112,7 @@ Release quality is partly about saying no. The phase should clearly define what 
 
 ## Companion Task List
 
-- Phase 52 task list — defer until implementation planning begins.
+- Phase 53 task list — defer until implementation planning begins.
 
 ## How Real OS Implementations Differ
 
