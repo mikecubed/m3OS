@@ -306,39 +306,41 @@ static uint8_t s_key_pressed[128];
 /* -------------------------------------------------------------------------
  * DG_GetKey -- return one key event per call
  *
- * Reads exactly one raw scancode per call.  Typematic repeats (a make code
- * for a key already marked down) are silently discarded so DOOM sees only
- * one key-down event per physical press.  DOOM's I_GetEvent caller loops
- * until we return 0 (empty), draining all available events each frame.
+ * Loops internally until it finds a meaningful key event or the raw
+ * scancode queue is empty.  Extended-prefix bytes (0xE0) and typematic
+ * repeats are consumed and skipped, so a return of 0 always means
+ * "queue empty" and DOOM's drain loop (while DG_GetKey) works correctly.
  * ------------------------------------------------------------------------- */
 
 int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
-    long sc = syscall0(SYS_READ_SCANCODE);
-    if (sc == 0) return 0;   /* ring buffer empty */
+    for (;;) {
+        long sc = syscall0(SYS_READ_SCANCODE);
+        if (sc == 0) return 0;   /* ring buffer truly empty */
 
-    uint8_t raw  = (uint8_t)(sc & 0xFF);
-    uint8_t make = raw & 0x7F;
-    unsigned char dk;
+        uint8_t raw  = (uint8_t)(sc & 0xFF);
+        uint8_t make = raw & 0x7F;
+        unsigned char dk;
 
-    if (!ps2_to_doom(make, &dk)) return 0;   /* unknown / extended prefix */
+        if (!ps2_to_doom(make, &dk)) continue;  /* skip extended prefix / unknown */
 
-    if (raw & 0x80) {
-        /* break code (key-up) */
-        s_key_pressed[make] = 0;
-        *pressed = 0;
+        if (raw & 0x80) {
+            /* break code (key-up) */
+            s_key_pressed[make] = 0;
+            *pressed = 0;
+            *doomKey = dk;
+            return 1;
+        }
+
+        /* make code: skip typematic repeats */
+        if (s_key_pressed[make]) continue;
+
+        /* fresh key-down */
+        s_key_pressed[make] = 1;
+        *pressed = 1;
         *doomKey = dk;
         return 1;
     }
-
-    /* make code: discard typematic repeats */
-    if (s_key_pressed[make]) return 0;
-
-    /* fresh key-down */
-    s_key_pressed[make] = 1;
-    *pressed = 1;
-    *doomKey = dk;
-    return 1;
 }
 
 /* -------------------------------------------------------------------------
