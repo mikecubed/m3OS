@@ -2473,15 +2473,10 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
 
-    // Always yield at least once so sub-1ms sleeps do not become tight
-    // busy-spins that starve other tasks.
-    crate::task::yield_now();
-    restore_caller_context(pid, saved_user_rsp);
-    if has_pending_signal() {
-        return NEG_EINTR;
-    }
-
     if sleep_us == 0 {
+        // Zero sleep: yield once to be cooperative (standard POSIX behaviour).
+        crate::task::yield_now();
+        restore_caller_context(pid, saved_user_rsp);
         return 0;
     }
 
@@ -2498,11 +2493,29 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
                 return NEG_EINTR;
             }
         }
+    } else if sleep_us < 5_000 {
+        // Short sleep (< 5 ms): TSC busy-spin without yielding.
+        //
+        // APs have a 10 ms timer granularity, so a single yield_now() would
+        // sleep ~10 ms — far too coarse for the 1 ms sleeps that DOOM's game
+        // loop relies on for accurate 35 Hz tic timing.  A brief busy-spin is
+        // acceptable here: the sleep completes in < 5 ms and the cost is a
+        // small window of raised interrupt latency on this core.
+        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
+        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
+            core::hint::spin_loop();
+        }
     } else {
-        // TSC-based sleep: accurate on any CPU core because TSC is
-        // invariant and advances regardless of which core DOOM is on.
-        // This avoids the 10ms AP-timer-granularity problem where
-        // nanosleep(1ms) on an AP would sleep ~10ms.
+        // Long sleep (≥ 5 ms): yield-based sleep.
+        // TSC is invariant across cores, so this is accurate regardless of
+        // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
+        // granularity, which is acceptable for multi-millisecond sleeps.
+        crate::task::yield_now();
+        restore_caller_context(pid, saved_user_rsp);
+        if has_pending_signal() {
+            return NEG_EINTR;
+        }
         let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {

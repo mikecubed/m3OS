@@ -301,44 +301,15 @@ static int ps2_to_doom(uint8_t scancode, unsigned char *doom_key)
  * ------------------------------------------------------------------------- */
 
 /* per-make-code pressed state — used to suppress PS/2 typematic repeats */
-static uint8_t  s_key_pressed[128];
-
-/* Timestamp (ms) of the last make code seen per key.
- * Used to detect stuck keys: if s_key_pressed[k]=1 but the last make was
- * more than STUCK_KEY_MS milliseconds ago, the break code was almost
- * certainly lost during a hitch and the key is now permanently stuck.
- * We clear the flag and re-emit the key-down so DOOM's gamekeys[] corrects
- * itself on the very next tick the user presses the key again.
- *
- * Threshold rationale: default PS/2 typematic initial delay is ≤500 ms,
- * then repeats arrive every ~33–100 ms.  If a key is genuinely held down,
- * typematic makes arrive continuously and the "time since last make" stays
- * well below 200 ms.  Only a stuck key (lost break code) would exceed
- * STUCK_KEY_MS without a fresh make arriving. */
-#define STUCK_KEY_MS  700u
-static uint32_t s_key_time[128];
+static uint8_t s_key_pressed[128];
 
 /* -------------------------------------------------------------------------
  * DG_GetKey -- return one key event per call
  *
- * Design notes:
- *   • Single-pass: reads exactly ONE raw scancode per call (no internal
- *     retry loop).  If the scancode is unknown or a typematic repeat,
- *     we return 0 immediately.  DOOM's I_GetEvent drain loop will call
- *     us again on the next tic, so unknown/extended prefix bytes are
- *     naturally flushed one-per-tic rather than in a tight loop.
- *
- *   • 0xE0 extended prefix bytes: bit 7 is set (0xE0 = 1110_0000), so
- *     they map to make 0x60 — unknown → return 0.  The real key byte
- *     that follows is handled normally on the next call.
- *
- *   • s_key_pressed[] suppresses PS/2 typematic repeats (hardware
- *     auto-repeat after hold delay).  Only the first make code is
- *     forwarded; subsequent ones return 0 until the break arrives.
- *
- *   • s_key_time[] enables stuck-key recovery: if a make arrives for a
- *     key that has been "down" for over STUCK_KEY_MS without a break,
- *     the break was likely lost and we synthesize a release.
+ * Reads exactly one raw scancode per call.  Typematic repeats (a make code
+ * for a key already marked down) are silently discarded so DOOM sees only
+ * one key-down event per physical press.  DOOM's I_GetEvent caller loops
+ * until we return 0 (empty), draining all available events each frame.
  * ------------------------------------------------------------------------- */
 
 int DG_GetKey(int *pressed, unsigned char *doomKey)
@@ -360,24 +331,11 @@ int DG_GetKey(int *pressed, unsigned char *doomKey)
         return 1;
     }
 
-    /* make code (key-down or typematic) */
-    uint32_t now = DG_GetTicksMs();
-    if (s_key_pressed[make]) {
-        if ((now - s_key_time[make]) >= STUCK_KEY_MS) {
-            /* Break code was lost — synthesize key-up to un-stick DOOM. */
-            s_key_pressed[make] = 0;
-            *pressed = 0;
-            *doomKey = dk;
-            return 1;
-        }
-        /* Typematic repeat: refresh timestamp and discard. */
-        s_key_time[make] = now;
-        return 0;
-    }
+    /* make code: discard typematic repeats */
+    if (s_key_pressed[make]) return 0;
 
-    /* Fresh key-down */
+    /* fresh key-down */
     s_key_pressed[make] = 1;
-    s_key_time[make]    = now;
     *pressed = 1;
     *doomKey = dk;
     return 1;
@@ -433,16 +391,8 @@ int main(int argc, char **argv)
 
     doomgeneric_Create(argc, argv);
 
-    /* Cap the frame rate to ~70 fps (14ms/frame).
-     * Without this, DOOM burns 100% CPU indefinitely, starving the
-     * scheduler and making nanosleep-based timing inaccurate. */
-    for (;;) {
-        uint32_t t0 = DG_GetTicksMs();
+    for (;;)
         doomgeneric_Tick();
-        uint32_t elapsed = DG_GetTicksMs() - t0;
-        if (elapsed < 14)
-            DG_SleepMs(14 - elapsed);
-    }
 
     return 0;
 }
