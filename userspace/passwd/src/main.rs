@@ -5,7 +5,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, exit, fsync, geteuid, getuid, open, read, write, write_str,
+    O_RDONLY, STDOUT_FILENO, close, exit, fsync, geteuid, getrandom, getuid, open, read, write,
+    write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
@@ -61,11 +62,12 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    // Generate new hash with a simple salt from username bytes.
-    let salt = username; // Use username as salt (simple but deterministic).
-    let hash = syscall_lib::sha256::hash_password(&new_input[..new_len], salt);
+    // Generate new hash with random salt and iterated SHA-256.
+    let mut salt = [0u8; 16];
+    getrandom(&mut salt);
+    let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
     let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
+    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
 
@@ -90,7 +92,7 @@ pub extern "C" fn _start() -> ! {
         {
             // Replace this line with new hash.
             out_pos += copy_to(&mut new_shadow[out_pos..], username);
-            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256$");
+            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256i$10000$");
             out_pos += copy_to(&mut new_shadow[out_pos..], &salt_hex[..salt_hex_len]);
             out_pos += copy_to(&mut new_shadow[out_pos..], b"$");
             out_pos += copy_to(&mut new_shadow[out_pos..], &hash_hex[..hash_hex_len]);

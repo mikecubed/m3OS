@@ -3,8 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, open, read, write, write_str,
-    write_u64,
+    O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, getrandom, open, read, write,
+    write_str, write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
@@ -73,11 +73,12 @@ pub extern "C" fn _start() -> ! {
     let new_uid = max_uid + 1;
     let new_gid = new_uid; // GID = UID
 
-    // Hash the password.
-    let salt = username;
-    let hash = syscall_lib::sha256::hash_password(&pw_input[..plen], salt);
+    // Hash the password with random salt and iterated SHA-256.
+    let mut salt = [0u8; 16];
+    getrandom(&mut salt);
+    let hash = syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, 10000);
     let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
+    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
 
@@ -123,7 +124,7 @@ pub extern "C" fn _start() -> ! {
         let mut buf = [0u8; 512];
         let mut pos = 0;
         pos += copy_to_buf(&mut buf[pos..], username);
-        pos += copy_to_buf(&mut buf[pos..], b":$sha256$");
+        pos += copy_to_buf(&mut buf[pos..], b":$sha256i$10000$");
         pos += copy_to_buf(&mut buf[pos..], &salt_hex[..salt_hex_len]);
         pos += copy_to_buf(&mut buf[pos..], b"$");
         pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
