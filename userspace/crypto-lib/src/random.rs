@@ -1,10 +1,11 @@
 //! CSPRNG seeded from the kernel's `getrandom` syscall.
 //!
-//! **Entropy note:** The current kernel `getrandom` implementation uses
-//! TSC-seeded PRNG output, which is not cryptographically secure entropy.
-//! Generated keys are suitable for testing and development but should not
-//! be used to protect real secrets until the kernel entropy source is
-//! hardened (e.g., RDRAND/RDSEED + conditioning).
+//! **Entropy note:** The kernel `getrandom` implementation seeds its PRNG
+//! from RDRAND mixed with TSC, and reseeds from RDRAND every 256 bytes.
+//! This provides hardware-backed entropy on supported CPUs. The underlying
+//! xorshift64-multiply PRNG has not been audited for production use;
+//! generated keys are suitable for testing and development but should not
+//! be used to protect real secrets.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};

@@ -106,7 +106,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run|run-gui|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -3664,7 +3664,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap());
+    create_data_disk(uefi_image.parent().unwrap(), false);
     let doom_wad_available = host_has_doom_wad();
     if !doom_wad_available {
         println!("smoke-test: skipping DOOM launch validation (doom1.wad unavailable)");
@@ -3744,6 +3744,7 @@ struct ImageArgs {
     sign: bool,
     key: PathBuf,
     cert: PathBuf,
+    enable_telnet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3797,6 +3798,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
     let mut sign = false;
     let mut key = None;
     let mut cert = None;
+    let mut enable_telnet = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -3825,6 +3827,9 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
             _ if let Some(value) = arg.strip_prefix("--cert=") => {
                 cert = Some(PathBuf::from(value));
             }
+            "--enable-telnet" => {
+                enable_telnet = true;
+            }
             _ => {
                 return Err(format!("unknown image flag `{arg}`"));
             }
@@ -3840,6 +3845,7 @@ fn parse_image_args(args: &[String], workspace_root: &Path) -> Result<ImageArgs,
         sign,
         key: key.unwrap_or_else(|| default_key_path(workspace_root)),
         cert: cert.unwrap_or_else(|| default_cert_path(workspace_root)),
+        enable_telnet,
     })
 }
 
@@ -3914,7 +3920,7 @@ fn signed_path(path: &Path) -> PathBuf {
 /// Skips creation if the image already exists to preserve persisted data.
 ///
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
-fn create_data_disk(output_dir: &Path) -> PathBuf {
+fn create_data_disk(output_dir: &Path, enable_telnet: bool) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
@@ -4011,7 +4017,7 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     }
 
     // Populate files using debugfs.
-    populate_ext2_files(&part_tmp, output_dir);
+    populate_ext2_files(&part_tmp, output_dir, enable_telnet);
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
     let root = workspace_root();
@@ -4059,7 +4065,7 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
 
 /// Populate the ext2 partition image with initial directories and files
 /// using `debugfs -w`. Creates temp host files for the `write` command.
-fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
+fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool) {
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
@@ -4078,7 +4084,6 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let shadow_tmp = output_dir.join("_tmp_shadow");
     let group_tmp = output_dir.join("_tmp_group");
     let sshd_conf_tmp = output_dir.join("_tmp_sshd_conf");
-    let telnetd_conf_tmp = output_dir.join("_tmp_telnetd_conf");
     let syslogd_conf_tmp = output_dir.join("_tmp_syslogd_conf");
     let crond_conf_tmp = output_dir.join("_tmp_crond_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
@@ -4086,10 +4091,24 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
-    fs::write(&telnetd_conf_tmp, telnetd_conf).expect("write temp telnetd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
+
+    // Phase 48: telnetd service config is only written when --enable-telnet is passed.
+    let telnetd_cmds = if enable_telnet {
+        let telnetd_conf_tmp = output_dir.join("_tmp_telnetd_conf");
+        fs::write(&telnetd_conf_tmp, telnetd_conf).expect("write temp telnetd.conf");
+        format!(
+            "write \"{}\" etc/services.d/telnetd.conf\n\
+             sif etc/services.d/telnetd.conf mode 0x81A4\n\
+             sif etc/services.d/telnetd.conf uid 0\n\
+             sif etc/services.d/telnetd.conf gid 0\n",
+            telnetd_conf_tmp.display()
+        )
+    } else {
+        String::new()
+    };
 
     // Standard Unix root filesystem directories and files.
     // debugfs mode values: S_IFDIR|perm or S_IFREG|perm
@@ -4169,10 +4188,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
          sif etc/services.d/sshd.conf mode 0x81A4\n\
          sif etc/services.d/sshd.conf uid 0\n\
          sif etc/services.d/sshd.conf gid 0\n\
-         write \"{telnetd_conf}\" etc/services.d/telnetd.conf\n\
-         sif etc/services.d/telnetd.conf mode 0x81A4\n\
-         sif etc/services.d/telnetd.conf uid 0\n\
-         sif etc/services.d/telnetd.conf gid 0\n\
+         {telnetd_cmds}\
          write \"{syslogd_conf}\" etc/services.d/syslogd.conf\n\
          sif etc/services.d/syslogd.conf mode 0x81A4\n\
          sif etc/services.d/syslogd.conf uid 0\n\
@@ -4190,7 +4206,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
         shadow = shadow_tmp.display(),
         group = group_tmp.display(),
         sshd_conf = sshd_conf_tmp.display(),
-        telnetd_conf = telnetd_conf_tmp.display(),
+        telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
         crond_conf = crond_conf_tmp.display(),
         hostname = hostname_tmp.display(),
@@ -4225,7 +4241,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path) {
     let _ = fs::remove_file(&shadow_tmp);
     let _ = fs::remove_file(&group_tmp);
     let _ = fs::remove_file(&sshd_conf_tmp);
-    let _ = fs::remove_file(&telnetd_conf_tmp);
+    if enable_telnet {
+        let _ = fs::remove_file(output_dir.join("_tmp_telnetd_conf"));
+    }
     let _ = fs::remove_file(&syslogd_conf_tmp);
     let _ = fs::remove_file(&crond_conf_tmp);
     let _ = fs::remove_file(&hostname_tmp);
@@ -4902,7 +4920,7 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir);
+    create_data_disk(output_dir, image_args.enable_telnet);
 
     if !image_args.sign {
         return;
@@ -5265,7 +5283,7 @@ fn cmd_run() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
-    create_data_disk(uefi_image.parent().unwrap());
+    create_data_disk(uefi_image.parent().unwrap(), false);
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
 }
 
@@ -5273,7 +5291,7 @@ fn cmd_run_gui() {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
-    create_data_disk(uefi_image.parent().unwrap());
+    create_data_disk(uefi_image.parent().unwrap(), false);
     launch_qemu(&uefi_image, QemuDisplayMode::Gui);
 }
 
