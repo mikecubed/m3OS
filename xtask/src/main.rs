@@ -4069,7 +4069,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
-    let shadow_content = "root:$sha256$726f6f7473616c74$e95f58b3cda26426125bb223a690ddfde7444ac5d859e260fade5e515b91e7be::::::\nuser:$sha256$7573657273616c74$9df26fef99d129060bdc8b3c35db9cdffd52cfc58361c4045ce3d37eb46160fe::::::\n";
+    let shadow_content = "root:!::::::\nuser:!::::::\n";
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
     // Phase 46: service definition files.
