@@ -716,8 +716,20 @@ unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
-    let mut port: Port<u8> = Port::new(0x60);
-    let scancode: u8 = unsafe { port.read() };
+    let mut data_port: Port<u8> = Port::new(0x60);
+    let mut status_port: Port<u8> = Port::new(0x64);
+
+    // Drain all pending bytes from the i8042 output buffer.
+    //
+    // Extended scancodes (e.g. 0xE0 prefixed arrow keys) arrive as multi-byte
+    // sequences.  With edge-triggered IRQ delivery, reading only one byte per
+    // interrupt can strand the second byte of an extended break code until the
+    // next key event, making keys appear stuck.  We loop while the i8042
+    // status register's Output Buffer Full bit (bit 0) is set.
+    //
+    // A small iteration cap prevents pathological infinite loops if the
+    // controller misbehaves.
+    const MAX_DRAIN: usize = 16;
 
     // Route to the appropriate ring buffer.
     //
@@ -728,26 +740,40 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // the two consumers never compete.
     //
     // When no process owns the framebuffer we use the normal TTY path.
-    if crate::fb::fb_owner_pid() != 0 {
-        unsafe {
-            push_to_buf(
-                (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
-                &RAW_SCANCODE_BUF_HEAD,
-                &RAW_SCANCODE_BUF_TAIL,
-                scancode,
-            );
+    let fb_owned = crate::fb::fb_owner_pid() != 0;
+    let mut got_tty_byte = false;
+
+    for _ in 0..MAX_DRAIN {
+        let status = unsafe { status_port.read() };
+        if status & 0x01 == 0 {
+            break; // output buffer empty — nothing left to read
         }
-        // Do NOT signal kbd_server — it has no scancodes to read.
-    } else {
-        unsafe {
-            push_to_buf(
-                (&raw mut SCANCODE_BUF).cast::<u8>(),
-                &SCANCODE_BUF_HEAD,
-                &SCANCODE_BUF_TAIL,
-                scancode,
-            );
+        let scancode: u8 = unsafe { data_port.read() };
+
+        if fb_owned {
+            unsafe {
+                push_to_buf(
+                    (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
+                    &RAW_SCANCODE_BUF_HEAD,
+                    &RAW_SCANCODE_BUF_TAIL,
+                    scancode,
+                );
+            }
+        } else {
+            unsafe {
+                push_to_buf(
+                    (&raw mut SCANCODE_BUF).cast::<u8>(),
+                    &SCANCODE_BUF_HEAD,
+                    &SCANCODE_BUF_TAIL,
+                    scancode,
+                );
+            }
+            got_tty_byte = true;
         }
-        // Wake kbd_server / any task waiting on IRQ1.
+    }
+
+    // Signal kbd_server once after draining the whole batch, not per byte.
+    if got_tty_byte {
         crate::ipc::notification::signal_irq(1);
     }
 
