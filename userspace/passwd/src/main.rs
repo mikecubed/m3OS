@@ -5,7 +5,7 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, exit, geteuid, getuid, open, read, write, write_str,
+    O_RDONLY, STDOUT_FILENO, close, exit, fsync, geteuid, getuid, open, read, write, write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
@@ -108,6 +108,7 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
     let _ = write(fd as i32, &new_shadow[..out_pos]);
+    fsync(fd as i32);
     close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");

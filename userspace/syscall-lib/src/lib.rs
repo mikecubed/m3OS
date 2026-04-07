@@ -370,6 +370,7 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
 
 // fcntl constants
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FSYNC: u64 = 74;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
 pub const O_NONBLOCK: u64 = 0x800;
@@ -599,6 +600,11 @@ pub fn open(path: &[u8], flags: u64, mode: u64) -> isize {
 /// Close a file descriptor.
 pub fn close(fd: i32) -> isize {
     unsafe { syscall1(SYS_CLOSE, fd as u64) as isize }
+}
+
+/// Flush file data to storage.
+pub fn fsync(fd: i32) -> isize {
+    unsafe { syscall1(SYS_FSYNC, fd as u64) as isize }
 }
 
 // ===========================================================================

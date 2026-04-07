@@ -3,7 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, chown, close, exit, geteuid, open, read, write, write_str, write_u64,
+    O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, open, read, write, write_str,
+    write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
@@ -80,7 +81,7 @@ pub extern "C" fn _start() -> ! {
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
 
-    // Append to /etc/passwd.
+    // Append to /etc/passwd (single write).
     {
         let fd = open(
             PASSWD_PATH,
@@ -91,20 +92,24 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/passwd\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":x:");
-        write_u32_to_fd(fd as i32, new_uid);
-        let _ = write(fd as i32, b":");
-        write_u32_to_fd(fd as i32, new_gid);
-        let _ = write(fd as i32, b":");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":/tmp/home/");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":/bin/ion\n");
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":x:");
+        pos += u32_to_buf(&mut buf[pos..], new_uid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += u32_to_buf(&mut buf[pos..], new_gid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":/tmp/home/");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":/bin/ion\n");
+        let _ = write(fd as i32, &buf[..pos]);
+        fsync(fd as i32);
         close(fd as i32);
     }
 
-    // Append to /etc/shadow.
+    // Append to /etc/shadow (single write).
     {
         let fd = open(
             SHADOW_PATH,
@@ -115,28 +120,36 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/shadow\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":$sha256$");
-        let _ = write(fd as i32, &salt_hex[..salt_hex_len]);
-        let _ = write(fd as i32, b"$");
-        let _ = write(fd as i32, &hash_hex[..hash_hex_len]);
-        let _ = write(fd as i32, b"::::::\n");
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":$sha256$");
+        pos += copy_to_buf(&mut buf[pos..], &salt_hex[..salt_hex_len]);
+        pos += copy_to_buf(&mut buf[pos..], b"$");
+        pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
+        pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
+        let _ = write(fd as i32, &buf[..pos]);
+        fsync(fd as i32);
         close(fd as i32);
     }
 
-    // Append to /etc/group.
+    // Append to /etc/group (single write).
     {
         let fd = open(GROUP_PATH, syscall_lib::O_WRONLY | syscall_lib::O_APPEND, 0);
         if fd < 0 {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/group\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":x:");
-        write_u32_to_fd(fd as i32, new_gid);
-        let _ = write(fd as i32, b":");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b"\n");
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":x:");
+        pos += u32_to_buf(&mut buf[pos..], new_gid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b"\n");
+        let _ = write(fd as i32, &buf[..pos]);
+        fsync(fd as i32);
         close(fd as i32);
     }
 
@@ -170,20 +183,31 @@ pub extern "C" fn _start() -> ! {
     exit(0);
 }
 
-fn write_u32_to_fd(fd: i32, n: u32) {
-    let mut buf = [0u8; 12];
-    let mut pos = buf.len();
-    let mut val = n;
-    if val == 0 {
-        let _ = write(fd, b"0");
-        return;
+fn copy_to_buf(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+fn u32_to_buf(dst: &mut [u8], n: u32) -> usize {
+    if n == 0 {
+        if !dst.is_empty() {
+            dst[0] = b'0';
+        }
+        return 1;
     }
+    let mut tmp = [0u8; 12];
+    let mut pos = tmp.len();
+    let mut val = n;
     while val > 0 {
         pos -= 1;
-        buf[pos] = b'0' + (val % 10) as u8;
+        tmp[pos] = b'0' + (val % 10) as u8;
         val /= 10;
     }
-    let _ = write(fd, &buf[pos..]);
+    let len = tmp.len() - pos;
+    let n = len.min(dst.len());
+    dst[..n].copy_from_slice(&tmp[pos..pos + n]);
+    n
 }
 
 fn parse_u32(s: &[u8]) -> u32 {
