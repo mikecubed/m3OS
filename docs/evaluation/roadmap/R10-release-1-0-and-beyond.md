@@ -30,10 +30,10 @@ system can actually support.
 This phase exists to define that promise, ship it if the earlier work is real,
 and keep post-1.0 growth from quietly turning back into uncontrolled scope.
 
-Because Phases 44-46 are already part of the current base, that promise is less
-about inventing basic developer or system-operations capability and more about
-deciding how much confidence, architectural honesty, and support boundary the
-project has actually earned.
+Because Phases 44-47 are already part of the current base, that promise is less
+about inventing basic developer, graphical-proof, or system-operations
+capability and more about deciding how much confidence, architectural honesty,
+and support boundary the project has actually earned.
 
 ```mermaid
 flowchart TD
@@ -51,7 +51,7 @@ flowchart TD
 | Area | Current state | Required for 1.0 | Post-1.0 direction |
 |---|---|---|---|
 | Release promise | Broad capability, uneven maturity | Narrow, explicit support matrix and documented claims | Wider hardware and ecosystem claims |
-| Desktop/local UX | Still substrate-stage | Optional minimal compositor + terminal/launcher if 1.0 aims beyond headless | Broader session UX, richer apps, audio polish |
+| Desktop/local UX | Phase 47 proves one real full-screen graphical workload, but there is still no compositor/session model | Optional minimal compositor + terminal/launcher if 1.0 aims beyond headless | Broader session UX, richer apps, audio polish |
 | Toolchains | Rust std and ports/package work are part of the base but still settling | Rust std and core packaging flow are enough for the release story | Python, larger toolchains, Node.js, agent workloads |
 | Hardware | QEMU-first with limited real-hardware maturity | Reference hardware is named, testable, and documented | Wider device matrix, xHCI, audio, Wi-Fi, GPU work |
 | Compatibility | Linux-like syscall ABI is useful but still evolving | Clear statement about what is stable at 1.0 | Wider compatibility, versioning, and richer ecosystem support |

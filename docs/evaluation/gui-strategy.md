@@ -8,7 +8,7 @@ The current repo is closer to "graphics-capable kernel substrate" than to "deskt
 
 - `kernel/src/fb/mod.rs` implements a framebuffer text console
 - `docs/09-framebuffer-and-shell.md` already hints at moving framebuffer ownership to a dedicated display server later
-- `docs/roadmap/47-doom.md` now anchors the single-app graphics proof that is already in flight
+- `docs/roadmap/47-doom.md` now anchors the shipped single-app graphics proof from Phase 47
 - `docs/roadmap/56-display-and-input-architecture.md` and `docs/roadmap/57-audio-and-local-session.md` define the later display, input, audio, and session work more explicitly
 - Phase 46 now supplies a real service/logging/admin baseline that later display/session services can reuse
 
@@ -57,7 +57,7 @@ flowchart LR
 That is enough for:
 
 - framebuffer text UI
-- a DOOM-style "one app owns the screen" milestone
+- the shipped DOOM-style "one app owns the screen" milestone
 
 It is not enough for:
 
@@ -113,20 +113,21 @@ This matches m3OS better than a Wayland-first approach because:
 
 ## Practical staged plan
 
-In the official roadmap, this staged GUI path now maps roughly to **Phase 47**
-(DOOM / graphics proof), **Phase 56** (display and input architecture),
-**Phase 57** (audio and local session), and the **Phase 58** release decision
-about whether 1.0 includes the local-system branch or remains headless-first.
+In the official roadmap, the current baseline now includes **Phase 47**
+(DOOM / shipped graphics proof). The next architectural steps are **Phase 56**
+(display and input architecture), **Phase 57** (audio and local session), and
+the **Phase 58** release decision about whether 1.0 includes the local-system
+branch or remains headless-first.
 
-### Phase A: single-app graphics proof
+### Phase A: shipped single-app graphics proof
 
-Purpose: prove that graphical applications can run at all.
+Purpose: establish, and now preserve, proof that graphical applications can run at all.
 
 Suggested scope:
 
 - expose framebuffer access through a device-style API rather than a custom long-term syscall contract
 - expose raw keyboard input for one foreground graphical client
-- ship the DOOM milestone as a proof of graphical capability, not as the desktop architecture
+- keep the shipped DOOM milestone positioned as a proof of graphical capability, not as the desktop architecture
 
 ### Phase B: input and event model
 
@@ -198,7 +199,7 @@ That does **not** mean m3OS needs to clone Redox exactly. It does mean the short
 
 The best path is:
 
-1. use Phase 47-style DOOM or raw-framebuffer work as a **graphics bring-up milestone**
+1. treat shipped Phase 47 DOOM/raw-framebuffer work as the **graphics bring-up milestone**
 2. immediately follow with **input abstraction**
 3. then design and build a **userspace display server/compositor**
 4. only after that consider higher-level compatibility layers or larger GUI toolkits

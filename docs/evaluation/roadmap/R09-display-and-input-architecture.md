@@ -15,9 +15,9 @@
 ## Why This Phase Exists
 
 A GUI is not "draw some pixels and add a mouse." It is a policy problem about
-ownership, focus, composition, event routing, and failure containment. m3OS is
-still at the framebuffer-console stage today, which is a good substrate but not
-a graphical system.
+ownership, focus, composition, event routing, and failure containment. m3OS now
+has a shipped single-app graphical proof through Phase 47 DOOM, but that still
+leaves the system short of a real graphical architecture.
 
 This phase exists to build the smallest credible graphical architecture that is
 consistent with the rest of the roadmap: a userspace-owned display/input model
@@ -41,8 +41,8 @@ flowchart TB
 
 | Area | Current state | Required in this phase | Later extension |
 |---|---|---|---|
-| Display | Raw framebuffer text console | One userspace process owns composition and presentation | Richer desktop polish and graphics acceleration |
-| Input | Keyboard-centric, limited pointing-device story | Unified keyboard/mouse event model routed through userspace | USB HID, touch, richer devices |
+| Display | Framebuffer text console plus a shipped single-app DOOM proof | One userspace process owns composition and presentation | Richer desktop polish and graphics acceleration |
+| Input | Keyboard-centric, single-foreground-client story | Unified keyboard/mouse event model routed through userspace | USB HID, touch, richer devices |
 | Application model | Single-console worldview, albeit with a stronger service/session baseline from Phase 46 | Multiple clients can coexist under a compositor | Toolkit, richer apps, session polish |
 | Audio | Planned but not central yet | Scoped clearly as part of the local-system story | Full audio server and richer media behavior |
 
@@ -50,7 +50,7 @@ flowchart TB
 
 | Track | What changes | Why now |
 |---|---|---|
-| Graphics proof | Use DOOM-class or other raw-framebuffer apps as an early proof that userspace graphics can work | Good architectural experiments need visible feedback |
+| Graphics proof | Build on the shipped DOOM-class raw-framebuffer proof instead of reinventing it | Good architectural experiments need visible feedback without reopening solved bring-up work |
 | Input event model | Unify keyboard and mouse events into one routable userspace model | Multiple apps need a clear focus and event story |
 | Display server | One process owns the framebuffer and composes multiple clients | This is the key GUI boundary |
 | Client protocol | Define how apps submit buffers, receive events, and manage windows | Good GUI architecture needs a protocol, not ad hoc calls |
@@ -78,9 +78,9 @@ applications and concentrating composition policy in restartable services.
 
 ## What This Phase Unlocks
 
-After this phase, m3OS can move beyond "framebuffer console plus future roadmap"
-and point to a real local-system substrate. That is the bridge between a strong
-headless release and any Redox-like desktop ambition.
+After this phase, m3OS can move beyond "framebuffer console plus single-app
+proof" and point to a real local-system substrate. That is the bridge between a
+strong headless release and any Redox-like desktop ambition.
 
 ## Acceptance Criteria
 

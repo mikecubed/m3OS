@@ -115,8 +115,8 @@ instead of fixing them.
 
 ## Deferred or Later-Phase Topics
 
-- Mouse input for graphical programs (Phase 48)
-- Audio output and DOOM sound/music support (Phase 49)
+- Routed mouse/input architecture and multi-client display ownership (Phase 56)
+- Audio output and local graphical session work, including DOOM sound/music support if desired (Phase 57)
 - Frame/tic/blit instrumentation for performance tuning
 - Write-combining framebuffer mappings or smaller dirty-rectangle blits
 - User-supplied IWAD workflow and broader WAD compatibility

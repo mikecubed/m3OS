@@ -134,7 +134,7 @@ flowchart TD
     P34 --> P46
     P39 --> P46
 
-    %% In-flight graphics proof phase
+    %% Shipped graphics proof phase
     P9 --> P47["Phase 47<br/>DOOM"]
     P12 --> P47
     P24 --> P47
@@ -251,11 +251,11 @@ flowchart TD
 | 45 | Ports System | Source-based package building and installation | Complete | `phase-45` | [Phase 45](./45-ports-system.md) | [Tasks](./tasks/45-ports-system-tasks.md) |
 | 46 | System Services | Service manager, syslog, cron, shutdown | Complete | `phase-46` | [Phase 46](./46-system-services.md) | [Tasks](./tasks/46-system-services-tasks.md) |
 
-### Graphics Proof Phase (in progress)
+### Graphics Proof Phase (complete)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 47 | DOOM | A real full-screen graphical program runs and proves the graphics substrate under load | In Progress | `phase-47` | [Phase 47](./47-doom.md) | Deferred until implementation planning |
+| 47 | DOOM | A real full-screen graphical program runs and proves the graphics substrate under load | Complete | `phase-47` | [Phase 47](./47-doom.md) | [Tasks](./tasks/47-doom-tasks.md) |
 
 ### Convergence and Release-Critical Phases (planned)
 

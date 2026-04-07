@@ -323,7 +323,7 @@ progress so contributors can find work items.
 **Acceptance:**
 - [ ] `docs/roadmap/47-doom.md` links to `./tasks/47-doom-tasks.md` in the Companion Task List section
 - [ ] `docs/roadmap/README.md` Phase 47 row has Tasks column linking to `./tasks/47-doom-tasks.md`
-- [ ] Status updated from Planned to In Progress when implementation begins
+- [ ] Status updated to Complete and linked from the roadmap once the phase lands
 
 ---
 

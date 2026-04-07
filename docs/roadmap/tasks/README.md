@@ -127,6 +127,10 @@ flowchart TD
     P24 --> P46
     P34 --> P46
     P39 --> P46
+    P9 --> P47["Phase 47 Tasks"]
+    P12 --> P47
+    P24 --> P47
+    P46 --> P47
 ```
 
 ## Task Documents
@@ -211,8 +215,14 @@ flowchart TD
 | 45 | Ports system (source-based package building) | Complete | `phase-45` | [Tasks](./45-ports-system-tasks.md) |
 | 46 | System services (init, syslog, cron) | Complete | `phase-46` | [Tasks](./46-system-services-tasks.md) |
 
+### Graphics Proof Phase (complete)
+
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 47 | DOOM | Complete | `phase-47` | [Tasks](./47-doom-tasks.md) |
+
 ### Future Task Docs
-Task docs for Phases **47 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **48 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

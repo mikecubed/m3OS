@@ -1,6 +1,6 @@
 # Phase 47 - DOOM
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-47
 **Depends on:** Phase 9 (Framebuffer and Shell) ✅, Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅, Phase 46 (System Services) ✅
 **Builds on:** Uses the framebuffer, storage, and service baseline to prove that m3OS can host a real full-screen graphical program, while explicitly avoiding the mistake of treating one graphical app as the finished GUI architecture
@@ -97,7 +97,7 @@ The port proves more than graphics. It validates that m3OS can package a larger 
 - Update `docs/09-framebuffer-and-shell.md`, `docs/README.md`, and `docs/roadmap/README.md`.
 - Update `docs/evaluation/gui-strategy.md`, `docs/evaluation/usability-roadmap.md`, and `docs/evaluation/roadmap/R09-display-and-input-architecture.md`.
 - Update any build or image docs that describe graphical-mode boot, DOOM assets, or graphical program launch.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.47.0`.
+- This phase ships as `0.47.0`; keep later release/version references aligned with that milestone.
 
 ## Acceptance Criteria
 
@@ -109,7 +109,7 @@ The port proves more than graphics. It validates that m3OS can package a larger 
 
 ## Companion Task List
 
-- Phase 47 task list — defer until implementation planning begins.
+- [Phase 47 task list](./tasks/47-doom-tasks.md)
 
 ## How Real OS Implementations Differ
 

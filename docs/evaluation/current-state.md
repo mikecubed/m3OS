@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-m3OS is best understood as a **well-structured, heavily documented, QEMU-first Rust OS with microkernel ambitions, a surprisingly deep userspace, and a now-real service-management/logging layer**.
+m3OS is best understood as a **well-structured, heavily documented, QEMU-first Rust OS with microkernel ambitions, a surprisingly deep userspace, a now-real service-management/logging layer, and a shipped single-app graphics proof**.
 
 The central architectural truth is:
 
@@ -11,9 +11,9 @@ The central architectural truth is:
 
 That tension does not make the project bad. It makes the project **pragmatic**. But it does shape what "usable", "secure", and "GUI-ready" should mean.
 
-Phase 46 materially improves the headless story by adding a real userspace service manager, logging daemon, cron daemon, and admin commands. That is a meaningful maturity jump, but it does **not** by itself narrow the kernel or resolve the security floor.
+Phase 46 materially improves the headless story by adding a real userspace service manager, logging daemon, cron daemon, and admin commands. Phase 47 adds a real userspace graphical proof by running DOOM end to end through the framebuffer path. Those are meaningful maturity jumps, but they do **not** by themselves narrow the kernel, resolve the security floor, or create a display-server architecture.
 
-A useful framing change after `v0.46.0` is that phases 1-46 are the shipped base. If something expected from that scope still feels rough, it is best described as a quality or integration gap in current behavior, not as pre-46 roadmap debt hiding elsewhere.
+A useful framing change after `v0.47.0` is that phases 1-47 are the shipped base. If something expected from that scope still feels rough, it is best described as a quality or integration gap in current behavior, not as pre-47 roadmap debt hiding elsewhere.
 
 ```mermaid
 flowchart TB
@@ -94,7 +94,7 @@ This is the main reason the current system reads as "microkernel-aimed" rather t
 | Networking | Solid system infrastructure, still not full product networking | `docs/16-network.md`, `docs/23-socket-api.md`, `docs/39-unix-domain-sockets.md`, `kernel/src/net/` |
 | Userspace tooling | Far beyond the kernel-demo stage | `userspace/`, `userspace/coreutils-rs/`, `docs/32-build-tools.md`, `docs/45-ports-system.md` |
 | Service model | Real Phase 46 baseline, but still not the same thing as a clean graph of restartable ring-3 core services | `docs/roadmap/46-system-services.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
-| Graphics/UI | Text console only | `docs/09-framebuffer-and-shell.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
+| Graphics/UI | Framebuffer text console plus a shipped single-app graphics proof; still no multi-client display/input architecture | `docs/09-framebuffer-and-shell.md`, `docs/47-doom.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
 | Hardware breadth | Still QEMU-centric | `kernel/src/blk/`, `kernel/src/net/virtio_net.rs`, `docs/roadmap/55-hardware-substrate.md`, `docs/roadmap/57-audio-and-local-session.md` |
 
 ## Why m3OS is already more than "just a toy"

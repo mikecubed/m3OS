@@ -11,6 +11,8 @@ m3OS already satisfies the first two in a meaningful way. The work ahead is abou
 
 Phase 46 changes Stage 1 significantly: service supervision, logging, cron, and admin tooling now exist in the current base. Stage 1 is therefore less about inventing a service model and more about hardening, validating, and learning to rely on the shipped one.
 
+Phase 47 changes the Stage 2 starting point more modestly but still materially: a real full-screen graphical workload now runs on the shipped system. That proves the framebuffer boundary can support userspace graphics, even though there is still no compositor, routed multi-app input model, or graphical session architecture.
+
 ## Stage model
 
 ```mermaid
@@ -105,7 +107,7 @@ Call Stage 1 achieved only when all of these are true:
 
 | Work item | Why it matters | Evidence |
 |---|---|---|
-| Replace "graphics = raw framebuffer text console" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/09-framebuffer-and-shell.md`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
+| Replace "graphics = framebuffer console plus one foreground graphical client" with a display model | Multiple GUI apps need composition, focus, and ownership rules | `docs/09-framebuffer-and-shell.md`, `docs/47-doom.md`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
 | Add mouse input and event abstraction | A desktop cannot stay keyboard-only | `docs/roadmap/56-display-and-input-architecture.md` |
 | Add audio output | Even a minimal desktop needs media and UI feedback | `docs/roadmap/57-audio-and-local-session.md` |
 | Add a session/launcher/app model | Desktop usability is more than drawing pixels | `docs/roadmap/46-system-services.md`, GUI gaps in [gui-strategy.md](./gui-strategy.md) |

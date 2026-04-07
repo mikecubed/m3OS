@@ -1,6 +1,6 @@
 # m3OS Evaluation
 
-This directory captures a repo-wide evaluation of m3OS as of this review pass, updated against the current base through Phase 46 / `v0.46.0`: what is already strong, what is still missing, what blocks a safer and more usable system, and what a realistic GUI path would look like. Because phases 1-46 are now the shipped base, anything still rough in that scope should be read as a maturity gap in current behavior, not as hidden future work.
+This directory captures a repo-wide evaluation of m3OS as of this review pass, updated against the current base through Phase 47 / `v0.47.0`: what is already strong, what is still missing, what blocks a safer and more usable system, and what a realistic GUI path would look like. Because phases 1-47 are now the shipped base, anything still rough in that scope should be read as a maturity gap in current behavior, not as hidden future work.
 
 ## Executive verdict
 
@@ -49,7 +49,7 @@ flowchart LR
 1. **As a serious microkernel-style OS project, m3OS is already substantial.** It goes far beyond "boot a kernel" tutorials and already demonstrates SMP, paging, process isolation, SSH, Unix sockets, PTYs, ext2, and a substantial userspace.
 2. **As a secure multi-user system, it is not ready.** The current `setuid`/`setgid` behavior, entropy story, telnet default, and baked-in credentials are enough to block that claim.
 3. **As a managed headless/reference system, it is materially stronger after Phase 46.** The service model, logging, cron, and admin surface are now real, but security fixes, packaging/runtime polish, and targeted regression reliability still need work.
-4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** The framebuffer, input, audio, and display-server pieces are still roadmap items rather than an integrated graphics stack; the in-flight Phase 47 DOOM milestone improves bring-up, but it does not solve the display-server/compositor gap.
+4. **As a desktop or Redox-like GUI system, it is still at the substrate stage.** Phase 47 now provides a shipped single-app graphical proof through DOOM, but the framebuffer, routed input, audio, and display-server pieces are still not an integrated graphics stack, and the display-server/compositor gap remains open.
 5. **As a documented microkernel design, the architecture is ahead of the implementation.** The project already has the right foundational primitives — ring-3 processes, per-process address spaces, capability-based IPC, notifications, and a strong roadmap story — but core services still live in ring 0 and several IPC/data paths still assume a shared kernel address space.
 6. **As a real-hardware platform, the next bottleneck is driver strategy rather than just ambition.** m3OS has enough kernel substrate to begin real-hardware bringup, but it needs a deliberate sourcing strategy: public specs first, Redox as the closest reusable Rust codebase, BSD as a permissive reference, and Linux primarily as a behavior/quirk reference rather than a donor.
 

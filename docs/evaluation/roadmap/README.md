@@ -11,11 +11,11 @@ The core judgment behind this roadmap is simple:
 **early work should narrow the kernel, fix the security floor, complete the
 service model, and only then broaden the hardware and desktop story.**
 
-Completed Phases 44-46 already change the starting point for this overlay: Rust
-`std`, ports, and a real service/logging/admin baseline are now part of the
-shipped base. Those areas are no longer hypothetical earlier-phase work; they
-are current capabilities that still need hardening, integration, and clear
-release boundaries.
+Completed Phases 44-47 already change the starting point for this overlay: Rust
+`std`, ports, a real service/logging/admin baseline, and a shipped single-app
+graphical proof are now part of the base. Those areas are no longer
+hypothetical earlier-phase work; they are current capabilities that still need
+hardening, integration, and clear release boundaries.
 
 ## What this directory is and is not
 
@@ -150,7 +150,7 @@ Examples:
   part of **R04** and **R06**
 - [Phase 44 — Rust Cross-Compilation](../../roadmap/44-rust-cross-compilation.md)
   is primarily part of **R06**
-- [Phase 47 — DOOM](../../roadmap/47-doom.md) is the in-flight graphical proof
+- [Phase 47 — DOOM](../../roadmap/47-doom.md) is the shipped graphical proof
   point that mainly informs **R09** and the optional local-system branch in
   **R10**
 - [Phases 48–54](../../roadmap/48-security-foundation.md) are the main
@@ -163,13 +163,15 @@ Examples:
 - [Phases 59–62](../../roadmap/59-cross-compiled-toolchains.md) are explicitly
   **post-1.0 growth**, not hidden early release blockers
 
-Because phases 1-46 are already complete, missing behavior in those areas should
+Because phases 1-47 are already complete, missing behavior in those areas should
 usually be read as a quality gap in the shipped base or as explicit later-phase
-scope, not as unscheduled pre-46 work hiding between roadmap lines.
+scope, not as unscheduled pre-47 work hiding between roadmap lines.
 
 That distinction matters because a good release plan is **not** just a list of
 future features. It is an argument about ordering, risk, and what the project is
 trying to prove.
 
-As of `v0.46.0`, R04 is materially underway in the current base, and R06 already
-starts from completed Phases 43c-46 rather than blank space.
+As of `v0.47.0`, R04 is materially underway in the current base, R06 already
+starts from completed Phases 43c-46 rather than blank space, and R09 now begins
+from a shipped single-app graphics proof instead of a hypothetical bring-up
+milestone.
