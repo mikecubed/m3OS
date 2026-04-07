@@ -115,7 +115,7 @@ The combination of init defaults, account provisioning, and remote-access config
 
 ## Companion Task List
 
-- Phase 48 task list — defer until implementation planning begins.
+- [Phase 48 Task List](./tasks/48-security-foundation-tasks.md)
 
 ## How Real OS Implementations Differ
 
