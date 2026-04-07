@@ -148,6 +148,9 @@ static SYSINFO_RUST_ELF: &[u8] = include_bytes!("../../initrd/sysinfo-rust");
 static HTTPD_RUST_ELF: &[u8] = include_bytes!("../../initrd/httpd-rust");
 static CALC_RUST_ELF: &[u8] = include_bytes!("../../initrd/calc-rust");
 static TODO_RUST_ELF: &[u8] = include_bytes!("../../initrd/todo-rust");
+// Phase 46: background daemons managed by init
+static SYSLOGD_ELF: &[u8] = include_bytes!("../../initrd/syslogd");
+static CROND_ELF: &[u8] = include_bytes!("../../initrd/crond");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");
 
@@ -242,6 +245,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     // Phase 43: SSH server
     ("sshd", RamdiskNode::File { content: SSHD_ELF }),
+    (
+        "syslogd",
+        RamdiskNode::File {
+            content: SYSLOGD_ELF,
+        },
+    ),
+    ("crond", RamdiskNode::File { content: CROND_ELF }),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),

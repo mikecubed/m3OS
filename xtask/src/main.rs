@@ -1871,17 +1871,30 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     })
 }
 
-/// Strip lines containing kernel log tags from serial output.
+/// Strip background noise lines from serial output.
 ///
-/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the
-/// same serial port as userspace output.  When a tag appears mid-line (the
-/// kernel interrupted a userspace write), the entire line is corrupted and
-/// must be discarded to avoid false pattern matches.
+/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the same
+/// serial port as userspace output. PID 1 also writes service lifecycle chatter
+/// such as `init: restarting 'syslogd' (2/10)` to that same serial stream.
+/// When either class of message lands mid-line, the entire line is corrupted
+/// and must be discarded to avoid false pattern matches.
 ///
 /// Operates line-by-line: any line containing a recognised tag is removed.
-/// Tags recognised: `[INFO]`, `[DEBUG]`, `[WARN]`, `[ERROR]`, `[TRACE]`.
-fn strip_kernel_logs(input: &str) -> String {
-    const TAGS: &[&str] = &["[INFO]", "[DEBUG]", "[WARN]", "[ERROR]", "[TRACE]"];
+/// Tags recognised: kernel log levels and init service lifecycle prefixes.
+fn strip_background_noise(input: &str) -> String {
+    const TAGS: &[&str] = &[
+        "[INFO]",
+        "[DEBUG]",
+        "[WARN]",
+        "[ERROR]",
+        "[TRACE]",
+        "init: starting '",
+        "init: started '",
+        "init: service '",
+        "init: restarting '",
+        "init: execve failed for '",
+        "init: session ended, respawning login...",
+    ];
 
     let mut out = String::with_capacity(input.len());
     for line in input.split_inclusive('\n') {
@@ -2020,7 +2033,7 @@ fn run_smoke_script(
                     let (search_str, used_cleaned) = if stripped.contains(pattern) {
                         (&stripped, false)
                     } else {
-                        cleaned = strip_kernel_logs(&stripped);
+                        cleaned = strip_background_noise(&stripped);
                         if cleaned.contains(pattern) {
                             (&cleaned, true)
                         } else {
@@ -2874,9 +2887,27 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after clustered pipeline first line check",
     });
+    steps.extend(cmd_then_prompt(
+        "/bin/echo root:x:0:0:root:/root:/bin/ion > /tmp/uniq_input\n",
+        "uniq fixture: write first root line",
+        "prompt after first uniq fixture line",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo root:x:0:0:root:/root:/bin/ion >> /tmp/uniq_input\n",
+        "uniq fixture: append second root line",
+        "prompt after second uniq fixture line",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin >> /tmp/uniq_input\n",
+        "uniq fixture: append daemon line",
+        "prompt after daemon uniq fixture line",
+        10,
+    ));
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/cat /etc/passwd /etc/passwd | /bin/sort | /bin/uniq -c\n",
+        input: "/bin/uniq -c /tmp/uniq_input\n",
         label: "uniq: count adjacent duplicates",
     });
     steps.push(SmokeStep::Wait {
@@ -3593,7 +3624,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
 
     if doom_wad_available {
         // -------------------------------------------------------------------
-        // 19. Phase 47 — run doom and capture debug output before crash
+        // 19. Phase 47 — run doom long enough to prove the WAD boots
         // -------------------------------------------------------------------
         steps.push(SmokeStep::Sleep { millis: 500 });
         steps.push(SmokeStep::Send {
@@ -3605,18 +3636,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
             pattern: "I_InitGraphics:",
             timeout_secs: 30,
             label: "doom: wait for graphics init",
-        });
-        // Capture the DBG line just before the crash
-        steps.push(SmokeStep::Wait {
-            pattern: "DBG W_CacheLumpNum:",
-            timeout_secs: 10,
-            label: "doom: capture W_CacheLumpNum debug trace",
-        });
-        // Wait for the shell prompt to return after crash
-        steps.push(SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 15,
-            label: "doom: prompt after crash",
         });
     }
 
@@ -5599,7 +5618,7 @@ fn run_smoke_steps_with_capture(
                     }
 
                     let stripped = strip_ansi(serial_buf);
-                    let cleaned = strip_kernel_logs(&stripped);
+                    let cleaned = strip_background_noise(&stripped);
 
                     // Check for kernel-level crash indicators in serial output.
                     // Only match ring-0 crashes, not handled ring-3 faults:
@@ -6065,6 +6084,13 @@ mod tests {
             .collect()
     }
 
+    fn send_input_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
+        steps.iter().find_map(|step| match step {
+            SmokeStep::Send { input, label } if *label == target_label => Some(*input),
+            _ => None,
+        })
+    }
+
     #[test]
     fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
@@ -6241,14 +6267,46 @@ mod tests {
 
     #[test]
     fn smoke_test_with_wad_uses_plain_doom_launch_command() {
-        let doom_launch = smoke_test_script(true).iter().find_map(|step| match step {
-            SmokeStep::Send { input, label } if *label == "doom: launch with iwad" => Some(*input),
-            _ => None,
-        });
+        let labels = smoke_step_labels(&smoke_test_script(true));
+        let doom_launch = send_input_for_label(&smoke_test_script(true), "doom: launch with iwad");
 
+        assert!(labels.contains(&"doom: wait for graphics init"));
+        assert!(!labels.contains(&"doom: capture W_CacheLumpNum debug trace"));
+        assert!(!labels.contains(&"doom: prompt after crash"));
         assert_eq!(
             doom_launch,
             Some("/bin/doom -iwad /usr/share/doom/doom1.wad\n")
         );
+    }
+
+    #[test]
+    fn smoke_test_uniq_step_uses_prebuilt_fixture_file() {
+        let uniq_input =
+            send_input_for_label(&smoke_test_script(true), "uniq: count adjacent duplicates");
+
+        assert_eq!(uniq_input, Some("/bin/uniq -c /tmp/uniq_input\n"));
+    }
+
+    #[test]
+    fn strip_background_noise_removes_kernel_and_init_service_lines() {
+        let input = concat!(
+            "root@m3os:/home/project# /bin/stat libutil.a\n",
+            "[INFO] [waitpid] pid 71 exited\n",
+            "init: service 'syslogd' exited (127)\n",
+            "init: restarting 'syslogd' (8/10)\n",
+            "  File: libutil.a\n",
+        );
+
+        assert_eq!(
+            strip_background_noise(input),
+            "root@m3os:/home/project# /bin/stat libutil.a\n  File: libutil.a\n"
+        );
+    }
+
+    #[test]
+    fn strip_background_noise_keeps_regular_userspace_output() {
+        let input = "init: configuration loaded from /etc/init.conf\n";
+
+        assert_eq!(strip_background_noise(input), input);
     }
 }
