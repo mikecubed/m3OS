@@ -2466,12 +2466,13 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
         return NEG_EINVAL;
     }
-    // Convert seconds+nsec to ticks using the current TICKS_PER_SEC constant.
-    let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
-        + (nsecs as u64) / (1_000_000_000 / TICKS_PER_SEC);
-    let start = crate::arch::x86_64::interrupts::tick_count();
+    let sleep_us = (secs as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((nsecs as u64) / 1_000);
+
     let pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
+
     // Always yield at least once so sub-1ms sleeps do not become tight
     // busy-spins that starve other tasks.
     crate::task::yield_now();
@@ -2479,11 +2480,37 @@ fn sys_nanosleep(req_ptr: u64) -> u64 {
     if has_pending_signal() {
         return NEG_EINTR;
     }
-    while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
-        crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
-        if has_pending_signal() {
-            return NEG_EINTR;
+
+    if sleep_us == 0 {
+        return 0;
+    }
+
+    let tsc_per_ms = crate::arch::x86_64::apic::tsc_per_ms();
+    if tsc_per_ms == 0 {
+        // TSC not yet calibrated — fall back to tick_count (coarse, 1ms res).
+        let ticks = (secs as u64).saturating_mul(TICKS_PER_SEC)
+            + (nsecs as u64) / (1_000_000_000 / TICKS_PER_SEC);
+        let start = crate::arch::x86_64::interrupts::tick_count();
+        while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            if has_pending_signal() {
+                return NEG_EINTR;
+            }
+        }
+    } else {
+        // TSC-based sleep: accurate on any CPU core because TSC is
+        // invariant and advances regardless of which core DOOM is on.
+        // This avoids the 10ms AP-timer-granularity problem where
+        // nanosleep(1ms) on an AP would sleep ~10ms.
+        let sleep_tsc = sleep_us.saturating_mul(tsc_per_ms) / 1_000;
+        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
+            crate::task::yield_now();
+            restore_caller_context(pid, saved_user_rsp);
+            if has_pending_signal() {
+                return NEG_EINTR;
+            }
         }
     }
     0

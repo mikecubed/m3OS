@@ -322,82 +322,65 @@ static uint32_t s_key_time[128];
  * DG_GetKey -- return one key event per call
  *
  * Design notes:
- *   • We loop internally on unknown / unmapped scancodes instead of
- *     returning 0, so that a 0xE0 extended prefix does not break the
- *     I_GetEvent drain loop and leave the following real scancode stuck
- *     in the ring buffer until the next tick.
- *   • 0xE0 prefix bytes: bit 7 is set (0xE0 = 1110_0000), so they are
- *     treated as break codes for make 0x60 — unknown, skipped.  The
- *     real key byte that follows is handled normally.
- *   • s_key_pressed[] de-duplicates PS/2 typematic repeats: a make code
- *     is only forwarded on the first occurrence; subsequent identical make
- *     codes (hardware auto-repeat) are silently discarded until the break
- *     code is seen.  This prevents a single tap from appearing as a held
- *     key when the game loop is slow.
+ *   • Single-pass: reads exactly ONE raw scancode per call (no internal
+ *     retry loop).  If the scancode is unknown or a typematic repeat,
+ *     we return 0 immediately.  DOOM's I_GetEvent drain loop will call
+ *     us again on the next tic, so unknown/extended prefix bytes are
+ *     naturally flushed one-per-tic rather than in a tight loop.
+ *
+ *   • 0xE0 extended prefix bytes: bit 7 is set (0xE0 = 1110_0000), so
+ *     they map to make 0x60 — unknown → return 0.  The real key byte
+ *     that follows is handled normally on the next call.
+ *
+ *   • s_key_pressed[] suppresses PS/2 typematic repeats (hardware
+ *     auto-repeat after hold delay).  Only the first make code is
+ *     forwarded; subsequent ones return 0 until the break arrives.
+ *
  *   • s_key_time[] enables stuck-key recovery: if a make arrives for a
- *     "currently pressed" key but STUCK_KEY_MS has elapsed since the last
- *     make for that key, the break was lost and we synthesize a release
- *     before re-issuing the key-down. ------------------------------------------------------------------------- */
+ *     key that has been "down" for over STUCK_KEY_MS without a break,
+ *     the break was likely lost and we synthesize a release.
+ * ------------------------------------------------------------------------- */
 
 int DG_GetKey(int *pressed, unsigned char *doomKey)
 {
-    while (1) {
-        long sc = syscall0(SYS_READ_SCANCODE);
-        if (sc == 0) return 0;   /* ring buffer empty */
+    long sc = syscall0(SYS_READ_SCANCODE);
+    if (sc == 0) return 0;   /* ring buffer empty */
 
-        uint8_t raw  = (uint8_t)(sc & 0xFF);
-        uint8_t make = raw & 0x7F;
-        unsigned char dk;
+    uint8_t raw  = (uint8_t)(sc & 0xFF);
+    uint8_t make = raw & 0x7F;
+    unsigned char dk;
 
-        if (!ps2_to_doom(make, &dk)) continue;   /* unknown key — drain & retry */
+    if (!ps2_to_doom(make, &dk)) return 0;   /* unknown / extended prefix */
 
-        if (raw & 0x80) {
-            /* break code (key-up) */
+    if (raw & 0x80) {
+        /* break code (key-up) */
+        s_key_pressed[make] = 0;
+        *pressed = 0;
+        *doomKey = dk;
+        return 1;
+    }
+
+    /* make code (key-down or typematic) */
+    uint32_t now = DG_GetTicksMs();
+    if (s_key_pressed[make]) {
+        if ((now - s_key_time[make]) >= STUCK_KEY_MS) {
+            /* Break code was lost — synthesize key-up to un-stick DOOM. */
             s_key_pressed[make] = 0;
             *pressed = 0;
             *doomKey = dk;
             return 1;
-        } else {
-            /* make code (key-down) */
-            uint32_t now = DG_GetTicksMs();
-            if (s_key_pressed[make]) {
-                /* Key is "currently down" — could be typematic repeat or a
-                 * stuck key (break code was lost during a hitch).
-                 *
-                 * Distinguish them with the timestamp:
-                 *   • If the key is genuinely held, the PS/2 hardware sends
-                 *     typematic make codes every ~33–100 ms after the initial
-                 *     500 ms delay.  These makes refresh s_key_time, so
-                 *     (now - s_key_time) stays well below STUCK_KEY_MS.
-                 *   • If the break code was lost (stuck key), no further makes
-                 *     arrive for that key until the user presses it again.
-                 *     s_key_time grows stale and (now - s_key_time) eventually
-                 *     exceeds STUCK_KEY_MS, triggering recovery.
-                 *
-                 * IMPORTANT: always refresh s_key_time even when discarding,
-                 * so that legitimate holds never false-trigger the recovery. */
-                if ((now - s_key_time[make]) >= STUCK_KEY_MS) {
-                    /* Stuck key detected: synthesize a key-up so DOOM clears
-                     * its internal gamekeys[] state.  The real key-down will
-                     * be delivered on the next DG_GetKey call (this scancode
-                     * is still in the caller's loop). */
-                    s_key_pressed[make] = 0;
-                    *pressed = 0;
-                    *doomKey = dk;
-                    return 1;
-                }
-                /* Typematic repeat within window — discard, but refresh time
-                 * so a legitimately-held key never trips the stuck-key check. */
-                s_key_time[make] = now;
-                continue;
-            }
-            s_key_pressed[make] = 1;
-            s_key_time[make]    = now;
-            *pressed = 1;
-            *doomKey = dk;
-            return 1;
         }
+        /* Typematic repeat: refresh timestamp and discard. */
+        s_key_time[make] = now;
+        return 0;
     }
+
+    /* Fresh key-down */
+    s_key_pressed[make] = 1;
+    s_key_time[make]    = now;
+    *pressed = 1;
+    *doomKey = dk;
+    return 1;
 }
 
 /* -------------------------------------------------------------------------
@@ -450,8 +433,16 @@ int main(int argc, char **argv)
 
     doomgeneric_Create(argc, argv);
 
-    for (;;)
+    /* Cap the frame rate to ~70 fps (14ms/frame).
+     * Without this, DOOM burns 100% CPU indefinitely, starving the
+     * scheduler and making nanosleep-based timing inaccurate. */
+    for (;;) {
+        uint32_t t0 = DG_GetTicksMs();
         doomgeneric_Tick();
+        uint32_t elapsed = DG_GetTicksMs() - t0;
+        if (elapsed < 14)
+            DG_SleepMs(14 - elapsed);
+    }
 
     return 0;
 }
