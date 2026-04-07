@@ -134,24 +134,39 @@ flowchart TD
     P34 --> P46
     P39 --> P46
 
-    %% Showcase phases
-    P12 --> P47["Phase 47<br/>DOOM"]
+    %% Shipped graphics proof phase
+    P9 --> P47["Phase 47<br/>DOOM"]
+    P12 --> P47
     P24 --> P47
-    P9 --> P47
-    P15 --> P48["Phase 48<br/>Mouse Input"]
-    P47 -.->|optional| P48
-    P15 --> P49["Phase 49<br/>Audio"]
-    P47 -.->|optional| P49
+    P46 --> P47
 
-    %% Cross-compiled runtimes
-    P36 --> P50["Phase 50<br/>Cross-Compiled Toolchains"]
-    P50 --> P51["Phase 51<br/>Networking and GitHub"]
-    P42 --> P51
-    P37 --> P51
-    P40 --> P51
-    P51 --> P52["Phase 52<br/>Node.js"]
-    P52 --> P53["Phase 53<br/>Claude Code"]
-    P50 --> P53
+    %% Convergence and release-critical phases
+    P46 --> P48["Phase 48<br/>Security Foundation"]
+    P48 --> P49["Phase 49<br/>Architectural Declaration"]
+    P49 --> P50["Phase 50<br/>IPC Completion"]
+    P46 --> P51["Phase 51<br/>Service Model Maturity"]
+    P50 --> P51
+    P51 --> P52["Phase 52<br/>First Service Extractions"]
+    P48 --> P53["Phase 53<br/>Headless Hardening"]
+    P51 --> P53
+    P52 --> P53
+    P52 --> P54["Phase 54<br/>Deep Serverization"]
+    P53 --> P54
+
+    %% Hardware, local-system, and release gate phases
+    P54 --> P55["Phase 55<br/>Hardware Substrate"]
+    P47 --> P56["Phase 56<br/>Display and Input Architecture"]
+    P55 --> P56
+    P56 --> P57["Phase 57<br/>Audio and Local Session"]
+    P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
+    P55 --> P58
+    P57 -.->|optional local-system branch| P58
+
+    %% Post-1.0 platform growth
+    P58 --> P59["Phase 59<br/>Cross-Compiled Toolchains"]
+    P59 --> P60["Phase 60<br/>Networking and GitHub"]
+    P60 --> P61["Phase 61<br/>Node.js"]
+    P61 --> P62["Phase 62<br/>Claude Code"]
 ```
 
 ## Milestone Summary
@@ -222,7 +237,7 @@ flowchart TD
 | 39 | Unix Domain Sockets | AF_UNIX stream/datagram, socketpair | Complete | `phase-39` | [Phase 39](./39-unix-domain-sockets.md) | [Tasks](./tasks/39-unix-domain-sockets-tasks.md) |
 | 40 | Threading | clone CLONE_THREAD, futex, TLS, thread groups | Complete | `phase-40` | [Phase 40](./40-threading-primitives.md) | [Tasks](./tasks/40-threading-primitives-tasks.md) |
 
-### Application Phases (planned)
+### Application Phases (complete)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
@@ -232,26 +247,45 @@ flowchart TD
 | 43a | Crash Diagnostics | Enriched panic/fault handlers, scheduler/fork/IPC assertions | Complete | `phase-43a` | [Phase 43a](./43a-crash-diagnostics.md) | [Tasks](./tasks/43a-crash-diagnostics-tasks.md) |
 | 43b | Kernel Trace Ring | Per-core lockless trace ring, auto-dump on crash, sys_ktrace | Complete | `phase-43b` | [Phase 43b](./43b-kernel-trace-ring.md) | [Tasks](./tasks/43b-kernel-trace-ring-tasks.md) |
 | 43c | Regression & Stress | xtask regression/stress commands, CI tiers, proptest/loom | Complete | `phase-43c` | [Phase 43c](./43c-regression-stress-ci.md) | [Tasks](./tasks/43c-regression-stress-ci-tasks.md) |
-| 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | In Progress | `phase-44` | [Phase 44](./44-rust-cross-compilation.md) | [Tasks](./tasks/44-rust-cross-compilation-tasks.md) |
+| 44 | Rust Cross-Compilation | Rust programs compiled on host run in the OS | Complete | `phase-44` | [Phase 44](./44-rust-cross-compilation.md) | [Tasks](./tasks/44-rust-cross-compilation-tasks.md) |
 | 45 | Ports System | Source-based package building and installation | Complete | `phase-45` | [Phase 45](./45-ports-system.md) | [Tasks](./tasks/45-ports-system-tasks.md) |
 | 46 | System Services | Service manager, syslog, cron, shutdown | Complete | `phase-46` | [Phase 46](./46-system-services.md) | [Tasks](./tasks/46-system-services-tasks.md) |
 
-### Showcase Phases (planned)
+### Graphics Proof Phase (complete)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 47 | DOOM | DOOM runs with framebuffer rendering and keyboard input | Complete | `phase-47` | [Phase 47](./47-doom.md) | [Tasks](./tasks/47-doom-tasks.md) |
-| 48 | Mouse Input | PS/2 mouse driver for graphical programs | Planned | `phase-48` | [Phase 48](./48-mouse-input.md) | *not yet created* |
-| 49 | Audio | Sound card driver (HDA/AC97) for audio output | Planned | `phase-49` | [Phase 49](./49-audio.md) | *not yet created* |
+| 47 | DOOM | A real full-screen graphical program runs and proves the graphics substrate under load | Complete | `phase-47` | [Phase 47](./47-doom.md) | [Tasks](./tasks/47-doom-tasks.md) |
 
-### Cross-Compiled Runtimes (planned)
+### Convergence and Release-Critical Phases (planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 50 | Cross-Compiled Toolchains | git, Python, Clang bundled on disk | Planned | `phase-50` | [Phase 50](./50-cross-compiled-toolchains.md) | *not yet created* |
-| 51 | Networking and GitHub | gh CLI, git HTTPS, DNS resolution | Planned | `phase-51` | [Phase 51](./51-networking-and-github.md) | *not yet created* |
-| 52 | Node.js | V8 + libuv runtime for JavaScript | Planned | `phase-52` | [Phase 52](./52-nodejs.md) | *not yet created* |
-| 53 | Claude Code | AI coding agent on m3OS | Planned | `phase-53` | [Phase 53](./53-claude-code.md) | *not yet created* |
+| 48 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Planned | `phase-48` | [Phase 48](./48-security-foundation.md) | Deferred until implementation planning |
+| 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Planned | `phase-49` | [Phase 49](./49-architectural-declaration.md) | Deferred until implementation planning |
+| 50 | IPC Completion | Finish capability grants, bulk data transport, and ring-3-safe service contracts | Planned | `phase-50` | [Phase 50](./50-ipc-completion.md) | Deferred until implementation planning |
+| 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | Planned | `phase-51` | [Phase 51](./51-service-model-maturity.md) | Deferred until implementation planning |
+| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-52` | [Phase 52](./52-first-service-extractions.md) | Deferred until implementation planning |
+| 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
+| 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
+
+### Hardware, Local-System, and Release Phases (planned)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 55 | Hardware Substrate | A narrow, real-hardware support story exists on a reference matrix | Planned | `phase-55` | [Phase 55](./55-hardware-substrate.md) | Deferred until implementation planning |
+| 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Planned | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | Deferred until implementation planning |
+| 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Planned | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | Deferred until implementation planning |
+| 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |
+
+### Post-1.0 Platform Growth (planned)
+
+| Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
+|---|---|---|---|---|---|---|
+| 59 | Cross-Compiled Toolchains | git, Python, and Clang are bundled as a supported post-1.0 developer-toolchain set | Planned | `phase-59` | [Phase 59](./59-cross-compiled-toolchains.md) | Deferred until implementation planning |
+| 60 | Networking and GitHub | Outbound developer workflows add DNS, HTTPS, git remotes, and GitHub CLI support | Planned | `phase-60` | [Phase 60](./60-networking-and-github.md) | Deferred until implementation planning |
+| 61 | Node.js | A supported Node.js and npm environment runs natively inside m3OS | Planned | `phase-61` | [Phase 61](./61-nodejs.md) | Deferred until implementation planning |
+| 62 | Claude Code | A modern CLI coding agent runs on the post-1.0 m3OS developer platform | Planned | `phase-62` | [Phase 62](./62-claude-code.md) | Deferred until implementation planning |
 
 ## Suggested Delivery Rhythm
 

@@ -1,212 +1,125 @@
 # Phase 47 - DOOM
 
+**Status:** Complete
+**Source Ref:** phase-47
+**Depends on:** Phase 9 (Framebuffer and Shell) ✅, Phase 12 (POSIX Compat) ✅, Phase 24 (Persistent Storage) ✅, Phase 46 (System Services) ✅
+**Builds on:** Uses the framebuffer, storage, and service baseline to prove that m3OS can host a real full-screen graphical program, while explicitly avoiding the mistake of treating one graphical app as the finished GUI architecture
+**Primary Components:** kernel/src/fb, kernel/src/arch/x86_64/syscall.rs, userspace graphics demo or DOOM port, xtask/src/main.rs, docs/09-framebuffer-and-shell.md
+
 ## Milestone Goal
 
-DOOM runs inside the OS. The shareware `doom1.wad` loads from disk, renders to the
-framebuffer, and accepts keyboard input for gameplay. This is the "it runs DOOM"
-milestone — the classic proof that a hobby OS has reached a meaningful level of
-capability.
+m3OS can run DOOM as a real full-screen graphical application. The game loads its WAD data from disk, renders through the framebuffer path, accepts keyboard input for gameplay, and returns the system to a usable administration path when it exits.
+
+## Why This Phase Exists
+
+The DOOM milestone is the classic proof that an OS has crossed out of the purely synthetic-demo stage and into "real program under real load" territory. It exercises framebuffer ownership, interactive input, timing, file I/O, memory behavior, asset packaging, and the practical problem of handing control back to the rest of the system when the program exits.
+
+This phase exists to provide that visible proof point without confusing it for the long-term GUI architecture. DOOM proves that graphical userspace is real; it does not solve composition, multiple windows, focus policy, or a desktop session model.
 
 ## Learning Goals
 
-- Understand what a real graphical application needs from the OS: raw framebuffer
-  access, input events, timing, and large file I/O.
-- Learn how the DOOM rendering pipeline works: BSP traversal, palette-indexed 320x200
-  software rendering, scaled blit to native resolution.
-- See how a minimal platform abstraction layer bridges a large C codebase to a new OS.
-- Experience porting a real program — the gap between "all syscalls pass tests" and
-  "a real program actually works" teaches more than any unit test.
+- Understand what a real graphical program needs from the OS beyond text output.
+- Learn how framebuffer access, timing, input events, and large file I/O interact in one concrete workload.
+- See how a thin platform layer such as `doomgeneric` bridges a larger C codebase to a new OS.
+- Understand why "it runs DOOM" is a useful milestone but not the same thing as a display server or desktop stack.
 
 ## Feature Scope
 
-### Kernel: Framebuffer Access Syscall
+### Framebuffer access contract
 
-The UEFI bootloader provides a raw pixel framebuffer (typically 1024x768 ARGB in QEMU
-GUI mode). Currently only the kernel can write to it. Expose it to userspace:
+Expose a durable userspace path for graphical rendering. That can be a device-style framebuffer contract or a similarly explicit transitional interface, but the phase must document how userspace gains framebuffer access and how the text console yields and recovers.
 
-**New syscall: `sys_framebuffer_info`**
-- Returns framebuffer metadata to userspace: base physical address, width, height,
-  pitch (bytes per row), bytes per pixel, pixel format (RGB/BGR).
-- Alternatively, implement as an ioctl on `/dev/fb0`.
+### Raw keyboard input for gameplay
 
-**New syscall: `sys_framebuffer_mmap`**
-- Maps the framebuffer physical pages into the calling process's address space.
-- Returns the virtual address of the mapped framebuffer.
-- Alternatively, extend `mmap()` to support mapping `/dev/fb0`.
+Provide the input path needed by DOOM without baking long-term window-system policy into the kernel. Keyboard support is the requirement for this phase; richer pointer-driven UI policy belongs later.
 
-**Dual-mode console:**
-- When a graphical program owns the framebuffer, the text console must yield.
-- On program exit, restore the text console.
-- Simplest approach: the graphical program takes over entirely; text console is
-  only available via serial or telnet.
+### `doomgeneric` or equivalent port
 
-### Kernel: Raw Keyboard Input
+Port DOOM through a small platform layer that maps m3OS framebuffer, timing, and input services to the game. The value of the phase comes from running a real program with real assets, not from a synthetic graphics test.
 
-The kernel captures PS/2 scancodes in a ring buffer (`SCANCODE_BUF` in `interrupts.rs`)
-but only delivers cooked terminal input to userspace. DOOM needs key-down/key-up events.
+### Asset packaging, launch, and recovery
 
-**New syscall: `sys_read_scancode`** (or `/dev/input` device)
-- Returns raw PS/2 scancodes (make/break codes).
-- Non-blocking: returns 0 if no scancode available.
-- DOOM's input loop polls this each frame.
+Integrate the WAD file and binary into the supported image/build flow, make startup from the normal system path explicit, and document how the operator returns to the shell or admin environment after exit or failure.
 
-**Scancode-to-key mapping:**
-- DOOM uses its own key mapping; just deliver raw scancodes.
-- Make codes (key down) and break codes (key up, 0x80 | make) are sufficient.
+## Critical and Non-Deferrable Items
 
-### Userspace: doomgeneric Platform Layer
-
-[doomgeneric](https://github.com/ozkl/doomgeneric) is a portable DOOM source port
-designed for exactly this use case. You implement 4 functions:
-
-```c
-void DG_Init();                          // open framebuffer, init input
-void DG_DrawFrame();                     // blit 320x200 → native framebuffer
-void DG_SleepMs(uint32_t ms);           // nanosleep wrapper
-uint32_t DG_GetTicksMs();               // gettimeofday wrapper
-```
-
-Plus input handling via `DG_GetKey()` which returns key events.
-
-**Platform implementation (~200 lines C):**
-1. `DG_Init()` — call `sys_framebuffer_info`, `sys_framebuffer_mmap`, set up scaling.
-2. `DG_DrawFrame()` — convert DOOM's 320x200 palette-indexed buffer to ARGB, scale
-   to native resolution, copy to mapped framebuffer.
-3. `DG_SleepMs()` — call `nanosleep()`.
-4. `DG_GetTicksMs()` — call `gettimeofday()`, convert to milliseconds.
-5. `DG_GetKey()` — call `sys_read_scancode()`, translate to DOOM key codes.
-
-### WAD File on Disk
-
-Place `doom1.wad` (shareware, ~4 MB) on the ext2 disk image at `/usr/share/doom/doom1.wad`.
-The game opens and reads it via standard `open()`/`read()`/`lseek()`.
-
-### Build Integration
-
-- Cross-compile doomgeneric with `musl-gcc -static`.
-- Add to the xtask build system alongside other C userspace programs.
-- Binary goes to `kernel/initrd/doom`.
-- Repo-backed DOOM engine fixes live in `userspace/doom/patches/` and are copied over
-  the upstream checkout during the xtask build.
-
-### Color Palette Conversion
-
-DOOM uses a 256-color palette (VGA palette from the WAD file). The framebuffer is
-32-bit ARGB. The platform layer must:
-1. Read the PLAYPAL lump from the WAD (768 bytes: 256 RGB triplets).
-2. Build a lookup table: `palette[256] → uint32_t ARGB`.
-3. In `DG_DrawFrame()`, convert each pixel: `fb[y * pitch + x] = palette[doom_buf[y * 320 + x]]`.
-
-### Scaling Strategy
-
-DOOM renders 320x200. Native framebuffer is likely 1024x768.
-
-**Option A: Nearest-neighbor 3x scale** → 960x600, centered in 1024x768.
-**Option B: 2x scale** → 640x400, centered.
-**Option C: Full-screen stretch** with integer scaling.
-
-Nearest-neighbor is simplest and preserves the pixel art aesthetic.
-
-## Prerequisites
-
-| Phase | Why needed |
+| Item | Why it cannot be deferred in this phase |
 |---|---|
-| Phase 9 (Framebuffer) | Framebuffer exists in kernel |
-| Phase 12 (POSIX Compat) | musl-linked C binary runs |
-| Phase 24 (Persistent Storage) | WAD file on ext2 disk |
+| Real DOOM or equivalent full-screen workload | The point is to validate the OS with a meaningful graphical program |
+| Documented framebuffer and input path | The milestone must teach how graphics access actually works |
+| Clean console handoff and recovery | Graphics takeover cannot strand the operator |
+
+## Evaluation Gate
+
+| Check | Required state before closing the phase | If missing, add it to this phase |
+|---|---|---|
+| Framebuffer baseline | The Phase 9 console/framebuffer path is stable enough for userspace handoff | Add missing framebuffer cleanup or handoff rules here |
+| Binary/runtime baseline | The Phase 12 userspace environment can run the chosen port correctly | Add missing userspace or ABI fixes required by the game |
+| Asset/storage baseline | The WAD and related assets load through the supported storage path | Add missing image-layout or file-loading work here |
+| Recovery baseline | The system can return to a usable admin path after exit or crash | Add missing session or supervisor cleanup needed for takeover/release |
+
+## Important Components and How They Work
+
+### Framebuffer userspace interface
+
+The framebuffer contract is the hardware-facing substrate for the game. It should tell the user program enough about dimensions, pitch, format, and ownership to render correctly while still leaving room for later display-service ownership.
+
+### Input and timing path
+
+DOOM needs immediate keyboard events and predictable timing. This phase should keep that interface focused on the game's needs and document where a later general input architecture will replace or subsume it.
+
+### Port and asset integration
+
+The port proves more than graphics. It validates that m3OS can package a larger application, load its assets from disk, and survive a real interactive workload end-to-end.
+
+## How This Builds on Earlier Phases
+
+- Builds directly on Phase 9's framebuffer console and Phase 12's ability to run real userspace binaries.
+- Reuses the Phase 24 storage story for WAD assets and the Phase 46 service/session baseline for startup and recovery.
+- Provides the graphics proof point that later display and local-session phases can build on without mistaking it for a full GUI model.
 
 ## Implementation Outline
 
-1. Implement `sys_framebuffer_info` syscall — return dimensions, pitch, pixel format.
-2. Implement `sys_framebuffer_mmap` syscall — map framebuffer into userspace.
-3. Implement `sys_read_scancode` syscall — return raw PS/2 scancodes.
-4. Clone doomgeneric source; write m3os platform layer (~200 lines).
-5. Cross-compile with `musl-gcc -static`; add to xtask build.
-6. Add `doom1.wad` to the ext2 disk image.
-7. Boot with `cargo xtask run-gui` and test.
-8. Tune scaling and input mapping.
-9. Screenshot the running game for the README.
+1. Define the documented userspace framebuffer and keyboard path used by the port.
+2. Implement or finish the platform layer for DOOM.
+3. Integrate the WAD and binary into the supported image/build flow.
+4. Validate launch, rendering, gameplay input, and exit/recovery behavior.
+5. Document what this phase proves and what it does not prove about the later GUI stack.
+
+## Learning Documentation Requirement
+
+- Create `docs/47-doom.md` using the aligned learning-doc template in `docs/appendix/doc-templates.md`.
+- Explain the framebuffer contract, input path, porting layer, WAD/asset story, and why DOOM is a bring-up milestone rather than a full GUI architecture.
+- Link the learning doc from `docs/README.md` when this phase lands.
+
+## Related Documentation and Version Updates
+
+- Update `docs/09-framebuffer-and-shell.md`, `docs/README.md`, and `docs/roadmap/README.md`.
+- Update `docs/evaluation/gui-strategy.md`, `docs/evaluation/usability-roadmap.md`, and `docs/evaluation/roadmap/R09-display-and-input-architecture.md`.
+- Update any build or image docs that describe graphical-mode boot, DOOM assets, or graphical program launch.
+- This phase ships as `0.47.0`; keep later release/version references aligned with that milestone.
 
 ## Acceptance Criteria
 
-- `doom` binary starts from the shell and displays the DOOM title screen.
-- The framebuffer shows the game at a playable resolution.
-- Keyboard input works: arrow keys move, Ctrl fires, Space opens doors, Enter selects menu items.
-- The game runs at a playable frame rate (15+ FPS).
-- WAD file loads from the ext2 disk without errors.
-- Exiting DOOM (quit menu or Ctrl-C) returns to the shell.
-- `cargo xtask run-gui` launches QEMU in GUI mode with the game playable.
-- The shareware episode (E1M1 through E1M8) is completable.
-
-## What We Had to Fix in Practice
-
-Getting DOOM to boot was only the first half of the work. The real bring-up effort
-was in making a large graphical userspace program behave correctly under QEMU:
-
-1. **Timing and frame pacing:** short sleeps and wall-clock timing were initially too
-   coarse during gameplay. The final implementation uses TSC-backed timekeeping in
-   `kernel/src/arch/x86_64/syscall.rs` so `gettimeofday()` and short `nanosleep()`
-   calls behave predictably enough for DOOM's 35 Hz tic model.
-2. **WAD file I/O pressure:** the shareware WAD exposed ext2 hot-path problems that
-   simpler workloads never hit. `kernel/src/fs/ext2.rs` now uses a larger block cache
-   and a `read_block_into_slice()` path to avoid extra allocation/copy work during
-   repeated WAD reads.
-3. **Hold-key freeze:** `userspace/doom/dg_m3os.c` originally returned `0` from
-   `DG_GetKey()` for filtered bytes such as PS/2 extended prefixes and typematic
-   repeats. DOOM interprets `0` as "queue empty", so input draining stopped early and
-   gameplay froze while a key was held. The final platform layer now drains filtered
-   bytes internally and only returns `0` when the raw queue is truly empty.
-4. **Stuck keys after release:** two separate release-path bugs had to be fixed.
-   `userspace/doom/patches/i_input.c` removes the upstream `I_GetEvent()` asymmetry
-   that stopped after the first key-up event, and
-   `kernel/src/arch/x86_64/interrupts.rs` now drains all pending i8042 bytes per
-   keyboard IRQ so extended break codes are not stranded behind a single-byte read.
-
-The important lesson from this phase is that "working syscalls" are not enough for a
-real program. Correctness had to be fixed at the actual producer/consumer boundaries,
-not by layering heuristic recovery on top of a broken input path.
-
-## What Still Needs Future Work
-
-Phase 47 is complete as a functional milestone, but a few follow-on items remain:
-
-- **Performance instrumentation:** the game works, but performance is still not where
-  we want it. Future work should start with real frame/tic/blit timing instrumentation
-  rather than more guesswork.
-- **Framebuffer optimization:** software blitting is still expensive in QEMU. Later
-  work should evaluate write-combining framebuffer mappings, smaller dirty-rectangle
-  blits, or a better scaler.
-- **Higher-level input devices:** Phase 47 deliberately uses raw PS/2 scancode polling.
-  Mouse input (Phase 48) and a more structured event interface are still ahead.
-- **Audio and richer presentation:** sound output, commercial WAD support, and more
-  polished graphics remain later-phase work.
+- DOOM or the chosen equivalent graphical workload launches from m3OS and renders through the documented framebuffer path.
+- The application loads its assets from the supported storage path without undocumented host-side tricks.
+- Interactive keyboard input works well enough for real use of the application.
+- Exiting or crashing the graphical program returns the system to a usable administration path.
+- The docs explicitly describe this milestone as a graphics proof point, not a complete GUI stack.
 
 ## Companion Task List
 
-- [Phase 47 Task List](./tasks/47-doom-tasks.md)
-- [Phase 47 Learning Doc](../47-doom.md)
+- [Phase 47 task list](./tasks/47-doom-tasks.md)
 
 ## How Real OS Implementations Differ
 
-Real systems provide standardized graphics APIs:
-- **Linux framebuffer** (`/dev/fb0`) with `fbdev` ioctls for mode setting.
-- **DRM/KMS** (Direct Rendering Manager / Kernel Mode Setting) for modern GPU access.
-- **X11/Wayland** compositing window managers for multi-application graphics.
-- **OpenGL/Vulkan** hardware-accelerated 3D rendering.
-- **ALSA/PulseAudio** for sound output.
-- **evdev** (`/dev/input/event*`) for unified input events (keyboard, mouse, gamepad).
-
-Our approach is much simpler: direct framebuffer mapping and raw scancodes. This is
-closer to how DOS DOOM originally worked — direct VGA memory access at segment 0xA000
-and BIOS keyboard interrupts.
+- Mature systems usually expose standardized graphics and input interfaces rather than one milestone app driving the first visible proof.
+- Real desktops rely on compositors, richer input stacks, audio, toolkit layers, and often hardware acceleration.
+- m3OS should use this phase to validate the substrate with a real workload, not to freeze the wrong long-term abstraction.
 
 ## Deferred Until Later
 
-- Sound output (PC speaker beeps, Sound Blaster emulation)
-- Mouse input (PS/2 mouse driver)
-- Network multiplayer (IPX/UDP)
-- Save games to persistent storage (could work already via file I/O)
-- DOOM II and commercial WAD support
-- Higher-resolution rendering (GZDoom-style)
+- Multi-application composition and windowing
+- Pointer-driven GUI policy
+- Audio output for the graphical session
 - Hardware-accelerated rendering
-- Window manager / compositor for multi-app graphics

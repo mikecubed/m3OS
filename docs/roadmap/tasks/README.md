@@ -114,6 +114,9 @@ flowchart TD
     P29 --> P43
     P27 --> P43
     P37 --> P43
+    P42 --> P43a["Phase 43a Tasks"]
+    P43a --> P43b["Phase 43b Tasks"]
+    P43a --> P43c["Phase 43c Tasks"]
     P12 --> P44["Phase 44 Tasks"]
     P24 --> P44
     P31 --> P45["Phase 45 Tasks"]
@@ -124,13 +127,10 @@ flowchart TD
     P24 --> P46
     P34 --> P46
     P39 --> P46
-
-    %% Cross-compiled runtimes
-    P36 --> P50["Phase 50 Tasks"]
-    P50 --> P51["Phase 51 Tasks"]
-    P42 --> P51
-    P51 --> P52["Phase 52 Tasks"]
-    P52 --> P53["Phase 53 Tasks"]
+    P9 --> P47["Phase 47 Tasks"]
+    P12 --> P47
+    P24 --> P47
+    P46 --> P47
 ```
 
 ## Task Documents
@@ -201,33 +201,38 @@ flowchart TD
 | 39 | Unix domain sockets (AF_UNIX) | Complete | `phase-39` | [Phase 39 Tasks](./39-unix-domain-sockets-tasks.md) |
 | 40 | Threading primitives (clone, futex, TLS) | Complete | `phase-40` | [Phase 40 Tasks](./40-threading-primitives-tasks.md) |
 
-### Application Phases (planned)
+### Application Phases (complete)
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 41 | Expanded coreutils (head, tail, sort, find, diff, ps) | Complete | `phase-41` | [Phase 41 Tasks](./41-expanded-coreutils-tasks.md) |
 | 42 | Crypto Primitives (RustCrypto crypto-lib) | Complete | `phase-42` | [Tasks](./42-crypto-primitives-tasks.md) |
-| 43 | SSH (sunset or Dropbear) | Planned | `phase-43` | *not yet created* |
-| 44 | Rust cross-compilation | Planned | `phase-44` | *not yet created* |
-| 45 | Ports system (source-based package building) | Planned | `phase-45` | *not yet created* |
-| 46 | System services (init, syslog, cron) | Planned | `phase-46` | *not yet created* |
+| 43 | SSH (sunset or Dropbear) | Complete | `phase-43` | [Tasks](./43-ssh-server-tasks.md) |
+| 43a | Crash diagnostics | Complete | `phase-43a` | [Tasks](./43a-crash-diagnostics-tasks.md) |
+| 43b | Kernel trace ring | Complete | `phase-43b` | [Tasks](./43b-kernel-trace-ring-tasks.md) |
+| 43c | Regression and stress | Complete | `phase-43c` | [Tasks](./43c-regression-stress-ci-tasks.md) |
+| 44 | Rust cross-compilation | Complete | `phase-44` | [Tasks](./44-rust-cross-compilation-tasks.md) |
+| 45 | Ports system (source-based package building) | Complete | `phase-45` | [Tasks](./45-ports-system-tasks.md) |
+| 46 | System services (init, syslog, cron) | Complete | `phase-46` | [Tasks](./46-system-services-tasks.md) |
 
-### Showcase Phases (planned)
-
-| Phase | Focus | Status | Source Ref | Task List |
-|---|---|---|---|---|
-| 47 | DOOM (framebuffer, raw input, doomgeneric port) | Planned | `phase-47` | *not yet created* |
-| 48 | Mouse input (PS/2 mouse driver) | Planned | `phase-48` | *not yet created* |
-| 49 | Audio output (HDA/AC97 sound card driver) | Planned | `phase-49` | *not yet created* |
-
-### Cross-Compiled Runtimes (planned)
+### Graphics Proof Phase (complete)
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
-| 50 | Cross-compiled toolchains (git, Python, Clang) | Planned | `phase-50` | *not yet created* |
-| 51 | Networking and GitHub (gh, git HTTPS, DNS) | Planned | `phase-51` | *not yet created* |
-| 52 | Node.js (V8 + libuv runtime) | Planned | `phase-52` | *not yet created* |
-| 53 | Claude Code (AI agent on m3OS) | Planned | `phase-53` | *not yet created* |
+| 47 | DOOM | Complete | `phase-47` | [Tasks](./47-doom-tasks.md) |
+
+### Future Task Docs
+Task docs for Phases **48 and later** are intentionally deferred until closer to implementation time.
+
+The main roadmap phases now define:
+
+- explicit evaluation gates
+- critical and non-deferrable items
+- learning-documentation requirements
+- related documentation / README update requirements
+
+When a future phase moves into active implementation planning, add its task doc in this
+directory using the phase task template from `docs/appendix/doc-templates.md`.
 
 ## Suggested Usage
 
