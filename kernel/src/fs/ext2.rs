@@ -24,9 +24,17 @@ use spin::Mutex;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of ext2 blocks held in the read cache.
-/// At 4 KiB per block this is a 4 MiB budget — enough to absorb most of a
-/// typical IWAD after the first pass, eliminating repeated VirtIO round-trips.
-const BLOCK_CACHE_MAX: usize = 1024;
+///
+/// 4096 entries × 4 KiB/block = 16 MiB budget.  This covers:
+///   - all userspace ELF binaries loaded at boot      (~400 blocks)
+///   - a full doom1.wad (4.2 MiB / 4 KiB ≈ 1031 blocks)
+///   - filesystem metadata (inodes, directories, etc.)
+///   - comfortable headroom for other games / large files
+///
+/// The kernel heap grows on demand up to 64 MiB, so 16 MiB of cache data is
+/// well within budget.  After the first cold pass all VirtIO round-trips for
+/// cached blocks are eliminated.
+const BLOCK_CACHE_MAX: usize = 4096;
 
 /// A mounted ext2 volume backed by virtio-blk sectors.
 pub struct Ext2Volume {
@@ -151,7 +159,53 @@ impl Ext2Volume {
         Ok(buf)
     }
 
-    /// Write an ext2 block to disk and invalidate the cache entry.
+    /// Copy exactly `dst.len()` bytes from `block_num[block_offset..]` into `dst`.
+    ///
+    /// Optimised for the file-data hot path:
+    /// - **Cache hit**: copies directly under the spinlock (no heap allocation).
+    /// - **Cache miss**: one allocation for the full block, VirtIO read, copy
+    ///   the requested slice into `dst`, then insert the full block into the cache.
+    ///
+    /// This eliminates the intermediate `Vec<u8>` that `read_block` would allocate
+    /// for each data block in `read_file_data`, halving the allocation/copy work on
+    /// the cache-warm path.
+    fn read_block_into_slice(
+        &self,
+        block_num: u32,
+        block_offset: usize,
+        dst: &mut [u8],
+    ) -> Result<(), Ext2Error> {
+        // Cache hit: copy directly under the spinlock — no heap allocation.
+        {
+            let cache = self.block_cache.lock();
+            if let Some(cached) = cache.get(&block_num) {
+                dst.copy_from_slice(&cached[block_offset..block_offset + dst.len()]);
+                return Ok(());
+            }
+        }
+
+        // Cache miss: read the full block from VirtIO-blk, cache it, then copy
+        // the requested slice into dst.
+        let mut block_buf = vec![0u8; self.block_size as usize];
+        crate::blk::read_sectors(
+            self.block_to_lba(block_num),
+            self.sectors_per_block as usize,
+            &mut block_buf,
+        )
+        .map_err(|_| Ext2Error::IoError)?;
+
+        dst.copy_from_slice(&block_buf[block_offset..block_offset + dst.len()]);
+
+        // Insert the full block into the cache (allocation already done above).
+        {
+            let mut cache = self.block_cache.lock();
+            if cache.len() < BLOCK_CACHE_MAX {
+                cache.insert(block_num, block_buf);
+            }
+        }
+        Ok(())
+    }
+
     fn write_block(&self, block_num: u32, data: &[u8]) -> Result<(), Ext2Error> {
         // Invalidate before write so stale data is never served.
         self.block_cache.lock().remove(&block_num);
@@ -317,9 +371,13 @@ impl Ext2Volume {
                 // Sparse hole: fill with zeros.
                 buf[bytes_read..bytes_read + copy_len].fill(0);
             } else {
-                let block_data = self.read_block(phys_block)?;
-                buf[bytes_read..bytes_read + copy_len]
-                    .copy_from_slice(&block_data[offset_in_block..offset_in_block + copy_len]);
+                // Use the zero-copy helper: copies directly from cache (or disk on miss)
+                // into the output slice without allocating an intermediate Vec.
+                self.read_block_into_slice(
+                    phys_block,
+                    offset_in_block,
+                    &mut buf[bytes_read..bytes_read + copy_len],
+                )?;
             }
 
             bytes_read += copy_len;
