@@ -1836,6 +1836,17 @@ enum SmokeStep {
     },
     /// Pause between steps.
     Sleep { millis: u64 },
+    /// Wait for either `pattern_a` or `pattern_b`. Injects `extra_steps_a`
+    /// if pattern_a matches, or `extra_steps_b` if pattern_b matches.
+    /// Used for first-boot vs. normal login branching.
+    WaitEither {
+        pattern_a: &'static str,
+        pattern_b: &'static str,
+        timeout_secs: u64,
+        label: &'static str,
+        extra_steps_a: &'static [SmokeStep],
+        extra_steps_b: &'static [SmokeStep],
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1979,24 +1990,28 @@ fn run_smoke_script(
     steps: &[SmokeStep],
     global_timeout: std::time::Duration,
 ) -> Result<(), String> {
+    use std::collections::VecDeque;
     let stdout = child.stdout.take().ok_or("no stdout pipe")?;
     let rx = spawn_serial_reader(stdout);
 
     let mut serial_buf = String::new();
     let global_start = std::time::Instant::now();
-    let total = steps.len();
+    // Use a queue so WaitEither can inject extra steps at the front.
+    let mut queue: VecDeque<&SmokeStep> = steps.iter().collect();
+    let mut step_num = 0usize;
 
-    for (i, step) in steps.iter().enumerate() {
+    while let Some(step) = queue.pop_front() {
+        step_num += 1;
         // Global timeout check.
         if global_start.elapsed() > global_timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "global timeout ({global_timeout:?}) exceeded at step {}/{}",
-                i + 1,
-                total
+                "global timeout ({global_timeout:?}) exceeded at step {}",
+                step_num
             ));
         }
+        let remaining = queue.len();
 
         match step {
             SmokeStep::Wait {
@@ -2004,12 +2019,7 @@ fn run_smoke_script(
                 timeout_secs,
                 label,
             } => {
-                println!(
-                    "[step {}/{}] wait: {label} ({}s)",
-                    i + 1,
-                    total,
-                    timeout_secs
-                );
+                println!("[step {}] wait: {label} ({}s)", step_num, timeout_secs);
                 let step_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
                 let global_deadline = global_start + global_timeout;
@@ -2100,11 +2110,10 @@ fn run_smoke_script(
                         let _ = child.wait();
                         let tail = tail_lines(&strip_ansi(&serial_buf), 50);
                         return Err(format!(
-                            "step {}/{} timed out: {label}\n\
+                            "step {} timed out: {label}\n\
                              expected pattern: \"{pattern}\"\n\
                              last serial output:\n{tail}",
-                            i + 1,
-                            total
+                            step_num
                         ));
                     }
 
@@ -2122,17 +2131,16 @@ fn run_smoke_script(
                             // subsequent steps would fail anyway.
                             let _ = child.wait();
                             let stripped = strip_ansi(&serial_buf);
-                            if stripped.contains(pattern) && i + 1 == total {
+                            if stripped.contains(pattern) && remaining == 0 {
                                 serial_buf.clear();
                                 break;
                             }
                             let tail = tail_lines(&stripped, 50);
                             return Err(format!(
-                                "QEMU exited while waiting for step {}/{}: {label}\n\
+                                "QEMU exited while waiting for step {}: {label}\n\
                                  expected pattern: \"{pattern}\"\n\
                                  last serial output:\n{tail}",
-                                i + 1,
-                                total
+                                step_num
                             ));
                         }
                     }
@@ -2150,21 +2158,118 @@ fn run_smoke_script(
             }
 
             SmokeStep::Send { input, label } => {
-                println!("[step {}/{}] send: {label}", i + 1, total);
+                println!("[step {}] send: {label}", step_num);
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
                     if stdin.write_all(input.as_bytes()).is_err() {
-                        return Err(format!("failed to send input at step {}: {label}", i + 1));
+                        return Err(format!(
+                            "failed to send input at step {}: {label}",
+                            step_num
+                        ));
                     }
                     let _ = stdin.flush();
                 } else {
-                    return Err(format!("no stdin pipe at step {}: {label}", i + 1));
+                    return Err(format!("no stdin pipe at step {}: {label}", step_num));
                 }
             }
 
             SmokeStep::Sleep { millis } => {
-                println!("[step {}/{}] sleep {}ms", i + 1, total, millis);
+                println!("[step {}] sleep {}ms", step_num, millis);
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
+            }
+
+            SmokeStep::WaitEither {
+                pattern_a,
+                pattern_b,
+                timeout_secs,
+                label,
+                extra_steps_a,
+                extra_steps_b,
+            } => {
+                println!(
+                    "[step {}] wait-either: {label} ({}s)",
+                    step_num, timeout_secs
+                );
+                let step_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                let matched_a;
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        let text = String::from_utf8_lossy(&chunk);
+                        serial_buf.push_str(&text);
+                    }
+                    let stripped = strip_ansi(&serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+                    if stripped.contains(pattern_a) || cleaned.contains(pattern_a) {
+                        matched_a = true;
+                        // Drain to last newline.
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        }
+                        break;
+                    }
+                    if stripped.contains(pattern_b) || cleaned.contains(pattern_b) {
+                        matched_a = false;
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        }
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                        return Err(format!(
+                            "step {} timed out: {label}\n\
+                             expected pattern_a: \"{pattern_a}\"\n\
+                             expected pattern_b: \"{pattern_b}\"\n\
+                             last serial output:\n{tail}",
+                            step_num
+                        ));
+                    }
+                    match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(chunk) => {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            let _ = child.wait();
+                            let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                            return Err(format!(
+                                "QEMU exited while waiting for step {}: {label}\n\
+                                 last serial output:\n{tail}",
+                                step_num
+                            ));
+                        }
+                    }
+                    if serial_buf.len() > 64 * 1024 {
+                        let mut cut = serial_buf.len() - 48 * 1024;
+                        while cut < serial_buf.len() && !serial_buf.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        serial_buf.drain(..cut);
+                    }
+                }
+                let inject = if matched_a {
+                    println!(
+                        "  -> matched pattern_a, injecting {} extra steps",
+                        extra_steps_a.len()
+                    );
+                    extra_steps_a
+                } else {
+                    println!(
+                        "  -> matched pattern_b, injecting {} extra steps",
+                        extra_steps_b.len()
+                    );
+                    extra_steps_b
+                };
+                for extra in inject.iter().rev() {
+                    queue.push_front(extra);
+                }
             }
         }
     }
@@ -2213,8 +2318,43 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     let mut steps = Vec::new();
 
     // -----------------------------------------------------------------------
-    // 1. Boot and login
+    // 1. Boot and login (handles both first-boot locked accounts and normal login)
     // -----------------------------------------------------------------------
+    // First-boot: account is locked (hash "!"), login prompts to set password.
+    // Normal boot: account has a password, login prompts for it.
+    // Both paths use "root" as the password.
+    const FIRST_BOOT_LOGIN: &[SmokeStep] = &[
+        SmokeStep::Send {
+            input: "root\n",
+            label: "set initial password",
+        },
+        SmokeStep::Wait {
+            pattern: "Retype password:",
+            timeout_secs: 10,
+            label: "wait for password confirmation prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "confirm initial password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for shell prompt after first-boot setup",
+        },
+    ];
+    const NORMAL_LOGIN: &[SmokeStep] = &[
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for shell prompt",
+        },
+    ];
+
     steps.push(SmokeStep::Wait {
         pattern: "login:",
         timeout_secs: 60,
@@ -2224,19 +2364,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         input: "rooo\x08t\n",
         label: "enter username with backspace correction",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "Password:",
+    // Branch: first-boot shows "Set password for" while normal login shows "Password:".
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "Set password for",
+        pattern_b: "Password:",
         timeout_secs: 10,
-        label: "wait for password prompt",
-    });
-    steps.push(SmokeStep::Send {
-        input: "root\n",
-        label: "enter password",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 30,
-        label: "wait for shell prompt",
+        label: "detect first-boot or normal login",
+        extra_steps_a: FIRST_BOOT_LOGIN,
+        extra_steps_b: NORMAL_LOGIN,
     });
 
     // Fork/wait regression: nested fork + pipe + waitpid flow that mirrors
@@ -5731,6 +5866,10 @@ fn run_smoke_steps_with_capture(
             SmokeStep::Sleep { millis } => {
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
+            SmokeStep::WaitEither { .. } => {
+                // WaitEither is only used by the smoke test runner, not the
+                // regression runner. If encountered here, treat as a no-op.
+            }
         }
     }
 
@@ -6096,7 +6235,9 @@ mod tests {
         steps
             .iter()
             .map(|step| match step {
-                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => *label,
+                SmokeStep::Wait { label, .. }
+                | SmokeStep::Send { label, .. }
+                | SmokeStep::WaitEither { label, .. } => *label,
                 SmokeStep::Sleep { .. } => "sleep",
             })
             .collect()
