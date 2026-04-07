@@ -623,7 +623,11 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     // Only the BSP increments the global tick counter. APs have their own
     // per-1ms LAPIC timers that drive the scheduler but must not skew the
     // global wall-clock tick count (which nanosleep and uptime rely on).
-    if crate::smp::is_bsp() {
+    //
+    // In PIC mode (no MADT / single-core), we are always the BSP and
+    // `is_bsp()` must not be called — it reads LAPIC MMIO which is not
+    // mapped when the APIC was never initialised.
+    if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     crate::task::signal_reschedule();
@@ -648,7 +652,7 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 //                   owns the framebuffer (FB_OWNER_PID == 0).
 //
 //   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
-//                   (sys_read_scancode syscall 0x1004).  Only populated when
+//                   (sys_read_scancode syscall 0x1007).  Only populated when
 //                   a process owns the framebuffer (FB_OWNER_PID != 0).
 //
 // Routing is done inside the IRQ handler so that the two consumers never

@@ -1,7 +1,7 @@
 # File-Backed mmap — Design and Implementation Plan
 
 **Type:** Appendix — kernel feature design  
-**Status:** Planned  
+**Status:** Partially implemented (Strategy A — eager loading)  
 **Depends on:** Phase 33 (buddy allocator, demand paging, mprotect/munmap) ✅  
 **Related:** Phase 47 (DOOM port) — identified WAD file mmap as root cause of zone pressure
 
@@ -9,28 +9,28 @@
 
 ## Background
 
-m3OS currently supports only anonymous `mmap` (`MAP_ANONYMOUS`). Any call to
-`mmap(fd, ...)` with a file descriptor returns `-EINVAL`. This means programs
-that rely on file-backed memory mappings — most notably DOOM (WAD loading),
-but also shared libraries, memory-mapped databases, and language runtimes —
-cannot use the OS-provided mmap fast path and must fall back to `read()`-based
-I/O combined with heap allocation.
+m3OS supports file-backed `mmap` via eager loading (Strategy A below). When a
+process calls `mmap(fd, len, prot, MAP_PRIVATE, offset)`, the kernel reads the
+file contents into freshly allocated frames and maps them into the caller's
+address space at `mmap` time. This is sufficient for WAD file loading, static
+data files, and other `MAP_PRIVATE | PROT_READ` use cases.
+
+Demand-paged file-backed mmap (Strategy B below) is not yet implemented.
 
 ### Impact on DOOM (the motivating case)
 
 DOOM's WAD loader in chocolate-doom/doomgeneric calls `mmap` on the opened WAD
-file to get a zero-copy pointer into the file data. When this succeeds,
-`lump->wad_file->mapped != NULL` and every lump access returns a pointer
-directly into the mapped region — **no zone allocation at all**.
+file to get a zero-copy pointer into the file data. With eager file-backed
+mmap in place, `lump->wad_file->mapped != NULL` and every lump access returns
+a pointer directly into the mapped region — **no zone allocation at all**.
 
-When mmap returns `MAP_FAILED` (as it does on m3OS today), every lump read
-instead calls `Z_Malloc` + `W_ReadLump`, feeding all 4 MB of WAD data through
-the 6 MB DOOM zone allocator. This causes excessive `PU_CACHE` eviction,
-contributes to null pointer crashes in status-bar rendering, and degrades
-overall game performance.
+Without file-backed mmap, every lump read instead calls `Z_Malloc` +
+`W_ReadLump`, feeding all 4 MB of WAD data through the 6 MB DOOM zone
+allocator. This causes excessive `PU_CACHE` eviction, contributes to null
+pointer crashes in status-bar rendering, and degrades overall game
+performance.
 
-The fix is not DOOM-specific — file-backed mmap is a POSIX primitive that
-many programs depend on.
+File-backed mmap is a POSIX primitive that many programs depend on.
 
 ---
 
@@ -62,7 +62,7 @@ processes mapping the same file.
 
 ### Two implementation strategies
 
-#### Strategy A — Eager loading (simpler, implement first)
+#### Strategy A — Eager loading (implemented ✅)
 
 When `mmap(fd, len, prot, MAP_PRIVATE, offset)` is called:
 
@@ -96,7 +96,7 @@ This is how Linux and every production OS implements mmap. It enables
 memory-mapped executables (the foundation for a dynamic linker), shared
 anonymous memory, and copy-on-write fork optimisation.
 
-**For the immediate DOOM fix, Strategy A is sufficient.** Strategy B is the
+**Strategy A is implemented and ships with Phase 47.** Strategy B is the
 right long-term design.
 
 ---
@@ -206,8 +206,8 @@ VMA, service the fault.
 
 ## Implementation Order
 
-1. **Strategy A (eager)** — implement first, unblocks DOOM and all
-   `MAP_PRIVATE | PROT_READ` use cases.
+1. **Strategy A (eager)** — ✅ implemented; ships with Phase 47. Unblocks
+   DOOM and all `MAP_PRIVATE | PROT_READ` use cases.
 2. **`MAP_SHARED` writeback** — needed for mmap-based IPC and databases.
 3. **Strategy B (demand paging)** — enables dynamic linking and efficient
    large-file access; requires page-fault handler VMA lookup.
