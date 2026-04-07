@@ -7393,10 +7393,16 @@ fn sys_framebuffer_mmap() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn sys_read_scancode() -> u64 {
+    let pid = crate::process::current_pid();
+    if crate::fb::fb_owner_pid() != pid {
+        return 0;
+    }
+
     // Use the dedicated raw/game-input ring buffer.  This buffer is only
     // populated by the keyboard IRQ handler when a process owns the
-    // framebuffer (FB_OWNER_PID != 0), ensuring the kbd_server never steals
-    // break codes that DOOM needs to detect key-up events.
+    // framebuffer and only readable by that same owner process, ensuring the
+    // kbd_server never steals break codes that DOOM needs to detect key-up
+    // events and that a non-owner cannot read another process's raw stream.
     match super::interrupts::read_raw_scancode() {
         Some(sc) => sc as u64,
         None => 0,

@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use kernel_core::input::{ScancodeRouter, ScancodeSink};
 use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -676,6 +677,7 @@ static SCANCODE_BUF_TAIL: AtomicUsize = AtomicUsize::new(0);
 static mut RAW_SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
 static RAW_SCANCODE_BUF_HEAD: AtomicUsize = AtomicUsize::new(0);
 static RAW_SCANCODE_BUF_TAIL: AtomicUsize = AtomicUsize::new(0);
+static RAW_INPUT_ROUTER: Mutex<ScancodeRouter> = Mutex::new(ScancodeRouter::new());
 
 /// Pop one scancode from the **TTY** ring buffer, or `None` if it is empty.
 #[allow(dead_code)]
@@ -693,6 +695,7 @@ pub fn read_scancode() -> Option<u8> {
 
 /// Pop one scancode from the **raw / game-input** ring buffer, or `None`.
 pub fn read_raw_scancode() -> Option<u8> {
+    let _guard = RAW_INPUT_ROUTER.lock();
     let head = RAW_SCANCODE_BUF_HEAD.load(Ordering::Acquire);
     let tail = RAW_SCANCODE_BUF_TAIL.load(Ordering::Acquire);
     if head == tail {
@@ -701,6 +704,13 @@ pub fn read_raw_scancode() -> Option<u8> {
     let byte = unsafe { RAW_SCANCODE_BUF[head] };
     RAW_SCANCODE_BUF_HEAD.store((head + 1) & (SCANCODE_BUF_SIZE - 1), Ordering::Release);
     Some(byte)
+}
+
+pub fn reset_raw_input_state() {
+    let mut router = RAW_INPUT_ROUTER.lock();
+    router.reset();
+    RAW_SCANCODE_BUF_HEAD.store(0, Ordering::Release);
+    RAW_SCANCODE_BUF_TAIL.store(0, Ordering::Release);
 }
 
 #[inline(always)]
@@ -735,17 +745,15 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // controller misbehaves.
     const MAX_DRAIN: usize = 16;
 
-    // Route to the appropriate ring buffer.
+    // Route each byte to the appropriate sink.
     //
-    // When a process owns the framebuffer it is running as the "active game"
-    // and needs exclusive, uncontested access to every scancode (especially
-    // break codes — losing a break code leaves a key stuck in DOOM).  We
-    // redirect to RAW_SCANCODE_BUF and skip the kbd_server notification so
-    // the two consumers never compete.
-    //
-    // When no process owns the framebuffer we use the normal TTY path.
-    let fb_owned = crate::fb::fb_owner_pid() != 0;
+    // Ownership can change while we are draining the i8042, so we re-check the
+    // framebuffer owner for every new sequence instead of snapshotting once per
+    // batch. Multi-byte prefixes (`0xE0`, `0xE1`) stay latched to the sink that
+    // received their first byte so an ownership handoff cannot split one
+    // extended scancode sequence across RAW_SCANCODE_BUF and SCANCODE_BUF.
     let mut got_tty_byte = false;
+    let mut raw_input_router = RAW_INPUT_ROUTER.lock();
 
     for _ in 0..MAX_DRAIN {
         let status = unsafe { status_port.read() };
@@ -754,25 +762,26 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
         }
         let scancode: u8 = unsafe { data_port.read() };
 
-        if fb_owned {
-            unsafe {
+        match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
+            ScancodeSink::Raw => unsafe {
                 push_to_buf(
                     (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
                     &RAW_SCANCODE_BUF_HEAD,
                     &RAW_SCANCODE_BUF_TAIL,
                     scancode,
                 );
+            },
+            ScancodeSink::Tty => {
+                unsafe {
+                    push_to_buf(
+                        (&raw mut SCANCODE_BUF).cast::<u8>(),
+                        &SCANCODE_BUF_HEAD,
+                        &SCANCODE_BUF_TAIL,
+                        scancode,
+                    );
+                }
+                got_tty_byte = true;
             }
-        } else {
-            unsafe {
-                push_to_buf(
-                    (&raw mut SCANCODE_BUF).cast::<u8>(),
-                    &SCANCODE_BUF_HEAD,
-                    &SCANCODE_BUF_TAIL,
-                    scancode,
-                );
-            }
-            got_tty_byte = true;
         }
     }
 

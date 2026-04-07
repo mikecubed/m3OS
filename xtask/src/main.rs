@@ -2196,7 +2196,7 @@ fn cmd_then_prompt(
 ///
 /// Replaces the Phase 31 smoke test with a more thorough script that validates
 /// the full userspace stack including new utilities and the make build tool.
-fn smoke_test_script() -> Vec<SmokeStep> {
+fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     let mut steps = Vec::new();
 
     // -----------------------------------------------------------------------
@@ -3591,32 +3591,34 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "doom: prompt after ls",
     });
 
-    // -----------------------------------------------------------------------
-    // 19. Phase 47 — run doom and capture debug output before crash
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
-    steps.push(SmokeStep::Send {
-        input: "/bin/doom -iwad /usr/share/doom/doom1.wad 2>&1\n",
-        label: "doom: launch with iwad, redirect stderr",
-    });
-    // Wait for I_InitGraphics to complete (proof WAD loaded OK)
-    steps.push(SmokeStep::Wait {
-        pattern: "I_InitGraphics:",
-        timeout_secs: 30,
-        label: "doom: wait for graphics init",
-    });
-    // Capture the DBG line just before the crash
-    steps.push(SmokeStep::Wait {
-        pattern: "DBG W_CacheLumpNum:",
-        timeout_secs: 10,
-        label: "doom: capture W_CacheLumpNum debug trace",
-    });
-    // Wait for the shell prompt to return after crash
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "doom: prompt after crash",
-    });
+    if doom_wad_available {
+        // -------------------------------------------------------------------
+        // 19. Phase 47 — run doom and capture debug output before crash
+        // -------------------------------------------------------------------
+        steps.push(SmokeStep::Sleep { millis: 500 });
+        steps.push(SmokeStep::Send {
+            input: "/bin/doom -iwad /usr/share/doom/doom1.wad\n",
+            label: "doom: launch with iwad",
+        });
+        // Wait for I_InitGraphics to complete (proof WAD loaded OK)
+        steps.push(SmokeStep::Wait {
+            pattern: "I_InitGraphics:",
+            timeout_secs: 30,
+            label: "doom: wait for graphics init",
+        });
+        // Capture the DBG line just before the crash
+        steps.push(SmokeStep::Wait {
+            pattern: "DBG W_CacheLumpNum:",
+            timeout_secs: 10,
+            label: "doom: capture W_CacheLumpNum debug trace",
+        });
+        // Wait for the shell prompt to return after crash
+        steps.push(SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 15,
+            label: "doom: prompt after crash",
+        });
+    }
 
     steps
 }
@@ -3644,6 +3646,10 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         let _ = fs::remove_file(&disk_img);
     }
     create_data_disk(uefi_image.parent().unwrap());
+    let doom_wad_available = host_has_doom_wad();
+    if !doom_wad_available {
+        println!("smoke-test: skipping DOOM launch validation (doom1.wad unavailable)");
+    }
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -3668,7 +3674,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         .spawn()
         .expect("failed to launch QEMU");
 
-    let steps = smoke_test_script();
+    let steps = smoke_test_script(doom_wad_available);
     let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
     let start = std::time::Instant::now();
 
@@ -4865,6 +4871,11 @@ fn populate_doom_files(part_path: &Path) {
     }
 }
 
+fn host_has_doom_wad() -> bool {
+    let root = workspace_root();
+    root.join("target/doom1.wad").exists() || root.join("doom1.wad").exists()
+}
+
 fn cmd_image(image_args: &ImageArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
@@ -6044,6 +6055,16 @@ mod tests {
         parts.iter().map(|part| part.to_string()).collect()
     }
 
+    fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
+        steps
+            .iter()
+            .map(|step| match step {
+                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => *label,
+                SmokeStep::Sleep { .. } => "sleep",
+            })
+            .collect()
+    }
+
     #[test]
     fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
@@ -6207,5 +6228,27 @@ mod tests {
         let mut kernel_bytes = Vec::new();
         kernel.read_to_end(&mut kernel_bytes).unwrap();
         assert_eq!(kernel_bytes, b"kernel-bytes");
+    }
+
+    #[test]
+    fn smoke_test_without_wad_skips_doom_launch_steps() {
+        let labels = smoke_step_labels(&smoke_test_script(false));
+
+        assert!(labels.contains(&"doom: list /bin directory"));
+        assert!(!labels.contains(&"doom: launch with iwad"));
+        assert!(!labels.contains(&"doom: wait for graphics init"));
+    }
+
+    #[test]
+    fn smoke_test_with_wad_uses_plain_doom_launch_command() {
+        let doom_launch = smoke_test_script(true).iter().find_map(|step| match step {
+            SmokeStep::Send { input, label } if *label == "doom: launch with iwad" => Some(*input),
+            _ => None,
+        });
+
+        assert_eq!(
+            doom_launch,
+            Some("/bin/doom -iwad /usr/share/doom/doom1.wad\n")
+        );
     }
 }

@@ -812,6 +812,7 @@ static CONSOLE_YIELDED: AtomicBool = AtomicBool::new(false);
 
 /// PID of the process that currently owns the raw framebuffer (0 = none).
 static FB_OWNER_PID: AtomicU32 = AtomicU32::new(0);
+const FB_OWNER_TRANSITIONING: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -957,6 +958,7 @@ pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
 /// atomic compare-and-swap ownership check.
 fn yield_console(owner_pid: u32) {
     FB_OWNER_PID.store(owner_pid, Ordering::Release);
+    crate::arch::x86_64::interrupts::reset_raw_input_state();
     let _guard = CONSOLE.lock();
     CONSOLE_YIELDED.store(true, Ordering::Release);
 }
@@ -970,6 +972,7 @@ fn yield_console(owner_pid: u32) {
 pub fn try_yield_console(owner_pid: u32) -> bool {
     match FB_OWNER_PID.compare_exchange(0, owner_pid, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => {
+            crate::arch::x86_64::interrupts::reset_raw_input_state();
             // Hold the console lock while flipping the flag so write_str
             // cannot slip through between the CAS and the flag transition.
             let _guard = CONSOLE.lock();
@@ -996,12 +999,18 @@ pub fn try_yield_console(owner_pid: u32) -> bool {
 /// Used to roll back `try_yield_console` when the framebuffer mapping fails
 /// after a successful CAS.  Does not clear the screen.
 pub fn release_console_claim(owner_pid: u32) {
-    // Only clear if we still own it (guard against accidental double-release).
     if FB_OWNER_PID
-        .compare_exchange(owner_pid, 0, Ordering::AcqRel, Ordering::Relaxed)
+        .compare_exchange(
+            owner_pid,
+            FB_OWNER_TRANSITIONING,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
         .is_ok()
     {
+        crate::arch::x86_64::interrupts::reset_raw_input_state();
         CONSOLE_YIELDED.store(false, Ordering::Release);
+        FB_OWNER_PID.store(0, Ordering::Release);
     }
 }
 
@@ -1031,6 +1040,8 @@ pub fn restore_console() {
         // screen.
         CONSOLE_YIELDED.store(false, Ordering::Release);
     } // ← lock drops here
+
+    crate::arch::x86_64::interrupts::reset_raw_input_state();
 
     // Clear ownership last: a concurrent try_yield_console sees owner != 0
     // until this point, preventing it from racing mid-restore and then having
