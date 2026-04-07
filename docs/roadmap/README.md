@@ -240,7 +240,7 @@ flowchart TD
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 47 | DOOM | DOOM runs with framebuffer rendering and keyboard input | Planned | `phase-47` | [Phase 47](./47-doom.md) | *not yet created* |
+| 47 | DOOM | DOOM runs with framebuffer rendering and keyboard input | Complete | `phase-47` | [Phase 47](./47-doom.md) | [Tasks](./tasks/47-doom-tasks.md) |
 | 48 | Mouse Input | PS/2 mouse driver for graphical programs | Planned | `phase-48` | [Phase 48](./48-mouse-input.md) | *not yet created* |
 | 49 | Audio | Sound card driver (HDA/AC97) for audio output | Planned | `phase-49` | [Phase 49](./49-audio.md) | *not yet created* |
 

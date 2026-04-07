@@ -48,6 +48,7 @@ userspace shell and programs.
 | [True SMP](./25-smp.md) | 35 | Per-core syscalls, priority scheduling, load balancing |
 | [Expanded Memory](./33-kernel-memory.md) | 36 | Demand paging, mprotect, large mmap, 1 GB RAM/disk |
 | [Crash Diagnostics](./43a-crash-diagnostics.md) | 43a | Enriched panic/fault handlers, scheduler/fork/IPC assertions |
+| [DOOM Port](./47-doom.md) | 47 | Framebuffer mapping, raw scancodes, doomgeneric integration, and real-world input/performance lessons |
 
 ### Roadmap
 

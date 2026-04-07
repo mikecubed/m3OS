@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
 use spin::Mutex;
 
@@ -805,6 +806,14 @@ impl FbConsole {
 
 static CONSOLE: Mutex<Option<FbConsole>> = Mutex::new(None);
 
+/// When `true`, framebuffer text output is suppressed (a graphical process owns
+/// the framebuffer directly).  Serial output is unaffected.
+static CONSOLE_YIELDED: AtomicBool = AtomicBool::new(false);
+
+/// PID of the process that currently owns the raw framebuffer (0 = none).
+static FB_OWNER_PID: AtomicU32 = AtomicU32::new(0);
+const FB_OWNER_TRANSITIONING: u32 = u32::MAX;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -901,7 +910,147 @@ pub fn console_text_size() -> Option<(u16, u16)> {
 ///
 /// Does nothing if [`init`] has not been called yet.
 pub fn write_str(s: &str) {
-    if let Some(ref mut console) = *CONSOLE.lock() {
+    // Fast path: skip taking the lock if the console is clearly yielded.
+    if CONSOLE_YIELDED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut guard = CONSOLE.lock();
+    // Re-check under the lock: serializes with try_yield_console's
+    // lock-guarded flag transition so a yield cannot slip between our
+    // pre-check above and the framebuffer write below.
+    if CONSOLE_YIELDED.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(ref mut console) = *guard {
         console.write_str(s);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 47: framebuffer info helpers and console yield/restore
+// ---------------------------------------------------------------------------
+
+/// Returns `(width, height, stride, bytes_per_pixel, pixel_format)` or `None`
+/// if the framebuffer console has not been initialised.
+pub fn framebuffer_raw_info() -> Option<(usize, usize, usize, usize, PixelFormat)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| {
+        (
+            c.width,
+            c.height,
+            c.stride,
+            c.bytes_per_pixel,
+            c.pixel_format,
+        )
+    })
+}
+
+/// Returns `(buf_virt_addr, byte_len)` of the raw framebuffer, or `None`.
+pub fn framebuffer_buf_addr() -> Option<(u64, usize)> {
+    let guard = CONSOLE.lock();
+    guard.as_ref().map(|c| (c.buf as u64, c.byte_len))
+}
+
+/// Suppresses all framebuffer console output.
+///
+/// For internal use only.  External callers that need to claim the
+/// framebuffer should use [`try_yield_console`] which performs an
+/// atomic compare-and-swap ownership check.
+fn yield_console(owner_pid: u32) {
+    FB_OWNER_PID.store(owner_pid, Ordering::Release);
+    crate::arch::x86_64::interrupts::reset_raw_input_state();
+    let _guard = CONSOLE.lock();
+    CONSOLE_YIELDED.store(true, Ordering::Release);
+}
+
+/// Atomically claim the framebuffer for `owner_pid` using compare-and-swap,
+/// then suppress console text output.
+///
+/// Returns `true` if the framebuffer was unowned (CAS succeeded) or is already
+/// owned by `owner_pid` (re-entrant call).  Returns `false` if another process
+/// owns it — caller should return `EBUSY` without doing any mapping.
+pub fn try_yield_console(owner_pid: u32) -> bool {
+    match FB_OWNER_PID.compare_exchange(0, owner_pid, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            crate::arch::x86_64::interrupts::reset_raw_input_state();
+            // Hold the console lock while flipping the flag so write_str
+            // cannot slip through between the CAS and the flag transition.
+            let _guard = CONSOLE.lock();
+            CONSOLE_YIELDED.store(true, Ordering::Release);
+            true
+        }
+        Err(current) if current == owner_pid => {
+            // Re-entrant: we already own the FB.  The original claim may still
+            // be waiting to acquire CONSOLE before setting CONSOLE_YIELDED=true,
+            // so ensure the flag is set before we return to avoid a window where
+            // write_str observes CONSOLE_YIELDED=false while we're the owner.
+            if !CONSOLE_YIELDED.load(Ordering::Acquire) {
+                let _guard = CONSOLE.lock();
+                CONSOLE_YIELDED.store(true, Ordering::Release);
+            }
+            true
+        }
+        Err(_) => false, // owned by another process
+    }
+}
+
+/// Release a previously claimed console ownership without a full restore.
+///
+/// Used to roll back `try_yield_console` when the framebuffer mapping fails
+/// after a successful CAS.  Does not clear the screen.
+pub fn release_console_claim(owner_pid: u32) {
+    if FB_OWNER_PID
+        .compare_exchange(
+            owner_pid,
+            FB_OWNER_TRANSITIONING,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        crate::arch::x86_64::interrupts::reset_raw_input_state();
+        CONSOLE_YIELDED.store(false, Ordering::Release);
+        FB_OWNER_PID.store(0, Ordering::Release);
+    }
+}
+
+/// Restores framebuffer console output after a graphical process exits.
+///
+/// Clears the framebuffer and resets the owner PID.  The console lock is held
+/// throughout the clear so no writer can sneak in between the flag flip and the
+/// clear and have its output immediately wiped.
+///
+/// `FB_OWNER_PID` is cleared **last** — after `CONSOLE_YIELDED` is already
+/// false and the lock is dropped — so `try_yield_console` cannot win the CAS
+/// while the restore is still in progress (the CAS requires owner == 0).
+pub fn restore_console() {
+    // Hold the lock while clearing so no concurrent writer observes
+    // CONSOLE_YIELDED = false and starts writing before the clear completes.
+    {
+        let mut guard = CONSOLE.lock();
+        if let Some(ref mut console) = *guard {
+            let rows = console.rows();
+            let cols = console.cols();
+            if rows > 0 && cols > 0 {
+                console.clear_region(0, 0, cols, rows);
+            }
+        }
+        // Flip the flag only after the clear is done and while we still hold
+        // the lock, so the first write after restore sees a freshly-cleared
+        // screen.
+        CONSOLE_YIELDED.store(false, Ordering::Release);
+    } // ← lock drops here
+
+    crate::arch::x86_64::interrupts::reset_raw_input_state();
+
+    // Clear ownership last: a concurrent try_yield_console sees owner != 0
+    // until this point, preventing it from racing mid-restore and then having
+    // CONSOLE_YIELDED overwritten back to false by this function.
+    FB_OWNER_PID.store(0, Ordering::Release);
+}
+
+/// Returns the PID of the process currently owning the raw framebuffer
+/// (0 = no owner).
+pub fn fb_owner_pid() -> u32 {
+    FB_OWNER_PID.load(Ordering::Acquire)
 }

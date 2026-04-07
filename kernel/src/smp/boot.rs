@@ -529,7 +529,10 @@ fn ap_lapic_init_from(lapic_base: usize, tpm: u32) {
         core::ptr::write_volatile((lapic_base + 0x0F0) as *mut u32, spur | 0x1FF);
         core::ptr::write_volatile((lapic_base + 0x080) as *mut u32, 0); // TPR = 0
 
-        // LAPIC timer: periodic, vector 32, 10 ms period.
+        // LAPIC timer: periodic, vector 32, 10 ms period for APs.
+        // APs do not drive the global tick counter (only BSP does), so a
+        // coarser 10 ms quantum is sufficient to yield stalled tasks without
+        // flooding the system with timer interrupts.
         core::ptr::write_volatile((lapic_base + 0x320) as *mut u32, 32 | (1 << 17));
         core::ptr::write_volatile((lapic_base + 0x3E0) as *mut u32, 0x03); // divide-by-16
         let init_count = (tpm as u64 * 10).min(u32::MAX as u64) as u32;

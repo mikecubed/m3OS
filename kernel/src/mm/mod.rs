@@ -291,6 +291,11 @@ pub fn free_process_page_table(cr3_phys: u64) {
         !flags.contains(PageTableFlags::HUGE_PAGE)
     }
     fn user_leaf(flags: PageTableFlags) -> bool {
+        // BIT_11 marks "device/hardware frame" (e.g. UEFI framebuffer) that
+        // must NOT be returned to the frame allocator on process teardown.
+        flags.contains(PageTableFlags::USER_ACCESSIBLE) && !flags.contains(PageTableFlags::BIT_11)
+    }
+    fn any_user(flags: PageTableFlags) -> bool {
         flags.contains(PageTableFlags::USER_ACCESSIBLE)
     }
 
@@ -326,11 +331,15 @@ pub fn free_process_page_table(cr3_phys: u64) {
 
                 for pt_phys in &pt_addrs {
                     let leaf_addrs = collect_children(phys_off, *pt_phys, 512, user_leaf);
-                    let has_user = !leaf_addrs.is_empty();
+                    // A PT that holds only BIT_11 (device-frame) entries still needs its
+                    // own frame freed — separate the "free leaves" predicate from the
+                    // "free this PT" predicate.
+                    let pt_has_user =
+                        !collect_children(phys_off, *pt_phys, 512, any_user).is_empty();
                     for leaf in &leaf_addrs {
                         frame_allocator::free_frame(*leaf);
                     }
-                    if has_user {
+                    if pt_has_user {
                         frame_allocator::free_frame(*pt_phys);
                     }
                 }

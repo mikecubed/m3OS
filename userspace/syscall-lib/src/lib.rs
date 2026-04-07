@@ -250,6 +250,15 @@ pub const SYS_MEMINFO: u64 = 0x1001;
 /// Custom kernel trace ring read syscall (Phase 43b).
 pub const SYS_KTRACE: u64 = 0x1002;
 
+/// Phase 47: framebuffer info syscall.
+pub const SYS_FRAMEBUFFER_INFO: u64 = 0x1005;
+
+/// Phase 47: framebuffer mmap syscall.
+pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
+
+/// Phase 47: raw scancode read syscall.
+pub const SYS_READ_SCANCODE: u64 = 0x1007;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -1287,6 +1296,34 @@ pub fn ktrace(core_id: u32, buf: &mut [u8]) -> u64 {
             buf.len() as u64,
         )
     }
+}
+
+/// Retrieves framebuffer metadata into `buf` (must be ≥ 20 bytes).
+/// Returns 0 on success, negative errno on failure.
+pub fn framebuffer_info(buf: &mut [u8]) -> isize {
+    unsafe {
+        syscall2(
+            SYS_FRAMEBUFFER_INFO,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as isize
+    }
+}
+
+/// Maps the framebuffer into the calling process's address space.
+///
+/// Returns the userspace virtual address of the mapped framebuffer on success.
+/// On error, returns a large `u64` encoding a negative errno (e.g.
+/// `(-22_i64) as u64` for EINVAL, `(-16_i64) as u64` for EBUSY).
+/// Callers should check `ret > u64::MAX - 4096` to detect error values.
+pub fn framebuffer_mmap() -> u64 {
+    unsafe { syscall0(SYS_FRAMEBUFFER_MMAP) }
+}
+
+/// Reads one raw PS/2 scancode from the keyboard ring buffer.
+/// Returns the scancode (0x01–0xFF), or 0 if no key is pending.
+pub fn read_scancode() -> u64 {
+    unsafe { syscall0(SYS_READ_SCANCODE) }
 }
 
 /// Write a string slice to a file descriptor.

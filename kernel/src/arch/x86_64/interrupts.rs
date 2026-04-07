@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use kernel_core::input::{ScancodeRouter, ScancodeSink};
 use spin::{Lazy, Mutex};
 use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -620,7 +621,16 @@ pub fn tick_count() -> u64 {
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Only the BSP increments the global tick counter. APs have their own
+    // per-1ms LAPIC timers that drive the scheduler but must not skew the
+    // global wall-clock tick count (which nanosleep and uptime rely on).
+    //
+    // In PIC mode (no MADT / single-core), we are always the BSP and
+    // `is_bsp()` must not be called — it reads LAPIC MMIO which is not
+    // mapped when the APIC was never initialised.
+    if !USING_APIC.load(Ordering::Relaxed) || crate::smp::is_bsp() {
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
     crate::task::signal_reschedule();
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
@@ -635,22 +645,41 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 // ---------------------------------------------------------------------------
 // Keyboard scancode ring buffer
 // ---------------------------------------------------------------------------
+//
+// There are TWO separate ring buffers:
+//
+//   SCANCODE_BUF  — normal TTY path; consumed by the kbd_server kernel task
+//                   via `read_scancode()`.  Only populated when no process
+//                   owns the framebuffer (FB_OWNER_PID == 0).
+//
+//   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
+//                   (sys_read_scancode syscall 0x1007).  Only populated when
+//                   a process owns the framebuffer (FB_OWNER_PID != 0).
+//
+// Routing is done inside the IRQ handler so that the two consumers never
+// compete for the same bytes.  Without this separation the kbd_server and the
+// game could both read from the same buffer; if the kbd_server stole a break
+// code the game would never see the key-up and the key would remain stuck.
 
-// Lock-free SPSC ring buffer: the keyboard IRQ is the sole producer (writes at
-// `tail`), and `read_scancode` is the sole consumer (reads at `head`).  Using a
-// plain `static mut` avoids any mutex in the IRQ path, eliminating the risk of
-// spinning forever if the consumer holds a lock when the IRQ fires.
-const SCANCODE_BUF_SIZE: usize = 64;
+const SCANCODE_BUF_SIZE: usize = 256;
 // Bitmask wraparound requires a power-of-two buffer size.
 const _: () = assert!(
     SCANCODE_BUF_SIZE.is_power_of_two(),
     "SCANCODE_BUF_SIZE must be a power of two for bitmask wraparound"
 );
+
+// TTY path buffer
 static mut SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
 static SCANCODE_BUF_HEAD: AtomicUsize = AtomicUsize::new(0);
 static SCANCODE_BUF_TAIL: AtomicUsize = AtomicUsize::new(0);
 
-/// Pop one scancode from the ring buffer, or `None` if it is empty.
+// Raw / game-input path buffer
+static mut RAW_SCANCODE_BUF: [u8; SCANCODE_BUF_SIZE] = [0u8; SCANCODE_BUF_SIZE];
+static RAW_SCANCODE_BUF_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RAW_SCANCODE_BUF_TAIL: AtomicUsize = AtomicUsize::new(0);
+static RAW_INPUT_ROUTER: Mutex<ScancodeRouter> = Mutex::new(ScancodeRouter::new());
+
+/// Pop one scancode from the **TTY** ring buffer, or `None` if it is empty.
 #[allow(dead_code)]
 pub fn read_scancode() -> Option<u8> {
     let head = SCANCODE_BUF_HEAD.load(Ordering::Acquire);
@@ -664,25 +693,102 @@ pub fn read_scancode() -> Option<u8> {
     Some(byte)
 }
 
+/// Pop one scancode from the **raw / game-input** ring buffer, or `None`.
+pub fn read_raw_scancode() -> Option<u8> {
+    let _guard = RAW_INPUT_ROUTER.lock();
+    let head = RAW_SCANCODE_BUF_HEAD.load(Ordering::Acquire);
+    let tail = RAW_SCANCODE_BUF_TAIL.load(Ordering::Acquire);
+    if head == tail {
+        return None;
+    }
+    let byte = unsafe { RAW_SCANCODE_BUF[head] };
+    RAW_SCANCODE_BUF_HEAD.store((head + 1) & (SCANCODE_BUF_SIZE - 1), Ordering::Release);
+    Some(byte)
+}
+
+pub fn reset_raw_input_state() {
+    let mut router = RAW_INPUT_ROUTER.lock();
+    router.reset();
+    RAW_SCANCODE_BUF_HEAD.store(0, Ordering::Release);
+    RAW_SCANCODE_BUF_TAIL.store(0, Ordering::Release);
+}
+
+#[inline(always)]
+unsafe fn push_to_buf(buf: *mut u8, head: &AtomicUsize, tail: &AtomicUsize, byte: u8) {
+    let t = tail.load(Ordering::Relaxed);
+    let next = (t + 1) & (SCANCODE_BUF_SIZE - 1);
+    if next != head.load(Ordering::Acquire) {
+        // Safety: caller guarantees `buf` points to a [u8; SCANCODE_BUF_SIZE]
+        // and that this is the sole writer (single-producer ISR context).
+        unsafe { buf.add(t).write(byte) };
+        tail.store(next, Ordering::Release);
+    }
+    // else: buffer full — silently drop (prefer losing a typematic repeat
+    // over blocking an interrupt handler).
+}
+
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
-    let mut port: Port<u8> = Port::new(0x60);
-    let scancode: u8 = unsafe { port.read() };
+    let mut data_port: Port<u8> = Port::new(0x60);
+    let mut status_port: Port<u8> = Port::new(0x64);
 
-    // Push scancode to the ring buffer for polling consumers.
-    let tail = SCANCODE_BUF_TAIL.load(Ordering::Relaxed);
-    let next_tail = (tail + 1) & (SCANCODE_BUF_SIZE - 1);
-    if next_tail != SCANCODE_BUF_HEAD.load(Ordering::Acquire) {
-        // Safety: single producer; tail is only advanced here and never overtakes head.
-        unsafe { SCANCODE_BUF[tail] = scancode };
-        SCANCODE_BUF_TAIL.store(next_tail, Ordering::Release);
+    // Drain all pending bytes from the i8042 output buffer.
+    //
+    // Extended scancodes (e.g. 0xE0 prefixed arrow keys) arrive as multi-byte
+    // sequences.  With edge-triggered IRQ delivery, reading only one byte per
+    // interrupt can strand the second byte of an extended break code until the
+    // next key event, making keys appear stuck.  We loop while the i8042
+    // status register's Output Buffer Full bit (bit 0) is set.
+    //
+    // A small iteration cap prevents pathological infinite loops if the
+    // controller misbehaves.
+    const MAX_DRAIN: usize = 16;
+
+    // Route each byte to the appropriate sink.
+    //
+    // Ownership can change while we are draining the i8042, so we re-check the
+    // framebuffer owner for every new sequence instead of snapshotting once per
+    // batch. Multi-byte prefixes (`0xE0`, `0xE1`) stay latched to the sink that
+    // received their first byte so an ownership handoff cannot split one
+    // extended scancode sequence across RAW_SCANCODE_BUF and SCANCODE_BUF.
+    let mut got_tty_byte = false;
+    let mut raw_input_router = RAW_INPUT_ROUTER.lock();
+
+    for _ in 0..MAX_DRAIN {
+        let status = unsafe { status_port.read() };
+        if status & 0x01 == 0 {
+            break; // output buffer empty — nothing left to read
+        }
+        let scancode: u8 = unsafe { data_port.read() };
+
+        match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
+            ScancodeSink::Raw => unsafe {
+                push_to_buf(
+                    (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
+                    &RAW_SCANCODE_BUF_HEAD,
+                    &RAW_SCANCODE_BUF_TAIL,
+                    scancode,
+                );
+            },
+            ScancodeSink::Tty => {
+                unsafe {
+                    push_to_buf(
+                        (&raw mut SCANCODE_BUF).cast::<u8>(),
+                        &SCANCODE_BUF_HEAD,
+                        &SCANCODE_BUF_TAIL,
+                        scancode,
+                    );
+                }
+                got_tty_byte = true;
+            }
+        }
     }
 
-    // Signal any notification object registered for IRQ1 (keyboard).
-    // This wakes a kernel task blocked in notification::wait() — the IPC-based
-    // IRQ delivery path used by kbd_server in Phase 7+.
-    crate::ipc::notification::signal_irq(1);
+    // Signal kbd_server once after draining the whole batch, not per byte.
+    if got_tty_byte {
+        crate::ipc::notification::signal_irq(1);
+    }
 
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();

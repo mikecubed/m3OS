@@ -85,7 +85,9 @@ The game opens and reads it via standard `open()`/`read()`/`lseek()`.
 
 - Cross-compile doomgeneric with `musl-gcc -static`.
 - Add to the xtask build system alongside other C userspace programs.
-- Binary goes to `kernel/initrd/doom.elf` or the ext2 disk image.
+- Binary goes to `kernel/initrd/doom`.
+- Repo-backed DOOM engine fixes live in `userspace/doom/patches/` and are copied over
+  the upstream checkout during the xtask build.
 
 ### Color Palette Conversion
 
@@ -136,9 +138,53 @@ Nearest-neighbor is simplest and preserves the pixel art aesthetic.
 - `cargo xtask run-gui` launches QEMU in GUI mode with the game playable.
 - The shareware episode (E1M1 through E1M8) is completable.
 
+## What We Had to Fix in Practice
+
+Getting DOOM to boot was only the first half of the work. The real bring-up effort
+was in making a large graphical userspace program behave correctly under QEMU:
+
+1. **Timing and frame pacing:** short sleeps and wall-clock timing were initially too
+   coarse during gameplay. The final implementation uses TSC-backed timekeeping in
+   `kernel/src/arch/x86_64/syscall.rs` so `gettimeofday()` and short `nanosleep()`
+   calls behave predictably enough for DOOM's 35 Hz tic model.
+2. **WAD file I/O pressure:** the shareware WAD exposed ext2 hot-path problems that
+   simpler workloads never hit. `kernel/src/fs/ext2.rs` now uses a larger block cache
+   and a `read_block_into_slice()` path to avoid extra allocation/copy work during
+   repeated WAD reads.
+3. **Hold-key freeze:** `userspace/doom/dg_m3os.c` originally returned `0` from
+   `DG_GetKey()` for filtered bytes such as PS/2 extended prefixes and typematic
+   repeats. DOOM interprets `0` as "queue empty", so input draining stopped early and
+   gameplay froze while a key was held. The final platform layer now drains filtered
+   bytes internally and only returns `0` when the raw queue is truly empty.
+4. **Stuck keys after release:** two separate release-path bugs had to be fixed.
+   `userspace/doom/patches/i_input.c` removes the upstream `I_GetEvent()` asymmetry
+   that stopped after the first key-up event, and
+   `kernel/src/arch/x86_64/interrupts.rs` now drains all pending i8042 bytes per
+   keyboard IRQ so extended break codes are not stranded behind a single-byte read.
+
+The important lesson from this phase is that "working syscalls" are not enough for a
+real program. Correctness had to be fixed at the actual producer/consumer boundaries,
+not by layering heuristic recovery on top of a broken input path.
+
+## What Still Needs Future Work
+
+Phase 47 is complete as a functional milestone, but a few follow-on items remain:
+
+- **Performance instrumentation:** the game works, but performance is still not where
+  we want it. Future work should start with real frame/tic/blit timing instrumentation
+  rather than more guesswork.
+- **Framebuffer optimization:** software blitting is still expensive in QEMU. Later
+  work should evaluate write-combining framebuffer mappings, smaller dirty-rectangle
+  blits, or a better scaler.
+- **Higher-level input devices:** Phase 47 deliberately uses raw PS/2 scancode polling.
+  Mouse input (Phase 48) and a more structured event interface are still ahead.
+- **Audio and richer presentation:** sound output, commercial WAD support, and more
+  polished graphics remain later-phase work.
+
 ## Companion Task List
 
-- Phase 47 Task List — *not yet created*
+- [Phase 47 Task List](./tasks/47-doom-tasks.md)
+- [Phase 47 Learning Doc](../47-doom.md)
 
 ## How Real OS Implementations Differ
 

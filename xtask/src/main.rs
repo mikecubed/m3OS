@@ -676,6 +676,243 @@ fn build_pdpmake() {
     println!("pdpmake: built → kernel/initrd/make");
 }
 
+/// Phase 47: Cross-compile doomgeneric + m3OS platform layer into a static DOOM binary.
+///
+/// Strategy: clone doomgeneric from GitHub into `target/doomgeneric-src/`, collect core engine
+/// `.c` files from `target/doomgeneric-src/doomgeneric/` (skipping platform-specific back-ends
+/// and standalone tools), add `userspace/doom/dg_m3os.c`, compile with
+/// `musl-gcc -static -O2`. Output: `kernel/initrd/doom`.
+///
+/// Gracefully creates an empty placeholder if musl-gcc is not available.
+fn build_doom() {
+    // Pinned upstream commit — update when pulling in doomgeneric changes.
+    // Commit date: 2026-03-28  "__bool_true_false_are_defined handling"
+    // Repo: https://github.com/ozkl/doomgeneric
+    const DOOMGENERIC_COMMIT: &str = "3b1d53020373b502035d7d48dede645a7c429feb";
+
+    let root = workspace_root();
+    let initrd = root.join("kernel/initrd");
+    let doom_bin = initrd.join("doom");
+
+    let commit_stamp = initrd.join("doom.commit");
+    let cached_commit = fs::read_to_string(&commit_stamp).unwrap_or_default();
+
+    // Cache hit: non-empty binary AND it was built from the current pinned commit.
+    // When DOOMGENERIC_COMMIT changes the stamp mismatch forces a rebuild.
+    if doom_bin.exists()
+        && doom_bin.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && cached_commit.trim() == DOOMGENERIC_COMMIT
+    {
+        println!(
+            "doom: using cached {} (commit {})",
+            doom_bin.display(),
+            DOOMGENERIC_COMMIT
+        );
+        return;
+    }
+
+    // Clone doomgeneric source and pin to the known-good commit.
+    let dg_src = root.join("target/doomgeneric-src");
+    if !dg_src.join("doomgeneric").join("doomgeneric.c").exists() {
+        println!("doom: cloning doomgeneric (full history) for commit {DOOMGENERIC_COMMIT}...");
+        let _ = fs::remove_dir_all(&dg_src);
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "https://github.com/ozkl/doomgeneric.git",
+                dg_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for doomgeneric");
+        if !status.success() {
+            eprintln!("warning: failed to clone doomgeneric — creating empty placeholder");
+            if !doom_bin.exists() {
+                fs::write(&doom_bin, b"").unwrap();
+            }
+            return;
+        }
+    }
+
+    // Always enforce the pinned commit — even in a cached clone.
+    // This guards against stale caches and DOOMGENERIC_COMMIT changes.
+    println!("doom: ensuring doomgeneric is at pinned commit {DOOMGENERIC_COMMIT}...");
+    let checkout = Command::new("git")
+        .args([
+            "-C",
+            dg_src.to_str().unwrap(),
+            "checkout",
+            "--force",
+            DOOMGENERIC_COMMIT,
+        ])
+        .status()
+        .expect("failed to run git checkout for doomgeneric");
+    if !checkout.success() {
+        // The cached clone may be shallow or corrupted — self-heal by
+        // deleting it and re-cloning before retrying.
+        eprintln!("doom: checkout failed — re-cloning doomgeneric to recover...");
+        let _ = fs::remove_dir_all(&dg_src);
+        let reclone = Command::new("git")
+            .args([
+                "clone",
+                "https://github.com/ozkl/doomgeneric.git",
+                dg_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run git clone for doomgeneric recovery");
+        if !reclone.success() {
+            eprintln!("doom: re-clone failed — aborting build");
+            if !doom_bin.exists() {
+                let _ = fs::write(&doom_bin, b"");
+            }
+            return;
+        }
+        let retry = Command::new("git")
+            .args([
+                "-C",
+                dg_src.to_str().unwrap(),
+                "checkout",
+                "--force",
+                DOOMGENERIC_COMMIT,
+            ])
+            .status()
+            .expect("failed to run git checkout for doomgeneric recovery");
+        if !retry.success() {
+            eprintln!("doom: checkout still failed after re-clone — aborting build");
+            if !doom_bin.exists() {
+                let _ = fs::write(&doom_bin, b"");
+            }
+            return;
+        }
+    }
+
+    // Collect core engine .c files — skip all platform-specific implementations.
+    // The doomgeneric repo bundles SDL, Allegro, X11, Windows, etc. back-ends;
+    // we only want the engine core and will provide our own dg_m3os.c.
+    //
+    // Excluded patterns:
+    //   doomgeneric_*.c  — alternative platform back-ends (SDL, xlib, win, …)
+    //   i_sdl*.c         — SDL audio/music drivers
+    //   i_allegro*.c     — Allegro audio/music drivers
+    //   mus2mid.c        — standalone tool with its own main()
+    let dg_game_src = dg_src.join("doomgeneric");
+
+    // Apply local patches — copy any files from userspace/doom/patches/ into
+    // the doomgeneric source tree, overwriting the upstreamed originals.
+    // This runs after git checkout so our patches survive the forced reset.
+    let patches_dir = root.join("userspace/doom/patches");
+    if patches_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&patches_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.extension().is_some_and(|e| e == "c" || e == "h") {
+                    let dst = dg_game_src.join(src.file_name().unwrap());
+                    fs::copy(&src, &dst).unwrap_or_else(|e| {
+                        eprintln!(
+                            "doom: failed to apply patch {:?}: {e}",
+                            src.file_name().unwrap()
+                        );
+                        0
+                    });
+                    println!(
+                        "doom: applied patch {}",
+                        src.file_name().unwrap().to_str().unwrap_or("?")
+                    );
+                }
+            }
+        }
+    }
+
+    let mut c_files: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dg_game_src) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "c") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_str().unwrap_or("");
+            // Skip platform-specific back-ends and standalone tools.
+            if name.starts_with("doomgeneric_")
+                || name.starts_with("i_sdl")
+                || name.starts_with("i_allegro")
+                || name == "mus2mid.c"
+            {
+                continue;
+            }
+            c_files.push(path.to_str().unwrap().to_string());
+        }
+    }
+
+    c_files.sort(); // deterministic build order
+    if c_files.is_empty() {
+        eprintln!("warning: no .c files found in doomgeneric source — creating empty placeholder");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    // Add the m3OS platform layer.
+    let platform = root.join("userspace/doom/dg_m3os.c");
+    if platform.exists() {
+        c_files.push(platform.to_str().unwrap().to_string());
+    } else {
+        eprintln!("warning: userspace/doom/dg_m3os.c not found — creating empty placeholder");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    // Detect musl cross-compiler.
+    let cc = if Command::new("x86_64-linux-musl-gcc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        "x86_64-linux-musl-gcc"
+    } else {
+        "musl-gcc"
+    };
+
+    // Include path: point to the doomgeneric source so dg_m3os.c can
+    // `#include "doomgeneric/doomgeneric.h"` via the cloned source.
+    // Disable optional SDL audio (FEATURE_SOUND) — m3OS has no audio yet.
+    let mut args = vec![
+        "-static".to_string(),
+        "-O2".to_string(),
+        format!("-I{}", dg_src.to_str().unwrap()),
+        "-UFEATURE_SOUND".to_string(),
+    ];
+    args.extend(c_files);
+    args.push("-o".to_string());
+    args.push(doom_bin.to_str().unwrap().to_string());
+
+    let status = match Command::new(cc).args(&args).status() {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("warning: {cc} not found — skipping doom build");
+            if !doom_bin.exists() {
+                fs::write(&doom_bin, b"").unwrap();
+            }
+            return;
+        }
+        Err(e) => panic!("failed to run {cc} for doom: {e}"),
+    };
+    if !status.success() {
+        eprintln!("warning: doom build failed");
+        if !doom_bin.exists() {
+            fs::write(&doom_bin, b"").unwrap();
+        }
+        return;
+    }
+
+    println!("doom: built → kernel/initrd/doom");
+    // Record the commit so future runs can validate the binary cache.
+    let _ = fs::write(initrd.join("doom.commit"), DOOMGENERIC_COMMIT);
+}
+
 /// Phase 31: Cross-compile TCC for x86-64 Linux with musl (static binary).
 ///
 /// Strategy: clone TCC source from repo.or.cz (or use cached clone in
@@ -1030,6 +1267,8 @@ fn build_kernel() -> PathBuf {
     build_pdpmake();
     // Phase 45: fetch port sources for bundling into the disk image.
     fetch_port_sources();
+    // Phase 47: cross-compile DOOM.
+    build_doom();
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -1206,6 +1445,7 @@ fn cmd_check() {
     build_musl_rust_bins();
     build_ion();
     build_pdpmake();
+    build_doom();
 
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1631,17 +1871,30 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
     })
 }
 
-/// Strip lines containing kernel log tags from serial output.
+/// Strip background noise lines from serial output.
 ///
-/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the
-/// same serial port as userspace output.  When a tag appears mid-line (the
-/// kernel interrupted a userspace write), the entire line is corrupted and
-/// must be discarded to avoid false pattern matches.
+/// The kernel's `log` crate emits lines like `[INFO] [p3] fork()` on the same
+/// serial port as userspace output. PID 1 also writes service lifecycle chatter
+/// such as `init: restarting 'syslogd' (2/10)` to that same serial stream.
+/// When either class of message lands mid-line, the entire line is corrupted
+/// and must be discarded to avoid false pattern matches.
 ///
 /// Operates line-by-line: any line containing a recognised tag is removed.
-/// Tags recognised: `[INFO]`, `[DEBUG]`, `[WARN]`, `[ERROR]`, `[TRACE]`.
-fn strip_kernel_logs(input: &str) -> String {
-    const TAGS: &[&str] = &["[INFO]", "[DEBUG]", "[WARN]", "[ERROR]", "[TRACE]"];
+/// Tags recognised: kernel log levels and init service lifecycle prefixes.
+fn strip_background_noise(input: &str) -> String {
+    const TAGS: &[&str] = &[
+        "[INFO]",
+        "[DEBUG]",
+        "[WARN]",
+        "[ERROR]",
+        "[TRACE]",
+        "init: starting '",
+        "init: started '",
+        "init: service '",
+        "init: restarting '",
+        "init: execve failed for '",
+        "init: session ended, respawning login...",
+    ];
 
     let mut out = String::with_capacity(input.len());
     for line in input.split_inclusive('\n') {
@@ -1780,7 +2033,7 @@ fn run_smoke_script(
                     let (search_str, used_cleaned) = if stripped.contains(pattern) {
                         (&stripped, false)
                     } else {
-                        cleaned = strip_kernel_logs(&stripped);
+                        cleaned = strip_background_noise(&stripped);
                         if cleaned.contains(pattern) {
                             (&cleaned, true)
                         } else {
@@ -1956,7 +2209,7 @@ fn cmd_then_prompt(
 ///
 /// Replaces the Phase 31 smoke test with a more thorough script that validates
 /// the full userspace stack including new utilities and the make build tool.
-fn smoke_test_script() -> Vec<SmokeStep> {
+fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     let mut steps = Vec::new();
 
     // -----------------------------------------------------------------------
@@ -2634,9 +2887,27 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after clustered pipeline first line check",
     });
+    steps.extend(cmd_then_prompt(
+        "/bin/echo root:x:0:0:root:/root:/bin/ion > /tmp/uniq_input\n",
+        "uniq fixture: write first root line",
+        "prompt after first uniq fixture line",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo root:x:0:0:root:/root:/bin/ion >> /tmp/uniq_input\n",
+        "uniq fixture: append second root line",
+        "prompt after second uniq fixture line",
+        10,
+    ));
+    steps.extend(cmd_then_prompt(
+        "/bin/echo daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin >> /tmp/uniq_input\n",
+        "uniq fixture: append daemon line",
+        "prompt after daemon uniq fixture line",
+        10,
+    ));
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/cat /etc/passwd /etc/passwd | /bin/sort | /bin/uniq -c\n",
+        input: "/bin/uniq -c /tmp/uniq_input\n",
         label: "uniq: count adjacent duplicates",
     });
     steps.push(SmokeStep::Wait {
@@ -3332,6 +3603,42 @@ fn smoke_test_script() -> Vec<SmokeStep> {
         label: "wait for make clean",
     });
 
+    // -----------------------------------------------------------------------
+    // 18. Phase 47 — verify /bin/doom is present in the ramdisk
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "ls /bin\n",
+        label: "doom: list /bin directory",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "doom",
+        timeout_secs: 10,
+        label: "doom: verify doom binary appears in /bin listing",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "doom: prompt after ls",
+    });
+
+    if doom_wad_available {
+        // -------------------------------------------------------------------
+        // 19. Phase 47 — run doom long enough to prove the WAD boots
+        // -------------------------------------------------------------------
+        steps.push(SmokeStep::Sleep { millis: 500 });
+        steps.push(SmokeStep::Send {
+            input: "/bin/doom -iwad /usr/share/doom/doom1.wad\n",
+            label: "doom: launch with iwad",
+        });
+        // Wait for I_InitGraphics to complete (proof WAD loaded OK)
+        steps.push(SmokeStep::Wait {
+            pattern: "I_InitGraphics:",
+            timeout_secs: 30,
+            label: "doom: wait for graphics init",
+        });
+    }
+
     steps
 }
 
@@ -3358,6 +3665,10 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         let _ = fs::remove_file(&disk_img);
     }
     create_data_disk(uefi_image.parent().unwrap());
+    let doom_wad_available = host_has_doom_wad();
+    if !doom_wad_available {
+        println!("smoke-test: skipping DOOM launch validation (doom1.wad unavailable)");
+    }
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -3382,7 +3693,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
         .spawn()
         .expect("failed to launch QEMU");
 
-    let steps = smoke_test_script();
+    let steps = smoke_test_script(doom_wad_available);
     let global_timeout = std::time::Duration::from_secs(smoke_args.timeout_secs);
     let start = std::time::Instant::now();
 
@@ -3715,6 +4026,8 @@ fn create_data_disk(output_dir: &Path) -> PathBuf {
     // Phase 45: populate ports tree and bundled source into /usr/ports/.
     let ports_src = root.join("target/ports-src");
     populate_ports_tree(&part_tmp, &root, &ports_src);
+    // Phase 47: place doom1.wad on the ext2 partition.
+    populate_doom_files(&part_tmp);
 
     // Validate with e2fsck.
     let fsck_status = Command::new("e2fsck")
@@ -4403,6 +4716,183 @@ fn collect_ports_entries(
             files.push((child_prefix, path));
         }
     }
+}
+
+/// Download doom1.wad (shareware, freely redistributable) into `dest`.
+///
+/// Download `doom1.wad` (shareware) to `dest` if `M3OS_DOWNLOAD_WAD=1` is set.
+///
+/// Gated by the env var to avoid unexpected network access in offline/CI builds.
+/// Verifies the SHA-256 checksum of the downloaded file and removes it on mismatch.
+/// Tries `curl` first, then `wget`.
+fn fetch_doom_wad(dest: &Path) {
+    const WAD_URL: &str = "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad";
+    // SHA-256 of doom1.wad from distro.ibiblio.org (verified 2026-04-04).
+    const WAD_SHA256: &str = "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771";
+
+    if std::env::var("M3OS_DOWNLOAD_WAD").as_deref() != Ok("1") {
+        eprintln!(
+            "doom: doom1.wad not found — set M3OS_DOWNLOAD_WAD=1 to auto-download, or\n\
+             place it at target/doom1.wad (or repo root doom1.wad) manually.\n\
+             Download: {WAD_URL}"
+        );
+        return;
+    }
+
+    println!("doom: doom1.wad not found — downloading shareware WAD (~4 MB)...");
+    println!("doom: source: {WAD_URL}");
+
+    // Try curl first.
+    let curl_ok = Command::new("curl")
+        .args(["-fsSL", "--output", dest.to_str().unwrap(), WAD_URL])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !curl_ok || !dest.exists() {
+        // Fall back to wget.
+        let wget_ok = Command::new("wget")
+            .args(["-q", "-O", dest.to_str().unwrap(), WAD_URL])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !wget_ok || !dest.exists() {
+            eprintln!(
+                "warning: could not download doom1.wad (curl/wget not available or download failed)\n\
+                 To enable DOOM: place doom1.wad in the repository root or at target/doom1.wad\n\
+                 Download: {WAD_URL}"
+            );
+            let _ = fs::remove_file(dest);
+            return;
+        }
+    }
+
+    // Verify SHA-256 checksum.
+    if !verify_sha256(dest, WAD_SHA256) {
+        eprintln!(
+            "warning: doom1.wad verification failed (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
+             Expected SHA-256: {WAD_SHA256}\n\
+             Place a valid doom1.wad at target/doom1.wad manually."
+        );
+        let _ = fs::remove_file(dest);
+        return;
+    }
+
+    println!("doom: downloaded and verified → {}", dest.display());
+}
+
+/// Compute the hex SHA-256 digest of `path` and compare it to `expected`.
+///
+/// Returns `true` on a confirmed match.  Returns `false` on a checksum
+/// mismatch or when `sha256sum` is unavailable.
+///
+/// When `sha256sum` is unavailable this function deletes `path` and returns
+/// `false` — callers that set `M3OS_DOWNLOAD_WAD=1` have opted into
+/// supply-chain verification, so a missing tool must not silently allow an
+/// unverified binary to proceed.  On a checksum mismatch the file is left in
+/// place and deletion is the caller's responsibility (see `fetch_doom_wad`).
+fn verify_sha256(path: &Path, expected: &str) -> bool {
+    // Use the `sha256sum` tool if available (common on Linux).
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+
+    if let Some(out) = output {
+        let line = String::from_utf8_lossy(&out.stdout);
+        // sha256sum output: "<hex>  <filename>"
+        if let Some(hex) = line.split_whitespace().next() {
+            return hex.eq_ignore_ascii_case(expected);
+        }
+    }
+
+    // sha256sum is not available — treat as a hard error when the caller has
+    // explicitly opted into verified downloads (M3OS_DOWNLOAD_WAD=1).
+    eprintln!(
+        "doom: sha256sum not found — cannot verify {}; deleting download",
+        path.display()
+    );
+    let _ = std::fs::remove_file(path);
+    false
+}
+
+/// Phase 47: Place doom1.wad on the ext2 partition at /usr/share/doom/doom1.wad.
+///
+/// The WAD is cached in target/doom1.wad (gitignored) and auto-downloaded on
+/// first use. The shareware doom1.wad is freely redistributable (~4 MB).
+fn populate_doom_files(part_path: &Path) {
+    // Cache the WAD in target/ so it is never committed and persists across
+    // builds.  Also accept a manually placed doom1.wad at the repo root for
+    // users who already have it.
+    let wad_cached = workspace_root().join("target/doom1.wad");
+    let wad_root = workspace_root().join("doom1.wad");
+
+    let wad_src = if wad_cached.exists() {
+        wad_cached
+    } else if wad_root.exists() {
+        wad_root
+    } else {
+        fetch_doom_wad(&wad_cached);
+        if wad_cached.exists() {
+            wad_cached
+        } else {
+            return; // download failed; already warned
+        }
+    };
+
+    let mut cmds = String::new();
+
+    // Create /usr/share/doom/ directory tree.
+    // debugfs mkdir does not create parent directories, so each level must be
+    // created explicitly starting from the top-level `usr` directory.
+    cmds.push_str("mkdir usr\n");
+    cmds.push_str("mkdir usr/share\n");
+    cmds.push_str("mkdir usr/share/doom\n");
+
+    // Write the WAD file.
+    cmds.push_str(&format!(
+        "write \"{}\" usr/share/doom/doom1.wad\n",
+        wad_src.display()
+    ));
+
+    // Set permissions.
+    cmds.push_str("sif usr mode 0x41ED\n");
+    cmds.push_str("sif usr/share mode 0x41ED\n");
+    cmds.push_str("sif usr/share/doom mode 0x41ED\n");
+    cmds.push_str("sif usr/share/doom/doom1.wad mode 0x81A4\n");
+    cmds.push_str("q\n");
+
+    // Run debugfs.
+    let mut debugfs = Command::new("debugfs")
+        .args(["-w", part_path.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run debugfs for doom files");
+
+    {
+        use std::io::Write as _;
+        let stdin = debugfs.stdin.as_mut().expect("debugfs stdin");
+        stdin
+            .write_all(cmds.as_bytes())
+            .expect("write debugfs commands");
+    }
+
+    let output = debugfs.wait_with_output().expect("debugfs wait");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("warning: debugfs populate_doom_files failed: {stderr}");
+    } else {
+        println!("doom: placed doom1.wad at /usr/share/doom/doom1.wad");
+    }
+}
+
+fn host_has_doom_wad() -> bool {
+    let root = workspace_root();
+    root.join("target/doom1.wad").exists() || root.join("doom1.wad").exists()
 }
 
 fn cmd_image(image_args: &ImageArgs) {
@@ -5128,7 +5618,7 @@ fn run_smoke_steps_with_capture(
                     }
 
                     let stripped = strip_ansi(serial_buf);
-                    let cleaned = strip_kernel_logs(&stripped);
+                    let cleaned = strip_background_noise(&stripped);
 
                     // Check for kernel-level crash indicators in serial output.
                     // Only match ring-0 crashes, not handled ring-3 faults:
@@ -5584,6 +6074,23 @@ mod tests {
         parts.iter().map(|part| part.to_string()).collect()
     }
 
+    fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
+        steps
+            .iter()
+            .map(|step| match step {
+                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => *label,
+                SmokeStep::Sleep { .. } => "sleep",
+            })
+            .collect()
+    }
+
+    fn send_input_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
+        steps.iter().find_map(|step| match step {
+            SmokeStep::Send { input, label } if *label == target_label => Some(*input),
+            _ => None,
+        })
+    }
+
     #[test]
     fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
@@ -5747,5 +6254,59 @@ mod tests {
         let mut kernel_bytes = Vec::new();
         kernel.read_to_end(&mut kernel_bytes).unwrap();
         assert_eq!(kernel_bytes, b"kernel-bytes");
+    }
+
+    #[test]
+    fn smoke_test_without_wad_skips_doom_launch_steps() {
+        let labels = smoke_step_labels(&smoke_test_script(false));
+
+        assert!(labels.contains(&"doom: list /bin directory"));
+        assert!(!labels.contains(&"doom: launch with iwad"));
+        assert!(!labels.contains(&"doom: wait for graphics init"));
+    }
+
+    #[test]
+    fn smoke_test_with_wad_uses_plain_doom_launch_command() {
+        let labels = smoke_step_labels(&smoke_test_script(true));
+        let doom_launch = send_input_for_label(&smoke_test_script(true), "doom: launch with iwad");
+
+        assert!(labels.contains(&"doom: wait for graphics init"));
+        assert!(!labels.contains(&"doom: capture W_CacheLumpNum debug trace"));
+        assert!(!labels.contains(&"doom: prompt after crash"));
+        assert_eq!(
+            doom_launch,
+            Some("/bin/doom -iwad /usr/share/doom/doom1.wad\n")
+        );
+    }
+
+    #[test]
+    fn smoke_test_uniq_step_uses_prebuilt_fixture_file() {
+        let uniq_input =
+            send_input_for_label(&smoke_test_script(true), "uniq: count adjacent duplicates");
+
+        assert_eq!(uniq_input, Some("/bin/uniq -c /tmp/uniq_input\n"));
+    }
+
+    #[test]
+    fn strip_background_noise_removes_kernel_and_init_service_lines() {
+        let input = concat!(
+            "root@m3os:/home/project# /bin/stat libutil.a\n",
+            "[INFO] [waitpid] pid 71 exited\n",
+            "init: service 'syslogd' exited (127)\n",
+            "init: restarting 'syslogd' (8/10)\n",
+            "  File: libutil.a\n",
+        );
+
+        assert_eq!(
+            strip_background_noise(input),
+            "root@m3os:/home/project# /bin/stat libutil.a\n  File: libutil.a\n"
+        );
+    }
+
+    #[test]
+    fn strip_background_noise_keeps_regular_userspace_output() {
+        let input = "init: configuration loaded from /etc/init.conf\n";
+
+        assert_eq!(strip_background_noise(input), input);
     }
 }
