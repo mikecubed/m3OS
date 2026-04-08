@@ -4,6 +4,7 @@
 ///
 /// Returns `Some(result)` if the syscall number belongs to this subsystem,
 /// `None` otherwise.
+#[inline(always)]
 pub(super) fn handle_net_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> Option<u64> {
     let result = match number {
         // socket

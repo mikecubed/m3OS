@@ -4,6 +4,7 @@
 ///
 /// Returns `Some(result)` if the syscall number belongs to this subsystem,
 /// `None` otherwise.
+#[inline(always)]
 pub(super) fn handle_process_syscall(
     number: u64,
     arg0: u64,
@@ -100,6 +101,7 @@ pub(super) fn handle_process_syscall(
     Some(result)
 }
 
+#[inline(always)]
 /// Handle divergent process syscalls (exit, exit_group).
 ///
 /// Returns `true` if the syscall number was handled (diverges, never returns).
