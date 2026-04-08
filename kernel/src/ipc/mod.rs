@@ -56,7 +56,7 @@ pub use registry::RegistryError;
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
 /// Userspace syscall numbers `0x1100`–`0x1109` are translated to internal
-/// dispatch numbers 1–10 by `handle_ipc_syscall` in `syscall/ipc.rs`.
+/// dispatch numbers 1–10 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|

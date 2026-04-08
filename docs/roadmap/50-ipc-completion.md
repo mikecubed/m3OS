@@ -117,13 +117,13 @@ Real userspace services need a stable discovery story and a simple server loop. 
 Every site in the IPC subsystem and kernel server loops where user-supplied pointers
 are dereferenced as raw kernel addresses without `copy_from_user` validation:
 
-| Site | File | Lines | Assumption |
+| Site | File | Lines | Status |
 |---|---|---|---|
-| `ipc_register_service` name read | `kernel/src/ipc/mod.rs` | 229–232 | `name_ptr` treated as kernel-space pointer; comment says "Phase 7 only — all callers are kernel tasks" |
-| `ipc_lookup_service` name read | `kernel/src/ipc/mod.rs` | 254–257 | Same assumption; `name_ptr` dereferenced via `core::slice::from_raw_parts` |
-| `console_server_task` write payload | `kernel/src/main.rs` | 350–361 | `msg.data[0]` (client-supplied pointer) dereferenced as `*const u8` in kernel space; comment says "In Phase 9, clients still share the kernel address space" |
-| `fat_server_task` file path/data | `kernel/src/main.rs` | 506–508 | Delegates to `ramdisk::handle(&msg)` which interprets `msg.data[]` words as kernel pointers to file path strings and data buffers |
-| `vfs_server_task` forwarding | `kernel/src/main.rs` | 570–571 | Forwards entire message (including kernel-pointer data words) to fat_server via `call_msg` — inherits pointer assumptions |
+| `ipc_register_service` name read | `kernel/src/ipc/mod.rs` | 274–284 | **Migrated** — now uses `copy_from_user` (Phase 50) |
+| `ipc_lookup_service` name read | `kernel/src/ipc/mod.rs` | 301–313 | **Migrated** — now uses `copy_from_user` (Phase 50) |
+| `console_server_task` write payload | `kernel/src/main.rs` | 350–361 | Still uses `copy_nonoverlapping` — kernel-task shortcut; migration planned for ring-3 move |
+| `fat_server_task` file path/data | `kernel/src/main.rs` | 506–508 | Still uses raw pointers — delegates to `ramdisk::handle(&msg)` |
+| `vfs_server_task` forwarding | `kernel/src/main.rs` | 570–571 | Still forwards raw-pointer messages — inherits fat_server assumptions |
 
 The `kbd_server_task` does **not** dereference user pointers — it returns scancodes as
 integer values in `msg.data[0]`, not pointer-based payloads.

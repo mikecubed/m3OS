@@ -170,7 +170,7 @@ This is the real prerequisite for the rest.
 | `copy_from_user` in IPC register/lookup | Complete | `kernel/src/ipc/mod.rs` |
 | Owner-tracked registry with re-registration | Complete | `kernel-core/src/ipc/registry.rs` |
 | Registry capacity increased (8 to 16) | Complete | `kernel-core/src/ipc/registry.rs` |
-| IPC syscall dispatch module | Complete | `kernel/src/arch/x86_64/syscall/ipc.rs` |
+| IPC syscall dispatch module | Complete | `kernel/src/arch/x86_64/syscall/mod.rs` (flat dispatch table; `ipc.rs` retained as documentation) |
 | Server-loop failure semantics | Complete | `docs/06-ipc.md` |
 | IPC cleanup on task exit | Complete | `kernel/src/ipc/endpoint.rs` |
 | Console server validated data path | Complete | `kernel/src/main.rs` |

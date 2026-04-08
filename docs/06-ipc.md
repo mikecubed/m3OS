@@ -748,7 +748,7 @@ name-to-endpoint table inside `init_task`.
 | Feature | Status | Phase |
 |---|---|---|
 | **Capability grants via IPC** (`sys_cap_grant`) | Complete | Phase 50 |
-| **Page-capability bulk transfers** (`Capability::Grant`) | Complete | Phase 50 |
+| **Page-capability bulk transfers** (`Capability::Grant`) | Groundwork (cap-table variant exists; kernel-side page mapping/revocation deferred) | Phase 50 |
 | **Bulk-data copy-from-user path** | Complete | Phase 50 |
 | **Ring-3-safe service registry** | Complete | Phase 50 |
 | **Server-loop failure semantics** | Complete | Phase 50 |
