@@ -51,6 +51,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Crash Diagnostics](./43a-crash-diagnostics.md) | 43a | Enriched panic/fault handlers, scheduler/fork/IPC assertions |
 | [DOOM Port](./47-doom.md) | 47 | Framebuffer mapping, raw scancodes, doomgeneric integration, and real-world input/performance lessons |
 | [Security Foundation](./48-security-foundation.md) | 48 | Kernel-enforced credentials, RDRAND entropy, iterated password hashing, first-boot provisioning |
+| [Architectural Declaration](./49-architectural-declaration.md) | 49 | Syscall decomposition, keep/move/transition matrix, userspace-first rule |
 
 ### Roadmap
 
