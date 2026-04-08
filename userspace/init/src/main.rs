@@ -1392,8 +1392,13 @@ impl ServiceManager {
                 ServiceStatus::Running => write_str(fd as i32, "running"),
                 ServiceStatus::Stopping => write_str(fd as i32, "stopping"),
                 ServiceStatus::Stopped(code) => {
-                    write_str(fd as i32, "stopped:");
-                    write_u64(fd as i32, code as u64);
+                    if code < 0 {
+                        write_str(fd as i32, "stopped:-");
+                        write_u64(fd as i32, (-(code as i64)) as u64);
+                    } else {
+                        write_str(fd as i32, "stopped:");
+                        write_u64(fd as i32, code as u64);
+                    }
                     0 // match arm type consistency
                 }
                 ServiceStatus::PermanentlyStopped => write_str(fd as i32, "permanently-stopped"),
