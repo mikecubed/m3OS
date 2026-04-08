@@ -61,6 +61,7 @@ pub use registry::RegistryError;
 /// | 3 | `ipc_call(ep_cap, label, data0)` | `arg0..2` |
 /// | 4 | `ipc_reply(reply_cap, label, data0)` | `arg0..2` |
 /// | 5 | `ipc_reply_recv(reply_cap, label, ep_cap)` | `arg0..2` — ep_cap in arg2 |
+/// | 6 | `sys_cap_grant(source_handle, target_task_id)` | `arg0, arg1` |
 /// | 7 | `notify_wait(notif_cap)` | `arg0 = notif_cap_handle` |
 /// | 8 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
 /// | 9 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
@@ -79,13 +80,15 @@ pub use registry::RegistryError;
 /// - `notify_wait` (7): returns the pending-bit word on success, or `0` on
 ///   error (invalid handle or wrong type).  Note: `0` cannot be a valid
 ///   notification word since `wait` only returns when at least one bit is set.
+/// - `sys_cap_grant` (6): returns the new `CapHandle` as `u64` on success,
+///   or `u64::MAX` on error (invalid handle, target not found, table full).
 /// - `notify_signal` (8): returns `0` on success, `u64::MAX` on error.
 /// - `ipc_register_service` (9): returns `0` on success, `u64::MAX` on error.
 /// - `ipc_lookup_service` (10): returns the new `CapHandle` as `u64` on
 ///   success, or `u64::MAX` on error (not found, cap table full, etc.).
 #[allow(dead_code)]
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
-    use crate::task::scheduler;
+    use crate::task::{TaskId, scheduler};
 
     // notify_wait (7) errors return 0; all other IPC errors return u64::MAX.
     let err_val = if number == 7 { 0 } else { u64::MAX };
@@ -116,6 +119,40 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
     };
 
     match number {
+        6 => {
+            // sys_cap_grant(source_handle, target_task_id)
+            // `cap` was already looked up from arg0 above — we know it's valid.
+            // Now remove it from the caller and insert into the target.
+            let target_id = TaskId(arg1);
+
+            // Validate target task exists by trying to look up handle 0 in its
+            // cap table.  If the task doesn't exist, task_cap returns
+            // InvalidHandle — but that could also mean slot 0 is empty.
+            // Instead, try a remove + insert sequence: remove from caller
+            // first, attempt insert into target, and roll back on failure.
+            let removed = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(c) => c,
+                Err(_) => return u64::MAX,
+            };
+
+            match scheduler::insert_cap(target_id, removed) {
+                Ok(new_handle) => {
+                    log::trace!(
+                        "[ipc] sys_cap_grant: task {} -> task {} (new handle {})",
+                        task_id.0,
+                        target_id.0,
+                        new_handle,
+                    );
+                    u64::from(new_handle)
+                }
+                Err(_) => {
+                    // Roll back: re-insert into the caller's table at the
+                    // original slot so there are no side effects.
+                    let _ = scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed);
+                    u64::MAX
+                }
+            }
+        }
         1 => {
             // ipc_recv(ep_cap_handle)
             match cap {

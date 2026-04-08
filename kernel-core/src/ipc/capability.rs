@@ -78,6 +78,30 @@ impl CapabilityTable {
             .ok_or(CapError::InvalidHandle)?;
         slot.take().ok_or(CapError::InvalidHandle)
     }
+
+    /// Atomically transfer a capability from `self[source_handle]` to `dest_table`.
+    ///
+    /// On success the source slot is cleared and the new handle in the
+    /// destination table is returned.  On failure (invalid source handle or
+    /// destination table full) the source retains its capability and an error
+    /// is returned — no side effects.
+    pub fn grant(
+        &mut self,
+        source_handle: CapHandle,
+        dest_table: &mut CapabilityTable,
+    ) -> Result<CapHandle, CapError> {
+        // Validate source handle first, without removing yet.
+        let cap = self.get(source_handle)?;
+
+        // Try to insert into destination — if it fails, source keeps the cap.
+        let dest_handle = dest_table.insert(cap)?;
+
+        // Destination succeeded — now remove from source (infallible since we
+        // already validated the handle above and hold &mut self).
+        let _ = self.remove(source_handle);
+
+        Ok(dest_handle)
+    }
 }
 
 impl Default for CapabilityTable {
@@ -161,5 +185,53 @@ mod tests {
         for i in 0..CapabilityTable::SIZE {
             assert_eq!(table.get(i as CapHandle), Err(CapError::InvalidHandle));
         }
+    }
+
+    // --- B.1 / B.2: capability grant tests ---
+
+    #[test]
+    fn grant_moves_cap_from_source_to_dest() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+        let cap = Capability::Endpoint(EndpointId(7));
+        let src_handle = src.insert(cap).unwrap();
+
+        let dst_handle = src.grant(src_handle, &mut dst).unwrap();
+
+        // Source slot is cleared.
+        assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
+        // Destination slot is populated with the same capability.
+        assert_eq!(dst.get(dst_handle), Ok(cap));
+    }
+
+    #[test]
+    fn grant_to_full_table_returns_table_full() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+
+        // Fill the destination table.
+        for i in 0..CapabilityTable::SIZE {
+            dst.insert(Capability::Notification(NotifId(i as u8)))
+                .unwrap();
+        }
+
+        let cap = Capability::Endpoint(EndpointId(1));
+        let src_handle = src.insert(cap).unwrap();
+
+        // Grant must fail with TableFull.
+        assert_eq!(src.grant(src_handle, &mut dst), Err(CapError::TableFull));
+        // Source must still have the capability (no side effects).
+        assert_eq!(src.get(src_handle), Ok(cap));
+    }
+
+    #[test]
+    fn grant_invalid_handle_returns_invalid() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+
+        // Handle 0 is empty — no capability was inserted.
+        assert_eq!(src.grant(0, &mut dst), Err(CapError::InvalidHandle));
+        // Out-of-range handle.
+        assert_eq!(src.grant(100, &mut dst), Err(CapError::InvalidHandle));
     }
 }
