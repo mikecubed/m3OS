@@ -926,22 +926,32 @@ fn idle_task() -> ! {
 // Phase 21 — serial stdin feeder
 // ---------------------------------------------------------------------------
 
-/// Poll the serial port (COM1) for incoming bytes and feed them into the
+/// Read bytes from the IRQ-driven serial ring buffer and feed them into the
 /// kernel stdin buffer with canonical editing, echo, and signal support.
 fn serial_stdin_feeder_task() -> ! {
     use kernel_core::tty::*;
 
-    log::info!("[serial-stdin] feeder ready (echo + signals)");
+    // Enable UART Receive Data Available interrupt (IER bit 0).
+    unsafe {
+        x86_64::instructions::port::Port::new(0x3F9u16).write(0x01u8);
+    }
+
+    log::info!("[serial-stdin] feeder ready (IRQ-driven, echo + signals)");
 
     loop {
-        // Read from COM1 data port (0x3F8) if data is available.
-        // Line Status Register (0x3FD) bit 0 = data ready.
-        let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FD).read() };
-        if lsr & 1 == 0 {
-            task::yield_now();
-            continue;
-        }
-        let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8).read() };
+        // Read from the IRQ-driven ring buffer instead of polling the UART.
+        let byte = {
+            let mut buf = crate::serial::SERIAL_RX_BUF.lock();
+            buf.pop()
+        };
+        let byte = match byte {
+            Some(b) => b,
+            None => {
+                // Block until the serial IRQ handler wakes us.
+                crate::serial::SERIAL_RX_WAITQUEUE.sleep();
+                continue;
+            }
+        };
 
         // Read termios flags under lock.
         let (c_lflag, c_iflag, c_oflag, c_cc_arr) = {

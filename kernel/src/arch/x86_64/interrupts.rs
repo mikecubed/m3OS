@@ -322,6 +322,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
     idt[InterruptIndex::VirtioNet as u8].set_handler_fn(virtio_net_handler);
+    idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
     idt[InterruptIndex::Spurious as u8].set_handler_fn(spurious_handler);
@@ -581,6 +582,7 @@ pub enum InterruptIndex {
     Timer = 32,
     Keyboard = 33,
     VirtioNet = 34,
+    Serial = 36,
     Spurious = 0xFF,
 }
 
@@ -852,6 +854,23 @@ extern "x86-interrupt" fn virtio_net_handler(_stack_frame: InterruptStackFrame) 
         unsafe {
             PICS.lock()
                 .notify_end_of_interrupt(InterruptIndex::VirtioNet as u8);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serial (COM1) IRQ handler — vector 36
+// ---------------------------------------------------------------------------
+
+extern "x86-interrupt" fn serial_handler(_stack_frame: InterruptStackFrame) {
+    crate::serial::handle_serial_irq();
+
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    } else {
+        unsafe {
+            PICS.lock()
+                .notify_end_of_interrupt(InterruptIndex::Serial as u8);
         }
     }
 }

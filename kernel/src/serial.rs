@@ -134,3 +134,72 @@ pub fn init_logger() {
         .map(|()| log::set_max_level(log::LevelFilter::Trace))
         .expect("logger already set");
 }
+
+// ---------------------------------------------------------------------------
+// IRQ-driven serial RX ring buffer (replaces polling)
+// ---------------------------------------------------------------------------
+
+use crate::task::wait_queue::WaitQueue;
+
+const SERIAL_BUF_SIZE: usize = 256;
+
+pub struct SerialRingBuf {
+    buf: [u8; SERIAL_BUF_SIZE],
+    head: usize,
+    tail: usize,
+    count: usize,
+}
+
+impl SerialRingBuf {
+    const fn new() -> Self {
+        Self {
+            buf: [0; SERIAL_BUF_SIZE],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.count < SERIAL_BUF_SIZE {
+            self.buf[self.tail] = byte;
+            self.tail = (self.tail + 1) % SERIAL_BUF_SIZE;
+            self.count += 1;
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<u8> {
+        if self.count == 0 {
+            None
+        } else {
+            let byte = self.buf[self.head];
+            self.head = (self.head + 1) % SERIAL_BUF_SIZE;
+            self.count -= 1;
+            Some(byte)
+        }
+    }
+}
+
+pub static SERIAL_RX_BUF: Mutex<SerialRingBuf> = Mutex::new(SerialRingBuf::new());
+pub static SERIAL_RX_WAITQUEUE: WaitQueue = WaitQueue::new();
+
+/// Called from the serial IRQ handler. Drains all available bytes from the
+/// UART FIFO into the ring buffer.
+pub fn handle_serial_irq() {
+    let mut buf = SERIAL_RX_BUF.lock();
+    let mut got_data = false;
+    // Drain all available bytes from the UART FIFO.
+    loop {
+        let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FDu16).read() };
+        if lsr & 1 == 0 {
+            break;
+        }
+        let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8u16).read() };
+        buf.push(byte);
+        got_data = true;
+    }
+    drop(buf);
+    if got_data {
+        SERIAL_RX_WAITQUEUE.wake_all();
+    }
+}

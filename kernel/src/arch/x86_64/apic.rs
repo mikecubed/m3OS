@@ -198,9 +198,8 @@ fn gsi_to_pin(gsi: u32, gsi_base: u32, max_redir: u32) -> Option<u32> {
 
 /// Program the I/O APIC redirection table.
 ///
-/// Routes keyboard (IRQ 1) to vector 33 and configures COM1 (IRQ 4) to use
-/// vector 36 on the BSP, but keeps the COM1 entry masked until a serial IRQ
-/// handler is installed. All other entries are masked.
+/// Routes keyboard (IRQ 1) to vector 33 and COM1 (IRQ 4) to vector 36 on the
+/// BSP. All other entries are masked.
 fn ioapic_init() {
     unsafe {
         // Read the maximum redirection entry count from version register (reg 1).
@@ -254,9 +253,7 @@ fn ioapic_init() {
         }
 
         // --- COM1: ISA IRQ 4 → vector 36 ---
-        // Kept masked: no IDT handler for vector 36 is installed yet.
-        // Unmasking without a handler would triple-fault on UART interrupts.
-        // A future serial IRQ handler can unmask this entry when ready.
+        // Unmasked: the serial IRQ handler (vector 36) is registered in the IDT.
         {
             let (gsi, active_low, level_triggered) = if let Some(ovr) = crate::acpi::irq_override(4)
             {
@@ -266,12 +263,14 @@ fn ioapic_init() {
                 (gsi_base + 4, false, false)
             };
             if let Some(pin) = gsi_to_pin(gsi, gsi_base, max_redir) {
-                let low = redir_entry_low(36, active_low, level_triggered, true); // masked
+                let low = redir_entry_low(36, active_low, level_triggered, false); // unmasked
                 ioapic_write_redir(pin, low, bsp_lapic_id);
                 log::info!(
-                    "[apic] I/O APIC: IRQ 4 → GSI {} (pin {}) → vector 36 (masked, no handler yet)",
+                    "[apic] I/O APIC: IRQ 4 → GSI {} (pin {}) → vector 36 (active_low={}, level={})",
                     gsi,
                     pin,
+                    active_low,
+                    level_triggered
                 );
             } else {
                 log::warn!(
@@ -547,7 +546,7 @@ pub fn route_pci_irq(irq_line: u8, vector: u8) {
 /// enables IRQs). After this function returns:
 ///
 /// * The Local APIC is enabled (spurious vector 0xFF).
-/// * The I/O APIC routes keyboard (IRQ 1 → vec 33) and COM1 (IRQ 4 → vec 36).
+/// * The I/O APIC routes keyboard (IRQ 1 → vec 33) and COM1 (IRQ 4 → vec 36, unmasked).
 /// * The LAPIC timer fires vector 32 at ~100 Hz (10 ms period).
 /// * The legacy 8259 PIC is fully masked.
 pub fn init() {
