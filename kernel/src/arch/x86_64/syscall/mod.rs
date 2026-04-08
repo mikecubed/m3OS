@@ -16,7 +16,7 @@
 //!
 //! | Number | Name         | Args                  |
 //! |---|---|---|
-//! | 1–5,7–10 | IPC     | (dispatched to ipc::dispatch) |
+//! | 0x1100–0x1109 | IPC | dispatched to ipc::dispatch as 1–10 |
 //! | 6       | exit (legacy) | code                |
 //! | 12      | debug_print   | ptr, len            |
 //! | 39      | getpid        | —                   |
@@ -31,6 +31,7 @@ extern crate alloc;
 
 mod fs;
 mod io;
+mod ipc;
 mod misc;
 mod mm;
 mod net;
@@ -46,15 +47,15 @@ const NEG_EIO: u64 = (-5_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
 #[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
-pub(super) const NEG_EFAULT: u64 = (-14_i64) as u64;
-pub(super) const NEG_EINVAL: u64 = (-22_i64) as u64;
+const NEG_EFAULT: u64 = (-14_i64) as u64;
+const NEG_EINVAL: u64 = (-22_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
 const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
-pub(super) const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
@@ -910,6 +911,157 @@ global_asm!(
 );
 
 // ---------------------------------------------------------------------------
+// Syscall number constants (x86_64 Linux ABI + m3OS custom range)
+// ---------------------------------------------------------------------------
+
+/// Linux x86_64 syscall numbers and m3OS custom extensions.
+///
+/// Scoped in a module so the short names (READ, WRITE, …) don't leak into
+/// the rest of the file. Import with `use syscall_nr::*` at the match site.
+mod syscall_nr {
+    // -- fs --
+    pub const READ: u64 = 0;
+    pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
+    pub const CLOSE: u64 = 3;
+    pub const STAT: u64 = 4;
+    pub const FSTAT: u64 = 5;
+    pub const LSTAT: u64 = 6;
+    pub const LSEEK: u64 = 8;
+    pub const READV: u64 = 19;
+    pub const WRITEV: u64 = 20;
+    pub const ACCESS: u64 = 21;
+    pub const DUP: u64 = 32;
+    pub const DUP2: u64 = 33;
+    pub const FCNTL: u64 = 72;
+    pub const FSYNC: u64 = 74;
+    pub const TRUNCATE: u64 = 76;
+    pub const FTRUNCATE: u64 = 77;
+    pub const GETCWD: u64 = 79;
+    pub const CHDIR: u64 = 80;
+    pub const RENAME: u64 = 82;
+    pub const MKDIR: u64 = 83;
+    pub const RMDIR: u64 = 84;
+    pub const LINK: u64 = 86;
+    pub const UNLINK: u64 = 87;
+    pub const SYMLINK: u64 = 88;
+    pub const READLINK: u64 = 89;
+    pub const CHMOD: u64 = 90;
+    pub const FCHMOD: u64 = 91;
+    pub const CHOWN: u64 = 92;
+    pub const FCHOWN: u64 = 93;
+    pub const STATFS: u64 = 137;
+    pub const FSTATFS: u64 = 138;
+    pub const MOUNT: u64 = 165;
+    pub const UMOUNT2: u64 = 166;
+    pub const GETDENTS64: u64 = 217;
+    pub const OPENAT: u64 = 257;
+    pub const NEWFSTATAT: u64 = 262;
+    pub const LINKAT: u64 = 265;
+    pub const SYMLINKAT: u64 = 266;
+    pub const READLINKAT: u64 = 267;
+    pub const UTIMENSAT: u64 = 280;
+    pub const DUP3: u64 = 292;
+
+    // -- mm --
+    pub const MMAP: u64 = 9;
+    pub const MPROTECT: u64 = 10;
+    pub const MUNMAP: u64 = 11;
+    pub const BRK: u64 = 12;
+
+    // -- process --
+    pub const GETPID: u64 = 39;
+    pub const CLONE: u64 = 56;
+    pub const FORK: u64 = 57;
+    pub const EXECVE: u64 = 59;
+    pub const EXIT: u64 = 60;
+    pub const WAIT4: u64 = 61;
+    pub const UMASK: u64 = 95;
+    pub const GETUID: u64 = 102;
+    pub const GETGID: u64 = 104;
+    pub const SETUID: u64 = 105;
+    pub const SETGID: u64 = 106;
+    pub const GETEUID: u64 = 107;
+    pub const GETEGID: u64 = 108;
+    pub const SETPGID: u64 = 109;
+    pub const GETPPID: u64 = 110;
+    pub const GETPGRP: u64 = 111;
+    pub const SETSID: u64 = 112;
+    pub const SETREUID: u64 = 113;
+    pub const SETREGID: u64 = 114;
+    pub const GETPGID: u64 = 121;
+    pub const GETSID: u64 = 124;
+    pub const GETTID: u64 = 186;
+    pub const TKILL: u64 = 200;
+    pub const SCHED_SETAFFINITY: u64 = 203;
+    pub const SCHED_GETAFFINITY: u64 = 204;
+    pub const SET_TID_ADDRESS: u64 = 218;
+    pub const EXIT_GROUP: u64 = 231;
+
+    // -- net --
+    pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const ACCEPT: u64 = 43;
+    pub const SENDTO: u64 = 44;
+    pub const RECVFROM: u64 = 45;
+    pub const SHUTDOWN: u64 = 48;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const GETSOCKNAME: u64 = 51;
+    pub const GETPEERNAME: u64 = 52;
+    pub const SOCKETPAIR: u64 = 53;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const GETSOCKOPT: u64 = 55;
+    pub const ACCEPT4: u64 = 288;
+
+    // -- signal --
+    pub const RT_SIGACTION: u64 = 13;
+    pub const RT_SIGPROCMASK: u64 = 14;
+    pub const SIGRETURN: u64 = 15;
+    pub const KILL: u64 = 62;
+    pub const SIGALTSTACK: u64 = 131;
+
+    // -- io --
+    pub const POLL: u64 = 7;
+    pub const PIPE: u64 = 22;
+    pub const SELECT: u64 = 23;
+    pub const EPOLL_WAIT: u64 = 232;
+    pub const EPOLL_CTL: u64 = 233;
+    pub const PSELECT6: u64 = 270;
+    pub const EPOLL_CREATE1: u64 = 291;
+    pub const PIPE2: u64 = 293;
+
+    // -- time --
+    pub const NANOSLEEP: u64 = 35;
+    pub const GETTIMEOFDAY: u64 = 96;
+    pub const TIMES: u64 = 100;
+    pub const CLOCK_GETTIME: u64 = 228;
+
+    // -- misc --
+    pub const IOCTL: u64 = 16;
+    pub const NICE: u64 = 34;
+    pub const UNAME: u64 = 63;
+    pub const ARCH_PRCTL: u64 = 158;
+    pub const REBOOT: u64 = 169;
+    pub const FUTEX: u64 = 202;
+    pub const SET_ROBUST_LIST: u64 = 273;
+    pub const PRLIMIT64: u64 = 302;
+    pub const GETRANDOM: u64 = 318;
+
+    // -- m3OS custom --
+    pub const DEBUG_PRINT: u64 = 0x1000;
+    pub const MEMINFO: u64 = 0x1001;
+    pub const KTRACE: u64 = 0x1002;
+    pub const FRAMEBUFFER_INFO: u64 = 0x1005;
+    pub const FRAMEBUFFER_MMAP: u64 = 0x1006;
+    pub const READ_SCANCODE: u64 = 0x1007;
+
+    // -- ipc --
+    pub const IPC_BASE: u64 = 0x1100;
+    pub const IPC_LAST: u64 = 0x1109;
+}
+
+// ---------------------------------------------------------------------------
 // Syscall dispatcher
 // ---------------------------------------------------------------------------
 
@@ -958,33 +1110,247 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
-    // Divergent syscalls (exit, sigreturn) never return — handle them first.
-    signal::handle_divergent_signal_syscall(number, user_rsp);
-    process::handle_divergent_syscall(number, arg0);
+    use syscall_nr::*;
 
-    // Dispatch to subsystem handlers. Each returns Some(result) if handled.
-    let result = if let Some(r) = fs::handle_fs_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = mm::handle_mm_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) =
-        process::handle_process_syscall(number, arg0, arg1, arg2, user_rip, user_rsp)
-    {
-        r
-    } else if let Some(r) = net::handle_net_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = signal::handle_signal_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = io::handle_io_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = time::handle_time_syscall(number, arg0, arg1) {
-        r
-    } else if let Some(r) = misc::handle_misc_syscall(number, arg0, arg1, arg2) {
-        r
-    } else {
-        // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
-        log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
-        NEG_ENOSYS
+    // Divergent syscalls never return — handle them first.
+    match number {
+        SIGRETURN => sys_sigreturn(user_rsp),
+        EXIT => sys_exit(arg0 as i32),
+        EXIT_GROUP => sys_exit_group(arg0 as i32),
+        _ => {}
+    }
+
+    // Flat dispatch table — gives LLVM a single match to lower into a jump
+    // table, which is critical for performance under QEMU's TCG where
+    // chained branch sequences are much slower than indexed lookups.
+    let result = match number {
+        // -- fs --
+        READ => sys_linux_read(arg0, arg1, arg2),
+        WRITE => sys_linux_write(arg0, arg1, arg2),
+        OPEN => sys_linux_open(arg0, arg1, arg2),
+        CLOSE => sys_linux_close(arg0),
+        STAT => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
+        FSTAT => sys_linux_fstat(arg0, arg1),
+        LSTAT => sys_linux_fstatat(AT_FDCWD, arg0, arg1, AT_SYMLINK_NOFOLLOW),
+        LSEEK => sys_linux_lseek(arg0, arg1, arg2),
+        READV => sys_linux_readv(arg0, arg1, arg2),
+        WRITEV => sys_linux_writev(arg0, arg1, arg2),
+        ACCESS => sys_access(arg0),
+        DUP => sys_dup(arg0),
+        DUP2 => sys_dup2(arg0, arg1),
+        FCNTL => sys_fcntl(arg0, arg1, arg2),
+        FSYNC => sys_linux_fsync(arg0),
+        TRUNCATE => sys_linux_truncate(arg0, arg1),
+        FTRUNCATE => sys_linux_ftruncate(arg0, arg1),
+        GETCWD => sys_linux_getcwd(arg0, arg1),
+        CHDIR => sys_linux_chdir(arg0),
+        RENAME => sys_linux_rename(arg0, arg1),
+        MKDIR => sys_linux_mkdir(arg0, arg1),
+        RMDIR => sys_linux_rmdir(arg0),
+        LINK => sys_link(arg0, arg1),
+        UNLINK => sys_linux_unlink(arg0),
+        SYMLINK => sys_symlink(arg0, arg1),
+        READLINK => sys_readlink(arg0, arg1, arg2),
+        CHMOD => sys_linux_chmod(arg0, arg1),
+        FCHMOD => sys_linux_fchmod(arg0, arg1),
+        CHOWN => sys_linux_chown(arg0, arg1, arg2),
+        FCHOWN => sys_linux_fchown(arg0, arg1, arg2),
+        STATFS => sys_statfs(arg0, arg1),
+        FSTATFS => sys_fstatfs(arg0, arg1),
+        MOUNT => sys_linux_mount(arg0, arg1, arg2),
+        UMOUNT2 => sys_linux_umount2(arg0, arg1),
+        GETDENTS64 => sys_linux_getdents64(arg0, arg1, arg2),
+        OPENAT => sys_linux_openat(arg0, arg1, arg2),
+        NEWFSTATAT => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        LINKAT => sys_linkat(
+            arg0,
+            arg1,
+            arg2,
+            per_core_syscall_arg3(),
+            crate::smp::per_core().syscall_user_r8,
+        ),
+        SYMLINKAT => sys_symlinkat(arg0, arg1, arg2),
+        READLINKAT => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        UTIMENSAT => {
+            let flags = per_core_syscall_arg3();
+            sys_utimensat(arg0, arg1, arg2, flags)
+        }
+        DUP3 => sys_dup2(arg0, arg1),
+        // -- mm --
+        MMAP => sys_linux_mmap(arg0, arg1, arg2),
+        MPROTECT => sys_mprotect(arg0, arg1, arg2),
+        MUNMAP => sys_linux_munmap(arg0, arg1),
+        BRK => sys_linux_brk(arg0),
+        // -- process --
+        GETPID => sys_getpid(),
+        CLONE => {
+            let child_tidptr = per_core_syscall_arg3();
+            let tls = crate::smp::per_core().syscall_user_r8;
+            sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
+        }
+        FORK => sys_fork(user_rip, user_rsp),
+        EXECVE => sys_execve(arg0, arg1, arg2),
+        WAIT4 => sys_waitpid(arg0, arg1, arg2),
+        UMASK => sys_umask(arg0),
+        GETUID => sys_linux_getuid(),
+        GETGID => sys_linux_getgid(),
+        SETUID => sys_linux_setuid(arg0),
+        SETGID => sys_linux_setgid(arg0),
+        GETEUID => sys_linux_geteuid(),
+        GETEGID => sys_linux_getegid(),
+        SETPGID => sys_setpgid(arg0, arg1),
+        GETPPID => sys_getppid(),
+        GETPGRP => sys_getpgid(0),
+        SETSID => sys_setsid(),
+        SETREUID => sys_linux_setreuid(arg0, arg1),
+        SETREGID => sys_linux_setregid(arg0, arg1),
+        GETPGID => sys_getpgid(arg0),
+        GETSID => sys_getsid(arg0),
+        GETTID => sys_gettid(),
+        TKILL => sys_tkill(arg0, arg1),
+        SCHED_SETAFFINITY => {
+            if arg2 == 0 {
+                NEG_EFAULT
+            } else if arg1 < 8 {
+                NEG_EINVAL
+            } else {
+                let mask = {
+                    let mut buf = [0u8; 8];
+                    if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    u64::from_ne_bytes(buf)
+                };
+                crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
+            }
+        }
+        SCHED_GETAFFINITY => {
+            let mask = crate::task::sys_sched_getaffinity(arg0 as u32);
+            if mask < 0 {
+                mask as u64
+            } else if arg2 != 0 && arg1 >= 8 {
+                let bytes = (mask as u64).to_ne_bytes();
+                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
+                    return NEG_EFAULT;
+                }
+                8
+            } else {
+                NEG_EINVAL
+            }
+        }
+        SET_TID_ADDRESS => sys_linux_set_tid_address(arg0),
+        // -- net --
+        SOCKET => sys_socket(arg0, arg1, arg2),
+        CONNECT => sys_connect(arg0, arg1, arg2),
+        ACCEPT => sys_accept(arg0, arg1, arg2),
+        SENDTO => {
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len = crate::smp::per_core().syscall_user_r9;
+            sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
+        }
+        RECVFROM => {
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
+            sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
+        }
+        SHUTDOWN => sys_shutdown_sock(arg0, arg1),
+        BIND => sys_bind(arg0, arg1, arg2),
+        LISTEN => sys_listen(arg0, arg1),
+        GETSOCKNAME => sys_getsockname(arg0, arg1, arg2),
+        GETPEERNAME => sys_getpeername(arg0, arg1, arg2),
+        SOCKETPAIR => {
+            let sv_ptr = per_core_syscall_arg3();
+            sys_socketpair(arg0, arg1, arg2, sv_ptr)
+        }
+        SETSOCKOPT => {
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen = crate::smp::per_core().syscall_user_r8;
+            sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
+        }
+        GETSOCKOPT => {
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
+        }
+        ACCEPT4 => {
+            let flags = per_core_syscall_arg3();
+            sys_accept4(arg0, arg1, arg2, flags)
+        }
+        // -- signal --
+        RT_SIGACTION => sys_rt_sigaction(arg0, arg1, arg2),
+        RT_SIGPROCMASK => sys_rt_sigprocmask(arg0, arg1, arg2),
+        KILL => sys_kill(arg0, arg1),
+        SIGALTSTACK => sys_sigaltstack(arg0, arg1),
+        // -- io --
+        POLL => sys_poll(arg0, arg1, arg2),
+        PIPE => sys_pipe_with_flags(arg0, false),
+        SELECT => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
+        EPOLL_WAIT => {
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
+        EPOLL_CTL => {
+            let event_ptr = per_core_syscall_arg3();
+            sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
+        }
+        PSELECT6 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
+        EPOLL_CREATE1 => sys_epoll_create1(arg0),
+        PIPE2 => {
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(arg0, cloexec)
+        }
+        // -- time --
+        NANOSLEEP => sys_nanosleep(arg0),
+        GETTIMEOFDAY => sys_gettimeofday(arg0),
+        TIMES => sys_times(arg0),
+        CLOCK_GETTIME => sys_clock_gettime(arg0, arg1),
+        // -- misc --
+        IOCTL => sys_linux_ioctl(arg0, arg1, arg2),
+        NICE => {
+            let pid = crate::process::current_pid();
+            let uid_val = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).map(|p| p.uid).unwrap_or(0)
+            };
+            crate::task::sys_nice(arg0 as i32, uid_val) as u64
+        }
+        UNAME => sys_linux_uname(arg0),
+        ARCH_PRCTL => sys_linux_arch_prctl(arg0, arg1),
+        REBOOT => sys_reboot(arg0),
+        FUTEX => {
+            let val3 = crate::smp::per_core().syscall_user_r9;
+            sys_futex(arg0, arg1, arg2, val3)
+        }
+        SET_ROBUST_LIST => 0,
+        PRLIMIT64 => NEG_ENOSYS,
+        GETRANDOM => sys_getrandom(arg0, arg1, arg2),
+        // -- m3OS custom --
+        DEBUG_PRINT => sys_debug_print(arg0, arg1),
+        MEMINFO => sys_meminfo(arg0, arg1),
+        #[cfg(feature = "trace")]
+        KTRACE => sys_ktrace(arg0, arg1, arg2),
+        FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
+        FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
+        READ_SCANCODE => sys_read_scancode(),
+        // -- ipc --
+        IPC_BASE..=IPC_LAST => {
+            let dispatch_number = (number - IPC_BASE) + 1;
+            crate::ipc::dispatch(dispatch_number, arg0, arg1, arg2, 0, 0)
+        }
+        _ => {
+            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            NEG_ENOSYS
+        }
     };
 
     // Phase 14/19: check pending signals before returning to userspace.
@@ -1291,6 +1657,12 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
 /// free page table.  Called when a single-threaded process exits or when the
 /// last thread in a thread group exits.
 fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
+    // Clean up IPC state (endpoint queues, notification waiters) before
+    // closing FDs so that IPC peers see errors promptly.
+    if let Some(task_id) = crate::task::scheduler::current_task_id() {
+        crate::ipc::cleanup::cleanup_task_ipc(task_id);
+    }
+
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
 

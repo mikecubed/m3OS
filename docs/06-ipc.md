@@ -101,8 +101,10 @@ For large transfers the pattern is:
    capability grant** — atomic, kernel-mediated, zero-copy.
 2. Use sync IPC to signal "data is ready in the shared region."
 
-Page capability grants are deferred to Phase 7+.  In Phase 6 all data fits in
-the four-word inline payload.
+Page capability grants are implemented in Phase 50 via the `Capability::Grant`
+variant.  In Phase 6 all data fits in the four-word inline payload; Phase 50
+adds the full bulk-data transport described in the [Bulk-Data Transport](#bulk-data-transport)
+section below.
 
 ---
 
@@ -115,8 +117,11 @@ pub struct Message {
 }
 ```
 
-A `Message` is 40 bytes — five 64-bit registers.  It transfers entirely through
-CPU registers: no pointer, no allocation, no cache miss.
+The syscall ABI transfers a `Message` through five 64-bit registers (label +
+four data words = 40 bytes).  The in-memory `Message` struct is larger because
+Phase 50 added an optional `cap: Option<Capability>` field (see below), but
+that field is kernel-internal — it never crosses the syscall boundary in a
+register.
 
 `label` is a convention between sender and receiver: it identifies which
 operation is being requested (analogous to a method ID in Mach or a message tag
@@ -130,9 +135,14 @@ The constructors match the number of data words used:
 | `Message::with1(label, d0)` | `data[0]` |
 | `Message::with2(label, d0, d1)` | `data[0..1]` |
 
-Capability grants in the message payload are deferred to Phase 7+.  For now, if
-a server needs to share memory with a client it must use a pre-arranged shared
-address.
+Phase 50 adds an optional `cap: Option<Capability>` field to `Message` for
+in-band capability transfer.  When the kernel delivers a message with an
+attached capability, it inserts the capability into the receiver's
+`CapabilityTable` via `insert_cap` and stores the assigned handle in
+`msg.data[3]` so the receiver can reference the transferred capability.
+The sender's copy is consumed from the `Message`; this is *not* an atomic
+cross-table move — see `transfer_cap` in `kernel/src/ipc/endpoint.rs` and
+`docs/50-ipc-completion.md` for details.
 
 ---
 
@@ -156,13 +166,14 @@ graph TD
     style EP fill:#8e44ad,color:#fff
 ```
 
-### Phase 6 Capability Variants
+### Capability Variants
 
-| Variant | What it grants |
-|---|---|
-| `Capability::Endpoint(EndpointId)` | Send or receive on a specific IPC endpoint |
-| `Capability::Notification(NotifId)` | Signal or wait on a notification object |
-| `Capability::Reply(TaskId)` | One-shot right to reply to a specific blocked caller |
+| Variant | What it grants | Added |
+|---|---|---|
+| `Capability::Endpoint(EndpointId)` | Send or receive on a specific IPC endpoint | Phase 6 |
+| `Capability::Notification(NotifId)` | Signal or wait on a notification object | Phase 6 |
+| `Capability::Reply(TaskId)` | One-shot right to reply to a specific blocked caller | Phase 6 |
+| `Capability::Grant { frame, page_count, writable }` | Ownership of physical page frames for zero-copy transfer | Phase 50 |
 
 `Reply` capabilities are ephemeral.  The kernel inserts one into the server's
 table when it delivers a `call` message; `reply` or `reply_recv` consumes it.
@@ -175,8 +186,10 @@ alongside the task structure.  `insert` scans for the first `None` slot;
 `remove` clears the slot.  A `TableFull` error is returned if all 64 slots are
 occupied — this should not occur in a teaching OS with a handful of services.
 
-Capability delegation (`sys_cap_grant`, transferring a capability to another
-task via IPC) is deferred to Phase 7+.
+Capability delegation is implemented in Phase 50 via `sys_cap_grant` (IPC
+syscall number 6), which atomically transfers a capability from the caller's
+table to a target task's table.  In-band capability transfer is also supported
+via the `Message.cap` field.
 
 ---
 
@@ -519,6 +532,142 @@ label, clearly distinguishing success from failure without a separate register.
 
 ---
 
+## Bulk-Data Transport
+
+IPC messages carry control data only — up to 4 machine words (32 bytes) of
+inline payload.  Bulk data such as file contents, framebuffer spans, and
+network packets uses a separate mechanism that bypasses the register-based
+message path entirely.
+
+### Hybrid Model: copy_from_user + Page Grants
+
+m3OS uses a two-tier bulk-data strategy selected by payload size:
+
+| Tier | Payload size | Mechanism | Latency |
+|---|---|---|---|
+| **Small copy** | 0 – 64 KiB | `copy_from_user` / `copy_to_user` | Low (memcpy through validated page tables) |
+| **Page grant** | > 64 KiB | `Capability::Grant` page transfer | Near-zero (remap, no copy) |
+
+**Small-copy path** — The kernel validates the user-space buffer address
+(must be above `0x1000`, below `0x0000_8000_0000_0000`, no wraparound, length
+<= 64 KiB) and then uses `copy_from_user` / `copy_to_user` (implemented in
+`kernel/src/mm/user_mem.rs`) to transfer bytes through the caller's page
+tables.  This is the common path for the vast majority of IPC payloads.
+
+**Page-grant path (structural groundwork)** — For transfers larger than 64 KiB
+(primarily framebuffer spans), Phase 50 adds a `Capability::Grant { frame,
+page_count, writable }` variant to the capability table.  The kernel-side
+mapping and revocation logic that would remap pages into the receiver's address
+space is not yet implemented; the Grant variant is capability-table groundwork
+for a future zero-copy transport path.
+
+### Payload Coverage
+
+The hybrid model covers every bulk-data type in the system:
+
+| Payload type | Typical size | Tier |
+|---|---|---|
+| Service-name strings (registry lookup) | 1 – 32 B | Small copy |
+| VFS paths | up to 4 KiB | Small copy |
+| Console write buffers | up to 4 KiB | Small copy |
+| Network packets (Ethernet MTU) | up to 1500 B | Small copy |
+| FAT32 disk blocks | 512 B – 64 KiB | Small copy |
+| Framebuffer spans | 4 KiB – 8 MiB | Page grant |
+
+### Ownership Rules
+
+1. **Allocator** — The sender allocates the buffer (either a user-space heap
+   buffer for small copies, or physical frames for page grants).
+2. **Lifetime** — For small copies, the kernel copies synchronously during the
+   syscall; the sender may reuse or free its buffer immediately after the
+   syscall returns.  For page grants, ownership transfers to the receiver on
+   successful grant; the sender must not access the pages afterward.
+3. **Service crash** — If a service holding granted pages crashes, the kernel
+   reclaims the pages during task cleanup (the same path that reclaims all
+   task-owned physical memory).  Small-copy buffers are ordinary user-space
+   allocations and are freed with the process address space.
+4. **Grant-of-grant** — A receiver that holds a `Grant` capability may
+   further grant it to another task.  Ownership chains are implicit; the
+   kernel tracks only the current holder.
+
+### Buffer Validation
+
+The kernel's `copy_from_user` / `copy_to_user` helpers (in
+`kernel/src/mm/user_mem.rs`) perform their own address and page-table
+validation inline.  A separate pure-logic helper,
+`validate_user_buffer(addr, len)` (defined in `kernel-core/src/ipc/buffer.rs`),
+mirrors these checks for host-side unit testing without requiring a live
+page table.  The shared validation rules are:
+
+- Address must be in the valid user-space range (> `0x1000`, < `0x0000_8000_0000_0000`)
+- Length must not exceed 64 KiB
+- `addr + len` must not wrap around
+- Zero-length buffers are accepted (no-op)
+- Null pointers (`0x0`) are rejected
+
+The kernel-core helper is a host-testable mirror of these rules, not the
+driver of the kernel's runtime checks.
+
+---
+
+## Server-Loop Failure Semantics
+
+IPC endpoints and notification objects are kernel resources that outlive
+individual syscalls.  When a task dies, the kernel must clean up its IPC
+state to prevent resource leaks and unblock peers that are waiting for
+the dying task.
+
+### Client dies before server replies
+
+The server holds a `Reply(caller_id)` capability.  When the server calls
+`reply()`, the reply message is delivered to the dead task's message slot
+(a harmless no-op since the task is dead and will never consume it).
+The server loop continues normally.  The dangling reply cap is consumed
+by `reply` and cleared from the server's capability table — no leak.
+In a `reply_recv` loop, the server atomically replies and waits for the
+next message, so the dead-client reply is a fire-and-forget operation.
+
+### Server dies while client is blocked in `call`
+
+The client is blocked in `BlockedOnReply` state, waiting for the server
+to call `reply()`.  During the server's exit, `cleanup_task_ipc(server_task_id)`
+is called (from `do_full_process_exit`), which:
+
+1. Removes the server from all endpoint receiver queues.
+2. Removes the server's pending sends from all endpoint sender queues.
+3. Clears any notification waiter slots held by the server.
+
+Callers that are blocked in `call` waiting for a reply from the server
+remain in `BlockedOnReply` state indefinitely.  A restarted server
+cannot reply to pre-crash callers because the one-shot `Reply(TaskId)`
+capabilities lived in the dying server's capability table and are lost
+on exit.  In a future enhancement, `cleanup_task_ipc` should scan for
+Reply caps targeting the dying task and wake the corresponding callers
+with an error message (`u64::MAX`).
+
+### Service restarts and re-registers
+
+The service registry (Phase 50, Track D) supports re-registration via
+`replace_service()`.  After the service manager restarts a crashed
+service, the new instance calls `ipc_register_service` with the same
+name, which atomically replaces the old endpoint mapping.  New clients
+that call `ipc_lookup_service` receive the new endpoint.
+
+Existing clients that cached the old endpoint cap must re-lookup the
+service after receiving an error from `call`.  The recommended pattern
+for resilient clients:
+
+```text
+loop:
+    result = ipc_call(server_ep, REQ, data)
+    if result == u64::MAX:
+        server_ep = ipc_lookup_service("my_service")
+        continue
+    handle(result)
+```
+
+---
+
 ## Phase 6 Simplifications vs. Real Microkernels
 
 Phase 6 deliberately keeps the IPC contract small.  Here is what a production
@@ -594,22 +743,25 @@ name-to-endpoint table inside `init_task`.
 
 ---
 
-## What Is Deferred to Phase 7+
+## What Was Deferred Beyond Phase 6 (Status)
 
-| Feature | Why Deferred |
-|---|---|
-| **Capability grants via IPC** (`sys_cap_grant`) | Requires `ipc_call` to carry capability slots in the message, copy-on-revocation semantics, and a parent-child capability tree |
-| **Page-capability bulk transfers** | Requires per-process page tables (CR3 switching) and page-mapping syscalls |
-| **IPC timeouts / cancellation** | Requires a kernel timer list and a way to unblock a sender whose receiver never shows up |
-| **Priority inheritance for IPC** | Requires a priority scheduler (deferred until after Phase 6) |
-| **Multi-process userspace IPC** | Phase 6 exercises IPC with kernel tasks; full ring-3 multi-process IPC is Phase 7 |
-| **Growable capability tables** | 64 slots is sufficient; growable tables need heap reallocation and handle remapping |
+| Feature | Status | Phase |
+|---|---|---|
+| **Capability grants via IPC** (`sys_cap_grant`) | Complete | Phase 50 |
+| **Page-capability bulk transfers** (`Capability::Grant`) | Groundwork (cap-table variant exists; kernel-side page mapping/revocation deferred) | Phase 50 |
+| **Bulk-data copy-from-user path** | Complete | Phase 50 |
+| **Ring-3-safe service registry** | Complete | Phase 50 |
+| **Server-loop failure semantics** | Complete | Phase 50 |
+| **IPC timeouts / cancellation** | Deferred | Requires a kernel timer list |
+| **Priority inheritance for IPC** | Deferred | Requires priority-aware IPC scheduler |
+| **Growable capability tables** | Deferred | 64 slots is sufficient for now |
 
 ---
 
 ## See Also
 
 - `docs/05-userspace-entry.md` — ring-3 execution model (Phase 5)
+- `docs/50-ipc-completion.md` — capability grants, bulk-data transport, registry safety (Phase 50)
 - `docs/07-core-servers.md` — server infrastructure built on this IPC (Phase 7)
 - `docs/appendix/testing.md` — how to test IPC paths in QEMU
 - `docs/roadmap/06-ipc-core.md` — roadmap phase doc

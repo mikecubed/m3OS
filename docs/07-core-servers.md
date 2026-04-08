@@ -264,14 +264,15 @@ This is not implemented in Phase 7. Currently `kbd_server` only logs scancodes t
 
 ## Limitations and Deferred Work
 
-### Servers are kernel tasks, not ring-3 processes
+### Servers are kernel tasks, not ring-3 processes (transition underway)
 
-The most important limitation: in Phase 7, `console_server` and `kbd_server` run as kernel
-threads in ring 0, sharing the kernel address space. They are not isolated processes.
+In Phase 7, `console_server` and `kbd_server` run as kernel threads in ring 0, sharing the
+kernel address space. They are not isolated processes.
 
-This is a deliberate deferral. Building true ring-3 servers requires an ELF loader (to parse
-and map server binaries) and a process manager (to allocate page tables, set up the initial
-stack, and transfer capabilities). Those belong to Phase 8.
+As of Phase 50, the IPC transport model is complete: capability grants, validated
+`copy_from_user` paths, and page-grant bulk transfers mean services **can** be ring-3
+processes communicating through the standard IPC contract. The remaining work to actually
+extract them into ring-3 binaries is planned for Phase 52 (First Service Extractions).
 
 The architecture is otherwise identical to what ring-3 servers would look like: the IPC paths,
 the endpoint capability model, and the service registry all work the same way. Moving servers
@@ -283,31 +284,30 @@ Because servers share the kernel address space, a bug in `console_server` can co
 data structures. In a real microkernel, this is impossible by construction: each server runs in
 its own page table and can only reach kernel memory through validated syscalls.
 
-### String pointers are kernel addresses
+### String pointers are kernel addresses (Phase 7 only)
 
-The `CONSOLE_WRITE` message passes a pointer directly in the IPC payload:
+The Phase 7 `CONSOLE_WRITE` message passes a pointer directly in the IPC payload:
 
 ```
 data[0]: pointer to string (kernel virtual address)
 ```
 
-In Phase 8+, when clients are ring-3 processes, this cannot work: the pointer would be a
-user virtual address, which the server cannot dereference directly. The correct mechanism is a
-**page capability grant**: the client maps a page into the server's address space, writes the
-string there, then sends only the page capability and offset. Phase 7 defers this because there
-are no ring-3 processes yet.
+Phase 50 defines the intended migration of the console server data path to validated
+`copy_from_user` and, for transfers larger than 64 KiB, page capability grants
+(`Capability::Grant`) as a zero-copy path. The current Phase 7-style pointer-in-message
+path still uses `copy_nonoverlapping` with basic address-range validation, not full
+page-table-walking `copy_from_user`. See `docs/50-ipc-completion.md` for the planned
+bulk-data transport model.
 
-### Registry is static
+### Registry is static (Phase 7 only)
 
-The service registry supports `register` and `lookup` but not:
+The Phase 7 service registry supports `register` and `lookup` but not deregistration,
+restart policy, or health monitoring.
 
-- **Deregistration** — once registered, an entry cannot be removed
-- **Restart policy** — if a server crashes, nothing restarts it
-- **Health monitoring** — there is no heartbeat or watchdog mechanism
-
-These are standard features of production service managers (systemd, s6, SMF). They are
-deferred because Phase 7's goal is to prove that the IPC plumbing works, not to build a
-production service supervisor.
+As of Phase 50, the registry tracks service owners via `TaskId`, supports
+re-registration for restarted services via `replace_service()`, and has been
+expanded to 16 entries. Phase 46 added a full service manager with
+dependency-ordered boot, automatic restart, and system logging.
 
 ---
 

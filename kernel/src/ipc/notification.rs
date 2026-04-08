@@ -208,6 +208,20 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     scheduler::signal_reschedule();
 }
 
+/// Clear a dying task from all notification waiter slots.
+///
+/// Called during task cleanup to ensure the dying task is not left as a
+/// waiter on any notification object.  Without this, a subsequent
+/// `signal()` would attempt to wake a dead task.
+pub fn clear_waiter(task_id: TaskId) {
+    let mut waiters = WAITERS.lock();
+    for slot in waiters.iter_mut() {
+        if *slot == Some(task_id) {
+            *slot = None;
+        }
+    }
+}
+
 /// Scan all notifications and wake any task whose PENDING bits are non-zero.
 ///
 /// Called from the scheduler loop in task context (after interrupts are

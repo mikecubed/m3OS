@@ -272,7 +272,7 @@ pub unsafe fn enter_userspace(entry: VirtAddr, user_stack_top: VirtAddr) -> ! {
 
 ## Current Architecture
 
-Today (v0.48.0), m3OS is architecturally a **monolithic kernel with microkernel IPC
+Today (v0.50.0), m3OS is architecturally a **monolithic kernel with microkernel IPC
 infrastructure**. All subsystems run in ring 0:
 
 - **Memory** (mm/): buddy frame allocator, slab caches, page tables, heap, ELF loader,
@@ -385,12 +385,13 @@ For Move/Transition subsystems, the migration stage refers to the planned extrac
 | net/mod (socket table) | Transition | Socket lifecycle management is policy but deeply integrated with syscall layer | Stage 4 |
 | tty | Transition | TTY line discipline is policy but signal delivery coupling keeps it ring-0 for now | Stage 3 |
 | pty | Move | PTY pairs are pure data buffering — can run as ring-3 server | Stage 3 |
+| kbd/keyboard/input | Move | Input device driver — can run in ring 3 with IRQ notification capabilities | Stage 2 |
 
 ### Migration Stages
 
-- **Stage 0** (current): All subsystems in ring 0. IPC infrastructure exists but servers run as kernel tasks.
-- **Stage 1**: Syscall surface decomposed into subsystem modules. Ownership documented. (Phase 49 — this phase.)
-- **Stage 2**: Hardware drivers (VirtIO-blk, VirtIO-net, framebuffer) extracted to ring-3 with I/O capability grants.
+- **Stage 0** (complete): All subsystems in ring 0. IPC infrastructure exists but servers run as kernel tasks.
+- **Stage 1** (complete): Syscall surface decomposed (Phase 49). IPC transport model completed with capability grants, bulk-data paths, ring-3-safe registry, and server-loop failure semantics (Phase 50).
+- **Stage 2**: Hardware drivers (VirtIO-blk, VirtIO-net, framebuffer, keyboard/input) extracted to ring-3 with I/O capability grants.
 - **Stage 3**: Filesystem stack extracted to ring-3 VFS/FS servers. Syscalls forwarded via IPC.
 - **Stage 4**: Network protocol stack extracted to ring-3 network server. Socket syscalls forwarded via IPC.
 
@@ -525,6 +526,7 @@ that could be forwarded to a ring-3 server via IPC in the target architecture.
 | 0x1000 | debug_print | misc | Mechanism | Direct serial output for kernel debugging |
 | 0x1001 | meminfo | mm | Mechanism | Kernel memory statistics from allocator internals |
 | 0x1002 | ktrace | misc | Mechanism | Kernel trace ring access |
+| 0x1100–0x1109 | ipc_* | ipc | Mechanism | IPC operations dispatched through `kernel/src/arch/x86_64/syscall/ipc.rs`; maps userspace `0x1100`–`0x1109` to internal dispatch 1–10 (includes recv, send, call, reply, reply_recv, cap_grant, notify_wait, notify_signal, register_service, lookup_service) (Phase 50) |
 | 0x1005 | framebuffer_info | misc | Policy/compat | Framebuffer metadata; forward to display server (Stage 2) |
 | 0x1006 | framebuffer_mmap | mm | Mechanism | Maps framebuffer MMIO into user address space — ring-0 page table op |
 | 0x1007 | read_scancode | misc | Policy/compat | Raw keyboard input; forward to keyboard server (Stage 2) |
@@ -533,8 +535,8 @@ that could be forwarded to a ring-3 server via IPC in the target architecture.
 
 | Classification | Count | Percentage |
 |---|---|---|
-| Mechanism (ring-0 required) | ~35 | ~39% |
-| Policy/compat (extraction candidate) | ~55 | ~61% |
+| Mechanism (ring-0 required) | ~36 | ~39% |
+| Policy/compat (extraction candidate) | ~55 | ~60% |
 
 The ~55 policy/compat syscalls are candidates for IPC forwarding in Stages 2-4.
 The ~35 mechanism syscalls must remain in ring 0 as they require direct hardware

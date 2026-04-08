@@ -1,11 +1,13 @@
 # Release Phase R03 — IPC Completion
 
-**Status:** Proposed  
+**Status:** Complete (v0.50.0)  
 **Depends on:** [R02 — Architectural Declaration](./R02-architectural-declaration.md)  
-**Official roadmap phases covered:** [Phase 6](../../roadmap/06-ipc-core.md),
+**Official roadmap phases covered:** [Phase 50](../../roadmap/50-ipc-completion.md)
+(builds on [Phase 6](../../roadmap/06-ipc-core.md),
 [Phase 7](../../roadmap/07-core-servers.md),
 [Phase 8](../../roadmap/08-storage-and-vfs.md),
-[Phase 39](../../roadmap/39-unix-domain-sockets.md)  
+[Phase 39](../../roadmap/39-unix-domain-sockets.md),
+[Phase 49](../../roadmap/49-architectural-declaration.md))  
 **Primary evaluation docs:** [Path to a Proper Microkernel Design](../microkernel-path.md),
 [Current State](../current-state.md)
 
@@ -93,9 +95,10 @@ architecture move cheaper and more trustworthy.
 - [Phase 6 — IPC Core](../../roadmap/06-ipc-core.md)
 - [Phase 8 — Storage and VFS](../../roadmap/08-storage-and-vfs.md)
 
-## Open Questions
+## Resolved Design Questions
 
-- Should the first bulk-data path be framed around granted pages, shared buffers,
-  or a hybrid copy-and-grant model?
-- How much typed IPC support belongs in shared libraries versus the kernel
-  contract itself?
+- **Bulk-data path**: Phase 50 chose a hybrid copy-and-grant model. Small payloads
+  (up to 64 KiB) use `copy_from_user` / `copy_to_user` with validated page-table
+  access. Large payloads (framebuffer spans) use `Capability::Grant` page transfers.
+- **Typed IPC support**: Deferred. Phase 50 standardizes the raw message and
+  capability-grant contract. Typed IDLs and code-generated bindings are later work.

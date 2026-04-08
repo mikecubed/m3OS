@@ -141,7 +141,7 @@ Before moving subsystems, m3OS should make the target architecture explicit in c
 
 **Deferred items:** None. All three Stage 0 goals are addressed. The actual code movement (extracting subsystems to userspace) is the subject of Stages 1--5 and is not part of Stage 0.
 
-### Stage 1: complete the IPC model for real ring-3 servers
+### Stage 1: complete the IPC model for real ring-3 servers (COMPLETE -- Phase 50)
 
 This is the real prerequisite for the rest.
 
@@ -158,6 +158,24 @@ This is the real prerequisite for the rest.
 - fix service-registry syscalls so they are ring-3-safe
 - define a stable message/buffer contract for strings, file blocks, framebuffer spans, and packet buffers
 - connect service registration, death handling, and restart semantics to the existing Phase 46 supervisor so extracted services can actually be managed
+
+**Completion status (Phase 50, v0.50.0)**
+
+| Deliverable | Status | Reference |
+|---|---|---|
+| Capability grants (`sys_cap_grant`, `CapabilityTable::grant`) | Complete | `kernel-core/src/ipc/capability.rs`, `kernel/src/ipc/mod.rs` |
+| Grant capability variant for page transfers | Complete | `Capability::Grant { frame, page_count, writable }` |
+| Message cap field for in-band capability delivery | Complete | `kernel-core/src/ipc/message.rs` |
+| Buffer validation (`validate_user_buffer`) | Complete | `kernel-core/src/ipc/buffer.rs` |
+| `copy_from_user` in IPC register/lookup | Complete | `kernel/src/ipc/mod.rs` |
+| Owner-tracked registry with re-registration | Complete | `kernel-core/src/ipc/registry.rs` |
+| Registry capacity increased (8 to 16) | Complete | `kernel-core/src/ipc/registry.rs` |
+| IPC syscall dispatch module | Complete | `kernel/src/arch/x86_64/syscall/mod.rs` (flat dispatch table; `ipc.rs` retained as documentation) |
+| Server-loop failure semantics | Complete | `docs/06-ipc.md` |
+| IPC cleanup on task exit | Complete | `kernel/src/ipc/endpoint.rs` |
+| Console server validated data path | Complete | `kernel/src/main.rs` |
+
+**Deferred items:** None. All five Stage 1 goals are addressed. Actual service extraction to ring-3 processes is the subject of Stages 2--5.
 
 **Why this stage matters**
 

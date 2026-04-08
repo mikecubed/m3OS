@@ -263,7 +263,7 @@ flowchart TD
 |---|---|---|---|---|---|---|
 | 48 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Complete | `phase-48` | [Phase 48](./48-security-foundation.md) | [Tasks](./tasks/48-security-foundation-tasks.md) |
 | 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Complete | `phase-49` | [Phase 49](./49-architectural-declaration.md) | [Tasks](./tasks/49-architectural-declaration-tasks.md) |
-| 50 | IPC Completion | Finish capability grants, bulk data transport, and ring-3-safe service contracts | Planned | `phase-50` | [Phase 50](./50-ipc-completion.md) | Deferred until implementation planning |
+| 50 | IPC Completion | Capability grants, bulk-data transport (copy + page grants), ring-3-safe registry, server-loop failure semantics | Complete | `phase-50` | [Phase 50](./50-ipc-completion.md) | [Tasks](./tasks/50-ipc-completion-tasks.md) |
 | 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | Planned | `phase-51` | [Phase 51](./51-service-model-maturity.md) | Deferred until implementation planning |
 | 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-52` | [Phase 52](./52-first-service-extractions.md) | Deferred until implementation planning |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |

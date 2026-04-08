@@ -819,6 +819,16 @@ pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
     }
 }
 
+/// Insert a capability into a task's capability table at a specific slot.
+pub fn insert_cap_at(id: TaskId, handle: CapHandle, cap: Capability) -> Result<(), CapError> {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].caps.insert_at(handle, cap)
+    } else {
+        Err(CapError::InvalidHandle)
+    }
+}
+
 /// Look up a capability in a task's capability table.
 pub fn task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapError> {
     let sched = SCHEDULER.lock();

@@ -31,7 +31,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use spin::Mutex;
 
-use super::{Capability, Message};
+use super::{CapError, Capability, Message};
 use crate::task::{TaskId, scheduler};
 
 pub use kernel_core::types::EndpointId;
@@ -41,7 +41,7 @@ pub use kernel_core::types::EndpointId;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of concurrent IPC endpoints.
-const MAX_ENDPOINTS: usize = 16;
+pub(super) const MAX_ENDPOINTS: usize = 16;
 
 /// Global registry of all kernel IPC endpoints.
 ///
@@ -100,18 +100,18 @@ impl EndpointRegistry {
 pub struct Endpoint {
     /// Tasks blocked waiting to *send* a message (or in `call`, also waiting
     /// for a reply afterwards).
-    senders: VecDeque<PendingSend>,
+    pub(super) senders: VecDeque<PendingSend>,
     /// Tasks blocked waiting to *receive* a message.
-    receivers: VecDeque<TaskId>,
+    pub(super) receivers: VecDeque<TaskId>,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
-struct PendingSend {
-    task: TaskId,
-    msg: Message,
+pub(super) struct PendingSend {
+    pub(super) task: TaskId,
+    pub(super) msg: Message,
     /// `true` if this is a `call` — the sender expects a reply cap to be
     /// inserted into the server's capability table.
-    wants_reply: bool,
+    pub(super) wants_reply: bool,
 }
 
 impl Endpoint {
@@ -162,26 +162,48 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
     // ENDPOINTS lock is released before any scheduler calls.
 
     match action {
-        Some(pending) => {
-            // A sender was waiting — deliver message to ourselves.
+        Some(mut pending) => {
+            // Insert reply cap FIRST so it reserves a slot before transfer_cap
+            // can consume the last free entry.  This prevents a scenario where
+            // transfer_cap succeeds but the reply-cap insertion fails, leaving
+            // an unreachable capability in the receiver's table.
+            let reply_cap_handle = if pending.wants_reply {
+                match scheduler::insert_cap(receiver, Capability::Reply(pending.task)) {
+                    Ok(handle) => Some(handle),
+                    Err(_) => {
+                        log::warn!(
+                            "[ipc] recv_msg: capability table full, unblocking sender without reply"
+                        );
+                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                        let _ = scheduler::wake_task(pending.task);
+                        return Message::new(u64::MAX);
+                    }
+                }
+            } else {
+                None
+            };
+            // Transfer any attached capability from the sender's message.
+            if transfer_cap(pending.task, receiver, &mut pending.msg).is_err() {
+                log::warn!(
+                    "[ipc] recv_msg: capability transfer failed, dropping message from task {}",
+                    pending.task.0,
+                );
+                // Remove the reply cap we just inserted to avoid a dangling cap.
+                if let Some(handle) = reply_cap_handle {
+                    let _ = scheduler::remove_task_cap(receiver, handle);
+                }
+                // Wake the sender with an error so it doesn't block forever.
+                scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                let _ = scheduler::wake_task(pending.task);
+                return Message::new(u64::MAX);
+            }
+            // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            if pending.wants_reply {
-                // Insert a one-shot reply cap; sender stays blocked awaiting reply().
-                // If the table is full, deliver an explicit error reply so the
-                // sender's take_message() returns Some(u64::MAX) rather than None
-                // (which would fire a misleading debug_assert in call()).
-                if scheduler::insert_cap(receiver, Capability::Reply(pending.task)).is_err() {
-                    log::warn!(
-                        "[ipc] recv_msg: capability table full, unblocking sender without reply"
-                    );
-                    scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                    let _ = scheduler::wake_task(pending.task);
-                }
-            } else {
+            if !pending.wants_reply {
                 let _ = scheduler::wake_task(pending.task);
             }
         }
@@ -397,4 +419,102 @@ pub fn reply_recv_msg(
 ) -> Message {
     reply(caller, reply_msg);
     recv_msg(server, ep_id)
+}
+
+// ---------------------------------------------------------------------------
+// Capability transfer helper
+// ---------------------------------------------------------------------------
+
+/// Transfer an attached capability from sender to receiver.
+///
+/// If `msg` carries a capability (`msg.cap` is `Some`), insert it into the
+/// receiver's capability table.  On success, clear the cap from `msg` and
+/// store the assigned handle index in `msg.data[3]` so the receiver can
+/// discover the new capability.  On failure (receiver table full), return an
+/// error; the caller should abort the send.
+///
+/// If `msg` has no attached cap, this is a no-op returning `Ok(())`.
+fn transfer_cap(_sender: TaskId, receiver: TaskId, msg: &mut Message) -> Result<(), CapError> {
+    if let Some(cap) = msg.cap.take() {
+        match scheduler::insert_cap(receiver, cap) {
+            Ok(handle) => {
+                // Communicate the assigned handle to the receiver via data[3].
+                msg.data[3] = handle as u64;
+                log::trace!(
+                    "[ipc] capability transferred: {:?} -> task {} (handle {})",
+                    cap,
+                    receiver.0,
+                    handle,
+                );
+                crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
+                    task_idx: receiver.0 as u32,
+                    ep: u32::MAX, // sentinel: capability transfer, not endpoint delivery
+                });
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "[ipc] capability transfer failed: receiver {} table full",
+                    receiver.0,
+                );
+                // Put the cap back so the sender doesn't lose it.
+                msg.cap = Some(cap);
+                Err(e)
+            }
+        }
+    } else {
+        Ok(())
+    }
+}
+
+/// Variant of `send` that also transfers an attached capability.
+///
+/// If the message carries a capability and the receiver's table is full,
+/// the send fails and returns `false`.  The sender retains the capability.
+pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> bool {
+    let matched_receiver = {
+        let mut reg = ENDPOINTS.lock();
+        let ep = match reg.get_mut(ep_id) {
+            Some(e) => e,
+            None => return false,
+        };
+        if let Some(receiver) = ep.receivers.pop_front() {
+            Some(receiver)
+        } else {
+            ep.senders.push_back(PendingSend {
+                task: sender,
+                msg,
+                wants_reply: false,
+            });
+            None
+        }
+    };
+
+    match matched_receiver {
+        Some(receiver) => {
+            // Transfer capability before delivering the message.
+            if transfer_cap(sender, receiver, &mut msg).is_err() {
+                // Put receiver back — act as if the send never happened.
+                let mut reg = ENDPOINTS.lock();
+                if let Some(ep) = reg.get_mut(ep_id) {
+                    ep.receivers.push_front(receiver);
+                }
+                return false;
+            }
+            scheduler::deliver_message(receiver, msg);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
+                task_idx: receiver.0 as u32,
+                ep: ep_id.0 as u32,
+            });
+            let _ = scheduler::wake_task(receiver);
+        }
+        None => {
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendBlock {
+                task_idx: sender.0 as u32,
+                ep: ep_id.0 as u32,
+            });
+            scheduler::block_current_on_send();
+        }
+    }
+    true
 }
