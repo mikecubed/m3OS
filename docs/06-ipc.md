@@ -101,8 +101,10 @@ For large transfers the pattern is:
    capability grant** — atomic, kernel-mediated, zero-copy.
 2. Use sync IPC to signal "data is ready in the shared region."
 
-Page capability grants are deferred to Phase 7+.  In Phase 6 all data fits in
-the four-word inline payload.
+Page capability grants are implemented in Phase 50 via the `Capability::Grant`
+variant.  In Phase 6 all data fits in the four-word inline payload; Phase 50
+adds the full bulk-data transport described in the [Bulk-Data Transport](#bulk-data-transport)
+section below.
 
 ---
 
@@ -130,9 +132,11 @@ The constructors match the number of data words used:
 | `Message::with1(label, d0)` | `data[0]` |
 | `Message::with2(label, d0, d1)` | `data[0..1]` |
 
-Capability grants in the message payload are deferred to Phase 7+.  For now, if
-a server needs to share memory with a client it must use a pre-arranged shared
-address.
+Phase 50 adds an optional `cap: Option<Capability>` field to `Message` for
+in-band capability transfer.  When a message with an attached capability is
+delivered, the kernel uses `CapabilityTable::grant` to atomically move the
+capability from sender to receiver.  See `docs/50-ipc-completion.md` for
+details.
 
 ---
 
@@ -156,13 +160,14 @@ graph TD
     style EP fill:#8e44ad,color:#fff
 ```
 
-### Phase 6 Capability Variants
+### Capability Variants
 
-| Variant | What it grants |
-|---|---|
-| `Capability::Endpoint(EndpointId)` | Send or receive on a specific IPC endpoint |
-| `Capability::Notification(NotifId)` | Signal or wait on a notification object |
-| `Capability::Reply(TaskId)` | One-shot right to reply to a specific blocked caller |
+| Variant | What it grants | Added |
+|---|---|---|
+| `Capability::Endpoint(EndpointId)` | Send or receive on a specific IPC endpoint | Phase 6 |
+| `Capability::Notification(NotifId)` | Signal or wait on a notification object | Phase 6 |
+| `Capability::Reply(TaskId)` | One-shot right to reply to a specific blocked caller | Phase 6 |
+| `Capability::Grant { frame, page_count, writable }` | Ownership of physical page frames for zero-copy transfer | Phase 50 |
 
 `Reply` capabilities are ephemeral.  The kernel inserts one into the server's
 table when it delivers a `call` message; `reply` or `reply_recv` consumes it.
@@ -175,8 +180,10 @@ alongside the task structure.  `insert` scans for the first `None` slot;
 `remove` clears the slot.  A `TableFull` error is returned if all 64 slots are
 occupied — this should not occur in a teaching OS with a handful of services.
 
-Capability delegation (`sys_cap_grant`, transferring a capability to another
-task via IPC) is deferred to Phase 7+.
+Capability delegation is implemented in Phase 50 via `sys_cap_grant` (IPC
+syscall number 6), which atomically transfers a capability from the caller's
+table to a target task's table.  In-band capability transfer is also supported
+via the `Message.cap` field.
 
 ---
 
@@ -725,22 +732,25 @@ name-to-endpoint table inside `init_task`.
 
 ---
 
-## What Is Deferred to Phase 7+
+## What Was Deferred Beyond Phase 6 (Status)
 
-| Feature | Why Deferred |
-|---|---|
-| **Capability grants via IPC** (`sys_cap_grant`) | Requires `ipc_call` to carry capability slots in the message, copy-on-revocation semantics, and a parent-child capability tree |
-| **Page-capability bulk transfers** | Requires per-process page tables (CR3 switching) and page-mapping syscalls |
-| **IPC timeouts / cancellation** | Requires a kernel timer list and a way to unblock a sender whose receiver never shows up |
-| **Priority inheritance for IPC** | Requires a priority scheduler (deferred until after Phase 6) |
-| **Multi-process userspace IPC** | Phase 6 exercises IPC with kernel tasks; full ring-3 multi-process IPC is Phase 7 |
-| **Growable capability tables** | 64 slots is sufficient; growable tables need heap reallocation and handle remapping |
+| Feature | Status | Phase |
+|---|---|---|
+| **Capability grants via IPC** (`sys_cap_grant`) | Complete | Phase 50 |
+| **Page-capability bulk transfers** (`Capability::Grant`) | Complete | Phase 50 |
+| **Bulk-data copy-from-user path** | Complete | Phase 50 |
+| **Ring-3-safe service registry** | Complete | Phase 50 |
+| **Server-loop failure semantics** | Complete | Phase 50 |
+| **IPC timeouts / cancellation** | Deferred | Requires a kernel timer list |
+| **Priority inheritance for IPC** | Deferred | Requires priority-aware IPC scheduler |
+| **Growable capability tables** | Deferred | 64 slots is sufficient for now |
 
 ---
 
 ## See Also
 
 - `docs/05-userspace-entry.md` — ring-3 execution model (Phase 5)
+- `docs/50-ipc-completion.md` — capability grants, bulk-data transport, registry safety (Phase 50)
 - `docs/07-core-servers.md` — server infrastructure built on this IPC (Phase 7)
 - `docs/appendix/testing.md` — how to test IPC paths in QEMU
 - `docs/roadmap/06-ipc-core.md` — roadmap phase doc
