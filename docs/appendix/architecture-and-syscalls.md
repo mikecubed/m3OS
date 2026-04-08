@@ -542,6 +542,87 @@ access, page table manipulation, or scheduler/process table operations.
 
 ---
 
+## Userspace-First Rule
+
+New high-level policy defaults to userspace implementation unless a documented
+ring-0 justification is provided.
+
+This rule exists to prevent the kernel from growing by convenience. As m3OS
+moves toward a properly enforced microkernel boundary, the default placement
+for any new subsystem, protocol handler, policy module, or service is
+**userspace (ring 3)**.
+
+### Valid justifications for ring-0 placement
+
+Code belongs in the kernel only when one or more of the following apply:
+
+1. **Hardware mediation** -- the code requires direct access to privileged
+   hardware registers, MMIO regions, or I/O ports that cannot be safely
+   delegated to a userspace driver without kernel support.
+2. **Scheduler or memory primitives** -- the code implements core scheduling
+   decisions, page table manipulation, frame allocation, or address-space
+   management that fundamentally requires ring-0 privilege.
+3. **Interrupt handling** -- the code is part of the minimal interrupt service
+   routine path (ISR entry, device acknowledgment, EOI, ring-buffer push) that
+   must execute before returning to the interrupted context.
+4. **IPC mechanism** -- the code implements the IPC fast path, capability
+   validation, endpoint/notification object management, or other primitives
+   that form the kernel's communication substrate.
+
+### Documenting a ring-0 exception
+
+When a phase design doc proposes placing policy-heavy code in ring 0, the
+author must add a **Ring-0 Justification** section to that phase's design
+document. The section must:
+
+1. Name the specific code or subsystem being placed in ring 0.
+2. State which valid justification(s) from the list above apply.
+3. Explain why a userspace implementation is not practical for this case.
+4. Declare whether the placement is **permanent** (mechanism that inherently
+   requires ring 0) or **transitional** (will be moved to userspace when
+   prerequisites like IPC buffer grants are available).
+
+If no Ring-0 Justification section exists and the code adds policy to ring 0,
+the phase should be treated as incomplete.
+
+---
+
+## Architecture Review Checklist
+
+Use this checklist when evaluating whether new code belongs in ring 0 or
+userspace. Any "yes" answer without a documented Ring-0 Justification is a
+sign that the code should be reconsidered.
+
+- [ ] **Syscall surface growth** -- Does this change add new syscall numbers?
+  Each new syscall widens the kernel's attack surface and ABI commitment.
+  Prefer routing new functionality through existing IPC or file-descriptor
+  interfaces rather than adding kernel entry points.
+
+- [ ] **New kernel-resident service tasks** -- Does this change introduce a new
+  long-running task or server loop inside the kernel? Kernel tasks share
+  ring-0 fate with the scheduler and memory manager. Services that can crash
+  independently should be userspace processes supervised by init.
+
+- [ ] **New policy logic in existing kernel modules** -- Does this change add
+  decision-making, configuration parsing, access-control rules, or protocol
+  state machines to an existing kernel module? Policy accumulation is the
+  primary way kernels grow beyond their intended scope. Prefer thin kernel
+  mechanisms that delegate policy to userspace.
+
+- [ ] **New filesystem or network protocol handling** -- Does this change add a
+  new filesystem type, network protocol, or socket family implementation
+  inside the kernel? These are classic candidates for userspace servers in a
+  microkernel. Unless the protocol requires interrupt-level or page-table-level
+  integration, it should be a userspace service.
+
+- [ ] **Shared-state assumptions** -- Does this change rely on accessing
+  another subsystem's internal state directly (e.g., reading scheduler
+  structures from a filesystem module)? Cross-subsystem coupling in ring 0
+  makes future extraction harder. Prefer explicit interfaces that could later
+  become IPC boundaries.
+
+---
+
 ## Related Docs
 
 - [Phase 5 — Userspace Entry](../05-userspace-entry.md) — Ring 3 execution model

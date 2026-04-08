@@ -1,3 +1,6 @@
+//! # Ownership: Keep
+//! Syscall dispatcher is a core kernel mechanism — routes syscall numbers to subsystem handlers.
+//!
 //! Syscall entry point via the SYSCALL/SYSRET instruction pair.
 //!
 //! On SYSCALL the CPU:

@@ -1,6 +1,6 @@
 # Release Phase R02 — Architectural Declaration
 
-**Status:** Proposed  
+**Status:** Complete (Phase 49)  
 **Depends on:** none  
 **Official roadmap phases covered:** [Phase 6](../../roadmap/06-ipc-core.md),
 [Phase 7](../../roadmap/07-core-servers.md),
@@ -79,15 +79,37 @@ trying to be. That dramatically reduces the risk of halfway migrations.
 
 ## Acceptance Criteria
 
-- There is a clear and maintained statement of ring-0 vs. ring-3 ownership
-- `syscall.rs` is decomposed enough that kernel mechanisms and compatibility
-  facades are visibly distinct
-- New high-level subsystem work defaults to userspace unless there is a written
-  exception
-- Key docs explicitly distinguish **current implementation** from **target
+- **There is a clear and maintained statement of ring-0 vs. ring-3 ownership**
+  -- Satisfied by the Keep/Move/Transition Matrix in
+  `docs/appendix/architecture-and-syscalls.md`, which classifies every major
+  kernel subsystem as permanent ring-0 mechanism, transitional, or targeted for
+  userspace extraction.
+
+- **`syscall.rs` is decomposed enough that kernel mechanisms and compatibility
+  facades are visibly distinct**
+  -- Satisfied by the syscall decomposition in
+  `kernel/src/arch/x86_64/syscall/` (mod.rs dispatcher + 8 subsystem modules:
+  mm, process, fs, net, ipc, tty, misc, security). The Syscall Ownership
+  Classification section in the architecture doc tags each syscall as
+  fundamental primitive or compatibility shim.
+
+- **New high-level subsystem work defaults to userspace unless there is a
+  written exception**
+  -- Satisfied by the Userspace-First Rule section in
+  `docs/appendix/architecture-and-syscalls.md` and the corresponding
+  convention entry in `AGENTS.md`. The rule requires a Ring-0 Justification
+  section in any phase design doc that places policy in the kernel.
+
+- **Key docs explicitly distinguish current implementation from target
   architecture**
-- The project can explain, in one page, what "properly enforced microkernel"
-  means for m3OS specifically
+  -- Satisfied by `docs/evaluation/microkernel-path.md` (current vs. target
+  architecture with migration stages) and the Keep/Move/Transition Matrix
+  (per-subsystem current-state and target-state columns).
+
+- **The project can explain, in one page, what "properly enforced microkernel"
+  means for m3OS specifically**
+  -- Satisfied by the "What proper microkernel should mean for m3OS" section in
+  `docs/evaluation/microkernel-path.md`, which defines five concrete criteria.
 
 ## Key Cross-Links
 
@@ -97,8 +119,20 @@ trying to be. That dramatically reduces the risk of halfway migrations.
 - [Phase 6 — IPC Core](../../roadmap/06-ipc-core.md)
 - [Phase 12 — POSIX Compatibility](../../roadmap/12-posix-compat.md)
 
-## Open Questions
+## Open Questions (Addressed)
 
-- How much POSIX/Linux ABI translation should remain in the kernel for 1.0?
-- Is there a small set of policy-heavy kernel code that is intentionally kept in
-  ring 0 even after the migration, or is the long-term direction stricter?
+- **How much POSIX/Linux ABI translation should remain in the kernel for 1.0?**
+  -- Deferred to later stages. The recommended approach in
+  `docs/evaluation/microkernel-path.md` is a hybrid incremental strategy:
+  preserve the current syscall ABI, move implementation behind it to userspace
+  where practical, and refuse new large policy additions to the kernel. The
+  exact POSIX surface retained at 1.0 depends on progress through Stages 1--4
+  of the migration path.
+
+- **Is there a small set of policy-heavy kernel code that is intentionally kept
+  in ring 0 even after the migration, or is the long-term direction stricter?**
+  -- Addressed by the Keep/Move/Transition Matrix. Some subsystems (VFS shim,
+  fd table, signal delivery) are marked as transitional with long-term
+  residence in ring 0 as thin kernel facades that delegate to userspace
+  servers. The Userspace-First Rule ensures any such permanent placement
+  requires an explicit Ring-0 Justification.
