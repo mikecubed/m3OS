@@ -519,6 +519,81 @@ label, clearly distinguishing success from failure without a separate register.
 
 ---
 
+## Bulk-Data Transport
+
+IPC messages carry control data only — up to 4 machine words (32 bytes) of
+inline payload.  Bulk data such as file contents, framebuffer spans, and
+network packets uses a separate mechanism that bypasses the register-based
+message path entirely.
+
+### Hybrid Model: copy_from_user + Page Grants
+
+m3OS uses a two-tier bulk-data strategy selected by payload size:
+
+| Tier | Payload size | Mechanism | Latency |
+|---|---|---|---|
+| **Small copy** | 0 – 64 KiB | `copy_from_user` / `copy_to_user` | Low (memcpy through validated page tables) |
+| **Page grant** | > 64 KiB | `Capability::Grant` page transfer | Near-zero (remap, no copy) |
+
+**Small-copy path** — The kernel validates the user-space buffer address
+(must be above `0x1000`, below `0x0000_8000_0000_0000`, no wraparound, length
+<= 64 KiB) and then uses `copy_from_user` / `copy_to_user` (implemented in
+`kernel/src/mm/user_mem.rs`) to transfer bytes through the caller's page
+tables.  This is the common path for the vast majority of IPC payloads.
+
+**Page-grant path** — For transfers larger than 64 KiB (primarily framebuffer
+spans), the sender grants one or more physical page frames to the receiver via
+a `Capability::Grant { frame, page_count, writable }` capability.  The kernel
+remaps the pages into the receiver's address space; no byte-copying occurs.
+Ownership transfers atomically: the sender loses access when the grant
+succeeds.
+
+### Payload Coverage
+
+The hybrid model covers every bulk-data type in the system:
+
+| Payload type | Typical size | Tier |
+|---|---|---|
+| Service-name strings (registry lookup) | 1 – 32 B | Small copy |
+| VFS paths | up to 4 KiB | Small copy |
+| Console write buffers | up to 4 KiB | Small copy |
+| Network packets (Ethernet MTU) | up to 1500 B | Small copy |
+| FAT32 disk blocks | 512 B – 64 KiB | Small copy |
+| Framebuffer spans | 4 KiB – 8 MiB | Page grant |
+
+### Ownership Rules
+
+1. **Allocator** — The sender allocates the buffer (either a user-space heap
+   buffer for small copies, or physical frames for page grants).
+2. **Lifetime** — For small copies, the kernel copies synchronously during the
+   syscall; the sender may reuse or free its buffer immediately after the
+   syscall returns.  For page grants, ownership transfers to the receiver on
+   successful grant; the sender must not access the pages afterward.
+3. **Service crash** — If a service holding granted pages crashes, the kernel
+   reclaims the pages during task cleanup (the same path that reclaims all
+   task-owned physical memory).  Small-copy buffers are ordinary user-space
+   allocations and are freed with the process address space.
+4. **Grant-of-grant** — A receiver that holds a `Grant` capability may
+   further grant it to another task.  Ownership chains are implicit; the
+   kernel tracks only the current holder.
+
+### Buffer Validation
+
+Before any `copy_from_user` / `copy_to_user`, the kernel calls
+`validate_user_buffer(addr, len)` (defined in `kernel-core/src/ipc/buffer.rs`)
+to perform pure-logic address checks:
+
+- Address must be in the valid user-space range (> `0x1000`, < `0x0000_8000_0000_0000`)
+- Length must not exceed 64 KiB
+- `addr + len` must not wrap around
+- Zero-length buffers are accepted (no-op)
+- Null pointers (`0x0`) are rejected
+
+These checks run before page-table validation, catching obviously invalid
+addresses without touching the page tables.
+
+---
+
 ## Phase 6 Simplifications vs. Real Microkernels
 
 Phase 6 deliberately keeps the IPC contract small.  Here is what a production
