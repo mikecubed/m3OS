@@ -695,36 +695,51 @@ impl ServiceManager {
         self.syslog_fd = fd as i32;
     }
 
-    /// Send a log message through syslog (if available) and always echo to serial.
-    #[allow(dead_code)]
-    fn log_to_syslog(&self, severity: u8, msg: &[u8]) {
-        // Always echo to stdout/serial.
-        write_str(STDOUT_FILENO, "init: ");
-        write(STDOUT_FILENO, msg);
-        write_str(STDOUT_FILENO, "\n");
-
-        // Send to syslog if available.
-        if self.syslog_fd >= 0 {
-            let priority = ((FACILITY_DAEMON as u32) << 3) | (severity as u32);
-            let mut buf = [0u8; 256];
-            let mut pos = 0;
-            // Format: <priority>init: message
-            buf[pos] = b'<';
-            pos += 1;
-            pos += write_u32_to_buf(&mut buf[pos..], priority);
-            buf[pos] = b'>';
-            pos += 1;
-            let tag = b"init: ";
-            let tag_len = tag.len().min(buf.len() - pos);
-            buf[pos..pos + tag_len].copy_from_slice(&tag[..tag_len]);
-            pos += tag_len;
-            let msg_len = msg.len().min(buf.len() - pos);
-            buf[pos..pos + msg_len].copy_from_slice(&msg[..msg_len]);
-            pos += msg_len;
-
-            let addr = SockaddrUn::new("/dev/log");
-            let _ = sendto_unix(self.syslog_fd, &buf[..pos], 0, &addr);
+    /// Send a lifecycle event for a named service to syslog (serial is handled by caller).
+    fn syslog_service_event(&self, severity: u8, verb: &[u8], name: &[u8]) {
+        if self.syslog_fd < 0 {
+            return;
         }
+        let mut msg = [0u8; 128];
+        let mut pos = 0;
+        let vlen = verb.len().min(msg.len());
+        msg[..vlen].copy_from_slice(&verb[..vlen]);
+        pos += vlen;
+        if pos + 2 + name.len() < msg.len() {
+            msg[pos] = b' ';
+            msg[pos + 1] = b'\'';
+            pos += 2;
+            let nlen = name.len().min(msg.len() - pos - 1);
+            msg[pos..pos + nlen].copy_from_slice(&name[..nlen]);
+            pos += nlen;
+            msg[pos] = b'\'';
+            pos += 1;
+        }
+        self.send_syslog(severity, &msg[..pos]);
+    }
+
+    /// Low-level syslog send (no serial echo).
+    fn send_syslog(&self, severity: u8, msg: &[u8]) {
+        if self.syslog_fd < 0 {
+            return;
+        }
+        let priority = ((FACILITY_DAEMON as u32) << 3) | (severity as u32);
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        buf[pos] = b'<';
+        pos += 1;
+        pos += write_u32_to_buf(&mut buf[pos..], priority);
+        buf[pos] = b'>';
+        pos += 1;
+        let tag = b"init: ";
+        let tag_len = tag.len().min(buf.len() - pos);
+        buf[pos..pos + tag_len].copy_from_slice(&tag[..tag_len]);
+        pos += tag_len;
+        let msg_len = msg.len().min(buf.len() - pos);
+        buf[pos..pos + msg_len].copy_from_slice(&msg[..msg_len]);
+        pos += msg_len;
+        let addr = SockaddrUn::new("/dev/log");
+        let _ = sendto_unix(self.syslog_fd, &buf[..pos], 0, &addr);
     }
 
     /// Load service definitions from `/etc/services.d/`.
@@ -1064,6 +1079,7 @@ impl ServiceManager {
         write_str(STDOUT_FILENO, "' pid=");
         write_u64(STDOUT_FILENO, pid as u64);
         write_str(STDOUT_FILENO, "\n");
+        self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
 
         // Write status immediately on state transition.
         self.write_status_file();
@@ -1102,6 +1118,12 @@ impl ServiceManager {
                     write_u64(STDOUT_FILENO, exit_code as u64);
                 }
                 write_str(STDOUT_FILENO, "\n");
+                let sev = if exit_code == 0 && !signaled {
+                    SEV_INFO
+                } else {
+                    SEV_ERROR
+                };
+                self.syslog_service_event(sev, b"exited", self.services[idx].name.as_bytes());
 
                 // Write status immediately on state transition.
                 self.write_status_file();
@@ -1188,6 +1210,7 @@ impl ServiceManager {
     /// Orderly shutdown of all services in reverse dependency order.
     fn shutdown_services(&mut self) {
         write_str(STDOUT_FILENO, "init: shutting down services...\n");
+        self.send_syslog(SEV_INFO, b"shutting down services");
         let shutdown_start = now_epoch_secs();
 
         // Iteratively find a running service whose dependents are all stopped,
@@ -1352,6 +1375,7 @@ impl ServiceManager {
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
                 self.services[idx].last_change_time = now_epoch_secs();
+                self.syslog_service_event(SEV_INFO, b"stopped", self.services[idx].name.as_bytes());
                 self.write_status_file();
                 return true;
             }
@@ -1371,6 +1395,11 @@ impl ServiceManager {
         self.services[idx].status = ServiceStatus::Stopped(-1);
         self.services[idx].pid = 0;
         self.services[idx].last_change_time = now_epoch_secs();
+        self.syslog_service_event(
+            SEV_WARNING,
+            b"force-killed",
+            self.services[idx].name.as_bytes(),
+        );
         self.write_status_file();
         false
     }
