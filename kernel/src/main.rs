@@ -317,10 +317,31 @@ fn spawn_userspace_init() {
 
 /// Console server: receives IPC write requests, logs to serial, replies with ack.
 ///
-/// IPC protocol (label=0, CONSOLE_WRITE):
-///   data[0] = pointer to UTF-8 string bytes (kernel address)
-///   data[1] = byte length (capped at 4096)
-/// Reply: label=0 (ack)
+/// # Data path
+///
+/// Callers pass a kernel-space pointer and length in the IPC message.  The
+/// server **validates** the pointer range (non-null, bounded length, no
+/// overflow) and then copies the bytes into a local buffer before use.
+/// This eliminates the previous `from_raw_parts` shortcut that directly
+/// aliased caller memory.
+///
+/// When this service is eventually extracted to a ring-3 process, the
+/// validated copy will be replaced by `copy_from_user` which additionally
+/// walks the caller's page tables.
+///
+/// # IPC protocol (label = CONSOLE_WRITE)
+///
+///   data\[0\] = pointer to UTF-8 string bytes (kernel address)
+///   data\[1\] = byte length (must be 1..=4096)
+///
+/// Reply: data\[0\] = 0 on success, `u64::MAX` on error.
+///
+/// # Service lifecycle (Phase 46)
+///
+/// Follows the standard service lifecycle: registers its endpoint via the
+/// service registry, enters a recv/reply_recv loop, and is restart-safe
+/// (the registry supports re-registration, and `cleanup_task_ipc` from
+/// Track E handles blocked callers if this task dies).
 fn console_server_task() -> ! {
     let my_id = task::current_task_id().expect("[console] no task id");
 
@@ -346,24 +367,24 @@ fn console_server_task() -> ! {
     loop {
         let reply_msg = match msg.label {
             CONSOLE_WRITE => {
-                // Handle the write request: data[0]=ptr, data[1]=len.
-                let ptr = msg.data[0] as *const u8;
+                let ptr = msg.data[0];
                 let len = msg.data[1] as usize;
-                if ptr.is_null() || len == 0 || len > MAX_CONSOLE_WRITE_LEN {
-                    // Bad request — reply with error label.
+                if ptr == 0
+                    || len == 0
+                    || len > MAX_CONSOLE_WRITE_LEN
+                    || ptr.checked_add(len as u64).is_none()
+                {
                     ipc::Message::new(u64::MAX)
                 } else {
-                    // Safety: In Phase 9, clients still share the kernel address
-                    // space with the server. The caller provides a kernel pointer
-                    // to a valid UTF-8 byte range that remains live for the
-                    // duration of this synchronous IPC call. `ptr` is non-null
-                    // (checked above) and `len` is in 1..=MAX_CONSOLE_WRITE_LEN.
-                    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-                    if let Ok(text) = core::str::from_utf8(bytes) {
+                    // Validated kernel-space copy: current callers are kernel tasks
+                    // sharing the kernel address space. When this service moves to
+                    // ring 3, callers will use copy_from_user instead.
+                    let mut buf = alloc::vec![0u8; len];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len);
+                    }
+                    if let Ok(text) = core::str::from_utf8(&buf) {
                         crate::serial::_print(format_args!("{}", text));
-                        // P9-T003: mirror output to framebuffer console.
-                        // Write text exactly as provided — no extra newline added here;
-                        // callers are responsible for including '\n' when desired.
                         fb::write_str(text);
                         ipc::Message::new(0)
                     } else {
