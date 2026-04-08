@@ -50,6 +50,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Expanded Memory](./33-kernel-memory.md) | 36 | Demand paging, mprotect, large mmap, 1 GB RAM/disk |
 | [Crash Diagnostics](./43a-crash-diagnostics.md) | 43a | Enriched panic/fault handlers, scheduler/fork/IPC assertions |
 | [DOOM Port](./47-doom.md) | 47 | Framebuffer mapping, raw scancodes, doomgeneric integration, and real-world input/performance lessons |
+| [Security Foundation](./48-security-foundation.md) | 48 | Kernel-enforced credentials, RDRAND entropy, iterated password hashing, first-boot provisioning |
 
 ### Roadmap
 

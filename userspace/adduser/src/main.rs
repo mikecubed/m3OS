@@ -3,7 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, chown, close, exit, geteuid, open, read, write, write_str, write_u64,
+    O_RDONLY, STDOUT_FILENO, chown, close, exit, fsync, geteuid, getrandom, open, read, write,
+    write_str, write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
@@ -72,15 +73,19 @@ pub extern "C" fn _start() -> ! {
     let new_uid = max_uid + 1;
     let new_gid = new_uid; // GID = UID
 
-    // Hash the password.
-    let salt = username;
-    let hash = syscall_lib::sha256::hash_password(&pw_input[..plen], salt);
+    // Hash the password with random salt and iterated SHA-256.
+    let mut salt = [0u8; 16];
+    if getrandom(&mut salt) != 16 {
+        write_str(STDOUT_FILENO, "adduser: failed to generate random salt\n");
+        exit(1);
+    }
+    let hash = syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, 10000);
     let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
+    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
 
-    // Append to /etc/passwd.
+    // Append to /etc/passwd (single write).
     {
         let fd = open(
             PASSWD_PATH,
@@ -91,20 +96,34 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/passwd\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":x:");
-        write_u32_to_fd(fd as i32, new_uid);
-        let _ = write(fd as i32, b":");
-        write_u32_to_fd(fd as i32, new_gid);
-        let _ = write(fd as i32, b":");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":/tmp/home/");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":/bin/ion\n");
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":x:");
+        pos += u32_to_buf(&mut buf[pos..], new_uid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += u32_to_buf(&mut buf[pos..], new_gid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":/tmp/home/");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":/bin/ion\n");
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/passwd\n");
+            close(fd as i32);
+            exit(1);
+        }
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/passwd\n",
+            );
+        }
         close(fd as i32);
     }
 
-    // Append to /etc/shadow.
+    // Append to /etc/shadow (single write).
     {
         let fd = open(
             SHADOW_PATH,
@@ -115,28 +134,56 @@ pub extern "C" fn _start() -> ! {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/shadow\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":$sha256$");
-        let _ = write(fd as i32, &salt_hex[..salt_hex_len]);
-        let _ = write(fd as i32, b"$");
-        let _ = write(fd as i32, &hash_hex[..hash_hex_len]);
-        let _ = write(fd as i32, b"::::::\n");
+        let mut buf = [0u8; 512];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":$sha256i$10000$");
+        pos += copy_to_buf(&mut buf[pos..], &salt_hex[..salt_hex_len]);
+        pos += copy_to_buf(&mut buf[pos..], b"$");
+        pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
+        pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/shadow\n");
+            close(fd as i32);
+            exit(1);
+        }
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/shadow\n",
+            );
+        }
         close(fd as i32);
     }
 
-    // Append to /etc/group.
+    // Append to /etc/group (single write).
     {
         let fd = open(GROUP_PATH, syscall_lib::O_WRONLY | syscall_lib::O_APPEND, 0);
         if fd < 0 {
             write_str(STDOUT_FILENO, "adduser: cannot open /etc/group\n");
             exit(1);
         }
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b":x:");
-        write_u32_to_fd(fd as i32, new_gid);
-        let _ = write(fd as i32, b":");
-        let _ = write(fd as i32, username);
-        let _ = write(fd as i32, b"\n");
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b":x:");
+        pos += u32_to_buf(&mut buf[pos..], new_gid);
+        pos += copy_to_buf(&mut buf[pos..], b":");
+        pos += copy_to_buf(&mut buf[pos..], username);
+        pos += copy_to_buf(&mut buf[pos..], b"\n");
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/group\n");
+            close(fd as i32);
+            exit(1);
+        }
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/group\n",
+            );
+        }
         close(fd as i32);
     }
 
@@ -170,20 +217,32 @@ pub extern "C" fn _start() -> ! {
     exit(0);
 }
 
-fn write_u32_to_fd(fd: i32, n: u32) {
-    let mut buf = [0u8; 12];
-    let mut pos = buf.len();
-    let mut val = n;
-    if val == 0 {
-        let _ = write(fd, b"0");
-        return;
+fn copy_to_buf(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+fn u32_to_buf(dst: &mut [u8], n: u32) -> usize {
+    if n == 0 {
+        if !dst.is_empty() {
+            dst[0] = b'0';
+            return 1;
+        }
+        return 0;
     }
+    let mut tmp = [0u8; 12];
+    let mut pos = tmp.len();
+    let mut val = n;
     while val > 0 {
         pos -= 1;
-        buf[pos] = b'0' + (val % 10) as u8;
+        tmp[pos] = b'0' + (val % 10) as u8;
         val /= 10;
     }
-    let _ = write(fd, &buf[pos..]);
+    let len = tmp.len() - pos;
+    let n = len.min(dst.len());
+    dst[..n].copy_from_slice(&tmp[pos..pos + n]);
+    n
 }
 
 fn parse_u32(s: &[u8]) -> u32 {
@@ -245,7 +304,7 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
 
 fn restore_echo(saved: Option<syscall_lib::Termios>) {
     if let Some(t) = saved {
-        let _ = syscall_lib::tcsetattr(0, &t);
+        let _ = syscall_lib::tcsetattr_flush(0, &t);
     }
 }
 

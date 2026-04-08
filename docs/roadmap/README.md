@@ -261,7 +261,7 @@ flowchart TD
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 48 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Planned | `phase-48` | [Phase 48](./48-security-foundation.md) | Deferred until implementation planning |
+| 48 | Security Foundation | Repair trust-floor issues in identity, entropy, and boot defaults | Complete | `phase-48` | [Phase 48](./48-security-foundation.md) | [Tasks](./tasks/48-security-foundation-tasks.md) |
 | 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Planned | `phase-49` | [Phase 49](./49-architectural-declaration.md) | Deferred until implementation planning |
 | 50 | IPC Completion | Finish capability grants, bulk data transport, and ring-3-safe service contracts | Planned | `phase-50` | [Phase 50](./50-ipc-completion.md) | Deferred until implementation planning |
 | 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | Planned | `phase-51` | [Phase 51](./51-service-model-maturity.md) | Deferred until implementation planning |

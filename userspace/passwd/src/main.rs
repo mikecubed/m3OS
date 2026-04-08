@@ -5,7 +5,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, exit, geteuid, getuid, open, read, write, write_str,
+    O_RDONLY, STDOUT_FILENO, close, exit, fsync, geteuid, getrandom, getuid, open, read, write,
+    write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
@@ -61,11 +62,15 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    // Generate new hash with a simple salt from username bytes.
-    let salt = username; // Use username as salt (simple but deterministic).
-    let hash = syscall_lib::sha256::hash_password(&new_input[..new_len], salt);
+    // Generate new hash with random salt and iterated SHA-256.
+    let mut salt = [0u8; 16];
+    if getrandom(&mut salt) != 16 {
+        write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
+        exit(1);
+    }
+    let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
     let mut salt_hex = [0u8; 64];
-    let salt_hex_len = syscall_lib::sha256::to_hex(salt, &mut salt_hex);
+    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
 
@@ -90,7 +95,7 @@ pub extern "C" fn _start() -> ! {
         {
             // Replace this line with new hash.
             out_pos += copy_to(&mut new_shadow[out_pos..], username);
-            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256$");
+            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256i$10000$");
             out_pos += copy_to(&mut new_shadow[out_pos..], &salt_hex[..salt_hex_len]);
             out_pos += copy_to(&mut new_shadow[out_pos..], b"$");
             out_pos += copy_to(&mut new_shadow[out_pos..], &hash_hex[..hash_hex_len]);
@@ -107,7 +112,18 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "passwd: cannot write shadow file\n");
         exit(1);
     }
-    let _ = write(fd as i32, &new_shadow[..out_pos]);
+    let written = write(fd as i32, &new_shadow[..out_pos]);
+    if written < 0 || written as usize != out_pos {
+        write_str(STDOUT_FILENO, "passwd: failed to fully write shadow file\n");
+        close(fd as i32);
+        exit(1);
+    }
+    if fsync(fd as i32) < 0 {
+        write_str(
+            STDOUT_FILENO,
+            "passwd: warning: fsync failed on shadow file\n",
+        );
+    }
     close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");
@@ -205,7 +221,7 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
 
 fn restore_echo(saved: Option<syscall_lib::Termios>) {
     if let Some(t) = saved {
-        let _ = syscall_lib::tcsetattr(0, &t);
+        let _ = syscall_lib::tcsetattr_flush(0, &t);
     }
 }
 

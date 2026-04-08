@@ -2656,10 +2656,12 @@ fn sys_linux_getegid() -> u64 {
 
 /// `setuid(uid)` — set user ID (syscall 105).
 ///
-/// Sets both real uid and effective uid unconditionally.
-/// Note: without setuid-bit support, password-authenticated programs
-/// like `su` and `login` rely on this being unrestricted. The password
-/// check in userspace provides the security boundary.
+/// Enforces POSIX-style privilege checks:
+/// - If euid == 0 (root): sets both real uid and effective uid.
+/// - If euid != 0: only allows setting effective uid back to the real uid.
+/// - Otherwise returns -EPERM.
+///
+/// Login and su work because they run as root (euid 0) when transitioning.
 fn sys_linux_setuid(uid_arg: u64) -> u64 {
     let new_uid = uid_arg as u32;
     let pid = crate::process::current_pid();
@@ -2668,14 +2670,24 @@ fn sys_linux_setuid(uid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-    proc.uid = new_uid;
-    proc.euid = new_uid;
+    let mut cred = kernel_core::cred::Credentials {
+        uid: proc.uid,
+        gid: proc.gid,
+        euid: proc.euid,
+        egid: proc.egid,
+    };
+    if cred.set_uid(new_uid).is_err() {
+        return NEG_EPERM;
+    }
+    proc.uid = cred.uid;
+    proc.euid = cred.euid;
     0
 }
 
 /// `setgid(gid)` — set group ID (syscall 106).
 ///
-/// Unconditional — see `sys_linux_setuid` comment.
+/// Mirrors `sys_linux_setuid` enforcement for group IDs.
+/// Privilege check is based on euid (not egid), matching Linux behavior.
 fn sys_linux_setgid(gid_arg: u64) -> u64 {
     let new_gid = gid_arg as u32;
     let pid = crate::process::current_pid();
@@ -2684,15 +2696,24 @@ fn sys_linux_setgid(gid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-    proc.gid = new_gid;
-    proc.egid = new_gid;
+    let mut cred = kernel_core::cred::Credentials {
+        uid: proc.uid,
+        gid: proc.gid,
+        euid: proc.euid,
+        egid: proc.egid,
+    };
+    if cred.set_gid(new_gid).is_err() {
+        return NEG_EPERM;
+    }
+    proc.gid = cred.gid;
+    proc.egid = cred.egid;
     0
 }
 
 /// `setreuid(ruid, euid)` — set real and effective user IDs (syscall 113).
 ///
 /// If ruid != -1: set real uid (only if euid==0 or ruid matches current real/effective uid).
-/// If euid != -1: set effective uid (only if euid==0 or value matches current real uid).
+/// If euid != -1: set effective uid (only if euid==0 or value matches current real/effective uid).
 fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
     let ruid = ruid_arg as i32;
     let euid = euid_arg as i32;
@@ -2702,29 +2723,24 @@ fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-
-    if ruid != -1 {
-        let new_ruid = ruid as u32;
-        if proc.euid == 0 || new_ruid == proc.uid || new_ruid == proc.euid {
-            proc.uid = new_ruid;
-        } else {
-            return NEG_EPERM;
-        }
+    let mut cred = kernel_core::cred::Credentials {
+        uid: proc.uid,
+        gid: proc.gid,
+        euid: proc.euid,
+        egid: proc.egid,
+    };
+    if cred.set_reuid(ruid, euid).is_err() {
+        return NEG_EPERM;
     }
-
-    if euid != -1 {
-        let new_euid = euid as u32;
-        if proc.euid == 0 || new_euid == proc.uid || new_euid == proc.euid {
-            proc.euid = new_euid;
-        } else {
-            return NEG_EPERM;
-        }
-    }
-
+    proc.uid = cred.uid;
+    proc.euid = cred.euid;
     0
 }
 
 /// `setregid(rgid, egid)` — set real and effective group IDs (syscall 114).
+///
+/// Mirrors `sys_linux_setreuid` enforcement for group IDs.
+/// Privilege check is based on euid (not egid), matching Linux behavior.
 fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
     let rgid = rgid_arg as i32;
     let egid = egid_arg as i32;
@@ -2734,25 +2750,17 @@ fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
         Some(p) => p,
         None => return NEG_EPERM,
     };
-
-    if rgid != -1 {
-        let new_rgid = rgid as u32;
-        if proc.egid == 0 || new_rgid == proc.gid || new_rgid == proc.egid {
-            proc.gid = new_rgid;
-        } else {
-            return NEG_EPERM;
-        }
+    let mut cred = kernel_core::cred::Credentials {
+        uid: proc.uid,
+        gid: proc.gid,
+        euid: proc.euid,
+        egid: proc.egid,
+    };
+    if cred.set_regid(rgid, egid).is_err() {
+        return NEG_EPERM;
     }
-
-    if egid != -1 {
-        let new_egid = egid as u32;
-        if proc.egid == 0 || new_egid == proc.gid || new_egid == proc.egid {
-            proc.egid = new_egid;
-        } else {
-            return NEG_EPERM;
-        }
-    }
-
+    proc.gid = cred.gid;
+    proc.egid = cred.egid;
     0
 }
 
@@ -3621,21 +3629,84 @@ fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
     proc.fd_alloc(min_fd, entry)
 }
 
-fn seed_pseudorandom_state() -> u64 {
-    let mut state: u64 = unsafe { core::arch::x86_64::_rdtsc() };
-    if state == 0 {
-        state = 0xDEAD_BEEF_CAFE_BABE;
+/// Returns whether the current CPU reports support for the RDRAND instruction
+/// (CPUID.01H:ECX bit 30).
+fn cpu_has_rdrand() -> bool {
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx,
+            out("eax") _,
+            out("edx") _,
+        );
     }
-    state
+    ecx & (1 << 30) != 0
+}
+
+/// Cached RDRAND support: 0 = unchecked, 1 = supported, 2 = unsupported.
+static RDRAND_SUPPORT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Try to read a 64-bit value from the hardware RDRAND instruction.
+/// Returns `Some(value)` if RDRAND is available and succeeded, `None` otherwise.
+/// Caches the CPUID check so only the first call executes CPUID.
+/// Retries up to 10 times on transient failure per Intel guidance.
+fn rdrand64() -> Option<u64> {
+    let cached = RDRAND_SUPPORT.load(core::sync::atomic::Ordering::Relaxed);
+    let supported = if cached == 0 {
+        let s = cpu_has_rdrand();
+        RDRAND_SUPPORT.store(if s { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+        s
+    } else {
+        cached == 1
+    };
+    if !supported {
+        return None;
+    }
+    for _ in 0..10 {
+        let mut val: u64;
+        let ok: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdrand {val}",
+                "setc {ok}",
+                val = out(reg) val,
+                ok = out(reg_byte) ok,
+            );
+        }
+        if ok != 0 {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Seed the PRNG state using RDRAND + TSC mixing.
+///
+/// Uses RDRAND as the primary entropy source when available.
+/// Mixes with TSC to hedge against RDRAND-only failure modes.
+/// The fallback constant is only reachable if both sources return zero.
+fn seed_pseudorandom_state() -> u64 {
+    let rdrand_val = rdrand64().unwrap_or(0);
+    let tsc_val = unsafe { core::arch::x86_64::_rdtsc() };
+    let mixed = rdrand_val ^ tsc_val;
+    if mixed == 0 {
+        0xDEAD_BEEF_CAFE_BABE
+    } else {
+        mixed
+    }
 }
 
 fn fill_pseudorandom_bytes(state: &mut u64, out: &mut [u8]) {
-    for byte in out.iter_mut() {
-        *state ^= *state >> 12;
-        *state ^= *state << 25;
-        *state ^= *state >> 27;
-        *byte = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
-    }
+    let mut prng = kernel_core::prng::Prng::new(*state);
+    prng.fill_bytes(out);
+    // Update caller's state for continuity
+    let mut state_bytes = [0u8; 8];
+    prng.fill_bytes(&mut state_bytes);
+    *state = u64::from_ne_bytes(state_bytes);
 }
 
 fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(), ()> {
@@ -3662,6 +3733,13 @@ fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
             return Err(());
         }
         written += len;
+        // Reseed from RDRAND every 256 bytes to limit state-compromise damage
+        if let Some(entropy) = rdrand64() {
+            state ^= entropy;
+            if state == 0 {
+                state = 0xDEAD_BEEF_CAFE_BABE;
+            }
+        }
     }
     Ok(())
 }

@@ -52,7 +52,7 @@ jobs:
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.
           rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 120
+          cargo xtask smoke-test --timeout 180
 
       - name: Regression tests (fork-overlap, ipc-wake, pty-overlap)
         run: cargo xtask regression --timeout 90

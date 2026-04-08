@@ -3,8 +3,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, execve, exit, open, read, setgid, setuid, write, write_str,
-    write_u64,
+    O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, execve, exit, fsync, getrandom, open, read,
+    setgid, setuid, write, write_str, write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
@@ -27,19 +27,7 @@ fn login_once() {
     }
     let username = &username[..ulen];
 
-    // Prompt for password with echo disabled.
-    let _ = write(STDOUT_FILENO, b"\n");
-    write_str(STDOUT_FILENO, "Password: ");
-
-    // Disable echo for password input.
-    let saved = disable_echo();
-    let mut pw_input = [0u8; 128];
-    let plen = read_line(&mut pw_input);
-    restore_echo(saved);
-    let _ = write(STDOUT_FILENO, b"\n");
-    let pw_input = &pw_input[..plen];
-
-    // Look up user in /etc/passwd.
+    // Look up user in /etc/passwd before prompting for password.
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
@@ -55,7 +43,7 @@ fn login_once() {
         }
     };
 
-    // Verify password against /etc/shadow.
+    // Read /etc/shadow to determine if account is locked or has a password.
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
@@ -63,9 +51,56 @@ fn login_once() {
         return;
     }
 
-    if !verify_shadow(&shadow_buf[..shadow_len], username, pw_input) {
-        write_str(STDOUT_FILENO, "Login incorrect\n");
-        return;
+    // Check if account is locked (first-boot setup).
+    if is_locked_account(&shadow_buf[..shadow_len], username) {
+        let _ = write(STDOUT_FILENO, b"\n");
+        write_str(STDOUT_FILENO, "Account requires initial password setup.\n");
+        write_str(STDOUT_FILENO, "Set password for ");
+        let _ = write(STDOUT_FILENO, username);
+        write_str(STDOUT_FILENO, ": ");
+        let saved2 = disable_echo();
+        let mut new_pw = [0u8; 128];
+        let new_pw_len = read_line(&mut new_pw);
+        restore_echo(saved2);
+        let _ = write(STDOUT_FILENO, b"\n");
+
+        if new_pw_len == 0 {
+            write_str(STDOUT_FILENO, "Password cannot be empty\n");
+            return;
+        }
+
+        write_str(STDOUT_FILENO, "Retype password: ");
+        let saved3 = disable_echo();
+        let mut confirm = [0u8; 128];
+        let confirm_len = read_line(&mut confirm);
+        restore_echo(saved3);
+        let _ = write(STDOUT_FILENO, b"\n");
+
+        if new_pw_len != confirm_len || new_pw[..new_pw_len] != confirm[..confirm_len] {
+            write_str(STDOUT_FILENO, "Passwords don't match\n");
+            return;
+        }
+
+        if !set_initial_password(username, &new_pw[..new_pw_len]) {
+            write_str(STDOUT_FILENO, "login: failed to set password\n");
+            return;
+        }
+        write_str(STDOUT_FILENO, "Password set successfully.\n");
+        // Fall through to authenticated login.
+    } else {
+        // Normal login — prompt for password.
+        let _ = write(STDOUT_FILENO, b"\n");
+        write_str(STDOUT_FILENO, "Password: ");
+        let saved = disable_echo();
+        let mut pw_input = [0u8; 128];
+        let plen = read_line(&mut pw_input);
+        restore_echo(saved);
+        let _ = write(STDOUT_FILENO, b"\n");
+
+        if !verify_shadow(&shadow_buf[..shadow_len], username, &pw_input[..plen]) {
+            write_str(STDOUT_FILENO, "Login incorrect\n");
+            return;
+        }
     }
 
     // Authentication succeeded.
@@ -213,6 +248,112 @@ fn parse_u32(s: &[u8]) -> u32 {
     n
 }
 
+/// Check if an account's shadow entry indicates a locked account (hash field is "!" or "*").
+fn is_locked_account(shadow: &[u8], username: &[u8]) -> bool {
+    for line in shadow.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':') {
+            let name = &line[..colon];
+            if name == username {
+                let rest = &line[colon + 1..];
+                let hash_end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+                let hash_field = &rest[..hash_end];
+                return hash_field == b"!" || hash_field == b"*";
+            }
+        }
+    }
+    false
+}
+
+/// Set a new password for a locked account by rewriting /etc/shadow.
+fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
+    // Generate random salt and hash the password.
+    let mut salt = [0u8; 16];
+    if getrandom(&mut salt) != 16 {
+        return false;
+    }
+    let hash = syscall_lib::sha256::hash_password_iterated(password, &salt, 10000);
+    let mut salt_hex = [0u8; 64];
+    let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
+    let mut hash_hex = [0u8; 64];
+    let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
+
+    // Read current shadow file.
+    let mut shadow_buf = [0u8; 2048];
+    let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
+    if shadow_len == 0 {
+        return false;
+    }
+
+    // Build new shadow content, replacing the locked entry.
+    let mut new_shadow = [0u8; 2048];
+    let mut out_pos = 0;
+
+    for line in shadow_buf[..shadow_len].split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && &line[..colon] == username
+        {
+            // Replace this line with the new hash.
+            let n = username.len().min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&username[..n]);
+            out_pos += n;
+
+            let prefix = b":$sha256i$10000$";
+            let n = prefix.len().min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&prefix[..n]);
+            out_pos += n;
+
+            let n = salt_hex_len.min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&salt_hex[..n]);
+            out_pos += n;
+
+            let dollar = b"$";
+            let n = dollar.len().min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&dollar[..n]);
+            out_pos += n;
+
+            let n = hash_hex_len.min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&hash_hex[..n]);
+            out_pos += n;
+
+            let suffix = b"::::::\n";
+            let n = suffix.len().min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&suffix[..n]);
+            out_pos += n;
+        } else {
+            let n = line.len().min(new_shadow.len() - out_pos);
+            new_shadow[out_pos..out_pos + n].copy_from_slice(&line[..n]);
+            out_pos += n;
+            if out_pos < new_shadow.len() {
+                new_shadow[out_pos] = b'\n';
+                out_pos += 1;
+            }
+        }
+    }
+
+    // Write the new shadow file.
+    let fd = open(SHADOW_PATH, O_WRONLY | O_TRUNC, 0);
+    if fd < 0 {
+        return false;
+    }
+    let written = write(fd as i32, &new_shadow[..out_pos]);
+    if written != out_pos as isize {
+        close(fd as i32);
+        return false;
+    }
+    if fsync(fd as i32) < 0 {
+        close(fd as i32);
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
 /// Verify password against /etc/shadow.
 fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
     for line in shadow.split(|&b| b == b'\n') {
@@ -301,7 +442,7 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
 /// Restore terminal settings.
 fn restore_echo(saved: Option<syscall_lib::Termios>) {
     if let Some(t) = saved {
-        let _ = syscall_lib::tcsetattr(0, &t);
+        let _ = syscall_lib::tcsetattr_flush(0, &t);
     }
 }
 

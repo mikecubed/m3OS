@@ -370,6 +370,7 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
 
 // fcntl constants
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FSYNC: u64 = 74;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
 pub const O_NONBLOCK: u64 = 0x800;
@@ -601,6 +602,11 @@ pub fn close(fd: i32) -> isize {
     unsafe { syscall1(SYS_CLOSE, fd as u64) as isize }
 }
 
+/// Flush file data to storage.
+pub fn fsync(fd: i32) -> isize {
+    unsafe { syscall1(SYS_FSYNC, fd as u64) as isize }
+}
+
 // ===========================================================================
 // High-level wrappers — ioctl, lseek, termios, signals
 // ===========================================================================
@@ -632,6 +638,15 @@ pub fn tcgetattr(fd: i32) -> Result<Termios, isize> {
 /// Set terminal attributes.
 pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
     let ret = ioctl(fd, TCSETS, termios as *const Termios as usize);
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Set terminal attributes, flushing pending input first (TCSETSF).
+///
+/// Like [`tcsetattr`], but uses the TCSETSF ioctl which flushes the stdin
+/// buffer and TTY edit buffer before applying the new settings.
+pub fn tcsetattr_flush(fd: i32, termios: &Termios) -> Result<(), isize> {
+    let ret = ioctl(fd, TCSETSF, termios as *const Termios as usize);
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 

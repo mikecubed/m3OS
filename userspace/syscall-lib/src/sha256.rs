@@ -169,37 +169,120 @@ fn hex_digit(c: u8) -> u8 {
     }
 }
 
-/// Verify a password against a shadow entry in format: $sha256$hex_salt$hex_hash
+/// Hash a password with salt using iterated SHA-256 (multiple rounds).
+///
+/// Format: $sha256i$<rounds>$<hex_salt>$<hex_hash>
+/// Round 1 computes SHA-256(salt || password).
+/// Rounds 2..N compute SHA-256(previous_hash || salt || password).
+pub fn hash_password_iterated(password: &[u8], salt: &[u8], rounds: u32) -> [u8; 32] {
+    let mut hash = hash_password(password, salt);
+    for _ in 1..rounds {
+        // SHA-256(hash || salt || password)
+        let total = 32 + salt.len() + password.len();
+        let mut buf = [0u8; 512];
+        if total > buf.len() {
+            return hash; // safety cap
+        }
+        buf[..32].copy_from_slice(&hash);
+        buf[32..32 + salt.len()].copy_from_slice(salt);
+        buf[32 + salt.len()..total].copy_from_slice(password);
+        hash = sha256(&buf[..total]);
+    }
+    hash
+}
+
+/// Parse a decimal u32 from bytes. Rejects non-digit characters and caps
+/// the result at 100,000 to prevent extreme CPU usage during verification.
+fn parse_u32_bytes(s: &[u8]) -> u32 {
+    const MAX_ROUNDS: u32 = 100_000;
+    let mut n: u32 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return 0; // reject malformed input
+        }
+        n = match n
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((b - b'0') as u32))
+        {
+            Some(v) if v <= MAX_ROUNDS => v,
+            _ => return 0, // overflow or exceeds cap
+        };
+    }
+    n
+}
+
+/// Verify a password against a shadow entry.
+///
+/// Supports two formats:
+/// - Legacy: `$sha256$<hex_salt>$<hex_hash>`
+/// - Iterated: `$sha256i$<rounds>$<hex_salt>$<hex_hash>`
 ///
 /// Uses constant-time comparison to prevent timing attacks.
 pub fn verify_password(password: &[u8], shadow_entry: &[u8]) -> bool {
-    // Parse: $sha256$<hex_salt>$<hex_hash>
-    if !shadow_entry.starts_with(b"$sha256$") {
-        return false;
+    if shadow_entry.starts_with(b"$sha256i$") {
+        // Iterated format: $sha256i$<rounds>$<hex_salt>$<hex_hash>
+        let rest = &shadow_entry[9..]; // skip "$sha256i$"
+        let first_dollar = match rest.iter().position(|&b| b == b'$') {
+            Some(p) => p,
+            None => return false,
+        };
+        let rounds_str = &rest[..first_dollar];
+        let rounds = parse_u32_bytes(rounds_str);
+        if rounds == 0 {
+            return false;
+        }
+        let rest2 = &rest[first_dollar + 1..];
+        let second_dollar = match rest2.iter().position(|&b| b == b'$') {
+            Some(p) => p,
+            None => return false,
+        };
+        let hex_salt = &rest2[..second_dollar];
+        let hex_hash = &rest2[second_dollar + 1..];
+
+        let mut parsed_salt = [0u8; 32];
+        let salt_len = from_hex(hex_salt, &mut parsed_salt);
+
+        let computed = hash_password_iterated(password, &parsed_salt[..salt_len], rounds);
+
+        let mut computed_hex = [0u8; 64];
+        to_hex(&computed, &mut computed_hex);
+
+        // Constant-time comparison
+        if hex_hash.len() != 64 {
+            return false;
+        }
+        let mut diff = 0u8;
+        for i in 0..64 {
+            diff |= computed_hex[i] ^ hex_hash[i];
+        }
+        diff == 0
+    } else if shadow_entry.starts_with(b"$sha256$") {
+        // Legacy format (unchanged)
+        let rest = &shadow_entry[8..];
+        let dollar_pos = match rest.iter().position(|&b| b == b'$') {
+            Some(p) => p,
+            None => return false,
+        };
+        let hex_salt = &rest[..dollar_pos];
+        let hex_hash = &rest[dollar_pos + 1..];
+
+        let mut parsed_salt = [0u8; 32];
+        let salt_len = from_hex(hex_salt, &mut parsed_salt);
+
+        let computed = hash_password(password, &parsed_salt[..salt_len]);
+
+        let mut computed_hex = [0u8; 64];
+        to_hex(&computed, &mut computed_hex);
+
+        if computed_hex.len() < hex_hash.len() || hex_hash.len() != 64 {
+            return false;
+        }
+        let mut diff = 0u8;
+        for i in 0..64 {
+            diff |= computed_hex[i] ^ hex_hash[i];
+        }
+        diff == 0
+    } else {
+        false
     }
-    let rest = &shadow_entry[8..];
-    let dollar_pos = match rest.iter().position(|&b| b == b'$') {
-        Some(p) => p,
-        None => return false,
-    };
-    let hex_salt = &rest[..dollar_pos];
-    let hex_hash = &rest[dollar_pos + 1..];
-
-    let mut parsed_salt = [0u8; 32];
-    let salt_len = from_hex(hex_salt, &mut parsed_salt);
-
-    let computed = hash_password(password, &parsed_salt[..salt_len]);
-
-    let mut computed_hex = [0u8; 64];
-    to_hex(&computed, &mut computed_hex);
-
-    // Constant-time comparison.
-    if computed_hex.len() < hex_hash.len() || hex_hash.len() != 64 {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..64 {
-        diff |= computed_hex[i] ^ hex_hash[i];
-    }
-    diff == 0
 }

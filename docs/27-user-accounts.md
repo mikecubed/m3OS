@@ -283,16 +283,18 @@ C libc stubs were added to the coreutils libc for `getuid`, `getgid`,
 
 ## Known Limitations
 
-- **No setuid-bit on executables** — `setuid`/`setgid` syscalls are
-  unconditional; password auth in `su`/`login` is the security boundary.
-  Setuid-on-exec is deferred.
+- **No setuid-bit on executables** — setuid-on-exec is deferred.
+  Phase 48 added kernel enforcement for `setuid`/`setgid` syscalls
+  (root-only escalation), replacing the previous unconditional behavior.
 - **No sticky bit enforcement** — `/tmp` is mode `0o1777` but
   `check_permission` does not prevent users from deleting each other's
   files in sticky directories.
 - **No supplementary groups** — only a single GID per process.
 - **No umask** — file creation mode is not masked.
-- **Salt is username bytes** — not cryptographically random. A proper
-  entropy source (`/dev/urandom`) is deferred.
+- **Iterated SHA-256 password hashing** — Phase 48 replaced
+  single-iteration SHA-256 with 10,000-round iterated hashing and
+  cryptographically random salts. The legacy `$sha256$` format is still
+  verified for migration. A proper KDF (Argon2id) is deferred.
 
 ## Foundation for Future Phases
 

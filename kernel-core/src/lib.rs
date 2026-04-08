@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod buddy;
+pub mod cred;
 pub mod fb;
 pub mod fs;
 pub mod input;
@@ -10,6 +11,7 @@ pub mod ipc;
 pub mod log_ring;
 pub mod net;
 pub mod pipe;
+pub mod prng;
 pub mod pty;
 pub mod slab;
 pub mod time;
