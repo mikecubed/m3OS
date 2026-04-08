@@ -1,3 +1,6 @@
+//! # Ownership: Keep
+//! Scheduler is a core kernel primitive — task state, context switching, and CPU dispatch must remain ring-0.
+//!
 //! Kernel task management: task structure, stacks, and context switching.
 //!
 //! Phase 6 activates the scheduler for multi-task IPC demos.  Each task

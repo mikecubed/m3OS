@@ -1,3 +1,6 @@
+//! # Ownership: Keep
+//! Process lifecycle is a core kernel primitive — PID management, fork, exec, and exit must remain ring-0.
+//!
 //! Userspace process management — Phase 11 / Phase 14.
 //!
 //! This module owns the global process table and the types that describe
