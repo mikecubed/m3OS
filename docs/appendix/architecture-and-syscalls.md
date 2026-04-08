@@ -526,7 +526,7 @@ that could be forwarded to a ring-3 server via IPC in the target architecture.
 | 0x1000 | debug_print | misc | Mechanism | Direct serial output for kernel debugging |
 | 0x1001 | meminfo | mm | Mechanism | Kernel memory statistics from allocator internals |
 | 0x1002 | ktrace | misc | Mechanism | Kernel trace ring access |
-| 0x1003 | ipc_cap_grant | ipc | Mechanism | Capability transfer between task capability tables — ring-0 table manipulation (Phase 50) |
+| 0x1100–0x1109 | ipc_* | ipc | Mechanism | IPC operations dispatched through `kernel/src/arch/x86_64/syscall/ipc.rs`; maps userspace `0x1100`–`0x1109` to internal dispatch 1–10 (includes recv, send, call, reply, reply_recv, cap_grant, notify_wait, notify_signal, register_service, lookup_service) (Phase 50) |
 | 0x1005 | framebuffer_info | misc | Policy/compat | Framebuffer metadata; forward to display server (Stage 2) |
 | 0x1006 | framebuffer_mmap | mm | Mechanism | Maps framebuffer MMIO into user address space — ring-0 page table op |
 | 0x1007 | read_scancode | misc | Policy/compat | Raw keyboard input; forward to keyboard server (Stage 2) |

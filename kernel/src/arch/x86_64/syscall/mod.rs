@@ -16,7 +16,7 @@
 //!
 //! | Number | Name         | Args                  |
 //! |---|---|---|
-//! | 1–5,7–10 | IPC     | (dispatched to ipc::dispatch) |
+//! | 0x1100–0x1109 | IPC | (dispatched to ipc::dispatch as 1–10) |
 //! | 6       | exit (legacy) | code                |
 //! | 12      | debug_print   | ptr, len            |
 //! | 39      | getpid        | —                   |

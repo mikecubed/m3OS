@@ -586,9 +586,12 @@ The hybrid model covers every bulk-data type in the system:
 
 ### Buffer Validation
 
-Before any `copy_from_user` / `copy_to_user`, the kernel calls
-`validate_user_buffer(addr, len)` (defined in `kernel-core/src/ipc/buffer.rs`)
-to perform pure-logic address checks:
+The kernel's `copy_from_user` / `copy_to_user` helpers (in
+`kernel/src/mm/user_mem.rs`) perform their own address and page-table
+validation inline.  A separate pure-logic helper,
+`validate_user_buffer(addr, len)` (defined in `kernel-core/src/ipc/buffer.rs`),
+mirrors these checks for host-side unit testing without requiring a live
+page table.  The shared validation rules are:
 
 - Address must be in the valid user-space range (> `0x1000`, < `0x0000_8000_0000_0000`)
 - Length must not exceed 64 KiB
@@ -596,8 +599,8 @@ to perform pure-logic address checks:
 - Zero-length buffers are accepted (no-op)
 - Null pointers (`0x0`) are rejected
 
-These checks run before page-table validation, catching obviously invalid
-addresses without touching the page tables.
+The kernel-core helper is a host-testable mirror of these rules, not the
+driver of the kernel's runtime checks.
 
 ---
 
@@ -629,10 +632,12 @@ is called (from `do_full_process_exit`), which:
 3. Clears any notification waiter slots held by the server.
 
 Callers that are blocked in `call` waiting for a reply from the server
-remain in `BlockedOnReply` state until the service manager restarts the
-server.  In a future enhancement, the kernel could scan for Reply caps
-pointing at the dying task and wake the corresponding callers with an
-error message.
+remain in `BlockedOnReply` state indefinitely.  A restarted server
+cannot reply to pre-crash callers because the one-shot `Reply(TaskId)`
+capabilities lived in the dying server's capability table and are lost
+on exit.  In a future enhancement, `cleanup_task_ipc` should scan for
+Reply caps targeting the dying task and wake the corresponding callers
+with an error message (`u64::MAX`).
 
 ### Service restarts and re-registers
 

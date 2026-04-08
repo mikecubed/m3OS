@@ -26,8 +26,8 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers 4 and 7 only;
-//!   syscall 10 was remapped to `mprotect` in Phase 21).
+//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1109`;
+//!   earlier phases used low numbers 4 and 7, remapped in Phase 50).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
 //!
@@ -55,18 +55,21 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// | Number | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
-/// |---|---|---|
-/// | 1 | `ipc_recv(ep_cap)` | `arg0 = ep_cap_handle` |
-/// | 2 | `ipc_send(ep_cap, label, data0)` | `arg0..2` |
-/// | 3 | `ipc_call(ep_cap, label, data0)` | `arg0..2` |
-/// | 4 | `ipc_reply(reply_cap, label, data0)` | `arg0..2` |
-/// | 5 | `ipc_reply_recv(reply_cap, label, ep_cap)` | `arg0..2` — ep_cap in arg2 |
-/// | 6 | `sys_cap_grant(source_handle, target_task_id)` | `arg0, arg1` |
-/// | 7 | `notify_wait(notif_cap)` | `arg0 = notif_cap_handle` |
-/// | 8 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
-/// | 9 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
-/// | 10 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
+/// Userspace syscall numbers `0x1100`–`0x1109` are translated to internal
+/// dispatch numbers 1–10 by `handle_ipc_syscall` in `syscall/ipc.rs`.
+///
+/// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
+/// |---|---|---|---|
+/// | 1 | 0x1100 | `ipc_recv(ep_cap)` | `arg0 = ep_cap_handle` |
+/// | 2 | 0x1101 | `ipc_send(ep_cap, label, data0)` | `arg0..2` |
+/// | 3 | 0x1102 | `ipc_call(ep_cap, label, data0)` | `arg0..2` |
+/// | 4 | 0x1103 | `ipc_reply(reply_cap, label, data0)` | `arg0..2` |
+/// | 5 | 0x1104 | `ipc_reply_recv(reply_cap, label, ep_cap)` | `arg0..2` — ep_cap in arg2 |
+/// | 6 | 0x1105 | `sys_cap_grant(source_handle, target_task_id)` | `arg0, arg1` |
+/// | 7 | 0x1106 | `notify_wait(notif_cap)` | `arg0 = notif_cap_handle` |
+/// | 8 | 0x1107 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
+/// | 9 | 0x1108 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
+/// | 10 | 0x1109 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -148,7 +151,19 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
                 Err(_) => {
                     // Roll back: re-insert into the caller's table at the
                     // original slot so there are no side effects.
-                    let _ = scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed);
+                    //
+                    // NOTE: The remove+insert sequence is not atomic across
+                    // capability tables — another core can briefly observe
+                    // the capability absent from the source.  A future
+                    // improvement could hold the scheduler lock across the
+                    // entire grant operation.
+                    if scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed).is_err() {
+                        log::error!(
+                            "[ipc] sys_cap_grant: CRITICAL rollback failed for task {} handle {}",
+                            task_id.0,
+                            arg0,
+                        );
+                    }
                     u64::MAX
                 }
             }

@@ -41,7 +41,7 @@ pub use kernel_core::types::EndpointId;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of concurrent IPC endpoints.
-const MAX_ENDPOINTS: usize = 16;
+pub(super) const MAX_ENDPOINTS: usize = 16;
 
 /// Global registry of all kernel IPC endpoints.
 ///

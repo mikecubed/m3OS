@@ -15,6 +15,8 @@ pub enum RegistryError {
     NameTooLong,
     /// A service with this name is already registered.
     AlreadyExists,
+    /// No service with this name exists, or the entry is owned by a different task.
+    NotFound,
 }
 
 #[derive(Clone, Copy)]
@@ -132,7 +134,7 @@ impl Registry {
             }
         }
 
-        Err(RegistryError::AlreadyExists)
+        Err(RegistryError::NotFound)
     }
 
     /// Look up a named service endpoint.
@@ -251,7 +253,10 @@ mod tests {
     fn replace_service_wrong_owner_fails() {
         let mut reg = Registry::new();
         reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
-        assert!(reg.replace_service("svc", EndpointId(2), 99, 20).is_err());
+        assert_eq!(
+            reg.replace_service("svc", EndpointId(2), 99, 20),
+            Err(RegistryError::NotFound)
+        );
     }
 
     #[test]
@@ -309,8 +314,11 @@ mod tests {
         let mut reg = Registry::new();
         reg.register_with_owner("alive", EndpointId(1), 10).unwrap();
 
-        // Try to replace with wrong old_owner — should fail.
-        assert!(reg.replace_service("alive", EndpointId(2), 99, 20).is_err());
+        // Try to replace with wrong old_owner — should fail with NotFound.
+        assert_eq!(
+            reg.replace_service("alive", EndpointId(2), 99, 20),
+            Err(RegistryError::NotFound)
+        );
 
         // Original service unchanged.
         assert_eq!(reg.lookup("alive"), Some(EndpointId(1)));

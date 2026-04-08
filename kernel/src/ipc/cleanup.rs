@@ -2,7 +2,7 @@
 
 use crate::task::TaskId;
 
-use super::endpoint::{ENDPOINTS, EndpointId};
+use super::endpoint::{ENDPOINTS, EndpointId, MAX_ENDPOINTS};
 use super::notification;
 
 /// Clean up all IPC state for a dying task.
@@ -21,7 +21,7 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
     // the task will never consume a reply anyway.
     {
         let mut reg = ENDPOINTS.lock();
-        for i in 0..16u8 {
+        for i in 0..MAX_ENDPOINTS as u8 {
             let ep_id = EndpointId(i);
             if let Some(ep) = reg.get_mut(ep_id) {
                 // Remove dying task from receivers queue.
