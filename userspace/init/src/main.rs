@@ -17,7 +17,8 @@
 use syscall_lib::{
     AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
     SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
-    nanosleep, open, read, rt_sigaction, sendto_unix, socket, waitpid, write, write_str, write_u64,
+    nanosleep, open, read, rt_sigaction, sendto_unix, setuid, socket, waitpid, write, write_str,
+    write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1027,17 @@ impl ServiceManager {
                 ENV_EDITOR.as_ptr(),
                 core::ptr::null(),
             ];
+
+            // Drop privileges if run_as_uid is set.
+            if svc.run_as_uid != 0 {
+                let ret = setuid(svc.run_as_uid);
+                if ret < 0 {
+                    write_str(STDOUT_FILENO, "init: setuid failed for '");
+                    write(STDOUT_FILENO, svc.name.as_bytes());
+                    write_str(STDOUT_FILENO, "'\n");
+                    exit(126);
+                }
+            }
 
             // Build argv: argv[0] = command path.
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
