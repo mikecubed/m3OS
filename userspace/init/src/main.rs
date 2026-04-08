@@ -987,14 +987,12 @@ impl ServiceManager {
     fn start_service(&mut self, idx: usize) {
         let svc = &mut self.services[idx];
 
-        // Validate state transition (diagnostic only — log but don't block).
+        // Enforce state transition — reject invalid starts.
         if !svc.status.try_transition(ServiceStatus::Starting) {
-            write_str(
-                STDOUT_FILENO,
-                "init: warning: unexpected state transition to Starting for '",
-            );
+            write_str(STDOUT_FILENO, "init: rejected start for '");
             write(STDOUT_FILENO, svc.name.as_bytes());
-            write_str(STDOUT_FILENO, "'\n");
+            write_str(STDOUT_FILENO, "' (invalid state transition)\n");
+            return;
         }
 
         svc.status = ServiceStatus::Starting;
@@ -1312,17 +1310,15 @@ impl ServiceManager {
             return true;
         }
 
-        // Validate state transition (diagnostic only — log but don't block).
+        // Enforce state transition — reject invalid stops.
         if !self.services[idx]
             .status
             .try_transition(ServiceStatus::Stopping)
         {
-            write_str(
-                STDOUT_FILENO,
-                "init: warning: unexpected state transition to Stopping for '",
-            );
+            write_str(STDOUT_FILENO, "init: rejected stop for '");
             write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-            write_str(STDOUT_FILENO, "'\n");
+            write_str(STDOUT_FILENO, "' (invalid state transition)\n");
+            return true;
         }
 
         self.services[idx].status = ServiceStatus::Stopping;

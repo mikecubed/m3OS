@@ -12,7 +12,7 @@ restart policies, syslog, cron, and admin commands, Phase 51 strengthens every
 layer so that later extracted ring-3 services can join the same supervision
 framework without inventing their own conventions. The key changes are: a
 stabilized service-definition contract with privilege and timeout fields, a
-validated state machine with diagnostic transition checks, restart backoff with crash
+validated state machine with enforced transition guards, restart backoff with crash
 classification, deterministic shutdown ordering with per-service timeouts and
 orphan reaping, syslog integration for init itself, and a hardened admin control
 path.
@@ -21,7 +21,7 @@ path.
 
 - Service-definition contract (fields: name, command, type, restart, max_restart,
   depends, user, stop_timeout)
-- Service state machine with diagnostic transition checks
+- Service state machine with enforced transition guards
 - Restart backoff (1s, 2s, 5s cap; reset after 10s uptime)
 - Crash classification (clean exit, error exit, signal death)
 - Shutdown ordering (reverse dependency order, per-service timeout, orphan reaping)
@@ -58,9 +58,9 @@ file without recompiling init.
 
 The state machine from Phase 46 is retained with a `try_transition` validation
 method. Invalid transitions (such as `PermanentlyStopped` to `Starting`) are
-detected and logged as warnings. The validation is currently diagnostic — init
-proceeds with the transition to preserve PID 1 robustness — but the method
-enables future enforcement once the state machine has been battle-tested.
+rejected — `start_service` and `stop_service` return early when the guard
+fails, preventing duplicate instances or stop attempts on already-stopped
+services.
 
 ```
 NeverStarted --> Starting --> Running --> Stopping --> Stopped(exit_code)
