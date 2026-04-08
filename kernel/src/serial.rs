@@ -136,70 +136,65 @@ pub fn init_logger() {
 }
 
 // ---------------------------------------------------------------------------
-// IRQ-driven serial RX ring buffer (replaces polling)
+// IRQ-driven serial RX ring buffer (lock-free, ISR-safe)
+// ---------------------------------------------------------------------------
+// Uses atomic head/tail indices (same pattern as the keyboard scancode
+// buffers) so the IRQ handler never takes a mutex. Single-producer (IRQ)
+// single-consumer (serial feeder task).
 // ---------------------------------------------------------------------------
 
-use crate::task::wait_queue::WaitQueue;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const SERIAL_BUF_SIZE: usize = 256;
+const SERIAL_BUF_SIZE: usize = 256; // must be power of 2
+const SERIAL_BUF_MASK: usize = SERIAL_BUF_SIZE - 1;
 
-pub struct SerialRingBuf {
-    buf: [u8; SERIAL_BUF_SIZE],
-    head: usize,
-    tail: usize,
-    count: usize,
+static mut SERIAL_RX_RAW: [u8; SERIAL_BUF_SIZE] = [0u8; SERIAL_BUF_SIZE];
+static SERIAL_RX_HEAD: AtomicUsize = AtomicUsize::new(0);
+static SERIAL_RX_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+/// Pop one byte from the serial RX ring buffer, or `None` if empty.
+/// Single-consumer: only called from the serial feeder task.
+pub fn serial_rx_pop() -> Option<u8> {
+    let head = SERIAL_RX_HEAD.load(Ordering::Acquire);
+    let tail = SERIAL_RX_TAIL.load(Ordering::Acquire);
+    if head == tail {
+        return None;
+    }
+    // Safety: single consumer; head is only advanced here.
+    let byte = unsafe { SERIAL_RX_RAW[head] };
+    SERIAL_RX_HEAD.store((head + 1) & SERIAL_BUF_MASK, Ordering::Release);
+    Some(byte)
 }
-
-impl SerialRingBuf {
-    const fn new() -> Self {
-        Self {
-            buf: [0; SERIAL_BUF_SIZE],
-            head: 0,
-            tail: 0,
-            count: 0,
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.count < SERIAL_BUF_SIZE {
-            self.buf[self.tail] = byte;
-            self.tail = (self.tail + 1) % SERIAL_BUF_SIZE;
-            self.count += 1;
-        }
-    }
-
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.count == 0 {
-            None
-        } else {
-            let byte = self.buf[self.head];
-            self.head = (self.head + 1) % SERIAL_BUF_SIZE;
-            self.count -= 1;
-            Some(byte)
-        }
-    }
-}
-
-pub static SERIAL_RX_BUF: Mutex<SerialRingBuf> = Mutex::new(SerialRingBuf::new());
-pub static SERIAL_RX_WAITQUEUE: WaitQueue = WaitQueue::new();
 
 /// Called from the serial IRQ handler. Drains all available bytes from the
-/// UART FIFO into the ring buffer.
+/// UART FIFO into the lock-free ring buffer. No mutex is taken — safe to
+/// call from interrupt context.
 pub fn handle_serial_irq() {
-    let mut buf = SERIAL_RX_BUF.lock();
     let mut got_data = false;
-    // Drain all available bytes from the UART FIFO.
     loop {
         let lsr: u8 = unsafe { x86_64::instructions::port::Port::new(0x3FDu16).read() };
         if lsr & 1 == 0 {
             break;
         }
         let byte: u8 = unsafe { x86_64::instructions::port::Port::new(0x3F8u16).read() };
-        buf.push(byte);
+        let tail = SERIAL_RX_TAIL.load(Ordering::Relaxed);
+        let next = (tail + 1) & SERIAL_BUF_MASK;
+        if next != SERIAL_RX_HEAD.load(Ordering::Acquire) {
+            // Safety: single producer (IRQ handler); tail only advanced here.
+            unsafe { SERIAL_RX_RAW[tail] = byte };
+            SERIAL_RX_TAIL.store(next, Ordering::Release);
+        }
+        // else: buffer full — drop byte (prefer losing data over blocking ISR)
         got_data = true;
     }
-    drop(buf);
     if got_data {
-        SERIAL_RX_WAITQUEUE.wake_all();
+        // Set a flag so the consumer knows data arrived. The feeder task
+        // checks this after re-enabling interrupts to close the lost-wakeup
+        // window.
+        SERIAL_RX_PENDING.store(true, Ordering::Release);
     }
 }
+
+/// Atomic flag set by the IRQ handler when new data is available.
+/// The feeder task clears it under disabled interrupts to avoid lost wakeups.
+pub static SERIAL_RX_PENDING: AtomicBool = AtomicBool::new(false);

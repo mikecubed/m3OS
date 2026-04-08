@@ -939,21 +939,28 @@ fn serial_stdin_feeder_task() -> ! {
     log::info!("[serial-stdin] feeder ready (IRQ-driven, echo + signals)");
 
     loop {
-        // Read from the IRQ-driven ring buffer instead of polling the UART.
-        let byte = {
-            let mut buf = crate::serial::SERIAL_RX_BUF.lock();
-            buf.pop()
-        };
-        let byte = match byte {
+        // Read from the lock-free ring buffer. If empty, disable interrupts,
+        // re-check, and halt until the next IRQ — this closes the lost-wakeup
+        // window without busy-polling.
+        let byte = match crate::serial::serial_rx_pop() {
             Some(b) => b,
             None => {
-                // Yield instead of sleeping to avoid the lost-wakeup race:
-                // if the IRQ fires between pop() returning None and entering
-                // sleep(), the wake_all() is lost and the feeder hangs.
-                // The IRQ handler + ring buffer still prevents FIFO overflow;
-                // yielding just means the feeder polls the ring buffer.
-                task::yield_now();
-                continue;
+                loop {
+                    x86_64::instructions::interrupts::disable();
+                    // Clear the pending flag and re-check the buffer while
+                    // interrupts are disabled. If the IRQ fired between our
+                    // pop() and disable(), the flag/buffer will be non-empty
+                    // and we retry immediately instead of halting.
+                    crate::serial::SERIAL_RX_PENDING
+                        .store(false, core::sync::atomic::Ordering::SeqCst);
+                    if let Some(b) = crate::serial::serial_rx_pop() {
+                        x86_64::instructions::interrupts::enable();
+                        break b;
+                    }
+                    // Atomically re-enable interrupts and halt. The next IRQ
+                    // (serial or otherwise) will wake us.
+                    x86_64::instructions::interrupts::enable_and_hlt();
+                }
             }
         };
 
