@@ -37,7 +37,7 @@ flowchart TB
 |---|---|---|
 | Documentation | `docs/roadmap/README.md` plus per-phase docs/tasks make the system unusually understandable | New work can be planned and reviewed against explicit scope |
 | Core architecture | `kernel-core/` extracts pure logic from hardware-facing code | Host tests and property tests are possible without QEMU |
-| Syscall/userspace surface | `kernel/src/arch/x86_64/syscall.rs`, `userspace/`, and `userspace/coreutils-rs/` provide real breadth | m3OS is beyond a kernel demo and into OS territory |
+| Syscall/userspace surface | `kernel/src/arch/x86_64/syscall/` (decomposed into 8 subsystem modules), `userspace/`, and `userspace/coreutils-rs/` provide real breadth | m3OS is beyond a kernel demo and into OS territory |
 | SMP and VM | `kernel/src/smp/`, `kernel/src/mm/`, `docs/25-smp.md`, `docs/33-kernel-memory.md`, `docs/36-expanded-memory.md` | The project has already crossed major "serious OS" milestones |
 | Diagnostics/testing | `docs/43c-regression-stress-ci.md`, trace-ring and crash-diag docs | Failures are observable, not opaque |
 | System operations baseline | Phase 46 adds a real PID 1 service manager, service definitions, `syslogd`, `crond`, and admin commands | The headless/reference-system story is now built on shipped lifecycle plumbing rather than aspiration |
@@ -53,7 +53,7 @@ The current tree still places substantial functionality in ring 0:
 - filesystems in `kernel/src/fs/`
 - networking in `kernel/src/net/`
 - TTY/PTY and signal handling in `kernel/src/tty.rs`, `kernel/src/pty.rs`, and `kernel/src/signal.rs`
-- a very large syscall surface in `kernel/src/arch/x86_64/syscall.rs`
+- a large syscall surface in `kernel/src/arch/x86_64/syscall/` (now decomposed into subsystem modules with ownership classification)
 
 That means the current system is architecturally closer to a **modular monolith with microkernel-compatible ideas** than to a fully enforced seL4/Redox-style userspace-services model.
 
@@ -63,11 +63,11 @@ The split between `kernel/` and `kernel-core/` is one of the project's highest-l
 
 If m3OS keeps evolving, this split is likely to matter more than whether every subsystem eventually moves out of ring 0.
 
-### 3. `syscall.rs` is now architectural debt
+### 3. Syscall decomposition and ownership classification (Phase 49)
 
-The single-file syscall layer is already a maintenance boundary problem. It is not just long; it is where filesystem, networking, process, memory, auth, and miscellaneous device behavior all meet.
+The former single-file `syscall.rs` has been decomposed into `kernel/src/arch/x86_64/syscall/` with eight subsystem modules (fs, mm, process, net, signal, io, time, misc). Each module carries an ownership header classifying it as kernel-mechanism, transitional, or future-userspace.
 
-Before adding graphics, audio, or more runtime/toolchain surface, splitting this area into subsystem-specific syscall modules would reduce risk.
+A keep/move/transition matrix in `docs/appendix/architecture-and-syscalls.md` formally classifies every kernel subsystem by long-term ownership. A userspace-first rule is now adopted: new policy-heavy behavior defaults to ring 3 unless a clear ring-0 requirement exists.
 
 ### 4. The microkernel deficiencies are concrete, not abstract
 
@@ -108,7 +108,7 @@ Concrete reasons:
 | Capability | Why it changes the classification | Evidence |
 |---|---|---|
 | SSH and remote login | Remote administration moves the project into real operating-system territory | `docs/roadmap/43-ssh-server.md`, `userspace/sshd/`, `userspace/init/src/main.rs` |
-| Multi-user accounts and permissions | UID/GID, `/etc/passwd`, `/etc/shadow`, and permission checks are system-level concerns | `docs/27-user-accounts.md`, `kernel/src/arch/x86_64/syscall.rs` |
+| Multi-user accounts and permissions | UID/GID, `/etc/passwd`, `/etc/shadow`, and permission checks are system-level concerns | `docs/27-user-accounts.md`, `kernel/src/arch/x86_64/syscall/` |
 | PTYs, Unix sockets, threads, and epoll | These are meaningful maturity markers for shells, daemons, and ports | `docs/29-pty-subsystem.md`, `docs/39-unix-domain-sockets.md`, `docs/40-threading-primitives.md`, `docs/37-io-multiplexing.md` |
 | ext2, procfs, and ports/build tools | The system can host a non-trivial userland rather than booting one static demo binary | `docs/28-ext2-filesystem.md`, `docs/38-filesystem-enhancements.md`, `docs/45-ports-system.md` |
 | Smoke/regression/stress infrastructure | The project already behaves like something expecting ongoing maintenance and release discipline | `docs/43c-regression-stress-ci.md`, `xtask/src/main.rs` |

@@ -1,3 +1,6 @@
+//! # Ownership: Transition
+//! Filesystem policy layer — target ring-3 server per microkernel Stage 3.
+//!
 //! Filesystem services — Phase 8 / Phase 13.
 //!
 //! Provides a VFS routing layer, a read-only ramdisk backend, and a

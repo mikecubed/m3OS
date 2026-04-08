@@ -249,6 +249,10 @@ const QEMU_EXIT_SUCCESS: u32 = 0x10;
 const QEMU_EXIT_FAILURE: u32 = 0x11;
 ```
 
+### Userspace-first rule
+
+New high-level policy defaults to userspace. Before adding policy-heavy code to ring 0, check the architecture review checklist in `docs/appendix/architecture-and-syscalls.md`.
+
 ### `BootInfo` is read-only after init
 
 Parse memory regions, framebuffer, RSDP during `kernel_main` init and store in typed kernel structures. Do not hold long-lived references to `BootInfo`.

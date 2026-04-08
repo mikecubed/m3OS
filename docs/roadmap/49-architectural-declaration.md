@@ -1,6 +1,6 @@
 # Phase 49 - Architectural Declaration
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-49
 **Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 11 (Process Model) ✅, Phase 12 (POSIX Compat) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 48 (Security Foundation) ✅
 **Builds on:** Converts the project's documented microkernel intent into an implementation contract that constrains future work instead of remaining only a design aspiration
@@ -112,7 +112,7 @@ The current kernel-resident "servers" and policy-heavy modules are the migration
 
 ## Companion Task List
 
-- Phase 49 task list — defer until implementation planning begins.
+- [Phase 49 Task List](./tasks/49-architectural-declaration-tasks.md)
 
 ## How Real OS Implementations Differ
 

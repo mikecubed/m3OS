@@ -113,7 +113,7 @@ That approach is not perfectly pure, but it is realistic and protects the curren
 
 ## Recommended staged migration path
 
-### Stage 0: make the target explicit and stop digging the hole deeper
+### Stage 0: make the target explicit and stop digging the hole deeper (COMPLETE -- Phase 49)
 
 Before moving subsystems, m3OS should make the target architecture explicit in code and docs.
 
@@ -125,9 +125,21 @@ Before moving subsystems, m3OS should make the target architecture explicit in c
 
 **Concrete work**
 
-- break `kernel/src/arch/x86_64/syscall.rs` into `syscall/{mm,process,fs,net,ipc,tty,misc}.rs`
+- break `kernel/src/arch/x86_64/syscall.rs` into `syscall/{fs,mm,process,net,signal,io,time,misc}.rs`
 - document which syscalls are "fundamental kernel primitives" versus "compatibility shims"
 - add evaluation/roadmap notes about which in-kernel services are temporary, transitional, or intended to stay
+
+**Completion status (Phase 49)**
+
+| Deliverable | Status | Reference |
+|---|---|---|
+| Syscall decomposition | Complete | `kernel/src/arch/x86_64/syscall/` (mod.rs + 8 subsystem modules: fs, mm, process, net, signal, io, time, misc) |
+| Ownership matrix | Complete | `docs/appendix/architecture-and-syscalls.md` -- Keep/Move/Transition Matrix section |
+| Syscall classification | Complete | `docs/appendix/architecture-and-syscalls.md` -- Syscall Ownership Classification section |
+| Userspace-first rule | Complete | `docs/appendix/architecture-and-syscalls.md` -- Userspace-First Rule section |
+| Architecture review checklist | Complete | `docs/appendix/architecture-and-syscalls.md` -- Architecture Review Checklist section |
+
+**Deferred items:** None. All three Stage 0 goals are addressed. The actual code movement (extracting subsystems to userspace) is the subject of Stages 1--5 and is not part of Stage 0.
 
 ### Stage 1: complete the IPC model for real ring-3 servers
 

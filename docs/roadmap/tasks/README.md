@@ -226,9 +226,10 @@ flowchart TD
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 48 | Security Foundation | Complete | `phase-48` | [Tasks](./48-security-foundation-tasks.md) |
+| 49 | Architectural Declaration | Complete | `phase-49` | [Tasks](./49-architectural-declaration-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **49 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **50 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 
