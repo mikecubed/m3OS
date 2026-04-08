@@ -125,7 +125,7 @@ Before moving subsystems, m3OS should make the target architecture explicit in c
 
 **Concrete work**
 
-- break `kernel/src/arch/x86_64/syscall.rs` into `syscall/{mm,process,fs,net,ipc,tty,misc}.rs`
+- break `kernel/src/arch/x86_64/syscall.rs` into `syscall/{fs,mm,process,net,signal,io,time,misc}.rs`
 - document which syscalls are "fundamental kernel primitives" versus "compatibility shims"
 - add evaluation/roadmap notes about which in-kernel services are temporary, transitional, or intended to stay
 
@@ -133,7 +133,7 @@ Before moving subsystems, m3OS should make the target architecture explicit in c
 
 | Deliverable | Status | Reference |
 |---|---|---|
-| Syscall decomposition | Complete | `kernel/src/arch/x86_64/syscall/` (mod.rs + 8 subsystem modules: mm, process, fs, net, ipc, tty, misc, security) |
+| Syscall decomposition | Complete | `kernel/src/arch/x86_64/syscall/` (mod.rs + 8 subsystem modules: fs, mm, process, net, signal, io, time, misc) |
 | Ownership matrix | Complete | `docs/appendix/architecture-and-syscalls.md` -- Keep/Move/Transition Matrix section |
 | Syscall classification | Complete | `docs/appendix/architecture-and-syscalls.md` -- Syscall Ownership Classification section |
 | Userspace-first rule | Complete | `docs/appendix/architecture-and-syscalls.md` -- Userspace-First Rule section |

@@ -89,7 +89,7 @@ trying to be. That dramatically reduces the risk of halfway migrations.
   facades are visibly distinct**
   -- Satisfied by the syscall decomposition in
   `kernel/src/arch/x86_64/syscall/` (mod.rs dispatcher + 8 subsystem modules:
-  mm, process, fs, net, ipc, tty, misc, security). The Syscall Ownership
+  fs, mm, process, net, signal, io, time, misc). The Syscall Ownership
   Classification section in the architecture doc tags each syscall as
   fundamental primitive or compatibility shim.
 
