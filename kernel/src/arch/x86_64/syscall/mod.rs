@@ -26,6 +26,15 @@
 
 extern crate alloc;
 
+mod fs;
+mod io;
+mod misc;
+mod mm;
+mod net;
+mod process;
+mod signal;
+mod time;
+
 // Linux errno values (negated for syscall return convention).
 #[allow(dead_code)]
 const NEG_EPERM: u64 = (-1_i64) as u64;
@@ -34,15 +43,15 @@ const NEG_EIO: u64 = (-5_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
 #[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
-const NEG_EFAULT: u64 = (-14_i64) as u64;
-const NEG_EINVAL: u64 = (-22_i64) as u64;
+pub(super) const NEG_EFAULT: u64 = (-14_i64) as u64;
+pub(super) const NEG_EINVAL: u64 = (-22_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
 const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
-const NEG_ENOSYS: u64 = (-38_i64) as u64;
+pub(super) const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
@@ -732,7 +741,7 @@ use super::gdt;
 // The Rust-side helpers below read from per-core data.
 
 /// Read the per-core `syscall_arg3` (R10 at SYSCALL entry).
-fn per_core_syscall_arg3() -> u64 {
+pub(super) fn per_core_syscall_arg3() -> u64 {
     crate::smp::per_core().syscall_arg3
 }
 
@@ -947,292 +956,32 @@ pub extern "C" fn syscall_handler(
     user_rsp: u64,
 ) -> u64 {
     // Divergent syscalls (exit, sigreturn) never return — handle them first.
-    match number {
-        15 => sys_sigreturn(user_rsp),
-        60 => sys_exit(arg0 as i32),
-        231 => sys_exit_group(arg0 as i32),
-        _ => {}
-    }
+    signal::handle_divergent_signal_syscall(number, user_rsp);
+    process::handle_divergent_syscall(number, arg0);
 
-    let result = match number {
-        // Linux-compatible file I/O (Phase 12, T013–T017)
-        0 => sys_linux_read(arg0, arg1, arg2),
-        1 => sys_linux_write(arg0, arg1, arg2),
-        2 => sys_linux_open(arg0, arg1, arg2),
-        3 => sys_linux_close(arg0),
-        // stat(path, buf) follows the final symlink.
-        4 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
-        5 => sys_linux_fstat(arg0, arg1),
-        // lstat(path, buf) inspects the final symlink itself.
-        6 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, AT_SYMLINK_NOFOLLOW),
-        // Phase 22: poll stub — report all requested fds as ready.
-        // Ion uses poll() to multiplex between signal pipe and stdin.
-        7 => sys_poll(arg0, arg1, arg2),
-        8 => sys_linux_lseek(arg0, arg1, arg2),
-        // Phase 36: mprotect(addr, len, prot) — change page permissions.
-        10 => sys_mprotect(arg0, arg1, arg2),
-        // Linux-compatible memory (Phase 12, T018–T020)
-        9 => sys_linux_mmap(arg0, arg1, arg2),
-        11 => sys_linux_munmap(arg0, arg1),
-        12 => sys_linux_brk(arg0),
-        86 => sys_link(arg0, arg1),
-        88 => sys_symlink(arg0, arg1),
-        89 => sys_readlink(arg0, arg1, arg2),
-        // Phase 14: signal syscalls (rt_sigaction, rt_sigprocmask)
-        13 => sys_rt_sigaction(arg0, arg1, arg2),
-        14 => sys_rt_sigprocmask(arg0, arg1, arg2),
-        // Linux misc (Phase 12, T023–T026)
-        16 => sys_linux_ioctl(arg0, arg1, arg2),
-        19 => sys_linux_readv(arg0, arg1, arg2),
-        20 => sys_linux_writev(arg0, arg1, arg2),
-        // Phase 21: access stub (PATH search — check existence only)
-        21 => sys_access(arg0),
-        // Phase 37: select(nfds, readfds, writefds, exceptfds, timeout)
-        23 => {
-            let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
-            sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
-        }
-        // Phase 14: pipe and dup2
-        22 => sys_pipe_with_flags(arg0, false),
-        32 => sys_dup(arg0),
-        33 => sys_dup2(arg0, arg1),
-        // Phase 35: nice(increment) — adjust task priority
-        34 => {
-            let pid = crate::process::current_pid();
-            let uid_val = {
-                let table = crate::process::PROCESS_TABLE.lock();
-                table.find(pid).map(|p| p.uid).unwrap_or(0)
-            };
-            crate::task::sys_nice(arg0 as i32, uid_val) as u64
-        }
-        // Phase 14: nanosleep
-        35 => sys_nanosleep(arg0),
-        // Phase 23: socket syscalls
-        41 => sys_socket(arg0, arg1, arg2),
-        42 => sys_connect(arg0, arg1, arg2),
-        43 => sys_accept(arg0, arg1, arg2),
-        44 => {
-            let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len = crate::smp::per_core().syscall_user_r9;
-            sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
-        }
-        45 => {
-            let flags = per_core_syscall_arg3();
-            let addr_ptr = crate::smp::per_core().syscall_user_r8;
-            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
-            sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
-        }
-        48 => sys_shutdown_sock(arg0, arg1),
-        49 => sys_bind(arg0, arg1, arg2),
-        50 => sys_listen(arg0, arg1),
-        51 => sys_getsockname(arg0, arg1, arg2),
-        52 => sys_getpeername(arg0, arg1, arg2),
-        54 => {
-            let optval_ptr = per_core_syscall_arg3();
-            let optlen = crate::smp::per_core().syscall_user_r8;
-            sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
-        }
-        55 => {
-            let optval_ptr = per_core_syscall_arg3();
-            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
-            sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
-        }
-        // IPC syscalls (Phase 6) — kernel-task only.
-        // Note: syscall 4 was IPC but is now stat (Linux ABI).
-        // Note: syscall 7 was IPC but is now poll (Phase 22).
-        // Note: syscall 10 was IPC but is now mprotect (Phase 21).
-        // Phase 11 + Linux-compatible process syscalls
-        39 => sys_getpid(),
-        // Phase 39: socketpair(domain, type, protocol, sv)
-        53 => {
-            let sv_ptr = per_core_syscall_arg3();
-            sys_socketpair(arg0, arg1, arg2, sv_ptr)
-        }
-        // Phase 21/40: clone — fork or thread creation
-        56 => {
-            let child_tidptr = per_core_syscall_arg3(); // r10
-            let tls = crate::smp::per_core().syscall_user_r8;
-            sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
-        }
-        57 => sys_fork(user_rip, user_rsp),
-        59 => sys_execve(arg0, arg1, arg2),
-        61 => sys_waitpid(arg0, arg1, arg2),
-        // Phase 14: signal syscalls
-        62 => sys_kill(arg0, arg1),
-        63 => sys_linux_uname(arg0),
-        // Phase 21: fcntl stub
-        72 => sys_fcntl(arg0, arg1, arg2),
-        // Phase 13: filesystem mutation syscalls
-        74 => sys_linux_fsync(arg0),
-        // Phase 21: gettimeofday stub — return approximate time from LAPIC tick count
-        96 => sys_gettimeofday(arg0),
-        76 => sys_linux_truncate(arg0, arg1),
-        77 => sys_linux_ftruncate(arg0, arg1),
-        79 => sys_linux_getcwd(arg0, arg1),
-        80 => sys_linux_chdir(arg0),
-        82 => sys_linux_rename(arg0, arg1),
-        83 => sys_linux_mkdir(arg0, arg1),
-        84 => sys_linux_rmdir(arg0),
-        87 => sys_linux_unlink(arg0),
-        // Phase 27: file permission syscalls
-        90 => sys_linux_chmod(arg0, arg1),
-        91 => sys_linux_fchmod(arg0, arg1),
-        92 => sys_linux_chown(arg0, arg1, arg2),
-        93 => sys_linux_fchown(arg0, arg1, arg2),
-        95 => sys_umask(arg0),
-        // Phase 35: times(buf) — fill struct tms with CPU time accounting
-        100 => sys_times(arg0),
-        // Phase 27: user/group identity syscalls
-        102 => sys_linux_getuid(),
-        104 => sys_linux_getgid(),
-        105 => sys_linux_setuid(arg0),
-        106 => sys_linux_setgid(arg0),
-        107 => sys_linux_geteuid(),
-        108 => sys_linux_getegid(),
-        113 => sys_linux_setreuid(arg0, arg1),
-        114 => sys_linux_setregid(arg0, arg1),
-        // Phase 14: process group syscalls
-        109 => sys_setpgid(arg0, arg1),
-        110 => sys_getppid(),
-        // Phase 21: getpgrp — equivalent to getpgid(0)
-        111 => sys_getpgid(0),
-        // Phase 29: setsid — create a new session
-        112 => sys_setsid(),
-        121 => sys_getpgid(arg0),
-        // Phase 29: getsid — get session ID
-        124 => sys_getsid(arg0),
-        // Phase 19: sigaltstack
-        131 => sys_sigaltstack(arg0, arg1),
-        137 => sys_statfs(arg0, arg1),
-        138 => sys_fstatfs(arg0, arg1),
-        // musl TLS init (Phase 12, T030 dependency)
-        158 => sys_linux_arch_prctl(arg0, arg1),
-        // Phase 24: mount(source, target, fstype)
-        165 => sys_linux_mount(arg0, arg1, arg2),
-        166 => sys_linux_umount2(arg0, arg1),
-        // Phase 19: gettid — returns PID (no threads, tid=pid)
-        186 => sys_gettid(),
-        // Phase 40: tkill(tid, sig) — send signal to a specific thread
-        200 => sys_tkill(arg0, arg1),
-        // Phase 40: futex — real wait/wake queues
-        202 => {
-            let val3 = crate::smp::per_core().syscall_user_r9;
-            sys_futex(arg0, arg1, arg2, val3)
-        }
-        // Phase 35: sched_setaffinity(pid, len, mask_ptr) / sched_getaffinity(pid, len, mask_ptr)
-        203 => {
-            // sched_setaffinity: read mask from user memory
-            if arg2 == 0 {
-                return NEG_EFAULT;
-            }
-            if arg1 < 8 {
-                return NEG_EINVAL;
-            }
-            let mask = {
-                let mut buf = [0u8; 8];
-                if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
-                    return NEG_EFAULT;
-                }
-                u64::from_ne_bytes(buf)
-            };
-            crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
-        }
-        204 => {
-            // sched_getaffinity: write mask to user memory
-            let mask = crate::task::sys_sched_getaffinity(arg0 as u32);
-            if mask < 0 {
-                mask as u64
-            } else if arg2 != 0 && arg1 >= 8 {
-                let bytes = (mask as u64).to_ne_bytes();
-                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
-                    return NEG_EFAULT;
-                }
-                8 // return bytes written
-            } else {
-                NEG_EINVAL
-            }
-        }
-        217 => sys_linux_getdents64(arg0, arg1, arg2),
-        218 => sys_linux_set_tid_address(arg0),
-        // Phase 21: clock_gettime — return approximate time from LAPIC ticks
-        228 => sys_clock_gettime(arg0, arg1),
-        // Phase 18: openat(dirfd, path, flags) — mode (4th arg) not yet wired through
-        257 => sys_linux_openat(arg0, arg1, arg2),
-        // Phase 21: set_robust_list stub — musl thread init, no-op
-        273 => 0,
-        // Phase 21: dup3 — delegate to dup2 (ignore flags)
-        292 => sys_dup2(arg0, arg1),
-        // Phase 21: pipe2 — delegate to pipe (ignore flags)
-        293 => {
-            // pipe2(fds, flags) — O_CLOEXEC = 0x80000
-            let cloexec = arg1 & 0x80000 != 0;
-            sys_pipe_with_flags(arg0, cloexec)
-        }
-        // Phase 37: epoll_create1(flags)
-        291 => sys_epoll_create1(arg0),
-        // Phase 37: accept4(fd, addr, addrlen, flags) — syscall 288
-        288 => {
-            let flags = per_core_syscall_arg3();
-            sys_accept4(arg0, arg1, arg2, flags)
-        }
-        // Phase 21: prlimit64 — return ENOSYS (musl handles gracefully)
-        302 => NEG_ENOSYS,
-        // Phase 21: getrandom — fill buffer with TSC-seeded PRNG bytes
-        318 => sys_getrandom(arg0, arg1, arg2),
-        // newfstatat: fstat via path lookup
-        262 => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
-        // Phase 37: epoll_wait(epfd, events, maxevents, timeout)
-        232 => {
-            let timeout = per_core_syscall_arg3();
-            sys_epoll_wait(arg0, arg1, arg2, timeout)
-        }
-        // Phase 37: epoll_ctl(epfd, op, fd, event)
-        233 => {
-            let event_ptr = per_core_syscall_arg3();
-            sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
-        }
-        // Phase 37: pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)
-        270 => {
-            let exceptfds = per_core_syscall_arg3();
-            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
-            // 6th arg (sigmask) is in r9 — ignored for now.
-            sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
-        }
-        265 => sys_linkat(
-            arg0,
-            arg1,
-            arg2,
-            per_core_syscall_arg3(),
-            crate::smp::per_core().syscall_user_r8,
-        ),
-        266 => sys_symlinkat(arg0, arg1, arg2),
-        267 => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
-        // Phase 32: utimensat(dirfd, path, times, flags) — update file timestamps
-        280 => {
-            let flags = per_core_syscall_arg3();
-            sys_utimensat(arg0, arg1, arg2, flags)
-        }
-        // Phase 46: sys_reboot(cmd) — halt or restart the system
-        169 => sys_reboot(arg0),
-        // Custom kernel debug print (moved from 12, Phase 12 T010)
-        0x1000 => sys_debug_print(arg0, arg1),
-        // Custom kernel meminfo (Phase 33 Track F)
-        0x1001 => sys_meminfo(arg0, arg1),
-        // Custom kernel trace ring read (Phase 43b Track G)
-        #[cfg(feature = "trace")]
-        0x1002 => sys_ktrace(arg0, arg1, arg2),
-        // Phase 47 Track A: framebuffer info + mmap
-        0x1005 => sys_framebuffer_info(arg0, arg1),
-        0x1006 => sys_framebuffer_mmap(),
-        // Phase 47 Track B: raw scancode
-        0x1007 => sys_read_scancode(),
-        _ => {
-            // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
-            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
-            NEG_ENOSYS
-        }
+    // Dispatch to subsystem handlers. Each returns Some(result) if handled.
+    let result = if let Some(r) = fs::handle_fs_syscall(number, arg0, arg1, arg2) {
+        r
+    } else if let Some(r) = mm::handle_mm_syscall(number, arg0, arg1, arg2) {
+        r
+    } else if let Some(r) =
+        process::handle_process_syscall(number, arg0, arg1, arg2, user_rip, user_rsp)
+    {
+        r
+    } else if let Some(r) = net::handle_net_syscall(number, arg0, arg1, arg2) {
+        r
+    } else if let Some(r) = signal::handle_signal_syscall(number, arg0, arg1, arg2) {
+        r
+    } else if let Some(r) = io::handle_io_syscall(number, arg0, arg1, arg2) {
+        r
+    } else if let Some(r) = time::handle_time_syscall(number, arg0, arg1) {
+        r
+    } else if let Some(r) = misc::handle_misc_syscall(number, arg0, arg1, arg2) {
+        r
+    } else {
+        // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
+        log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+        NEG_ENOSYS
     };
 
     // Phase 14/19: check pending signals before returning to userspace.
@@ -1439,7 +1188,7 @@ unsafe fn enter_signal_handler(
 // sys_debug_print
 // ---------------------------------------------------------------------------
 
-fn sys_debug_print(ptr: u64, len: u64) -> u64 {
+pub(super) fn sys_debug_print(ptr: u64, len: u64) -> u64 {
     if len > 4096 {
         return u64::MAX;
     }
@@ -1460,7 +1209,7 @@ fn sys_debug_print(ptr: u64, len: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// `getpid()` — return the calling thread's thread-group ID (POSIX PID).
-fn sys_getpid() -> u64 {
+pub(super) fn sys_getpid() -> u64 {
     let pid = crate::process::current_pid();
     crate::process::PROCESS_TABLE
         .lock()
@@ -1470,7 +1219,7 @@ fn sys_getpid() -> u64 {
 }
 
 /// `gettid()` — return the calling thread's unique thread ID.
-fn sys_gettid() -> u64 {
+pub(super) fn sys_gettid() -> u64 {
     let pid = crate::process::current_pid();
     crate::process::PROCESS_TABLE
         .lock()
@@ -1480,7 +1229,7 @@ fn sys_gettid() -> u64 {
 }
 
 /// `getppid()` — return the calling process's parent PID.
-fn sys_getppid() -> u64 {
+pub(super) fn sys_getppid() -> u64 {
     let pid = crate::process::current_pid();
     crate::process::PROCESS_TABLE
         .lock()
@@ -1581,7 +1330,7 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
 ///   - If this is the LAST thread: full process cleanup.
 ///   - Otherwise: minimal cleanup — remove from group, clear_child_tid wake,
 ///     remove Process entry, mark scheduler task as Dead.
-fn sys_exit(code: i32) -> ! {
+pub(super) fn sys_exit(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::info!("[p{}] exit({})", pid, code);
 
@@ -1639,7 +1388,7 @@ fn sys_exit(code: i32) -> ! {
 /// For single-threaded processes: identical to `sys_exit`.
 /// For thread groups: kills all sibling threads first, then the caller does
 /// full process cleanup as the last thread standing.
-fn sys_exit_group(code: i32) -> ! {
+pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::info!("[p{}] exit_group({})", pid, code);
 
@@ -1691,7 +1440,7 @@ fn sys_exit_group(code: i32) -> ! {
 // ---------------------------------------------------------------------------
 
 /// `kill(pid, sig)` — send a signal to a process (syscall 62).
-fn sys_kill(pid: u64, sig: u64) -> u64 {
+pub(super) fn sys_kill(pid: u64, sig: u64) -> u64 {
     let sig = sig as u32;
     let target_pid = pid as i64;
 
@@ -1816,7 +1565,7 @@ fn send_signal_to_thread_group(pid: crate::process::Pid, sig: u32) -> bool {
 }
 
 /// `tkill(tid, sig)` — send a signal to a specific thread (syscall 200).
-fn sys_tkill(tid: u64, sig: u64) -> u64 {
+pub(super) fn sys_tkill(tid: u64, sig: u64) -> u64 {
     let sig = sig as u32;
     if sig > 63 {
         return NEG_EINVAL;
@@ -1842,7 +1591,7 @@ fn sys_tkill(tid: u64, sig: u64) -> u64 {
 /// This is a divergent syscall: it reads the sigframe from the user stack,
 /// restores all saved registers and the signal mask, and enters ring 3 at
 /// the interrupted instruction.  It never returns through the normal path.
-fn sys_sigreturn(user_rsp: u64) -> ! {
+pub(super) fn sys_sigreturn(user_rsp: u64) -> ! {
     let pid = crate::process::current_pid();
 
     // Restore registers and signal mask from the sigframe.
@@ -1959,7 +1708,7 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
 }
 
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
-fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
+pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
     if sig == 0 || sig >= 32 {
         return NEG_EINVAL;
@@ -2079,7 +1828,7 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 /// `rt_sigprocmask(how, set_ptr, oldset_ptr, sigsetsize)` — syscall 14.
 ///
 /// Reads/modifies the calling process's blocked-signal mask.
-fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
+pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
     let mut table = crate::process::PROCESS_TABLE.lock();
@@ -2139,7 +1888,7 @@ fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// `sigaltstack(ss, old_ss)` — register/query alternate signal stack (syscall 131).
-fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
     let mut table = crate::process::PROCESS_TABLE.lock();
@@ -2215,7 +1964,7 @@ fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// `pipe(pipefd_ptr)` — create a pipe (syscall 22).
 ///
 /// Writes `[read_fd, write_fd]` to userspace memory at `pipefd_ptr`.
-fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
+pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     // Pipe starts with reader_count=0, writer_count=0.
     // We bump refcounts explicitly after each successful FD allocation.
     let pipe_id = crate::pipe::create_pipe();
@@ -2282,7 +2031,7 @@ fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
 }
 
 /// `dup2(oldfd, newfd)` — duplicate a file descriptor (syscall 33).
-fn sys_dup(oldfd: u64) -> u64 {
+pub(super) fn sys_dup(oldfd: u64) -> u64 {
     let oldfd = oldfd as usize;
     if oldfd >= MAX_FDS {
         return NEG_EBADF;
@@ -2320,7 +2069,7 @@ fn sys_dup(oldfd: u64) -> u64 {
     }
 }
 
-fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+pub(super) fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     let oldfd = oldfd as usize;
     let newfd = newfd as usize;
 
@@ -2375,7 +2124,7 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// `setpgid(pid, pgid)` — set process group ID (syscall 109).
-fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
+pub(super) fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
     let caller = crate::process::current_pid();
     let target = if pid == 0 {
         caller
@@ -2399,7 +2148,7 @@ fn sys_setpgid(pid: u64, pgid: u64) -> u64 {
 }
 
 /// `getpgid(pid)` — get process group ID (syscall 121).
-fn sys_getpgid(pid: u64) -> u64 {
+pub(super) fn sys_getpgid(pid: u64) -> u64 {
     let target = if pid == 0 {
         crate::process::current_pid()
     } else {
@@ -2414,7 +2163,7 @@ fn sys_getpgid(pid: u64) -> u64 {
 }
 
 /// `setsid()` — create a new session (syscall 112).
-fn sys_setsid() -> u64 {
+pub(super) fn sys_setsid() -> u64 {
     let calling_pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
 
@@ -2436,7 +2185,7 @@ fn sys_setsid() -> u64 {
 }
 
 /// `getsid(pid)` — get session ID (syscall 124).
-fn sys_getsid(pid: u64) -> u64 {
+pub(super) fn sys_getsid(pid: u64) -> u64 {
     let target = if pid == 0 {
         crate::process::current_pid()
     } else {
@@ -2453,7 +2202,7 @@ fn sys_getsid(pid: u64) -> u64 {
 ///
 /// Reads a `timespec` struct from user memory and yield-loops for the
 /// requested number of timer ticks.
-fn sys_nanosleep(req_ptr: u64) -> u64 {
+pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
     if req_ptr == 0 {
         return NEG_EFAULT;
     }
@@ -2538,7 +2287,7 @@ const REBOOT_CMD_HALT: u64 = 0xCDEF0123;
 const REBOOT_CMD_RESTART: u64 = 0x01234567;
 const REBOOT_CMD_POWER_OFF: u64 = 0x4321FEDC;
 
-fn sys_reboot(cmd: u64) -> u64 {
+pub(super) fn sys_reboot(cmd: u64) -> u64 {
     // Only UID 0 (root) may invoke reboot.
     let pid = crate::process::current_pid();
     let uid = {
@@ -2619,7 +2368,7 @@ fn current_process_ids() -> (u32, u32, u32, u32) {
 ///   offset 16: tms_cutime — children user CPU time
 ///   offset 24: tms_cstime — children system CPU time
 /// Returns: clock ticks since boot.
-fn sys_times(buf_ptr: u64) -> u64 {
+pub(super) fn sys_times(buf_ptr: u64) -> u64 {
     let (user_ticks, system_ticks) = crate::task::scheduler::current_task_times().unwrap_or((0, 0));
     if buf_ptr != 0 {
         let mut bytes = [0u8; 32]; // 4 × i64
@@ -2635,22 +2384,22 @@ fn sys_times(buf_ptr: u64) -> u64 {
 }
 
 /// `getuid()` — return real user ID (syscall 102).
-fn sys_linux_getuid() -> u64 {
+pub(super) fn sys_linux_getuid() -> u64 {
     current_process_ids().0 as u64
 }
 
 /// `getgid()` — return real group ID (syscall 104).
-fn sys_linux_getgid() -> u64 {
+pub(super) fn sys_linux_getgid() -> u64 {
     current_process_ids().1 as u64
 }
 
 /// `geteuid()` — return effective user ID (syscall 107).
-fn sys_linux_geteuid() -> u64 {
+pub(super) fn sys_linux_geteuid() -> u64 {
     current_process_ids().2 as u64
 }
 
 /// `getegid()` — return effective group ID (syscall 108).
-fn sys_linux_getegid() -> u64 {
+pub(super) fn sys_linux_getegid() -> u64 {
     current_process_ids().3 as u64
 }
 
@@ -2662,7 +2411,7 @@ fn sys_linux_getegid() -> u64 {
 /// - Otherwise returns -EPERM.
 ///
 /// Login and su work because they run as root (euid 0) when transitioning.
-fn sys_linux_setuid(uid_arg: u64) -> u64 {
+pub(super) fn sys_linux_setuid(uid_arg: u64) -> u64 {
     let new_uid = uid_arg as u32;
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
@@ -2688,7 +2437,7 @@ fn sys_linux_setuid(uid_arg: u64) -> u64 {
 ///
 /// Mirrors `sys_linux_setuid` enforcement for group IDs.
 /// Privilege check is based on euid (not egid), matching Linux behavior.
-fn sys_linux_setgid(gid_arg: u64) -> u64 {
+pub(super) fn sys_linux_setgid(gid_arg: u64) -> u64 {
     let new_gid = gid_arg as u32;
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
@@ -2714,7 +2463,7 @@ fn sys_linux_setgid(gid_arg: u64) -> u64 {
 ///
 /// If ruid != -1: set real uid (only if euid==0 or ruid matches current real/effective uid).
 /// If euid != -1: set effective uid (only if euid==0 or value matches current real/effective uid).
-fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
+pub(super) fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
     let ruid = ruid_arg as i32;
     let euid = euid_arg as i32;
     let pid = crate::process::current_pid();
@@ -2741,7 +2490,7 @@ fn sys_linux_setreuid(ruid_arg: u64, euid_arg: u64) -> u64 {
 ///
 /// Mirrors `sys_linux_setreuid` enforcement for group IDs.
 /// Privilege check is based on euid (not egid), matching Linux behavior.
-fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
+pub(super) fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
     let rgid = rgid_arg as i32;
     let egid = egid_arg as i32;
     let pid = crate::process::current_pid();
@@ -2771,7 +2520,7 @@ fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
 /// entry function enters ring 3 at `user_rip` with `user_rsp` and rax=0.
 ///
 /// Returns the child PID to the parent.
-fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
+pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     let parent_pid = crate::process::current_pid();
     log::info!("[p{}] fork()", parent_pid);
 
@@ -2987,7 +2736,7 @@ fn read_user_string_array(
 /// with a new ELF binary read from the ramdisk.
 ///
 /// Phase 14: now parses argv and envp from user memory (Linux ABI).
-fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // Read the filename as a null-terminated C string.
     let mut name_cstr = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut name_cstr) {
@@ -3159,7 +2908,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 /// Supports pid > 0 (specific child), pid == -1 (any child), pid == 0
 /// (any child in caller's process group).
 /// WUNTRACED (0x2): also report stopped children.
-fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
+pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
     let calling_pid = crate::process::current_pid();
     let saved_user_rsp = per_core_syscall_user_rsp();
@@ -3748,7 +3497,7 @@ fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
 // T013: read(fd, buf, count)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd = fd as usize;
     if fd >= MAX_FDS {
         return NEG_EBADF;
@@ -4193,7 +3942,7 @@ fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
 // T014: write(fd, buf, count)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -4772,8 +4521,8 @@ const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 
 /// `AT_FDCWD` sentinel: resolve relative paths against the process's cwd.
-const AT_FDCWD: u64 = (-100_i64) as u64;
-const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub(super) const AT_FDCWD: u64 = (-100_i64) as u64;
+pub(super) const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_SYMLINK_FOLLOW: u64 = 0x400;
 
 /// Check if a resolved absolute path is a directory across all filesystems.
@@ -5534,7 +5283,7 @@ fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
     }
 }
 
-fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
+pub(super) fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -5548,7 +5297,7 @@ fn sys_linux_open(path_ptr: u64, flags: u64, mode_arg: u64) -> u64 {
 // Phase 18: openat(dirfd, path, flags, mode) — syscall 257
 // ---------------------------------------------------------------------------
 
-fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
+pub(super) fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     // Read mode from SYSCALL_ARG3 (r10 — 4th syscall argument in Linux ABI).
     let mode_arg = per_core_syscall_arg3();
     let mut buf = [0u8; 512];
@@ -5582,7 +5331,7 @@ pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
 // T015 (close) / T013 (close)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_close(fd: u64) -> u64 {
+pub(super) fn sys_linux_close(fd: u64) -> u64 {
     let fd = fd as usize;
     // stdin/stdout/stderr (0–2) are virtual and cannot be closed.
     if fd < 3 {
@@ -5865,7 +5614,7 @@ fn data_is_mounted() -> bool {
     crate::fs::ext2::is_mounted() || crate::fs::fat32::is_mounted()
 }
 
-fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
+pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -6016,7 +5765,7 @@ fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     0
 }
 
-fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
+pub(super) fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw = match read_user_cstr(path_ptr, &mut buf) {
         Some(p) => p,
@@ -6037,7 +5786,7 @@ fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
     write_statfs_to_user(buf_ptr, &stat)
 }
 
-fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
+pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -6210,7 +5959,7 @@ fn create_parent_is_read_only(abs_path: &str) -> bool {
 }
 
 /// `chmod(path, mode)` — change file mode bits (syscall 90).
-fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
+pub(super) fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -6257,7 +6006,7 @@ fn sys_linux_chmod(path_ptr: u64, mode_arg: u64) -> u64 {
 }
 
 /// `fchmod(fd, mode)` — change file mode bits by fd (syscall 91).
-fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
+pub(super) fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -6303,7 +6052,7 @@ fn sys_linux_fchmod(fd: u64, mode_arg: u64) -> u64 {
 
 /// `chown(path, uid, gid)` — change file owner (syscall 92).
 /// Only root can change file ownership.
-fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
+pub(super) fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -6335,7 +6084,7 @@ fn sys_linux_chown(path_ptr: u64, uid_arg: u64, gid_arg: u64) -> u64 {
 }
 
 /// `fchown(fd, uid, gid)` — change file owner by fd (syscall 93).
-fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
+pub(super) fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -6372,7 +6121,7 @@ fn sys_linux_fchown(fd: u64, uid_arg: u64, gid_arg: u64) -> u64 {
 // T017: lseek(fd, offset, whence)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
+pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     let fd = fd as usize;
     if !(3..MAX_FDS).contains(&fd) {
         return NEG_EBADF;
@@ -6536,7 +6285,7 @@ fn kernel_read_fd_at(pid: u32, fd: usize, offset: usize, buf: &mut [u8]) -> Resu
     }
 }
 
-fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
+pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     // Read flags from SYSCALL_ARG3 (r10 at syscall entry).
     // SAFETY: single-CPU, read after every SYSCALL entry stores to SYSCALL_ARG3.
     let flags = per_core_syscall_arg3();
@@ -6788,7 +6537,7 @@ fn sys_mmap_file_backed(
     base
 }
 
-fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
+pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     // Validate: page-aligned address and non-zero length.
     if addr & 0xFFF != 0 || len == 0 {
         return NEG_EINVAL;
@@ -6935,7 +6684,7 @@ fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
 // regions. Updates PTEs in-place and splits VMAs at mprotect boundaries.
 // ---------------------------------------------------------------------------
 
-fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     // Mask prot to supported POSIX bits only.
     let prot = prot & 0x7; // PROT_READ | PROT_WRITE | PROT_EXEC
 
@@ -7117,7 +6866,7 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 // Returns number of bytes written, or 0 on error.
 // ---------------------------------------------------------------------------
 
-fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
+pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     use core::fmt::Write;
 
     if buf_addr == 0 || buf_len == 0 {
@@ -7236,7 +6985,7 @@ struct FbInfo {
     pixel_format: u32,
 }
 
-fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
+pub(super) fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
     const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
     const FB_INFO_SIZE: u64 = core::mem::size_of::<FbInfo>() as u64;
 
@@ -7285,7 +7034,7 @@ fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
 /// lives in the OS-private range and is never returned to userspace.
 const FB_MAPPING_FLAG: u64 = 1 << 32;
 
-fn sys_framebuffer_mmap() -> u64 {
+pub(super) fn sys_framebuffer_mmap() -> u64 {
     let (buf_virt, byte_len) = match crate::fb::framebuffer_buf_addr() {
         Some(v) => v,
         None => {
@@ -7470,7 +7219,7 @@ fn sys_framebuffer_mmap() -> u64 {
 // or 0 if no scancode is available (non-blocking).
 // ---------------------------------------------------------------------------
 
-fn sys_read_scancode() -> u64 {
+pub(super) fn sys_read_scancode() -> u64 {
     let pid = crate::process::current_pid();
     if crate::fb::fb_owner_pid() != pid {
         return 0;
@@ -7491,7 +7240,7 @@ fn sys_read_scancode() -> u64 {
 // T020: brk(addr)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_brk(addr: u64) -> u64 {
+pub(super) fn sys_linux_brk(addr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
     // Always initialise brk_current to BRK_BASE if it is still 0, regardless
@@ -7579,7 +7328,7 @@ fn sys_linux_brk(addr: u64) -> u64 {
 // T023: writev(fd, iov, iovcnt)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+pub(super) fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
     if iovcnt > 1024 {
         return NEG_EINVAL;
     }
@@ -7631,7 +7380,7 @@ fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 // T023: readv(fd, iov, iovcnt)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+pub(super) fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
     if iovcnt > 1024 {
         return NEG_EINVAL;
     }
@@ -7682,7 +7431,7 @@ fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
 // T024: getcwd(buf, size) — return per-process working directory
 // ---------------------------------------------------------------------------
 
-fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
+pub(super) fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
     let cwd = current_cwd();
     let cwd_bytes = cwd.as_bytes();
     let total_len = cwd_bytes.len() + 1; // include null terminator
@@ -7709,7 +7458,7 @@ fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
 // T024: chdir(path) — resolve path, validate directory, update process cwd
 // ---------------------------------------------------------------------------
 
-fn sys_linux_chdir(path_ptr: u64) -> u64 {
+pub(super) fn sys_linux_chdir(path_ptr: u64) -> u64 {
     let _mount_guard = MOUNT_OP_LOCK.lock();
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
@@ -7762,7 +7511,7 @@ fn sys_linux_chdir(path_ptr: u64) -> u64 {
 // T025: ioctl — TIOCGWINSZ only
 // ---------------------------------------------------------------------------
 
-fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
+pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     // Musl declares ioctl(int, int, ...) — the request code is sign-extended
     // from 32 bits.  Truncate to u32 so _IOR/_IOW constants with bit 31 set
     // (e.g., TIOCGPTN = 0x80045430) compare correctly.
@@ -8056,7 +7805,7 @@ fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
 // T026: uname(buf) — writes a fixed struct utsname
 // ---------------------------------------------------------------------------
 
-fn sys_linux_uname(buf_ptr: u64) -> u64 {
+pub(super) fn sys_linux_uname(buf_ptr: u64) -> u64 {
     // struct utsname: 6 fields of 65 bytes each = 390 bytes
     let mut utsname = [0u8; 390];
     let fill = |dst: &mut [u8], s: &[u8]| {
@@ -8079,7 +7828,7 @@ fn sys_linux_uname(buf_ptr: u64) -> u64 {
 // T026 (via path): newfstatat(dirfd, path, stat_ptr, flags)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
+pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8246,11 +7995,11 @@ fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u6
     }
 }
 
-fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> u64 {
+pub(super) fn sys_symlink(target_ptr: u64, linkpath_ptr: u64) -> u64 {
     sys_symlinkat(target_ptr, AT_FDCWD, linkpath_ptr)
 }
 
-fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
+pub(super) fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
     let mut target_buf = [0u8; 4096];
     let target = match read_user_cstr(target_ptr, &mut target_buf) {
         Some(s) => s,
@@ -8335,11 +8084,11 @@ fn sys_symlinkat(target_ptr: u64, dirfd: u64, linkpath_ptr: u64) -> u64 {
     }
 }
 
-fn sys_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+pub(super) fn sys_readlink(path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     sys_readlinkat(AT_FDCWD, path_ptr, buf_ptr, buf_len)
 }
 
-fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+pub(super) fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     if buf_len == 0 {
         return NEG_EINVAL;
     }
@@ -8370,11 +8119,17 @@ fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> u64 
     to_copy as u64
 }
 
-fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> u64 {
+pub(super) fn sys_link(oldpath_ptr: u64, newpath_ptr: u64) -> u64 {
     sys_linkat(AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
 }
 
-fn sys_linkat(olddirfd: u64, oldpath_ptr: u64, newdirfd: u64, newpath_ptr: u64, flags: u64) -> u64 {
+pub(super) fn sys_linkat(
+    olddirfd: u64,
+    oldpath_ptr: u64,
+    newdirfd: u64,
+    newpath_ptr: u64,
+    flags: u64,
+) -> u64 {
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return NEG_EINVAL;
     }
@@ -8493,7 +8248,7 @@ fn current_unix_time() -> u32 {
     (ticks / TICKS_PER_SEC) as u32
 }
 
-fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64 {
+pub(super) fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8589,7 +8344,7 @@ fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: u64) -> u64
 // Phase 13: mkdir(pathname) — syscall 83
 // ---------------------------------------------------------------------------
 
-fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
+pub(super) fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8742,7 +8497,7 @@ fn sys_linux_mkdir(path_ptr: u64, mode: u64) -> u64 {
 // Phase 13: rmdir(pathname) — syscall 84
 // ---------------------------------------------------------------------------
 
-fn sys_linux_rmdir(path_ptr: u64) -> u64 {
+pub(super) fn sys_linux_rmdir(path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8788,7 +8543,7 @@ fn sys_linux_rmdir(path_ptr: u64) -> u64 {
 // Phase 13: unlink(pathname) — syscall 87
 // ---------------------------------------------------------------------------
 
-fn sys_linux_unlink(path_ptr: u64) -> u64 {
+pub(super) fn sys_linux_unlink(path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let raw_name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -8931,7 +8686,7 @@ fn sys_linux_unlink(path_ptr: u64) -> u64 {
 // Phase 13: rename(oldpath, newpath) — syscall 82
 // ---------------------------------------------------------------------------
 
-fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
+pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
     let mut buf1 = [0u8; 512];
     let old_raw = match read_user_cstr(old_ptr, &mut buf1) {
         Some(n) => n,
@@ -9005,7 +8760,7 @@ fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // Phase 24: mount(source, target, fstype) — syscall 165
 // ---------------------------------------------------------------------------
 
-fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
+pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
     let _mount_guard = MOUNT_OP_LOCK.lock();
     let mut buf_target = [0u8; 512];
     let target = match read_user_cstr(target_ptr, &mut buf_target) {
@@ -9094,7 +8849,7 @@ fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
     }
 }
 
-fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
+pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
     let _mount_guard = MOUNT_OP_LOCK.lock();
     if flags != 0 {
         return NEG_EINVAL;
@@ -9182,7 +8937,7 @@ fn mount_holds_fd(target: &str, backend: &FdBackend) -> bool {
 // Phase 13: truncate(path, length) — syscall 76
 // ---------------------------------------------------------------------------
 
-fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
+pub(super) fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
     // Linux truncate() takes a signed off_t.
     let length_i64 = length as i64;
     if length_i64 < 0 {
@@ -9222,7 +8977,7 @@ fn sys_linux_truncate(path_ptr: u64, length: u64) -> u64 {
 // Phase 13: ftruncate(fd, length) — syscall 77
 // ---------------------------------------------------------------------------
 
-fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
+pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
     // Linux ftruncate() takes a signed off_t.
     let length_i64 = length as i64;
     if length_i64 < 0 {
@@ -9280,7 +9035,7 @@ fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
 // Phase 13: fsync(fd) — syscall 74 (no-op for tmpfs)
 // ---------------------------------------------------------------------------
 
-fn sys_linux_fsync(fd: u64) -> u64 {
+pub(super) fn sys_linux_fsync(fd: u64) -> u64 {
     let fd_idx = fd as usize;
     if !(3..MAX_FDS).contains(&fd_idx) {
         return NEG_EBADF;
@@ -9295,7 +9050,7 @@ fn sys_linux_fsync(fd: u64) -> u64 {
 // Phase 13: getdents64(fd, buf, count) — syscall 217
 // ---------------------------------------------------------------------------
 
-fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
+pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -9521,7 +9276,7 @@ fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     out.len() as u64
 }
 
-fn sys_umask(mask: u64) -> u64 {
+pub(super) fn sys_umask(mask: u64) -> u64 {
     let new_mask = (mask as u16) & 0o777;
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
@@ -9539,7 +9294,7 @@ fn sys_umask(mask: u64) -> u64 {
 
 /// Handles `ARCH_SET_FS` (0x1002) which musl uses to set the FS.base MSR for
 /// thread-local storage.  Other sub-commands return -EINVAL.
-fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
+pub(super) fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
     const ARCH_SET_FS: u64 = 0x1002;
     match code {
         ARCH_SET_FS => {
@@ -9569,7 +9324,7 @@ fn sys_linux_arch_prctl(code: u64, addr: u64) -> u64 {
 ///
 /// musl calls this during `__init_tls` to record the address that the kernel
 /// should clear (and futex-wake) when the thread exits.
-fn sys_linux_set_tid_address(tidptr: u64) -> u64 {
+pub(super) fn sys_linux_set_tid_address(tidptr: u64) -> u64 {
     let pid = crate::process::current_pid();
 
     {
@@ -9592,7 +9347,7 @@ fn sys_linux_set_tid_address(tidptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Check if a path exists. Ignores the mode argument (no permission model).
-fn sys_access(path_ptr: u64) -> u64 {
+pub(super) fn sys_access(path_ptr: u64) -> u64 {
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -9690,7 +9445,7 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 ///
 /// Linux clone ABI: flags (rdi), child_stack (rsi), parent_tidptr (rdx),
 /// child_tidptr (r10), tls (r8).
-fn sys_clone(
+pub(super) fn sys_clone(
     flags: u64,
     child_stack: u64,
     parent_tidptr: u64,
@@ -10017,7 +9772,7 @@ fn sys_clone_thread(
 // ---------------------------------------------------------------------------
 
 /// Minimal fcntl: F_DUPFD, F_GETFD, F_SETFD, F_GETFL, F_SETFL.
-fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+pub(super) fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
@@ -10143,7 +9898,7 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Fill user buffer with pseudo-random bytes seeded from the TSC.
-fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
+pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
     let len = buflen as usize;
     if len == 0 {
         return 0;
@@ -10198,7 +9953,7 @@ fn tsc_now_us() -> (u64, u64) {
 }
 
 /// Return wall-clock time (CLOCK_REALTIME) as struct timeval.
-fn sys_gettimeofday(tv_ptr: u64) -> u64 {
+pub(super) fn sys_gettimeofday(tv_ptr: u64) -> u64 {
     if tv_ptr == 0 {
         return NEG_EFAULT;
     }
@@ -10225,7 +9980,7 @@ const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
 
 /// Return time as struct timespec, dispatching on clock ID.
-fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
+pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
     if tp_ptr == 0 {
         return NEG_EFAULT;
     }
@@ -10279,7 +10034,7 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
 ///
 /// Supports `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`, and
 /// `FUTEX_WAKE_BITSET` operations with the `FUTEX_PRIVATE_FLAG`.
-fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
+pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
     const FUTEX_WAIT_BITSET: u64 = 9;
@@ -10554,7 +10309,7 @@ fn sys_socket_unix(socktype: u64) -> u64 {
 }
 
 /// socketpair(domain, type, protocol, sv) — syscall 53
-fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr: u64) -> u64 {
+pub(super) fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr: u64) -> u64 {
     const AF_UNIX: u64 = 1;
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
@@ -11125,7 +10880,7 @@ fn sys_recvfrom_unix(
 }
 
 /// socket(domain, type, protocol) — syscall 41
-fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
+pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     use crate::net::{SocketKind, SocketProtocol};
     const AF_UNIX: u64 = 1;
     const AF_INET: u64 = 2;
@@ -11174,7 +10929,7 @@ fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
 }
 
 /// bind(fd, addr, addrlen) — syscall 49
-fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+pub(super) fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     // Check for Unix socket first.
     if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
         return sys_bind_unix(fd, addr_ptr, addr_len);
@@ -11227,7 +10982,7 @@ fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 }
 
 /// connect(fd, addr, addrlen) — syscall 42
-fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
     if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
         return sys_connect_unix(fd, addr_ptr, addr_len);
     }
@@ -11342,7 +11097,7 @@ fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 }
 
 /// listen(fd, backlog) — syscall 50
-fn sys_listen(fd: u64, backlog: u64) -> u64 {
+pub(super) fn sys_listen(fd: u64, backlog: u64) -> u64 {
     if let Ok((handle, _)) = unix_socket_handle_from_fd(fd) {
         return sys_listen_unix(handle, backlog);
     }
@@ -11371,7 +11126,7 @@ fn sys_listen(fd: u64, backlog: u64) -> u64 {
 }
 
 /// accept(fd, addr, addrlen) — syscall 43
-fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     if let Ok((_, _)) = unix_socket_handle_from_fd(fd) {
         return sys_accept_unix(fd, addr_ptr, addr_len_ptr, 0);
     }
@@ -11494,7 +11249,7 @@ fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 ///
 /// Like accept() but applies SOCK_NONBLOCK and SOCK_CLOEXEC flags
 /// to the newly accepted socket FD.
-fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
+pub(super) fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
@@ -11521,7 +11276,14 @@ fn sys_accept4(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64 {
 }
 
 /// sendto(fd, buf, len, flags, addr, addrlen) — syscall 44
-fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, addr_len: u64) -> u64 {
+pub(super) fn sys_sendto(
+    fd: u64,
+    buf_ptr: u64,
+    len: u64,
+    _flags: u64,
+    addr_ptr: u64,
+    addr_len: u64,
+) -> u64 {
     let fd_idx = fd as usize;
     if fd_idx >= MAX_FDS {
         return NEG_EBADF;
@@ -11654,7 +11416,7 @@ fn sys_sendto(fd: u64, buf_ptr: u64, len: u64, _flags: u64, addr_ptr: u64, addr_
 }
 
 /// recvfrom(fd, buf, len, flags, addr, addrlen) — syscall 45
-fn sys_recvfrom_socket(
+pub(super) fn sys_recvfrom_socket(
     fd: u64,
     buf_ptr: u64,
     count: u64,
@@ -11901,7 +11663,7 @@ fn sys_recvfrom_socket(
 }
 
 /// shutdown(fd, how) — syscall 48
-fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
+pub(super) fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
     if let Ok((handle, _)) = unix_socket_handle_from_fd(fd) {
         return sys_shutdown_unix(handle, how);
     }
@@ -11939,7 +11701,7 @@ fn sys_shutdown_sock(fd: u64, how: u64) -> u64 {
 }
 
 /// getsockname(fd, addr, addrlen) — syscall 51
-fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+pub(super) fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -11971,7 +11733,7 @@ fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 }
 
 /// getpeername(fd, addr, addrlen) — syscall 52
-fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
+pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -12007,7 +11769,13 @@ fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 }
 
 /// setsockopt(fd, level, optname, optval, optlen) — syscall 54
-fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u64) -> u64 {
+pub(super) fn sys_setsockopt(
+    fd: u64,
+    level: u64,
+    optname: u64,
+    optval_ptr: u64,
+    optlen: u64,
+) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -12056,7 +11824,13 @@ fn sys_setsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen: u6
 }
 
 /// getsockopt(fd, level, optname, optval, optlen) — syscall 55
-fn sys_getsockopt(fd: u64, level: u64, optname: u64, optval_ptr: u64, optlen_ptr: u64) -> u64 {
+pub(super) fn sys_getsockopt(
+    fd: u64,
+    level: u64,
+    optname: u64,
+    optval_ptr: u64,
+    optlen_ptr: u64,
+) -> u64 {
     let (handle, _kind, _proto) = match socket_handle_from_fd(fd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -12428,7 +12202,7 @@ fn fd_deregister_waiter(entry: &FdEntry, task_id: crate::task::TaskId) {
 /// Phase 37 rewrite: uses per-FD wait queues instead of busy-wait yield loop.
 /// The task blocks via WaitQueue until an FD becomes ready or timeout expires.
 #[allow(clippy::needless_range_loop)]
-fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
+pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     let nfds = nfds as usize;
     if nfds > 256 {
         return NEG_EINVAL;
@@ -12628,7 +12402,7 @@ fn write_fd_set(ptr: u64, mask: u32) -> Result<(), u64> {
 }
 
 /// select(nfds, readfds, writefds, exceptfds, timeout) — syscall 23
-fn sys_select(
+pub(super) fn sys_select(
     nfds: u64,
     readfds_ptr: u64,
     writefds_ptr: u64,
@@ -12827,7 +12601,7 @@ fn select_inner(
 ///
 /// Modern variant of select with timespec timeout and signal mask.
 /// Signal mask is accepted but not applied (no signal masking yet).
-fn sys_pselect6(
+pub(super) fn sys_pselect6(
     nfds: u64,
     readfds_ptr: u64,
     writefds_ptr: u64,
@@ -12945,7 +12719,7 @@ fn epoll_remove_fd(fd: usize) {
 }
 
 /// epoll_create1(flags) — syscall 291
-fn sys_epoll_create1(flags: u64) -> u64 {
+pub(super) fn sys_epoll_create1(flags: u64) -> u64 {
     // Reject unknown flags.
     if flags & !EPOLL_CLOEXEC != 0 {
         return NEG_EINVAL;
@@ -12988,7 +12762,7 @@ fn sys_epoll_create1(flags: u64) -> u64 {
 }
 
 /// epoll_ctl(epfd, op, fd, event_ptr) — syscall 233
-fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
     let epfd_idx = epfd as usize;
     let fd_idx = fd as usize;
     if epfd_idx >= MAX_FDS || fd_idx >= MAX_FDS {
@@ -13082,7 +12856,7 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
 }
 
 /// epoll_wait(epfd, events, maxevents, timeout) — syscall 232
-fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
     let maxevents = (maxevents as usize).min(MAX_EPOLL_INTEREST);
     if maxevents == 0 {
         return NEG_EINVAL;
@@ -13244,7 +13018,7 @@ fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u
 ///   - `buf_len`: size of the userspace buffer in bytes
 ///
 /// Returns the number of entries written, or `u64::MAX` on error.
-fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     let core_id = core_id as u8;
     if core_id >= crate::smp::core_count() {
         return u64::MAX;
