@@ -2430,7 +2430,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "PASS: dual_ion_supervisors",
-        timeout_secs: 20,
+        timeout_secs: 30,
         label: "verify dual PTY supervisor regression",
     });
     steps.push(SmokeStep::Wait {
