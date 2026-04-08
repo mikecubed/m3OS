@@ -262,4 +262,57 @@ mod tests {
         reg.register("ksvc", EndpointId(4)).unwrap();
         assert_eq!(reg.lookup("ksvc"), Some(EndpointId(4)));
     }
+
+    // --- G.2: additional registry ownership and re-registration tests ---
+
+    #[test]
+    fn register_with_owner_and_lookup() {
+        let mut reg = Registry::new();
+        let ep = EndpointId(42);
+        reg.register_with_owner("display", ep, 100).unwrap();
+        assert_eq!(reg.lookup("display"), Some(ep));
+        // Other names still missing.
+        assert_eq!(reg.lookup("audio"), None);
+    }
+
+    #[test]
+    fn re_register_same_owner_updates() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("net", EndpointId(1), 50).unwrap();
+        assert_eq!(reg.lookup("net"), Some(EndpointId(1)));
+
+        // Same owner re-registers with a new endpoint.
+        reg.register_with_owner("net", EndpointId(99), 50).unwrap();
+        assert_eq!(reg.lookup("net"), Some(EndpointId(99)));
+    }
+
+    #[test]
+    fn replace_after_death() {
+        let mut reg = Registry::new();
+        // Original owner (pid 10) registers the service.
+        reg.register_with_owner("crashed", EndpointId(1), 10)
+            .unwrap();
+
+        // After pid 10 dies, a supervisor replaces it with pid 20.
+        reg.replace_service("crashed", EndpointId(2), 10, 20)
+            .unwrap();
+        assert_eq!(reg.lookup("crashed"), Some(EndpointId(2)));
+
+        // New owner (20) can re-register.
+        reg.register_with_owner("crashed", EndpointId(3), 20)
+            .unwrap();
+        assert_eq!(reg.lookup("crashed"), Some(EndpointId(3)));
+    }
+
+    #[test]
+    fn replace_while_alive_wrong_old_owner_returns_error() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("alive", EndpointId(1), 10).unwrap();
+
+        // Try to replace with wrong old_owner — should fail.
+        assert!(reg.replace_service("alive", EndpointId(2), 99, 20).is_err());
+
+        // Original service unchanged.
+        assert_eq!(reg.lookup("alive"), Some(EndpointId(1)));
+    }
 }

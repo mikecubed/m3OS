@@ -311,4 +311,91 @@ mod tests {
         let h_rw = table.insert(rw).unwrap();
         assert_ne!(table.get(h_ro), table.get(h_rw));
     }
+
+    // --- G.1: additional grant logic tests ---
+
+    #[test]
+    fn grant_then_revoke() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+        let cap = Capability::Endpoint(EndpointId(10));
+        let src_handle = src.insert(cap).unwrap();
+
+        // Grant from src to dst.
+        let dst_handle = src.grant(src_handle, &mut dst).unwrap();
+
+        // Source slot is cleared after grant.
+        assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
+        // Destination has the cap.
+        assert_eq!(dst.get(dst_handle), Ok(cap));
+
+        // Now revoke (remove) from destination.
+        assert_eq!(dst.remove(dst_handle), Ok(cap));
+        // Both tables now have the slot empty.
+        assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
+        assert_eq!(dst.get(dst_handle), Err(CapError::InvalidHandle));
+    }
+
+    #[test]
+    fn double_grant_chain() {
+        let mut a = CapabilityTable::new();
+        let mut b = CapabilityTable::new();
+        let mut c = CapabilityTable::new();
+
+        let cap = Capability::Notification(NotifId(5));
+        let a_handle = a.insert(cap).unwrap();
+
+        // Grant A -> B.
+        let b_handle = a.grant(a_handle, &mut b).unwrap();
+        assert_eq!(a.get(a_handle), Err(CapError::InvalidHandle));
+        assert_eq!(b.get(b_handle), Ok(cap));
+
+        // Grant B -> C.
+        let c_handle = b.grant(b_handle, &mut c).unwrap();
+        assert_eq!(b.get(b_handle), Err(CapError::InvalidHandle));
+        assert_eq!(c.get(c_handle), Ok(cap));
+
+        // Only C holds the capability now.
+        assert_eq!(a.get(a_handle), Err(CapError::InvalidHandle));
+        assert_eq!(b.get(b_handle), Err(CapError::InvalidHandle));
+        assert_eq!(c.get(c_handle), Ok(cap));
+    }
+
+    #[test]
+    fn grant_across_different_capability_types() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+
+        let ep_cap = Capability::Endpoint(EndpointId(1));
+        let notif_cap = Capability::Notification(NotifId(2));
+        let reply_cap = Capability::Reply(TaskId(3));
+        let grant_cap = Capability::Grant {
+            frame: 0x4000,
+            page_count: 8,
+            writable: true,
+        };
+
+        let h_ep = src.insert(ep_cap).unwrap();
+        let h_notif = src.insert(notif_cap).unwrap();
+        let h_reply = src.insert(reply_cap).unwrap();
+        let h_grant = src.insert(grant_cap).unwrap();
+
+        // Grant all four types to dst.
+        let d_ep = src.grant(h_ep, &mut dst).unwrap();
+        let d_notif = src.grant(h_notif, &mut dst).unwrap();
+        let d_reply = src.grant(h_reply, &mut dst).unwrap();
+        let d_grant = src.grant(h_grant, &mut dst).unwrap();
+
+        // All source slots empty.
+        assert_eq!(src.get(h_ep), Err(CapError::InvalidHandle));
+        assert_eq!(src.get(h_notif), Err(CapError::InvalidHandle));
+        assert_eq!(src.get(h_reply), Err(CapError::InvalidHandle));
+        assert_eq!(src.get(h_grant), Err(CapError::InvalidHandle));
+
+        // All dest slots populated with correct types.
+        assert_eq!(dst.get(d_ep), Ok(ep_cap));
+        assert_eq!(dst.get(d_notif), Ok(notif_cap));
+        assert_eq!(dst.get(d_reply), Ok(reply_cap));
+        assert_eq!(dst.get(d_grant), Ok(grant_cap));
+    }
 }

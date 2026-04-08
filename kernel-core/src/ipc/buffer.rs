@@ -160,4 +160,24 @@ mod tests {
     fn typical_network_packet() {
         assert_eq!(validate_user_buffer(0x0040_0000, 1500), Ok(()));
     }
+
+    // --- G.3: additional buffer validation edge cases ---
+
+    #[test]
+    fn validate_max_user_address_boundary() {
+        // Address at exactly 0x7FFF_FFFF_F000 with len 0x1000 ends at
+        // 0x8000_0000_0000 which is USER_ADDR_MAX — should be accepted.
+        assert_eq!(validate_user_buffer(0x7FFF_FFFF_F000, 0x1000), Ok(()));
+    }
+
+    #[test]
+    fn validate_address_just_above_null_page() {
+        // 0x1000 is USER_ADDR_MIN — first valid page.
+        assert_eq!(validate_user_buffer(0x1000, 1), Ok(()));
+        // One byte below is the null guard page.
+        assert_eq!(
+            validate_user_buffer(0x0FFF, 1),
+            Err(BufferError::AddressOutOfRange)
+        );
+    }
 }

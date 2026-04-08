@@ -132,6 +132,45 @@ mod loom_tests {
             server.join().unwrap();
         });
     }
+
+    /// G.4: Verify concurrent grants to the same destination table never
+    /// exceed capacity or lose capabilities.
+    #[test]
+    fn concurrent_grants_to_same_dest_never_exceed_capacity() {
+        use loom::sync::Mutex;
+
+        loom::model(|| {
+            let dest = Arc::new(Mutex::new(kernel_core::ipc::CapabilityTable::new()));
+
+            let dest1 = dest.clone();
+            let dest2 = dest.clone();
+
+            let t1 = thread::spawn(move || {
+                let mut src = kernel_core::ipc::CapabilityTable::new();
+                let _ = src.insert(kernel_core::ipc::Capability::Endpoint(
+                    kernel_core::types::EndpointId(1),
+                ));
+                let mut d = dest1.lock().unwrap();
+                src.grant(0, &mut d)
+            });
+
+            let t2 = thread::spawn(move || {
+                let mut src = kernel_core::ipc::CapabilityTable::new();
+                let _ = src.insert(kernel_core::ipc::Capability::Notification(
+                    kernel_core::types::NotifId(2),
+                ));
+                let mut d = dest2.lock().unwrap();
+                src.grant(0, &mut d)
+            });
+
+            let r1 = t1.join().unwrap();
+            let r2 = t2.join().unwrap();
+
+            // Both should succeed since dest table has 64 slots.
+            assert!(r1.is_ok());
+            assert!(r2.is_ok());
+        });
+    }
 }
 
 /// Non-loom placeholder tests that always pass when loom is not active.
