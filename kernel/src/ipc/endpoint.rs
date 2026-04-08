@@ -163,28 +163,39 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
 
     match action {
         Some(mut pending) => {
+            // Insert reply cap FIRST so it reserves a slot before transfer_cap
+            // can consume the last free entry.  This prevents a scenario where
+            // transfer_cap succeeds but the reply-cap insertion fails, leaving
+            // an unreachable capability in the receiver's table.
+            let reply_cap_handle = if pending.wants_reply {
+                match scheduler::insert_cap(receiver, Capability::Reply(pending.task)) {
+                    Ok(handle) => Some(handle),
+                    Err(_) => {
+                        log::warn!(
+                            "[ipc] recv_msg: capability table full, unblocking sender without reply"
+                        );
+                        scheduler::deliver_message(pending.task, Message::new(u64::MAX));
+                        let _ = scheduler::wake_task(pending.task);
+                        return Message::new(u64::MAX);
+                    }
+                }
+            } else {
+                None
+            };
             // Transfer any attached capability from the sender's message.
             if transfer_cap(pending.task, receiver, &mut pending.msg).is_err() {
                 log::warn!(
                     "[ipc] recv_msg: capability transfer failed, dropping message from task {}",
                     pending.task.0,
                 );
+                // Remove the reply cap we just inserted to avoid a dangling cap.
+                if let Some(handle) = reply_cap_handle {
+                    let _ = scheduler::remove_task_cap(receiver, handle);
+                }
                 // Wake the sender with an error so it doesn't block forever.
                 scheduler::deliver_message(pending.task, Message::new(u64::MAX));
                 let _ = scheduler::wake_task(pending.task);
                 return Message::new(u64::MAX);
-            }
-            if pending.wants_reply {
-                // Insert reply cap BEFORE delivering the message, so the receiver
-                // never sees a request it cannot reply to.
-                if scheduler::insert_cap(receiver, Capability::Reply(pending.task)).is_err() {
-                    log::warn!(
-                        "[ipc] recv_msg: capability table full, unblocking sender without reply"
-                    );
-                    scheduler::deliver_message(pending.task, Message::new(u64::MAX));
-                    let _ = scheduler::wake_task(pending.task);
-                    return Message::new(u64::MAX);
-                }
             }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
