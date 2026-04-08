@@ -1,6 +1,6 @@
 # Phase 50 - IPC Completion
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-50
 **Depends on:** Phase 6 (IPC Core) ✅, Phase 7 (Core Servers) ✅, Phase 8 (Storage and VFS) ✅, Phase 39 (Unix Domain Sockets) ✅, Phase 49 (Architectural Declaration) ✅
 **Builds on:** Turns the existing capability and rendezvous primitives into a transport model that can support real ring-3 services without shared-address-space shortcuts
@@ -110,9 +110,67 @@ Real userspace services need a stable discovery story and a simple server loop. 
 - At least one representative service path uses the new transport without kernel-pointer shortcuts.
 - The IPC docs and validation coverage describe the same control flow and failure semantics the code actually implements.
 
+## Evaluation Gate Results (Track A)
+
+### A.1 — Kernel-Pointer Shortcut Inventory
+
+Every site in the IPC subsystem and kernel server loops where user-supplied pointers
+are dereferenced as raw kernel addresses without `copy_from_user` validation:
+
+| Site | File | Lines | Assumption |
+|---|---|---|---|
+| `ipc_register_service` name read | `kernel/src/ipc/mod.rs` | 229–232 | `name_ptr` treated as kernel-space pointer; comment says "Phase 7 only — all callers are kernel tasks" |
+| `ipc_lookup_service` name read | `kernel/src/ipc/mod.rs` | 254–257 | Same assumption; `name_ptr` dereferenced via `core::slice::from_raw_parts` |
+| `console_server_task` write payload | `kernel/src/main.rs` | 350–361 | `msg.data[0]` (client-supplied pointer) dereferenced as `*const u8` in kernel space; comment says "In Phase 9, clients still share the kernel address space" |
+| `fat_server_task` file path/data | `kernel/src/main.rs` | 506–508 | Delegates to `ramdisk::handle(&msg)` which interprets `msg.data[]` words as kernel pointers to file path strings and data buffers |
+| `vfs_server_task` forwarding | `kernel/src/main.rs` | 570–571 | Forwards entire message (including kernel-pointer data words) to fat_server via `call_msg` — inherits pointer assumptions |
+
+The `kbd_server_task` does **not** dereference user pointers — it returns scancodes as
+integer values in `msg.data[0]`, not pointer-based payloads.
+
+### A.2 — Phase 49 Ownership Matrix Verification
+
+Cross-reference of in-kernel server loops against the Keep/Move/Transition matrix
+in `docs/appendix/architecture-and-syscalls.md`:
+
+| Server loop | Matrix subsystem | Classification | Consistent? |
+|---|---|---|---|
+| `console_server_task` | fb (framebuffer) | Move — Stage 2 | Yes — console output is display policy |
+| `kbd_server_task` | (not explicitly listed) | — | **Gap** — keyboard/input subsystem missing from matrix |
+| `fat_server_task` | fs/ramdisk | Move — Stage 3 | Yes — filesystem policy |
+| `vfs_server_task` | fs/vfs | Transition — Stage 3 | Yes — VFS routing is policy |
+
+**Gap resolved:** The keyboard/input subsystem must be added to the matrix as **Move — Stage 2**
+(input device drivers can run in ring 3 with IRQ notification capabilities, same as
+VirtIO drivers). This will be addressed in Track H (H.4).
+
+The `docs/evaluation/microkernel-path.md` Stage 1 concrete-work list (Phase 49) is
+consistent with this audit: it identifies all four server loops as kernel tasks that
+need eventual extraction.
+
+### A.3 — Bulk-Data Payload Target Inventory
+
+| Payload type | Source subsystem | Typical size range | Proposed transport |
+|---|---|---|---|
+| Service-name strings | IPC registry (register/lookup) | 1–32 bytes | `copy_from_user` (small, bounded) |
+| VFS path strings | VFS/FS server requests | 1–4096 bytes | `copy_from_user` (bounded by PATH_MAX) |
+| Console write strings | Console server | 1–4096 bytes | `copy_from_user` (bounded by MAX_CONSOLE_WRITE_LEN) |
+| FAT32 file blocks | Storage server read/write | 512–65536 bytes | Page grant for blocks ≥4096; `copy_from_user` for smaller |
+| Network packet buffers | Network stack tx/rx | 64–1500 bytes (MTU) | `copy_from_user` (fits in 64 KiB limit) |
+| Framebuffer spans | Display/compositor | 4096–8 MiB (full screen) | Page grant (zero-copy, read-write mapped into receiver) |
+
+Transport mechanism summary:
+- **`copy_from_user` / `copy_to_user`** (already implemented in `kernel/src/mm/user_mem.rs`,
+  64 KiB max per call): used for small-to-medium payloads. Validates page-table mappings
+  before copying. Handles demand faults and CoW.
+- **Page grant** (`Capability::Grant`): new capability variant for zero-copy sharing of
+  physical pages between address spaces. Used for framebuffer-sized and streaming transfers
+  where copying is prohibitively expensive. Ownership is explicit: grantor retains physical
+  ownership, grantee gets a mapped view with specified permissions, revocation unmaps cleanly.
+
 ## Companion Task List
 
-- Phase 50 task list — defer until implementation planning begins.
+- [Phase 50 task list](./tasks/50-ipc-completion-tasks.md)
 
 ## How Real OS Implementations Differ
 
