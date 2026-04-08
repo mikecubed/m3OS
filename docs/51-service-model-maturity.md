@@ -12,7 +12,7 @@ restart policies, syslog, cron, and admin commands, Phase 51 strengthens every
 layer so that later extracted ring-3 services can join the same supervision
 framework without inventing their own conventions. The key changes are: a
 stabilized service-definition contract with privilege and timeout fields, a
-validated state machine with guarded transitions, restart backoff with crash
+validated state machine with diagnostic transition checks, restart backoff with crash
 classification, deterministic shutdown ordering with per-service timeouts and
 orphan reaping, syslog integration for init itself, and a hardened admin control
 path.
@@ -21,7 +21,7 @@ path.
 
 - Service-definition contract (fields: name, command, type, restart, max_restart,
   depends, user, stop_timeout)
-- Service state machine with guarded transitions
+- Service state machine with diagnostic transition checks
 - Restart backoff (1s, 2s, 5s cap; reset after 10s uptime)
 - Crash classification (clean exit, error exit, signal death)
 - Shutdown ordering (reverse dependency order, per-service timeout, orphan reaping)
@@ -47,7 +47,7 @@ stabilizes this format as the contract that all managed services must follow.
 | `restart` | `always`, `on-failure`, `never` | `always` | When to restart after exit |
 | `max_restart` | integer | 10 | Maximum consecutive restart attempts before permanent stop |
 | `depends` | comma-separated names | none | Services that must be running before this one starts |
-| `user` | name or UID | 0 (root) | Privilege level for the service process |
+| `user` | UID (numeric) | 0 (root) | Privilege level for the service process |
 | `stop_timeout` | seconds | 5 | How long to wait between SIGTERM and SIGKILL during shutdown |
 
 Phase 51 also replaces the hardcoded `KNOWN_CONFIGS` array with a directory scan
@@ -56,9 +56,11 @@ file without recompiling init.
 
 ### Service State Machine
 
-The state machine from Phase 46 is retained but strengthened with guarded
-transitions. Invalid transitions (such as `PermanentlyStopped` to `Starting`)
-are rejected by a validation method rather than relying on callers.
+The state machine from Phase 46 is retained with a `try_transition` validation
+method. Invalid transitions (such as `PermanentlyStopped` to `Starting`) are
+detected and logged as warnings. The validation is currently diagnostic — init
+proceeds with the transition to preserve PID 1 robustness — but the method
+enables future enforcement once the state machine has been battle-tested.
 
 ```
 NeverStarted --> Starting --> Running --> Stopping --> Stopped(exit_code)
