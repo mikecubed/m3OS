@@ -1,7 +1,7 @@
 use crate::types::EndpointId;
 
 /// Maximum number of services that can be registered simultaneously.
-pub const MAX_SERVICES: usize = 8;
+pub const MAX_SERVICES: usize = 16;
 
 /// Maximum byte length of a service name.
 pub const MAX_NAME_LEN: usize = 32;
@@ -22,6 +22,9 @@ struct Entry {
     name: [u8; MAX_NAME_LEN],
     name_len: usize,
     ep_id: EndpointId,
+    /// Task that owns this service registration. `0` means kernel-registered
+    /// (no specific owner).
+    owner: u64,
 }
 
 impl Entry {
@@ -30,7 +33,7 @@ impl Entry {
     }
 }
 
-/// Service registry — static name-to-endpoint mapping.
+/// Service registry — static name-to-endpoint mapping with ownership tracking.
 pub struct Registry {
     entries: [Option<Entry>; MAX_SERVICES],
     count: usize,
@@ -45,15 +48,39 @@ impl Registry {
         }
     }
 
-    /// Register a named service endpoint.
+    /// Register a named service endpoint (kernel-owned, no specific task owner).
+    ///
+    /// This is the legacy API used by kernel init code that registers services
+    /// from ring 0. The entry's owner is set to `0` (kernel).
     pub fn register(&mut self, name: &str, ep_id: EndpointId) -> Result<(), RegistryError> {
+        self.register_with_owner(name, ep_id, 0)
+    }
+
+    /// Register a named service endpoint with an owning task ID.
+    ///
+    /// If a service with the same name already exists and is owned by a
+    /// different task, returns [`RegistryError::AlreadyExists`]. If the same
+    /// name exists with the same owner (re-registration), the endpoint is
+    /// updated in place.
+    pub fn register_with_owner(
+        &mut self,
+        name: &str,
+        ep_id: EndpointId,
+        owner: u64,
+    ) -> Result<(), RegistryError> {
         let name_bytes = name.as_bytes();
         if name_bytes.len() > MAX_NAME_LEN {
             return Err(RegistryError::NameTooLong);
         }
 
-        for slot in self.entries.iter().flatten() {
+        // Check for existing entry with the same name.
+        for slot in self.entries.iter_mut().flatten() {
             if slot.name_matches(name_bytes) {
+                if slot.owner == owner {
+                    // Re-registration by the same owner: update endpoint.
+                    slot.ep_id = ep_id;
+                    return Ok(());
+                }
                 return Err(RegistryError::AlreadyExists);
             }
         }
@@ -70,6 +97,7 @@ impl Registry {
                     name: entry_name,
                     name_len: name_bytes.len(),
                     ep_id,
+                    owner,
                 });
                 self.count += 1;
                 return Ok(());
@@ -77,6 +105,34 @@ impl Registry {
         }
 
         Err(RegistryError::Full)
+    }
+
+    /// Replace a dead task's service entry with a new registration.
+    ///
+    /// If a service named `name` exists and is owned by `old_owner`, it is
+    /// replaced with the new `ep_id` and `new_owner`. Returns `Ok(())` on
+    /// success, or `Err` if the name is not found or not owned by `old_owner`.
+    pub fn replace_service(
+        &mut self,
+        name: &str,
+        ep_id: EndpointId,
+        old_owner: u64,
+        new_owner: u64,
+    ) -> Result<(), RegistryError> {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > MAX_NAME_LEN {
+            return Err(RegistryError::NameTooLong);
+        }
+
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.name_matches(name_bytes) && slot.owner == old_owner {
+                slot.ep_id = ep_id;
+                slot.owner = new_owner;
+                return Ok(());
+            }
+        }
+
+        Err(RegistryError::AlreadyExists)
     }
 
     /// Look up a named service endpoint.
@@ -120,11 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_name() {
+    fn duplicate_name_different_owner() {
         let mut reg = Registry::new();
-        reg.register("vfs", EndpointId(0)).unwrap();
+        reg.register_with_owner("vfs", EndpointId(0), 1).unwrap();
         assert_eq!(
-            reg.register("vfs", EndpointId(1)),
+            reg.register_with_owner("vfs", EndpointId(1), 2),
             Err(RegistryError::AlreadyExists)
         );
     }
@@ -150,5 +206,60 @@ mod tests {
             reg.register("overflow", EndpointId(99)),
             Err(RegistryError::Full)
         );
+    }
+
+    #[test]
+    fn max_services_is_at_least_16() {
+        assert!(MAX_SERVICES >= 16);
+    }
+
+    #[test]
+    fn register_with_owner_tracks_owner() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("myservice", EndpointId(5), 42)
+            .unwrap();
+        assert_eq!(reg.lookup("myservice"), Some(EndpointId(5)));
+    }
+
+    #[test]
+    fn reregister_same_owner_updates_endpoint() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        reg.register_with_owner("svc", EndpointId(2), 10).unwrap();
+        assert_eq!(reg.lookup("svc"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn reregister_different_owner_rejected() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        assert_eq!(
+            reg.register_with_owner("svc", EndpointId(2), 20),
+            Err(RegistryError::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn replace_service_by_old_owner() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        reg.replace_service("svc", EndpointId(2), 10, 20).unwrap();
+        assert_eq!(reg.lookup("svc"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn replace_service_wrong_owner_fails() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        assert!(reg.replace_service("svc", EndpointId(2), 99, 20).is_err());
+    }
+
+    #[test]
+    fn kernel_register_sets_owner_zero() {
+        let mut reg = Registry::new();
+        reg.register("ksvc", EndpointId(3)).unwrap();
+        // Same owner (0) should allow re-registration
+        reg.register("ksvc", EndpointId(4)).unwrap();
+        assert_eq!(reg.lookup("ksvc"), Some(EndpointId(4)));
     }
 }
