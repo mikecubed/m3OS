@@ -15,8 +15,9 @@
 #![no_main]
 
 use syscall_lib::{
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, SigAction, WNOHANG, close, execve, exit,
-    fork, kill, mount, nanosleep, open, read, rt_sigaction, waitpid, write, write_str, write_u64,
+    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, SigAction, WNOHANG, clock_gettime, close,
+    execve, exit, fork, kill, mount, nanosleep, open, read, rt_sigaction, waitpid, write,
+    write_str, write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,10 @@ struct ServiceDef {
     pid: i32,
     /// Number of restarts performed.
     restart_count: u32,
+    /// Epoch seconds when the service was last started (for backoff reset).
+    last_start_time: u64,
+    /// Epoch seconds when the last state transition occurred.
+    last_change_time: u64,
     /// Whether this service is active (slot in use).
     active: bool,
 }
@@ -187,6 +192,8 @@ impl ServiceDef {
             status: ServiceStatus::NeverStarted,
             pid: 0,
             restart_count: 0,
+            last_start_time: 0,
+            last_change_time: 0,
             active: false,
         }
     }
@@ -696,6 +703,8 @@ impl ServiceManager {
                     write_str(STDOUT_FILENO, "init: skipping '");
                     write(STDOUT_FILENO, self.services[idx].name.as_bytes());
                     write_str(STDOUT_FILENO, "' (deps not ready)\n");
+                    self.services[idx].status = ServiceStatus::PermanentlyStopped;
+                    self.services[idx].last_change_time = now_epoch_secs();
                 }
             }
             i += 1;
@@ -732,6 +741,9 @@ impl ServiceManager {
             write(STDOUT_FILENO, svc.name.as_bytes());
             write_str(STDOUT_FILENO, "'\n");
             svc.status = ServiceStatus::Stopped(-1);
+            svc.last_change_time = now_epoch_secs();
+            // Note: cannot call self.write_status_file() here because svc borrows self.
+            // Status file will be written on the next transition or periodic write.
             return;
         }
 
@@ -762,8 +774,11 @@ impl ServiceManager {
         }
 
         // Parent.
+        let now = now_epoch_secs();
         self.services[idx].status = ServiceStatus::Running;
         self.services[idx].pid = pid as i32;
+        self.services[idx].last_start_time = now;
+        self.services[idx].last_change_time = now;
         self.pid_table.insert(pid as i32, idx);
 
         write_str(STDOUT_FILENO, "init: started '");
@@ -771,26 +786,51 @@ impl ServiceManager {
         write_str(STDOUT_FILENO, "' pid=");
         write_u64(STDOUT_FILENO, pid as u64);
         write_str(STDOUT_FILENO, "\n");
+
+        // Write status immediately on state transition.
+        self.write_status_file();
     }
 
     /// Handle a reaped child PID with its exit status.
+    ///
+    /// Wait status encoding:
+    /// - If bit 7 set: process was killed by signal, bits 0-6 = signal number
+    /// - Otherwise: bits 8-15 = exit code
     fn handle_child_exit(&mut self, pid: i32, status: i32) {
         match self.pid_table.lookup(pid) {
             Some(idx) => {
                 self.pid_table.remove(pid);
-                let exit_code = (status >> 8) & 0xff;
+
+                let signaled = (status & 0x80) != 0;
+                let (exit_code, signal_num) = if signaled {
+                    (status & 0x7f, status & 0x7f) // signal number in lower 7 bits
+                } else {
+                    (((status >> 8) & 0xff), 0)
+                };
+
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
+                self.services[idx].last_change_time = now_epoch_secs();
 
                 write_str(STDOUT_FILENO, "init: service '");
                 write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-                write_str(STDOUT_FILENO, "' exited (");
-                write_u64(STDOUT_FILENO, exit_code as u64);
-                write_str(STDOUT_FILENO, ")\n");
+                if signaled {
+                    write_str(STDOUT_FILENO, "' killed by signal ");
+                    write_u64(STDOUT_FILENO, signal_num as u64);
+                } else if exit_code == 0 {
+                    write_str(STDOUT_FILENO, "' exited normally");
+                } else {
+                    write_str(STDOUT_FILENO, "' exited with error ");
+                    write_u64(STDOUT_FILENO, exit_code as u64);
+                }
+                write_str(STDOUT_FILENO, "\n");
+
+                // Write status immediately on state transition.
+                self.write_status_file();
 
                 // Check restart policy if not shutting down.
                 if !self.shutdown_requested {
-                    self.maybe_restart(idx, exit_code);
+                    self.maybe_restart(idx, exit_code, signaled);
                 }
             }
             None => {
@@ -807,12 +847,15 @@ impl ServiceManager {
     }
 
     /// Restart a service if its restart policy allows it.
-    fn maybe_restart(&mut self, idx: usize, exit_code: i32) {
+    ///
+    /// `signaled` indicates the process was killed by a signal (not a normal exit).
+    fn maybe_restart(&mut self, idx: usize, exit_code: i32, signaled: bool) {
         let svc = &self.services[idx];
 
         let should_restart = match svc.restart_policy {
             RestartPolicy::Always => true,
-            RestartPolicy::OnFailure => exit_code != 0,
+            // OnFailure restarts on error exit OR signal death, but NOT clean exit.
+            RestartPolicy::OnFailure => signaled || exit_code != 0,
             RestartPolicy::Never => false,
         };
 
@@ -828,12 +871,25 @@ impl ServiceManager {
                 "' exceeded max restarts, permanently stopped\n",
             );
             self.services[idx].status = ServiceStatus::PermanentlyStopped;
+            self.services[idx].last_change_time = now_epoch_secs();
+            self.write_status_file();
             return;
         }
 
+        // Reset restart count if the service ran for at least 10 seconds.
+        let now = now_epoch_secs();
+        let last_start = self.services[idx].last_start_time;
+        if last_start > 0 && now >= last_start + 10 {
+            self.services[idx].restart_count = 0;
+        }
+
+        let delay = restart_delay_secs(self.services[idx].restart_count);
+
         write_str(STDOUT_FILENO, "init: restarting '");
         write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-        write_str(STDOUT_FILENO, "' (");
+        write_str(STDOUT_FILENO, "' after ");
+        write_u64(STDOUT_FILENO, delay);
+        write_str(STDOUT_FILENO, "s delay (attempt ");
         write_u64(STDOUT_FILENO, (self.services[idx].restart_count + 1) as u64);
         write_str(STDOUT_FILENO, "/");
         write_u64(STDOUT_FILENO, self.services[idx].max_restart as u64);
@@ -841,8 +897,12 @@ impl ServiceManager {
 
         self.services[idx].restart_count += 1;
 
-        // 1-second delay between restarts.
-        nanosleep(1);
+        // Progressive backoff delay.
+        let mut d: u64 = 0;
+        while d < delay {
+            nanosleep(1);
+            d += 1;
+        }
 
         self.start_service(idx);
     }
@@ -932,6 +992,8 @@ impl ServiceManager {
         let pid = self.services[idx].pid;
         if pid <= 0 {
             self.services[idx].status = ServiceStatus::Stopped(0);
+            self.services[idx].last_change_time = now_epoch_secs();
+            self.write_status_file();
             return;
         }
 
@@ -952,6 +1014,8 @@ impl ServiceManager {
                 let exit_code = (st >> 8) & 0xff;
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
+                self.services[idx].last_change_time = now_epoch_secs();
+                self.write_status_file();
                 return;
             }
             nanosleep(1);
@@ -969,6 +1033,8 @@ impl ServiceManager {
         self.pid_table.remove(pid);
         self.services[idx].status = ServiceStatus::Stopped(-1);
         self.services[idx].pid = 0;
+        self.services[idx].last_change_time = now_epoch_secs();
+        self.write_status_file();
     }
 
     /// Write service status to `/var/run/services.status`.
@@ -1007,6 +1073,8 @@ impl ServiceManager {
             write_u64(fd as i32, svc.pid as u64);
             write_str(fd as i32, " restarts=");
             write_u64(fd as i32, svc.restart_count as u64);
+            write_str(fd as i32, " changed=");
+            write_u64(fd as i32, svc.last_change_time);
             write_str(fd as i32, "\n");
 
             i += 1;
@@ -1086,6 +1154,22 @@ impl ServiceManager {
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+/// Get current wall-clock time as epoch seconds, or 0 on error.
+fn now_epoch_secs() -> u64 {
+    let (sec, _nsec) = clock_gettime(0); // CLOCK_REALTIME = 0
+    if sec < 0 { 0 } else { sec as u64 }
+}
+
+/// Compute restart delay in seconds based on restart count (progressive backoff).
+/// 1s for first restart, 2s for second, then 5s cap.
+fn restart_delay_secs(restart_count: u32) -> u64 {
+    match restart_count {
+        0 => 1,
+        1 => 2,
+        _ => 5,
+    }
+}
 
 fn trim_newline(buf: &[u8]) -> &[u8] {
     let mut end = buf.len();
