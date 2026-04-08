@@ -9,7 +9,8 @@
 [Phase 34](../../roadmap/34-real-time-clock.md),
 [Phase 39](../../roadmap/39-unix-domain-sockets.md),
 [Phase 43](../../roadmap/43-ssh-server.md),
-[Phase 46](../../roadmap/46-system-services.md)  
+[Phase 46](../../roadmap/46-system-services.md),
+[Phase 51](../../roadmap/51-service-model-maturity.md)  
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
 [Path to a Proper Microkernel Design](../microkernel-path.md),
 [Security Review](../security-review.md)
@@ -28,10 +29,14 @@ microkernel story produces complexity without operability.
 Phase 46 already delivers the first real answer to this problem on current
 main: PID 1 now parses service definitions, starts services in dependency order,
 reaps children, restarts managed daemons, coordinates shutdown, and works with
-`syslogd`, `crond`, and admin commands. The release question is no longer
-whether m3OS needs a service model; it already has one. The remaining question
-is how much that model must mature before it can host extracted microkernel
-services and anchor a release story.
+`syslogd`, `crond`, and admin commands. Phase 51 hardens this baseline with a
+stable service-definition contract (including privilege and timeout fields),
+restart backoff with crash classification, deterministic shutdown ordering with
+per-service timeouts and orphan reaping, init-to-syslog integration, admin
+surface improvements (enable/disable, richer status), and control-path
+hardening. The release question is no longer whether m3OS needs a service
+model; the model now exists and is maturing toward hosting extracted
+microkernel services.
 
 ```mermaid
 flowchart TD
@@ -48,10 +53,10 @@ flowchart TD
 
 | Area | Current state | Required in this phase | Later extension |
 |---|---|---|---|
-| Startup | Phase 46 PID 1 plus `/etc/services.d` gives the system an explicit startup graph | Extracted core services and broader coverage fit that graph cleanly | More advanced activation models |
-| Recovery | Restart and status behavior exist for managed daemons | Restart-on-failure semantics and service status reporting are trusted for long-lived and later extracted services | Sandboxing, backoff policies, service health probes |
-| Logging | `syslogd` and admin tooling now exist in the base | Central logging path and sane operator visibility hold up as the service graph expands | Structured journaling and rotation |
-| Shutdown | Ordered shutdown/reboot paths now exist | Ordered service drain and clean restart/halt are trusted across the service graph | Richer operational controls |
+| Startup | Phase 46 PID 1 plus `/etc/services.d` gives the system an explicit startup graph; Phase 51 replaces hardcoded config list with directory scan | Extracted core services and broader coverage fit that graph cleanly | More advanced activation models |
+| Recovery | Phase 51 adds restart backoff (1s/2s/5s cap), crash classification (clean/error/signal), and guarded state transitions | Restart-on-failure semantics and service status reporting are trusted for long-lived and later extracted services | Sandboxing, service health probes |
+| Logging | Phase 51 routes init lifecycle events through syslog; facility coverage expanded | Central logging path and sane operator visibility hold up as the service graph expands | Structured journaling and rotation |
+| Shutdown | Phase 51 adds per-service stop timeouts, progress logging, and orphan reaping | Ordered service drain and clean restart/halt are trusted across the service graph | Richer operational controls |
 
 ## Detailed workstreams
 
@@ -103,6 +108,8 @@ phase is about making it strong enough for architectural extraction.
 - [Path to a Usable State](../usability-roadmap.md)
 - [Path to a Proper Microkernel Design](../microkernel-path.md)
 - [Phase 46 — System Services](../../roadmap/46-system-services.md)
+- [Phase 51 — Service Model Maturity](../../roadmap/51-service-model-maturity.md)
+- [Phase 51 Learning Doc](../../51-service-model-maturity.md)
 - [Phase 43c — Regression and Stress](../../roadmap/43c-regression-stress-ci.md)
 
 ## Open Questions

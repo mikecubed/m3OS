@@ -53,6 +53,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Security Foundation](./48-security-foundation.md) | 48 | Kernel-enforced credentials, RDRAND entropy, iterated password hashing, first-boot provisioning |
 | [Architectural Declaration](./49-architectural-declaration.md) | 49 | Syscall decomposition, keep/move/transition matrix, userspace-first rule |
 | [IPC Completion](./50-ipc-completion.md) | 50 | Capability grants, bulk-data transport, ring-3-safe registry, server-loop failure semantics |
+| [Service Model Maturity](./51-service-model-maturity.md) | 51 | Stable service contract, restart backoff, crash classification, shutdown ordering, admin hardening |
 
 ### Roadmap
 

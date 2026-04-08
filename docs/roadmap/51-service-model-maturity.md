@@ -1,6 +1,6 @@
 # Phase 51 - Service Model Maturity
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-51
 **Depends on:** Phase 39 (Unix Domain Sockets) ✅, Phase 43 (SSH) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 50 (IPC Completion) ✅
 **Builds on:** Hardens and extends the Phase 46 service manager, logging, and admin surface so later extracted services can be supervised like real first-class system components
@@ -113,7 +113,7 @@ Commands like `service`, `shutdown`, and `reboot` are the human interface to the
 
 ## Companion Task List
 
-- Phase 51 task list — defer until implementation planning begins.
+- [Phase 51 Task List](./tasks/51-service-model-maturity-tasks.md)
 
 ## How Real OS Implementations Differ
 
