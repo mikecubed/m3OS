@@ -341,8 +341,15 @@ fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
     if fd < 0 {
         return false;
     }
-    let _ = write(fd as i32, &new_shadow[..out_pos]);
-    fsync(fd as i32);
+    let written = write(fd as i32, &new_shadow[..out_pos]);
+    if written != out_pos as isize {
+        close(fd as i32);
+        return false;
+    }
+    if fsync(fd as i32) < 0 {
+        close(fd as i32);
+        return false;
+    }
     close(fd as i32);
     true
 }

@@ -5587,6 +5587,42 @@ fn pty_overlap_steps() -> Vec<SmokeStep> {
 
 /// Common boot + login steps shared by all regression tests.
 fn boot_and_login_steps() -> Vec<SmokeStep> {
+    // First-boot: account is locked (hash "!"), login prompts to set password.
+    // Normal boot (or after first-boot persists): account has a password.
+    // Both paths use "root" as the password. Regression runs use -snapshot,
+    // so they always hit the first-boot path on a fresh locked image.
+    const FIRST_BOOT_LOGIN: &[SmokeStep] = &[
+        SmokeStep::Send {
+            input: "root\n",
+            label: "set initial password",
+        },
+        SmokeStep::Wait {
+            pattern: "Retype password:",
+            timeout_secs: 10,
+            label: "wait for password confirmation prompt",
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "confirm initial password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for shell prompt after first-boot setup",
+        },
+    ];
+    const NORMAL_LOGIN: &[SmokeStep] = &[
+        SmokeStep::Send {
+            input: "root\n",
+            label: "enter password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for shell prompt",
+        },
+    ];
+
     vec![
         SmokeStep::Wait {
             pattern: "login:",
@@ -5598,19 +5634,13 @@ fn boot_and_login_steps() -> Vec<SmokeStep> {
             input: "root\n",
             label: "username",
         },
-        SmokeStep::Wait {
-            pattern: "Password:",
+        SmokeStep::WaitEither {
+            pattern_a: "Set password for",
+            pattern_b: "Password:",
             timeout_secs: 10,
-            label: "password prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "password",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 10,
-            label: "shell prompt",
+            label: "detect first-boot or normal login",
+            extra_steps_a: FIRST_BOOT_LOGIN,
+            extra_steps_b: NORMAL_LOGIN,
         },
     ]
 }
@@ -5740,16 +5770,18 @@ fn run_smoke_steps_with_capture(
     serial_buf: &mut String,
     global_start: std::time::Instant,
 ) -> Result<(), String> {
-    let total = steps.len();
+    // Use a queue so WaitEither can inject extra steps at the front.
+    let mut queue: std::collections::VecDeque<&SmokeStep> = steps.iter().collect();
+    let mut step_num = 0usize;
 
-    for (i, step) in steps.iter().enumerate() {
+    while let Some(step) = queue.pop_front() {
+        step_num += 1;
         if global_start.elapsed() > global_timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "global timeout ({global_timeout:?}) exceeded at step {}/{}",
-                i + 1,
-                total
+                "global timeout ({global_timeout:?}) exceeded at step {}",
+                step_num
             ));
         }
 
@@ -5774,28 +5806,17 @@ fn run_smoke_steps_with_capture(
                     let cleaned = strip_background_noise(&stripped);
 
                     // Check for kernel-level crash indicators in serial output.
-                    // Only match ring-0 crashes, not handled ring-3 faults:
-                    // - "userspace page fault" + "CRASH DIAGNOSTICS" = handled (process killed)
-                    // - "kernel page fault" = ring-0 crash (OS halts)
-                    // - "KERNEL PANIC" = explicit kernel panic
-                    // - "DOUBLE FAULT" = unrecoverable double fault
                     if cleaned.contains("KERNEL PANIC")
                         || cleaned.contains("kernel page fault")
                         || cleaned.contains("DOUBLE FAULT")
                     {
                         return Err(format!(
-                            "kernel crash detected during step {}/{} ({label})",
-                            i + 1,
-                            total
+                            "kernel crash detected during step {} ({label})",
+                            step_num
                         ));
                     }
 
                     if cleaned.contains(pattern) || stripped.contains(pattern) {
-                        // Drain buffer up to last newline to prevent later
-                        // steps from re-matching earlier output. We can't map
-                        // cleaned/stripped offsets back to raw serial_buf offsets
-                        // (ANSI stripping + log filtering change positions), so
-                        // drain to the last newline which is safe and conservative.
                         if let Some(nl) = serial_buf.rfind('\n') {
                             serial_buf.drain(..=nl);
                         } else if serial_buf.len() > 4096 {
@@ -5804,19 +5825,14 @@ fn run_smoke_steps_with_capture(
                         break;
                     }
 
-                    // Detect QEMU exit without probing the serial channel
-                    // again — a second try_recv() here could consume a pending
-                    // chunk and hide the last serial output before exit.
                     if child.try_wait().ok().flatten().is_some() {
-                        // Drain any remaining serial output before reporting.
                         while let Ok(chunk) = rx.try_recv() {
                             let text = String::from_utf8_lossy(&chunk);
                             serial_buf.push_str(&text);
                         }
                         return Err(format!(
-                            "QEMU exited unexpectedly at step {}/{} ({label})",
-                            i + 1,
-                            total
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
                         ));
                     }
 
@@ -5831,9 +5847,8 @@ fn run_smoke_steps_with_capture(
                             .collect::<Vec<_>>()
                             .join("\n");
                         return Err(format!(
-                            "timeout waiting for '{pattern}' at step {}/{} ({label})\nLast serial output:\n{last_lines}",
-                            i + 1,
-                            total
+                            "timeout waiting for '{pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
+                            step_num
                         ));
                     }
 
@@ -5843,7 +5858,6 @@ fn run_smoke_steps_with_capture(
                 // Trim buffer to avoid unbounded growth.
                 if serial_buf.len() > 64 * 1024 {
                     let keep_from = serial_buf.len() - 48 * 1024;
-                    // Find next char boundary at or after keep_from.
                     let boundary = (keep_from..serial_buf.len())
                         .find(|&i| serial_buf.is_char_boundary(i))
                         .unwrap_or(serial_buf.len());
@@ -5854,21 +5868,93 @@ fn run_smoke_steps_with_capture(
                 let stdin = child
                     .stdin
                     .as_mut()
-                    .ok_or_else(|| format!("no stdin at step {}/{} ({label})", i + 1, total))?;
+                    .ok_or_else(|| format!("no stdin at step {} ({label})", step_num))?;
                 use std::io::Write;
-                stdin.write_all(input.as_bytes()).map_err(|e| {
-                    format!("write failed at step {}/{} ({label}): {e}", i + 1, total)
-                })?;
-                stdin.flush().map_err(|e| {
-                    format!("flush failed at step {}/{} ({label}): {e}", i + 1, total)
-                })?;
+                stdin
+                    .write_all(input.as_bytes())
+                    .map_err(|e| format!("write failed at step {} ({label}): {e}", step_num))?;
+                stdin
+                    .flush()
+                    .map_err(|e| format!("flush failed at step {} ({label}): {e}", step_num))?;
             }
             SmokeStep::Sleep { millis } => {
                 std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
-            SmokeStep::WaitEither { .. } => {
-                // WaitEither is only used by the smoke test runner, not the
-                // regression runner. If encountered here, treat as a no-op.
+            SmokeStep::WaitEither {
+                pattern_a,
+                pattern_b,
+                timeout_secs,
+                label,
+                extra_steps_a,
+                extra_steps_b,
+            } => {
+                let step_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let global_deadline = global_start + global_timeout;
+                let deadline = step_deadline.min(global_deadline);
+
+                let matched_a;
+                loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        let text = String::from_utf8_lossy(&chunk);
+                        serial_buf.push_str(&text);
+                    }
+                    let stripped = strip_ansi(serial_buf);
+                    let cleaned = strip_background_noise(&stripped);
+
+                    if cleaned.contains(pattern_a) || stripped.contains(pattern_a) {
+                        matched_a = true;
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        }
+                        break;
+                    }
+                    if cleaned.contains(pattern_b) || stripped.contains(pattern_b) {
+                        matched_a = false;
+                        if let Some(nl) = serial_buf.rfind('\n') {
+                            serial_buf.drain(..=nl);
+                        }
+                        break;
+                    }
+
+                    if child.try_wait().ok().flatten().is_some() {
+                        while let Ok(chunk) = rx.try_recv() {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                        }
+                        return Err(format!(
+                            "QEMU exited unexpectedly at step {} ({label})",
+                            step_num
+                        ));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        let last_lines: String = serial_buf
+                            .lines()
+                            .rev()
+                            .take(30)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        return Err(format!(
+                            "timeout at step {} ({label}), expected '{pattern_a}' or '{pattern_b}'\nLast serial output:\n{last_lines}",
+                            step_num
+                        ));
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                let inject = if matched_a {
+                    extra_steps_a
+                } else {
+                    extra_steps_b
+                };
+                for extra in inject.iter().rev() {
+                    queue.push_front(extra);
+                }
             }
         }
     }

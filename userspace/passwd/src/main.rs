@@ -112,7 +112,12 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "passwd: cannot write shadow file\n");
         exit(1);
     }
-    let _ = write(fd as i32, &new_shadow[..out_pos]);
+    let written = write(fd as i32, &new_shadow[..out_pos]);
+    if written < 0 || written as usize != out_pos {
+        write_str(STDOUT_FILENO, "passwd: failed to fully write shadow file\n");
+        close(fd as i32);
+        exit(1);
+    }
     if fsync(fd as i32) < 0 {
         write_str(
             STDOUT_FILENO,

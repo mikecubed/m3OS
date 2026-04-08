@@ -108,7 +108,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], b":/tmp/home/");
         pos += copy_to_buf(&mut buf[pos..], username);
         pos += copy_to_buf(&mut buf[pos..], b":/bin/ion\n");
-        let _ = write(fd as i32, &buf[..pos]);
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/passwd\n");
+            close(fd as i32);
+            exit(1);
+        }
         if fsync(fd as i32) < 0 {
             write_str(
                 STDOUT_FILENO,
@@ -137,7 +142,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], b"$");
         pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
         pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
-        let _ = write(fd as i32, &buf[..pos]);
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/shadow\n");
+            close(fd as i32);
+            exit(1);
+        }
         if fsync(fd as i32) < 0 {
             write_str(
                 STDOUT_FILENO,
@@ -162,7 +172,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], b":");
         pos += copy_to_buf(&mut buf[pos..], username);
         pos += copy_to_buf(&mut buf[pos..], b"\n");
-        let _ = write(fd as i32, &buf[..pos]);
+        let written = write(fd as i32, &buf[..pos]);
+        if written < 0 || written as usize != pos {
+            write_str(STDOUT_FILENO, "adduser: failed to write /etc/group\n");
+            close(fd as i32);
+            exit(1);
+        }
         if fsync(fd as i32) < 0 {
             write_str(
                 STDOUT_FILENO,

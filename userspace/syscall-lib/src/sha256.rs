@@ -172,7 +172,8 @@ fn hex_digit(c: u8) -> u8 {
 /// Hash a password with salt using iterated SHA-256 (multiple rounds).
 ///
 /// Format: $sha256i$<rounds>$<hex_salt>$<hex_hash>
-/// Each round computes SHA-256(previous_hash || salt || password).
+/// Round 1 computes SHA-256(salt || password).
+/// Rounds 2..N compute SHA-256(previous_hash || salt || password).
 pub fn hash_password_iterated(password: &[u8], salt: &[u8], rounds: u32) -> [u8; 32] {
     let mut hash = hash_password(password, salt);
     for _ in 1..rounds {
