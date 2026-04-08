@@ -15,9 +15,9 @@
 #![no_main]
 
 use syscall_lib::{
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, SigAction, WNOHANG, clock_gettime, close,
-    execve, exit, fork, getdents64, kill, mount, nanosleep, open, read, rt_sigaction, waitpid,
-    write, write_str, write_u64,
+    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
+    SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
+    nanosleep, open, read, rt_sigaction, sendto_unix, socket, waitpid, write, write_str, write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -657,7 +657,21 @@ struct ServiceManager {
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
+    /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
+    syslog_fd: i32,
 }
+
+/// Syslog severity levels.
+#[allow(dead_code)]
+const SEV_ERROR: u8 = 3;
+#[allow(dead_code)]
+const SEV_WARNING: u8 = 4;
+#[allow(dead_code)]
+const SEV_INFO: u8 = 6;
+
+/// Syslog facility: daemon = 3.
+#[allow(dead_code)]
+const FACILITY_DAEMON: u8 = 3;
 
 impl ServiceManager {
     const fn new() -> Self {
@@ -667,6 +681,48 @@ impl ServiceManager {
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
+            syslog_fd: -1,
+        }
+    }
+
+    /// Open a DGRAM socket to `/dev/log` for syslog output.
+    fn open_syslog(&mut self) {
+        let fd = socket(AF_UNIX as i32, SOCK_DGRAM as i32, 0);
+        if fd < 0 {
+            return;
+        }
+        self.syslog_fd = fd as i32;
+    }
+
+    /// Send a log message through syslog (if available) and always echo to serial.
+    #[allow(dead_code)]
+    fn log_to_syslog(&self, severity: u8, msg: &[u8]) {
+        // Always echo to stdout/serial.
+        write_str(STDOUT_FILENO, "init: ");
+        write(STDOUT_FILENO, msg);
+        write_str(STDOUT_FILENO, "\n");
+
+        // Send to syslog if available.
+        if self.syslog_fd >= 0 {
+            let priority = ((FACILITY_DAEMON as u32) << 3) | (severity as u32);
+            let mut buf = [0u8; 256];
+            let mut pos = 0;
+            // Format: <priority>init: message
+            buf[pos] = b'<';
+            pos += 1;
+            pos += write_u32_to_buf(&mut buf[pos..], priority);
+            buf[pos] = b'>';
+            pos += 1;
+            let tag = b"init: ";
+            let tag_len = tag.len().min(buf.len() - pos);
+            buf[pos..pos + tag_len].copy_from_slice(&tag[..tag_len]);
+            pos += tag_len;
+            let msg_len = msg.len().min(buf.len() - pos);
+            buf[pos..pos + msg_len].copy_from_slice(&msg[..msg_len]);
+            pos += msg_len;
+
+            let addr = SockaddrUn::new("/dev/log");
+            let _ = sendto_unix(self.syslog_fd, &buf[..pos], 0, &addr);
         }
     }
 
@@ -1421,6 +1477,32 @@ impl ServiceManager {
 // Utility functions
 // ---------------------------------------------------------------------------
 
+/// Write a u32 value as decimal ASCII into a buffer. Returns bytes written.
+#[allow(dead_code)]
+fn write_u32_to_buf(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut n = val;
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len());
+    let mut j = 0;
+    while j < len {
+        buf[j] = tmp[i - 1 - j];
+        j += 1;
+    }
+    len
+}
+
 /// Get current wall-clock time as epoch seconds, or 0 on error.
 fn now_epoch_secs() -> u64 {
     let (sec, _nsec) = clock_gettime(0); // CLOCK_REALTIME = 0
@@ -1526,6 +1608,9 @@ pub extern "C" fn _start() -> ! {
 
     // Boot all services in dependency order.
     mgr.boot_services();
+
+    // Open syslog socket now that syslogd should be running.
+    mgr.open_syslog();
 
     // Spawn initial login session (not a managed service).
     mgr.login_pid = spawn_login();

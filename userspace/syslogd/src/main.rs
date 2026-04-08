@@ -178,7 +178,7 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 
         // Periodically drain kernel messages.
         if kmsg_fd >= 0 {
-            drain_kmsg(kmsg_fd, kern_fd, &mut kmsg_buf, &mut line_buf);
+            drain_kmsg(kmsg_fd, kern_fd, msg_fd, &mut kmsg_buf, &mut line_buf);
         }
     }
 }
@@ -187,7 +187,7 @@ fn main_loop(sock_fd: i32, msg_fd: i32, kern_fd: i32, kmsg_fd: i32) -> ! {
 // Kernel message drain
 // ---------------------------------------------------------------------------
 
-fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
+fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, msg_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
     loop {
         let nr = syscall_lib::read(kmsg_fd, buf);
         if nr <= 0 {
@@ -196,7 +196,10 @@ fn drain_kmsg(kmsg_fd: i32, kern_fd: i32, buf: &mut [u8], line_buf: &mut [u8]) {
         let msg = &buf[..nr as usize];
         let len = format_log_line(line_buf, b"kern", msg);
         if len > 0 {
+            // Write to kern.log (dedicated kernel log).
             syscall_lib::write(kern_fd, &line_buf[..len]);
+            // Also write to messages for unified viewing.
+            syscall_lib::write(msg_fd, &line_buf[..len]);
         }
     }
 }
@@ -254,7 +257,6 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
 fn priority_name(pri: u32) -> &'static [u8] {
     let severity = pri & 0x07;
     let facility = (pri >> 3) & 0x1F;
-    // Return a combined tag. For simplicity, only distinguish a few common ones.
     match facility {
         0 => match severity {
             0 => b"kern.emerg",
@@ -266,15 +268,50 @@ fn priority_name(pri: u32) -> &'static [u8] {
             6 => b"kern.info",
             _ => b"kern.debug",
         },
-        1 => b"user",
-        3 => b"daemon",
-        4 => b"auth",
-        10 => b"authpriv",
+        1 => match severity {
+            0..=3 => b"user.err",
+            4..=5 => b"user.notice",
+            6 => b"user.info",
+            _ => b"user.debug",
+        },
+        3 => match severity {
+            0..=3 => b"daemon.err",
+            4..=5 => b"daemon.notice",
+            6 => b"daemon.info",
+            _ => b"daemon.debug",
+        },
+        4 => match severity {
+            0..=3 => b"auth.err",
+            4..=5 => b"auth.notice",
+            6 => b"auth.info",
+            _ => b"auth.debug",
+        },
+        9 => match severity {
+            0..=3 => b"cron.err",
+            4..=5 => b"cron.notice",
+            6 => b"cron.info",
+            _ => b"cron.debug",
+        },
+        10 => match severity {
+            0..=3 => b"authpriv.err",
+            4..=5 => b"authpriv.notice",
+            6 => b"authpriv.info",
+            _ => b"authpriv.debug",
+        },
+        16..=23 => {
+            // local0-local7
+            match severity {
+                0..=3 => b"local.err",
+                4..=5 => b"local.notice",
+                6 => b"local.info",
+                _ => b"local.debug",
+            }
+        }
         _ => match severity {
-            0..=3 => b"local.err",
-            4..=5 => b"local.notice",
-            6 => b"local.info",
-            _ => b"local.debug",
+            0..=3 => b"unknown.err",
+            4..=5 => b"unknown.notice",
+            6 => b"unknown.info",
+            _ => b"unknown.debug",
         },
     }
 }
