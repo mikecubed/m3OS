@@ -2159,6 +2159,32 @@ fn run_smoke_script(
 
             SmokeStep::Send { input, label } => {
                 println!("[step {}] send: {label}", step_num);
+                // Drain serial output until 150ms of silence before sending
+                // input.  This ensures the shell/terminal has finished all
+                // prompt rendering (ANSI escapes, cursor repositioning) so the
+                // first character of the command is not swallowed.
+                let idle_threshold = std::time::Duration::from_millis(150);
+                let idle_cap = std::time::Duration::from_secs(2);
+                let idle_start = std::time::Instant::now();
+                let mut last_data = std::time::Instant::now();
+                loop {
+                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(chunk) => {
+                            let text = String::from_utf8_lossy(&chunk);
+                            serial_buf.push_str(&text);
+                            last_data = std::time::Instant::now();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if last_data.elapsed() >= idle_threshold {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    if idle_start.elapsed() >= idle_cap {
+                        break; // cap to avoid stalling on noisy kernel logs
+                    }
+                }
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
                     if stdin.write_all(input.as_bytes()).is_err() {
@@ -2288,8 +2314,8 @@ fn tail_lines(s: &str, n: usize) -> String {
 }
 
 /// Helper: send a command and wait for the shell prompt to return.
-/// Includes a small sleep before sending to avoid serial input races
-/// where characters get consumed by ANSI escape sequence processing.
+/// The Send step itself drains serial output until idle before writing,
+/// so no explicit sleep is needed to avoid input races.
 fn cmd_then_prompt(
     input: &'static str,
     send_label: &'static str,
@@ -2297,7 +2323,6 @@ fn cmd_then_prompt(
     timeout: u64,
 ) -> Vec<SmokeStep> {
     vec![
-        SmokeStep::Sleep { millis: 500 },
         SmokeStep::Send {
             input,
             label: send_label,
@@ -2376,7 +2401,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
 
     // Fork/wait regression: nested fork + pipe + waitpid flow that mirrors
     // ion spawning PROMPT and draining its output before reaping it.
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/fork-test\n",
         label: "run nested fork regression",
@@ -2391,7 +2415,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "prompt after nested fork regression",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/pty-test\n",
         label: "run PTY ion prompt regression",
@@ -2425,7 +2448,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 2. Basic coreutils sanity
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo SMOKE_OK\n",
         label: "echo test",
@@ -2444,7 +2466,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 3. TCC compiler (Phase 31 regression)
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/usr/bin/tcc --version\n",
         label: "tcc --version",
@@ -2460,7 +2481,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "prompt after tcc --version",
     });
 
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n",
         label: "compile hello.c with TCC",
@@ -2470,7 +2490,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 30,
         label: "wait for hello.c compilation",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/tmp/hello\n",
         label: "run compiled hello",
@@ -2499,7 +2518,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     ));
 
     // stat — verify the file exists and shows metadata
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/stat /tmp/smoke_file\n",
         label: "stat: show file metadata",
@@ -2516,7 +2534,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
 
     // wc — count words in a known file
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/wc /home/project/main.c\n",
         label: "wc: count lines in main.c",
@@ -2543,7 +2560,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     ));
 
     // Full build (use absolute path — bare 'make' loses 'm' to ANSI SGR)
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/make\n",
         label: "make: build demo project",
@@ -2581,7 +2597,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 6. ar — create a static library (using util.o from make build)
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/ar rcs libutil.a util.o\n",
         label: "ar: create static library",
@@ -2593,7 +2608,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
 
     // Verify archive was created
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/stat libutil.a\n",
         label: "stat: verify libutil.a exists",
@@ -2612,7 +2626,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 7. Phase 33: mmap/munmap leak test
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/mmap-leak-test\n",
         label: "mmap/munmap leak test",
@@ -2631,7 +2644,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 8. Phase 38: filesystem enhancements integration
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/tmpfs-test\n",
         label: "phase 38 integration test",
@@ -2653,7 +2665,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "wait: prompt after ln",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/readlink /tmp/mysh\n",
         label: "readlink: verify symlink target",
@@ -2680,7 +2691,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "wait: prompt after ext2 symlink create",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/stat /phase38-passwd-link\n",
         label: "stat: verify ext2 symlink metadata",
@@ -2733,7 +2743,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 9. Phase 41 initial tools: head, tail, tee, chmod, chown
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/head -n 1 /home/project/main.c\n",
         label: "head: first line of main.c",
@@ -2748,7 +2757,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after head -n",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /home/project/main.c | /bin/head\n",
         label: "head: default stdin mode",
@@ -2763,7 +2771,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after head stdin",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/tail -n 1 /etc/passwd\n",
         label: "tail: last passwd line",
@@ -2778,7 +2785,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tail -n",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /etc/passwd | /bin/tail\n",
         label: "tail: default stdin mode",
@@ -2793,7 +2799,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tail stdin",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo teecheck | /bin/tee /tmp/tee-output\n",
         label: "tee: write stdout and file",
@@ -2808,7 +2813,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tee write",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /tmp/tee-output\n",
         label: "tee: verify written file",
@@ -2823,7 +2827,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tee file check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo appendcheck | /bin/tee -a /tmp/tee-output\n",
         label: "tee: append mode",
@@ -2838,7 +2841,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tee append",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /tmp/tee-output\n",
         label: "tee: verify appended file",
@@ -2865,7 +2867,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "wait: prompt after chmod",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/stat /tmp/permfile\n",
         label: "stat: verify chmod result",
@@ -2886,7 +2887,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "wait: prompt after chown",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/stat /tmp/permfile\n",
         label: "stat: verify chown result",
@@ -2928,7 +2928,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "prompt after appending orange",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/sort /tmp/sort_words | /bin/head -n 1\n",
         label: "sort: verify first lexicographic line",
@@ -2943,7 +2942,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after first sort line check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/sort /tmp/sort_words | /bin/head -n 2 | /bin/tail -n 1\n",
         label: "sort: verify middle lexicographic line",
@@ -2958,7 +2956,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after middle sort line check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.extend(cmd_then_prompt(
         "/bin/echo 10 > /tmp/sort_nums\n",
         "sort numeric fixture: write 10",
@@ -2977,7 +2974,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "prompt after appending 1",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 1\n",
         label: "sort: verify first numeric line",
@@ -2992,7 +2988,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after first numeric line check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/sort -n /tmp/sort_nums | /bin/head -n 2 | /bin/tail -n 1\n",
         label: "sort: verify middle numeric line",
@@ -3007,7 +3002,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after middle numeric line check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /tmp/sort_nums | /bin/sort -rn | /bin/head -n 1\n",
         label: "sort: verify clustered pipeline first line",
@@ -3040,7 +3034,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         "prompt after daemon uniq fixture line",
         10,
     ));
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/uniq -c /tmp/uniq_input\n",
         label: "uniq: count adjacent duplicates",
@@ -3055,7 +3048,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after uniq",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cut -d: -f1 /etc/passwd\n",
         label: "cut: passwd usernames",
@@ -3075,7 +3067,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after cut field",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo abcdef | /bin/cut -c2-4\n",
         label: "cut: character range",
@@ -3094,7 +3085,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 11. Phase 41 text tools: tr, sed
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo HELLO | /bin/tr A-Z a-z\n",
         label: "tr: translate uppercase to lowercase",
@@ -3109,7 +3099,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tr translate",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo hello | /bin/tr -d '\\n' | /bin/wc -l\n",
         label: "tr: delete newline",
@@ -3124,7 +3113,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after tr delete",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo foofoo | /bin/sed 's/foo/bar/'\n",
         label: "sed: single substitution",
@@ -3139,7 +3127,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after sed substitution",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo foofoo | /bin/sed 's/foo/bar/g'\n",
         label: "sed: global substitution",
@@ -3154,7 +3141,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after sed global substitution",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /etc/passwd /etc/passwd /etc/passwd | /bin/sed -n '3,5p'\n",
         label: "sed: print selected range",
@@ -3178,7 +3164,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 12. Phase 41 file tools: file, hexdump
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/file /bin/sh0\n",
         label: "file: detect ELF binary",
@@ -3193,7 +3178,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after file ELF",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/file /home/project/main.c\n",
         label: "file: detect ASCII text",
@@ -3208,7 +3192,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after file text",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/file /dev/null\n",
         label: "file: detect character special",
@@ -3223,7 +3206,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after file char device",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/hexdump -n 16 /bin/sh0\n",
         label: "hexdump: default output",
@@ -3243,7 +3225,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after hexdump default",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/hexdump -C -n 16 /bin/sh0\n",
         label: "hexdump: canonical output",
@@ -3272,7 +3253,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 13. Phase 41 file tools: du, df
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/du -s /home/project\n",
         label: "du: summarize project directory",
@@ -3287,7 +3267,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after du summary",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/du -h -s /home/project\n",
         label: "du: human-readable summary",
@@ -3302,7 +3281,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after du human-readable",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/du -h -s /home/project | /bin/cut -f1\n",
         label: "du: isolate human-readable size field",
@@ -3317,7 +3295,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after du human-readable size field",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/df\n",
         label: "df: list mounted filesystems",
@@ -3342,7 +3319,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after df",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/df -h\n",
         label: "df: human-readable output",
@@ -3371,7 +3347,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 14. Phase 41 file tools: find, xargs
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -name '*.c'\n",
         label: "find: match C source files",
@@ -3386,7 +3361,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after find name",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -type d\n",
         label: "find: directories only",
@@ -3401,7 +3375,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after find directories",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -type f\n",
         label: "find: files only",
@@ -3430,7 +3403,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after xargs grep",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -name '*.c' -print0 | /bin/xargs -0 /bin/grep main\n",
         label: "xargs: null-delimited grep",
@@ -3445,7 +3417,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after xargs -0",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/find /home/project -name '*.c' | /bin/xargs -I ITEM /bin/echo file:ITEM\n",
         label: "xargs: replacement string",
@@ -3464,7 +3435,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 15. Phase 41 system tools: ps, free, dmesg, mount, umount, kill
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/ps -e\n",
         label: "ps: list processes",
@@ -3484,7 +3454,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after ps",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/free\n",
         label: "free: memory summary",
@@ -3499,7 +3468,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after free",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/free -h\n",
         label: "free: human-readable output",
@@ -3514,7 +3482,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after free -h",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/dmesg\n",
         label: "dmesg: kernel log snapshot",
@@ -3529,7 +3496,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 20,
         label: "prompt after dmesg",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/mount\n",
         label: "mount: list mounts",
@@ -3544,7 +3510,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after mount",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/umount /\n",
         label: "umount: busy root error",
@@ -3559,7 +3524,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after umount busy",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/kill -l\n",
         label: "kill: list signals",
@@ -3578,7 +3542,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 16. Phase 41 developer tools: strings, cal, diff, patch, less
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/strings -n 4 /etc/passwd | /bin/head -n 1\n",
         label: "strings: extract printable text",
@@ -3593,7 +3556,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after strings",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cal 6 2025\n",
         label: "cal: specific month",
@@ -3613,7 +3575,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after cal month",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cal 2025 | /bin/grep December\n",
         label: "cal: full year output",
@@ -3628,7 +3589,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after cal year",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo alpha > /tmp/diff-a\n",
         label: "diff fixture: write alpha",
@@ -3638,7 +3598,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after diff fixture alpha",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/echo beta > /tmp/diff-b\n",
         label: "diff fixture: write beta",
@@ -3648,7 +3607,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after diff fixture beta",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/diff /tmp/diff-a /tmp/diff-b > /tmp/change.diff ; /bin/cat /tmp/change.diff\n",
         label: "diff: unified output",
@@ -3673,7 +3631,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after diff",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/patch < /tmp/change.diff\n",
         label: "patch: apply unified diff",
@@ -3688,7 +3645,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after patch",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/cat /tmp/diff-a\n",
         label: "patch: verify patched file",
@@ -3703,7 +3659,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 5,
         label: "prompt after patched file check",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/less /etc/passwd\n",
         label: "less: open pager",
@@ -3713,7 +3668,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "verify less initial content",
     });
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "\x1b[Bq",
         label: "less: scroll once and quit",
@@ -3727,7 +3681,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // -----------------------------------------------------------------------
     // 17. make clean
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
         input: "/bin/make clean\n",
         label: "make clean",
@@ -3761,7 +3714,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         // -------------------------------------------------------------------
         // 19. Phase 47 — run doom long enough to prove the WAD boots
         // -------------------------------------------------------------------
-        steps.push(SmokeStep::Sleep { millis: 500 });
         steps.push(SmokeStep::Send {
             input: "/bin/doom -iwad /usr/share/doom/doom1.wad\n",
             label: "doom: launch with iwad",
