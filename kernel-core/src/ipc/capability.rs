@@ -68,6 +68,9 @@ impl CapabilityTable {
             .slots
             .get_mut(handle as usize)
             .ok_or(CapError::InvalidHandle)?;
+        if slot.is_some() {
+            return Err(CapError::TableFull);
+        }
         *slot = Some(cap);
         Ok(())
     }
@@ -187,6 +190,18 @@ mod tests {
             table.insert_at(100, Capability::Endpoint(EndpointId(0))),
             Err(CapError::InvalidHandle)
         );
+    }
+
+    #[test]
+    fn insert_at_rejects_occupied_slot() {
+        let mut table = CapabilityTable::new();
+        let cap1 = Capability::Endpoint(EndpointId(1));
+        let cap2 = Capability::Endpoint(EndpointId(2));
+        table.insert_at(5, cap1).unwrap();
+        // Second insert into the same slot must fail.
+        assert_eq!(table.insert_at(5, cap2), Err(CapError::TableFull));
+        // Original capability is preserved.
+        assert_eq!(table.get(5), Ok(cap1));
     }
 
     #[test]

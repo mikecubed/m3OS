@@ -157,11 +157,12 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
                     // the capability absent from the source.  A future
                     // improvement could hold the scheduler lock across the
                     // entire grant operation.
-                    if scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed).is_err() {
+                    if let Err(e) = scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed) {
                         log::error!(
-                            "[ipc] sys_cap_grant: CRITICAL rollback failed for task {} handle {}",
+                            "[ipc] sys_cap_grant: CRITICAL rollback failed for task {} handle {} ({:?}) — capability lost",
                             task_id.0,
                             arg0,
+                            e,
                         );
                     }
                     u64::MAX
