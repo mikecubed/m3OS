@@ -2184,26 +2184,25 @@ fn run_smoke_script(
                         break; // cap to avoid stalling on noisy kernel logs
                     }
                 }
-                // Write input in small chunks to avoid overflowing the
-                // guest's emulated 16550 UART FIFO (16 bytes).  A burst
-                // write_all of 30-60 byte commands can push bytes into
-                // the FIFO faster than the guest processes interrupts,
-                // causing dropped characters at arbitrary positions.
+                // Send a sacrificial Ctrl-U (kill-line) byte before the
+                // real command.  Something in the ion shell / TTY readline
+                // setup consistently swallows the first byte received after
+                // the prompt is printed.  Ctrl-U on an empty line is a
+                // no-op, so if it IS received the line stays clean; if it
+                // is consumed by the readline init race, the real command
+                // that follows arrives intact.
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
-                    let bytes = input.as_bytes();
-                    for chunk in bytes.chunks(4) {
-                        if stdin.write_all(chunk).is_err() {
-                            return Err(format!(
-                                "failed to send input at step {}: {label}",
-                                step_num
-                            ));
-                        }
-                        let _ = stdin.flush();
-                        if chunk.len() == 4 {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
+                    let _ = stdin.write_all(b"\x15");
+                    let _ = stdin.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if stdin.write_all(input.as_bytes()).is_err() {
+                        return Err(format!(
+                            "failed to send input at step {}: {label}",
+                            step_num
+                        ));
                     }
+                    let _ = stdin.flush();
                 } else {
                     return Err(format!("no stdin pipe at step {}: {label}", step_num));
                 }
