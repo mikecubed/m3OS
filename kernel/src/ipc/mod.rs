@@ -1,3 +1,6 @@
+//! # Ownership: Keep
+//! IPC mechanism is a core kernel primitive — message passing, capabilities, and notifications must remain ring-0.
+//!
 //! IPC Core — Phase 6.
 //!
 //! Provides the building blocks for microkernel inter-process communication:

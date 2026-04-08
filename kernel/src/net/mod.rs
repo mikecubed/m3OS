@@ -1,3 +1,6 @@
+//! # Ownership: Transition
+//! Network protocol policy layer — target ring-3 server per microkernel Stage 4.
+//!
 //! Network stack — Phase 16.
 //!
 //! Layers: virtio-net driver → Ethernet → ARP → IPv4 → ICMP / UDP / TCP.
