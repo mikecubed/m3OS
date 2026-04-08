@@ -641,6 +641,15 @@ pub fn tcsetattr(fd: i32, termios: &Termios) -> Result<(), isize> {
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
+/// Set terminal attributes, flushing pending input first (TCSETSF).
+///
+/// Like [`tcsetattr`], but uses the TCSETSF ioctl which flushes the stdin
+/// buffer and TTY edit buffer before applying the new settings.
+pub fn tcsetattr_flush(fd: i32, termios: &Termios) -> Result<(), isize> {
+    let ret = ioctl(fd, TCSETSF, termios as *const Termios as usize);
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
 /// Get terminal window size (rows, cols).
 pub fn get_window_size(fd: i32) -> Result<(u16, u16), isize> {
     let mut ws = Winsize {

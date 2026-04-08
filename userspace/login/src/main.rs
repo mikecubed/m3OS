@@ -442,7 +442,7 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
 /// Restore terminal settings.
 fn restore_echo(saved: Option<syscall_lib::Termios>) {
     if let Some(t) = saved {
-        let _ = syscall_lib::tcsetattr(0, &t);
+        let _ = syscall_lib::tcsetattr_flush(0, &t);
     }
 }
 
