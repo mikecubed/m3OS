@@ -242,23 +242,29 @@ The ordering guarantee matters: the fat endpoint is registered *before* `vfs_ser
 
 ## Limitations and Deferred Work
 
-### Servers are kernel tasks, not ring-3 processes
+### Servers are kernel tasks, not ring-3 processes (transition underway)
 
-The most important limitation: in Phase 8, `fat_server`, `vfs_server`, and `fs_client_task` all
-run as kernel threads in ring 0, sharing the kernel address space. They are not isolated processes.
+In Phase 8, `fat_server`, `vfs_server`, and `fs_client_task` all run as kernel threads in
+ring 0, sharing the kernel address space. They are not isolated processes.
 
-This is the same deferral as Phase 7. Moving servers to ring 3 requires an ELF loader and a
-process manager, both planned for Phase 9+. The IPC paths, endpoint capability model, and service
-registry all work the same way they will for ring-3 servers — only the task creation mechanism
-changes.
+As of Phase 50, the IPC transport model supports validated `copy_from_user` for file block
+transfers (up to 64 KiB) and `Capability::Grant` page transfers for larger payloads. The
+transport is now ready for ring-3 extraction. Actual extraction of filesystem servers into
+ring-3 processes is planned for Phase 52+.
 
-### Pointer-based data transfer
+### Pointer-based data transfer (Phase 8 only)
 
-`FILE_OPEN` and `FILE_READ` pass raw kernel virtual address pointers in the IPC payload. In
-Phase 9+, when servers run in separate address spaces, this cannot work. The replacement
-mechanism is **page-capability grants**: the client maps a shared page, places the path or
-receive buffer there, and sends the page capability handle. The server maps the capability, reads
-or writes through it, then releases it. No raw pointer ever crosses the IPC channel.
+Phase 8's `FILE_OPEN` and `FILE_READ` pass raw kernel virtual address pointers in the IPC
+payload. As of Phase 50, the IPC transport model provides two validated alternatives:
+
+- **`copy_from_user` / `copy_to_user`** for payloads up to 64 KiB (file blocks, paths,
+  console strings, network packets). The kernel validates the address range against the
+  caller's page tables before copying.
+- **Page capability grants** (`Capability::Grant`) for larger transfers (framebuffer spans).
+  The sender grants physical page frames to the receiver; ownership transfers atomically.
+
+The raw kernel-pointer convention is no longer the current behavior. See
+`docs/50-ipc-completion.md` for the full bulk-data transport contract.
 
 ### Stateless file descriptors
 

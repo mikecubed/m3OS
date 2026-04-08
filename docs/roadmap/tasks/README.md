@@ -131,6 +131,11 @@ flowchart TD
     P12 --> P47
     P24 --> P47
     P46 --> P47
+
+    %% Convergence phases
+    P46 --> P48["Phase 48 Tasks"]
+    P48 --> P49["Phase 49 Tasks"]
+    P49 --> P50["Phase 50 Tasks"]
 ```
 
 ## Task Documents
@@ -227,9 +232,10 @@ flowchart TD
 |---|---|---|---|---|
 | 48 | Security Foundation | Complete | `phase-48` | [Tasks](./48-security-foundation-tasks.md) |
 | 49 | Architectural Declaration | Complete | `phase-49` | [Tasks](./49-architectural-declaration-tasks.md) |
+| 50 | IPC Completion | Complete | `phase-50` | [Tasks](./50-ipc-completion-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **50 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **51 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 
