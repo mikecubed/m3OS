@@ -227,8 +227,9 @@ fn u32_to_buf(dst: &mut [u8], n: u32) -> usize {
     if n == 0 {
         if !dst.is_empty() {
             dst[0] = b'0';
+            return 1;
         }
-        return 1;
+        return 0;
     }
     let mut tmp = [0u8; 12];
     let mut pos = tmp.len();
