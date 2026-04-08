@@ -12,6 +12,16 @@ pub enum Capability {
     Notification(NotifId),
     /// One-shot right to reply to a specific blocked caller.
     Reply(TaskId),
+    /// Right to access a contiguous range of physical page frames.
+    ///
+    /// - `frame`: physical frame number (not byte address).
+    /// - `page_count`: number of contiguous 4 KiB pages.
+    /// - `writable`: whether the receiver may write to the pages.
+    Grant {
+        frame: u64,
+        page_count: u16,
+        writable: bool,
+    },
 }
 
 /// Errors returned by capability-table operations.
@@ -233,5 +243,72 @@ mod tests {
         assert_eq!(src.grant(0, &mut dst), Err(CapError::InvalidHandle));
         // Out-of-range handle.
         assert_eq!(src.grant(100, &mut dst), Err(CapError::InvalidHandle));
+    }
+
+    // --- C.4: Grant capability variant tests ---
+
+    #[test]
+    fn insert_and_get_grant_capability() {
+        let mut table = CapabilityTable::new();
+        let cap = Capability::Grant {
+            frame: 0x1000,
+            page_count: 16,
+            writable: true,
+        };
+        let handle = table.insert(cap).unwrap();
+        assert_eq!(table.get(handle), Ok(cap));
+
+        // Verify fields through pattern match.
+        if let Capability::Grant {
+            frame,
+            page_count,
+            writable,
+        } = table.get(handle).unwrap()
+        {
+            assert_eq!(frame, 0x1000);
+            assert_eq!(page_count, 16);
+            assert!(writable);
+        } else {
+            panic!("expected Grant capability");
+        }
+    }
+
+    #[test]
+    fn grant_a_grant_capability_between_tables() {
+        let mut src = CapabilityTable::new();
+        let mut dst = CapabilityTable::new();
+
+        let cap = Capability::Grant {
+            frame: 0x2000,
+            page_count: 4,
+            writable: false,
+        };
+        let src_handle = src.insert(cap).unwrap();
+
+        // Transfer the Grant capability from src to dst.
+        let dst_handle = src.grant(src_handle, &mut dst).unwrap();
+
+        // Source no longer holds it.
+        assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
+        // Destination has the exact same capability.
+        assert_eq!(dst.get(dst_handle), Ok(cap));
+    }
+
+    #[test]
+    fn grant_read_only_vs_writable() {
+        let mut table = CapabilityTable::new();
+        let ro = Capability::Grant {
+            frame: 0x100,
+            page_count: 1,
+            writable: false,
+        };
+        let rw = Capability::Grant {
+            frame: 0x100,
+            page_count: 1,
+            writable: true,
+        };
+        let h_ro = table.insert(ro).unwrap();
+        let h_rw = table.insert(rw).unwrap();
+        assert_ne!(table.get(h_ro), table.get(h_rw));
     }
 }
