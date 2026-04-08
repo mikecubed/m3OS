@@ -3642,18 +3642,28 @@ fn cpu_has_rdrand() -> bool {
             out("ecx") ecx,
             out("eax") _,
             out("edx") _,
-            options(nostack),
         );
     }
     ecx & (1 << 30) != 0
 }
 
+/// Cached RDRAND support: 0 = unchecked, 1 = supported, 2 = unsupported.
+static RDRAND_SUPPORT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// Try to read a 64-bit value from the hardware RDRAND instruction.
 /// Returns `Some(value)` if RDRAND is available and succeeded, `None` otherwise.
-/// Checks CPUID first to avoid #UD on CPUs without RDRAND support.
+/// Caches the CPUID check so only the first call executes CPUID.
 /// Retries up to 10 times on transient failure per Intel guidance.
 fn rdrand64() -> Option<u64> {
-    if !cpu_has_rdrand() {
+    let cached = RDRAND_SUPPORT.load(core::sync::atomic::Ordering::Relaxed);
+    let supported = if cached == 0 {
+        let s = cpu_has_rdrand();
+        RDRAND_SUPPORT.store(if s { 1 } else { 2 }, core::sync::atomic::Ordering::Relaxed);
+        s
+    } else {
+        cached == 1
+    };
+    if !supported {
         return None;
     }
     for _ in 0..10 {
