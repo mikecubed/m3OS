@@ -3629,20 +3629,49 @@ fn alloc_fd(min_fd: usize, entry: FdEntry) -> Option<usize> {
     proc.fd_alloc(min_fd, entry)
 }
 
-/// Try to read a 64-bit value from the hardware RDRAND instruction.
-/// Returns `Some(value)` if RDRAND is available and succeeded, `None` otherwise.
-fn rdrand64() -> Option<u64> {
-    let mut val: u64;
-    let ok: u8;
+/// Returns whether the current CPU reports support for the RDRAND instruction
+/// (CPUID.01H:ECX bit 30).
+fn cpu_has_rdrand() -> bool {
+    let ecx: u32;
     unsafe {
         core::arch::asm!(
-            "rdrand {val}",
-            "setc {ok}",
-            val = out(reg) val,
-            ok = out(reg_byte) ok,
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx,
+            out("eax") _,
+            out("edx") _,
+            options(nostack),
         );
     }
-    if ok != 0 { Some(val) } else { None }
+    ecx & (1 << 30) != 0
+}
+
+/// Try to read a 64-bit value from the hardware RDRAND instruction.
+/// Returns `Some(value)` if RDRAND is available and succeeded, `None` otherwise.
+/// Checks CPUID first to avoid #UD on CPUs without RDRAND support.
+/// Retries up to 10 times on transient failure per Intel guidance.
+fn rdrand64() -> Option<u64> {
+    if !cpu_has_rdrand() {
+        return None;
+    }
+    for _ in 0..10 {
+        let mut val: u64;
+        let ok: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdrand {val}",
+                "setc {ok}",
+                val = out(reg) val,
+                ok = out(reg_byte) ok,
+            );
+        }
+        if ok != 0 {
+            return Some(val);
+        }
+    }
+    None
 }
 
 /// Seed the PRNG state using RDRAND + TSC mixing.

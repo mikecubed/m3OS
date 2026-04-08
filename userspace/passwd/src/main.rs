@@ -64,7 +64,10 @@ pub extern "C" fn _start() -> ! {
 
     // Generate new hash with random salt and iterated SHA-256.
     let mut salt = [0u8; 16];
-    getrandom(&mut salt);
+    if getrandom(&mut salt) != 16 {
+        write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
+        exit(1);
+    }
     let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
@@ -110,7 +113,12 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
     let _ = write(fd as i32, &new_shadow[..out_pos]);
-    fsync(fd as i32);
+    if fsync(fd as i32) < 0 {
+        write_str(
+            STDOUT_FILENO,
+            "passwd: warning: fsync failed on shadow file\n",
+        );
+    }
     close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");

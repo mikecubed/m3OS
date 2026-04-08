@@ -11,15 +11,15 @@ claims are backed by real enforcement rather than trusted-demo assumptions.
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Evaluation gate and trust-floor audit | — | Planned |
-| B | Kernel-enforced credential transitions | A | Planned |
-| C | Entropy pipeline and `getrandom()` hardening | A | Planned |
-| D | Password hashing upgrade | C | Planned |
-| E | Default credential removal and provisioning | D | Planned |
-| F | Telnet opt-in and service default policy | A | Planned |
-| G | Account file update hardening | — | Planned |
-| H | Smoke and regression testing | B, C, D, E, F, G | Planned |
-| I | Documentation, versioning, and roadmap integration | H | Planned |
+| A | Evaluation gate and trust-floor audit | — | Complete |
+| B | Kernel-enforced credential transitions | A | Complete |
+| C | Entropy pipeline and `getrandom()` hardening | A | Complete |
+| D | Password hashing upgrade | C | Complete |
+| E | Default credential removal and provisioning | D | Complete |
+| F | Telnet opt-in and service default policy | A | Complete |
+| G | Account file update hardening | — | Complete |
+| H | Smoke and regression testing | B, C, D, E, F, G | Complete |
+| I | Documentation, versioning, and roadmap integration | H | Complete |
 
 ---
 

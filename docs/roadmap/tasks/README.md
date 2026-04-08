@@ -228,7 +228,7 @@ flowchart TD
 | 48 | Security Foundation | Complete | `phase-48` | [Tasks](./48-security-foundation-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **48 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **49 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

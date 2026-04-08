@@ -75,7 +75,10 @@ pub extern "C" fn _start() -> ! {
 
     // Hash the password with random salt and iterated SHA-256.
     let mut salt = [0u8; 16];
-    getrandom(&mut salt);
+    if getrandom(&mut salt) != 16 {
+        write_str(STDOUT_FILENO, "adduser: failed to generate random salt\n");
+        exit(1);
+    }
     let hash = syscall_lib::sha256::hash_password_iterated(&pw_input[..plen], &salt, 10000);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
@@ -106,7 +109,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], username);
         pos += copy_to_buf(&mut buf[pos..], b":/bin/ion\n");
         let _ = write(fd as i32, &buf[..pos]);
-        fsync(fd as i32);
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/passwd\n",
+            );
+        }
         close(fd as i32);
     }
 
@@ -130,7 +138,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], &hash_hex[..hash_hex_len]);
         pos += copy_to_buf(&mut buf[pos..], b"::::::\n");
         let _ = write(fd as i32, &buf[..pos]);
-        fsync(fd as i32);
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/shadow\n",
+            );
+        }
         close(fd as i32);
     }
 
@@ -150,7 +163,12 @@ pub extern "C" fn _start() -> ! {
         pos += copy_to_buf(&mut buf[pos..], username);
         pos += copy_to_buf(&mut buf[pos..], b"\n");
         let _ = write(fd as i32, &buf[..pos]);
-        fsync(fd as i32);
+        if fsync(fd as i32) < 0 {
+            write_str(
+                STDOUT_FILENO,
+                "adduser: warning: fsync failed on /etc/group\n",
+            );
+        }
         close(fd as i32);
     }
 

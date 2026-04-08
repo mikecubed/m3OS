@@ -190,12 +190,22 @@ pub fn hash_password_iterated(password: &[u8], salt: &[u8], rounds: u32) -> [u8;
     hash
 }
 
+/// Parse a decimal u32 from bytes. Rejects non-digit characters and caps
+/// the result at 100,000 to prevent extreme CPU usage during verification.
 fn parse_u32_bytes(s: &[u8]) -> u32 {
+    const MAX_ROUNDS: u32 = 100_000;
     let mut n: u32 = 0;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return 0; // reject malformed input
         }
+        n = match n
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((b - b'0') as u32))
+        {
+            Some(v) if v <= MAX_ROUNDS => v,
+            _ => return 0, // overflow or exceeds cap
+        };
     }
     n
 }

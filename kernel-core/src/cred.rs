@@ -48,7 +48,7 @@ impl Credentials {
 
     /// Apply setreuid rules:
     /// - ruid change: only if euid==0 or new_ruid matches current real or effective uid
-    /// - euid change: only if euid==0 or new_euid matches current real, effective, or saved uid
+    /// - euid change: only if euid==0 or new_euid matches current real or effective uid
     ///
     /// Pass -1 (as i32) for either argument to leave that field unchanged.
     pub fn set_reuid(&mut self, new_ruid: i32, new_euid: i32) -> Result<(), PermissionDenied> {

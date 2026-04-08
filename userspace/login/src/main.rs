@@ -27,19 +27,7 @@ fn login_once() {
     }
     let username = &username[..ulen];
 
-    // Prompt for password with echo disabled.
-    let _ = write(STDOUT_FILENO, b"\n");
-    write_str(STDOUT_FILENO, "Password: ");
-
-    // Disable echo for password input.
-    let saved = disable_echo();
-    let mut pw_input = [0u8; 128];
-    let plen = read_line(&mut pw_input);
-    restore_echo(saved);
-    let _ = write(STDOUT_FILENO, b"\n");
-    let pw_input = &pw_input[..plen];
-
-    // Look up user in /etc/passwd.
+    // Look up user in /etc/passwd before prompting for password.
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
@@ -55,7 +43,7 @@ fn login_once() {
         }
     };
 
-    // Verify password against /etc/shadow.
+    // Read /etc/shadow to determine if account is locked or has a password.
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
@@ -65,6 +53,7 @@ fn login_once() {
 
     // Check if account is locked (first-boot setup).
     if is_locked_account(&shadow_buf[..shadow_len], username) {
+        let _ = write(STDOUT_FILENO, b"\n");
         write_str(STDOUT_FILENO, "Account requires initial password setup.\n");
         write_str(STDOUT_FILENO, "Set password for ");
         let _ = write(STDOUT_FILENO, username);
@@ -74,6 +63,11 @@ fn login_once() {
         let new_pw_len = read_line(&mut new_pw);
         restore_echo(saved2);
         let _ = write(STDOUT_FILENO, b"\n");
+
+        if new_pw_len == 0 {
+            write_str(STDOUT_FILENO, "Password cannot be empty\n");
+            return;
+        }
 
         write_str(STDOUT_FILENO, "Retype password: ");
         let saved3 = disable_echo();
@@ -92,10 +86,21 @@ fn login_once() {
             return;
         }
         write_str(STDOUT_FILENO, "Password set successfully.\n");
-        // Fall through to login with the new credentials.
-    } else if !verify_shadow(&shadow_buf[..shadow_len], username, pw_input) {
-        write_str(STDOUT_FILENO, "Login incorrect\n");
-        return;
+        // Fall through to authenticated login.
+    } else {
+        // Normal login — prompt for password.
+        let _ = write(STDOUT_FILENO, b"\n");
+        write_str(STDOUT_FILENO, "Password: ");
+        let saved = disable_echo();
+        let mut pw_input = [0u8; 128];
+        let plen = read_line(&mut pw_input);
+        restore_echo(saved);
+        let _ = write(STDOUT_FILENO, b"\n");
+
+        if !verify_shadow(&shadow_buf[..shadow_len], username, &pw_input[..plen]) {
+            write_str(STDOUT_FILENO, "Login incorrect\n");
+            return;
+        }
     }
 
     // Authentication succeeded.
@@ -266,7 +271,9 @@ fn is_locked_account(shadow: &[u8], username: &[u8]) -> bool {
 fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
     // Generate random salt and hash the password.
     let mut salt = [0u8; 16];
-    getrandom(&mut salt);
+    if getrandom(&mut salt) != 16 {
+        return false;
+    }
     let hash = syscall_lib::sha256::hash_password_iterated(password, &salt, 10000);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
