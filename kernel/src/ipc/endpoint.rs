@@ -100,18 +100,18 @@ impl EndpointRegistry {
 pub struct Endpoint {
     /// Tasks blocked waiting to *send* a message (or in `call`, also waiting
     /// for a reply afterwards).
-    senders: VecDeque<PendingSend>,
+    pub(super) senders: VecDeque<PendingSend>,
     /// Tasks blocked waiting to *receive* a message.
-    receivers: VecDeque<TaskId>,
+    pub(super) receivers: VecDeque<TaskId>,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
-struct PendingSend {
-    task: TaskId,
-    msg: Message,
+pub(super) struct PendingSend {
+    pub(super) task: TaskId,
+    pub(super) msg: Message,
     /// `true` if this is a `call` — the sender expects a reply cap to be
     /// inserted into the server's capability table.
-    wants_reply: bool,
+    pub(super) wants_reply: bool,
 }
 
 impl Endpoint {

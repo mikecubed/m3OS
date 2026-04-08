@@ -31,6 +31,7 @@ extern crate alloc;
 
 mod fs;
 mod io;
+mod ipc;
 mod misc;
 mod mm;
 mod net;
@@ -981,6 +982,8 @@ pub extern "C" fn syscall_handler(
         r
     } else if let Some(r) = misc::handle_misc_syscall(number, arg0, arg1, arg2) {
         r
+    } else if let Some(r) = ipc::handle_ipc_syscall(number, arg0, arg1, arg2) {
+        r
     } else {
         // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
         log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -1291,6 +1294,12 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
 /// free page table.  Called when a single-threaded process exits or when the
 /// last thread in a thread group exits.
 fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
+    // Clean up IPC state (endpoint queues, notification waiters) before
+    // closing FDs so that IPC peers see errors promptly.
+    if let Some(task_id) = crate::task::scheduler::current_task_id() {
+        crate::ipc::cleanup::cleanup_task_ipc(task_id);
+    }
+
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
 

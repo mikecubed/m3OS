@@ -594,6 +594,62 @@ addresses without touching the page tables.
 
 ---
 
+## Server-Loop Failure Semantics
+
+IPC endpoints and notification objects are kernel resources that outlive
+individual syscalls.  When a task dies, the kernel must clean up its IPC
+state to prevent resource leaks and unblock peers that are waiting for
+the dying task.
+
+### Client dies before server replies
+
+The server holds a `Reply(caller_id)` capability.  When the server calls
+`reply()`, the reply message is delivered to the dead task's message slot
+(a harmless no-op since the task is dead and will never consume it).
+The server loop continues normally.  The dangling reply cap is consumed
+by `reply` and cleared from the server's capability table — no leak.
+In a `reply_recv` loop, the server atomically replies and waits for the
+next message, so the dead-client reply is a fire-and-forget operation.
+
+### Server dies while client is blocked in `call`
+
+The client is blocked in `BlockedOnReply` state, waiting for the server
+to call `reply()`.  During the server's exit, `cleanup_task_ipc(server_task_id)`
+is called (from `do_full_process_exit`), which:
+
+1. Removes the server from all endpoint receiver queues.
+2. Removes the server's pending sends from all endpoint sender queues.
+3. Clears any notification waiter slots held by the server.
+
+Callers that are blocked in `call` waiting for a reply from the server
+remain in `BlockedOnReply` state until the service manager restarts the
+server.  In a future enhancement, the kernel could scan for Reply caps
+pointing at the dying task and wake the corresponding callers with an
+error message.
+
+### Service restarts and re-registers
+
+The service registry (Phase 50, Track D) supports re-registration via
+`replace_service()`.  After the service manager restarts a crashed
+service, the new instance calls `ipc_register_service` with the same
+name, which atomically replaces the old endpoint mapping.  New clients
+that call `ipc_lookup_service` receive the new endpoint.
+
+Existing clients that cached the old endpoint cap must re-lookup the
+service after receiving an error from `call`.  The recommended pattern
+for resilient clients:
+
+```text
+loop:
+    result = ipc_call(server_ep, REQ, data)
+    if result == u64::MAX:
+        server_ep = ipc_lookup_service("my_service")
+        continue
+    handle(result)
+```
+
+---
+
 ## Phase 6 Simplifications vs. Real Microkernels
 
 Phase 6 deliberately keeps the IPC contract small.  Here is what a production

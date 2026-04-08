@@ -35,6 +35,7 @@
 //! transfers, IPC timeouts.
 
 pub mod capability;
+pub mod cleanup;
 pub mod endpoint;
 pub mod message;
 pub mod notification;
@@ -86,7 +87,6 @@ pub use registry::RegistryError;
 /// - `ipc_register_service` (9): returns `0` on success, `u64::MAX` on error.
 /// - `ipc_lookup_service` (10): returns the new `CapHandle` as `u64` on
 ///   success, or `u64::MAX` on error (not found, cap table full, etc.).
-#[allow(dead_code)]
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::{TaskId, scheduler};
 
