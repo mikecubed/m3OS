@@ -947,8 +947,12 @@ fn serial_stdin_feeder_task() -> ! {
         let byte = match byte {
             Some(b) => b,
             None => {
-                // Block until the serial IRQ handler wakes us.
-                crate::serial::SERIAL_RX_WAITQUEUE.sleep();
+                // Yield instead of sleeping to avoid the lost-wakeup race:
+                // if the IRQ fires between pop() returning None and entering
+                // sleep(), the wake_all() is lost and the feeder hangs.
+                // The IRQ handler + ring buffer still prevents FIFO overflow;
+                // yielding just means the feeder polls the ring buffer.
+                task::yield_now();
                 continue;
             }
         };
