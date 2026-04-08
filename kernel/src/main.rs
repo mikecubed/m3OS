@@ -334,7 +334,7 @@ fn spawn_userspace_init() {
 ///   data\[0\] = pointer to UTF-8 string bytes (kernel address)
 ///   data\[1\] = byte length (must be 1..=4096)
 ///
-/// Reply: data\[0\] = 0 on success, `u64::MAX` on error.
+/// Reply: label = 0 on success, `u64::MAX` on error.
 ///
 /// # Service lifecycle (Phase 46)
 ///
