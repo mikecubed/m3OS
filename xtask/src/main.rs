@@ -2159,13 +2159,9 @@ fn run_smoke_script(
 
             SmokeStep::Send { input, label } => {
                 println!("[step {}] send: {label}", step_num);
-                // Two-phase wait before sending input:
-                // 1. Drain serial output until 150ms of silence — ensures the
-                //    shell/terminal has finished prompt rendering (ANSI escapes,
-                //    cursor repositioning).
-                // 2. Fixed 100ms post-idle delay — covers the gap between the
-                //    shell finishing output and being ready to accept input
-                //    (readline state setup, line discipline reset, etc.).
+                // Drain serial output until 150ms of silence before sending
+                // input.  This ensures the shell/terminal has finished all
+                // prompt rendering (ANSI escapes, cursor repositioning).
                 let idle_threshold = std::time::Duration::from_millis(150);
                 let idle_cap = std::time::Duration::from_secs(2);
                 let idle_start = std::time::Instant::now();
@@ -2188,17 +2184,26 @@ fn run_smoke_script(
                         break; // cap to avoid stalling on noisy kernel logs
                     }
                 }
-                // Post-idle settling delay for shell internal state.
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Write input in small chunks to avoid overflowing the
+                // guest's emulated 16550 UART FIFO (16 bytes).  A burst
+                // write_all of 30-60 byte commands can push bytes into
+                // the FIFO faster than the guest processes interrupts,
+                // causing dropped characters at arbitrary positions.
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
-                    if stdin.write_all(input.as_bytes()).is_err() {
-                        return Err(format!(
-                            "failed to send input at step {}: {label}",
-                            step_num
-                        ));
+                    let bytes = input.as_bytes();
+                    for chunk in bytes.chunks(4) {
+                        if stdin.write_all(chunk).is_err() {
+                            return Err(format!(
+                                "failed to send input at step {}: {label}",
+                                step_num
+                            ));
+                        }
+                        let _ = stdin.flush();
+                        if chunk.len() == 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
                     }
-                    let _ = stdin.flush();
                 } else {
                     return Err(format!("no stdin pipe at step {}: {label}", step_num));
                 }
