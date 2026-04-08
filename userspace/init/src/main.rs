@@ -823,6 +823,7 @@ impl ServiceManager {
     }
 
     /// Try to open, read, and parse a single service config file.
+    /// Skips services that have a `.disabled` marker file.
     fn try_load_config(&mut self, path: &[u8]) {
         let fd = open(path, O_RDONLY, 0);
         if fd >= 0 {
@@ -832,6 +833,13 @@ impl ServiceManager {
             if n > 0 {
                 match parse_service_def(&buf, n as usize) {
                     Some(svc) => {
+                        // Check if this service is disabled.
+                        if Self::is_disabled(svc.name.as_bytes()) {
+                            write_str(STDOUT_FILENO, "init: skipping disabled service '");
+                            write(STDOUT_FILENO, svc.name.as_bytes());
+                            write_str(STDOUT_FILENO, "'\n");
+                            return;
+                        }
                         write_str(STDOUT_FILENO, "init: loaded service '");
                         write(STDOUT_FILENO, svc.name.as_bytes());
                         write_str(STDOUT_FILENO, "'\n");
@@ -1405,6 +1413,14 @@ impl ServiceManager {
         close(fd as i32);
     }
 
+    /// Create the control command file with root-only permissions (mode 0600).
+    fn create_control_file(&self) {
+        let fd = open(CMD_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+        if fd >= 0 {
+            close(fd as i32);
+        }
+    }
+
     /// Check for control commands in `/var/run/init.cmd`.
     fn check_control_commands(&mut self) {
         let fd = open(CMD_FILE, O_RDONLY, 0);
@@ -1416,7 +1432,7 @@ impl ServiceManager {
         let n = read(fd as i32, &mut buf);
         close(fd as i32);
 
-        // Delete the command file after reading by truncating it.
+        // Delete the command file after reading by truncating it (preserve 0600 mode).
         let fd2 = open(CMD_FILE, O_WRONLY | O_TRUNC, 0);
         if fd2 >= 0 {
             close(fd2 as i32);
@@ -1458,6 +1474,90 @@ impl ServiceManager {
                 nanosleep(1);
                 self.start_service(idx);
             }
+        } else if n >= 8 && bytes_eq(&buf[..7], b"disable") && buf[7] == b' ' {
+            let name = trim_newline(&buf[8..n]);
+            write_str(STDOUT_FILENO, "init: control: disabling '");
+            write(STDOUT_FILENO, name);
+            write_str(STDOUT_FILENO, "'\n");
+            // Write marker file /etc/services.d/<name>.disabled
+            Self::write_disabled_marker(name);
+        } else if n >= 7 && bytes_eq(&buf[..6], b"enable") && buf[6] == b' ' {
+            let name = trim_newline(&buf[7..n]);
+            write_str(STDOUT_FILENO, "init: control: enabling '");
+            write(STDOUT_FILENO, name);
+            write_str(STDOUT_FILENO, "'\n");
+            // Remove marker file /etc/services.d/<name>.disabled
+            Self::remove_disabled_marker(name);
+        }
+    }
+
+    /// Build the disabled marker path: /etc/services.d/<name>.disabled\0
+    fn build_disabled_path(name: &[u8], path_buf: &mut [u8; 128]) -> usize {
+        let prefix = b"/etc/services.d/";
+        let suffix = b".disabled";
+        let total = prefix.len() + name.len() + suffix.len() + 1;
+        if total > 128 {
+            return 0;
+        }
+        let mut pos = 0;
+        let mut i = 0;
+        while i < prefix.len() {
+            path_buf[pos] = prefix[i];
+            pos += 1;
+            i += 1;
+        }
+        i = 0;
+        while i < name.len() {
+            path_buf[pos] = name[i];
+            pos += 1;
+            i += 1;
+        }
+        i = 0;
+        while i < suffix.len() {
+            path_buf[pos] = suffix[i];
+            pos += 1;
+            i += 1;
+        }
+        path_buf[pos] = 0;
+        pos + 1
+    }
+
+    /// Write a .disabled marker file for a service.
+    fn write_disabled_marker(name: &[u8]) {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return;
+        }
+        let fd = open(&path_buf[..len], O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if fd >= 0 {
+            close(fd as i32);
+        }
+    }
+
+    /// Remove a .disabled marker file for a service.
+    fn remove_disabled_marker(name: &[u8]) {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return;
+        }
+        syscall_lib::unlink(&path_buf[..len]);
+    }
+
+    /// Check if a service has a .disabled marker file.
+    fn is_disabled(name: &[u8]) -> bool {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return false;
+        }
+        let fd = open(&path_buf[..len], O_RDONLY, 0);
+        if fd >= 0 {
+            close(fd as i32);
+            true
+        } else {
+            false
         }
     }
 
@@ -1618,6 +1718,9 @@ pub extern "C" fn _start() -> ! {
         write_str(STDOUT_FILENO, "init: failed to spawn login\n");
         // Not fatal — services may still be running.
     }
+
+    // Create control command file with root-only permissions (mode 0600).
+    mgr.create_control_file();
 
     // Write initial status file.
     mgr.write_status_file();
