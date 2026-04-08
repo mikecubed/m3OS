@@ -2184,18 +2184,8 @@ fn run_smoke_script(
                         break; // cap to avoid stalling on noisy kernel logs
                     }
                 }
-                // Send a sacrificial Ctrl-U (kill-line) byte before the
-                // real command.  Something in the ion shell / TTY readline
-                // setup consistently swallows the first byte received after
-                // the prompt is printed.  Ctrl-U on an empty line is a
-                // no-op, so if it IS received the line stays clean; if it
-                // is consumed by the readline init race, the real command
-                // that follows arrives intact.
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
-                    let _ = stdin.write_all(b"\x15");
-                    let _ = stdin.flush();
-                    std::thread::sleep(std::time::Duration::from_millis(50));
                     if stdin.write_all(input.as_bytes()).is_err() {
                         return Err(format!(
                             "failed to send input at step {}: {label}",
@@ -4165,7 +4155,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
-    let shadow_content = "root:!::::::\nuser:!::::::\n";
+    // Pre-provisioned password hashes for CI/testing.  Format: $sha256$hex_salt$hex_hash
+    // where hash = SHA-256(salt_bytes || password_bytes).  Passwords: root="root", user="user".
+    let shadow_content = "root:$sha256$63695f726f6f745f73616c7431323334$5c8e5a851fee488aae9fc5890dd433f8a391fba2860899c271a6e6f5d3e4c439::::::\nuser:$sha256$63695f757365725f73616c7435363738$64fb26f3575e26ed5fc3b07e6c4ca2b6af8bf1f17267c34babb76448301a16ca::::::\n";
     let group_content = "root:x:0:root\nuser:x:1000:user\n";
 
     // Phase 46: service definition files.
