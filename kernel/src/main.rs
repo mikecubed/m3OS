@@ -341,7 +341,8 @@ fn spawn_userspace_init() {
 /// Follows the standard service lifecycle: registers its endpoint via the
 /// service registry, enters a recv/reply_recv loop, and is restart-safe
 /// (the registry supports re-registration, and `cleanup_task_ipc` from
-/// Track E handles blocked callers if this task dies).
+/// Track E cleans up endpoint/notification state if this task dies;
+/// callers blocked in `BlockedOnReply` remain stuck — see docs/06-ipc.md).
 fn console_server_task() -> ! {
     let my_id = task::current_task_id().expect("[console] no task id");
 
