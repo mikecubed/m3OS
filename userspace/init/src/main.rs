@@ -224,6 +224,8 @@ struct ServiceDef {
     active: bool,
     /// UID to run the service as (0 = root, default).
     run_as_uid: u32,
+    /// Seconds to wait after SIGTERM before SIGKILL during shutdown (default 5).
+    stop_timeout: u32,
 }
 
 impl ServiceDef {
@@ -243,6 +245,7 @@ impl ServiceDef {
             last_change_time: 0,
             active: false,
             run_as_uid: 0,
+            stop_timeout: 5,
         }
     }
 }
@@ -559,6 +562,11 @@ fn parse_service_def(buf: &[u8], len: usize) -> Option<ServiceDef> {
             parse_deps(val, &mut svc.deps, &mut svc.dep_count);
         } else if bytes_eq(key, b"user") {
             svc.run_as_uid = parse_u32(val);
+        } else if bytes_eq(key, b"stop_timeout") {
+            let v = parse_u32(val);
+            if v > 0 {
+                svc.stop_timeout = v;
+            }
         } else {
             // Unknown field — log warning.
             write_str(STDOUT_FILENO, "init: warning: unknown field '");
@@ -1106,6 +1114,7 @@ impl ServiceManager {
     /// Orderly shutdown of all services in reverse dependency order.
     fn shutdown_services(&mut self) {
         write_str(STDOUT_FILENO, "init: shutting down services...\n");
+        let shutdown_start = now_epoch_secs();
 
         // Iteratively find a running service whose dependents are all stopped,
         // send SIGTERM, wait, then SIGKILL if needed.
@@ -1126,7 +1135,24 @@ impl ServiceManager {
                         any_running = true;
                         // Check if all dependents are stopped.
                         if self.all_dependents_stopped(&graph, i) {
-                            self.stop_service(i);
+                            let svc_start = now_epoch_secs();
+                            write_str(STDOUT_FILENO, "init: shutdown: stopping '");
+                            write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                            write_str(STDOUT_FILENO, "'...\n");
+
+                            let clean = self.stop_service(i);
+                            let elapsed = now_epoch_secs().saturating_sub(svc_start);
+
+                            write_str(STDOUT_FILENO, "init: shutdown: '");
+                            write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                            if clean {
+                                write_str(STDOUT_FILENO, "' stopped cleanly (");
+                            } else {
+                                write_str(STDOUT_FILENO, "' force-killed (");
+                            }
+                            write_u64(STDOUT_FILENO, elapsed);
+                            write_str(STDOUT_FILENO, "s)\n");
+
                             found = true;
                             break; // Re-scan after stopping one.
                         }
@@ -1164,7 +1190,35 @@ impl ServiceManager {
             }
         }
 
-        write_str(STDOUT_FILENO, "init: all services stopped\n");
+        // Reap orphaned children (forked workers reparented to PID 1).
+        let mut orphan_count: u32 = 0;
+        let mut reap_waited: u32 = 0;
+        loop {
+            let mut st: i32 = 0;
+            let ret = waitpid(-1, &mut st, WNOHANG);
+            if ret > 0 {
+                orphan_count += 1;
+            } else if ret <= 0 {
+                if reap_waited >= 15 {
+                    break; // global timeout
+                }
+                if ret < 0 {
+                    break; // no children left
+                }
+                nanosleep(1);
+                reap_waited += 1;
+            }
+        }
+        if orphan_count > 0 {
+            write_str(STDOUT_FILENO, "init: reaped ");
+            write_u64(STDOUT_FILENO, orphan_count as u64);
+            write_str(STDOUT_FILENO, " orphaned children\n");
+        }
+
+        let total_elapsed = now_epoch_secs().saturating_sub(shutdown_start);
+        write_str(STDOUT_FILENO, "init: shutdown complete (");
+        write_u64(STDOUT_FILENO, total_elapsed);
+        write_str(STDOUT_FILENO, "s total)\n");
         self.write_status_file();
     }
 
@@ -1183,14 +1237,15 @@ impl ServiceManager {
         true
     }
 
-    /// Stop a single service: SIGTERM, wait 5s, SIGKILL.
-    fn stop_service(&mut self, idx: usize) {
+    /// Stop a single service: SIGTERM, wait per-service timeout, SIGKILL.
+    /// Returns true if the service stopped cleanly, false if force-killed.
+    fn stop_service(&mut self, idx: usize) -> bool {
         let pid = self.services[idx].pid;
         if pid <= 0 {
             self.services[idx].status = ServiceStatus::Stopped(0);
             self.services[idx].last_change_time = now_epoch_secs();
             self.write_status_file();
-            return;
+            return true;
         }
 
         // Validate state transition (diagnostic only — log but don't block).
@@ -1213,9 +1268,10 @@ impl ServiceManager {
 
         kill(pid, SIGTERM);
 
-        // Wait up to 5 seconds for graceful exit.
-        let mut waited = 0;
-        while waited < 5 {
+        // Wait up to per-service timeout for graceful exit.
+        let timeout = self.services[idx].stop_timeout;
+        let mut waited: u32 = 0;
+        while waited < timeout {
             let mut st: i32 = 0;
             let ret = waitpid(pid, &mut st, WNOHANG);
             if ret > 0 {
@@ -1225,7 +1281,7 @@ impl ServiceManager {
                 self.services[idx].pid = 0;
                 self.services[idx].last_change_time = now_epoch_secs();
                 self.write_status_file();
-                return;
+                return true;
             }
             nanosleep(1);
             waited += 1;
@@ -1244,6 +1300,7 @@ impl ServiceManager {
         self.services[idx].pid = 0;
         self.services[idx].last_change_time = now_epoch_secs();
         self.write_status_file();
+        false
     }
 
     /// Write service status to `/var/run/services.status`.
@@ -1332,7 +1389,7 @@ impl ServiceManager {
                 write_str(STDOUT_FILENO, "'\n");
                 // Set restart policy to never so reap loop won't restart it.
                 self.services[idx].restart_policy = RestartPolicy::Never;
-                self.stop_service(idx);
+                let _ = self.stop_service(idx);
             }
         } else if n >= 8 && bytes_eq(&buf[..7], b"restart") && buf[7] == b' ' {
             let name = trim_newline(&buf[8..n]);
@@ -1340,7 +1397,7 @@ impl ServiceManager {
                 write_str(STDOUT_FILENO, "init: control: restarting '");
                 write(STDOUT_FILENO, name);
                 write_str(STDOUT_FILENO, "'\n");
-                self.stop_service(idx);
+                let _ = self.stop_service(idx);
                 self.services[idx].restart_count = 0;
                 nanosleep(1);
                 self.start_service(idx);
