@@ -117,8 +117,11 @@ pub struct Message {
 }
 ```
 
-A `Message` is 40 bytes — five 64-bit registers.  It transfers entirely through
-CPU registers: no pointer, no allocation, no cache miss.
+The syscall ABI transfers a `Message` through five 64-bit registers (label +
+four data words = 40 bytes).  The in-memory `Message` struct is larger because
+Phase 50 added an optional `cap: Option<Capability>` field (see below), but
+that field is kernel-internal — it never crosses the syscall boundary in a
+register.
 
 `label` is a convention between sender and receiver: it identifies which
 operation is being requested (analogous to a method ID in Mach or a message tag
@@ -133,10 +136,13 @@ The constructors match the number of data words used:
 | `Message::with2(label, d0, d1)` | `data[0..1]` |
 
 Phase 50 adds an optional `cap: Option<Capability>` field to `Message` for
-in-band capability transfer.  When a message with an attached capability is
-delivered, the kernel uses `CapabilityTable::grant` to atomically move the
-capability from sender to receiver.  See `docs/50-ipc-completion.md` for
-details.
+in-band capability transfer.  When the kernel delivers a message with an
+attached capability, it inserts the capability into the receiver's
+`CapabilityTable` via `insert_cap` and stores the assigned handle in
+`msg.data[3]` so the receiver can reference the transferred capability.
+The sender's copy is consumed from the `Message`; this is *not* an atomic
+cross-table move — see `transfer_cap` in `kernel/src/ipc/endpoint.rs` and
+`docs/50-ipc-completion.md` for details.
 
 ---
 
