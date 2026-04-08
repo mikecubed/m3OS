@@ -16,7 +16,8 @@
 
 use syscall_lib::{
     O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, SigAction, WNOHANG, close, execve, exit,
-    fork, kill, mount, nanosleep, open, read, rt_sigaction, waitpid, write, write_str, write_u64,
+    fork, getdents64, kill, mount, nanosleep, open, read, rt_sigaction, waitpid, write, write_str,
+    write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,19 @@ enum RestartPolicy {
     Never,
 }
 
+/// Service lifecycle state machine.
+///
+/// Valid transitions:
+///   NeverStarted ──→ Starting
+///   Starting     ──→ Running
+///   Starting     ──→ Stopped (exec failed)
+///   Running      ──→ Stopping
+///   Running      ──→ Stopped (unexpected exit)
+///   Stopping     ──→ Stopped
+///   Stopped      ──→ Starting (restart)
+///   Stopped      ──→ PermanentlyStopped (max restarts exceeded)
+///   *            ──→ PermanentlyStopped (unresolvable deps, etc.)
+///   PermanentlyStopped ──→ (nothing — terminal state)
 #[derive(Clone, Copy, PartialEq)]
 enum ServiceStatus {
     NeverStarted,
@@ -80,6 +94,38 @@ enum ServiceStatus {
     Stopping,
     Stopped(i32),
     PermanentlyStopped,
+}
+
+impl ServiceStatus {
+    /// Validate whether a transition from `self` to `target` is valid.
+    fn try_transition(&self, target: ServiceStatus) -> bool {
+        match (*self, target) {
+            // Terminal state.
+            (ServiceStatus::PermanentlyStopped, _) => false,
+            // NeverStarted → Starting or PermanentlyStopped.
+            (ServiceStatus::NeverStarted, ServiceStatus::Starting) => true,
+            (ServiceStatus::NeverStarted, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::NeverStarted, _) => false,
+            // Starting → Running, Stopped, or PermanentlyStopped.
+            (ServiceStatus::Starting, ServiceStatus::Running) => true,
+            (ServiceStatus::Starting, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Starting, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Starting, _) => false,
+            // Running → Stopping, Stopped, or PermanentlyStopped.
+            (ServiceStatus::Running, ServiceStatus::Stopping) => true,
+            (ServiceStatus::Running, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Running, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Running, _) => false,
+            // Stopping → Stopped or PermanentlyStopped.
+            (ServiceStatus::Stopping, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Stopping, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Stopping, _) => false,
+            // Stopped → Starting or PermanentlyStopped.
+            (ServiceStatus::Stopped(_), ServiceStatus::Starting) => true,
+            (ServiceStatus::Stopped(_), ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Stopped(_), _) => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +218,8 @@ struct ServiceDef {
     restart_count: u32,
     /// Whether this service is active (slot in use).
     active: bool,
+    /// UID to run the service as (0 = root, default).
+    run_as_uid: u32,
 }
 
 impl ServiceDef {
@@ -188,6 +236,7 @@ impl ServiceDef {
             pid: 0,
             restart_count: 0,
             active: false,
+            run_as_uid: 0,
         }
     }
 }
@@ -277,8 +326,11 @@ impl DepGraph {
         }
     }
 
-    fn build(services: &[ServiceDef; MAX_SERVICES], count: usize) -> Self {
+    /// Build the dependency graph. Returns a list of service indices whose
+    /// dependencies could not be resolved (they should be marked PermanentlyStopped).
+    fn build(services: &[ServiceDef; MAX_SERVICES], count: usize) -> (Self, [bool; MAX_SERVICES]) {
         let mut g = Self::new();
+        let mut unresolvable = [false; MAX_SERVICES];
 
         // Build forward edges.
         let mut i = 0;
@@ -292,6 +344,7 @@ impl DepGraph {
                 // Find dep index by name.
                 let dep_name = &services[i].deps[d];
                 let mut j = 0;
+                let mut found = false;
                 while j < count {
                     if j != i
                         && services[j].active
@@ -306,15 +359,25 @@ impl DepGraph {
                             g.required_by[j][g.required_by_count[j]] = i;
                             g.required_by_count[j] += 1;
                         }
+                        found = true;
                         break;
                     }
                     j += 1;
+                }
+                if !found {
+                    // Unresolvable dependency — log warning.
+                    write_str(STDOUT_FILENO, "init: warning: service '");
+                    write(STDOUT_FILENO, services[i].name.as_bytes());
+                    write_str(STDOUT_FILENO, "' has unresolvable dep '");
+                    write(STDOUT_FILENO, dep_name.as_bytes());
+                    write_str(STDOUT_FILENO, "'\n");
+                    unresolvable[i] = true;
                 }
                 d += 1;
             }
             i += 1;
         }
-        g
+        (g, unresolvable)
     }
 
     /// Check for cycles using DFS with a visited set. Returns true if cycle found.
@@ -488,6 +551,13 @@ fn parse_service_def(buf: &[u8], len: usize) -> Option<ServiceDef> {
         } else if bytes_eq(key, b"depends") {
             // Comma-separated list of dependency names.
             parse_deps(val, &mut svc.deps, &mut svc.dep_count);
+        } else if bytes_eq(key, b"user") {
+            svc.run_as_uid = parse_u32(val);
+        } else {
+            // Unknown field — log warning.
+            write_str(STDOUT_FILENO, "init: warning: unknown field '");
+            write(STDOUT_FILENO, key);
+            write_str(STDOUT_FILENO, "' in service config\n");
         }
 
         // Advance past end of line.
@@ -587,35 +657,17 @@ impl ServiceManager {
     }
 
     /// Load service definitions from `/etc/services.d/`.
+    ///
+    /// Tries to scan the directory first using `getdents64`. If the directory
+    /// cannot be opened, falls back to the hardcoded `KNOWN_CONFIGS` list.
     fn load_services(&mut self) {
-        let mut i = 0;
-        while i < KNOWN_CONFIGS.len() {
-            if self.count >= MAX_SERVICES {
-                break;
-            }
-            let fd = open(KNOWN_CONFIGS[i], O_RDONLY, 0);
-            if fd >= 0 {
-                let mut buf = [0u8; BUF_SIZE];
-                let n = read(fd as i32, &mut buf);
-                close(fd as i32);
-                if n > 0 {
-                    match parse_service_def(&buf, n as usize) {
-                        Some(svc) => {
-                            write_str(STDOUT_FILENO, "init: loaded service '");
-                            write(STDOUT_FILENO, svc.name.as_bytes());
-                            write_str(STDOUT_FILENO, "'\n");
-                            self.services[self.count] = svc;
-                            self.count += 1;
-                        }
-                        None => {
-                            write_str(STDOUT_FILENO, "init: warning: malformed service file ");
-                            write(STDOUT_FILENO, KNOWN_CONFIGS[i]);
-                            write_str(STDOUT_FILENO, "\n");
-                        }
-                    }
-                }
-            }
-            i += 1;
+        let dir_fd = open(b"/etc/services.d\0", O_RDONLY, 0);
+        if dir_fd >= 0 {
+            self.load_services_from_dir(dir_fd as i32);
+            close(dir_fd as i32);
+        } else {
+            // Fallback: try hardcoded config paths.
+            self.load_services_from_known_configs();
         }
 
         if self.count == 0 {
@@ -624,6 +676,105 @@ impl ServiceManager {
                 "init: no service configs found, using built-in defaults\n",
             );
             self.add_builtin_defaults();
+        }
+    }
+
+    /// Scan `/etc/services.d/` directory using getdents64 and load `.conf` files.
+    fn load_services_from_dir(&mut self, dir_fd: i32) {
+        let mut dent_buf = [0u8; 1024];
+        loop {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            let n = getdents64(dir_fd, &mut dent_buf);
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            let mut pos = 0;
+            while pos < n && self.count < MAX_SERVICES {
+                // Each dirent64: u64 ino, u64 off, u16 reclen, u8 type, name[]
+                if pos + 19 > n {
+                    break;
+                }
+                let reclen = (dent_buf[pos + 16] as usize) | ((dent_buf[pos + 17] as usize) << 8);
+                if reclen == 0 || pos + reclen > n {
+                    break;
+                }
+                // Name starts at offset 19.
+                let name_start = pos + 19;
+                let name_end = pos + reclen;
+                // Find null terminator.
+                let mut name_len = 0;
+                while name_start + name_len < name_end && dent_buf[name_start + name_len] != 0 {
+                    name_len += 1;
+                }
+                let name = &dent_buf[name_start..name_start + name_len];
+
+                // Filter for .conf files.
+                if name_len > 5 && name[name_len - 5..] == *b".conf" {
+                    // Build full path: /etc/services.d/<name>\0
+                    let prefix = b"/etc/services.d/";
+                    let path_len = prefix.len() + name_len + 1; // +1 for null
+                    if path_len <= BUF_SIZE {
+                        let mut path_buf = [0u8; BUF_SIZE];
+                        let mut pi = 0;
+                        while pi < prefix.len() {
+                            path_buf[pi] = prefix[pi];
+                            pi += 1;
+                        }
+                        let mut ni = 0;
+                        while ni < name_len {
+                            path_buf[pi] = name[ni];
+                            pi += 1;
+                            ni += 1;
+                        }
+                        path_buf[pi] = 0; // null terminate
+
+                        self.try_load_config(&path_buf[..pi + 1]);
+                    }
+                }
+
+                pos += reclen;
+            }
+        }
+    }
+
+    /// Fallback: iterate over hardcoded config paths.
+    fn load_services_from_known_configs(&mut self) {
+        let mut i = 0;
+        while i < KNOWN_CONFIGS.len() {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            self.try_load_config(KNOWN_CONFIGS[i]);
+            i += 1;
+        }
+    }
+
+    /// Try to open, read, and parse a single service config file.
+    fn try_load_config(&mut self, path: &[u8]) {
+        let fd = open(path, O_RDONLY, 0);
+        if fd >= 0 {
+            let mut buf = [0u8; BUF_SIZE];
+            let n = read(fd as i32, &mut buf);
+            close(fd as i32);
+            if n > 0 {
+                match parse_service_def(&buf, n as usize) {
+                    Some(svc) => {
+                        write_str(STDOUT_FILENO, "init: loaded service '");
+                        write(STDOUT_FILENO, svc.name.as_bytes());
+                        write_str(STDOUT_FILENO, "'\n");
+                        self.services[self.count] = svc;
+                        self.count += 1;
+                    }
+                    None => {
+                        write_str(STDOUT_FILENO, "init: warning: malformed service file ");
+                        write(STDOUT_FILENO, path);
+                        write_str(STDOUT_FILENO, "\n");
+                    }
+                }
+            }
         }
     }
 
@@ -657,21 +808,56 @@ impl ServiceManager {
 
     /// Boot all services in dependency order.
     fn boot_services(&mut self) {
-        let graph = DepGraph::build(&self.services, self.count);
+        let (graph, unresolvable) = DepGraph::build(&self.services, self.count);
+
+        // Mark services with unresolvable deps as PermanentlyStopped.
+        let mut i = 0;
+        while i < self.count {
+            if unresolvable[i] && self.services[i].active {
+                write_str(STDOUT_FILENO, "init: service '");
+                write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                write_str(
+                    STDOUT_FILENO,
+                    "' permanently stopped (unresolvable dependency)\n",
+                );
+                self.services[i].status = ServiceStatus::PermanentlyStopped;
+            }
+            i += 1;
+        }
 
         // Check for cycles.
         if graph.has_cycle(self.count) {
             write_str(
                 STDOUT_FILENO,
-                "init: WARNING: dependency cycle detected, starting services in file order\n",
+                "init: WARNING: dependency cycle detected among services, starting in file order\n",
             );
-            // Fall through to start in file order.
-            let mut i = 0;
-            while i < self.count {
-                if self.services[i].active {
-                    self.start_service(i);
+            // Log which services are involved.
+            write_str(STDOUT_FILENO, "init: cycle may involve: ");
+            let mut first = true;
+            let mut ci = 0;
+            while ci < self.count {
+                if self.services[ci].active
+                    && self.services[ci].status != ServiceStatus::PermanentlyStopped
+                    && graph.depends_count[ci] > 0
+                {
+                    if !first {
+                        write_str(STDOUT_FILENO, ", ");
+                    }
+                    write(STDOUT_FILENO, self.services[ci].name.as_bytes());
+                    first = false;
                 }
-                i += 1;
+                ci += 1;
+            }
+            write_str(STDOUT_FILENO, "\n");
+            // Fall through to start in file order.
+            let mut si = 0;
+            while si < self.count {
+                if self.services[si].active
+                    && self.services[si].status != ServiceStatus::PermanentlyStopped
+                {
+                    self.start_service(si);
+                }
+                si += 1;
             }
             return;
         }
@@ -720,6 +906,17 @@ impl ServiceManager {
     /// Fork+exec a single service.
     fn start_service(&mut self, idx: usize) {
         let svc = &mut self.services[idx];
+
+        // Validate state transition (diagnostic only — log but don't block).
+        if !svc.status.try_transition(ServiceStatus::Starting) {
+            write_str(
+                STDOUT_FILENO,
+                "init: warning: unexpected state transition to Starting for '",
+            );
+            write(STDOUT_FILENO, svc.name.as_bytes());
+            write_str(STDOUT_FILENO, "'\n");
+        }
+
         svc.status = ServiceStatus::Starting;
 
         write_str(STDOUT_FILENO, "init: starting '");
@@ -853,7 +1050,7 @@ impl ServiceManager {
 
         // Iteratively find a running service whose dependents are all stopped,
         // send SIGTERM, wait, then SIGKILL if needed.
-        let graph = DepGraph::build(&self.services, self.count);
+        let (graph, _unresolvable) = DepGraph::build(&self.services, self.count);
 
         loop {
             let mut found = false;
@@ -933,6 +1130,19 @@ impl ServiceManager {
         if pid <= 0 {
             self.services[idx].status = ServiceStatus::Stopped(0);
             return;
+        }
+
+        // Validate state transition (diagnostic only — log but don't block).
+        if !self.services[idx]
+            .status
+            .try_transition(ServiceStatus::Stopping)
+        {
+            write_str(
+                STDOUT_FILENO,
+                "init: warning: unexpected state transition to Stopping for '",
+            );
+            write(STDOUT_FILENO, self.services[idx].name.as_bytes());
+            write_str(STDOUT_FILENO, "'\n");
         }
 
         self.services[idx].status = ServiceStatus::Stopping;
