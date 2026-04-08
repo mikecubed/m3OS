@@ -150,7 +150,7 @@ pub fn should_restart(policy: RestartPolicy, exit: &ExitClassification) -> bool 
     }
 }
 
-/// Compute restart delay in seconds with exponential backoff, capped at 5s.
+/// Compute restart delay in seconds with stepped backoff, capped at 5s.
 ///
 /// - 0 previous restarts → 1s
 /// - 1 previous restart  → 2s
