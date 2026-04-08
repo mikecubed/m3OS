@@ -16,7 +16,7 @@
 //!
 //! | Number | Name         | Args                  |
 //! |---|---|---|
-//! | 0x1100–0x1109 | IPC | (dispatched to ipc::dispatch as 1–10) |
+//! | 0x1100–0x1109 | IPC | dispatched to ipc::dispatch as 1–10 |
 //! | 6       | exit (legacy) | code                |
 //! | 12      | debug_print   | ptr, len            |
 //! | 39      | getpid        | —                   |
@@ -47,15 +47,15 @@ const NEG_EIO: u64 = (-5_i64) as u64;
 const NEG_EBADF: u64 = (-9_i64) as u64;
 #[allow(dead_code)]
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
-pub(super) const NEG_EFAULT: u64 = (-14_i64) as u64;
-pub(super) const NEG_EINVAL: u64 = (-22_i64) as u64;
+const NEG_EFAULT: u64 = (-14_i64) as u64;
+const NEG_EINVAL: u64 = (-22_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
 const NEG_EROFS: u64 = (-30_i64) as u64;
 const NEG_ENOTDIR: u64 = (-20_i64) as u64;
 const NEG_EISDIR: u64 = (-21_i64) as u64;
-pub(super) const NEG_ENOSYS: u64 = (-38_i64) as u64;
+const NEG_ENOSYS: u64 = (-38_i64) as u64;
 const NEG_ESRCH: u64 = (-3_i64) as u64;
 const NEG_EINTR: u64 = (-4_i64) as u64;
 const NEG_ENOTEMPTY: u64 = (-39_i64) as u64;
@@ -959,35 +959,244 @@ pub extern "C" fn syscall_handler(
     user_rip: u64,
     user_rsp: u64,
 ) -> u64 {
-    // Divergent syscalls (exit, sigreturn) never return — handle them first.
-    signal::handle_divergent_signal_syscall(number, user_rsp);
-    process::handle_divergent_syscall(number, arg0);
+    // Divergent syscalls never return — handle them first.
+    match number {
+        15 => sys_sigreturn(user_rsp),
+        60 => sys_exit(arg0 as i32),
+        231 => sys_exit_group(arg0 as i32),
+        _ => {}
+    }
 
-    // Dispatch to subsystem handlers. Each returns Some(result) if handled.
-    let result = if let Some(r) = fs::handle_fs_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = mm::handle_mm_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) =
-        process::handle_process_syscall(number, arg0, arg1, arg2, user_rip, user_rsp)
-    {
-        r
-    } else if let Some(r) = net::handle_net_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = signal::handle_signal_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = io::handle_io_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = time::handle_time_syscall(number, arg0, arg1) {
-        r
-    } else if let Some(r) = misc::handle_misc_syscall(number, arg0, arg1, arg2) {
-        r
-    } else if let Some(r) = ipc::handle_ipc_syscall(number, arg0, arg1, arg2) {
-        r
-    } else {
-        // Phase 21: log unhandled syscalls to help debug ion/musl runtime.
-        log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
-        NEG_ENOSYS
+    // Flat dispatch table — gives LLVM a single match to lower into a jump
+    // table, which is critical for performance under QEMU's TCG where
+    // chained branch sequences are much slower than indexed lookups.
+    let result = match number {
+        // -- fs --
+        0 => sys_linux_read(arg0, arg1, arg2),
+        1 => sys_linux_write(arg0, arg1, arg2),
+        2 => sys_linux_open(arg0, arg1, arg2),
+        3 => sys_linux_close(arg0),
+        4 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, 0),
+        5 => sys_linux_fstat(arg0, arg1),
+        6 => sys_linux_fstatat(AT_FDCWD, arg0, arg1, AT_SYMLINK_NOFOLLOW),
+        8 => sys_linux_lseek(arg0, arg1, arg2),
+        19 => sys_linux_readv(arg0, arg1, arg2),
+        20 => sys_linux_writev(arg0, arg1, arg2),
+        21 => sys_access(arg0),
+        32 => sys_dup(arg0),
+        33 => sys_dup2(arg0, arg1),
+        72 => sys_fcntl(arg0, arg1, arg2),
+        74 => sys_linux_fsync(arg0),
+        76 => sys_linux_truncate(arg0, arg1),
+        77 => sys_linux_ftruncate(arg0, arg1),
+        79 => sys_linux_getcwd(arg0, arg1),
+        80 => sys_linux_chdir(arg0),
+        82 => sys_linux_rename(arg0, arg1),
+        83 => sys_linux_mkdir(arg0, arg1),
+        84 => sys_linux_rmdir(arg0),
+        86 => sys_link(arg0, arg1),
+        87 => sys_linux_unlink(arg0),
+        88 => sys_symlink(arg0, arg1),
+        89 => sys_readlink(arg0, arg1, arg2),
+        90 => sys_linux_chmod(arg0, arg1),
+        91 => sys_linux_fchmod(arg0, arg1),
+        92 => sys_linux_chown(arg0, arg1, arg2),
+        93 => sys_linux_fchown(arg0, arg1, arg2),
+        137 => sys_statfs(arg0, arg1),
+        138 => sys_fstatfs(arg0, arg1),
+        165 => sys_linux_mount(arg0, arg1, arg2),
+        166 => sys_linux_umount2(arg0, arg1),
+        217 => sys_linux_getdents64(arg0, arg1, arg2),
+        257 => sys_linux_openat(arg0, arg1, arg2),
+        262 => sys_linux_fstatat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        265 => sys_linkat(
+            arg0,
+            arg1,
+            arg2,
+            per_core_syscall_arg3(),
+            crate::smp::per_core().syscall_user_r8,
+        ),
+        266 => sys_symlinkat(arg0, arg1, arg2),
+        267 => sys_readlinkat(arg0, arg1, arg2, per_core_syscall_arg3()),
+        280 => {
+            let flags = per_core_syscall_arg3();
+            sys_utimensat(arg0, arg1, arg2, flags)
+        }
+        292 => sys_dup2(arg0, arg1),
+        // -- mm --
+        9 => sys_linux_mmap(arg0, arg1, arg2),
+        10 => sys_mprotect(arg0, arg1, arg2),
+        11 => sys_linux_munmap(arg0, arg1),
+        12 => sys_linux_brk(arg0),
+        // -- process --
+        39 => sys_getpid(),
+        56 => {
+            let child_tidptr = per_core_syscall_arg3();
+            let tls = crate::smp::per_core().syscall_user_r8;
+            sys_clone(arg0, arg1, arg2, child_tidptr, tls, user_rip, user_rsp)
+        }
+        57 => sys_fork(user_rip, user_rsp),
+        59 => sys_execve(arg0, arg1, arg2),
+        61 => sys_waitpid(arg0, arg1, arg2),
+        95 => sys_umask(arg0),
+        102 => sys_linux_getuid(),
+        104 => sys_linux_getgid(),
+        105 => sys_linux_setuid(arg0),
+        106 => sys_linux_setgid(arg0),
+        107 => sys_linux_geteuid(),
+        108 => sys_linux_getegid(),
+        109 => sys_setpgid(arg0, arg1),
+        110 => sys_getppid(),
+        111 => sys_getpgid(0),
+        112 => sys_setsid(),
+        113 => sys_linux_setreuid(arg0, arg1),
+        114 => sys_linux_setregid(arg0, arg1),
+        121 => sys_getpgid(arg0),
+        124 => sys_getsid(arg0),
+        186 => sys_gettid(),
+        200 => sys_tkill(arg0, arg1),
+        203 => {
+            if arg2 == 0 {
+                NEG_EFAULT
+            } else if arg1 < 8 {
+                NEG_EINVAL
+            } else {
+                let mask = {
+                    let mut buf = [0u8; 8];
+                    if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
+                        return NEG_EFAULT;
+                    }
+                    u64::from_ne_bytes(buf)
+                };
+                crate::task::sys_sched_setaffinity(arg0 as u32, mask) as u64
+            }
+        }
+        204 => {
+            let mask = crate::task::sys_sched_getaffinity(arg0 as u32);
+            if mask < 0 {
+                mask as u64
+            } else if arg2 != 0 && arg1 >= 8 {
+                let bytes = (mask as u64).to_ne_bytes();
+                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
+                    return NEG_EFAULT;
+                }
+                8
+            } else {
+                NEG_EINVAL
+            }
+        }
+        218 => sys_linux_set_tid_address(arg0),
+        // -- net --
+        41 => sys_socket(arg0, arg1, arg2),
+        42 => sys_connect(arg0, arg1, arg2),
+        43 => sys_accept(arg0, arg1, arg2),
+        44 => {
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len = crate::smp::per_core().syscall_user_r9;
+            sys_sendto(arg0, arg1, arg2, flags, addr_ptr, addr_len)
+        }
+        45 => {
+            let flags = per_core_syscall_arg3();
+            let addr_ptr = crate::smp::per_core().syscall_user_r8;
+            let addr_len_ptr = crate::smp::per_core().syscall_user_r9;
+            sys_recvfrom_socket(arg0, arg1, arg2, flags, addr_ptr, addr_len_ptr)
+        }
+        48 => sys_shutdown_sock(arg0, arg1),
+        49 => sys_bind(arg0, arg1, arg2),
+        50 => sys_listen(arg0, arg1),
+        51 => sys_getsockname(arg0, arg1, arg2),
+        52 => sys_getpeername(arg0, arg1, arg2),
+        53 => {
+            let sv_ptr = per_core_syscall_arg3();
+            sys_socketpair(arg0, arg1, arg2, sv_ptr)
+        }
+        54 => {
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen = crate::smp::per_core().syscall_user_r8;
+            sys_setsockopt(arg0, arg1, arg2, optval_ptr, optlen)
+        }
+        55 => {
+            let optval_ptr = per_core_syscall_arg3();
+            let optlen_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_getsockopt(arg0, arg1, arg2, optval_ptr, optlen_ptr)
+        }
+        288 => {
+            let flags = per_core_syscall_arg3();
+            sys_accept4(arg0, arg1, arg2, flags)
+        }
+        // -- signal --
+        13 => sys_rt_sigaction(arg0, arg1, arg2),
+        14 => sys_rt_sigprocmask(arg0, arg1, arg2),
+        62 => sys_kill(arg0, arg1),
+        131 => sys_sigaltstack(arg0, arg1),
+        // -- io --
+        7 => sys_poll(arg0, arg1, arg2),
+        22 => sys_pipe_with_flags(arg0, false),
+        23 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_select(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
+        232 => {
+            let timeout = per_core_syscall_arg3();
+            sys_epoll_wait(arg0, arg1, arg2, timeout)
+        }
+        233 => {
+            let event_ptr = per_core_syscall_arg3();
+            sys_epoll_ctl(arg0, arg1, arg2, event_ptr)
+        }
+        270 => {
+            let exceptfds = per_core_syscall_arg3();
+            let timeout_ptr = crate::smp::per_core().syscall_user_r8;
+            sys_pselect6(arg0, arg1, arg2, exceptfds, timeout_ptr)
+        }
+        291 => sys_epoll_create1(arg0),
+        293 => {
+            let cloexec = arg1 & 0x80000 != 0;
+            sys_pipe_with_flags(arg0, cloexec)
+        }
+        // -- time --
+        35 => sys_nanosleep(arg0),
+        96 => sys_gettimeofday(arg0),
+        100 => sys_times(arg0),
+        228 => sys_clock_gettime(arg0, arg1),
+        // -- misc --
+        16 => sys_linux_ioctl(arg0, arg1, arg2),
+        34 => {
+            let pid = crate::process::current_pid();
+            let uid_val = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table.find(pid).map(|p| p.uid).unwrap_or(0)
+            };
+            crate::task::sys_nice(arg0 as i32, uid_val) as u64
+        }
+        63 => sys_linux_uname(arg0),
+        158 => sys_linux_arch_prctl(arg0, arg1),
+        169 => sys_reboot(arg0),
+        202 => {
+            let val3 = crate::smp::per_core().syscall_user_r9;
+            sys_futex(arg0, arg1, arg2, val3)
+        }
+        273 => 0,
+        302 => NEG_ENOSYS,
+        318 => sys_getrandom(arg0, arg1, arg2),
+        0x1000 => sys_debug_print(arg0, arg1),
+        0x1001 => sys_meminfo(arg0, arg1),
+        #[cfg(feature = "trace")]
+        0x1002 => sys_ktrace(arg0, arg1, arg2),
+        0x1005 => sys_framebuffer_info(arg0, arg1),
+        0x1006 => sys_framebuffer_mmap(),
+        0x1007 => sys_read_scancode(),
+        // -- ipc --
+        0x1100..=0x1109 => {
+            let dispatch_number = (number - 0x1100) + 1;
+            crate::ipc::dispatch(dispatch_number, arg0, arg1, arg2, 0, 0)
+        }
+        _ => {
+            log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
+            NEG_ENOSYS
+        }
     };
 
     // Phase 14/19: check pending signals before returning to userspace.
