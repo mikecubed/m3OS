@@ -45,9 +45,10 @@ that the caller owns the source handle and that the target task exists.
 
 A new `Capability::Grant { frame, page_count, writable }` variant represents
 ownership of physical page frames that can be mapped into a receiver's address
-space. This is the zero-copy path for transfers larger than 64 KiB, primarily
-framebuffer spans. Ownership transfers atomically: the sender loses access
-when the grant succeeds.
+space. This is capability-table groundwork for a future zero-copy path for
+transfers larger than 64 KiB (primarily framebuffer spans). The kernel-side
+mapping and revocation logic is not yet implemented; the variant exists in the
+capability table but does not currently remap pages or transfer ownership.
 
 ### Message Cap Field
 
@@ -55,14 +56,19 @@ when the grant succeeds.
 that capability transfers can be bundled with IPC messages. Existing
 constructors (`new`, `with1`, `with2`) continue to work unchanged with no
 capability attached. When a message with an attached capability is delivered
-via `send` or `call`, the kernel invokes the grant logic to transfer the
-capability from sender to receiver.
+via `send` or `call`, the kernel transfers it using `transfer_cap` in
+`kernel/src/ipc/endpoint.rs`: it inserts the capability into the receiver's
+capability table via `insert_cap` and writes the assigned handle into
+`msg.data[3]`. This is distinct from the explicit `sys_cap_grant` /
+`CapabilityTable::grant` path.
 
 ### Buffer Validation
 
-Before any `copy_from_user` or `copy_to_user`, the kernel calls
 `validate_user_buffer(addr, len)` (defined in `kernel-core/src/ipc/buffer.rs`)
-to perform pure-logic address checks:
+is a host-testable pure-logic mirror of the address checks that
+`kernel/src/mm/user_mem.rs` performs inline before `copy_from_user` /
+`copy_to_user`. The kernel's runtime validation lives in `user_mem.rs`; this
+function provides the same rules in a form that can be unit-tested on the host:
 
 - Address must be above `0x1000` and below `0x0000_8000_0000_0000`
 - Length must not exceed 64 KiB

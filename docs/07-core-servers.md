@@ -292,10 +292,12 @@ The Phase 7 `CONSOLE_WRITE` message passes a pointer directly in the IPC payload
 data[0]: pointer to string (kernel virtual address)
 ```
 
-As of Phase 50, the console server's data path has been ported to use validated
-`copy_from_user` instead of raw kernel-pointer dereference. For transfers larger than
-64 KiB, page capability grants (`Capability::Grant`) provide a zero-copy path. See
-`docs/50-ipc-completion.md` for the complete bulk-data transport model.
+Phase 50 defines the intended migration of the console server data path to validated
+`copy_from_user` and, for transfers larger than 64 KiB, page capability grants
+(`Capability::Grant`) as a zero-copy path. The current Phase 7-style pointer-in-message
+path still uses `copy_nonoverlapping` with basic address-range validation, not full
+page-table-walking `copy_from_user`. See `docs/50-ipc-completion.md` for the planned
+bulk-data transport model.
 
 ### Registry is static (Phase 7 only)
 

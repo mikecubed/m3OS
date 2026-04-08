@@ -263,8 +263,11 @@ payload. As of Phase 50, the IPC transport model provides two validated alternat
 - **Page capability grants** (`Capability::Grant`) for larger transfers (framebuffer spans).
   The sender grants physical page frames to the receiver; ownership transfers atomically.
 
-The raw kernel-pointer convention is no longer the current behavior. See
-`docs/50-ipc-completion.md` for the full bulk-data transport contract.
+These are the transport primitives that Phase 50 makes available, but the
+existing Phase 8 filesystem IPC handlers still use the raw kernel-pointer
+convention until the servers and protocols are ported to `copy_from_user` /
+`copy_to_user` or grants. See `docs/50-ipc-completion.md` for the planned
+bulk-data transport contract.
 
 ### Stateless file descriptors
 

@@ -554,12 +554,12 @@ m3OS uses a two-tier bulk-data strategy selected by payload size:
 `kernel/src/mm/user_mem.rs`) to transfer bytes through the caller's page
 tables.  This is the common path for the vast majority of IPC payloads.
 
-**Page-grant path** — For transfers larger than 64 KiB (primarily framebuffer
-spans), the sender grants one or more physical page frames to the receiver via
-a `Capability::Grant { frame, page_count, writable }` capability.  The kernel
-remaps the pages into the receiver's address space; no byte-copying occurs.
-Ownership transfers atomically: the sender loses access when the grant
-succeeds.
+**Page-grant path (structural groundwork)** — For transfers larger than 64 KiB
+(primarily framebuffer spans), Phase 50 adds a `Capability::Grant { frame,
+page_count, writable }` variant to the capability table.  The kernel-side
+mapping and revocation logic that would remap pages into the receiver's address
+space is not yet implemented; the Grant variant is capability-table groundwork
+for a future zero-copy transport path.
 
 ### Payload Coverage
 
