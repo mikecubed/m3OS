@@ -308,6 +308,18 @@ pub const SYS_CREATE_IRQ_NOTIFICATION: u64 = 0x110A;
 /// Create a new IPC endpoint and return a cap handle.
 pub const SYS_CREATE_ENDPOINT: u64 = 0x110B;
 
+/// Send a message with an attached bulk-data buffer (fire-and-forget).
+pub const SYS_IPC_SEND_BUF: u64 = 0x110C;
+
+/// Send a message with an attached bulk-data buffer and wait for reply.
+pub const SYS_IPC_CALL_BUF: u64 = 0x110D;
+
+/// Receive a message with full data words and optional bulk payload.
+pub const SYS_IPC_RECV_MSG: u64 = 0x110E;
+
+/// Reply then receive with full data words and optional bulk payload.
+pub const SYS_IPC_REPLY_RECV_MSG: u64 = 0x110F;
+
 // ===========================================================================
 // IPC wrappers (Phase 52)
 // ===========================================================================
@@ -429,6 +441,94 @@ pub fn create_endpoint() -> u64 {
 /// Returns the new cap handle on success, `u64::MAX` on error.
 pub fn create_irq_notification(irq: u32) -> u64 {
     unsafe { syscall1(SYS_CREATE_IRQ_NOTIFICATION, irq as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-data IPC wrappers (Phase 52)
+// ---------------------------------------------------------------------------
+
+/// Send a message with an attached bulk-data buffer (fire-and-forget).
+///
+/// The kernel copies `buf` from this process's address space, attaches it
+/// to the IPC message, and delivers both to the endpoint receiver.
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_send_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_SEND_BUF,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    }
+}
+
+/// Send a message with an attached bulk-data buffer and wait for a reply.
+///
+/// Like [`ipc_call`] but additionally copies `buf` from this process's
+/// address space and delivers it alongside the message.
+/// Returns the reply label on success, `u64::MAX` on error.
+pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_CALL_BUF,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    }
+}
+
+/// Receive a message with full data words and optional bulk payload.
+///
+/// Blocks until a message arrives on the endpoint.  The kernel writes
+/// the [`IpcMessage`] header (label + data[0..4]) to `msg` and copies
+/// any attached bulk data into `buf`.  Returns the label on success,
+/// `u64::MAX` on error.
+pub fn ipc_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_RECV_MSG,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Reply to a caller and immediately receive the next message with bulk data.
+///
+/// Combines reply + recv_msg in one syscall.  The reply carries only a
+/// label (no bulk data in the reply direction).  The received message
+/// header is written to `msg` and any bulk payload to `buf`.
+/// Returns the next message label on success, `u64::MAX` on error.
+pub fn ipc_reply_recv_msg(
+    reply_cap_handle: u32,
+    reply_label: u64,
+    ep_cap_handle: u32,
+    msg: &mut IpcMessage,
+    buf: &mut [u8],
+) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_REPLY_RECV_MSG,
+            reply_cap_handle as u64,
+            reply_label,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            0,
+        )
+    }
 }
 
 /// Push bytes from a userspace buffer into the kernel stdin buffer.

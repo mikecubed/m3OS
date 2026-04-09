@@ -1068,7 +1068,7 @@ mod syscall_nr {
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x110B;
+    pub const IPC_LAST: u64 = 0x110F;
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,7 +1360,14 @@ pub extern "C" fn syscall_handler(
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
-            crate::ipc::dispatch(dispatch_number, arg0, arg1, arg2, 0, 0)
+            crate::ipc::dispatch(
+                dispatch_number,
+                arg0,
+                arg1,
+                arg2,
+                per_core_syscall_arg3(),
+                crate::smp::per_core().syscall_user_r8,
+            )
         }
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");

@@ -218,6 +218,7 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
+            transfer_bulk(pending.task, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
@@ -266,6 +267,16 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
     recv_msg(receiver, ep_id).label
 }
 
+/// Transfer any pending bulk data from `src` to `dst` task.
+///
+/// Called alongside `deliver_message` to move the sender's bulk payload to
+/// the receiver's slot.  No-op if no bulk data is pending.
+fn transfer_bulk(src: TaskId, dst: TaskId) {
+    if let Some(bulk) = scheduler::take_bulk_data(src) {
+        scheduler::deliver_bulk(dst, bulk);
+    }
+}
+
 /// Send a message to an endpoint.
 ///
 /// If a receiver is already waiting, deliver directly and wake it.
@@ -296,6 +307,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
@@ -364,6 +376,7 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                 return Message::new(u64::MAX);
             }
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(caller, receiver);
             let _ = scheduler::wake_task(receiver);
         }
         None => {
@@ -521,6 +534,7 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 return false;
             }
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,

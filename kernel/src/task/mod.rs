@@ -60,12 +60,12 @@ pub mod wait_queue;
 pub use scheduler::{
     block_current_on_futex, block_current_on_futex_unless_woken, block_current_on_notif,
     block_current_on_recv, block_current_on_reply, block_current_on_send,
-    block_current_unless_woken, current_task_id, deliver_message, insert_cap, mark_current_dead,
-    mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run, server_endpoint,
-    set_current_task_pid, set_server_endpoint, signal_reschedule, spawn, spawn_fork_task,
-    spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice, sys_sched_getaffinity,
-    sys_sched_setaffinity, take_current_task_fork_ctx, take_message, task_cap, wake_task,
-    yield_now,
+    block_current_unless_woken, current_task_id, deliver_bulk, deliver_message, insert_cap,
+    mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
+    server_endpoint, set_current_task_pid, set_server_endpoint, signal_reschedule, spawn,
+    spawn_fork_task, spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice,
+    sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data, take_current_task_fork_ctx,
+    take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +136,12 @@ pub struct Task {
     /// `None` when the task has not yet been sent a message.  Set by the
     /// sender/IPC core; consumed by `take_message` after the task wakes.
     pub pending_msg: Option<Message>,
+    /// Bulk data attached to the pending message (Phase 52).
+    ///
+    /// Set alongside `pending_msg` when a sender uses `ipc_send_buf` or
+    /// `ipc_call_buf`.  Consumed by `take_bulk_data` after the receiver
+    /// wakes.  `None` for messages without bulk payloads.
+    pub pending_bulk: Option<alloc::vec::Vec<u8>>,
     /// Endpoint this task is the "server" of (used by `reply_recv` to find
     /// the endpoint to block on after replying).
     pub server_endpoint: Option<crate::ipc::EndpointId>,
@@ -187,6 +193,7 @@ impl Task {
             saved_rsp,
             caps: CapabilityTable::new(),
             pending_msg: None,
+            pending_bulk: None,
             server_endpoint: None,
             assigned_core: 0,
             pid: 0,                  // Set by fork_child_trampoline for userspace tasks

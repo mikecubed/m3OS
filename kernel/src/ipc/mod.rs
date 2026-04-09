@@ -55,8 +55,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x110B` are translated to internal
-/// dispatch numbers 1–12 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x110F` are translated to internal
+/// dispatch numbers 1–16 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
@@ -72,6 +72,10 @@ pub use registry::RegistryError;
 /// | 10 | 0x1109 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
 /// | 11 | 0x110A | `create_irq_notification(irq)` | `arg0 = IRQ number` → new CapHandle |
 /// | 12 | 0x110B | `create_endpoint()` | — → new CapHandle |
+/// | 13 | 0x110C | `ipc_send_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` |
+/// | 14 | 0x110D | `ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` → label |
+/// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label |
+/// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -94,7 +98,7 @@ pub use registry::RegistryError;
 ///   success, or `u64::MAX` on error (not found, cap table full, etc.).
 /// - `create_irq_notification` (11): returns the new `CapHandle` as `u64` on
 ///   success, or `u64::MAX` on error (invalid IRQ, cap table full, etc.).
-pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     use crate::task::{TaskId, scheduler};
 
     // notify_wait (7) errors return 0; all other IPC errors return u64::MAX.
@@ -268,6 +272,57 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
                 _ => u64::MAX,
             }
         }
+        13 => {
+            // ipc_send_buf(ep_cap, label, data0, buf_ptr, buf_len)
+            match cap {
+                Capability::Endpoint(ep_id) => {
+                    let msg = message::Message::with2(arg1, arg2, 0);
+                    ipc_send_with_bulk(task_id, ep_id, msg, arg3, arg4, false)
+                }
+                _ => u64::MAX,
+            }
+        }
+        14 => {
+            // ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len)
+            match cap {
+                Capability::Endpoint(ep_id) => {
+                    let msg = message::Message::with2(arg1, arg2, 0);
+                    ipc_send_with_bulk(task_id, ep_id, msg, arg3, arg4, true)
+                }
+                _ => u64::MAX,
+            }
+        }
+        15 => {
+            // ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)
+            match cap {
+                Capability::Endpoint(ep_id) => ipc_recv_msg(task_id, ep_id, arg1, arg2, arg3),
+                _ => u64::MAX,
+            }
+        }
+        16 => {
+            // ipc_reply_recv_msg(reply_cap, reply_label, ep_cap, msg_ptr, buf_ptr)
+            // reply_cap = arg0 (already looked up as `cap`)
+            // reply_label = arg1
+            // ep_cap = arg2
+            // msg_ptr = arg3
+            // buf_ptr = arg4
+            let caller_id = match cap {
+                Capability::Reply(id) => id,
+                _ => return u64::MAX,
+            };
+            if arg2 > u64::from(u32::MAX) {
+                return u64::MAX;
+            }
+            let ep_id = match scheduler::task_cap(task_id, arg2 as CapHandle) {
+                Ok(Capability::Endpoint(id)) => id,
+                _ => return u64::MAX,
+            };
+            let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            let reply = message::Message::new(arg1);
+            endpoint::reply(caller_id, reply);
+            // Now recv with bulk output.  Use a fixed 4096-byte output buf len.
+            ipc_recv_msg(task_id, ep_id, arg3, arg4, 4096)
+        }
         _ => u64::MAX,
     }
 }
@@ -393,4 +448,110 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
             u64::MAX
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-data IPC helpers (Phase 52)
+// ---------------------------------------------------------------------------
+
+/// Maximum bulk-data payload accepted by `ipc_send_buf` / `ipc_call_buf`.
+const MAX_BULK_LEN: usize = 4096;
+
+/// Send (or call) with an attached bulk-data buffer.
+///
+/// Copies `buf_len` bytes from the sender's userspace address `buf_ptr` into
+/// a kernel-owned `Vec<u8>`, then delivers the message + bulk data to the
+/// receiver through the endpoint.  The `is_call` flag selects between
+/// fire-and-forget send and RPC-style call.
+///
+/// Returns `0` on send success, the reply label on call success, or
+/// `u64::MAX` on error.
+fn ipc_send_with_bulk(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    mut msg: message::Message,
+    buf_ptr: u64,
+    buf_len: u64,
+    is_call: bool,
+) -> u64 {
+    use crate::task::scheduler;
+
+    let len = buf_len as usize;
+    if len == 0 || len > MAX_BULK_LEN {
+        return u64::MAX;
+    }
+
+    // Copy the sender's buffer into kernel memory while the sender's CR3
+    // is still active.
+    let mut bulk = alloc::vec![0u8; len];
+    if crate::mm::user_mem::copy_from_user(&mut bulk, buf_ptr).is_err() {
+        return u64::MAX;
+    }
+
+    // Encode the actual bulk data length in data[1] so the receiver knows
+    // how many bytes to expect in its output buffer.
+    msg.data[1] = len as u64;
+
+    // Store bulk data in the sender's pending_bulk slot.  The endpoint
+    // send/call code will transfer it to the receiver via
+    // `deliver_message` + `deliver_bulk`.
+    scheduler::deliver_bulk(task_id, bulk);
+
+    if is_call {
+        endpoint::call(task_id, ep_id, msg)
+    } else if endpoint::send(task_id, ep_id, msg) {
+        0
+    } else {
+        // Send failed — clean up the bulk data.
+        let _ = scheduler::take_bulk_data(task_id);
+        u64::MAX
+    }
+}
+
+/// Receive a message with full data words and optional bulk payload.
+///
+/// Calls `recv_msg` to get the full `Message`, then writes the header
+/// (label + data[0..4]) to `msg_ptr` and any bulk data to `buf_ptr`
+/// via `copy_to_user`.  `buf_len` caps the bulk copy.
+///
+/// Returns the message label on success, or `u64::MAX` on error.
+fn ipc_recv_msg(
+    task_id: crate::task::TaskId,
+    ep_id: endpoint::EndpointId,
+    msg_ptr: u64,
+    buf_ptr: u64,
+    buf_len: u64,
+) -> u64 {
+    use crate::task::scheduler;
+
+    let msg = endpoint::recv_msg(task_id, ep_id);
+    if msg.label == u64::MAX {
+        return u64::MAX;
+    }
+
+    // Write the IpcMessage header (label + 4 data words = 40 bytes) to
+    // userspace.  Layout must match syscall_lib::IpcMessage.
+    if msg_ptr != 0 {
+        let mut header = [0u8; 40];
+        header[0..8].copy_from_slice(&msg.label.to_ne_bytes());
+        for (i, &d) in msg.data.iter().enumerate() {
+            let off = 8 + i * 8;
+            header[off..off + 8].copy_from_slice(&d.to_ne_bytes());
+        }
+        if crate::mm::user_mem::copy_to_user(msg_ptr, &header).is_err() {
+            return u64::MAX;
+        }
+    }
+
+    // Copy bulk data to the receiver's buffer if present.
+    if buf_ptr != 0
+        && let Some(bulk) = scheduler::take_bulk_data(task_id)
+    {
+        let copy_len = bulk.len().min(buf_len as usize);
+        if copy_len > 0 && crate::mm::user_mem::copy_to_user(buf_ptr, &bulk[..copy_len]).is_err() {
+            return u64::MAX;
+        }
+    }
+
+    msg.label
 }

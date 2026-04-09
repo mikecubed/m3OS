@@ -83,60 +83,47 @@ const REPLY_CAP_HANDLE: u32 = 1;
 // ---------------------------------------------------------------------------
 
 fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
+    let mut msg = syscall_lib::IpcMessage::new(0);
+    let mut buf = [0u8; MAX_CONSOLE_WRITE_LEN];
+
     // First receive — blocks until a client sends a message.
-    let mut label = syscall_lib::ipc_recv(ep_handle);
+    syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
 
     loop {
-        let reply_label = match label {
-            CONSOLE_WRITE => handle_console_write(renderer),
-            _ => {
-                // Unknown operation — reply with error.
-                u64::MAX
+        let reply_label = match msg.label {
+            CONSOLE_WRITE => {
+                let len = (msg.data[1] as usize).min(MAX_CONSOLE_WRITE_LEN);
+                handle_console_write(renderer, &buf[..len])
             }
+            _ => u64::MAX,
         };
 
         // Reply and wait for the next message.
-        label = syscall_lib::ipc_reply_recv(REPLY_CAP_HANDLE, reply_label, ep_handle);
+        msg = syscall_lib::IpcMessage::new(0);
+        syscall_lib::ipc_reply_recv_msg(
+            REPLY_CAP_HANDLE,
+            reply_label,
+            ep_handle,
+            &mut msg,
+            &mut buf,
+        );
     }
 }
 
-/// Handle a CONSOLE_WRITE message.
-///
-/// The kernel's IPC mechanism copies the message data fields (data[0] and
-/// data[1]) into the receiver's message registers. For userspace IPC with
-/// the current 3-arg syscall ABI, only the label is directly available via
-/// the recv return value. The full message payload (ptr, len) is passed
-/// through the kernel's message data fields.
-///
-/// However, since the current IPC recv only returns the label (not data
-/// fields), and the kernel copies data through registers, we need the
-/// caller to pass the data inline. For now, the console server reads
-/// from a shared IPC buffer convention.
-///
-/// For Phase 52, the actual text content arrives through the kernel's
-/// copy_from_user mechanism during the recv. The data[0] (pointer) and
-/// data[1] (length) fields are available after the recv completes.
-///
-/// Since the current syscall ABI only returns the label from ipc_recv,
-/// we use a fixed shared buffer approach: callers write their text to
-/// a well-known address in the caller's IPC buffer, and the server reads
-/// it from there.
-///
-/// Actually, the simplest approach that works with the existing kernel:
-/// the kernel's ipc_recv delivers the full Message to the task's IPC
-/// message registers. We just cannot read them from the userspace recv
-/// wrapper. We need a way to read the message data after recv.
-///
-/// For now, use a simpler protocol: the caller's data[0] is embedded as
-/// the second return value. Since our syscall ABI is limited, we'll echo
-/// a fixed test string until the full message data passing is wired up.
-///
-/// TODO(Phase 52): Wire full message data passing through ipc_recv.
-fn handle_console_write(_renderer: &mut FbRenderer) -> u64 {
-    // With the current limited IPC ABI, we acknowledge the write.
-    // The actual rendering happens when the kernel console path is
-    // used (the kernel still renders via its fb::write_str for now).
-    0
+/// Handle a CONSOLE_WRITE message by rendering the payload to the
+/// framebuffer and echoing it to serial via stdout.
+fn handle_console_write(renderer: &mut FbRenderer, data: &[u8]) -> u64 {
+    if data.is_empty() {
+        return u64::MAX;
+    }
+    // Validate UTF-8.  Non-UTF-8 payloads are rejected.
+    if let Ok(text) = core::str::from_utf8(data) {
+        renderer.write_str(text);
+        syscall_lib::write_str(STDOUT_FILENO, text);
+        0
+    } else {
+        u64::MAX
+    }
 }
 
 // ---------------------------------------------------------------------------

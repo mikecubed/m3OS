@@ -809,6 +809,24 @@ pub fn take_message(id: TaskId) -> Option<Message> {
     }
 }
 
+/// Store bulk data alongside a pending message (Phase 52).
+pub fn deliver_bulk(id: TaskId, data: alloc::vec::Vec<u8>) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].pending_bulk = Some(data);
+    }
+}
+
+/// Remove and return the pending bulk data for a task (Phase 52).
+pub fn take_bulk_data(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].pending_bulk.take()
+    } else {
+        None
+    }
+}
+
 /// Insert a capability into a task's capability table.
 pub fn insert_cap(id: TaskId, cap: Capability) -> Result<CapHandle, CapError> {
     let mut sched = SCHEDULER.lock();
