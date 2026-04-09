@@ -270,31 +270,36 @@ fn priority_name(pri: u32) -> &'static [u8] {
         },
         1 => match severity {
             0..=3 => b"user.err",
-            4..=5 => b"user.notice",
+            4 => b"user.warn",
+            5 => b"user.notice",
             6 => b"user.info",
             _ => b"user.debug",
         },
         3 => match severity {
             0..=3 => b"daemon.err",
-            4..=5 => b"daemon.notice",
+            4 => b"daemon.warn",
+            5 => b"daemon.notice",
             6 => b"daemon.info",
             _ => b"daemon.debug",
         },
         4 => match severity {
             0..=3 => b"auth.err",
-            4..=5 => b"auth.notice",
+            4 => b"auth.warn",
+            5 => b"auth.notice",
             6 => b"auth.info",
             _ => b"auth.debug",
         },
         9 => match severity {
             0..=3 => b"cron.err",
-            4..=5 => b"cron.notice",
+            4 => b"cron.warn",
+            5 => b"cron.notice",
             6 => b"cron.info",
             _ => b"cron.debug",
         },
         10 => match severity {
             0..=3 => b"authpriv.err",
-            4..=5 => b"authpriv.notice",
+            4 => b"authpriv.warn",
+            5 => b"authpriv.notice",
             6 => b"authpriv.info",
             _ => b"authpriv.debug",
         },
@@ -302,14 +307,16 @@ fn priority_name(pri: u32) -> &'static [u8] {
             // local0-local7
             match severity {
                 0..=3 => b"local.err",
-                4..=5 => b"local.notice",
+                4 => b"local.warn",
+                5 => b"local.notice",
                 6 => b"local.info",
                 _ => b"local.debug",
             }
         }
         _ => match severity {
             0..=3 => b"unknown.err",
-            4..=5 => b"unknown.notice",
+            4 => b"unknown.warn",
+            5 => b"unknown.notice",
             6 => b"unknown.info",
             _ => b"unknown.debug",
         },
