@@ -253,8 +253,13 @@ fn program_main(_args: &[&str]) -> i32 {
         // Read current termios flags from the kernel.
         let mut tf = TermiosFlags::zeroed();
         syscall_lib::get_termios_flags(&mut tf);
+        // Force reload from memory — the optimizer may cache the zeroed
+        // values across the syscall despite the implicit asm! barrier.
+        let c_lflag = unsafe { core::ptr::read_volatile(&tf.c_lflag) };
+        let c_iflag = unsafe { core::ptr::read_volatile(&tf.c_iflag) };
+        let c_oflag = unsafe { core::ptr::read_volatile(&tf.c_oflag) };
 
-        let canonical = tf.c_lflag & ICANON != 0;
+        let canonical = c_lflag & ICANON != 0;
 
         // VT100 escape sequences for special keys.
         let escape_seq: Option<&[u8]> = match sc {
@@ -304,11 +309,11 @@ fn program_main(_args: &[&str]) -> i32 {
             }
         };
 
-        let echo_on = tf.c_lflag & ECHO != 0;
-        let isig = tf.c_lflag & ISIG != 0;
+        let echo_on = c_lflag & ECHO != 0;
+        let isig = c_lflag & ISIG != 0;
 
         // ICRNL: translate CR to NL on input.
-        let byte = if (tf.c_iflag & ICRNL != 0) && byte == b'\r' {
+        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
             b'\n'
         } else {
             byte
@@ -344,7 +349,7 @@ fn program_main(_args: &[&str]) -> i32 {
             // VERASE (backspace/DEL)
             if byte == tf.c_cc[VERASE] || byte == 0x7F {
                 let erased = edit_buf.erase_char();
-                if erased.is_some() && echo_on && (tf.c_lflag & ECHOE != 0) {
+                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
                     echo("\x08 \x08");
                 }
                 continue;
@@ -353,7 +358,7 @@ fn program_main(_args: &[&str]) -> i32 {
             // VKILL (^U)
             if byte == tf.c_cc[VKILL] {
                 let n = edit_buf.kill_line();
-                if n > 0 && echo_on && (tf.c_lflag & ECHOK != 0) {
+                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
                     for _ in 0..n {
                         echo("\x08 \x08");
                     }
@@ -394,8 +399,8 @@ fn program_main(_args: &[&str]) -> i32 {
                 syscall_lib::stdin_push(&nl);
 
                 // Echo newline.
-                if echo_on || (tf.c_lflag & ECHONL != 0) {
-                    if tf.c_oflag & ONLCR != 0 {
+                if echo_on || (c_lflag & ECHONL != 0) {
+                    if c_oflag & ONLCR != 0 {
                         echo("\r\n");
                     } else {
                         echo("\n");
@@ -416,7 +421,7 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::stdin_push(&buf);
 
             if echo_on {
-                if tf.c_oflag & ONLCR != 0 && byte == b'\n' {
+                if c_oflag & ONLCR != 0 && byte == b'\n' {
                     echo("\r\n");
                 } else {
                     echo_byte(byte);
