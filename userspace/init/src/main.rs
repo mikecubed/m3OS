@@ -47,6 +47,9 @@ const CMD_FILE: &[u8] = b"/var/run/init.cmd\0";
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
+    b"/etc/services.d/console.conf\0",
+    b"/etc/services.d/kbd.conf\0",
+    b"/etc/services.d/stdin_feeder.conf\0",
     b"/etc/services.d/sshd.conf\0",
     b"/etc/services.d/telnetd.conf\0",
     b"/etc/services.d/syslogd.conf\0",
