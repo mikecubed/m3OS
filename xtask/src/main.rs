@@ -156,9 +156,12 @@ fn build_userspace_bins() {
         ("unix-socket-test", "unix-socket-test", false),
         ("thread-test", "thread-test", false),
         ("crypto-test", "crypto-test", true),
-        ("sshd", "sshd", true),        // Phase 43: SSH server
-        ("syslogd", "syslogd", false), // Phase 46: system logger
-        ("crond", "crond", false),     // Phase 46: cron daemon
+        ("sshd", "sshd", true),                     // Phase 43: SSH server
+        ("syslogd", "syslogd", false),              // Phase 46: system logger
+        ("crond", "crond", false),                  // Phase 46: cron daemon
+        ("console_server", "console_server", true), // Phase 52: ring-3 console (alloc for kernel-core dep)
+        ("kbd_server", "kbd_server", false),        // Phase 52: ring-3 keyboard
+        ("stdin_feeder", "stdin_feeder", false),    // Phase 52: ring-3 stdin
     ];
 
     for &(pkg, bin, needs_alloc) in bins {

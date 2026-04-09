@@ -6,9 +6,23 @@
 //! framebuffer.  Also echoes output to serial via stdout.
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+use core::alloc::Layout;
 use kernel_core::fb::{AnsiParser, ConsoleCmd, SgrParams};
 use syscall_lib::STDOUT_FILENO;
+use syscall_lib::heap::BrkAllocator;
+
+#[global_allocator]
+static ALLOCATOR: BrkAllocator = BrkAllocator::new();
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! {
+    syscall_lib::write_str(STDOUT_FILENO, "console_server: alloc error\n");
+    syscall_lib::exit(99)
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
