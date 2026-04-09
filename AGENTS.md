@@ -22,8 +22,11 @@ cargo xtask test --test <name>  # run a single QEMU test binary
 cargo xtask test --timeout 120  # custom timeout (default 60s)
 cargo xtask test --display      # show QEMU window for debugging
 cargo xtask sign         # sign EFI binary with Secure Boot keys
+cargo xtask clean        # delete disk.img so next run recreates it
 cargo test -p kernel-core       # run kernel-core host-side unit tests directly
 ```
+
+After adding new service configs to the ext2 data disk, run `cargo xtask clean` to force disk recreation.
 
 Tests cannot use `cargo test` on the kernel — it is `no_std` and tests run inside QEMU via the xtask harness. Pure-logic code lives in `kernel-core` and is testable on the host via `cargo test -p kernel-core`.
 
@@ -138,6 +141,15 @@ ports/
     src/                  # bundled source code
     patches/              # m3OS-specific patches
 ```
+
+### Adding a New Userspace Binary
+
+Adding a new userspace binary requires changes in **four** places. Missing any one of these causes the binary to either not be built, not be embedded in the kernel image, or not be found at runtime.
+
+1. **Workspace member** — add the crate to `Cargo.toml` `members` list
+2. **xtask build pipeline** — add to the `bins` array in `xtask/src/main.rs` (`build_userspace` function, ~line 141). Set `needs_alloc = true` if the crate depends on `alloc` (e.g., uses `kernel-core` or `Vec`/`Box`/`String`). If `needs_alloc` is true, the binary must define a `#[global_allocator]` (use `syscall_lib::heap::BrkAllocator`) and enable the `alloc` feature on `syscall-lib`.
+3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Without this, `execve` returns ENOENT.
+4. **Service config (if daemon)** — add a `.conf` file to the ext2 data disk builder in `xtask/src/main.rs` (`populate_ext2_files` function) AND to the `KNOWN_CONFIGS` fallback list in `userspace/init/src/main.rs`. Run `cargo xtask clean` to recreate the disk.
 
 ### Kernel Source Layout
 
