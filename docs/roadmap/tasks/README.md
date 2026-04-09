@@ -239,9 +239,10 @@ flowchart TD
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 51 | Service model maturity (contract, restart, shutdown, admin) | In Progress | `phase-51` | [Tasks](./51-service-model-maturity-tasks.md) |
+| 52 | First service extractions (console, keyboard to ring 3) | In Progress | `phase-52` | [Tasks](./52-first-service-extractions-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **52 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **53 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

@@ -54,6 +54,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Architectural Declaration](./49-architectural-declaration.md) | 49 | Syscall decomposition, keep/move/transition matrix, userspace-first rule |
 | [IPC Completion](./50-ipc-completion.md) | 50 | Capability grants, bulk-data transport, ring-3-safe registry, server-loop failure semantics |
 | [Service Model Maturity](./51-service-model-maturity.md) | 51 | Stable service contract, restart backoff, crash classification, shutdown ordering, admin hardening |
+| [First Service Extractions](./52-first-service-extractions.md) | 52 | Console and keyboard extracted to ring-3 services, restart behavior, IPC-based input/output |
 
 ### Roadmap
 

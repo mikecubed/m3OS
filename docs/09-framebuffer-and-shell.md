@@ -217,9 +217,21 @@ for `FILE_READ` in `docs/08-storage-and-vfs.md`.
 
 ---
 
+## Phase 52 Update: Framebuffer Rendering Moved to Userspace
+
+As of Phase 52 (First Service Extractions), framebuffer rendering policy has
+moved from kernel-resident code to the ring-3 `console_server` service. The
+kernel retains only the physical framebuffer mapping (page grants to the console
+service) and low-level pixel format detection. All text rendering, cursor
+management, scroll behavior, and dual serial/framebuffer output routing are now
+owned by the userspace console service. See
+[docs/52-first-service-extractions.md](./52-first-service-extractions.md) for
+the full design.
+
 ## See Also
 
 - `docs/07-core-servers.md` — console_server, kbd_server (Phase 7 foundation)
 - `docs/08-storage-and-vfs.md` — VFS and fat_server (Phase 8 foundation)
+- `docs/52-first-service-extractions.md` — Phase 52 console and keyboard extraction
 - `docs/roadmap/09-framebuffer-and-shell.md` — phase milestone and acceptance criteria
 - `docs/roadmap/tasks/09-framebuffer-and-shell-tasks.md` — per-task breakdown

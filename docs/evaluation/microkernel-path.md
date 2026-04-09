@@ -77,7 +77,7 @@ These are the concrete ways the current repo still falls short of a properly enf
 
 | Deficiency | Evidence | Why it matters |
 |---|---|---|
-| Core servers are still kernel tasks | `kernel/src/main.rs` spawns `console_server_task`, `kbd_server_task`, `fat_server_task`, and `vfs_server_task`; `docs/07-core-servers.md` and `docs/08-storage-and-vfs.md` explicitly call this out | Fault isolation is not real if core services still share ring-0 state |
+| Core servers are still kernel tasks | `kernel/src/main.rs` spawns `fat_server_task` and `vfs_server_task` as kernel tasks; `console_server` and `kbd_server` were extracted to ring-3 in Phase 52 | Fault isolation is partially real: console and keyboard are now isolated; storage servers remain in ring 0 |
 | IPC still assumes a shared kernel address space in places | `kernel/src/ipc/mod.rs` says service-registry syscalls still assume kernel-task callers; `kernel/src/main.rs` passes kernel pointers in console IPC; `docs/07-core-servers.md` and `docs/08-storage-and-vfs.md` explain this limitation | The system cannot fully serverize while message payloads still depend on shared in-kernel pointers |
 | Capability grant and bulk shared-data path are unfinished | `docs/06-ipc.md` defers page-capability grants and bulk data transfers | Serious userspace servers need a safe, zero-copy or bounded-copy way to exchange file blocks, framebuffer regions, packets, and strings |
 | Filesystem, networking, TTY, PTY, procfs, and related policy still live in ring 0 | `kernel/src/fs/`, `kernel/src/net/`, `kernel/src/tty.rs`, `kernel/src/pty.rs`, `kernel/src/signal.rs` | The kernel TCB is much larger than the documented architecture suggests |
@@ -181,7 +181,7 @@ This is the real prerequisite for the rest.
 
 Without it, every later "userspace server" migration either becomes fake isolation or forces awkward, special-case kernel escapes.
 
-### Stage 2: move the simplest and highest-value services first
+### Stage 2: move the simplest and highest-value services first (IN PROGRESS -- Phase 52)
 
 The first real serverization targets should be the services that are already conceptually server-shaped:
 
@@ -201,6 +201,16 @@ The first real serverization targets should be the services that are already con
 - turn `console_server_task` and `kbd_server_task` into real userspace binaries
 - move focus/input policy out of kernel-space task glue
 - treat the future display server as part of this family, not as a special later exception
+
+**Progress (Phase 52)**
+
+| Deliverable | Status | Reference |
+|---|---|---|
+| Console service extraction to ring 3 | In Progress | `userspace/console_server/` |
+| Keyboard service extraction to ring 3 | In Progress | `userspace/kbd_server/` |
+| Stdin feeder / line discipline in userspace | In Progress | Dual-routing through kernel stdin buffer |
+| Service restart and reconnection | In Progress | Phase 51 service manager integration |
+| Boundary measurements | TBD | Pending QEMU testing |
 
 ### Stage 3: serverize storage and namespace management
 

@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.51.0"
+version = "0.52.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "kernel-core"
-version = "0.50.0"
+version = "0.52.0"
 dependencies = [
  "loom",
  "proptest",

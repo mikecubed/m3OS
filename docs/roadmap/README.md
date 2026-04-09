@@ -265,7 +265,7 @@ flowchart TD
 | 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Complete | `phase-49` | [Phase 49](./49-architectural-declaration.md) | [Tasks](./tasks/49-architectural-declaration-tasks.md) |
 | 50 | IPC Completion | Capability grants, bulk-data transport (copy + page grants), ring-3-safe registry, server-loop failure semantics | Complete | `phase-50` | [Phase 50](./50-ipc-completion.md) | [Tasks](./tasks/50-ipc-completion-tasks.md) |
 | 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | In Progress | `phase-51` | [Phase 51](./51-service-model-maturity.md) | [Tasks](./tasks/51-service-model-maturity-tasks.md) |
-| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-52` | [Phase 52](./52-first-service-extractions.md) | Deferred until implementation planning |
+| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | In Progress | `phase-52` | [Phase 52](./52-first-service-extractions.md) | [Tasks](./tasks/52-first-service-extractions-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
 | 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
 
