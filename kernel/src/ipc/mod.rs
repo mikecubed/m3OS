@@ -255,7 +255,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
         9 => {
             // ipc_register_service(ep_cap_handle, name_ptr, name_len)
             match cap {
-                Capability::Endpoint(ep_id) => ipc_register_service(ep_id, arg1, arg2),
+                Capability::Endpoint(ep_id) => ipc_register_service(task_id, ep_id, arg1, arg2),
                 _ => u64::MAX,
             }
         }
@@ -272,7 +272,15 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
 /// `name_ptr` is a userspace virtual address pointing to `name_len` bytes of
 /// UTF-8. The name is safely copied from the caller's address space via
 /// `copy_from_user`. Invalid or unmapped pointers return an error.
-fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 {
+///
+/// The calling task's ID is recorded as the owner, enabling owner-based
+/// re-registration and cleanup on task exit.
+fn ipc_register_service(
+    task_id: crate::task::TaskId,
+    ep_id: EndpointId,
+    name_ptr: u64,
+    name_len: u64,
+) -> u64 {
     if name_ptr == 0 {
         return u64::MAX;
     }
@@ -288,7 +296,7 @@ fn ipc_register_service(ep_id: EndpointId, name_ptr: u64, name_len: u64) -> u64 
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    match registry::register(name, ep_id) {
+    match registry::register_with_owner(name, ep_id, task_id.0) {
         Ok(()) => 0,
         Err(_) => u64::MAX,
     }

@@ -137,6 +137,21 @@ impl Registry {
         Err(RegistryError::NotFound)
     }
 
+    /// Remove all registry entries owned by a specific task.
+    ///
+    /// Called during task exit cleanup so that a restarted service can
+    /// re-register the same name without hitting [`RegistryError::AlreadyExists`].
+    pub fn remove_by_owner(&mut self, owner: u64) {
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot
+                && entry.owner == owner
+            {
+                *slot = None;
+                self.count -= 1;
+            }
+        }
+    }
+
     /// Look up a named service endpoint.
     pub fn lookup(&self, name: &str) -> Option<EndpointId> {
         let name_bytes = name.as_bytes();
@@ -322,5 +337,44 @@ mod tests {
 
         // Original service unchanged.
         assert_eq!(reg.lookup("alive"), Some(EndpointId(1)));
+    }
+
+    // --- Phase 52: remove_by_owner tests ---
+
+    #[test]
+    fn remove_by_owner_clears_owned_entries() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc1", EndpointId(1), 10).unwrap();
+        reg.register_with_owner("svc2", EndpointId(2), 10).unwrap();
+        reg.register_with_owner("svc3", EndpointId(3), 20).unwrap();
+
+        reg.remove_by_owner(10);
+
+        assert_eq!(reg.lookup("svc1"), None);
+        assert_eq!(reg.lookup("svc2"), None);
+        assert_eq!(reg.lookup("svc3"), Some(EndpointId(3)));
+    }
+
+    #[test]
+    fn remove_by_owner_allows_reregistration() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("console", EndpointId(1), 10)
+            .unwrap();
+
+        // Simulate task 10 dying.
+        reg.remove_by_owner(10);
+
+        // New task 20 can now register the same name.
+        reg.register_with_owner("console", EndpointId(2), 20)
+            .unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn remove_by_owner_no_op_for_unknown_owner() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        reg.remove_by_owner(999);
+        assert_eq!(reg.lookup("svc"), Some(EndpointId(1)));
     }
 }

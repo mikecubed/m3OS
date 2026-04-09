@@ -36,6 +36,10 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
     // 2. Clean up notification waiters.
     notification::clear_waiter(task_id);
 
+    // 3. Remove any service registry entries owned by the dying task so
+    //    that a restarted service can re-register the same name.
+    super::registry::remove_by_owner(task_id.0);
+
     log::trace!(
         "[ipc] cleanup_task_ipc: cleaned up IPC state for task {}",
         task_id.0

@@ -269,6 +269,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_server"
+version = "0.52.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -782,6 +790,13 @@ checksum = "cc4c90f45aa2e6eacbe8645f77fdea542ac97a494bcd117a67df9ff4d611f995"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kbd_server"
+version = "0.52.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

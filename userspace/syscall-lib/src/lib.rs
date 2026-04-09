@@ -260,6 +260,148 @@ pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
 // ===========================================================================
+// IPC syscall numbers (Phase 50)
+// ===========================================================================
+
+/// IPC recv: block until a message arrives on the endpoint.
+pub const SYS_IPC_RECV: u64 = 0x1100;
+
+/// IPC send: send a message to an endpoint (no reply expected).
+pub const SYS_IPC_SEND: u64 = 0x1101;
+
+/// IPC call: send a message and block for a reply.
+pub const SYS_IPC_CALL: u64 = 0x1102;
+
+/// IPC reply: send a reply to a caller.
+pub const SYS_IPC_REPLY: u64 = 0x1103;
+
+/// IPC reply_recv: reply to a caller and immediately wait for the next message.
+pub const SYS_IPC_REPLY_RECV: u64 = 0x1104;
+
+/// Grant a capability to another task.
+pub const SYS_CAP_GRANT: u64 = 0x1105;
+
+/// Wait on a notification capability.
+pub const SYS_NOTIFY_WAIT: u64 = 0x1106;
+
+/// Signal a notification capability.
+pub const SYS_NOTIFY_SIGNAL: u64 = 0x1107;
+
+/// Register a named service in the IPC registry.
+pub const SYS_IPC_REGISTER_SERVICE: u64 = 0x1108;
+
+/// Look up a named service in the IPC registry.
+pub const SYS_IPC_LOOKUP_SERVICE: u64 = 0x1109;
+
+// ===========================================================================
+// IPC wrappers (Phase 52)
+// ===========================================================================
+
+/// IPC message data: 4 u64 words.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IpcMessage {
+    pub label: u64,
+    pub data: [u64; 4],
+}
+
+impl IpcMessage {
+    pub const fn new(label: u64) -> Self {
+        Self {
+            label,
+            data: [0; 4],
+        }
+    }
+}
+
+/// Receive a message on an endpoint capability.
+///
+/// `ep_cap_handle` is the handle of an Endpoint capability in the caller's
+/// capability table. Blocks until a message is available. Returns the
+/// message label on success, or `u64::MAX` on error.
+pub fn ipc_recv(ep_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_IPC_RECV, ep_cap_handle as u64) }
+}
+
+/// Send a message to an endpoint (fire-and-forget, no reply).
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_send(ep_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_SEND, ep_cap_handle as u64, label, data0) }
+}
+
+/// Send a message and block waiting for a reply (RPC-style call).
+///
+/// Returns the reply label on success, `u64::MAX` on error.
+pub fn ipc_call(ep_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_CALL, ep_cap_handle as u64, label, data0) }
+}
+
+/// Reply to a caller using a one-shot reply capability.
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_reply(reply_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_REPLY, reply_cap_handle as u64, label, data0) }
+}
+
+/// Reply to a caller and immediately wait for the next message on an endpoint.
+///
+/// Returns the next message label on success, `u64::MAX` on error.
+pub fn ipc_reply_recv(reply_cap_handle: u32, label: u64, ep_cap_handle: u32) -> u64 {
+    unsafe {
+        syscall3(
+            SYS_IPC_REPLY_RECV,
+            reply_cap_handle as u64,
+            label,
+            ep_cap_handle as u64,
+        )
+    }
+}
+
+/// Register a named service endpoint in the IPC registry.
+///
+/// `ep_cap_handle` is the handle of the Endpoint capability to register.
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_register_service(ep_cap_handle: u32, name: &str) -> u64 {
+    unsafe {
+        syscall3(
+            SYS_IPC_REGISTER_SERVICE,
+            ep_cap_handle as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    }
+}
+
+/// Look up a named service in the IPC registry.
+///
+/// On success, inserts an Endpoint capability into the caller's capability
+/// table and returns the new handle. Returns `u64::MAX` on error.
+pub fn ipc_lookup_service(name: &str) -> u64 {
+    unsafe {
+        syscall2(
+            SYS_IPC_LOOKUP_SERVICE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    }
+}
+
+/// Wait on a notification capability. Blocks until at least one bit is set.
+///
+/// Returns the pending-bit word on success, or 0 on error.
+pub fn notify_wait(notif_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_NOTIFY_WAIT, notif_cap_handle as u64) }
+}
+
+/// Signal a notification capability with the given bits.
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn notify_signal(notif_cap_handle: u32, bits: u64) -> u64 {
+    unsafe { syscall2(SYS_NOTIFY_SIGNAL, notif_cap_handle as u64, bits) }
+}
+
+// ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
 
