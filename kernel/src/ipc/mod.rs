@@ -26,7 +26,7 @@
 //! # Phase 6 scope
 //!
 //! - Kernel-thread IPC (kernel tasks call into the IPC subsystem directly).
-//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x1109`;
+//! - Userspace IPC via the syscall gate (syscall numbers `0x1100`–`0x110B`;
 //!   earlier phases used low numbers 4 and 7, remapped in Phase 50).
 //! - Capability validation per syscall.
 //! - IRQ registration via notification capabilities.
@@ -55,8 +55,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x110A` are translated to internal
-/// dispatch numbers 1–11 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x110B` are translated to internal
+/// dispatch numbers 1–12 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
@@ -105,7 +105,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
         None => return err_val,
     };
 
-    // Syscalls 10 and 11 do not use arg0 as a cap handle — handle them
+    // Syscalls 10, 11, and 12 do not use arg0 as a cap handle — handle them
     // before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
