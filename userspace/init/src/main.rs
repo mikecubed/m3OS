@@ -1800,11 +1800,14 @@ pub extern "C" fn _start() -> ! {
             mgr.handle_child_exit(ret as i32, status);
         }
 
-        // Check for control commands.
-        mgr.check_control_commands();
+        // Check for control commands every 3rd iteration (reduces syscall noise
+        // on serial, keeping control latency under 3 seconds).
+        loop_count = loop_count.wrapping_add(1);
+        if loop_count.is_multiple_of(3) {
+            mgr.check_control_commands();
+        }
 
         // Periodically write status file (every ~10 iterations).
-        loop_count = loop_count.wrapping_add(1);
         if loop_count.is_multiple_of(10) {
             mgr.write_status_file();
         }

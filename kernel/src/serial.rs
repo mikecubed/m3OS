@@ -131,7 +131,7 @@ static LOGGER: SerialLogger = SerialLogger;
 
 pub fn init_logger() {
     log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Trace))
+        .map(|()| log::set_max_level(log::LevelFilter::Info))
         .expect("logger already set");
 }
 
