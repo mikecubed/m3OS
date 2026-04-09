@@ -116,8 +116,10 @@ Phase 51 service manager:
   using the Phase 51 backoff policy (immediate first restart, then exponential
   backoff with crash classification)
 - **Re-registration**: the restarted service re-registers its endpoint in the
-  registry using `replace_service()` from Phase 50, so existing capability
-  handles held by clients become valid again
+  registry using `replace_service()` from Phase 50, so future lookups resolve
+  to the new endpoint.  Clients holding old endpoint capabilities must
+  re-lookup the service to obtain a valid handle (existing handles point to
+  the old, now-dead endpoint)
 - **No reboot required**: the kernel continues running; only the crashed service
   restarts
 

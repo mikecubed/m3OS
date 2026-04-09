@@ -313,13 +313,15 @@ dependency-ordered boot, automatic restart, and system logging.
 
 ## Phase 52 Update: Console and Keyboard Extracted to Ring 3
 
-As of Phase 52 (First Service Extractions), `console_server` and `kbd_server`
-are no longer kernel-resident tasks. They have been extracted into real ring-3
-userspace services that communicate through the Phase 50 IPC contract. The
-kernel retains only the minimal privileged substrate: framebuffer mapping, IRQ
-handling, scancode ring buffer, and notification delivery. The services are
-supervised by the Phase 51 service manager and can be restarted without
-rebooting. See [docs/52-first-service-extractions.md](./52-first-service-extractions.md)
+As of Phase 52 (First Service Extractions), ring-3 `console_server` and
+`kbd_server` binaries have been added as supervised userspace services.
+However, the kernel still runs its own `console_server_task` and
+`kbd_server_task` in parallel during the transition period.  The kernel
+tasks will be removed once the userspace services fully handle all
+rendering and scancode delivery through IPC.  The kernel retains the
+minimal privileged substrate: framebuffer mapping, IRQ handling, scancode
+ring buffer, and notification delivery.  See
+[docs/52-first-service-extractions.md](./52-first-service-extractions.md)
 for the full extraction design.
 
 ## See Also
