@@ -197,6 +197,21 @@ pub fn register_irq(irq: u8, notif_id: NotifId) {
     }
 }
 
+/// Atomically register an IRQ line if it is currently unregistered.
+///
+/// Returns `true` on success, `false` if the IRQ line already has a
+/// notification mapped.  Uses `compare_exchange` to prevent cross-core
+/// races where two concurrent callers both pass the `is_irq_registered`
+/// check and overwrite each other.
+pub fn try_register_irq(irq: u8, notif_id: NotifId) -> bool {
+    match IRQ_MAP.get(irq as usize) {
+        Some(slot) => slot
+            .compare_exchange(0xff, notif_id.0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        None => false,
+    }
+}
+
 /// Deliver a hardware IRQ to its registered notification object.
 ///
 /// **ISR-safe** — uses only lock-free atomics and does not call `wake_task`.

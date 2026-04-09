@@ -300,12 +300,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             }
         }
         16 => {
-            // ipc_reply_recv_msg(reply_cap, reply_label, ep_cap, msg_ptr, buf_ptr)
+            // ipc_reply_recv_msg(reply_cap, reply_label, ep_cap, msg_ptr, buf_ptr, buf_len)
             // reply_cap = arg0 (already looked up as `cap`)
             // reply_label = arg1
             // ep_cap = arg2
             // msg_ptr = arg3
             // buf_ptr = arg4
+            // buf_len = r9 (read from per-core saved registers)
             let caller_id = match cap {
                 Capability::Reply(id) => id,
                 _ => return u64::MAX,
@@ -320,8 +321,10 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
             let reply = message::Message::new(arg1);
             endpoint::reply(caller_id, reply);
-            // Now recv with bulk output.  Use a fixed 4096-byte output buf len.
-            ipc_recv_msg(task_id, ep_id, arg3, arg4, 4096)
+            // Read buf_len from the 6th syscall register (r9), capped at
+            // MAX_BULK_LEN to match ipc_recv_msg's bounds.
+            let buf_len = crate::smp::per_core().syscall_user_r9;
+            ipc_recv_msg(task_id, ep_id, arg3, arg4, buf_len)
         }
         _ => u64::MAX,
     }
@@ -428,15 +431,18 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
     if irq != 1 {
         return u64::MAX;
     }
-    // Exclusive registration: reject if this IRQ already has a notification.
-    // Prevents userspace tasks from stealing IRQ delivery from the real
-    // keyboard service.
-    if notification::is_irq_registered(irq as u8) {
-        return u64::MAX;
-    }
+    // Exclusive registration: atomically claim this IRQ line using
+    // compare_exchange so two concurrent callers on different cores cannot
+    // both pass the check and overwrite each other.
     let notif_id = match x86_64::instructions::interrupts::without_interrupts(|| {
-        notification::try_create().inspect(|&id| {
-            notification::register_irq(irq as u8, id);
+        notification::try_create().and_then(|id| {
+            if notification::try_register_irq(irq as u8, id) {
+                Some(id)
+            } else {
+                // IRQ line already taken — roll back the notification slot.
+                notification::free(id);
+                None
+            }
         })
     }) {
         Some(id) => id,

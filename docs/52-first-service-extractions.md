@@ -56,13 +56,13 @@ The console service owns all rendering policy:
 - Maps the framebuffer into its address space (page grant from kernel)
 - Registers as `"console"` in the service registry using the owner-based
   registration model from Phase 50
-- Accepts `CONSOLE_WRITE` IPC requests (currently stubbed — the userspace IPC
-  ABI does not yet expose message payloads, so string delivery is not
-  functional; the kernel console path still handles actual rendering)
-- **Target state** (once IPC payload delivery is wired up): receives string
-  payloads from clients, writes characters to the framebuffer, manages cursor
-  position, scroll behavior, text layout, and routes output to both framebuffer
-  and serial
+- Accepts `CONSOLE_WRITE` IPC requests via the bulk-data IPC path
+  (`ipc_recv_msg` / `ipc_reply_recv_msg`), receives string payloads from
+  clients, and renders them to the framebuffer via `FbRenderer::write_str`
+- Routes output to both framebuffer and serial
+- **Transitional note**: the kernel `console_server_task` still runs in
+  parallel and handles `sys_write(STDOUT)` output directly; the userspace
+  service handles IPC-routed writes only
 
 ### Keyboard service (`kbd_server`)
 

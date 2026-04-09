@@ -526,7 +526,7 @@ pub fn ipc_reply_recv_msg(
             ep_cap_handle as u64,
             msg as *mut IpcMessage as u64,
             buf.as_mut_ptr() as u64,
-            0,
+            buf.len() as u64,
         )
     }
 }
