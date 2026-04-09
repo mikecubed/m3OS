@@ -151,6 +151,10 @@ static TODO_RUST_ELF: &[u8] = include_bytes!("../../initrd/todo-rust");
 // Phase 46: background daemons managed by init
 static SYSLOGD_ELF: &[u8] = include_bytes!("../../initrd/syslogd");
 static CROND_ELF: &[u8] = include_bytes!("../../initrd/crond");
+// Phase 52: ring-3 extracted services
+static CONSOLE_SERVER_ELF: &[u8] = include_bytes!("../../initrd/console_server");
+static KBD_SERVER_ELF: &[u8] = include_bytes!("../../initrd/kbd_server");
+static STDIN_FEEDER_ELF: &[u8] = include_bytes!("../../initrd/stdin_feeder");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");
 
@@ -252,6 +256,25 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     ("crond", RamdiskNode::File { content: CROND_ELF }),
+    // Phase 52: ring-3 extracted services
+    (
+        "console_server",
+        RamdiskNode::File {
+            content: CONSOLE_SERVER_ELF,
+        },
+    ),
+    (
+        "kbd_server",
+        RamdiskNode::File {
+            content: KBD_SERVER_ELF,
+        },
+    ),
+    (
+        "stdin_feeder",
+        RamdiskNode::File {
+            content: STDIN_FEEDER_ELF,
+        },
+    ),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),
