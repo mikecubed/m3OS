@@ -650,18 +650,19 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 //
 // There are TWO separate ring buffers:
 //
-//   SCANCODE_BUF  — normal TTY path; consumed by the kbd_server kernel task
-//                   via `read_scancode()`.  Only populated when no process
-//                   owns the framebuffer (FB_OWNER_PID == 0).
+//   SCANCODE_BUF  — normal TTY / kbd_server path; consumed via
+//                   `read_scancode()`.  Always populated regardless of
+//                   framebuffer ownership (Phase 52: dual-routed so the
+//                   userspace stdin_feeder can read scancodes even when a
+//                   game owns the framebuffer).
 //
 //   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
 //                   (sys_read_scancode syscall 0x1007).  Only populated when
 //                   a process owns the framebuffer (FB_OWNER_PID != 0).
 //
-// Routing is done inside the IRQ handler so that the two consumers never
-// compete for the same bytes.  Without this separation the kbd_server and the
-// game could both read from the same buffer; if the kbd_server stole a break
-// code the game would never see the key-up and the key would remain stuck.
+// Both buffers may receive the same scancode when a process owns the
+// framebuffer (ScancodeSink::Raw path), so each consumer independently
+// drains its own buffer without competing for bytes.
 
 const SCANCODE_BUF_SIZE: usize = 256;
 // Bitmask wraparound requires a power-of-two buffer size.

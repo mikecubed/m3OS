@@ -217,16 +217,17 @@ for `FILE_READ` in `docs/08-storage-and-vfs.md`.
 
 ---
 
-## Phase 52 Update: Framebuffer Rendering Moved to Userspace
+## Phase 52 Update: Framebuffer Rendering Extraction (In Progress)
 
-As of Phase 52 (First Service Extractions), framebuffer rendering policy has
-moved from kernel-resident code to the ring-3 `console_server` service. The
-kernel retains only the physical framebuffer mapping (page grants to the console
-service) and low-level pixel format detection. All text rendering, cursor
-management, scroll behavior, and dual serial/framebuffer output routing are now
-owned by the userspace console service. See
+Phase 52 (First Service Extractions) adds a ring-3 `console_server` binary
+that maps the framebuffer and registers as the `"console"` IPC service.
+However, the userspace IPC ABI does not yet support delivering message
+payloads, so `CONSOLE_WRITE` handling is currently stubbed.  The kernel
+still performs all actual text rendering via its `console_server_task`
+during this transition.  Once message payload delivery is wired up, the
+kernel task will be removed and all rendering will move to userspace.  See
 [docs/52-first-service-extractions.md](./52-first-service-extractions.md) for
-the full design.
+the full extraction design.
 
 ## See Also
 

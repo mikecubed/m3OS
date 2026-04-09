@@ -53,14 +53,16 @@ everything else outward through notifications and IPC.
 
 The console service owns all rendering policy:
 
-- Receives string payloads via IPC from clients
-- Writes characters to the framebuffer through a mapped region (page grant from kernel)
-- Manages cursor position, scroll behavior, and text layout
-- Routes output to both framebuffer and serial (dual output)
-
-The service registers as `"console"` in the service registry using the
-owner-based registration model from Phase 50. Clients look up the endpoint by
-name and send `CONSOLE_WRITE` messages with validated buffer payloads.
+- Maps the framebuffer into its address space (page grant from kernel)
+- Registers as `"console"` in the service registry using the owner-based
+  registration model from Phase 50
+- Accepts `CONSOLE_WRITE` IPC requests (currently stubbed — the userspace IPC
+  ABI does not yet expose message payloads, so string delivery is not
+  functional; the kernel console path still handles actual rendering)
+- **Target state** (once IPC payload delivery is wired up): receives string
+  payloads from clients, writes characters to the framebuffer, manages cursor
+  position, scroll behavior, text layout, and routes output to both framebuffer
+  and serial
 
 ### Keyboard service (`kbd_server`)
 
@@ -74,9 +76,10 @@ The keyboard service owns input translation and event delivery:
 
 ### Stdin feeder / line discipline
 
-The stdin feeder bridges the keyboard IPC service with the legacy stdin path:
+The stdin feeder bridges the keyboard scancode path with the legacy stdin path:
 
-- Subscribes to kbd_server events
+- Reads scancodes via the kernel keyboard-scancode syscall (PS/2 ring buffer)
+- Translates raw scancodes to characters using a US-QWERTY lookup table
 - Performs line discipline processing (echo, backspace, line buffering)
 - Feeds processed input into the kernel stdin buffer for processes that read
   from fd 0 using traditional `sys_read`
