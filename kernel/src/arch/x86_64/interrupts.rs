@@ -766,12 +766,22 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 
         match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
             ScancodeSink::Raw => unsafe {
+                // Phase 52: always push to TTY buffer as well so the
+                // kbd_server and stdin_feeder work even when a process
+                // (console_server or DOOM) owns the framebuffer.
                 push_to_buf(
                     (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
                     &RAW_SCANCODE_BUF_HEAD,
                     &RAW_SCANCODE_BUF_TAIL,
                     scancode,
                 );
+                push_to_buf(
+                    (&raw mut SCANCODE_BUF).cast::<u8>(),
+                    &SCANCODE_BUF_HEAD,
+                    &SCANCODE_BUF_TAIL,
+                    scancode,
+                );
+                got_tty_byte = true;
             },
             ScancodeSink::Tty => {
                 unsafe {

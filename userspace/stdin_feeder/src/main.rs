@@ -200,11 +200,11 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut edit_buf = EditBuffer::new();
 
     loop {
-        // Read one scancode directly via SYS_READ_SCANCODE.
-        // This is non-blocking: returns 0 if no scancode is pending.
+        // Read one scancode from the TTY keyboard buffer via
+        // SYS_READ_KBD_SCANCODE.  Non-blocking: returns 0 if empty.
         // Poll with short sleeps until a scancode is available.
         let sc = loop {
-            let s = syscall_lib::read_scancode() as u8;
+            let s = syscall_lib::read_kbd_scancode();
             if s != 0 {
                 break s;
             }
