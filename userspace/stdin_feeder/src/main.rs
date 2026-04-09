@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{SIGINT, SIGQUIT, SIGTSTP, STDOUT_FILENO, TermiosFlags};
+use syscall_lib::{SIGINT, SIGQUIT, SIGTSTP, STDOUT_FILENO};
 
 // ---------------------------------------------------------------------------
 // Termios flag constants (mirrored from kernel-core/src/tty.rs)
@@ -250,14 +250,20 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         }
 
-        // Read current termios flags from the kernel.
-        let mut tf = TermiosFlags::zeroed();
-        syscall_lib::get_termios_flags(&mut tf);
-        // Force reload from memory — the optimizer may cache the zeroed
-        // values across the syscall despite the implicit asm! barrier.
-        let c_lflag = unsafe { core::ptr::read_volatile(&tf.c_lflag) };
-        let c_iflag = unsafe { core::ptr::read_volatile(&tf.c_iflag) };
-        let c_oflag = unsafe { core::ptr::read_volatile(&tf.c_oflag) };
+        // Read current termios flags via ioctl(TCGETS) — the same path
+        // that login uses successfully.
+        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = match syscall_lib::tcgetattr(0) {
+            Ok(t) => (t.c_lflag, t.c_iflag, t.c_oflag, t.c_cc),
+            Err(_) => {
+                // Fallback: assume cooked mode with echo.
+                (
+                    ICANON | ECHO | ECHOE | ISIG,
+                    ICRNL,
+                    ONLCR,
+                    [0u8; syscall_lib::NCCS],
+                )
+            }
+        };
 
         let canonical = c_lflag & ICANON != 0;
 
@@ -321,11 +327,11 @@ fn program_main(_args: &[&str]) -> i32 {
 
         // ISIG: check signal characters from c_cc.
         if isig {
-            let signal = if byte == tf.c_cc[VINTR] {
+            let signal = if byte == c_cc_arr[VINTR] {
                 Some((SIGINT as u32, "^C"))
-            } else if byte == tf.c_cc[VSUSP] {
+            } else if byte == c_cc_arr[VSUSP] {
                 Some((SIGTSTP as u32, "^Z"))
-            } else if byte == tf.c_cc[VQUIT] {
+            } else if byte == c_cc_arr[VQUIT] {
                 Some((SIGQUIT as u32, "^\\"))
             } else {
                 None
@@ -347,7 +353,7 @@ fn program_main(_args: &[&str]) -> i32 {
             // Cooked mode: buffer in edit_buf, deliver on newline or EOF.
 
             // VERASE (backspace/DEL)
-            if byte == tf.c_cc[VERASE] || byte == 0x7F {
+            if byte == c_cc_arr[VERASE] || byte == 0x7F {
                 let erased = edit_buf.erase_char();
                 if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
                     echo("\x08 \x08");
@@ -356,7 +362,7 @@ fn program_main(_args: &[&str]) -> i32 {
             }
 
             // VKILL (^U)
-            if byte == tf.c_cc[VKILL] {
+            if byte == c_cc_arr[VKILL] {
                 let n = edit_buf.kill_line();
                 if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
                     for _ in 0..n {
@@ -367,7 +373,7 @@ fn program_main(_args: &[&str]) -> i32 {
             }
 
             // VWERASE (^W)
-            if byte == tf.c_cc[VWERASE] {
+            if byte == c_cc_arr[VWERASE] {
                 let n = edit_buf.word_erase();
                 if n > 0 && echo_on {
                     for _ in 0..n {
@@ -378,7 +384,7 @@ fn program_main(_args: &[&str]) -> i32 {
             }
 
             // VEOF (^D)
-            if byte == tf.c_cc[VEOF] {
+            if byte == c_cc_arr[VEOF] {
                 if edit_buf.is_empty() {
                     syscall_lib::stdin_signal_eof();
                 } else {
