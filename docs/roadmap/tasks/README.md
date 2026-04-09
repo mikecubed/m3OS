@@ -234,8 +234,14 @@ flowchart TD
 | 49 | Architectural Declaration | Complete | `phase-49` | [Tasks](./49-architectural-declaration-tasks.md) |
 | 50 | IPC Completion | Complete | `phase-50` | [Tasks](./50-ipc-completion-tasks.md) |
 
+### Convergence Phases (in progress)
+
+| Phase | Focus | Status | Source Ref | Task List |
+|---|---|---|---|---|
+| 51 | Service model maturity (contract, restart, shutdown, admin) | In Progress | `phase-51` | [Tasks](./51-service-model-maturity-tasks.md) |
+
 ### Future Task Docs
-Task docs for Phases **51 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **52 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

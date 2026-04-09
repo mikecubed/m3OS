@@ -10,6 +10,7 @@
 [Phase 44](../../roadmap/44-rust-cross-compilation.md),
 [Phase 45](../../roadmap/45-ports-system.md),
 [Phase 46](../../roadmap/46-system-services.md),
+[Phase 51](../../roadmap/51-service-model-maturity.md),
 [Phase 53](../../roadmap/53-headless-hardening.md),
 [Phase 58](../../roadmap/58-release-1-0-gate.md)
 **Primary evaluation docs:** [Usability Roadmap](../usability-roadmap.md),
@@ -30,7 +31,10 @@ is still later.
 
 Completed Phases 44-46 mean this phase starts from a stronger baseline than the
 original evaluation assumed: Rust `std` binaries run, ports exist, and the
-system already has a managed-service/logging layer. The work here is therefore
+system already has a managed-service/logging layer. Phase 51 further strengthens
+the operational story with restart backoff, crash classification, per-service
+shutdown timeouts, orphan reaping, init-to-syslog integration, admin surface
+hardening, and service enable/disable controls. The work here is therefore
 about hardening shipped capabilities and deciding which remaining gaps are true
 release blockers.
 
@@ -106,6 +110,7 @@ software, diagnose failures, and trust the validation story enough to ship.
 - [Security Review](../security-review.md)
 - [Phase 44 — Rust Cross-Compilation](../../roadmap/44-rust-cross-compilation.md)
 - [Phase 45 — Ports System](../../roadmap/45-ports-system.md)
+- [Phase 51 — Service Model Maturity](../../roadmap/51-service-model-maturity.md)
 - [Phase 43c — Regression and Stress](../../roadmap/43c-regression-stress-ci.md)
 
 ## Open Questions

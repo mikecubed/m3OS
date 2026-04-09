@@ -1,11 +1,13 @@
-//! service — manage system services (Phase 46).
+//! service -- manage system services (Phase 46).
 //!
 //! Subcommands:
-//!   service list             — show all services and their status
-//!   service status <name>    — detailed status for one service
-//!   service start <name>     — start a stopped service
-//!   service stop <name>      — stop a running service
-//!   service restart <name>   — restart a service
+//!   service list             -- show all services and their status
+//!   service status <name>    -- detailed status for one service
+//!   service start <name>     -- start a stopped service
+//!   service stop <name>      -- stop a running service
+//!   service restart <name>   -- restart a service
+//!   service enable <name>    -- enable a disabled service
+//!   service disable <name>   -- disable a service (prevent auto-start)
 #![no_std]
 #![no_main]
 
@@ -40,6 +42,41 @@ fn write_file(path: &[u8], data: &[u8]) -> isize {
     n
 }
 
+/// Check if the caller is root. Returns true if root.
+fn require_root(action: &str) -> bool {
+    if syscall_lib::getuid() != 0 {
+        write_str(STDERR_FILENO, "service: ");
+        write_str(STDERR_FILENO, action);
+        write_str(STDERR_FILENO, " requires root privileges\n");
+        false
+    } else {
+        true
+    }
+}
+
+/// Pad a string to at least `width` characters with trailing spaces.
+fn write_padded(fd: i32, s: &str, width: usize) {
+    write_str(fd, s);
+    let len = s.len();
+    if len < width {
+        let mut rem = width - len;
+        while rem > 0 {
+            write_str(fd, " ");
+            rem -= 1;
+        }
+    }
+}
+
+/// Parse a key=value pair from a status line field.
+/// Returns the value part after '=' if the field starts with the given key.
+fn parse_field<'a>(field: &'a str, key: &str) -> Option<&'a str> {
+    if field.starts_with(key) && field.len() > key.len() && field.as_bytes()[key.len()] == b'=' {
+        Some(&field[key.len() + 1..])
+    } else {
+        None
+    }
+}
+
 fn cmd_list() -> i32 {
     let mut buf = [0u8; 4096];
     let n = read_file(STATUS_PATH, &mut buf);
@@ -50,15 +87,18 @@ fn cmd_list() -> i32 {
         );
         return 1;
     }
-    write_str(
-        STDOUT_FILENO,
-        "NAME            STATUS          PID     RESTARTS\n",
-    );
-    write_str(
-        STDOUT_FILENO,
-        "----            ------          ---     --------\n",
-    );
-    // Status file format: one line per service: name status pid restart_count
+    // Header.
+    write_padded(STDOUT_FILENO, "NAME", 20);
+    write_padded(STDOUT_FILENO, "STATUS", 22);
+    write_padded(STDOUT_FILENO, "PID", 8);
+    write_str(STDOUT_FILENO, "RESTARTS\n");
+
+    write_padded(STDOUT_FILENO, "----", 20);
+    write_padded(STDOUT_FILENO, "------", 22);
+    write_padded(STDOUT_FILENO, "---", 8);
+    write_str(STDOUT_FILENO, "--------\n");
+
+    // Status file format: <name> <status> pid=<N> restarts=<N> changed=<epoch>
     let data = &buf[..n as usize];
     let text = match core::str::from_utf8(data) {
         Ok(s) => s,
@@ -71,7 +111,30 @@ fn cmd_list() -> i32 {
         if line.is_empty() {
             continue;
         }
-        write_str(STDOUT_FILENO, line);
+        // Parse fields: name status pid=N restarts=N changed=N
+        let mut fields = line.split(' ');
+        let name = match fields.next() {
+            Some(n) => n,
+            None => continue,
+        };
+        let status = match fields.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let mut pid = "0";
+        let mut restarts = "0";
+        for field in fields {
+            if let Some(v) = parse_field(field, "pid") {
+                pid = v;
+            } else if let Some(v) = parse_field(field, "restarts") {
+                restarts = v;
+            }
+        }
+
+        write_padded(STDOUT_FILENO, name, 20);
+        write_padded(STDOUT_FILENO, status, 22);
+        write_padded(STDOUT_FILENO, pid, 8);
+        write_str(STDOUT_FILENO, restarts);
         write_str(STDOUT_FILENO, "\n");
     }
     0
@@ -96,11 +159,54 @@ fn cmd_status(name: &str) -> i32 {
         if let Some(rest) = line.strip_prefix(name)
             && (rest.starts_with(' ') || rest.starts_with('\t'))
         {
-            write_str(STDOUT_FILENO, "Service: ");
+            // Parse: <name> <status> pid=<N> restarts=<N> changed=<epoch>
+            let mut fields = line.split(' ');
+            let _svc_name = fields.next(); // skip name, we already have it
+            let status = fields.next().unwrap_or("unknown");
+            let mut pid = "0";
+            let mut restarts = "0";
+            let mut changed = "0";
+            for field in fields {
+                if let Some(v) = parse_field(field, "pid") {
+                    pid = v;
+                } else if let Some(v) = parse_field(field, "restarts") {
+                    restarts = v;
+                } else if let Some(v) = parse_field(field, "changed") {
+                    changed = v;
+                }
+            }
+
+            // Determine exit code from status (e.g. "stopped:42")
+            let (state_str, exit_code) = if let Some(code_str) = status.strip_prefix("stopped:") {
+                ("stopped", code_str)
+            } else {
+                (status, "-")
+            };
+
+            write_str(STDOUT_FILENO, "Name:           ");
             write_str(STDOUT_FILENO, name);
             write_str(STDOUT_FILENO, "\n");
-            write_str(STDOUT_FILENO, line);
+
+            write_str(STDOUT_FILENO, "State:          ");
+            write_str(STDOUT_FILENO, state_str);
             write_str(STDOUT_FILENO, "\n");
+
+            write_str(STDOUT_FILENO, "PID:            ");
+            write_str(STDOUT_FILENO, pid);
+            write_str(STDOUT_FILENO, "\n");
+
+            write_str(STDOUT_FILENO, "Restarts:       ");
+            write_str(STDOUT_FILENO, restarts);
+            write_str(STDOUT_FILENO, "\n");
+
+            write_str(STDOUT_FILENO, "Last exit:      ");
+            write_str(STDOUT_FILENO, exit_code);
+            write_str(STDOUT_FILENO, "\n");
+
+            write_str(STDOUT_FILENO, "Last changed:   ");
+            write_str(STDOUT_FILENO, changed);
+            write_str(STDOUT_FILENO, "\n");
+
             return 0;
         }
     }
@@ -130,7 +236,7 @@ fn send_command(cmd: &str, name: &str) -> i32 {
         return 1;
     }
     // Init polls /var/run/init.cmd in its main loop. Note: this is a
-    // last-writer-wins mechanism — rapid successive commands may clobber
+    // last-writer-wins mechanism -- rapid successive commands may clobber
     // each other. For single-operator use this is acceptable.
     write_str(STDOUT_FILENO, "service: ");
     write_str(STDOUT_FILENO, cmd);
@@ -144,7 +250,7 @@ fn main(args: &[&str]) -> i32 {
     if args.len() < 2 {
         write_str(
             STDERR_FILENO,
-            "usage: service {list|status|start|stop|restart} [name]\n",
+            "usage: service {list|status|start|stop|restart|enable|disable} [name]\n",
         );
         return 1;
     }
@@ -163,11 +269,17 @@ fn main(args: &[&str]) -> i32 {
                 write_str(STDERR_FILENO, "usage: service start <name>\n");
                 return 1;
             }
+            if !require_root("start") {
+                return 1;
+            }
             send_command("start", args[2])
         }
         "stop" => {
             if args.len() < 3 {
                 write_str(STDERR_FILENO, "usage: service stop <name>\n");
+                return 1;
+            }
+            if !require_root("stop") {
                 return 1;
             }
             send_command("stop", args[2])
@@ -177,7 +289,30 @@ fn main(args: &[&str]) -> i32 {
                 write_str(STDERR_FILENO, "usage: service restart <name>\n");
                 return 1;
             }
+            if !require_root("restart") {
+                return 1;
+            }
             send_command("restart", args[2])
+        }
+        "enable" => {
+            if args.len() < 3 {
+                write_str(STDERR_FILENO, "usage: service enable <name>\n");
+                return 1;
+            }
+            if !require_root("enable") {
+                return 1;
+            }
+            send_command("enable", args[2])
+        }
+        "disable" => {
+            if args.len() < 3 {
+                write_str(STDERR_FILENO, "usage: service disable <name>\n");
+                return 1;
+            }
+            if !require_root("disable") {
+                return 1;
+            }
+            send_command("disable", args[2])
         }
         _ => {
             write_str(STDERR_FILENO, "service: unknown subcommand '");

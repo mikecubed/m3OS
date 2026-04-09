@@ -13,6 +13,7 @@ pub mod net;
 pub mod pipe;
 pub mod prng;
 pub mod pty;
+pub mod service;
 pub mod slab;
 pub mod time;
 pub mod trace_ring;

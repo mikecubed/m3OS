@@ -15,8 +15,10 @@
 #![no_main]
 
 use syscall_lib::{
-    O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, SigAction, WNOHANG, close, execve, exit,
-    fork, kill, mount, nanosleep, open, read, rt_sigaction, waitpid, write, write_str, write_u64,
+    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
+    SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
+    nanosleep, open, read, rt_sigaction, sendto_unix, set_nonblocking, setuid, socket, waitpid,
+    write, write_str, write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +74,19 @@ enum RestartPolicy {
     Never,
 }
 
+/// Service lifecycle state machine.
+///
+/// Valid transitions:
+///   NeverStarted ──→ Starting
+///   Starting     ──→ Running
+///   Starting     ──→ Stopped (exec failed)
+///   Running      ──→ Stopping
+///   Running      ──→ Stopped (unexpected exit)
+///   Stopping     ──→ Stopped
+///   Stopped      ──→ Starting (restart)
+///   Stopped      ──→ PermanentlyStopped (max restarts exceeded)
+///   *            ──→ PermanentlyStopped (unresolvable deps, etc.)
+///   PermanentlyStopped ──→ (nothing — terminal state)
 #[derive(Clone, Copy, PartialEq)]
 enum ServiceStatus {
     NeverStarted,
@@ -80,6 +95,38 @@ enum ServiceStatus {
     Stopping,
     Stopped(i32),
     PermanentlyStopped,
+}
+
+impl ServiceStatus {
+    /// Validate whether a transition from `self` to `target` is valid.
+    fn try_transition(&self, target: ServiceStatus) -> bool {
+        match (*self, target) {
+            // Terminal state.
+            (ServiceStatus::PermanentlyStopped, _) => false,
+            // NeverStarted → Starting or PermanentlyStopped.
+            (ServiceStatus::NeverStarted, ServiceStatus::Starting) => true,
+            (ServiceStatus::NeverStarted, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::NeverStarted, _) => false,
+            // Starting → Running, Stopped, or PermanentlyStopped.
+            (ServiceStatus::Starting, ServiceStatus::Running) => true,
+            (ServiceStatus::Starting, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Starting, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Starting, _) => false,
+            // Running → Stopping, Stopped, or PermanentlyStopped.
+            (ServiceStatus::Running, ServiceStatus::Stopping) => true,
+            (ServiceStatus::Running, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Running, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Running, _) => false,
+            // Stopping → Stopped or PermanentlyStopped.
+            (ServiceStatus::Stopping, ServiceStatus::Stopped(_)) => true,
+            (ServiceStatus::Stopping, ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Stopping, _) => false,
+            // Stopped → Starting or PermanentlyStopped.
+            (ServiceStatus::Stopped(_), ServiceStatus::Starting) => true,
+            (ServiceStatus::Stopped(_), ServiceStatus::PermanentlyStopped) => true,
+            (ServiceStatus::Stopped(_), _) => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +217,16 @@ struct ServiceDef {
     pid: i32,
     /// Number of restarts performed.
     restart_count: u32,
+    /// Epoch seconds when the service was last started (for backoff reset).
+    last_start_time: u64,
+    /// Epoch seconds when the last state transition occurred.
+    last_change_time: u64,
     /// Whether this service is active (slot in use).
     active: bool,
+    /// UID to run the service as (0 = root, default).
+    run_as_uid: u32,
+    /// Seconds to wait after SIGTERM before SIGKILL during shutdown (default 5).
+    stop_timeout: u32,
 }
 
 impl ServiceDef {
@@ -187,7 +242,11 @@ impl ServiceDef {
             status: ServiceStatus::NeverStarted,
             pid: 0,
             restart_count: 0,
+            last_start_time: 0,
+            last_change_time: 0,
             active: false,
+            run_as_uid: 0,
+            stop_timeout: 5,
         }
     }
 }
@@ -277,8 +336,11 @@ impl DepGraph {
         }
     }
 
-    fn build(services: &[ServiceDef; MAX_SERVICES], count: usize) -> Self {
+    /// Build the dependency graph. Returns a list of service indices whose
+    /// dependencies could not be resolved (they should be marked PermanentlyStopped).
+    fn build(services: &[ServiceDef; MAX_SERVICES], count: usize) -> (Self, [bool; MAX_SERVICES]) {
         let mut g = Self::new();
+        let mut unresolvable = [false; MAX_SERVICES];
 
         // Build forward edges.
         let mut i = 0;
@@ -292,6 +354,7 @@ impl DepGraph {
                 // Find dep index by name.
                 let dep_name = &services[i].deps[d];
                 let mut j = 0;
+                let mut found = false;
                 while j < count {
                     if j != i
                         && services[j].active
@@ -306,15 +369,25 @@ impl DepGraph {
                             g.required_by[j][g.required_by_count[j]] = i;
                             g.required_by_count[j] += 1;
                         }
+                        found = true;
                         break;
                     }
                     j += 1;
+                }
+                if !found {
+                    // Unresolvable dependency — log warning.
+                    write_str(STDOUT_FILENO, "init: warning: service '");
+                    write(STDOUT_FILENO, services[i].name.as_bytes());
+                    write_str(STDOUT_FILENO, "' has unresolvable dep '");
+                    write(STDOUT_FILENO, dep_name.as_bytes());
+                    write_str(STDOUT_FILENO, "'\n");
+                    unresolvable[i] = true;
                 }
                 d += 1;
             }
             i += 1;
         }
-        g
+        (g, unresolvable)
     }
 
     /// Check for cycles using DFS with a visited set. Returns true if cycle found.
@@ -488,6 +561,18 @@ fn parse_service_def(buf: &[u8], len: usize) -> Option<ServiceDef> {
         } else if bytes_eq(key, b"depends") {
             // Comma-separated list of dependency names.
             parse_deps(val, &mut svc.deps, &mut svc.dep_count);
+        } else if bytes_eq(key, b"user") {
+            svc.run_as_uid = parse_u32(val);
+        } else if bytes_eq(key, b"stop_timeout") {
+            let v = parse_u32(val);
+            if v > 0 {
+                svc.stop_timeout = v;
+            }
+        } else {
+            // Unknown field — log warning.
+            write_str(STDOUT_FILENO, "init: warning: unknown field '");
+            write(STDOUT_FILENO, key);
+            write_str(STDOUT_FILENO, "' in service config\n");
         }
 
         // Advance past end of line.
@@ -573,7 +658,21 @@ struct ServiceManager {
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
+    /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
+    syslog_fd: i32,
 }
+
+/// Syslog severity levels.
+#[allow(dead_code)]
+const SEV_ERROR: u8 = 3;
+#[allow(dead_code)]
+const SEV_WARNING: u8 = 4;
+#[allow(dead_code)]
+const SEV_INFO: u8 = 6;
+
+/// Syslog facility: daemon = 3.
+#[allow(dead_code)]
+const FACILITY_DAEMON: u8 = 3;
 
 impl ServiceManager {
     const fn new() -> Self {
@@ -583,39 +682,80 @@ impl ServiceManager {
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
+            syslog_fd: -1,
         }
     }
 
+    /// Open a DGRAM socket to `/dev/log` for syslog output.
+    fn open_syslog(&mut self) {
+        let fd = socket(AF_UNIX as i32, SOCK_DGRAM as i32, 0);
+        if fd < 0 {
+            return;
+        }
+        // Non-blocking so PID 1 never stalls if syslogd is down or the buffer is full.
+        set_nonblocking(fd as i32);
+        self.syslog_fd = fd as i32;
+    }
+
+    /// Send a lifecycle event for a named service to syslog (serial is handled by caller).
+    fn syslog_service_event(&self, severity: u8, verb: &[u8], name: &[u8]) {
+        if self.syslog_fd < 0 {
+            return;
+        }
+        let mut msg = [0u8; 128];
+        let mut pos = 0;
+        let vlen = verb.len().min(msg.len());
+        msg[..vlen].copy_from_slice(&verb[..vlen]);
+        pos += vlen;
+        if pos + 2 + name.len() < msg.len() {
+            msg[pos] = b' ';
+            msg[pos + 1] = b'\'';
+            pos += 2;
+            let nlen = name.len().min(msg.len() - pos - 1);
+            msg[pos..pos + nlen].copy_from_slice(&name[..nlen]);
+            pos += nlen;
+            msg[pos] = b'\'';
+            pos += 1;
+        }
+        self.send_syslog(severity, &msg[..pos]);
+    }
+
+    /// Low-level syslog send (no serial echo).
+    fn send_syslog(&self, severity: u8, msg: &[u8]) {
+        if self.syslog_fd < 0 {
+            return;
+        }
+        let priority = ((FACILITY_DAEMON as u32) << 3) | (severity as u32);
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+        buf[pos] = b'<';
+        pos += 1;
+        pos += write_u32_to_buf(&mut buf[pos..], priority);
+        buf[pos] = b'>';
+        pos += 1;
+        let tag = b"init: ";
+        let tag_len = tag.len().min(buf.len() - pos);
+        buf[pos..pos + tag_len].copy_from_slice(&tag[..tag_len]);
+        pos += tag_len;
+        let msg_len = msg.len().min(buf.len() - pos);
+        buf[pos..pos + msg_len].copy_from_slice(&msg[..msg_len]);
+        pos += msg_len;
+        let addr = SockaddrUn::new("/dev/log");
+        let _ = sendto_unix(self.syslog_fd, &buf[..pos], 0, &addr);
+    }
+
     /// Load service definitions from `/etc/services.d/`.
+    ///
+    /// Tries to scan the directory first using `getdents64`. If the directory
+    /// cannot be opened, falls back to the hardcoded `KNOWN_CONFIGS` list.
     fn load_services(&mut self) {
-        let mut i = 0;
-        while i < KNOWN_CONFIGS.len() {
-            if self.count >= MAX_SERVICES {
-                break;
-            }
-            let fd = open(KNOWN_CONFIGS[i], O_RDONLY, 0);
-            if fd >= 0 {
-                let mut buf = [0u8; BUF_SIZE];
-                let n = read(fd as i32, &mut buf);
-                close(fd as i32);
-                if n > 0 {
-                    match parse_service_def(&buf, n as usize) {
-                        Some(svc) => {
-                            write_str(STDOUT_FILENO, "init: loaded service '");
-                            write(STDOUT_FILENO, svc.name.as_bytes());
-                            write_str(STDOUT_FILENO, "'\n");
-                            self.services[self.count] = svc;
-                            self.count += 1;
-                        }
-                        None => {
-                            write_str(STDOUT_FILENO, "init: warning: malformed service file ");
-                            write(STDOUT_FILENO, KNOWN_CONFIGS[i]);
-                            write_str(STDOUT_FILENO, "\n");
-                        }
-                    }
-                }
-            }
-            i += 1;
+        let dir_fd = open(b"/etc/services.d\0", O_RDONLY, 0);
+        if dir_fd >= 0 {
+            self.load_services_from_dir(dir_fd as i32);
+            close(dir_fd as i32);
+        } else {
+            // Fallback: try hardcoded config paths.
+            self.load_services_from_known_configs();
         }
 
         if self.count == 0 {
@@ -624,6 +764,113 @@ impl ServiceManager {
                 "init: no service configs found, using built-in defaults\n",
             );
             self.add_builtin_defaults();
+        }
+    }
+
+    /// Scan `/etc/services.d/` directory using getdents64 and load `.conf` files.
+    fn load_services_from_dir(&mut self, dir_fd: i32) {
+        let mut dent_buf = [0u8; 1024];
+        loop {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            let n = getdents64(dir_fd, &mut dent_buf);
+            if n <= 0 {
+                break;
+            }
+            let n = n as usize;
+            let mut pos = 0;
+            while pos < n && self.count < MAX_SERVICES {
+                // Each dirent64: u64 ino, u64 off, u16 reclen, u8 type, name[]
+                if pos + 19 > n {
+                    break;
+                }
+                let reclen = (dent_buf[pos + 16] as usize) | ((dent_buf[pos + 17] as usize) << 8);
+                if reclen == 0 || pos + reclen > n {
+                    break;
+                }
+                // Name starts at offset 19.
+                let name_start = pos + 19;
+                let name_end = pos + reclen;
+                // Find null terminator.
+                let mut name_len = 0;
+                while name_start + name_len < name_end && dent_buf[name_start + name_len] != 0 {
+                    name_len += 1;
+                }
+                let name = &dent_buf[name_start..name_start + name_len];
+
+                // Filter for .conf files.
+                if name_len > 5 && name[name_len - 5..] == *b".conf" {
+                    // Build full path: /etc/services.d/<name>\0
+                    let prefix = b"/etc/services.d/";
+                    let path_len = prefix.len() + name_len + 1; // +1 for null
+                    if path_len <= BUF_SIZE {
+                        let mut path_buf = [0u8; BUF_SIZE];
+                        let mut pi = 0;
+                        while pi < prefix.len() {
+                            path_buf[pi] = prefix[pi];
+                            pi += 1;
+                        }
+                        let mut ni = 0;
+                        while ni < name_len {
+                            path_buf[pi] = name[ni];
+                            pi += 1;
+                            ni += 1;
+                        }
+                        path_buf[pi] = 0; // null terminate
+
+                        self.try_load_config(&path_buf[..pi + 1]);
+                    }
+                }
+
+                pos += reclen;
+            }
+        }
+    }
+
+    /// Fallback: iterate over hardcoded config paths.
+    fn load_services_from_known_configs(&mut self) {
+        let mut i = 0;
+        while i < KNOWN_CONFIGS.len() {
+            if self.count >= MAX_SERVICES {
+                break;
+            }
+            self.try_load_config(KNOWN_CONFIGS[i]);
+            i += 1;
+        }
+    }
+
+    /// Try to open, read, and parse a single service config file.
+    /// Skips services that have a `.disabled` marker file.
+    fn try_load_config(&mut self, path: &[u8]) {
+        let fd = open(path, O_RDONLY, 0);
+        if fd >= 0 {
+            let mut buf = [0u8; BUF_SIZE];
+            let n = read(fd as i32, &mut buf);
+            close(fd as i32);
+            if n > 0 {
+                match parse_service_def(&buf, n as usize) {
+                    Some(svc) => {
+                        // Check if this service is disabled.
+                        if Self::is_disabled(svc.name.as_bytes()) {
+                            write_str(STDOUT_FILENO, "init: skipping disabled service '");
+                            write(STDOUT_FILENO, svc.name.as_bytes());
+                            write_str(STDOUT_FILENO, "'\n");
+                            return;
+                        }
+                        write_str(STDOUT_FILENO, "init: loaded service '");
+                        write(STDOUT_FILENO, svc.name.as_bytes());
+                        write_str(STDOUT_FILENO, "'\n");
+                        self.services[self.count] = svc;
+                        self.count += 1;
+                    }
+                    None => {
+                        write_str(STDOUT_FILENO, "init: warning: malformed service file ");
+                        write(STDOUT_FILENO, path);
+                        write_str(STDOUT_FILENO, "\n");
+                    }
+                }
+            }
         }
     }
 
@@ -657,21 +904,58 @@ impl ServiceManager {
 
     /// Boot all services in dependency order.
     fn boot_services(&mut self) {
-        let graph = DepGraph::build(&self.services, self.count);
+        let (graph, unresolvable) = DepGraph::build(&self.services, self.count);
+
+        // Mark services with unresolvable deps as PermanentlyStopped.
+        let mut i = 0;
+        while i < self.count {
+            if unresolvable[i] && self.services[i].active {
+                write_str(STDOUT_FILENO, "init: service '");
+                write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                write_str(
+                    STDOUT_FILENO,
+                    "' permanently stopped (unresolvable dependency)\n",
+                );
+                self.services[i].status = ServiceStatus::PermanentlyStopped;
+                self.services[i].last_change_time = now_epoch_secs();
+            }
+            i += 1;
+        }
+        self.write_status_file();
 
         // Check for cycles.
         if graph.has_cycle(self.count) {
             write_str(
                 STDOUT_FILENO,
-                "init: WARNING: dependency cycle detected, starting services in file order\n",
+                "init: WARNING: dependency cycle detected among services, starting in file order\n",
             );
-            // Fall through to start in file order.
-            let mut i = 0;
-            while i < self.count {
-                if self.services[i].active {
-                    self.start_service(i);
+            // Log which services are involved.
+            write_str(STDOUT_FILENO, "init: cycle may involve: ");
+            let mut first = true;
+            let mut ci = 0;
+            while ci < self.count {
+                if self.services[ci].active
+                    && self.services[ci].status != ServiceStatus::PermanentlyStopped
+                    && graph.depends_count[ci] > 0
+                {
+                    if !first {
+                        write_str(STDOUT_FILENO, ", ");
+                    }
+                    write(STDOUT_FILENO, self.services[ci].name.as_bytes());
+                    first = false;
                 }
-                i += 1;
+                ci += 1;
+            }
+            write_str(STDOUT_FILENO, "\n");
+            // Fall through to start in file order.
+            let mut si = 0;
+            while si < self.count {
+                if self.services[si].active
+                    && self.services[si].status != ServiceStatus::PermanentlyStopped
+                {
+                    self.start_service(si);
+                }
+                si += 1;
             }
             return;
         }
@@ -696,6 +980,8 @@ impl ServiceManager {
                     write_str(STDOUT_FILENO, "init: skipping '");
                     write(STDOUT_FILENO, self.services[idx].name.as_bytes());
                     write_str(STDOUT_FILENO, "' (deps not ready)\n");
+                    self.services[idx].status = ServiceStatus::PermanentlyStopped;
+                    self.services[idx].last_change_time = now_epoch_secs();
                 }
             }
             i += 1;
@@ -720,6 +1006,15 @@ impl ServiceManager {
     /// Fork+exec a single service.
     fn start_service(&mut self, idx: usize) {
         let svc = &mut self.services[idx];
+
+        // Enforce state transition — reject invalid starts.
+        if !svc.status.try_transition(ServiceStatus::Starting) {
+            write_str(STDOUT_FILENO, "init: rejected start for '");
+            write(STDOUT_FILENO, svc.name.as_bytes());
+            write_str(STDOUT_FILENO, "' (invalid state transition)\n");
+            return;
+        }
+
         svc.status = ServiceStatus::Starting;
 
         write_str(STDOUT_FILENO, "init: starting '");
@@ -732,6 +1027,9 @@ impl ServiceManager {
             write(STDOUT_FILENO, svc.name.as_bytes());
             write_str(STDOUT_FILENO, "'\n");
             svc.status = ServiceStatus::Stopped(-1);
+            svc.last_change_time = now_epoch_secs();
+            // Note: cannot call self.write_status_file() here because svc borrows self.
+            // Status file will be written on the next transition or periodic write.
             return;
         }
 
@@ -749,6 +1047,17 @@ impl ServiceManager {
                 core::ptr::null(),
             ];
 
+            // Drop privileges if run_as_uid is set.
+            if svc.run_as_uid != 0 {
+                let ret = setuid(svc.run_as_uid);
+                if ret < 0 {
+                    write_str(STDOUT_FILENO, "init: setuid failed for '");
+                    write(STDOUT_FILENO, svc.name.as_bytes());
+                    write_str(STDOUT_FILENO, "'\n");
+                    exit(126);
+                }
+            }
+
             // Build argv: argv[0] = command path.
             let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
             let ret = execve(path, &argv, &envp);
@@ -762,8 +1071,11 @@ impl ServiceManager {
         }
 
         // Parent.
+        let now = now_epoch_secs();
         self.services[idx].status = ServiceStatus::Running;
         self.services[idx].pid = pid as i32;
+        self.services[idx].last_start_time = now;
+        self.services[idx].last_change_time = now;
         self.pid_table.insert(pid as i32, idx);
 
         write_str(STDOUT_FILENO, "init: started '");
@@ -771,26 +1083,58 @@ impl ServiceManager {
         write_str(STDOUT_FILENO, "' pid=");
         write_u64(STDOUT_FILENO, pid as u64);
         write_str(STDOUT_FILENO, "\n");
+        self.syslog_service_event(SEV_INFO, b"started", self.services[idx].name.as_bytes());
+
+        // Write status immediately on state transition.
+        self.write_status_file();
     }
 
     /// Handle a reaped child PID with its exit status.
+    ///
+    /// Wait status encoding:
+    /// - If bit 7 set: process was killed by signal, bits 0-6 = signal number
+    /// - Otherwise: bits 8-15 = exit code
     fn handle_child_exit(&mut self, pid: i32, status: i32) {
         match self.pid_table.lookup(pid) {
             Some(idx) => {
                 self.pid_table.remove(pid);
-                let exit_code = (status >> 8) & 0xff;
+
+                let signaled = (status & 0x80) != 0;
+                let (exit_code, signal_num) = if signaled {
+                    (status & 0x7f, status & 0x7f) // signal number in lower 7 bits
+                } else {
+                    (((status >> 8) & 0xff), 0)
+                };
+
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
+                self.services[idx].last_change_time = now_epoch_secs();
 
                 write_str(STDOUT_FILENO, "init: service '");
                 write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-                write_str(STDOUT_FILENO, "' exited (");
-                write_u64(STDOUT_FILENO, exit_code as u64);
-                write_str(STDOUT_FILENO, ")\n");
+                if signaled {
+                    write_str(STDOUT_FILENO, "' killed by signal ");
+                    write_u64(STDOUT_FILENO, signal_num as u64);
+                } else if exit_code == 0 {
+                    write_str(STDOUT_FILENO, "' exited normally");
+                } else {
+                    write_str(STDOUT_FILENO, "' exited with error ");
+                    write_u64(STDOUT_FILENO, exit_code as u64);
+                }
+                write_str(STDOUT_FILENO, "\n");
+                let sev = if exit_code == 0 && !signaled {
+                    SEV_INFO
+                } else {
+                    SEV_ERROR
+                };
+                self.syslog_service_event(sev, b"exited", self.services[idx].name.as_bytes());
+
+                // Write status immediately on state transition.
+                self.write_status_file();
 
                 // Check restart policy if not shutting down.
                 if !self.shutdown_requested {
-                    self.maybe_restart(idx, exit_code);
+                    self.maybe_restart(idx, exit_code, signaled);
                 }
             }
             None => {
@@ -807,12 +1151,15 @@ impl ServiceManager {
     }
 
     /// Restart a service if its restart policy allows it.
-    fn maybe_restart(&mut self, idx: usize, exit_code: i32) {
+    ///
+    /// `signaled` indicates the process was killed by a signal (not a normal exit).
+    fn maybe_restart(&mut self, idx: usize, exit_code: i32, signaled: bool) {
         let svc = &self.services[idx];
 
         let should_restart = match svc.restart_policy {
             RestartPolicy::Always => true,
-            RestartPolicy::OnFailure => exit_code != 0,
+            // OnFailure restarts on error exit OR signal death, but NOT clean exit.
+            RestartPolicy::OnFailure => signaled || exit_code != 0,
             RestartPolicy::Never => false,
         };
 
@@ -828,12 +1175,25 @@ impl ServiceManager {
                 "' exceeded max restarts, permanently stopped\n",
             );
             self.services[idx].status = ServiceStatus::PermanentlyStopped;
+            self.services[idx].last_change_time = now_epoch_secs();
+            self.write_status_file();
             return;
         }
 
+        // Reset restart count if the service ran for at least 10 seconds.
+        let now = now_epoch_secs();
+        let last_start = self.services[idx].last_start_time;
+        if last_start > 0 && now >= last_start + 10 {
+            self.services[idx].restart_count = 0;
+        }
+
+        let delay = restart_delay_secs(self.services[idx].restart_count);
+
         write_str(STDOUT_FILENO, "init: restarting '");
         write(STDOUT_FILENO, self.services[idx].name.as_bytes());
-        write_str(STDOUT_FILENO, "' (");
+        write_str(STDOUT_FILENO, "' after ");
+        write_u64(STDOUT_FILENO, delay);
+        write_str(STDOUT_FILENO, "s delay (attempt ");
         write_u64(STDOUT_FILENO, (self.services[idx].restart_count + 1) as u64);
         write_str(STDOUT_FILENO, "/");
         write_u64(STDOUT_FILENO, self.services[idx].max_restart as u64);
@@ -841,8 +1201,12 @@ impl ServiceManager {
 
         self.services[idx].restart_count += 1;
 
-        // 1-second delay between restarts.
-        nanosleep(1);
+        // Progressive backoff delay.
+        let mut d: u64 = 0;
+        while d < delay {
+            nanosleep(1);
+            d += 1;
+        }
 
         self.start_service(idx);
     }
@@ -850,10 +1214,12 @@ impl ServiceManager {
     /// Orderly shutdown of all services in reverse dependency order.
     fn shutdown_services(&mut self) {
         write_str(STDOUT_FILENO, "init: shutting down services...\n");
+        self.send_syslog(SEV_INFO, b"shutting down services");
+        let shutdown_start = now_epoch_secs();
 
         // Iteratively find a running service whose dependents are all stopped,
         // send SIGTERM, wait, then SIGKILL if needed.
-        let graph = DepGraph::build(&self.services, self.count);
+        let (graph, _unresolvable) = DepGraph::build(&self.services, self.count);
 
         loop {
             let mut found = false;
@@ -870,7 +1236,24 @@ impl ServiceManager {
                         any_running = true;
                         // Check if all dependents are stopped.
                         if self.all_dependents_stopped(&graph, i) {
-                            self.stop_service(i);
+                            let svc_start = now_epoch_secs();
+                            write_str(STDOUT_FILENO, "init: shutdown: stopping '");
+                            write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                            write_str(STDOUT_FILENO, "'...\n");
+
+                            let clean = self.stop_service(i);
+                            let elapsed = now_epoch_secs().saturating_sub(svc_start);
+
+                            write_str(STDOUT_FILENO, "init: shutdown: '");
+                            write(STDOUT_FILENO, self.services[i].name.as_bytes());
+                            if clean {
+                                write_str(STDOUT_FILENO, "' stopped cleanly (");
+                            } else {
+                                write_str(STDOUT_FILENO, "' force-killed (");
+                            }
+                            write_u64(STDOUT_FILENO, elapsed);
+                            write_str(STDOUT_FILENO, "s)\n");
+
                             found = true;
                             break; // Re-scan after stopping one.
                         }
@@ -908,7 +1291,35 @@ impl ServiceManager {
             }
         }
 
-        write_str(STDOUT_FILENO, "init: all services stopped\n");
+        // Reap orphaned children (forked workers reparented to PID 1).
+        let mut orphan_count: u32 = 0;
+        let mut reap_waited: u32 = 0;
+        loop {
+            let mut st: i32 = 0;
+            let ret = waitpid(-1, &mut st, WNOHANG);
+            if ret > 0 {
+                orphan_count += 1;
+            } else if ret <= 0 {
+                if reap_waited >= 15 {
+                    break; // global timeout
+                }
+                if ret < 0 {
+                    break; // no children left
+                }
+                nanosleep(1);
+                reap_waited += 1;
+            }
+        }
+        if orphan_count > 0 {
+            write_str(STDOUT_FILENO, "init: reaped ");
+            write_u64(STDOUT_FILENO, orphan_count as u64);
+            write_str(STDOUT_FILENO, " orphaned children\n");
+        }
+
+        let total_elapsed = now_epoch_secs().saturating_sub(shutdown_start);
+        write_str(STDOUT_FILENO, "init: shutdown complete (");
+        write_u64(STDOUT_FILENO, total_elapsed);
+        write_str(STDOUT_FILENO, "s total)\n");
         self.write_status_file();
     }
 
@@ -927,12 +1338,26 @@ impl ServiceManager {
         true
     }
 
-    /// Stop a single service: SIGTERM, wait 5s, SIGKILL.
-    fn stop_service(&mut self, idx: usize) {
+    /// Stop a single service: SIGTERM, wait per-service timeout, SIGKILL.
+    /// Returns true if the service stopped cleanly, false if force-killed.
+    fn stop_service(&mut self, idx: usize) -> bool {
         let pid = self.services[idx].pid;
         if pid <= 0 {
             self.services[idx].status = ServiceStatus::Stopped(0);
-            return;
+            self.services[idx].last_change_time = now_epoch_secs();
+            self.write_status_file();
+            return true;
+        }
+
+        // Enforce state transition — reject invalid stops.
+        if !self.services[idx]
+            .status
+            .try_transition(ServiceStatus::Stopping)
+        {
+            write_str(STDOUT_FILENO, "init: rejected stop for '");
+            write(STDOUT_FILENO, self.services[idx].name.as_bytes());
+            write_str(STDOUT_FILENO, "' (invalid state transition)\n");
+            return true;
         }
 
         self.services[idx].status = ServiceStatus::Stopping;
@@ -942,9 +1367,10 @@ impl ServiceManager {
 
         kill(pid, SIGTERM);
 
-        // Wait up to 5 seconds for graceful exit.
-        let mut waited = 0;
-        while waited < 5 {
+        // Wait up to per-service timeout for graceful exit.
+        let timeout = self.services[idx].stop_timeout;
+        let mut waited: u32 = 0;
+        while waited < timeout {
             let mut st: i32 = 0;
             let ret = waitpid(pid, &mut st, WNOHANG);
             if ret > 0 {
@@ -952,7 +1378,10 @@ impl ServiceManager {
                 let exit_code = (st >> 8) & 0xff;
                 self.services[idx].status = ServiceStatus::Stopped(exit_code);
                 self.services[idx].pid = 0;
-                return;
+                self.services[idx].last_change_time = now_epoch_secs();
+                self.syslog_service_event(SEV_INFO, b"stopped", self.services[idx].name.as_bytes());
+                self.write_status_file();
+                return true;
             }
             nanosleep(1);
             waited += 1;
@@ -969,6 +1398,14 @@ impl ServiceManager {
         self.pid_table.remove(pid);
         self.services[idx].status = ServiceStatus::Stopped(-1);
         self.services[idx].pid = 0;
+        self.services[idx].last_change_time = now_epoch_secs();
+        self.syslog_service_event(
+            SEV_WARNING,
+            b"force-killed",
+            self.services[idx].name.as_bytes(),
+        );
+        self.write_status_file();
+        false
     }
 
     /// Write service status to `/var/run/services.status`.
@@ -996,8 +1433,13 @@ impl ServiceManager {
                 ServiceStatus::Running => write_str(fd as i32, "running"),
                 ServiceStatus::Stopping => write_str(fd as i32, "stopping"),
                 ServiceStatus::Stopped(code) => {
-                    write_str(fd as i32, "stopped:");
-                    write_u64(fd as i32, code as u64);
+                    if code < 0 {
+                        write_str(fd as i32, "stopped:-");
+                        write_u64(fd as i32, (-(code as i64)) as u64);
+                    } else {
+                        write_str(fd as i32, "stopped:");
+                        write_u64(fd as i32, code as u64);
+                    }
                     0 // match arm type consistency
                 }
                 ServiceStatus::PermanentlyStopped => write_str(fd as i32, "permanently-stopped"),
@@ -1007,12 +1449,22 @@ impl ServiceManager {
             write_u64(fd as i32, svc.pid as u64);
             write_str(fd as i32, " restarts=");
             write_u64(fd as i32, svc.restart_count as u64);
+            write_str(fd as i32, " changed=");
+            write_u64(fd as i32, svc.last_change_time);
             write_str(fd as i32, "\n");
 
             i += 1;
         }
 
         close(fd as i32);
+    }
+
+    /// Create the control command file with root-only permissions (mode 0600).
+    fn create_control_file(&self) {
+        let fd = open(CMD_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+        if fd >= 0 {
+            close(fd as i32);
+        }
     }
 
     /// Check for control commands in `/var/run/init.cmd`.
@@ -1026,7 +1478,7 @@ impl ServiceManager {
         let n = read(fd as i32, &mut buf);
         close(fd as i32);
 
-        // Delete the command file after reading by truncating it.
+        // Delete the command file after reading by truncating it (preserve 0600 mode).
         let fd2 = open(CMD_FILE, O_WRONLY | O_TRUNC, 0);
         if fd2 >= 0 {
             close(fd2 as i32);
@@ -1055,7 +1507,7 @@ impl ServiceManager {
                 write_str(STDOUT_FILENO, "'\n");
                 // Set restart policy to never so reap loop won't restart it.
                 self.services[idx].restart_policy = RestartPolicy::Never;
-                self.stop_service(idx);
+                let _ = self.stop_service(idx);
             }
         } else if n >= 8 && bytes_eq(&buf[..7], b"restart") && buf[7] == b' ' {
             let name = trim_newline(&buf[8..n]);
@@ -1063,11 +1515,95 @@ impl ServiceManager {
                 write_str(STDOUT_FILENO, "init: control: restarting '");
                 write(STDOUT_FILENO, name);
                 write_str(STDOUT_FILENO, "'\n");
-                self.stop_service(idx);
+                let _ = self.stop_service(idx);
                 self.services[idx].restart_count = 0;
                 nanosleep(1);
                 self.start_service(idx);
             }
+        } else if n >= 8 && bytes_eq(&buf[..7], b"disable") && buf[7] == b' ' {
+            let name = trim_newline(&buf[8..n]);
+            write_str(STDOUT_FILENO, "init: control: disabling '");
+            write(STDOUT_FILENO, name);
+            write_str(STDOUT_FILENO, "'\n");
+            // Write marker file /etc/services.d/<name>.disabled
+            Self::write_disabled_marker(name);
+        } else if n >= 7 && bytes_eq(&buf[..6], b"enable") && buf[6] == b' ' {
+            let name = trim_newline(&buf[7..n]);
+            write_str(STDOUT_FILENO, "init: control: enabling '");
+            write(STDOUT_FILENO, name);
+            write_str(STDOUT_FILENO, "'\n");
+            // Remove marker file /etc/services.d/<name>.disabled
+            Self::remove_disabled_marker(name);
+        }
+    }
+
+    /// Build the disabled marker path: /etc/services.d/<name>.disabled\0
+    fn build_disabled_path(name: &[u8], path_buf: &mut [u8; 128]) -> usize {
+        let prefix = b"/etc/services.d/";
+        let suffix = b".disabled";
+        let total = prefix.len() + name.len() + suffix.len() + 1;
+        if total > 128 {
+            return 0;
+        }
+        let mut pos = 0;
+        let mut i = 0;
+        while i < prefix.len() {
+            path_buf[pos] = prefix[i];
+            pos += 1;
+            i += 1;
+        }
+        i = 0;
+        while i < name.len() {
+            path_buf[pos] = name[i];
+            pos += 1;
+            i += 1;
+        }
+        i = 0;
+        while i < suffix.len() {
+            path_buf[pos] = suffix[i];
+            pos += 1;
+            i += 1;
+        }
+        path_buf[pos] = 0;
+        pos + 1
+    }
+
+    /// Write a .disabled marker file for a service.
+    fn write_disabled_marker(name: &[u8]) {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return;
+        }
+        let fd = open(&path_buf[..len], O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+        if fd >= 0 {
+            close(fd as i32);
+        }
+    }
+
+    /// Remove a .disabled marker file for a service.
+    fn remove_disabled_marker(name: &[u8]) {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return;
+        }
+        syscall_lib::unlink(&path_buf[..len]);
+    }
+
+    /// Check if a service has a .disabled marker file.
+    fn is_disabled(name: &[u8]) -> bool {
+        let mut path_buf = [0u8; 128];
+        let len = Self::build_disabled_path(name, &mut path_buf);
+        if len == 0 {
+            return false;
+        }
+        let fd = open(&path_buf[..len], O_RDONLY, 0);
+        if fd >= 0 {
+            close(fd as i32);
+            true
+        } else {
+            false
         }
     }
 
@@ -1086,6 +1622,48 @@ impl ServiceManager {
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+/// Write a u32 value as decimal ASCII into a buffer. Returns bytes written.
+#[allow(dead_code)]
+fn write_u32_to_buf(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut n = val;
+    let mut i = 0;
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len());
+    let mut j = 0;
+    while j < len {
+        buf[j] = tmp[i - 1 - j];
+        j += 1;
+    }
+    len
+}
+
+/// Get current wall-clock time as epoch seconds, or 0 on error.
+fn now_epoch_secs() -> u64 {
+    let (sec, _nsec) = clock_gettime(0); // CLOCK_REALTIME = 0
+    if sec < 0 { 0 } else { sec as u64 }
+}
+
+/// Compute restart delay in seconds based on restart count (progressive backoff).
+/// 1s for first restart, 2s for second, then 5s cap.
+fn restart_delay_secs(restart_count: u32) -> u64 {
+    match restart_count {
+        0 => 1,
+        1 => 2,
+        _ => 5,
+    }
+}
 
 fn trim_newline(buf: &[u8]) -> &[u8] {
     let mut end = buf.len();
@@ -1177,12 +1755,18 @@ pub extern "C" fn _start() -> ! {
     // Boot all services in dependency order.
     mgr.boot_services();
 
+    // Open syslog socket now that syslogd should be running.
+    mgr.open_syslog();
+
     // Spawn initial login session (not a managed service).
     mgr.login_pid = spawn_login();
     if mgr.login_pid < 0 {
         write_str(STDOUT_FILENO, "init: failed to spawn login\n");
         // Not fatal — services may still be running.
     }
+
+    // Create control command file with root-only permissions (mode 0600).
+    mgr.create_control_file();
 
     // Write initial status file.
     mgr.write_status_file();
@@ -1216,11 +1800,14 @@ pub extern "C" fn _start() -> ! {
             mgr.handle_child_exit(ret as i32, status);
         }
 
-        // Check for control commands.
-        mgr.check_control_commands();
+        // Check for control commands every 3rd iteration (reduces syscall noise
+        // on serial, keeping control latency under 3 seconds).
+        loop_count = loop_count.wrapping_add(1);
+        if loop_count.is_multiple_of(3) {
+            mgr.check_control_commands();
+        }
 
         // Periodically write status file (every ~10 iterations).
-        loop_count = loop_count.wrapping_add(1);
         if loop_count.is_multiple_of(10) {
             mgr.write_status_file();
         }

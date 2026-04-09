@@ -5,6 +5,11 @@
 **Source Ref:** phase-46
 **Supersedes Legacy Doc:** (none — new content)
 
+> **Note:** Phase 51 (Service Model Maturity) extends and hardens the service
+> model described here. For the matured service-definition contract, restart
+> backoff, crash classification, shutdown ordering, and admin surface
+> improvements, see [docs/51-service-model-maturity.md](./51-service-model-maturity.md).
+
 ## Overview
 
 Phase 46 transforms m3OS from a system that hardcodes which daemons to run into
