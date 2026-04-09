@@ -144,7 +144,7 @@ The `service` command gains richer output and new subcommands:
 | Subcommand | Behavior |
 |---|---|
 | `service list` | Summary table: name, state, PID, restart count |
-| `service status <name>` | Detail: name, state, PID, restart count, last exit code/signal, stop timeout, last state-change timestamp |
+| `service status <name>` | Detail: name, state, PID, restart count, last exit code/signal, last state-change timestamp |
 | `service start <name>` | Start a stopped service (root only) |
 | `service stop <name>` | Stop a running service (root only) |
 | `service restart <name>` | Stop then start (root only) |
@@ -152,8 +152,8 @@ The `service` command gains richer output and new subcommands:
 | `service disable <name>` | Create `.disabled` marker; service skipped at boot |
 
 The init control path (`/var/run/init.cmd`) is hardened: the file is created
-with mode 0600, and init validates root ownership before reading commands. The
-`service` command checks root privilege before writing.
+with mode 0600 inside root-owned `/var/run`, and the `service` command checks
+root privilege before writing.
 
 ## Key Files
 
