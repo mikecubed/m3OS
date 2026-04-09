@@ -566,6 +566,8 @@ pub struct TermiosFlags {
     pub c_iflag: u32,
     pub c_oflag: u32,
     pub c_cc: [u8; 19],
+    /// Padding to match the kernel's 32-byte `sys_get_termios_flags` layout.
+    pub _pad: u8,
 }
 
 impl TermiosFlags {
@@ -575,6 +577,7 @@ impl TermiosFlags {
             c_iflag: 0,
             c_oflag: 0,
             c_cc: [0; 19],
+            _pad: 0,
         }
     }
 }
