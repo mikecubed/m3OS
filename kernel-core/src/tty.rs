@@ -378,4 +378,67 @@ mod tests {
         assert_eq!(eb.kill_line(), 0);
         assert_eq!(eb.word_erase(), 0);
     }
+
+    #[test]
+    fn edit_buffer_drain_partial() {
+        let mut eb = EditBuffer::new();
+        for &b in b"hello world" {
+            eb.push(b);
+        }
+        eb.drain(6); // Remove "hello "
+        assert_eq!(eb.as_slice(), b"world");
+    }
+
+    #[test]
+    fn edit_buffer_drain_all() {
+        let mut eb = EditBuffer::new();
+        for &b in b"abc" {
+            eb.push(b);
+        }
+        eb.drain(3);
+        assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn edit_buffer_drain_more_than_len() {
+        let mut eb = EditBuffer::new();
+        for &b in b"ab" {
+            eb.push(b);
+        }
+        eb.drain(100); // Should clamp to len
+        assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn edit_buffer_drain_zero() {
+        let mut eb = EditBuffer::new();
+        for &b in b"abc" {
+            eb.push(b);
+        }
+        eb.drain(0);
+        assert_eq!(eb.as_slice(), b"abc");
+    }
+
+    #[test]
+    fn edit_buffer_overflow() {
+        let mut eb = EditBuffer::new();
+        // Fill to capacity (4096 bytes)
+        for _ in 0..4096 {
+            assert!(eb.push(b'x'));
+        }
+        // One more should fail
+        assert!(!eb.push(b'y'));
+        assert_eq!(eb.as_slice().len(), 4096);
+    }
+
+    #[test]
+    fn edit_buffer_clear() {
+        let mut eb = EditBuffer::new();
+        for &b in b"test" {
+            eb.push(b);
+        }
+        eb.clear();
+        assert!(eb.is_empty());
+        assert_eq!(eb.as_slice(), b"");
+    }
 }

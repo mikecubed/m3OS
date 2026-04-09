@@ -467,4 +467,121 @@ mod tests {
         }
         assert_eq!(parser.state, EscState::Normal);
     }
+
+    #[test]
+    fn test_sgr_bright_fg_colors() {
+        // Bright foreground colors: 90–97
+        for code in 90..=97u16 {
+            let seq = alloc::format!("\x1b[{}m", code);
+            let cmd = parse_str_last(&seq);
+            if let ConsoleCmd::Sgr(sgr) = cmd {
+                assert_eq!(sgr.count, 1);
+                assert_eq!(sgr.params[0], code);
+            } else {
+                panic!("Expected Sgr for code {}, got {:?}", code, cmd);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sgr_standard_fg_colors() {
+        // Standard foreground colors: 30–37
+        for code in 30..=37u16 {
+            let seq = alloc::format!("\x1b[{}m", code);
+            let cmd = parse_str_last(&seq);
+            if let ConsoleCmd::Sgr(sgr) = cmd {
+                assert_eq!(sgr.count, 1);
+                assert_eq!(sgr.params[0], code);
+            } else {
+                panic!("Expected Sgr for code {}, got {:?}", code, cmd);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sgr_standard_bg_colors() {
+        // Standard background colors: 40–47
+        for code in 40..=47u16 {
+            let seq = alloc::format!("\x1b[{}m", code);
+            let cmd = parse_str_last(&seq);
+            if let ConsoleCmd::Sgr(sgr) = cmd {
+                assert_eq!(sgr.count, 1);
+                assert_eq!(sgr.params[0], code);
+            } else {
+                panic!("Expected Sgr for code {}, got {:?}", code, cmd);
+            }
+        }
+    }
+
+    #[test]
+    fn test_partial_escape_sequence() {
+        // ESC alone produces Nop, parser should be in Escape state.
+        let mut parser = AnsiParser::new();
+        assert_eq!(parser.process_char('\x1b'), ConsoleCmd::Nop);
+        assert_eq!(parser.state, EscState::Escape);
+    }
+
+    #[test]
+    fn test_incomplete_csi_sequence() {
+        // ESC [ with digits but no final byte — parser stays in Csi state.
+        let mut parser = AnsiParser::new();
+        assert_eq!(parser.process_char('\x1b'), ConsoleCmd::Nop);
+        assert_eq!(parser.process_char('['), ConsoleCmd::Nop);
+        assert_eq!(parser.process_char('3'), ConsoleCmd::Nop);
+        assert_eq!(parser.state, EscState::Csi);
+        // A normal character after an incomplete CSI is not a valid final byte
+        // if it's outside 0x40-0x7E range; but 'A' (0x41) IS a final byte.
+        // Let's verify the digit accumulation by completing with a final byte.
+        assert_eq!(parser.process_char('A'), ConsoleCmd::CursorUp(3));
+        assert_eq!(parser.state, EscState::Normal);
+    }
+
+    #[test]
+    fn test_incomplete_csi_then_normal_text() {
+        // Start CSI, then feed a character outside valid CSI range (< 0x20)
+        // to trigger malformed discard, then normal text.
+        let mut parser = AnsiParser::new();
+        parser.process_char('\x1b');
+        parser.process_char('[');
+        // Feed a control char that's not a digit, semicolon, or final byte
+        let cmd = parser.process_char('\x01');
+        assert_eq!(cmd, ConsoleCmd::Nop); // malformed, discarded
+        assert_eq!(parser.state, EscState::Normal);
+        // Normal text works again
+        assert_eq!(parser.process_char('X'), ConsoleCmd::PutChar('X'));
+    }
+
+    #[test]
+    fn test_unknown_escape_after_esc() {
+        // ESC followed by something other than '[' discards and returns Nop.
+        let mut parser = AnsiParser::new();
+        parser.process_char('\x1b');
+        let cmd = parser.process_char('O'); // e.g. SS3 — not supported
+        assert_eq!(cmd, ConsoleCmd::Nop);
+        assert_eq!(parser.state, EscState::Normal);
+    }
+
+    #[test]
+    fn test_csi_private_unknown_param() {
+        // CSI ? with an unknown param (not 25) + 'h' should produce Nop.
+        assert_eq!(parse_str_last("\x1b[?1h"), ConsoleCmd::Nop);
+    }
+
+    #[test]
+    fn test_csi_private_unknown_final_byte() {
+        // CSI ? 25 with an unknown final byte should produce Nop.
+        assert_eq!(parse_str_last("\x1b[?25z"), ConsoleCmd::Nop);
+    }
+
+    #[test]
+    fn test_cursor_movement_defaults() {
+        // All cursor movement with no param defaults to 1.
+        assert_eq!(parse_str_last("\x1b[A"), ConsoleCmd::CursorUp(1));
+        assert_eq!(parse_str_last("\x1b[B"), ConsoleCmd::CursorDown(1));
+        assert_eq!(parse_str_last("\x1b[D"), ConsoleCmd::CursorBack(1));
+        assert_eq!(
+            parse_str_last("\x1b[G"),
+            ConsoleCmd::CursorHorizontalAbsolute(1)
+        );
+    }
 }
