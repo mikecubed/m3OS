@@ -4615,7 +4615,7 @@ fn fetch_zlib_source(ports_src: &Path) {
             "-fsSL",
             "-o",
             zlib_tar.to_str().unwrap(),
-            "https://zlib.net/zlib-1.3.1.tar.gz",
+            "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
         ])
         .status();
     match status {
