@@ -427,13 +427,36 @@ fn copy_with_nul(src: &[u8], dst: &mut [u8]) -> usize {
     n + 1
 }
 
-/// Disable echo on stdin (set raw mode).
+/// Disable echo on stdin for password entry.
+///
+/// Saves the current termios and clears ECHO. On restore, the saved
+/// termios is validated — if copy_to_user delivered zeros (known
+/// intermittent kernel bug), we fall back to sensible cooked-mode
+/// defaults to prevent poisoning the terminal state.
 fn disable_echo() -> Option<syscall_lib::Termios> {
     if let Ok(t) = syscall_lib::tcgetattr(0) {
-        let mut raw = t;
+        // Validate: c_lflag should never be 0 for a console TTY.
+        // If tcgetattr returned zeros (copy_to_user bug), use defaults.
+        let saved = if t.c_lflag == 0 {
+            syscall_lib::Termios {
+                c_iflag: syscall_lib::ICRNL,
+                c_oflag: 0o000005,                                  // OPOST | ONLCR
+                c_cflag: 0o000060 | 0o000200 | 0o000400 | 0o060000, // CS8|CREAD|HUPCL|B38400
+                c_lflag: syscall_lib::ICANON
+                    | syscall_lib::ECHO
+                    | syscall_lib::ECHOE
+                    | syscall_lib::ISIG
+                    | 0o100000, // IEXTEN
+                c_line: 0,
+                c_cc: t.c_cc, // c_cc might still be correct
+            }
+        } else {
+            t
+        };
+        let mut raw = saved;
         raw.c_lflag &= !(syscall_lib::ECHO | syscall_lib::ECHOE);
         let _ = syscall_lib::tcsetattr(0, &raw);
-        Some(t)
+        Some(saved)
     } else {
         None
     }
