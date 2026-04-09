@@ -651,18 +651,16 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 // There are TWO separate ring buffers:
 //
 //   SCANCODE_BUF  — normal TTY / kbd_server path; consumed via
-//                   `read_scancode()`.  Always populated regardless of
-//                   framebuffer ownership (Phase 52: dual-routed so the
-//                   userspace stdin_feeder can read scancodes even when a
-//                   game owns the framebuffer).
+//                   `read_scancode()`.  Only populated when no process
+//                   owns the framebuffer (FB_OWNER_PID == 0).
 //
 //   RAW_SCANCODE_BUF — game input path; consumed via `read_raw_scancode()`
 //                   (sys_read_scancode syscall 0x1007).  Only populated when
 //                   a process owns the framebuffer (FB_OWNER_PID != 0).
 //
-// Both buffers may receive the same scancode when a process owns the
-// framebuffer (ScancodeSink::Raw path), so each consumer independently
-// drains its own buffer without competing for bytes.
+// Routing is exclusive: each scancode goes to exactly one buffer based on
+// framebuffer ownership.  This prevents stale scancodes from accumulating
+// in SCANCODE_BUF during gameplay and replaying when the game exits.
 
 const SCANCODE_BUF_SIZE: usize = 256;
 // Bitmask wraparound requires a power-of-two buffer size.
@@ -767,22 +765,17 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
 
         match raw_input_router.route_byte(scancode, crate::fb::fb_owner_pid() != 0) {
             ScancodeSink::Raw => unsafe {
-                // Phase 52: always push to TTY buffer as well so the
-                // kbd_server and stdin_feeder work even when a process
-                // (console_server or DOOM) owns the framebuffer.
+                // Raw path: scancodes go to the game buffer only.
+                // kbd_server does NOT receive scancodes while a process
+                // (DOOM) owns the framebuffer — this prevents stale
+                // scancodes from accumulating and replaying after the
+                // game exits.
                 push_to_buf(
                     (&raw mut RAW_SCANCODE_BUF).cast::<u8>(),
                     &RAW_SCANCODE_BUF_HEAD,
                     &RAW_SCANCODE_BUF_TAIL,
                     scancode,
                 );
-                push_to_buf(
-                    (&raw mut SCANCODE_BUF).cast::<u8>(),
-                    &SCANCODE_BUF_HEAD,
-                    &SCANCODE_BUF_TAIL,
-                    scancode,
-                );
-                got_tty_byte = true;
             },
             ScancodeSink::Tty => {
                 unsafe {
