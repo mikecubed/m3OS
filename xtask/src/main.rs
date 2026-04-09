@@ -4001,6 +4001,82 @@ fn signed_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Patch Phase 52 service configs into an existing data disk if missing.
+///
+/// Uses `debugfs` to check whether `etc/services.d/kbd.conf` exists. If not,
+/// writes the three Phase 52 configs (console, kbd, stdin_feeder) into the
+/// ext2 partition. This avoids forcing users to delete their data disk when
+/// upgrading to Phase 52.
+fn ensure_phase52_configs(disk_path: &Path, output_dir: &Path) {
+    // Probe for kbd.conf via debugfs stat.
+    let probe = Command::new("debugfs")
+        .arg("-R")
+        .arg("stat etc/services.d/kbd.conf")
+        .arg("-f")
+        .arg("-")
+        .arg(disk_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if probe.is_ok_and(|s| s.success()) {
+        return; // already present
+    }
+
+    println!("Data disk: patching Phase 52 service configs...");
+    let console_conf = "name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
+    let kbd_conf = "name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n";
+    let stdin_feeder_conf = "name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n";
+
+    let console_tmp = output_dir.join("_p52_console_conf");
+    let kbd_tmp = output_dir.join("_p52_kbd_conf");
+    let sf_tmp = output_dir.join("_p52_stdin_feeder_conf");
+    fs::write(&console_tmp, console_conf).expect("write temp console.conf");
+    fs::write(&kbd_tmp, kbd_conf).expect("write temp kbd.conf");
+    fs::write(&sf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
+
+    let cmds = format!(
+        "write \"{console}\" etc/services.d/console.conf\n\
+         sif etc/services.d/console.conf mode 0x81A4\n\
+         sif etc/services.d/console.conf uid 0\n\
+         sif etc/services.d/console.conf gid 0\n\
+         write \"{kbd}\" etc/services.d/kbd.conf\n\
+         sif etc/services.d/kbd.conf mode 0x81A4\n\
+         sif etc/services.d/kbd.conf uid 0\n\
+         sif etc/services.d/kbd.conf gid 0\n\
+         write \"{sf}\" etc/services.d/stdin_feeder.conf\n\
+         sif etc/services.d/stdin_feeder.conf mode 0x81A4\n\
+         sif etc/services.d/stdin_feeder.conf uid 0\n\
+         sif etc/services.d/stdin_feeder.conf gid 0\n\
+         q\n",
+        console = console_tmp.display(),
+        kbd = kbd_tmp.display(),
+        sf = sf_tmp.display(),
+    );
+
+    let mut debugfs = Command::new("debugfs")
+        .arg("-w")
+        .arg(disk_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to run debugfs for Phase 52 patch");
+    debugfs
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(cmds.as_bytes())
+        .expect("write debugfs commands");
+    let status = debugfs.wait().expect("wait for debugfs");
+    if !status.success() {
+        eprintln!("warning: debugfs Phase 52 patch failed — delete disk.img to recreate");
+    }
+    let _ = fs::remove_file(&console_tmp);
+    let _ = fs::remove_file(&kbd_tmp);
+    let _ = fs::remove_file(&sf_tmp);
+}
+
 /// Create a 64 MB raw data disk image with an MBR partition table and an
 /// ext2-formatted partition. The image is placed at `output_dir/disk.img`.
 /// Skips creation if the image already exists to preserve persisted data.
@@ -4023,6 +4099,8 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool) -> PathBuf {
                 disk_path.display()
             );
         }
+        // Phase 52: patch missing service configs into existing disks.
+        ensure_phase52_configs(&disk_path, output_dir);
         println!("Data disk: {} (existing, preserved)", disk_path.display());
         return disk_path;
     }
