@@ -1,9 +1,10 @@
 //! Userspace stdin feeder for m3OS (Phase 52, Track E).
 //!
-//! Reads scancodes from the keyboard server via IPC, translates them to
-//! characters using a US-QWERTY lookup table, implements a line discipline
-//! (canonical mode editing, signal characters, echo), and pushes processed
-//! bytes into the kernel stdin buffer via `stdin_push`.
+//! Reads scancodes via the kernel keyboard-scancode syscall (backed by the
+//! kernel's PS/2 scancode ring buffer), translates them to characters using
+//! a US-QWERTY lookup table, implements a line discipline (canonical mode
+//! editing, signal characters, echo), and pushes processed bytes into the
+//! kernel stdin buffer via `stdin_push`.
 //!
 //! This is the ring-3 replacement for the kernel-resident `stdin_feeder_task`
 //! in `kernel/src/main.rs`.
