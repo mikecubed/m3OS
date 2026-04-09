@@ -17,8 +17,8 @@
 use syscall_lib::{
     AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
     SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
-    nanosleep, open, read, rt_sigaction, sendto_unix, setuid, socket, waitpid, write, write_str,
-    write_u64,
+    nanosleep, open, read, rt_sigaction, sendto_unix, set_nonblocking, setuid, socket, waitpid,
+    write, write_str, write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -692,6 +692,8 @@ impl ServiceManager {
         if fd < 0 {
             return;
         }
+        // Non-blocking so PID 1 never stalls if syslogd is down or the buffer is full.
+        set_nonblocking(fd as i32);
         self.syslog_fd = fd as i32;
     }
 
