@@ -399,6 +399,18 @@ fn program_main(_args: &[&str]) -> i32 {
             // Newline: deliver line.
             if byte == b'\n' {
                 let data = edit_buf.as_slice();
+                // DEBUG: dump bytes being pushed to stdin
+                {
+                    let hex = b"0123456789abcdef";
+                    syscall_lib::write_str(STDOUT_FILENO, "[push:");
+                    for &b in data {
+                        let h = [hex[(b >> 4) as usize], hex[(b & 0xf) as usize], b' '];
+                        if let Ok(s) = core::str::from_utf8(&h) {
+                            syscall_lib::write_str(STDOUT_FILENO, s);
+                        }
+                    }
+                    syscall_lib::write_str(STDOUT_FILENO, "0a]\n");
+                }
                 syscall_lib::stdin_push(data);
                 edit_buf.clear();
                 let nl = [b'\n'];
