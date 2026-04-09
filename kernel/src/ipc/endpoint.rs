@@ -71,14 +71,23 @@ impl EndpointRegistry {
     /// # Panics
     ///
     /// Panics if all 16 slots are occupied (in both debug and release builds).
+    /// Kernel-internal callers (boot-time init) use this; userspace-facing
+    /// syscalls should use [`try_create`] instead.
     pub fn create(&mut self) -> EndpointId {
+        self.try_create().expect("endpoint registry full")
+    }
+
+    /// Fallible version of [`create`] — returns `None` when all slots are
+    /// occupied instead of panicking.  Used by userspace-facing syscalls to
+    /// avoid kernel DoS via endpoint exhaustion.
+    pub fn try_create(&mut self) -> Option<EndpointId> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(Endpoint::new());
-                return EndpointId(i as u8);
+                return Some(EndpointId(i as u8));
             }
         }
-        panic!("endpoint registry full");
+        None
     }
 
     /// Borrow a mutable reference to an endpoint.

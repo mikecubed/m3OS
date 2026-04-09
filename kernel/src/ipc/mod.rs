@@ -349,7 +349,10 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
 ///
 /// Returns the new capability handle on success, or `u64::MAX` on error.
 fn ipc_create_endpoint(task_id: crate::task::TaskId) -> u64 {
-    let ep_id = endpoint::ENDPOINTS.lock().create();
+    let ep_id = match endpoint::ENDPOINTS.lock().try_create() {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
     match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
         Ok(handle) => u64::from(handle),
         Err(_) => u64::MAX,
@@ -366,11 +369,14 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
     if irq != 1 {
         return u64::MAX;
     }
-    let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
-        let id = notification::create();
-        notification::register_irq(irq as u8, id);
-        id
-    });
+    let notif_id = match x86_64::instructions::interrupts::without_interrupts(|| {
+        notification::try_create().inspect(|&id| {
+            notification::register_irq(irq as u8, id);
+        })
+    }) {
+        Some(id) => id,
+        None => return u64::MAX,
+    };
     match crate::task::scheduler::insert_cap(task_id, Capability::Notification(notif_id)) {
         Ok(handle) => u64::from(handle),
         Err(_) => u64::MAX,

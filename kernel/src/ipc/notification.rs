@@ -134,15 +134,24 @@ static ALLOCATED: Mutex<[bool; MAX_NOTIFS]> = Mutex::new([false; MAX_NOTIFS]);
 /// # Panics
 ///
 /// Panics if all 16 slots are occupied (in both debug and release builds).
+/// Kernel-internal callers (boot-time init) use this; userspace-facing
+/// syscalls should use [`try_create`] instead.
 pub fn create() -> NotifId {
+    try_create().expect("notification registry full")
+}
+
+/// Fallible version of [`create`] — returns `None` when all slots are
+/// occupied instead of panicking.  Used by userspace-facing syscalls to
+/// avoid kernel DoS via notification exhaustion.
+pub fn try_create() -> Option<NotifId> {
     let mut alloc = ALLOCATED.lock();
     for (i, slot) in alloc.iter_mut().enumerate() {
         if !*slot {
             *slot = true;
-            return NotifId(i as u8);
+            return Some(NotifId(i as u8));
         }
     }
-    panic!("notification registry full");
+    None
 }
 
 /// Register an IRQ number to signal a notification on each delivery.
