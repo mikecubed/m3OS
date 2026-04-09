@@ -12,7 +12,9 @@ Uses the `xtask` pattern — always build through `cargo xtask`, never `cargo bu
 
 ```bash
 cargo xtask run          # build + launch in QEMU (headless, serial output)
+cargo xtask run --fresh  # same, but recreate data disk first
 cargo xtask run-gui      # build + launch in QEMU (GUI with framebuffer)
+cargo xtask run-gui --fresh  # same, but recreate data disk first
 cargo xtask image        # build bootable disk image (UEFI raw + VHDX)
 cargo xtask image --sign # build + sign EFI binary for Secure Boot
 cargo xtask check        # clippy (-D warnings) + rustfmt + kernel-core host tests

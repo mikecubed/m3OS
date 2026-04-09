@@ -39,8 +39,14 @@ fn main() {
             });
             cmd_image(&image_args);
         }
-        Some("run") => cmd_run(),
-        Some("run-gui") => cmd_run_gui(),
+        Some("run") => {
+            let fresh = args.iter().any(|a| a == "--fresh");
+            cmd_run(fresh);
+        }
+        Some("run-gui") => {
+            let fresh = args.iter().any(|a| a == "--fresh");
+            cmd_run_gui(fresh);
+        }
         Some("check") => cmd_check(),
         Some("fmt") => {
             let fix = args.iter().any(|a| a == "--fix");
@@ -107,7 +113,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run|run-gui|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh]|run-gui [--fresh]|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -5410,18 +5416,32 @@ fn cmd_clean() {
     }
 }
 
-fn cmd_run() {
+fn cmd_run(fresh: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    if fresh {
+        let disk = uefi_image.parent().unwrap().join("disk.img");
+        if disk.exists() {
+            fs::remove_file(&disk).expect("failed to remove disk.img");
+            println!("Removed {} (--fresh)", disk.display());
+        }
+    }
     create_data_disk(uefi_image.parent().unwrap(), false);
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
 }
 
-fn cmd_run_gui() {
+fn cmd_run_gui(fresh: bool) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
+    if fresh {
+        let disk = uefi_image.parent().unwrap().join("disk.img");
+        if disk.exists() {
+            fs::remove_file(&disk).expect("failed to remove disk.img");
+            println!("Removed {} (--fresh)", disk.display());
+        }
+    }
     create_data_disk(uefi_image.parent().unwrap(), false);
     launch_qemu(&uefi_image, QemuDisplayMode::Gui);
 }
