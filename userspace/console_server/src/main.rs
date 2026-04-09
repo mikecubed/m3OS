@@ -33,27 +33,17 @@ syscall_lib::entry_point!(program_main);
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "console_server: starting\n");
 
-    // 1. Get framebuffer info.
-    let fb_info = match get_fb_info() {
-        Some(info) => info,
-        None => {
-            syscall_lib::write_str(STDOUT_FILENO, "console_server: no framebuffer available\n");
-            return 1;
-        }
-    };
+    // Phase 52 transitional: skip framebuffer_mmap because it calls
+    // try_yield_console which suppresses ALL kernel framebuffer text output
+    // (login prompt, shell, everything).  The kernel's fb console still
+    // handles sys_write rendering.  The userspace console_server runs as an
+    // IPC-only service: CONSOLE_WRITE payloads are echoed to stdout which
+    // the kernel renders to both serial and framebuffer.
+    //
+    // Full framebuffer takeover will be enabled in a later phase when
+    // sys_write(STDOUT) is routed through IPC to this service.
 
-    syscall_lib::write_str(STDOUT_FILENO, "console_server: got fb info\n");
-
-    // 2. Map the framebuffer into our address space.
-    let fb_addr = syscall_lib::framebuffer_mmap();
-    if is_error(fb_addr) {
-        syscall_lib::write_str(STDOUT_FILENO, "console_server: framebuffer mmap failed\n");
-        return 1;
-    }
-
-    syscall_lib::write_str(STDOUT_FILENO, "console_server: framebuffer mapped\n");
-
-    // 3. Create an IPC endpoint.
+    // 1. Create an IPC endpoint.
     let ep_handle = syscall_lib::create_endpoint();
     if ep_handle == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "console_server: create_endpoint failed\n");
@@ -61,7 +51,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     let ep_handle = ep_handle as u32;
 
-    // 4. Register as "console" service (takes over from kernel entry).
+    // 2. Register as "console" service (takes over from kernel entry).
     let ret = syscall_lib::ipc_register_service(ep_handle, "console");
     if ret == u64::MAX {
         syscall_lib::write_str(STDOUT_FILENO, "console_server: register_service failed\n");
@@ -69,13 +59,10 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     syscall_lib::write_str(STDOUT_FILENO, "console_server: registered as 'console'\n");
-
-    // 5. Initialize the framebuffer renderer.
-    let mut renderer = FbRenderer::new(fb_addr as *mut u8, &fb_info);
-
-    // 6. Enter the IPC server loop.
     syscall_lib::write_str(STDOUT_FILENO, "console_server: ready\n");
-    server_loop(&mut renderer, ep_handle);
+
+    // 3. Enter the IPC server loop (no framebuffer renderer — stdout only).
+    server_loop_stdout(ep_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -96,11 +83,48 @@ const REPLY_CAP_HANDLE: u32 = 1;
 // Server loop
 // ---------------------------------------------------------------------------
 
-fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
+/// Transitional server loop: receives CONSOLE_WRITE IPC and echoes the
+/// payload to stdout.  The kernel renders stdout to both serial and
+/// framebuffer, so text appears in both places without needing a direct
+/// framebuffer mapping.
+fn server_loop_stdout(ep_handle: u32) -> ! {
     let mut msg = syscall_lib::IpcMessage::new(0);
     let mut buf = [0u8; MAX_CONSOLE_WRITE_LEN];
 
     // First receive — blocks until a client sends a message.
+    syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
+
+    loop {
+        let reply_label = match msg.label {
+            CONSOLE_WRITE => {
+                let len = (msg.data[1] as usize).min(MAX_CONSOLE_WRITE_LEN);
+                if len > 0 {
+                    if let Ok(text) = core::str::from_utf8(&buf[..len]) {
+                        syscall_lib::write_str(STDOUT_FILENO, text);
+                    }
+                }
+                0
+            }
+            _ => u64::MAX,
+        };
+
+        // Reply and wait for the next message.
+        msg = syscall_lib::IpcMessage::new(0);
+        syscall_lib::ipc_reply_recv_msg(
+            REPLY_CAP_HANDLE,
+            reply_label,
+            ep_handle,
+            &mut msg,
+            &mut buf,
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
+    let mut msg = syscall_lib::IpcMessage::new(0);
+    let mut buf = [0u8; MAX_CONSOLE_WRITE_LEN];
+
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
 
     loop {
@@ -112,7 +136,6 @@ fn server_loop(renderer: &mut FbRenderer, ep_handle: u32) -> ! {
             _ => u64::MAX,
         };
 
-        // Reply and wait for the next message.
         msg = syscall_lib::IpcMessage::new(0);
         syscall_lib::ipc_reply_recv_msg(
             REPLY_CAP_HANDLE,
