@@ -452,6 +452,48 @@ pub fn signal_process_group(sig: u32) -> isize {
     unsafe { syscall2(SYS_SIGNAL_PROCESS_GROUP, sig as u64, 0) as isize }
 }
 
+/// Phase 52: get termios c_lflag, c_iflag, c_oflag, and c_cc from TTY0.
+pub const SYS_GET_TERMIOS_FLAGS: u64 = 0x100B;
+
+/// Phase 52: signal EOF on kernel stdin.
+pub const SYS_STDIN_SIGNAL_EOF: u64 = 0x100C;
+
+/// Termios flags returned by `get_termios_flags`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TermiosFlags {
+    pub c_lflag: u32,
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cc: [u8; 19],
+}
+
+impl TermiosFlags {
+    pub const fn zeroed() -> Self {
+        Self {
+            c_lflag: 0,
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cc: [0; 19],
+        }
+    }
+}
+
+/// Query termios flags from the kernel's TTY0.
+///
+/// Returns 0 on success and fills the provided struct.
+pub fn get_termios_flags(out: &mut TermiosFlags) -> isize {
+    let buf = out as *mut TermiosFlags as *mut u8;
+    unsafe { syscall2(SYS_GET_TERMIOS_FLAGS, buf as u64, 32) as isize }
+}
+
+/// Signal EOF on the kernel stdin buffer.
+///
+/// Causes the next `read(0, ...)` to return 0.
+pub fn stdin_signal_eof() -> isize {
+    unsafe { syscall0(SYS_STDIN_SIGNAL_EOF) as isize }
+}
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -675,6 +717,7 @@ pub const SEEK_END: usize = 2;
 
 pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
 pub const SIGKILL: i32 = 9;
 pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;

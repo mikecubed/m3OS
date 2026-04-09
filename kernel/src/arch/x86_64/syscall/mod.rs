@@ -1061,6 +1061,10 @@ mod syscall_nr {
     pub const READ_KBD_SCANCODE: u64 = 0x100A;
     /// Phase 52: signal a process group from userspace (for line discipline).
     pub const SIGNAL_PROCESS_GROUP: u64 = 0x1009;
+    /// Phase 52: get termios c_lflag, c_iflag, c_oflag, c_cc from TTY0.
+    pub const GET_TERMIOS_FLAGS: u64 = 0x100B;
+    /// Phase 52: signal EOF on kernel stdin from userspace.
+    pub const STDIN_SIGNAL_EOF: u64 = 0x100C;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1351,6 +1355,8 @@ pub extern "C" fn syscall_handler(
         STDIN_PUSH => sys_stdin_push(arg0, arg1),
         SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
         READ_KBD_SCANCODE => sys_read_kbd_scancode(),
+        GET_TERMIOS_FLAGS => sys_get_termios_flags(arg0, arg1),
+        STDIN_SIGNAL_EOF => sys_stdin_signal_eof(),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -7670,6 +7676,48 @@ pub(super) fn sys_signal_process_group(sig: u64, _arg1: u64) -> u64 {
         return 0;
     }
     crate::process::send_signal_to_group(fg, sig as u32);
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: get termios flags from TTY0
+// ---------------------------------------------------------------------------
+
+/// Return termios flags to a userspace buffer.
+///
+/// arg0 = user buffer pointer (must hold at least 32 bytes:
+///        c_lflag(4) + c_iflag(4) + c_oflag(4) + c_cc[19] + pad(1) = 32).
+/// arg1 = buffer length.
+/// Returns 0 on success, NEG_EFAULT on bad pointer, NEG_EINVAL on bad size.
+pub(super) fn sys_get_termios_flags(buf_ptr: u64, buf_len: u64) -> u64 {
+    const NEEDED: usize = 32; // 4+4+4+19+1
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if buf_ptr == 0 || buf_ptr >= USER_LIMIT || (buf_len as usize) < NEEDED {
+        return NEG_EINVAL;
+    }
+    let t = crate::tty::TTY0.lock();
+    let mut out = [0u8; NEEDED];
+    out[0..4].copy_from_slice(&t.termios.c_lflag.to_le_bytes());
+    out[4..8].copy_from_slice(&t.termios.c_iflag.to_le_bytes());
+    out[8..12].copy_from_slice(&t.termios.c_oflag.to_le_bytes());
+    out[12..31].copy_from_slice(&t.termios.c_cc);
+    out[31] = 0; // padding
+    drop(t);
+    if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+        return NEG_EFAULT;
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: signal EOF on kernel stdin
+// ---------------------------------------------------------------------------
+
+/// Signal EOF on the kernel stdin buffer.
+///
+/// Returns 0 always.
+pub(super) fn sys_stdin_signal_eof() -> u64 {
+    crate::stdin::signal_eof();
     0
 }
 

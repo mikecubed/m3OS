@@ -47,6 +47,7 @@ members = [
     # Phase 52 extracted services:
     "userspace/console_server",
     "userspace/kbd_server",
+    "userspace/stdin_feeder",
     # Future userspace servers:
     # "userspace/vfs_server",
     # "userspace/fat_server",
