@@ -197,12 +197,24 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: starting\n");
 
     // Look up the "kbd" service to obtain an endpoint capability.
-    let kbd_handle = syscall_lib::ipc_lookup_service("kbd");
-    if kbd_handle == u64::MAX {
-        syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: failed to lookup 'kbd'\n");
-        return 1;
-    }
-    let kbd_handle = kbd_handle as u32;
+    // Retry with short sleeps because the service manager starts us as soon
+    // as kbd_server is forked, which is before it has registered its IPC
+    // endpoint.
+    let kbd_handle = {
+        let mut h = u64::MAX;
+        for _ in 0..50 {
+            h = syscall_lib::ipc_lookup_service("kbd");
+            if h != u64::MAX {
+                break;
+            }
+            syscall_lib::nanosleep(20_000_000); // 20 ms
+        }
+        if h == u64::MAX {
+            syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: failed to lookup 'kbd'\n");
+            return 1;
+        }
+        h as u32
+    };
 
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: ready\n");
 
