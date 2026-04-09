@@ -4165,6 +4165,12 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let telnetd_conf = "name=telnetd\ncommand=/bin/telnetd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
     let syslogd_conf = "name=syslogd\ncommand=/bin/syslogd\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
     let crond_conf = "name=crond\ncommand=/bin/crond\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=syslogd\n";
+
+    // Phase 52: service definitions for extracted ring-3 services.
+    let console_conf = "name=console\ncommand=/bin/console_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
+    let kbd_conf = "name=kbd\ncommand=/bin/kbd_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console\n";
+    let stdin_feeder_conf = "name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n";
+
     let hostname_content = "m3os\n";
 
     // Create temp host files for debugfs `write` command.
@@ -4174,6 +4180,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let sshd_conf_tmp = output_dir.join("_tmp_sshd_conf");
     let syslogd_conf_tmp = output_dir.join("_tmp_syslogd_conf");
     let crond_conf_tmp = output_dir.join("_tmp_crond_conf");
+    let console_conf_tmp = output_dir.join("_tmp_console_conf");
+    let kbd_conf_tmp = output_dir.join("_tmp_kbd_conf");
+    let stdin_feeder_conf_tmp = output_dir.join("_tmp_stdin_feeder_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
@@ -4181,6 +4190,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     fs::write(&sshd_conf_tmp, sshd_conf).expect("write temp sshd.conf");
     fs::write(&syslogd_conf_tmp, syslogd_conf).expect("write temp syslogd.conf");
     fs::write(&crond_conf_tmp, crond_conf).expect("write temp crond.conf");
+    fs::write(&console_conf_tmp, console_conf).expect("write temp console.conf");
+    fs::write(&kbd_conf_tmp, kbd_conf).expect("write temp kbd.conf");
+    fs::write(&stdin_feeder_conf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
 
     // Phase 48: telnetd service config is only written when --enable-telnet is passed.
@@ -4285,6 +4297,18 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
          sif etc/services.d/crond.conf mode 0x81A4\n\
          sif etc/services.d/crond.conf uid 0\n\
          sif etc/services.d/crond.conf gid 0\n\
+         write \"{console_conf}\" etc/services.d/console.conf\n\
+         sif etc/services.d/console.conf mode 0x81A4\n\
+         sif etc/services.d/console.conf uid 0\n\
+         sif etc/services.d/console.conf gid 0\n\
+         write \"{kbd_conf}\" etc/services.d/kbd.conf\n\
+         sif etc/services.d/kbd.conf mode 0x81A4\n\
+         sif etc/services.d/kbd.conf uid 0\n\
+         sif etc/services.d/kbd.conf gid 0\n\
+         write \"{stdin_feeder_conf}\" etc/services.d/stdin_feeder.conf\n\
+         sif etc/services.d/stdin_feeder.conf mode 0x81A4\n\
+         sif etc/services.d/stdin_feeder.conf uid 0\n\
+         sif etc/services.d/stdin_feeder.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -4297,6 +4321,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
         telnetd_cmds = telnetd_cmds,
         syslogd_conf = syslogd_conf_tmp.display(),
         crond_conf = crond_conf_tmp.display(),
+        console_conf = console_conf_tmp.display(),
+        kbd_conf = kbd_conf_tmp.display(),
+        stdin_feeder_conf = stdin_feeder_conf_tmp.display(),
         hostname = hostname_tmp.display(),
     );
 
