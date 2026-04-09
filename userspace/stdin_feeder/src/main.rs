@@ -1,10 +1,9 @@
 //! Userspace stdin feeder for m3OS (Phase 52, Track E).
 //!
-//! Reads scancodes via the kernel keyboard-scancode syscall (backed by the
-//! kernel's PS/2 scancode ring buffer), translates them to characters using
-//! a US-QWERTY lookup table, implements a line discipline (canonical mode
-//! editing, signal characters, echo), and pushes processed bytes into the
-//! kernel stdin buffer via `stdin_push`.
+//! Obtains scancodes from the `kbd_server` service via IPC (`KBD_READ`),
+//! translates them to characters using a US-QWERTY lookup table, implements
+//! a line discipline (canonical mode editing, signal characters, echo), and
+//! pushes processed bytes into the kernel stdin buffer via `stdin_push`.
 //!
 //! This is the ring-3 replacement for the kernel-resident `stdin_feeder_task`
 //! in `kernel/src/main.rs`.
@@ -191,8 +190,19 @@ fn echo_byte(b: u8) {
 
 syscall_lib::entry_point!(program_main);
 
+/// IPC operation label: read one scancode from kbd_server.
+const KBD_READ: u64 = 1;
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: starting\n");
+
+    // Look up the "kbd" service to obtain an endpoint capability.
+    let kbd_handle = syscall_lib::ipc_lookup_service("kbd");
+    if kbd_handle == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: failed to lookup 'kbd'\n");
+        return 1;
+    }
+    let kbd_handle = kbd_handle as u32;
 
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: ready\n");
 
@@ -201,17 +211,10 @@ fn program_main(_args: &[&str]) -> i32 {
     let mut edit_buf = EditBuffer::new();
 
     loop {
-        // Read one scancode from the TTY keyboard buffer via
-        // SYS_READ_KBD_SCANCODE.  Non-blocking: returns 0 if empty.
-        // Poll with short sleeps until a scancode is available.
-        let sc = loop {
-            let s = syscall_lib::read_kbd_scancode();
-            if s != 0 {
-                break s;
-            }
-            // Yield the CPU briefly to avoid busy-spinning.
-            syscall_lib::nanosleep(0);
-        };
+        // Request one scancode from kbd_server via IPC.  This blocks until
+        // the keyboard service has a scancode ready (it blocks on IRQ1
+        // internally).  The scancode is returned as the reply label.
+        let sc = syscall_lib::ipc_call(kbd_handle, KBD_READ, 0) as u8;
 
         // Key-release (break) codes: bit 7 set.
         if sc >= 0x80 {

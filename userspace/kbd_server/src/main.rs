@@ -87,8 +87,9 @@ fn program_main(_args: &[&str]) -> i32 {
             // via ipc_reply the slot is freed, so it stays at slot 2.
             let reply_cap: u32 = 2;
 
-            // Reply with label=0 (success) and data0=scancode.
-            syscall_lib::ipc_reply(reply_cap, 0, scancode as u64);
+            // Reply with label=scancode so ipc_call callers (which only
+            // receive the reply label) can read it directly.
+            syscall_lib::ipc_reply(reply_cap, scancode as u64, 0);
 
             // Wait for next request.
             label = syscall_lib::ipc_recv(ep_handle);

@@ -210,11 +210,9 @@ fn init_task() -> ! {
         .expect("[init] failed to register console service");
     log::info!("[init] service registry: console={:?}", console_ep);
 
-    // Phase 9: kbd endpoint — registered before spawning kbd_server_task so the
-    // server can look it up via the registry on startup.
-    let kbd_ep = ipc::endpoint::ENDPOINTS.lock().create();
-    ipc::registry::register("kbd", kbd_ep).expect("[init] failed to register kbd service");
-    log::info!("[init] service registry: kbd={:?}", kbd_ep);
+    // Phase 52: kbd endpoint creation and registration moved to the userspace
+    // kbd_server service (kernel/initrd/etc/services.d/kbd.conf).  The kernel
+    // no longer pre-registers or spawns a ring-0 kbd_server_task.
 
     // Phase 8: fat_server endpoint — must be registered before vfs_server
     // spawns because vfs_server calls lookup("fat") during its startup.
@@ -229,7 +227,7 @@ fn init_task() -> ! {
 
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
-    task::spawn(kbd_server_task, "kbd");
+    // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
     // Spawn Phase 8 storage tasks.
     task::spawn(fat_server_task, "fat");
@@ -240,8 +238,8 @@ fn init_task() -> ! {
         task::spawn(net_task, "net");
     }
 
-    // Phase 14: stdin feeder — reads scancodes from kbd, decodes, feeds stdin buffer.
-    task::spawn(stdin_feeder_task, "stdin-feeder");
+    // Phase 52: stdin_feeder_task removed — userspace stdin_feeder reads from
+    // the userspace kbd_server via IPC and pushes to stdin via stdin_push syscall.
 
     // Phase 21: serial stdin feeder — reads bytes from COM1, feeds stdin buffer.
     // Allows testing ion interactively via `cargo xtask run` with piped input.
@@ -418,89 +416,15 @@ fn console_server_task() -> ! {
     }
 }
 
-/// Keyboard server: serves KBD_READ IPC requests, blocking on IRQ1 when no
-/// scancode is immediately available.
-///
-/// Capability table layout:
-///   handle 0 — Notification(notif_id)  inserted by kbd_server itself
-///   handle 1 — Reply(caller_id)        inserted by recv_msg / call_msg on each client call
-fn kbd_server_task() -> ! {
-    let my_id = task::current_task_id().expect("[kbd] no task id");
-
-    // Create a notification and register it for IRQ1 with interrupts disabled
-    // to avoid a race between create() and register_irq().
-    let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
-        let id = ipc::notification::create();
-        ipc::notification::register_irq(1, id);
-        id
-    });
-
-    // Handle 0: notification capability.
-    let notif_handle = task::insert_cap(my_id, ipc::Capability::Notification(notif_id))
-        .expect("[kbd] failed to insert notification cap");
-    debug_assert_eq!(
-        notif_handle, 0,
-        "[kbd] notification cap not at expected handle 0"
-    );
-
-    // Look up the kbd endpoint registered by init_task.
-    let ep_id = ipc::registry::lookup("kbd").expect("[kbd] endpoint not in registry");
-    task::set_server_endpoint(my_id, ep_id);
-
-    log::info!("[kbd] ready, waiting for KBD_READ requests");
-
-    // recv_msg/reply_recv_msg take EndpointId directly, so keep handle 1 free
-    // for the one-shot Reply capability inserted on each client call.
-    let reply_cap_handle: ipc::CapHandle = 1;
-
-    // First receive — blocks until a client sends KBD_READ.
-    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
-
-    loop {
-        let reply_msg = match msg.label {
-            KBD_READ => {
-                // Poll the ring buffer; if empty, sleep on IRQ notification.
-                let scancode = loop {
-                    if let Some(sc) = crate::arch::x86_64::interrupts::read_scancode() {
-                        break sc;
-                    }
-                    // Block until the keyboard ISR fires.
-                    ipc::notification::wait(my_id, notif_id);
-                    // After waking, drain will happen on next iteration.
-                };
-                log::debug!("[kbd] scancode={:#04x}", scancode);
-                let mut r = ipc::Message::new(0);
-                r.data[0] = scancode as u64;
-                r
-            }
-            _ => ipc::Message::new(u64::MAX),
-        };
-
-        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
-            Ok(ipc::Capability::Reply(id)) => id,
-            _ => {
-                log::warn!("[kbd] no reply cap at handle 1; sender used send rather than call");
-                msg = ipc::endpoint::recv_msg(my_id, ep_id);
-                continue;
-            }
-        };
-        let _ = task::remove_task_cap(my_id, reply_cap_handle);
-        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
-    }
-}
+// Phase 52: kbd_server_task removed — the userspace kbd_server
+// (kernel/initrd/etc/services.d/kbd.conf) now owns IRQ1, scancode translation,
+// and KBD_READ IPC handling.
 
 /// Console IPC operation label: write a UTF-8 string to the serial console.
 ///
 /// data[0] = kernel pointer to string bytes, data[1] = byte length (max 4096).
 const CONSOLE_WRITE: u64 = 0;
 const MAX_CONSOLE_WRITE_LEN: usize = 4096;
-
-/// Keyboard server IPC operation label: read one scancode.
-///
-/// Request: no data fields.
-/// Reply:   data[0] = scancode (u8 as u64).  The server blocks on IRQ1 if no
-///          scancode is available, so this call always returns a real scancode.
-const KBD_READ: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Phase 8 storage tasks
@@ -594,345 +518,6 @@ fn vfs_server_task() -> ! {
 
         let _ = task::remove_task_cap(my_id, reply_cap_handle);
         msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 9 shell tasks (T004–T009)
-// ---------------------------------------------------------------------------
-
-/// Translate a PS/2 scancode (make code, < 0x80) to an ASCII character.
-///
-/// Returns `None` for non-printable or unmapped scancodes.
-fn scancode_to_char(sc: u8, shift: bool) -> Option<char> {
-    // US-QWERTY layout.  Only make codes (< 0x80) are passed here.
-    let (lo, hi): (Option<char>, Option<char>) = match sc {
-        0x02 => (Some('1'), Some('!')),
-        0x03 => (Some('2'), Some('@')),
-        0x04 => (Some('3'), Some('#')),
-        0x05 => (Some('4'), Some('$')),
-        0x06 => (Some('5'), Some('%')),
-        0x07 => (Some('6'), Some('^')),
-        0x08 => (Some('7'), Some('&')),
-        0x09 => (Some('8'), Some('*')),
-        0x0A => (Some('9'), Some('(')),
-        0x0B => (Some('0'), Some(')')),
-        0x0C => (Some('-'), Some('_')),
-        0x0D => (Some('='), Some('+')),
-        0x10 => (Some('q'), Some('Q')),
-        0x11 => (Some('w'), Some('W')),
-        0x12 => (Some('e'), Some('E')),
-        0x13 => (Some('r'), Some('R')),
-        0x14 => (Some('t'), Some('T')),
-        0x15 => (Some('y'), Some('Y')),
-        0x16 => (Some('u'), Some('U')),
-        0x17 => (Some('i'), Some('I')),
-        0x18 => (Some('o'), Some('O')),
-        0x19 => (Some('p'), Some('P')),
-        0x1A => (Some('['), Some('{')),
-        0x1B => (Some(']'), Some('}')),
-        0x1E => (Some('a'), Some('A')),
-        0x1F => (Some('s'), Some('S')),
-        0x20 => (Some('d'), Some('D')),
-        0x21 => (Some('f'), Some('F')),
-        0x22 => (Some('g'), Some('G')),
-        0x23 => (Some('h'), Some('H')),
-        0x24 => (Some('j'), Some('J')),
-        0x25 => (Some('k'), Some('K')),
-        0x26 => (Some('l'), Some('L')),
-        0x27 => (Some(';'), Some(':')),
-        0x28 => (Some('\''), Some('"')),
-        0x2B => (Some('\\'), Some('|')),
-        0x2C => (Some('z'), Some('Z')),
-        0x2D => (Some('x'), Some('X')),
-        0x2E => (Some('c'), Some('C')),
-        0x2F => (Some('v'), Some('V')),
-        0x30 => (Some('b'), Some('B')),
-        0x31 => (Some('n'), Some('N')),
-        0x32 => (Some('m'), Some('M')),
-        0x33 => (Some(','), Some('<')),
-        0x34 => (Some('.'), Some('>')),
-        0x35 => (Some('/'), Some('?')),
-        0x39 => (Some(' '), Some(' ')),
-        _ => (None, None),
-    };
-    if shift { hi } else { lo }
-}
-
-/// Send a string slice to the console server via CONSOLE_WRITE IPC.
-fn shell_print(my_id: task::TaskId, console_ep: ipc::endpoint::EndpointId, s: &str) {
-    if s.is_empty() {
-        return;
-    }
-    let bytes = s.as_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let chunk_end = (offset + MAX_CONSOLE_WRITE_LEN).min(bytes.len());
-        let chunk = &bytes[offset..chunk_end];
-        let msg = ipc::Message::with2(CONSOLE_WRITE, chunk.as_ptr() as u64, chunk.len() as u64);
-        let _ = ipc::endpoint::call_msg(my_id, console_ep, msg);
-        offset = chunk_end;
-    }
-}
-
-/// Dispatch a parsed command line to the appropriate built-in.
-/// Stdin feeder task (Phase 14, Track E).
-///
-/// Reads scancodes from the keyboard server, decodes them to characters,
-/// echoes to the console, handles line buffering and backspace, and feeds
-/// completed lines into the kernel stdin buffer for `read(0, ...)`.
-fn stdin_feeder_task() -> ! {
-    use kernel_core::tty::*;
-
-    let my_id = task::current_task_id().expect("[stdin] no task id");
-
-    let console_ep = ipc::registry::lookup("console").expect("[stdin] console not found");
-    let kbd_ep = ipc::registry::lookup("kbd").expect("[stdin] kbd not found");
-
-    log::info!("[stdin] feeder ready (Phase 22 line discipline)");
-
-    let mut shift = false;
-    let mut ctrl = false;
-
-    loop {
-        // Request one scancode from the keyboard server.
-        let kbd_req = ipc::Message::new(KBD_READ);
-        let kbd_reply = ipc::endpoint::call_msg(my_id, kbd_ep, kbd_req);
-        if kbd_reply.label == u64::MAX {
-            task::yield_now();
-            continue;
-        }
-        let sc = kbd_reply.data[0] as u8;
-
-        // Key-release (break) codes: bit 7 set.
-        if sc >= 0x80 {
-            let make = sc & 0x7F;
-            if make == 0x2A || make == 0x36 {
-                shift = false;
-            }
-            if make == 0x1D {
-                ctrl = false;
-            }
-            continue;
-        }
-
-        // Modifier make codes.
-        if sc == 0x1D {
-            ctrl = true;
-            continue;
-        }
-        if sc == 0x2A || sc == 0x36 {
-            shift = true;
-            continue;
-        }
-
-        // Convert scancode to byte(s).
-        // Arrow keys, Home, End, Delete, PageUp/Down, and Escape produce
-        // VT100 escape sequences so that raw-mode programs (e.g. edit) can
-        // parse them with standard ANSI sequence handling.
-        let escape_seq: Option<&[u8]> = match sc {
-            0x48 => Some(b"\x1b[A"),  // Arrow Up
-            0x50 => Some(b"\x1b[B"),  // Arrow Down
-            0x4D => Some(b"\x1b[C"),  // Arrow Right
-            0x4B => Some(b"\x1b[D"),  // Arrow Left
-            0x47 => Some(b"\x1b[H"),  // Home
-            0x4F => Some(b"\x1b[F"),  // End
-            0x53 => Some(b"\x1b[3~"), // Delete
-            0x49 => Some(b"\x1b[5~"), // Page Up
-            0x51 => Some(b"\x1b[6~"), // Page Down
-            0x01 => Some(b"\x1b"),    // Escape
-            _ => None,
-        };
-
-        if let Some(seq) = escape_seq {
-            // Read termios to check canonical mode.
-            let canonical = tty::TTY0.lock().termios.c_lflag & ICANON != 0;
-            if canonical {
-                // In cooked mode, escape sequences are not useful — skip them
-                // to avoid polluting the line buffer.
-                continue;
-            }
-            for &b in seq {
-                stdin::push_char(b);
-            }
-            continue;
-        }
-
-        let byte = if sc == 0x1C {
-            b'\r' // Enter key produces CR; ICRNL translates to LF when enabled
-        } else if sc == 0x0F {
-            b'\t' // Tab
-        } else if sc == 0x0E {
-            0x7F // DEL / backspace
-        } else if ctrl {
-            // Ctrl + letter → control character (0x01–0x1A).
-            match scancode_to_char(sc, false) {
-                Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as u8) - b'A' + 1,
-                _ => continue,
-            }
-        } else {
-            match scancode_to_char(sc, shift) {
-                Some(c) => {
-                    let mut buf = [0u8; 4];
-                    let s = c.encode_utf8(&mut buf);
-                    s.as_bytes()[0]
-                }
-                None => continue,
-            }
-        };
-
-        // Read termios flags under lock.
-        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = {
-            let t = tty::TTY0.lock();
-            (
-                t.termios.c_lflag,
-                t.termios.c_iflag,
-                t.termios.c_oflag,
-                t.termios.c_cc,
-            )
-        };
-
-        let canonical = c_lflag & ICANON != 0;
-        let echo_on = c_lflag & ECHO != 0;
-        let isig = c_lflag & ISIG != 0;
-
-        // ICRNL: translate CR to NL on input.
-        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
-            b'\n'
-        } else {
-            byte
-        };
-
-        // ISIG: check signal characters from c_cc (not hardcoded).
-        if isig {
-            let signal = if byte == c_cc_arr[VINTR] {
-                Some((process::SIGINT, "^C"))
-            } else if byte == c_cc_arr[VSUSP] {
-                Some((process::SIGTSTP, "^Z"))
-            } else if byte == c_cc_arr[VQUIT] {
-                Some((process::SIGQUIT, "^\\"))
-            } else {
-                None
-            };
-
-            if let Some((sig, name)) = signal {
-                let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
-                if fg != 0 {
-                    // Clear edit buffer in canonical mode.
-                    if canonical {
-                        tty::TTY0.lock().edit_buf.clear();
-                    }
-                    shell_print(my_id, console_ep, name);
-                    shell_print(my_id, console_ep, "\n");
-                    process::send_signal_to_group(fg, sig);
-                } else {
-                    // No foreground group — push raw byte.
-                    stdin::push_char(byte);
-                }
-                continue;
-            }
-        }
-
-        if canonical {
-            // Cooked mode: buffer in edit_buf, deliver on newline or EOF.
-
-            // VERASE (backspace/DEL)
-            if byte == c_cc_arr[VERASE] || byte == 0x7F {
-                let erased = tty::TTY0.lock().edit_buf.erase_char();
-                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
-                    shell_print(my_id, console_ep, "\x08 \x08");
-                }
-                continue;
-            }
-
-            // VKILL (^U)
-            if byte == c_cc_arr[VKILL] {
-                let n = tty::TTY0.lock().edit_buf.kill_line();
-                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
-                    // Erase the line visually.
-                    for _ in 0..n {
-                        shell_print(my_id, console_ep, "\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VWERASE (^W)
-            if byte == c_cc_arr[VWERASE] {
-                let n = tty::TTY0.lock().edit_buf.word_erase();
-                if n > 0 && echo_on {
-                    for _ in 0..n {
-                        shell_print(my_id, console_ep, "\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VEOF (^D)
-            if byte == c_cc_arr[VEOF] {
-                let mut t = tty::TTY0.lock();
-                if t.edit_buf.is_empty() {
-                    drop(t);
-                    stdin::signal_eof();
-                } else {
-                    // Non-empty: flush buffer without appending newline.
-                    let len = t.edit_buf.len;
-                    // Push directly while holding the lock (stdin uses a
-                    // separate lock so this is safe from deadlock).
-                    for i in 0..len {
-                        stdin::push_char(t.edit_buf.buf[i]);
-                    }
-                    t.edit_buf.clear();
-                }
-                continue;
-            }
-
-            // Newline: deliver line.
-            if byte == b'\n' {
-                let mut t = tty::TTY0.lock();
-                let len = t.edit_buf.len;
-                for i in 0..len {
-                    stdin::push_char(t.edit_buf.buf[i]);
-                }
-                t.edit_buf.clear();
-                drop(t);
-                stdin::push_char(b'\n');
-
-                // Echo newline.
-                if echo_on || (c_lflag & ECHONL != 0) {
-                    if c_oflag & ONLCR != 0 {
-                        shell_print(my_id, console_ep, "\r\n");
-                    } else {
-                        shell_print(my_id, console_ep, "\n");
-                    }
-                }
-                continue;
-            }
-
-            // Regular character: buffer it.
-            tty::TTY0.lock().edit_buf.push(byte);
-
-            if echo_on {
-                let echo_buf = [byte];
-                if let Ok(s) = core::str::from_utf8(&echo_buf) {
-                    shell_print(my_id, console_ep, s);
-                }
-            }
-        } else {
-            // Raw / cbreak mode: push byte immediately.
-            stdin::push_char(byte);
-
-            if echo_on {
-                let echo_buf = [byte];
-                if let Ok(s) = core::str::from_utf8(&echo_buf) {
-                    if c_oflag & ONLCR != 0 && byte == b'\n' {
-                        shell_print(my_id, console_ep, "\r\n");
-                    } else {
-                        shell_print(my_id, console_ep, s);
-                    }
-                }
-            }
-        }
     }
 }
 
