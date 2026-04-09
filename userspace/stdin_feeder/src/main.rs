@@ -254,6 +254,22 @@ fn program_main(_args: &[&str]) -> i32 {
         let mut tf = TermiosFlags::zeroed();
         syscall_lib::get_termios_flags(&mut tf);
 
+        // DEBUG: print c_lflag and scancode for every keystroke
+        {
+            let hex = b"0123456789abcdef";
+            let lf = tf.c_lflag;
+            let mut dbg = *b"[sf:sc=XX lf=XXXX]\n";
+            dbg[6] = hex[(sc >> 4) as usize];
+            dbg[7] = hex[(sc & 0xf) as usize];
+            dbg[12] = hex[((lf >> 12) & 0xf) as usize];
+            dbg[13] = hex[((lf >> 8) & 0xf) as usize];
+            dbg[14] = hex[((lf >> 4) & 0xf) as usize];
+            dbg[15] = hex[(lf & 0xf) as usize];
+            if let Ok(s) = core::str::from_utf8(&dbg) {
+                syscall_lib::write_str(STDOUT_FILENO, s);
+            }
+        }
+
         let canonical = tf.c_lflag & ICANON != 0;
 
         // VT100 escape sequences for special keys.
