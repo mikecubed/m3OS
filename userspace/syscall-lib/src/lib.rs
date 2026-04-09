@@ -585,15 +585,23 @@ impl TermiosFlags {
 /// Query termios flags from the kernel's TTY0.
 ///
 /// Returns 0 on success and fills the provided struct.
+///
+/// Uses a compiler fence after the syscall to force a reload of the struct
+/// from memory. Without this, the optimizer may cache the pre-zeroed values
+/// because the syscall asm block passes the buffer as a raw integer, severing
+/// the pointer provenance that would tell the compiler the buffer is modified.
 pub fn get_termios_flags(out: &mut TermiosFlags) -> isize {
     let buf = out as *mut TermiosFlags as *mut u8;
-    unsafe {
+    let ret = unsafe {
         syscall2(
             SYS_GET_TERMIOS_FLAGS,
             buf as u64,
             core::mem::size_of::<TermiosFlags>() as u64,
         ) as isize
-    }
+    };
+    // Force the compiler to reload `out` from memory after the syscall.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    ret
 }
 
 /// Signal EOF on the kernel stdin buffer.

@@ -7706,24 +7706,13 @@ pub(super) fn sys_get_termios_flags(buf_ptr: u64, buf_len: u64) -> u64 {
         return NEG_EINVAL;
     }
     let t = crate::tty::TTY0.lock();
-    let lf = t.termios.c_lflag;
     let mut out = [0u8; NEEDED];
-    out[0..4].copy_from_slice(&lf.to_le_bytes());
+    out[0..4].copy_from_slice(&t.termios.c_lflag.to_le_bytes());
     out[4..8].copy_from_slice(&t.termios.c_iflag.to_le_bytes());
     out[8..12].copy_from_slice(&t.termios.c_oflag.to_le_bytes());
     out[12..31].copy_from_slice(&t.termios.c_cc);
     out[31] = 0; // padding
     drop(t);
-    // DEBUG: log kernel-side c_lflag once
-    static DBG_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if !DBG_ONCE.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        log::info!(
-            "[get_termios] c_lflag={:#06x} buf_ptr={:#x} buf_len={}",
-            lf,
-            buf_ptr,
-            buf_len
-        );
-    }
     if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
         return NEG_EFAULT;
     }

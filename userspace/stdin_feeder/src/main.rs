@@ -251,17 +251,8 @@ fn program_main(_args: &[&str]) -> i32 {
         }
 
         // Read current termios flags from the kernel.
-        // Use the direct c_lflag syscall to avoid a copy_to_user issue on
-        // CoW-forked stack pages where the written data isn't visible.
         let mut tf = TermiosFlags::zeroed();
-        tf.c_lflag = syscall_lib::get_termios_lflag();
-        // Fill remaining fields via the buffer syscall (best-effort — if
-        // copy_to_user fails, we still have c_lflag from above).
-        let mut tf2 = TermiosFlags::zeroed();
-        syscall_lib::get_termios_flags(&mut tf2);
-        tf.c_iflag = tf2.c_iflag;
-        tf.c_oflag = tf2.c_oflag;
-        tf.c_cc = tf2.c_cc;
+        syscall_lib::get_termios_flags(&mut tf);
 
         let canonical = tf.c_lflag & ICANON != 0;
 
