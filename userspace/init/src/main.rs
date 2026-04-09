@@ -915,9 +915,11 @@ impl ServiceManager {
                     "' permanently stopped (unresolvable dependency)\n",
                 );
                 self.services[i].status = ServiceStatus::PermanentlyStopped;
+                self.services[i].last_change_time = now_epoch_secs();
             }
             i += 1;
         }
+        self.write_status_file();
 
         // Check for cycles.
         if graph.has_cycle(self.count) {
