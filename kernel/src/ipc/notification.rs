@@ -175,6 +175,17 @@ pub fn unregister_irq(irq: u8) {
     }
 }
 
+/// Check whether an IRQ line already has a notification registered.
+///
+/// Returns `true` if the IRQ line has a registered notification (i.e. not
+/// `0xff`).  Used by `create_irq_notification` to enforce exclusive
+/// registration — only one notification per IRQ line.
+pub fn is_irq_registered(irq: u8) -> bool {
+    IRQ_MAP
+        .get(irq as usize)
+        .is_some_and(|a| a.load(Ordering::Acquire) != 0xff)
+}
+
 /// Register an IRQ number to signal a notification on each delivery.
 ///
 /// `irq` is the hardware IRQ line (0 = timer, 1 = keyboard, …).

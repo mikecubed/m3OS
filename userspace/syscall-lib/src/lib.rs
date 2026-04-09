@@ -584,7 +584,13 @@ impl TermiosFlags {
 /// Returns 0 on success and fills the provided struct.
 pub fn get_termios_flags(out: &mut TermiosFlags) -> isize {
     let buf = out as *mut TermiosFlags as *mut u8;
-    unsafe { syscall2(SYS_GET_TERMIOS_FLAGS, buf as u64, 32) as isize }
+    unsafe {
+        syscall2(
+            SYS_GET_TERMIOS_FLAGS,
+            buf as u64,
+            core::mem::size_of::<TermiosFlags>() as u64,
+        ) as isize
+    }
 }
 
 /// Signal EOF on the kernel stdin buffer.

@@ -428,6 +428,12 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
     if irq != 1 {
         return u64::MAX;
     }
+    // Exclusive registration: reject if this IRQ already has a notification.
+    // Prevents userspace tasks from stealing IRQ delivery from the real
+    // keyboard service.
+    if notification::is_irq_registered(irq as u8) {
+        return u64::MAX;
+    }
     let notif_id = match x86_64::instructions::interrupts::without_interrupts(|| {
         notification::try_create().inspect(|&id| {
             notification::register_irq(irq as u8, id);
