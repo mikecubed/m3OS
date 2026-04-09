@@ -603,6 +603,16 @@ pub fn stdin_signal_eof() -> isize {
     unsafe { syscall0(SYS_STDIN_SIGNAL_EOF) as isize }
 }
 
+/// Syscall number for get_termios_lflag (returns c_lflag directly).
+pub const SYS_GET_TERMIOS_LFLAG: u64 = 0x100D;
+
+/// Get the TTY0 c_lflag value directly as a return value.
+///
+/// Bypasses copy_to_user (which has a CoW page issue on forked processes).
+pub fn get_termios_lflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_LFLAG) as u32 }
+}
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================

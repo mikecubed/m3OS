@@ -1065,6 +1065,8 @@ mod syscall_nr {
     pub const GET_TERMIOS_FLAGS: u64 = 0x100B;
     /// Phase 52: signal EOF on kernel stdin from userspace.
     pub const STDIN_SIGNAL_EOF: u64 = 0x100C;
+    /// Phase 52: get c_lflag directly as return value (bypass copy_to_user).
+    pub const GET_TERMIOS_LFLAG: u64 = 0x100D;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1357,6 +1359,7 @@ pub extern "C" fn syscall_handler(
         READ_KBD_SCANCODE => sys_read_kbd_scancode(),
         GET_TERMIOS_FLAGS => sys_get_termios_flags(arg0, arg1),
         STDIN_SIGNAL_EOF => sys_stdin_signal_eof(),
+        GET_TERMIOS_LFLAG => crate::tty::TTY0.lock().termios.c_lflag as u64,
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
