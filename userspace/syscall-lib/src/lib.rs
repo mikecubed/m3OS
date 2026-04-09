@@ -611,14 +611,24 @@ pub fn stdin_signal_eof() -> isize {
     unsafe { syscall0(SYS_STDIN_SIGNAL_EOF) as isize }
 }
 
-/// Syscall number for get_termios_lflag (returns c_lflag directly).
+/// Syscall numbers for direct termios field reads (return value in rax).
 pub const SYS_GET_TERMIOS_LFLAG: u64 = 0x100D;
+pub const SYS_GET_TERMIOS_IFLAG: u64 = 0x100E;
+pub const SYS_GET_TERMIOS_OFLAG: u64 = 0x100F;
 
-/// Get the TTY0 c_lflag value directly as a return value.
-///
-/// Bypasses copy_to_user (which has a CoW page issue on forked processes).
+/// Get TTY0 c_lflag directly as a return value.
 pub fn get_termios_lflag() -> u32 {
     unsafe { syscall0(SYS_GET_TERMIOS_LFLAG) as u32 }
+}
+
+/// Get TTY0 c_iflag directly as a return value.
+pub fn get_termios_iflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_IFLAG) as u32 }
+}
+
+/// Get TTY0 c_oflag directly as a return value.
+pub fn get_termios_oflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_OFLAG) as u32 }
 }
 
 // ===========================================================================

@@ -216,6 +216,12 @@ fn program_main(_args: &[&str]) -> i32 {
         h as u32
     };
 
+    // Cache c_cc at startup — these control characters rarely change.
+    let c_cc_arr = match syscall_lib::tcgetattr(0) {
+        Ok(t) => t.c_cc,
+        Err(_) => [0u8; syscall_lib::NCCS],
+    };
+
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: ready\n");
 
     let mut shift = false;
@@ -250,20 +256,12 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         }
 
-        // Read current termios flags via ioctl(TCGETS) — the same path
-        // that login uses successfully.
-        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = match syscall_lib::tcgetattr(0) {
-            Ok(t) => (t.c_lflag, t.c_iflag, t.c_oflag, t.c_cc),
-            Err(_) => {
-                // Fallback: assume cooked mode with echo.
-                (
-                    ICANON | ECHO | ECHOE | ISIG,
-                    ICRNL,
-                    ONLCR,
-                    [0u8; syscall_lib::NCCS],
-                )
-            }
-        };
+        // Read termios flags via direct register-return syscalls.
+        // These bypass copy_to_user which has an intermittent reliability
+        // issue — see the copy_to_user investigation notes in this PR.
+        let c_lflag = syscall_lib::get_termios_lflag();
+        let c_iflag = syscall_lib::get_termios_iflag();
+        let c_oflag = syscall_lib::get_termios_oflag();
 
         let canonical = c_lflag & ICANON != 0;
 
@@ -399,18 +397,6 @@ fn program_main(_args: &[&str]) -> i32 {
             // Newline: deliver line.
             if byte == b'\n' {
                 let data = edit_buf.as_slice();
-                // DEBUG: dump bytes being pushed to stdin
-                {
-                    let hex = b"0123456789abcdef";
-                    syscall_lib::write_str(STDOUT_FILENO, "[push:");
-                    for &b in data {
-                        let h = [hex[(b >> 4) as usize], hex[(b & 0xf) as usize], b' '];
-                        if let Ok(s) = core::str::from_utf8(&h) {
-                            syscall_lib::write_str(STDOUT_FILENO, s);
-                        }
-                    }
-                    syscall_lib::write_str(STDOUT_FILENO, "0a]\n");
-                }
                 syscall_lib::stdin_push(data);
                 edit_buf.clear();
                 let nl = [b'\n'];
