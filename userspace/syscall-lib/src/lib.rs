@@ -305,6 +305,9 @@ pub const SYS_IPC_LOOKUP_SERVICE: u64 = 0x1109;
 /// Create a notification for a hardware IRQ and return a cap handle.
 pub const SYS_CREATE_IRQ_NOTIFICATION: u64 = 0x110A;
 
+/// Create a new IPC endpoint and return a cap handle.
+pub const SYS_CREATE_ENDPOINT: u64 = 0x110B;
+
 // ===========================================================================
 // IPC wrappers (Phase 52)
 // ===========================================================================
@@ -411,6 +414,13 @@ pub fn notify_wait(notif_cap_handle: u32) -> u64 {
 /// Returns 0 on success, `u64::MAX` on error.
 pub fn notify_signal(notif_cap_handle: u32, bits: u64) -> u64 {
     unsafe { syscall2(SYS_NOTIFY_SIGNAL, notif_cap_handle as u64, bits) }
+}
+
+/// Create a new IPC endpoint.
+///
+/// Returns the new cap handle on success, `u64::MAX` on error.
+pub fn create_endpoint() -> u64 {
+    unsafe { syscall0(SYS_CREATE_ENDPOINT) }
 }
 
 /// Create a notification registered for a hardware IRQ and return a cap handle.

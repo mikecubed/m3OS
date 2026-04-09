@@ -71,6 +71,7 @@ pub use registry::RegistryError;
 /// | 9 | 0x1108 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
 /// | 10 | 0x1109 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
 /// | 11 | 0x110A | `create_irq_notification(irq)` | `arg0 = IRQ number` → new CapHandle |
+/// | 12 | 0x110B | `create_endpoint()` | — → new CapHandle |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -111,6 +112,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
     }
     if number == 11 {
         return create_irq_notification(task_id, arg0);
+    }
+    if number == 12 {
+        return ipc_create_endpoint(task_id);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -334,6 +338,18 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
         Some(id) => id,
         None => return u64::MAX,
     };
+    match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
+        Ok(handle) => u64::from(handle),
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Syscall 12 (0x110B): allocate a new IPC endpoint and insert an Endpoint
+/// capability into the caller's capability table.
+///
+/// Returns the new capability handle on success, or `u64::MAX` on error.
+fn ipc_create_endpoint(task_id: crate::task::TaskId) -> u64 {
+    let ep_id = endpoint::ENDPOINTS.lock().create();
     match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
         Ok(handle) => u64::from(handle),
         Err(_) => u64::MAX,

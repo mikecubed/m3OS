@@ -1064,7 +1064,7 @@ mod syscall_nr {
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x110A;
+    pub const IPC_LAST: u64 = 0x110B;
 }
 
 // ---------------------------------------------------------------------------
