@@ -355,7 +355,11 @@ fn ipc_create_endpoint(task_id: crate::task::TaskId) -> u64 {
     };
     match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
         Ok(handle) => u64::from(handle),
-        Err(_) => u64::MAX,
+        Err(_) => {
+            // Roll back: free the endpoint slot so it is not permanently leaked.
+            endpoint::ENDPOINTS.lock().destroy(ep_id);
+            u64::MAX
+        }
     }
 }
 
@@ -379,6 +383,14 @@ fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
     };
     match crate::task::scheduler::insert_cap(task_id, Capability::Notification(notif_id)) {
         Ok(handle) => u64::from(handle),
-        Err(_) => u64::MAX,
+        Err(_) => {
+            // Roll back: unregister the IRQ mapping and free the notification
+            // slot so they are not permanently leaked/misrouted.
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                notification::unregister_irq(irq as u8);
+                notification::free(notif_id);
+            });
+            u64::MAX
+        }
     }
 }

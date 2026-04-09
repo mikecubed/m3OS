@@ -90,6 +90,16 @@ impl EndpointRegistry {
         None
     }
 
+    /// Free an endpoint slot so it can be reused.
+    ///
+    /// Used to roll back a `try_create` when the subsequent capability insert
+    /// fails, preventing permanent slot leaks from userspace syscalls.
+    pub fn destroy(&mut self, id: EndpointId) {
+        if let Some(slot) = self.slots.get_mut(id.0 as usize) {
+            *slot = None;
+        }
+    }
+
     /// Borrow a mutable reference to an endpoint.
     pub fn get_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
         self.slots.get_mut(id.0 as usize)?.as_mut()

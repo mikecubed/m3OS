@@ -154,6 +154,27 @@ pub fn try_create() -> Option<NotifId> {
     None
 }
 
+/// Free a notification slot so it can be reused.
+///
+/// Used to roll back a `try_create` when the subsequent capability insert
+/// fails, preventing permanent slot leaks from userspace syscalls.
+pub fn free(id: NotifId) {
+    let mut alloc = ALLOCATED.lock();
+    if let Some(slot) = alloc.get_mut(id.0 as usize) {
+        *slot = false;
+    }
+}
+
+/// Remove an IRQ→notification mapping, resetting the IRQ line to unregistered.
+///
+/// Used to roll back a `register_irq` when the subsequent capability insert
+/// fails, preventing IRQ misrouting.
+pub fn unregister_irq(irq: u8) {
+    if (irq as usize) < IRQ_MAP.len() {
+        IRQ_MAP[irq as usize].store(0xff, Ordering::Release);
+    }
+}
+
 /// Register an IRQ number to signal a notification on each delivery.
 ///
 /// `irq` is the hardware IRQ line (0 = timer, 1 = keyboard, …).
