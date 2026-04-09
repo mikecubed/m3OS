@@ -55,8 +55,8 @@ pub use registry::RegistryError;
 
 /// IPC syscall dispatcher, called from `arch::x86_64::syscall::syscall_handler`.
 ///
-/// Userspace syscall numbers `0x1100`–`0x1109` are translated to internal
-/// dispatch numbers 1–10 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
+/// Userspace syscall numbers `0x1100`–`0x110A` are translated to internal
+/// dispatch numbers 1–11 by the flat dispatch table in `arch/x86_64/syscall/mod.rs`.
 ///
 /// | Internal | Userspace | Operation | Args (SysV: rdi=arg0, rsi=arg1, rdx=arg2) |
 /// |---|---|---|---|
@@ -70,6 +70,7 @@ pub use registry::RegistryError;
 /// | 8 | 0x1107 | `notify_signal(notif_cap, bits)` | `arg0, arg1` |
 /// | 9 | 0x1108 | `ipc_register_service(ep_cap, name_ptr, name_len)` | `arg0..2` |
 /// | 10 | 0x1109 | `ipc_lookup_service(name_ptr, name_len)` | `arg0, arg1` → new CapHandle |
+/// | 11 | 0x110A | `create_irq_notification(irq)` | `arg0 = IRQ number` → new CapHandle |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -90,6 +91,8 @@ pub use registry::RegistryError;
 /// - `ipc_register_service` (9): returns `0` on success, `u64::MAX` on error.
 /// - `ipc_lookup_service` (10): returns the new `CapHandle` as `u64` on
 ///   success, or `u64::MAX` on error (not found, cap table full, etc.).
+/// - `create_irq_notification` (11): returns the new `CapHandle` as `u64` on
+///   success, or `u64::MAX` on error (invalid IRQ, cap table full, etc.).
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
     use crate::task::{TaskId, scheduler};
 
@@ -101,11 +104,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64, _arg4:
         None => return err_val,
     };
 
-    // Syscall 10 (ipc_lookup_service): arg0 is a name pointer, not a cap
-    // handle.  Handle it before the cap-lookup preamble that applies to all
-    // other syscalls in this dispatcher.
+    // Syscalls 10 and 11 do not use arg0 as a cap handle — handle them
+    // before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
+    }
+    if number == 11 {
+        return create_irq_notification(task_id, arg0);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -330,6 +335,27 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
         None => return u64::MAX,
     };
     match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
+        Ok(handle) => u64::from(handle),
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Syscall 11 (0x110A): create a notification registered for a hardware IRQ
+/// and insert a Notification capability into the caller's capability table.
+///
+/// Only IRQ 1 (keyboard) is currently allowed for userspace services.
+/// Returns the new capability handle on success, or `u64::MAX` on error.
+fn create_irq_notification(task_id: crate::task::TaskId, irq: u64) -> u64 {
+    // Only allow IRQ 1 (keyboard) for now.
+    if irq != 1 {
+        return u64::MAX;
+    }
+    let notif_id = x86_64::instructions::interrupts::without_interrupts(|| {
+        let id = notification::create();
+        notification::register_irq(irq as u8, id);
+        id
+    });
+    match crate::task::scheduler::insert_cap(task_id, Capability::Notification(notif_id)) {
         Ok(handle) => u64::from(handle),
         Err(_) => u64::MAX,
     }

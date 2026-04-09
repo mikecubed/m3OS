@@ -83,6 +83,15 @@ impl Registry {
                     slot.ep_id = ep_id;
                     return Ok(());
                 }
+                if slot.owner == 0 && owner != 0 {
+                    // Userspace takeover of a kernel-owned placeholder entry.
+                    // This enables the boot→userspace service handoff: the
+                    // kernel registers an early-boot endpoint (owner=0) that a
+                    // ring-3 service can replace once it starts.
+                    slot.ep_id = ep_id;
+                    slot.owner = owner;
+                    return Ok(());
+                }
                 return Err(RegistryError::AlreadyExists);
             }
         }
@@ -376,5 +385,30 @@ mod tests {
         reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
         reg.remove_by_owner(999);
         assert_eq!(reg.lookup("svc"), Some(EndpointId(1)));
+    }
+
+    #[test]
+    fn userspace_takeover_of_kernel_entry() {
+        let mut reg = Registry::new();
+        // Kernel registers a placeholder (owner=0).
+        reg.register("console", EndpointId(1)).unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(1)));
+
+        // Userspace task 42 takes over the kernel entry.
+        reg.register_with_owner("console", EndpointId(2), 42)
+            .unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn userspace_cannot_takeover_other_userspace_entry() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+
+        // Task 20 cannot take over task 10's entry.
+        assert_eq!(
+            reg.register_with_owner("svc", EndpointId(2), 20),
+            Err(RegistryError::AlreadyExists)
+        );
     }
 }

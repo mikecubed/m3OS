@@ -1055,10 +1055,16 @@ mod syscall_nr {
     pub const FRAMEBUFFER_INFO: u64 = 0x1005;
     pub const FRAMEBUFFER_MMAP: u64 = 0x1006;
     pub const READ_SCANCODE: u64 = 0x1007;
+    /// Phase 52: push bytes into the kernel stdin buffer from userspace.
+    pub const STDIN_PUSH: u64 = 0x1008;
+    /// Phase 52: read one scancode from the TTY keyboard buffer (for kbd service).
+    pub const READ_KBD_SCANCODE: u64 = 0x100A;
+    /// Phase 52: signal a process group from userspace (for line discipline).
+    pub const SIGNAL_PROCESS_GROUP: u64 = 0x1009;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x1109;
+    pub const IPC_LAST: u64 = 0x110A;
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,6 +1348,9 @@ pub extern "C" fn syscall_handler(
         FRAMEBUFFER_INFO => sys_framebuffer_info(arg0, arg1),
         FRAMEBUFFER_MMAP => sys_framebuffer_mmap(),
         READ_SCANCODE => sys_read_scancode(),
+        STDIN_PUSH => sys_stdin_push(arg0, arg1),
+        SIGNAL_PROCESS_GROUP => sys_signal_process_group(arg0, arg1),
+        READ_KBD_SCANCODE => sys_read_kbd_scancode(),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -7609,6 +7618,59 @@ pub(super) fn sys_read_scancode() -> u64 {
         Some(sc) => sc as u64,
         None => 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: stdin push from userspace
+// ---------------------------------------------------------------------------
+
+/// Read one scancode from the TTY keyboard ring buffer (non-blocking).
+///
+/// Returns the scancode as u64, or 0 if the buffer is empty.
+/// Unlike `sys_read_scancode` (0x1007) which reads the raw/DOOM buffer,
+/// this reads the TTY-routed buffer used by the keyboard service.
+pub(super) fn sys_read_kbd_scancode() -> u64 {
+    match super::interrupts::read_scancode() {
+        Some(sc) => sc as u64,
+        None => 0,
+    }
+}
+
+/// Push bytes from a userspace buffer into the kernel stdin buffer.
+///
+/// arg0 = user buffer pointer, arg1 = byte count.
+/// Returns 0 on success, NEG_EFAULT on bad pointer.
+pub(super) fn sys_stdin_push(buf_ptr: u64, len: u64) -> u64 {
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    if buf_ptr == 0 || buf_ptr >= USER_LIMIT || len == 0 || len > 4096 {
+        return NEG_EINVAL;
+    }
+    let len = len as usize;
+    let mut buf = [0u8; 4096];
+    if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+        return NEG_EFAULT;
+    }
+    for &b in &buf[..len] {
+        crate::stdin::push_char(b);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52: signal a process group from userspace
+// ---------------------------------------------------------------------------
+
+/// Send a signal to all processes in a foreground process group.
+///
+/// arg0 = signal number, arg1 = unused (uses current FG_PGID).
+/// Returns 0 on success.
+pub(super) fn sys_signal_process_group(sig: u64, _arg1: u64) -> u64 {
+    let fg = crate::process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+    if fg == 0 {
+        return 0;
+    }
+    crate::process::send_signal_to_group(fg, sig as u32);
+    0
 }
 
 // ---------------------------------------------------------------------------

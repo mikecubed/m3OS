@@ -259,6 +259,15 @@ pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
+/// Phase 52: push bytes into kernel stdin from userspace.
+pub const SYS_STDIN_PUSH: u64 = 0x1008;
+
+/// Phase 52: signal a foreground process group from userspace.
+pub const SYS_SIGNAL_PROCESS_GROUP: u64 = 0x1009;
+
+/// Phase 52: read one scancode from the TTY keyboard buffer (for kbd service).
+pub const SYS_READ_KBD_SCANCODE: u64 = 0x100A;
+
 // ===========================================================================
 // IPC syscall numbers (Phase 50)
 // ===========================================================================
@@ -292,6 +301,9 @@ pub const SYS_IPC_REGISTER_SERVICE: u64 = 0x1108;
 
 /// Look up a named service in the IPC registry.
 pub const SYS_IPC_LOOKUP_SERVICE: u64 = 0x1109;
+
+/// Create a notification for a hardware IRQ and return a cap handle.
+pub const SYS_CREATE_IRQ_NOTIFICATION: u64 = 0x110A;
 
 // ===========================================================================
 // IPC wrappers (Phase 52)
@@ -399,6 +411,35 @@ pub fn notify_wait(notif_cap_handle: u32) -> u64 {
 /// Returns 0 on success, `u64::MAX` on error.
 pub fn notify_signal(notif_cap_handle: u32, bits: u64) -> u64 {
     unsafe { syscall2(SYS_NOTIFY_SIGNAL, notif_cap_handle as u64, bits) }
+}
+
+/// Create a notification registered for a hardware IRQ and return a cap handle.
+///
+/// Only IRQ 1 (keyboard) is currently supported.
+/// Returns the new cap handle on success, `u64::MAX` on error.
+pub fn create_irq_notification(irq: u32) -> u64 {
+    unsafe { syscall1(SYS_CREATE_IRQ_NOTIFICATION, irq as u64) }
+}
+
+/// Push bytes from a userspace buffer into the kernel stdin buffer.
+///
+/// Returns 0 on success, negative errno on error.
+pub fn stdin_push(buf: &[u8]) -> isize {
+    unsafe { syscall2(SYS_STDIN_PUSH, buf.as_ptr() as u64, buf.len() as u64) as isize }
+}
+
+/// Read one scancode from the TTY keyboard buffer (non-blocking).
+///
+/// Returns the scancode, or 0 if the buffer is empty.
+pub fn read_kbd_scancode() -> u8 {
+    unsafe { syscall0(SYS_READ_KBD_SCANCODE) as u8 }
+}
+
+/// Signal the foreground process group with the given signal number.
+///
+/// Returns 0 on success.
+pub fn signal_process_group(sig: u32) -> isize {
+    unsafe { syscall2(SYS_SIGNAL_PROCESS_GROUP, sig as u64, 0) as isize }
 }
 
 // ===========================================================================
