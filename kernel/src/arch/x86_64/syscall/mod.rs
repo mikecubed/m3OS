@@ -1074,6 +1074,8 @@ mod syscall_nr {
     pub const GET_TERMIOS_LFLAG: u64 = 0x100D;
     pub const GET_TERMIOS_IFLAG: u64 = 0x100E;
     pub const GET_TERMIOS_OFLAG: u64 = 0x100F;
+    /// Phase 52c: push raw input byte through kernel line discipline.
+    pub const PUSH_RAW_INPUT: u64 = 0x1010;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1399,9 +1401,10 @@ pub extern "C" fn syscall_handler(
         READ_KBD_SCANCODE => sys_read_kbd_scancode(),
         GET_TERMIOS_FLAGS => sys_get_termios_flags(arg0, arg1),
         STDIN_SIGNAL_EOF => sys_stdin_signal_eof(),
-        GET_TERMIOS_LFLAG => crate::tty::TTY0.lock().termios.c_lflag as u64,
-        GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().termios.c_iflag as u64,
-        GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().termios.c_oflag as u64,
+        GET_TERMIOS_LFLAG => crate::tty::TTY0.lock().ldisc.termios.c_lflag as u64,
+        GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().ldisc.termios.c_iflag as u64,
+        GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
+        PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -7813,10 +7816,10 @@ pub(super) fn sys_get_termios_flags(buf_ptr: u64, buf_len: u64) -> u64 {
     }
     let t = crate::tty::TTY0.lock();
     let mut out = [0u8; NEEDED];
-    out[0..4].copy_from_slice(&t.termios.c_lflag.to_le_bytes());
-    out[4..8].copy_from_slice(&t.termios.c_iflag.to_le_bytes());
-    out[8..12].copy_from_slice(&t.termios.c_oflag.to_le_bytes());
-    out[12..31].copy_from_slice(&t.termios.c_cc);
+    out[0..4].copy_from_slice(&t.ldisc.termios.c_lflag.to_le_bytes());
+    out[4..8].copy_from_slice(&t.ldisc.termios.c_iflag.to_le_bytes());
+    out[8..12].copy_from_slice(&t.ldisc.termios.c_oflag.to_le_bytes());
+    out[12..31].copy_from_slice(&t.ldisc.termios.c_cc);
     out[31] = 0; // padding
     drop(t);
     if UserSliceWo::new(buf_ptr, out.len())
@@ -7838,6 +7841,82 @@ pub(super) fn sys_get_termios_flags(buf_ptr: u64, buf_len: u64) -> u64 {
 pub(super) fn sys_stdin_signal_eof() -> u64 {
     crate::stdin::signal_eof();
     0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52c: push_raw_input(byte) — kernel-side line discipline
+// ---------------------------------------------------------------------------
+
+/// Push a single raw input byte through the kernel's line discipline.
+///
+/// The byte is processed through TTY0's LineDiscipline which handles iflag
+/// transforms, signal generation, canonical editing, and echo generation.
+/// Echo output goes to the serial console (COM1).
+pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
+    let byte = byte_arg as u8;
+
+    // Process through LineDiscipline under TTY0 lock.
+    let mut eof_signal = false;
+    let result = {
+        let mut tty = crate::tty::TTY0.lock();
+        tty.ldisc.process_byte(byte, &mut |data| {
+            if data.is_empty() {
+                eof_signal = true;
+            } else {
+                for &b in data {
+                    crate::stdin::push_char(b);
+                }
+            }
+        })
+    };
+
+    if eof_signal {
+        crate::stdin::signal_eof();
+    }
+
+    // Handle the result: signals and echo.
+    match result {
+        kernel_core::tty::LdiscResult::Consumed => {}
+        kernel_core::tty::LdiscResult::Signal(sig) => {
+            let fg = crate::process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
+            if fg != 0 {
+                let name = match sig {
+                    2 => "^C",
+                    20 => "^Z",
+                    3 => "^\\",
+                    _ => "",
+                };
+                serial_echo_bytes(name.as_bytes());
+                serial_echo_bytes(b"\n");
+                crate::process::send_signal_to_group(fg, sig as u32);
+            } else {
+                // No foreground group — push raw byte.
+                crate::stdin::push_char(byte);
+            }
+        }
+        kernel_core::tty::LdiscResult::Pushed { ref echo }
+        | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
+            if let Some(count) = echo.erase_count() {
+                for _ in 0..count {
+                    serial_echo_bytes(b"\x08 \x08");
+                }
+            } else if !echo.is_empty() {
+                serial_echo_bytes(echo.as_slice());
+            }
+        }
+    }
+
+    0
+}
+
+/// Write raw bytes to the serial console (COM1) for echo.
+fn serial_echo_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        unsafe {
+            while x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20 == 0 {}
+            x86_64::instructions::port::Port::new(0x3F8).write(b);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8272,7 +8351,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             // Console TTY0.
             let tty = crate::tty::TTY0.lock();
             let src = unsafe {
-                core::slice::from_raw_parts(&tty.termios as *const _ as *const u8, TERMIOS_SIZE)
+                core::slice::from_raw_parts(
+                    &tty.ldisc.termios as *const _ as *const u8,
+                    TERMIOS_SIZE,
+                )
             };
             if UserSliceWo::new(arg, src.len())
                 .and_then(|s| s.copy_from_kernel(src))
@@ -8301,7 +8383,7 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 }
                 return NEG_EIO;
             }
-            crate::tty::TTY0.lock().termios = new_termios;
+            crate::tty::TTY0.lock().ldisc.termios = new_termios;
             0
         }
         TCSETSF => {
@@ -8328,8 +8410,8 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             }
             crate::stdin::flush();
             let mut tty = crate::tty::TTY0.lock();
-            tty.edit_buf.clear();
-            tty.termios = new_termios;
+            tty.ldisc.edit_buf.clear();
+            tty.ldisc.termios = new_termios;
             0
         }
         TIOCGPGRP => {

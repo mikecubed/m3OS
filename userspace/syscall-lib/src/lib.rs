@@ -631,6 +631,9 @@ pub fn get_termios_oflag() -> u32 {
     unsafe { syscall0(SYS_GET_TERMIOS_OFLAG) as u32 }
 }
 
+/// Phase 52c: push raw input byte through kernel line discipline.
+pub const SYS_PUSH_RAW_INPUT: u64 = 0x1010;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -1712,6 +1715,15 @@ pub fn framebuffer_mmap() -> u64 {
 /// Returns the scancode (0x01–0xFF), or 0 if no key is pending.
 pub fn read_scancode() -> u64 {
     unsafe { syscall0(SYS_READ_SCANCODE) }
+}
+
+/// Push a single raw input byte through the kernel's line discipline.
+///
+/// The kernel processes the byte through TTY0's LineDiscipline (iflag
+/// transforms, signal generation, canonical editing, echo) and delivers
+/// the result to stdin.
+pub fn push_raw_input(byte: u8) -> i64 {
+    unsafe { syscall1(SYS_PUSH_RAW_INPUT, byte as u64) as i64 }
 }
 
 /// Write a string slice to a file descriptor.

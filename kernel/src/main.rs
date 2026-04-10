@@ -536,8 +536,6 @@ fn idle_task() -> ! {
 /// Read bytes from the IRQ-driven serial ring buffer and feed them into the
 /// kernel stdin buffer with canonical editing, echo, and signal support.
 fn serial_stdin_feeder_task() -> ! {
-    use kernel_core::tty::*;
-
     // Enable UART Receive Data Available interrupt (IER bit 0).
     unsafe {
         x86_64::instructions::port::Port::new(0x3F9u16).write(0x01u8);
@@ -571,137 +569,52 @@ fn serial_stdin_feeder_task() -> ! {
             }
         };
 
-        // Read termios flags under lock.
-        let (c_lflag, c_iflag, c_oflag, c_cc_arr) = {
-            let t = tty::TTY0.lock();
-            (
-                t.termios.c_lflag,
-                t.termios.c_iflag,
-                t.termios.c_oflag,
-                t.termios.c_cc,
-            )
+        // Delegate to the unified LineDiscipline in TTY0.
+        let mut eof_signal = false;
+        let result = {
+            let mut t = tty::TTY0.lock();
+            t.ldisc.process_byte(byte, &mut |data| {
+                if data.is_empty() {
+                    eof_signal = true;
+                } else {
+                    for &b in data {
+                        stdin::push_char(b);
+                    }
+                }
+            })
         };
+        if eof_signal {
+            stdin::signal_eof();
+        }
 
-        let canonical = c_lflag & ICANON != 0;
-        let echo_on = c_lflag & ECHO != 0;
-        let isig = c_lflag & ISIG != 0;
-
-        // ICRNL: translate CR to NL on input.
-        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
-            b'\n'
-        } else {
-            byte
-        };
-
-        // ISIG: check signal characters.
-        if isig {
-            let signal = if byte == c_cc_arr[VINTR] {
-                Some((process::SIGINT, "^C"))
-            } else if byte == c_cc_arr[VSUSP] {
-                Some((process::SIGTSTP, "^Z"))
-            } else if byte == c_cc_arr[VQUIT] {
-                Some((process::SIGQUIT, "^\\"))
-            } else {
-                None
-            };
-
-            if let Some((sig, name)) = signal {
+        // Handle the result.
+        match result {
+            kernel_core::tty::LdiscResult::Consumed => {}
+            kernel_core::tty::LdiscResult::Signal(sig) => {
                 let fg = process::FG_PGID.load(core::sync::atomic::Ordering::Relaxed);
                 if fg != 0 {
-                    if canonical {
-                        tty::TTY0.lock().edit_buf.clear();
-                    }
+                    let name = match sig {
+                        2 => "^C",
+                        20 => "^Z",
+                        3 => "^\\",
+                        _ => "",
+                    };
                     serial_echo(name);
                     serial_echo("\n");
-                    process::send_signal_to_group(fg, sig);
+                    process::send_signal_to_group(fg, sig as u32);
                 } else {
                     stdin::push_char(byte);
                 }
-                continue;
             }
-        }
-
-        if canonical {
-            if byte == c_cc_arr[VERASE] || byte == 0x7F || byte == 0x08 {
-                let erased = tty::TTY0.lock().edit_buf.erase_char();
-                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
-                    serial_echo("\x08 \x08");
-                }
-                continue;
-            }
-
-            if byte == c_cc_arr[VKILL] {
-                let n = tty::TTY0.lock().edit_buf.kill_line();
-                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
-                    for _ in 0..n {
+            kernel_core::tty::LdiscResult::Pushed { ref echo }
+            | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
+                if let Some(count) = echo.erase_count() {
+                    for _ in 0..count {
                         serial_echo("\x08 \x08");
                     }
-                }
-                continue;
-            }
-
-            if byte == c_cc_arr[VWERASE] {
-                let n = tty::TTY0.lock().edit_buf.word_erase();
-                if n > 0 && echo_on {
-                    for _ in 0..n {
-                        serial_echo("\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            if byte == c_cc_arr[VEOF] {
-                let mut t = tty::TTY0.lock();
-                if t.edit_buf.is_empty() {
-                    drop(t);
-                    stdin::signal_eof();
-                } else {
-                    let len = t.edit_buf.len;
-                    for i in 0..len {
-                        stdin::push_char(t.edit_buf.buf[i]);
-                    }
-                    t.edit_buf.clear();
-                }
-                continue;
-            }
-
-            if byte == b'\n' {
-                let mut t = tty::TTY0.lock();
-                let len = t.edit_buf.len;
-                for i in 0..len {
-                    stdin::push_char(t.edit_buf.buf[i]);
-                }
-                t.edit_buf.clear();
-                drop(t);
-                stdin::push_char(b'\n');
-
-                if echo_on || (c_lflag & ECHONL != 0) {
-                    if c_oflag & ONLCR != 0 {
-                        serial_echo("\r\n");
-                    } else {
-                        serial_echo("\n");
-                    }
-                }
-                continue;
-            }
-
-            tty::TTY0.lock().edit_buf.push(byte);
-
-            if echo_on {
-                let echo_buf = [byte];
-                if let Ok(s) = core::str::from_utf8(&echo_buf) {
-                    serial_echo(s);
-                }
-            }
-        } else {
-            stdin::push_char(byte);
-
-            if echo_on {
-                if c_oflag & ONLCR != 0 && byte == b'\n' {
-                    serial_echo("\r\n");
-                } else {
-                    let echo_buf = [byte];
-                    if let Ok(s) = core::str::from_utf8(&echo_buf) {
+                } else if !echo.is_empty() {
+                    let echo_bytes = echo.as_slice();
+                    if let Ok(s) = core::str::from_utf8(echo_bytes) {
                         serial_echo(s);
                     }
                 }

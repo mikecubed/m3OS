@@ -1,26 +1,27 @@
-//! TTY layer (Phase 22).
+//! TTY layer (Phase 22, updated Phase 52c).
 //!
 //! Single console TTY (`TTY0`) holding the active termios configuration,
-//! window size, foreground process group, and canonical-mode edit buffer.
+//! window size, foreground process group, and unified line discipline.
 
-use kernel_core::tty::{EditBuffer, Termios, Winsize};
+use kernel_core::tty::{LineDiscipline, Winsize};
 use spin::Mutex;
 
 /// Kernel-side TTY state for the single console.
+///
+/// The `ldisc` field owns both the termios settings and the canonical-mode
+/// edit buffer. Access termios via `tty.ldisc.termios`.
 pub struct TtyState {
-    pub termios: Termios,
+    pub ldisc: LineDiscipline,
     pub winsize: Winsize,
     pub fg_pgid: u32,
-    pub edit_buf: EditBuffer,
 }
 
 impl TtyState {
     const fn new() -> Self {
         TtyState {
-            termios: Termios::default_cooked(),
+            ldisc: LineDiscipline::new(),
             winsize: Winsize::default_console(),
             fg_pgid: 0,
-            edit_buf: EditBuffer::new(),
         }
     }
 }
