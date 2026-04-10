@@ -437,6 +437,20 @@ fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
     sched.tasks[idx].user_ticks += elapsed;
 }
 
+/// Snapshot per-core user state (RSP, kernel stack, FS base) into the task
+/// so the scheduler can restore it on re-dispatch. No-op for kernel tasks.
+fn save_user_return_state(task: &mut Task) {
+    if task.pid != 0 {
+        let pc = crate::smp::per_core();
+        let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+        task.user_return = Some(crate::task::UserReturnState {
+            user_rsp: pc.syscall_user_rsp,
+            kernel_stack_top: pc.syscall_stack_top,
+            fs_base: fs,
+        });
+    }
+}
+
 /// Per-core pending re-enqueue slot. When a task yields, its index is stored
 /// here instead of being immediately enqueued. The scheduler loop re-enqueues
 /// it AFTER `switch_context` has saved the task's RSP, preventing a race where
@@ -506,6 +520,7 @@ pub fn yield_now() {
         // switch_context saves the RSP. This prevents the global fallback from
         // picking up the task with a stale saved_rsp on another core.
         sched.tasks[idx].switching_out = true;
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -579,6 +594,7 @@ fn block_current(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -612,6 +628,7 @@ fn block_current_unless_message(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -668,6 +685,7 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -693,6 +711,7 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -954,14 +973,62 @@ pub fn run() -> ! {
         {
             let pid = task_pid(_task_idx);
             crate::process::set_current_pid(pid);
+            // When dispatching a kernel-only task (pid==0), deactivate the
+            // previous user AddressSpace on this core so targeted TLB
+            // shootdowns skip it and the pointer doesn't dangle after reap.
+            if pid == 0 && crate::smp::is_per_core_ready() {
+                let pc = crate::smp::per_core();
+                let old_as_ptr = pc.current_addrspace;
+                if !old_as_ptr.is_null() {
+                    // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+                    // that is still alive (the owning Process holds the Arc).
+                    unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                    let pc_mut =
+                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                    unsafe { (*pc_mut).current_addrspace = core::ptr::null() };
+                }
+            }
             if pid != 0 {
-                let (cr3_phys, kstack, fs) = {
+                let (cr3_phys, kstack, fs, new_as_ptr) = {
                     let table = crate::process::PROCESS_TABLE.lock();
                     match table.find(pid) {
-                        Some(p) => (p.page_table_root, p.kernel_stack_top, p.fs_base),
-                        None => (None, 0, 0),
+                        Some(p) => {
+                            let as_ptr = p
+                                .addr_space
+                                .as_ref()
+                                .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                                .unwrap_or(core::ptr::null());
+                            (
+                                p.addr_space.as_ref().map(|a| a.pml4_phys()),
+                                p.kernel_stack_top,
+                                p.fs_base,
+                                as_ptr,
+                            )
+                        }
+                        None => (None, 0, 0, core::ptr::null()),
                     }
                 };
+                // Track active address space on this core.
+                if crate::smp::is_per_core_ready() {
+                    let pc = crate::smp::per_core();
+                    let old_as_ptr = pc.current_addrspace;
+                    if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                        // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+                        // that is still alive (the owning Process holds the Arc).
+                        unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    if !new_as_ptr.is_null() {
+                        // SAFETY: new_as_ptr points to an AddressSpace in an Arc
+                        // that is alive while the process is in the process table.
+                        unsafe { &*new_as_ptr }.activate_on_core(core_id);
+                    }
+                    // SAFETY: per_core() returns a reference to the current core's
+                    // data; we only write current_addrspace on the owning core.
+                    let pc_mut =
+                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                    unsafe { (*pc_mut).current_addrspace = new_as_ptr };
+                }
                 // Restore CR3 so the task's user-space pages are mapped.
                 if let Some(cr3) = cr3_phys {
                     unsafe {
@@ -974,6 +1041,17 @@ pub fn run() -> ! {
                             PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
                         Cr3::write(frame, Cr3Flags::empty());
                     }
+                    // A.4: Assert CR3 matches the address space after loading.
+                    #[cfg(debug_assertions)]
+                    {
+                        let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
+                        debug_assert_eq!(
+                            loaded_frame.start_address().as_u64(),
+                            cr3.as_u64(),
+                            "CR3 mismatch after load on core {}",
+                            core_id
+                        );
+                    }
                 }
                 if kstack != 0 {
                     crate::smp::set_current_core_kernel_stack(kstack);
@@ -982,6 +1060,25 @@ pub fn run() -> ! {
                     }
                 }
                 x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs));
+            }
+        }
+
+        // Restore per-core syscall_user_rsp from the task's UserReturnState.
+        // This eliminates the need for manual restore_caller_context calls
+        // after blocking syscalls.
+        {
+            let sched = SCHEDULER.lock();
+            if let Some(task) = sched.get_task(_task_idx)
+                && let Some(ref urs) = task.user_return
+            {
+                let data = crate::smp::per_core() as *const crate::smp::PerCoreData
+                    as *mut crate::smp::PerCoreData;
+                unsafe {
+                    (*data).syscall_user_rsp = urs.user_rsp;
+                }
+                // kstack and fs_base are already restored from PROCESS_TABLE above,
+                // but we could also use urs values. For now, keep the PROCESS_TABLE
+                // path for those since it's authoritative.
             }
         }
 

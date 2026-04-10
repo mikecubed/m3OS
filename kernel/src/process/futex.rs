@@ -1,6 +1,6 @@
 //! Futex wait/wake queue infrastructure (Phase 40, Track D).
 //!
-//! Provides a global futex wait-queue table keyed by `(page_table_root, vaddr)`.
+//! Provides a global futex wait-queue table keyed by `(pml4_phys, vaddr)`.
 //! Threads block via `FUTEX_WAIT` and are woken by `FUTEX_WAKE`.
 
 extern crate alloc;
@@ -36,14 +36,14 @@ pub struct FutexWaiter {
 // Global futex table
 // ---------------------------------------------------------------------------
 
-/// Key: `(page_table_root, virtual_address)`.
+/// Key: `(pml4_phys, virtual_address)`.
 ///
-/// For `FUTEX_PRIVATE_FLAG` futexes the page_table_root component is 0,
+/// For `FUTEX_PRIVATE_FLAG` futexes the pml4_phys component is 0,
 /// since private futexes are scoped to a single address space and do not
 /// require cross-process identity.
 type FutexKey = (u64, u64);
 
-/// Global table of futex wait queues, keyed by `(page_table_root, vaddr)`.
+/// Global table of futex wait queues, keyed by `(pml4_phys, vaddr)`.
 pub static FUTEX_TABLE: Lazy<Mutex<BTreeMap<FutexKey, Vec<FutexWaiter>>>> =
     Lazy::new(|| Mutex::new(BTreeMap::new()));
 

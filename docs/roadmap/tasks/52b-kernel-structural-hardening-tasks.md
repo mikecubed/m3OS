@@ -1,6 +1,6 @@
 # Phase 52b — Kernel Structural Hardening: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-52b
 **Depends on:** Phase 52a (Kernel Reliability Fixes)
 **Goal:** Replace fragile per-core scratch patterns with structurally sound alternatives, making the classes of bugs found in Phase 52 impossible rather than merely fixed.
@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | AddressSpace object | None | Planned |
-| B | Targeted batch TLB shootdown | A | Planned |
-| C | Task-owned syscall return state | None | Planned |
-| D | Typed UserBuffer wrappers | None | Planned |
-| E | Frame zeroing on free | None | Planned |
+| A | AddressSpace object | None | Complete |
+| B | Targeted batch TLB shootdown | A | Complete |
+| C | Task-owned syscall return state | None | Complete |
+| D | Typed UserBuffer wrappers | None | Complete |
+| E | Frame zeroing on free | None | Complete |
 
 ---
 

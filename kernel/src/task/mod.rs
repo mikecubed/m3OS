@@ -93,6 +93,20 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // TaskId is re-exported from kernel_core::types above.
 
 // ---------------------------------------------------------------------------
+// Task user-return state
+// ---------------------------------------------------------------------------
+
+/// User-mode return state saved when a task yields and restored by the
+/// scheduler on re-dispatch. Eliminates the need for manual
+/// `restore_caller_context` calls after blocking syscalls.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserReturnState {
+    pub user_rsp: u64,
+    pub kernel_stack_top: u64,
+    pub fs_base: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Task state
 // ---------------------------------------------------------------------------
 
@@ -167,6 +181,10 @@ pub struct Task {
     /// Set by a wakeup that arrives while `switching_out` is true so the
     /// scheduler can enqueue the task after `switch_context` completes.
     pub wake_after_switch: bool,
+    /// User-mode return state saved when this task yields and restored by the
+    /// scheduler on re-dispatch.  `None` for kernel-only tasks or before the
+    /// first yield from a userspace context.
+    pub user_return: Option<UserReturnState>,
     /// Userspace register frame restored by `fork_child_trampoline`, if this
     /// task was spawned to finish a fork/clone handoff.
     fork_ctx: Option<crate::process::ForkChildCtx>,
@@ -204,6 +222,7 @@ impl Task {
             start_tick: 0,
             switching_out: false,
             wake_after_switch: false,
+            user_return: None,
             fork_ctx: None,
             _stack: Some(stack),
         }

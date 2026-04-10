@@ -39,6 +39,8 @@ mod process;
 mod signal;
 mod time;
 
+use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
+
 // Linux errno values (negated for syscall return convention).
 #[allow(dead_code)]
 const NEG_EPERM: u64 = (-1_i64) as u64;
@@ -587,7 +589,10 @@ fn write_statfs_to_user(buf_ptr: u64, stat: &Statfs) -> u64 {
             core::mem::size_of::<Statfs>(),
         )
     };
-    if crate::mm::user_mem::copy_to_user(buf_ptr, bytes).is_err() {
+    if UserSliceWo::new(buf_ptr, bytes.len())
+        .and_then(|s| s.copy_from_kernel(bytes))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -1126,6 +1131,33 @@ pub extern "C" fn syscall_handler(
 ) -> u64 {
     use syscall_nr::*;
 
+    // Phase 52b: debug-assert that per-core current_addrspace matches the
+    // calling process's addr_space (catches stale CR3 / process mismatch).
+    #[cfg(debug_assertions)]
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            let expected = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table
+                    .find(pid)
+                    .and_then(|p| {
+                        p.addr_space
+                            .as_ref()
+                            .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                    })
+                    .unwrap_or_default()
+            };
+            debug_assert!(
+                pc.current_addrspace == expected,
+                "syscall_handler: current_addrspace mismatch for pid {} on core {}",
+                pid,
+                pc.core_id,
+            );
+        }
+    }
+
     // Divergent syscalls never return — handle them first.
     match number {
         SIGRETURN => sys_sigreturn(user_rsp),
@@ -1230,7 +1262,10 @@ pub extern "C" fn syscall_handler(
             } else {
                 let mask = {
                     let mut buf = [0u8; 8];
-                    if crate::mm::user_mem::copy_from_user(&mut buf, arg2).is_err() {
+                    if UserSliceRo::new(arg2, buf.len())
+                        .and_then(|s| s.copy_to_kernel(&mut buf))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     u64::from_ne_bytes(buf)
@@ -1244,7 +1279,10 @@ pub extern "C" fn syscall_handler(
                 mask as u64
             } else if arg2 != 0 && arg1 >= 8 {
                 let bytes = (mask as u64).to_ne_bytes();
-                if crate::mm::user_mem::copy_to_user(arg2, &bytes).is_err() {
+                if UserSliceWo::new(arg2, bytes.len())
+                    .and_then(|s| s.copy_from_kernel(&bytes))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 8
@@ -1425,7 +1463,6 @@ fn check_pending_signals(syscall_result: u64) {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
-                        let sig_saved_rsp = per_core_syscall_user_rsp();
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -1434,7 +1471,6 @@ fn check_pending_signals(syscall_result: u64) {
                                 .unwrap_or(false)
                         } {
                             crate::task::yield_now();
-                            restore_caller_context(pid, sig_saved_rsp);
                         }
                     }
                     SignalDisposition::Continue | SignalDisposition::Ignore => {}
@@ -1592,7 +1628,10 @@ pub(super) fn sys_debug_print(ptr: u64, len: u64) -> u64 {
     }
     let mut buf = [0u8; 4096];
     let dst = &mut buf[..len as usize];
-    if crate::mm::user_mem::copy_from_user(dst, ptr).is_err() {
+    if UserSliceRo::new(ptr, dst.len())
+        .and_then(|s| s.copy_to_kernel(dst))
+        .is_err()
+    {
         log::warn!("[sys_debug_print] invalid user pointer {:#x}+{}", ptr, len);
         return u64::MAX;
     }
@@ -1648,7 +1687,8 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
     if clear_tid_addr != 0 {
         // Write 0u32 to the userspace address.
         let zero = 0u32.to_ne_bytes();
-        let _ = crate::mm::user_mem::copy_to_user(clear_tid_addr, &zero);
+        let _ =
+            UserSliceWo::new(clear_tid_addr, zero.len()).and_then(|s| s.copy_from_kernel(&zero));
         // Wake one waiter on the private futex key (0, addr) — this
         // matches musl's pthread_join which uses FUTEX_WAIT|FUTEX_PRIVATE.
         use crate::process::futex::{FUTEX_BITSET_MATCH_ANY, FUTEX_TABLE};
@@ -1700,6 +1740,23 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     if crate::fb::fb_owner_pid() == pid {
         crate::fb::restore_console();
     }
+    // Deactivate this core's tracked AddressSpace *before* marking Zombie.
+    // Once the process is Zombie another core can reap() it, dropping the
+    // last Arc<AddressSpace>. If we still held a raw pointer in
+    // current_addrspace at that point the scheduler dispatch would
+    // dereference freed memory.
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let old_as_ptr = pc.current_addrspace;
+        if !old_as_ptr.is_null() {
+            let core_id = pc.core_id;
+            // SAFETY: The Arc<AddressSpace> is still alive — we have not
+            // marked the process Zombie yet, so no one can reap it.
+            unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+            let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+            unsafe { (*pc_mut).current_addrspace = core::ptr::null() };
+        }
+    }
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
@@ -1713,7 +1770,9 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).and_then(|p| p.page_table_root)
+        table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
     };
     // Restore kernel page table before yielding so the next scheduled task
     // does not inherit this process's CR3.
@@ -2153,7 +2212,10 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
                 old_sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
             }
         }
-        if crate::mm::user_mem::copy_to_user(oldact_ptr, &old_sa).is_err() {
+        if UserSliceWo::new(oldact_ptr, old_sa.len())
+            .and_then(|s| s.copy_from_kernel(&old_sa))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -2161,7 +2223,10 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     // Read new action if provided.
     if act_ptr != 0 {
         let mut sa = [0u8; 32];
-        if crate::mm::user_mem::copy_from_user(&mut sa, act_ptr).is_err() {
+        if UserSliceRo::new(act_ptr, sa.len())
+            .and_then(|s| s.copy_to_kernel(&mut sa))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
@@ -2248,7 +2313,10 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64
     if oldset_ptr != 0 {
         let old_user = proc.blocked_signals >> 1;
         let old_bytes = old_user.to_ne_bytes();
-        if crate::mm::user_mem::copy_to_user(oldset_ptr, &old_bytes).is_err() {
+        if UserSliceWo::new(oldset_ptr, old_bytes.len())
+            .and_then(|s| s.copy_from_kernel(&old_bytes))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -2256,7 +2324,10 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u64
     // Apply new mask if set_ptr is non-null.
     if set_ptr != 0 {
         let mut set_bytes = [0u8; 8];
-        if crate::mm::user_mem::copy_from_user(&mut set_bytes, set_ptr).is_err() {
+        if UserSliceRo::new(set_ptr, set_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut set_bytes))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         // Convert userspace→kernel by shifting left 1.
@@ -2308,7 +2379,10 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         buf[0..8].copy_from_slice(&proc.alt_stack_base.to_ne_bytes());
         buf[8..12].copy_from_slice(&proc.alt_stack_flags.to_ne_bytes());
         buf[16..24].copy_from_slice(&proc.alt_stack_size.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(old_ss_ptr, &buf).is_err() {
+        if UserSliceWo::new(old_ss_ptr, buf.len())
+            .and_then(|s| s.copy_from_kernel(&buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -2321,7 +2395,10 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
         }
 
         let mut buf = [0u8; 24];
-        if crate::mm::user_mem::copy_from_user(&mut buf, ss_ptr).is_err() {
+        if UserSliceRo::new(ss_ptr, buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let ss_sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
@@ -2416,7 +2493,10 @@ pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
     bytes[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
-    if crate::mm::user_mem::copy_to_user(pipefd_ptr, &bytes).is_err() {
+    if UserSliceWo::new(pipefd_ptr, bytes.len())
+        .and_then(|s| s.copy_from_kernel(&bytes))
+        .is_err()
+    {
         // Both FDs exist — close them properly via refcounts.
         with_current_fd_mut(read_fd, |slot| *slot = None);
         with_current_fd_mut(write_fd, |slot| *slot = None);
@@ -2611,7 +2691,10 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         return NEG_EFAULT;
     }
     let mut ts = [0u8; 16]; // struct timespec { tv_sec: i64, tv_nsec: i64 }
-    if crate::mm::user_mem::copy_from_user(&mut ts, req_ptr).is_err() {
+    if UserSliceRo::new(req_ptr, ts.len())
+        .and_then(|s| s.copy_to_kernel(&mut ts))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     let secs = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
@@ -2623,13 +2706,9 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         .saturating_mul(1_000_000)
         .saturating_add((nsecs as u64) / 1_000);
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
-
     if sleep_us == 0 {
         // Zero sleep: yield once to be cooperative (standard POSIX behaviour).
         crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
         return 0;
     }
 
@@ -2641,7 +2720,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         let start = crate::arch::x86_64::interrupts::tick_count();
         while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             if has_pending_signal() {
                 return NEG_EINTR;
             }
@@ -2665,7 +2743,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
         // granularity, which is acceptable for multi-millisecond sleeps.
         crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
         if has_pending_signal() {
             return NEG_EINTR;
         }
@@ -2673,7 +2750,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             if has_pending_signal() {
                 return NEG_EINTR;
             }
@@ -2780,7 +2856,10 @@ pub(super) fn sys_times(buf_ptr: u64) -> u64 {
         bytes[8..16].copy_from_slice(&(system_ticks as i64).to_ne_bytes()); // tms_stime
         bytes[16..24].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cutime (children — not tracked yet)
         bytes[24..32].copy_from_slice(&0_i64.to_ne_bytes()); // tms_cstime
-        if crate::mm::user_mem::copy_to_user(buf_ptr, &bytes).is_err() {
+        if UserSliceWo::new(buf_ptr, bytes.len())
+            .and_then(|s| s.copy_from_kernel(&bytes))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -3103,7 +3182,10 @@ fn read_user_string_array(
             None => return Err(()),
         };
         let mut ptr_bytes = [0u8; 8];
-        if crate::mm::user_mem::copy_from_user(&mut ptr_bytes, ptr_addr).is_err() {
+        if UserSliceRo::new(ptr_addr, ptr_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut ptr_bytes))
+            .is_err()
+        {
             return Err(());
         }
         let str_ptr = u64::from_ne_bytes(ptr_bytes);
@@ -3119,7 +3201,10 @@ fn read_user_string_array(
                 None => return Err(()),
             };
             let mut b = [0u8; 1];
-            if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
+            if UserSliceRo::new(addr, b.len())
+                .and_then(|s| s.copy_to_kernel(&mut b))
+                .is_err()
+            {
                 return Err(());
             }
             if b[0] == 0 {
@@ -3253,12 +3338,27 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
     crate::process::close_cloexec_fds(pid);
 
+    // Deactivate old AddressSpace tracking BEFORE replacing it in the
+    // process table (the old Arc is freed on replacement, so the raw
+    // pointer in current_addrspace would dangle after that).
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let old_as_ptr = pc.current_addrspace;
+        if !old_as_ptr.is_null() {
+            // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+            // still held by the process entry — not yet replaced.
+            unsafe { &*old_as_ptr }.deactivate_on_core(pc.core_id);
+        }
+    }
+
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.page_table_root = Some(x86_64::PhysAddr::new(new_cr3.start_address().as_u64()));
+            proc.addr_space = Some(alloc::sync::Arc::new(crate::mm::AddressSpace::new(
+                x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+            )));
             proc.entry_point = loaded.entry;
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
@@ -3288,6 +3388,26 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 proc.shared_signal_actions = None;
             }
         }
+    }
+
+    // Activate the new AddressSpace on this core and update the pointer.
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let core_id = pc.core_id;
+        let new_as_ptr = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table
+                .find(pid)
+                .and_then(|p| p.addr_space.as_ref())
+                .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                .unwrap_or_default()
+        };
+        if !new_as_ptr.is_null() {
+            // SAFETY: new_as_ptr points into the Arc just stored above.
+            unsafe { &*new_as_ptr }.activate_on_core(core_id);
+        }
+        let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+        unsafe { (*pc_mut).current_addrspace = new_as_ptr };
     }
 
     // Switch to the new page table and enter ring 3.
@@ -3328,7 +3448,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
     let calling_pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
     const WNOHANG: u64 = 0x1;
     const WUNTRACED: u64 = 0x2;
     let report_stopped = options & WUNTRACED != 0;
@@ -3415,9 +3534,6 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
-            // Restore caller context.
-            restore_caller_context(calling_pid, saved_user_rsp);
-
             // Write wstatus.
             if status_ptr != 0 {
                 let wstatus = if stopped {
@@ -3433,7 +3549,8 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                     }
                 };
                 let bytes = wstatus.to_ne_bytes();
-                let _ = crate::mm::user_mem::copy_to_user(status_ptr, &bytes);
+                let _ = UserSliceWo::new(status_ptr, bytes.len())
+                    .and_then(|s| s.copy_from_kernel(&bytes));
             }
             log::info!(
                 "[waitpid] pid {} {}",
@@ -3449,49 +3566,6 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         }
         // Yield and try again.
         crate::task::yield_now();
-        restore_caller_context(calling_pid, saved_user_rsp);
-    }
-}
-
-/// Restore the caller's CR3, kernel stack, and user RSP after a yield.
-///
-/// When a syscall handler calls `yield_now()` to block, another task may
-/// enter the kernel via syscall and overwrite the per-core `syscall_user_rsp`
-/// and `syscall_stack_top`. This function restores all per-process state
-/// so that the `sysretq` return path uses the correct values.
-pub(crate) fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
-    let (caller_cr3_phys, kstack_top, fs_base) = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
-        let kst = table
-            .find(calling_pid)
-            .map(|p| p.kernel_stack_top)
-            .unwrap_or(0);
-        let fsb = table.find(calling_pid).map(|p| p.fs_base).unwrap_or(0);
-        (cr3, kst, fsb)
-    };
-    if let Some(phys) = caller_cr3_phys {
-        unsafe {
-            use x86_64::{
-                registers::control::{Cr3, Cr3Flags},
-                structures::paging::PhysFrame,
-            };
-            let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
-            Cr3::write(frame, Cr3Flags::empty());
-        }
-    }
-    crate::process::set_current_pid(calling_pid);
-    // Restore per-core syscall state.
-    let data =
-        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-    unsafe {
-        (*data).syscall_user_rsp = saved_user_rsp;
-        if kstack_top != 0 {
-            (*data).syscall_stack_top = kstack_top;
-            crate::smp::set_current_core_kernel_stack(kstack_top);
-        }
-        // Restore FS.base (TLS pointer) for this process.
-        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
     }
 }
 
@@ -3572,6 +3646,10 @@ unsafe fn cow_clone_user_pages(
             &*(phys_offset + src_frame.start_address().as_u64()).as_ptr::<PageTable>();
 
         let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
+
+        // Track the range of CoW-marked pages for SMP shootdown.
+        let mut cow_range_start: u64 = u64::MAX;
+        let mut cow_range_end: u64 = 0;
 
         // Walk indices 0–255 (user half).
         for p4 in 0usize..256 {
@@ -3662,6 +3740,13 @@ unsafe fn cow_clone_user_pages(
                         // match (clear WRITABLE, set BIT_9) and bump refcount.
                         if was_writable {
                             pte.set_addr(src_phys, child_flags);
+                            // Track range of CoW-marked pages for SMP shootdown.
+                            if vaddr < cow_range_start {
+                                cow_range_start = vaddr;
+                            }
+                            if vaddr + 4096 > cow_range_end {
+                                cow_range_end = vaddr + 4096;
+                            }
                         }
                         crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                     }
@@ -3673,6 +3758,18 @@ unsafe fn cow_clone_user_pages(
         // A full CR3 reload is the simplest approach.
         let (current_cr3, cr3_flags) = Cr3::read();
         Cr3::write(current_cr3, cr3_flags);
+
+        // SMP shootdown: ensure remote cores that have the parent's address
+        // space loaded also see the cleared WRITABLE bits on CoW pages.
+        if cow_range_start < cow_range_end {
+            let parent_pid = crate::process::current_pid();
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table.find(parent_pid)
+                && let Some(ref addr_space) = p.addr_space
+            {
+                crate::smp::tlb::tlb_shootdown_range(addr_space, cow_range_start, cow_range_end);
+            }
+        }
 
         Ok(())
     }
@@ -3880,7 +3977,10 @@ fn copy_byte_pattern_to_user(buf_ptr: u64, count: usize, byte: u8) -> Result<(),
     let mut written = 0usize;
     while written < count {
         let len = (count - written).min(chunk.len());
-        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+        if UserSliceWo::new(buf_ptr + written as u64, chunk[..len].len())
+            .and_then(|s| s.copy_from_kernel(&chunk[..len]))
+            .is_err()
+        {
             return Err(());
         }
         written += len;
@@ -3895,7 +3995,10 @@ fn copy_pseudorandom_to_user(buf_ptr: u64, count: usize) -> Result<(), ()> {
     while written < count {
         let len = (count - written).min(chunk.len());
         fill_pseudorandom_bytes(&mut state, &mut chunk[..len]);
-        if crate::mm::user_mem::copy_to_user(buf_ptr + written as u64, &chunk[..len]).is_err() {
+        if UserSliceWo::new(buf_ptr + written as u64, chunk[..len].len())
+            .and_then(|s| s.copy_from_kernel(&chunk[..len]))
+            .is_err()
+        {
             return Err(());
         }
         written += len;
@@ -3934,14 +4037,15 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 if crate::stdin::has_data() {
                     let mut tmp = [0u8; 4096];
                     let n = crate::stdin::read(&mut tmp[..capped]);
                     if n > 0 {
-                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                        if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                            .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                            .is_err()
+                        {
                             return NEG_EFAULT;
                         }
                         return n as u64;
@@ -3955,7 +4059,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::Stdout => NEG_EBADF,
@@ -3974,7 +4077,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 core::slice::from_raw_parts((*content_addr + entry.offset) as *const u8, to_read)
             };
 
-            if crate::mm::user_mem::copy_to_user(buf_ptr, src).is_err() {
+            if UserSliceWo::new(buf_ptr, src.len())
+                .and_then(|s| s.copy_from_kernel(src))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
 
@@ -3999,7 +4105,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return 0; // EOF
             }
 
-            if crate::mm::user_mem::copy_to_user(buf_ptr, data).is_err() {
+            if UserSliceWo::new(buf_ptr, data.len())
+                .and_then(|s| s.copy_from_kernel(data))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
 
@@ -4029,7 +4138,9 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 return 0;
             }
 
-            if crate::mm::user_mem::copy_to_user(buf_ptr, &data[offset..offset + to_read]).is_err()
+            if UserSliceWo::new(buf_ptr, data[offset..offset + to_read].len())
+                .and_then(|s| s.copy_from_kernel(&data[offset..offset + to_read]))
+                .is_err()
             {
                 return NEG_EFAULT;
             }
@@ -4061,7 +4172,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                 match vol.read_file(start_cluster, file_size, offset, &mut read_buf) {
                     Ok(0) => 0,
                     Ok(n) => {
-                        if crate::mm::user_mem::copy_to_user(buf_ptr, &read_buf[..n]).is_err() {
+                        if UserSliceWo::new(buf_ptr, read_buf[..n].len())
+                            .and_then(|s| s.copy_from_kernel(&read_buf[..n]))
+                            .is_err()
+                        {
                             return NEG_EFAULT;
                         }
 
@@ -4082,15 +4196,16 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let pipe_id = *pipe_id;
             let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until data is available or writer closes.
             loop {
                 let mut tmp = [0u8; 4096];
                 match crate::pipe::pipe_read(pipe_id, &mut tmp[..capped]) {
                     Ok(0) => return 0, // EOF
                     Ok(n) => {
-                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                        if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                            .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                            .is_err()
+                        {
                             return NEG_EFAULT;
                         }
                         return n as u64;
@@ -4103,7 +4218,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -4125,7 +4239,8 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         match vol.read_file_data(&inode, offset as u64, &mut read_buf) {
                             Ok(0) => 0,
                             Ok(n) => {
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &read_buf[..n])
+                                if UserSliceWo::new(buf_ptr, read_buf[..n].len())
+                                    .and_then(|s| s.copy_from_kernel(&read_buf[..n]))
                                     .is_err()
                                 {
                                     return NEG_EFAULT;
@@ -4176,8 +4291,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -4189,7 +4302,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             drop(table);
                             // Reading from s2m frees space for slave writers.
                             crate::pty::wake_slave(pty_id);
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
+                            if UserSliceWo::new(buf_ptr, dst[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&dst[..n]))
+                                .is_err()
+                            {
                                 return NEG_EFAULT;
                             }
                             return n as u64;
@@ -4208,7 +4324,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::PtySlave { pty_id } => {
@@ -4218,8 +4333,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -4238,7 +4351,8 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 drop(table);
                                 // Draining edit_buf frees space for master writers.
                                 crate::pty::wake_master(pty_id);
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..to_copy])
+                                if UserSliceWo::new(buf_ptr, dst[..to_copy].len())
+                                    .and_then(|s| s.copy_from_kernel(&dst[..to_copy]))
                                     .is_err()
                                 {
                                     return NEG_EFAULT;
@@ -4260,7 +4374,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 drop(table);
                                 // Reading from m2s frees space for master writers.
                                 crate::pty::wake_master(pty_id);
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &dst[..n]).is_err() {
+                                if UserSliceWo::new(buf_ptr, dst[..n].len())
+                                    .and_then(|s| s.copy_from_kernel(&dst[..n]))
+                                    .is_err()
+                                {
                                     return NEG_EFAULT;
                                 }
                                 return n as u64;
@@ -4280,7 +4397,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::Socket { .. } => {
@@ -4293,8 +4409,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             let handle = *handle;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             let capped = (count as usize).min(4096);
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
             match sock_type {
@@ -4304,7 +4418,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         match crate::net::unix::unix_stream_read(handle, &mut tmp) {
                             Ok(0) => return 0,
                             Ok(n) => {
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                                    .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                                    .is_err()
+                                {
                                     return NEG_EFAULT;
                                 }
                                 return n as u64;
@@ -4318,7 +4435,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     return NEG_EINTR;
                                 }
                                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                                restore_caller_context(pid, saved_user_rsp);
                             }
                             Err(e) => return e as u64, // ENOTCONN, etc.
                         }
@@ -4329,7 +4445,10 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     loop {
                         match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
                             Ok((n, _sender)) => {
-                                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                                if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                                    .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                                    .is_err()
+                                {
                                     return NEG_EFAULT;
                                 }
                                 return n as u64;
@@ -4342,7 +4461,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     return NEG_EINTR;
                                 }
                                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                                restore_caller_context(pid, saved_user_rsp);
                             }
                             Err(e) => return e as u64,
                         }
@@ -4379,7 +4497,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // stdout/stderr/tty go to serial + framebuffer console.
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
-            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, buf[..len].len())
+                .and_then(|s| s.copy_to_kernel(&mut buf[..len]))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             if let Ok(s) = core::str::from_utf8(&buf[..len]) {
@@ -4409,7 +4530,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                         break;
                     }
                 };
-                if crate::mm::user_mem::copy_from_user(&mut buf[..chunk], user_ptr).is_err() {
+                if UserSliceRo::new(user_ptr, buf[..chunk].len())
+                    .and_then(|s| s.copy_to_kernel(&mut buf[..chunk]))
+                    .is_err()
+                {
                     if written == 0 {
                         return NEG_EFAULT;
                     }
@@ -4466,7 +4590,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                 };
                 let mut tmp = [0u8; 4096];
-                if crate::mm::user_mem::copy_from_user(&mut tmp[..chunk], user_ptr).is_err() {
+                if UserSliceRo::new(user_ptr, tmp[..chunk].len())
+                    .and_then(|s| s.copy_to_kernel(&mut tmp[..chunk]))
+                    .is_err()
+                {
                     if copied == 0 {
                         return NEG_EFAULT;
                     }
@@ -4537,7 +4664,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     }
                 };
                 let mut tmp = [0u8; 4096];
-                if crate::mm::user_mem::copy_from_user(&mut tmp[..chunk], user_ptr).is_err() {
+                if UserSliceRo::new(user_ptr, tmp[..chunk].len())
+                    .and_then(|s| s.copy_to_kernel(&mut tmp[..chunk]))
+                    .is_err()
+                {
                     if copied == 0 {
                         return NEG_EFAULT;
                     }
@@ -4588,11 +4718,12 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let nonblock = entry.nonblock;
             let len = (count as usize).min(4096);
             let mut buf = [0u8; 4096];
-            if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, buf[..len].len())
+                .and_then(|s| s.copy_to_kernel(&mut buf[..len]))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until space is available or reader closes.
             loop {
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
@@ -4611,7 +4742,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -4625,7 +4755,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Apply line discipline on the slave side (input processing).
             let pty_id = *pty_id;
             let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
-            if crate::mm::user_mem::copy_from_user(&mut src_data, buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, src_data.len())
+                .and_then(|s| s.copy_to_kernel(&mut src_data))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let mut table = crate::pty::PTY_TABLE.lock();
@@ -4790,7 +4923,10 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Apply output processing (OPOST).
             let pty_id = *pty_id;
             let mut src_data = alloc::vec![0u8; count.min(4096) as usize];
-            if crate::mm::user_mem::copy_from_user(&mut src_data, buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, src_data.len())
+                .and_then(|s| s.copy_to_kernel(&mut src_data))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let mut table = crate::pty::PTY_TABLE.lock();
@@ -4829,11 +4965,12 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::UnixSocket { handle } => {
             let handle = *handle;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             let capped = (count as usize).min(4096);
             let mut data = alloc::vec![0u8; capped];
-            if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, data.len())
+                .and_then(|s| s.copy_to_kernel(&mut data))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
@@ -4850,7 +4987,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 return NEG_EINTR;
                             }
                             crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                            restore_caller_context(pid, saved_user_rsp);
                         }
                         Err(e) => return e as u64, // EPIPE, ENOTCONN, etc.
                     }
@@ -4879,7 +5015,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                         return NEG_EINTR;
                                     }
                                     crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
-                                    restore_caller_context(pid, saved_user_rsp);
                                 }
                                 Err(e) => return e as u64,
                             }
@@ -4911,7 +5046,10 @@ fn read_user_cstr<const N: usize>(ptr: u64, buf: &mut [u8; N]) -> Option<&str> {
     while len < buf.len() {
         let mut b = [0u8; 1];
         let addr = ptr.checked_add(len as u64)?;
-        if crate::mm::user_mem::copy_from_user(&mut b, addr).is_err() {
+        if UserSliceRo::new(addr, b.len())
+            .and_then(|s| s.copy_to_kernel(&mut b))
+            .is_err()
+        {
             return None;
         }
         if b[0] == 0 {
@@ -6156,7 +6294,10 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
                 stat[72..80].copy_from_slice(&atime.to_ne_bytes());
                 stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
                 stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                if UserSliceWo::new(stat_ptr, stat.len())
+                    .and_then(|s| s.copy_from_kernel(&stat))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 return 0;
@@ -6176,7 +6317,10 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
     stat[48..56].copy_from_slice(&size.to_ne_bytes());
     stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
 
-    if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+    if UserSliceWo::new(stat_ptr, stat.len())
+        .and_then(|s| s.copy_from_kernel(&stat))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -6856,7 +7000,10 @@ fn sys_mmap_file_backed(
     // Get the process CR3 for the mapper.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(pid).and_then(|p| p.page_table_root) {
+        match table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
+        {
             Some(phys) => phys,
             None => return NEG_EINVAL,
         }
@@ -7022,9 +7169,19 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
     let freed_count = unmapped_addrs.len();
 
-    // SMP TLB shootdown: invalidate only pages that were actually unmapped.
-    for &page_addr in &unmapped_addrs {
-        crate::smp::tlb::tlb_shootdown(page_addr);
+    // SMP TLB shootdown: batch invalidation for the entire unmapped range.
+    if !unmapped_addrs.is_empty() {
+        let range_start = *unmapped_addrs.iter().min().unwrap();
+        let range_end = *unmapped_addrs.iter().max().unwrap() + 4096;
+        // Use targeted range shootdown via the process's AddressSpace.
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(p) = table.find(pid)
+            && let Some(ref addr_space) = p.addr_space
+        {
+            crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
+        }
+        drop(table);
     }
 
     // Update mapping tracking list: handle full removal, shrink, and split.
@@ -7205,9 +7362,18 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
-    // TLB shootdown for all changed pages.
-    for &page_addr in &changed_addrs {
-        crate::smp::tlb::tlb_shootdown(page_addr);
+    // Batch TLB shootdown for all changed pages.
+    if !changed_addrs.is_empty() {
+        let range_start = *changed_addrs.iter().min().unwrap();
+        let range_end = *changed_addrs.iter().max().unwrap() + 4096;
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(p) = table.find(pid)
+            && let Some(ref addr_space) = p.addr_space
+        {
+            crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
+        }
+        drop(table);
     }
 
     // Update VMA protection bits and split VMAs at mprotect boundaries.
@@ -7353,7 +7519,10 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
 
     // Copy to user buffer
     let copy_len = written.min(buf_len as usize);
-    if crate::mm::user_mem::copy_to_user(buf_addr, &tmp[..copy_len]).is_err() {
+    if UserSliceWo::new(buf_addr, tmp[..copy_len].len())
+        .and_then(|s| s.copy_from_kernel(&tmp[..copy_len]))
+        .is_err()
+    {
         return 0;
     }
 
@@ -7432,7 +7601,10 @@ pub(super) fn sys_framebuffer_info(buf_addr: u64, buf_len: u64) -> u64 {
     let info_bytes = unsafe {
         core::slice::from_raw_parts(&info as *const FbInfo as *const u8, FB_INFO_SIZE as usize)
     };
-    if crate::mm::user_mem::copy_to_user(buf_addr, info_bytes).is_err() {
+    if UserSliceWo::new(buf_addr, info_bytes.len())
+        .and_then(|s| s.copy_from_kernel(info_bytes))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -7556,7 +7728,10 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     // Get the process page table and map the frames.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(pid).and_then(|p| p.page_table_root) {
+        match table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
+        {
             Some(phys) => phys,
             None => {
                 crate::fb::release_console_claim(pid);
@@ -7680,7 +7855,10 @@ pub(super) fn sys_stdin_push(buf_ptr: u64, len: u64) -> u64 {
     }
     let len = len as usize;
     let mut buf = [0u8; 4096];
-    if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
+    if UserSliceRo::new(buf_ptr, len)
+        .and_then(|s| s.copy_to_kernel(&mut buf[..len]))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     for &b in &buf[..len] {
@@ -7730,7 +7908,10 @@ pub(super) fn sys_get_termios_flags(buf_ptr: u64, buf_len: u64) -> u64 {
     out[12..31].copy_from_slice(&t.termios.c_cc);
     out[31] = 0; // padding
     drop(t);
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+    if UserSliceWo::new(buf_ptr, out.len())
+        .and_then(|s| s.copy_from_kernel(&out))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -7857,7 +8038,10 @@ pub(super) fn sys_linux_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             None => return NEG_EFAULT,
         };
         let mut iov_bytes = [0u8; 16];
-        if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
+        if UserSliceRo::new(iov_addr, iov_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_bytes))
+            .is_err()
+        {
             if total == 0 {
                 return NEG_EFAULT;
             }
@@ -7908,7 +8092,10 @@ pub(super) fn sys_linux_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             None => return NEG_EFAULT,
         };
         let mut iov_bytes = [0u8; 16];
-        if crate::mm::user_mem::copy_from_user(&mut iov_bytes, iov_addr).is_err() {
+        if UserSliceRo::new(iov_addr, iov_bytes.len())
+            .and_then(|s| s.copy_to_kernel(&mut iov_bytes))
+            .is_err()
+        {
             if total == 0 {
                 return NEG_EFAULT;
             }
@@ -7952,14 +8139,20 @@ pub(super) fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
         return NEG_ERANGE;
     }
     // Copy path, then write a single null terminator — no heap allocation.
-    if crate::mm::user_mem::copy_to_user(buf_ptr, cwd_bytes).is_err() {
+    if UserSliceWo::new(buf_ptr, cwd_bytes.len())
+        .and_then(|s| s.copy_from_kernel(cwd_bytes))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     let terminator_ptr = match buf_ptr.checked_add(cwd_bytes.len() as u64) {
         Some(p) => p,
         None => return NEG_EFAULT,
     };
-    if crate::mm::user_mem::copy_to_user(terminator_ptr, &[0u8]).is_err() {
+    if UserSliceWo::new(terminator_ptr, [0u8].len())
+        .and_then(|s| s.copy_from_kernel(&[0u8]))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     // Linux getcwd returns the length of the path (including null terminator).
@@ -8072,7 +8265,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if req == TIOCGPTN {
         if let Some(FdBackend::PtyMaster { pty_id }) = &backend {
             let bytes = (*pty_id).to_ne_bytes();
-            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+            if UserSliceWo::new(arg, bytes.len())
+                .and_then(|s| s.copy_from_kernel(&bytes))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             return 0;
@@ -8091,7 +8287,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             && is_pty_master
         {
             let mut lock_val = [0u8; 4];
-            if crate::mm::user_mem::copy_from_user(&mut lock_val, arg).is_err() {
+            if UserSliceRo::new(arg, lock_val.len())
+                .and_then(|s| s.copy_to_kernel(&mut lock_val))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let val = i32::from_ne_bytes(lock_val);
@@ -8149,7 +8348,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             TERMIOS_SIZE,
                         )
                     };
-                    if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                    if UserSliceWo::new(arg, src.len())
+                        .and_then(|s| s.copy_from_kernel(src))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     return 0;
@@ -8161,14 +8363,20 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let src = unsafe {
                 core::slice::from_raw_parts(&tty.termios as *const _ as *const u8, TERMIOS_SIZE)
             };
-            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+            if UserSliceWo::new(arg, src.len())
+                .and_then(|s| s.copy_from_kernel(src))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             0
         }
         TCSETS | TCSETSW => {
             let mut buf = [0u8; TERMIOS_SIZE];
-            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+            if UserSliceRo::new(arg, buf.len())
+                .and_then(|s| s.copy_to_kernel(&mut buf))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let new_termios = unsafe {
@@ -8187,7 +8395,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         }
         TCSETSF => {
             let mut buf = [0u8; TERMIOS_SIZE];
-            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+            if UserSliceRo::new(arg, buf.len())
+                .and_then(|s| s.copy_to_kernel(&mut buf))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let new_termios = unsafe {
@@ -8216,7 +8427,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                 if let Some(Some(pair)) = table.get(id as usize) {
                     let pgid = pair.slave_fg_pgid;
                     let bytes = (pgid as i32).to_ne_bytes();
-                    if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+                    if UserSliceWo::new(arg, bytes.len())
+                        .and_then(|s| s.copy_from_kernel(&bytes))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     return 0;
@@ -8226,14 +8440,20 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let tty = crate::tty::TTY0.lock();
             let pgid = tty.fg_pgid;
             let bytes = (pgid as i32).to_ne_bytes();
-            if crate::mm::user_mem::copy_to_user(arg, &bytes).is_err() {
+            if UserSliceWo::new(arg, bytes.len())
+                .and_then(|s| s.copy_from_kernel(&bytes))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             0
         }
         TIOCSPGRP => {
             let mut bytes = [0u8; 4];
-            if crate::mm::user_mem::copy_from_user(&mut bytes, arg).is_err() {
+            if UserSliceRo::new(arg, bytes.len())
+                .and_then(|s| s.copy_to_kernel(&mut bytes))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let pgid = i32::from_ne_bytes(bytes) as u32;
@@ -8259,7 +8479,10 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
                             WINSIZE_SIZE,
                         )
                     };
-                    if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+                    if UserSliceWo::new(arg, src.len())
+                        .and_then(|s| s.copy_from_kernel(src))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     return 0;
@@ -8270,14 +8493,20 @@ pub(super) fn sys_linux_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             let src = unsafe {
                 core::slice::from_raw_parts(&tty.winsize as *const _ as *const u8, WINSIZE_SIZE)
             };
-            if crate::mm::user_mem::copy_to_user(arg, src).is_err() {
+            if UserSliceWo::new(arg, src.len())
+                .and_then(|s| s.copy_from_kernel(src))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             0
         }
         TIOCSWINSZ => {
             let mut buf = [0u8; WINSIZE_SIZE];
-            if crate::mm::user_mem::copy_from_user(&mut buf, arg).is_err() {
+            if UserSliceRo::new(arg, buf.len())
+                .and_then(|s| s.copy_to_kernel(&mut buf))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             let new_ws = unsafe {
@@ -8330,7 +8559,10 @@ pub(super) fn sys_linux_uname(buf_ptr: u64) -> u64 {
     fill(&mut utsname[195..260], env!("CARGO_PKG_VERSION").as_bytes()); // version
     fill(&mut utsname[260..325], b"x86_64"); // machine
     // domainname left as zero
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &utsname).is_err() {
+    if UserSliceWo::new(buf_ptr, utsname.len())
+        .and_then(|s| s.copy_from_kernel(&utsname))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -8367,7 +8599,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         stat[48..56].copy_from_slice(&st.size.to_ne_bytes());
         let blksize: u64 = 4096;
         stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+        if UserSliceWo::new(stat_ptr, stat.len())
+            .and_then(|s| s.copy_from_kernel(&stat))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         return 0;
@@ -8402,7 +8637,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
         let blksize: u64 = 4096;
         stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
         drop(tmpfs);
-        if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+        if UserSliceWo::new(stat_ptr, stat.len())
+            .and_then(|s| s.copy_from_kernel(&stat))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         return 0;
@@ -8418,7 +8656,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             stat[48..56].copy_from_slice(&size.to_ne_bytes());
             let blksize: u64 = 4096;
             stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            if UserSliceWo::new(stat_ptr, stat.len())
+                .and_then(|s| s.copy_from_kernel(&stat))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             0
@@ -8429,7 +8670,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             stat[24..28].copy_from_slice(&mode.to_ne_bytes());
             let blksize: u64 = 4096;
             stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-            if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+            if UserSliceWo::new(stat_ptr, stat.len())
+                .and_then(|s| s.copy_from_kernel(&stat))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
             0
@@ -8467,7 +8711,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                     stat[72..80].copy_from_slice(&atime.to_ne_bytes());
                     stat[88..96].copy_from_slice(&mtime.to_ne_bytes());
                     stat[104..112].copy_from_slice(&ctime.to_ne_bytes());
-                    if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                    if UserSliceWo::new(stat_ptr, stat.len())
+                        .and_then(|s| s.copy_from_kernel(&stat))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     return 0;
@@ -8485,7 +8732,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 let mut stat = [0u8; 144];
                 let mode: u32 = 0x2000 | 0o666; // S_IFCHR | rw-rw-rw-
                 stat[24..28].copy_from_slice(&mode.to_ne_bytes());
-                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                if UserSliceWo::new(stat_ptr, stat.len())
+                    .and_then(|s| s.copy_from_kernel(&stat))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 return 0;
@@ -8497,7 +8747,10 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
                 stat[24..28].copy_from_slice(&mode.to_ne_bytes());
                 let blksize: u64 = 4096;
                 stat[56..64].copy_from_slice(&blksize.to_ne_bytes());
-                if crate::mm::user_mem::copy_to_user(stat_ptr, &stat).is_err() {
+                if UserSliceWo::new(stat_ptr, stat.len())
+                    .and_then(|s| s.copy_from_kernel(&stat))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 return 0;
@@ -8625,7 +8878,10 @@ pub(super) fn sys_readlinkat(dirfd: u64, path_ptr: u64, buf_ptr: u64, buf_len: u
     };
 
     let to_copy = core::cmp::min(target.len(), buf_len as usize);
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &target.as_bytes()[..to_copy]).is_err() {
+    if UserSliceWo::new(buf_ptr, to_copy)
+        .and_then(|s| s.copy_from_kernel(&target.as_bytes()[..to_copy]))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     to_copy as u64
@@ -8784,7 +9040,10 @@ pub(super) fn sys_utimensat(_dirfd: u64, path_ptr: u64, times_ptr: u64, _flags: 
         (now, now)
     } else {
         let mut tbuf = [0u8; 32];
-        if crate::mm::user_mem::copy_from_user(&mut tbuf, times_ptr).is_err() {
+        if UserSliceRo::new(times_ptr, tbuf.len())
+            .and_then(|s| s.copy_to_kernel(&mut tbuf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let a_sec = i64::from_ne_bytes(tbuf[0..8].try_into().unwrap());
@@ -9774,7 +10033,10 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         return 0;
     }
 
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &out).is_err() {
+    if UserSliceWo::new(buf_ptr, out.len())
+        .and_then(|s| s.copy_from_kernel(&out))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
 
@@ -10044,15 +10306,15 @@ fn sys_clone_thread(
         let table = PROCESS_TABLE.lock();
         match table.find(parent_pid) {
             Some(p) => {
-                let cr3 = match p.page_table_root {
-                    Some(cr3) => cr3,
+                let parent_addr_space = match p.addr_space.as_ref() {
+                    Some(a) => alloc::sync::Arc::clone(a),
                     None => {
                         log::warn!("sys_clone_thread: parent has no page table");
                         return NEG_EINVAL;
                     }
                 };
                 Some((
-                    cr3,
+                    parent_addr_space,
                     p.tgid,
                     p.ppid,
                     p.brk_current,
@@ -10080,7 +10342,7 @@ fn sys_clone_thread(
     };
 
     let (
-        parent_cr3,
+        parent_addr_space,
         parent_tgid,
         parent_ppid,
         parent_brk,
@@ -10206,7 +10468,7 @@ fn sys_clone_thread(
         clear_child_tid: child_clear_tid,
         ppid: parent_ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(parent_cr3), // SHARED — same physical page table
+        addr_space: Some(parent_addr_space), // SHARED — same AddressSpace via Arc
         kernel_stack_top: kstack_top,
         entry_point: user_rip,
         user_stack_top: child_stack,
@@ -10260,14 +10522,16 @@ fn sys_clone_thread(
     // CLONE_PARENT_SETTID: write child TID to parent_tidptr in userspace.
     if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {
         let tid_bytes = (child_pid as i32).to_ne_bytes();
-        let _ = crate::mm::user_mem::copy_to_user(parent_tidptr, &tid_bytes);
+        let _ = UserSliceWo::new(parent_tidptr, tid_bytes.len())
+            .and_then(|s| s.copy_from_kernel(&tid_bytes));
     }
 
     // CLONE_CHILD_SETTID: write child TID to child_tidptr in userspace.
     // Since we share the address space, we can write it now from the parent context.
     if flags & CLONE_CHILD_SETTID != 0 && child_tidptr != 0 {
         let tid_bytes = (child_pid as i32).to_ne_bytes();
-        let _ = crate::mm::user_mem::copy_to_user(child_tidptr, &tid_bytes);
+        let _ = UserSliceWo::new(child_tidptr, tid_bytes.len())
+            .and_then(|s| s.copy_from_kernel(&tid_bytes));
     }
 
     crate::task::spawn_fork_task(
@@ -10422,7 +10686,10 @@ pub(super) fn sys_getrandom(buf_ptr: u64, buflen: u64, _flags: u64) -> u64 {
     let mut state = seed_pseudorandom_state();
     fill_pseudorandom_bytes(&mut state, &mut out[..actual]);
 
-    if crate::mm::user_mem::copy_to_user(buf_ptr, &out[..actual]).is_err() {
+    if UserSliceWo::new(buf_ptr, out[..actual].len())
+        .and_then(|s| s.copy_from_kernel(&out[..actual]))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     actual as u64
@@ -10474,7 +10741,10 @@ pub(super) fn sys_gettimeofday(tv_ptr: u64) -> u64 {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&(tv_sec as i64).to_ne_bytes());
     buf[8..16].copy_from_slice(&(tv_usec as i64).to_ne_bytes());
-    if crate::mm::user_mem::copy_to_user(tv_ptr, &buf).is_err() {
+    if UserSliceWo::new(tv_ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -10531,7 +10801,10 @@ pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> u64 {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&(secs as i64).to_ne_bytes());
     buf[8..16].copy_from_slice(&(nsecs as i64).to_ne_bytes());
-    if crate::mm::user_mem::copy_to_user(tp_ptr, &buf).is_err() {
+    if UserSliceWo::new(tp_ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     0
@@ -10558,22 +10831,22 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG);
 
-    // Build the futex key: (page_table_root, uaddr).
+    // Build the futex key: (addr_space pml4_phys, uaddr).
     // Private futexes use 0 as root; shared futexes use the real CR3.
-    let page_table_root = if is_private {
+    let futex_root = if is_private {
         0u64
     } else {
         let pid = crate::process::current_pid();
         match crate::process::PROCESS_TABLE
             .lock()
             .find(pid)
-            .and_then(|p| p.page_table_root.map(|a| a.as_u64()))
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))
         {
             Some(root) => root,
-            None => return NEG_EINVAL, // non-private futex requires a page table root
+            None => return NEG_EINVAL, // non-private futex requires an address space
         }
     };
-    let key = (page_table_root, uaddr);
+    let key = (futex_root, uaddr);
 
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
@@ -10609,13 +10882,17 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
             };
             if is_single_threaded {
                 let mut cur = [0u8; 4];
-                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                if UserSliceRo::new(uaddr, cur.len())
+                    .and_then(|s| s.copy_to_kernel(&mut cur))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 if u32::from_ne_bytes(cur) as u64 != val {
                     return NEG_EAGAIN;
                 }
-                let _ = crate::mm::user_mem::copy_to_user(uaddr, &0u32.to_ne_bytes());
+                let _ = UserSliceWo::new(uaddr, 4)
+                    .and_then(|s| s.copy_from_kernel(&0u32.to_ne_bytes()));
                 return 0;
             }
 
@@ -10626,7 +10903,10 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
 
                 // Read the futex word from userspace.
                 let mut cur = [0u8; 4];
-                if crate::mm::user_mem::copy_from_user(&mut cur, uaddr).is_err() {
+                if UserSliceRo::new(uaddr, cur.len())
+                    .and_then(|s| s.copy_to_kernel(&mut cur))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 let current_val = u32::from_ne_bytes(cur) as u64;
@@ -10642,18 +10922,11 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 });
             }
 
-            // Capture per-core syscall state before blocking — after a
-            // context switch the per-core values belong to a different task.
-            let futex_calling_pid = crate::process::current_pid();
-            let futex_saved_user_rsp = per_core_syscall_user_rsp();
-
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
             crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
-            // Woken — restore caller context so sysretq uses correct values.
-            restore_caller_context(futex_calling_pid, futex_saved_user_rsp);
             0
         }
 
@@ -10721,7 +10994,10 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
 /// Helper: read a SockaddrIn from userspace and return (ip, port).
 fn sockaddr_from_user(addr_ptr: u64) -> Result<([u8; 4], u16), u64> {
     let mut buf = [0u8; 16]; // sizeof(sockaddr_in)
-    if crate::mm::user_mem::copy_from_user(&mut buf, addr_ptr).is_err() {
+    if UserSliceRo::new(addr_ptr, buf.len())
+        .and_then(|s| s.copy_to_kernel(&mut buf))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
@@ -10743,7 +11019,10 @@ fn sockaddr_to_user(addr_ptr: u64, ip: [u8; 4], port: u16) -> Result<(), u64> {
     buf[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
     buf[2..4].copy_from_slice(&port.to_be_bytes());
     buf[4..8].copy_from_slice(&ip);
-    if crate::mm::user_mem::copy_to_user(addr_ptr, &buf).is_err() {
+    if UserSliceWo::new(addr_ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     Ok(())
@@ -10914,7 +11193,10 @@ pub(super) fn sys_socketpair(domain: u64, socktype: u64, _protocol: u64, sv_ptr:
     let mut sv_bytes = [0u8; 8];
     sv_bytes[..4].copy_from_slice(&(fd1 as i32).to_ne_bytes());
     sv_bytes[4..].copy_from_slice(&(fd2 as i32).to_ne_bytes());
-    if crate::mm::user_mem::copy_to_user(sv_ptr, &sv_bytes).is_err() {
+    if UserSliceWo::new(sv_ptr, sv_bytes.len())
+        .and_then(|s| s.copy_from_kernel(&sv_bytes))
+        .is_err()
+    {
         // Clean up on fault.
         with_current_fd_mut(fd1, |slot| *slot = None);
         with_current_fd_mut(fd2, |slot| *slot = None);
@@ -10932,7 +11214,10 @@ fn sockaddr_un_from_user(addr_ptr: u64, addr_len: u64) -> Result<alloc::string::
     }
     let len = (addr_len as usize).min(110); // sun_family(2) + path(up to 108)
     let mut buf = [0u8; 110];
-    if crate::mm::user_mem::copy_from_user(&mut buf[..len], addr_ptr).is_err() {
+    if UserSliceRo::new(addr_ptr, buf[..len].len())
+        .and_then(|s| s.copy_to_kernel(&mut buf[..len]))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     // Validate sun_family == AF_UNIX (1)
@@ -11094,8 +11379,6 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
             // Block until accepted (state transitions to Connected) or return EAGAIN.
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             loop {
                 let state = crate::net::unix::with_unix_socket(handle, |s| s.state);
                 if state == Some(crate::net::unix::UnixSocketState::Connected) {
@@ -11113,7 +11396,6 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                     return if nonblock { NEG_EAGAIN } else { NEG_EINTR };
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         crate::net::unix::UnixSocketType::Datagram => {
@@ -11162,8 +11444,6 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
     }
 
     let nonblock = entry.nonblock;
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
 
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
@@ -11236,7 +11516,6 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
             return NEG_EINTR;
         }
         crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-        restore_caller_context(pid, saved_user_rsp);
     }
 }
 
@@ -11244,7 +11523,10 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
 fn sockaddr_un_to_user(addr_ptr: u64, addr_len_ptr: u64, path: Option<&str>) -> Result<(), u64> {
     // Read the caller-provided buffer size.
     let mut caller_len_bytes = [0u8; 4];
-    if crate::mm::user_mem::copy_from_user(&mut caller_len_bytes, addr_len_ptr).is_err() {
+    if UserSliceRo::new(addr_len_ptr, caller_len_bytes.len())
+        .and_then(|s| s.copy_to_kernel(&mut caller_len_bytes))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     let caller_len = u32::from_ne_bytes(caller_len_bytes) as usize;
@@ -11262,12 +11544,19 @@ fn sockaddr_un_to_user(addr_ptr: u64, addr_len_ptr: u64, path: Option<&str>) -> 
     };
     // Only write up to the caller's buffer size.
     let write_len = total_len.min(caller_len);
-    if write_len > 0 && crate::mm::user_mem::copy_to_user(addr_ptr, &buf[..write_len]).is_err() {
+    if write_len > 0
+        && UserSliceWo::new(addr_ptr, buf[..write_len].len())
+            .and_then(|s| s.copy_from_kernel(&buf[..write_len]))
+            .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     // Write back the actual address length.
     let len_val = (total_len as u32).to_ne_bytes();
-    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_val).is_err() {
+    if UserSliceWo::new(addr_len_ptr, len_val.len())
+        .and_then(|s| s.copy_from_kernel(&len_val))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     Ok(())
@@ -11312,7 +11601,10 @@ fn sys_sendto_unix(
 ) -> u64 {
     let capped = (len as usize).min(4096);
     let mut data = alloc::vec![0u8; capped];
-    if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
+    if UserSliceRo::new(buf_ptr, data.len())
+        .and_then(|s| s.copy_to_kernel(&mut data))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
 
@@ -11335,8 +11627,6 @@ fn sys_sendto_unix(
         }
     };
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
     loop {
         match crate::net::unix::unix_dgram_send(sender_path.clone(), target, &data) {
             Ok(n) => {
@@ -11352,7 +11642,6 @@ fn sys_sendto_unix(
                     return NEG_EINTR;
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
             Err(e) => return e as u64, // ECONNREFUSED, etc.
         }
@@ -11368,14 +11657,15 @@ fn sys_recvfrom_unix(
     addr_ptr: u64,
     addr_len_ptr: u64,
 ) -> u64 {
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
     let capped = (count as usize).min(4096);
     let mut tmp = alloc::vec![0u8; capped];
     loop {
         match crate::net::unix::unix_dgram_recv(handle, &mut tmp) {
             Ok((n, sender_path)) => {
-                if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                    .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 if addr_ptr != 0 && addr_len_ptr != 0 {
@@ -11391,7 +11681,6 @@ fn sys_recvfrom_unix(
                     return NEG_EINTR;
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
     }
@@ -11543,8 +11832,6 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             });
 
             // Block until connected or error
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             let start_tick = crate::arch::x86_64::interrupts::tick_count();
             loop {
                 let state = crate::net::tcp::state(tcp_idx);
@@ -11579,7 +11866,6 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -11658,8 +11944,6 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     };
 
     // Block until an incoming connection is established
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
     loop {
         let state = crate::net::tcp::state(tcp_idx);
         match state {
@@ -11713,7 +11997,10 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
-                    if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+                    if UserSliceRo::new(addr_len_ptr, len_buf.len())
+                        .and_then(|s| s.copy_to_kernel(&mut len_buf))
+                        .is_err()
+                    {
                         crate::net::free_socket(new_handle);
                         return NEG_EFAULT;
                     }
@@ -11729,7 +12016,10 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
 
                 if addr_len_ptr != 0 {
                     let len_buf = 16u32.to_ne_bytes();
-                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                        .and_then(|s| s.copy_from_kernel(&len_buf))
+                        .is_err()
+                    {
                         crate::net::free_socket(new_handle);
                         return NEG_EFAULT;
                     }
@@ -11757,7 +12047,6 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
     }
@@ -11835,7 +12124,10 @@ pub(super) fn sys_sendto(
 
             let capped = (len as usize).min(4096);
             let mut tmp = [0u8; 4096];
-            if crate::mm::user_mem::copy_from_user(&mut tmp[..capped], buf_ptr).is_err() {
+            if UserSliceRo::new(buf_ptr, tmp[..capped].len())
+                .and_then(|s| s.copy_to_kernel(&mut tmp[..capped]))
+                .is_err()
+            {
                 return NEG_EFAULT;
             }
 
@@ -11981,7 +12273,10 @@ pub(super) fn sys_recvfrom_socket(
                     return NEG_EINVAL;
                 }
                 let mut len_buf = [0u8; 4];
-                if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+                if UserSliceRo::new(addr_len_ptr, len_buf.len())
+                    .and_then(|s| s.copy_to_kernel(&mut len_buf))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
                 if u32::from_ne_bytes(len_buf) < 16 {
@@ -11997,13 +12292,14 @@ pub(super) fn sys_recvfrom_socket(
                         Some(idx) => idx,
                         None => return NEG_ENOTCONN,
                     };
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         let mut tmp = [0u8; 4096];
                         let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..capped]);
                         if n > 0 {
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                                .is_err()
+                            {
                                 return NEG_EFAULT;
                             }
                             if addr_ptr != 0 {
@@ -12013,7 +12309,8 @@ pub(super) fn sys_recvfrom_socket(
                                 }
                                 if addr_len_ptr != 0 {
                                     let len_buf = 16u32.to_ne_bytes();
-                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                        .and_then(|s| s.copy_from_kernel(&len_buf))
                                         .is_err()
                                     {
                                         return NEG_EFAULT;
@@ -12039,52 +12336,46 @@ pub(super) fn sys_recvfrom_socket(
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
-                crate::net::SocketProtocol::Udp => {
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
-                    loop {
-                        if let Some(dgram) = crate::net::udp::recv(local_port) {
-                            let n = dgram.data.len().min(capped);
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &dgram.data[..n]).is_err()
+                crate::net::SocketProtocol::Udp => loop {
+                    if let Some(dgram) = crate::net::udp::recv(local_port) {
+                        let n = dgram.data.len().min(capped);
+                        if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
+                            .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
+                            .is_err()
+                        {
+                            return NEG_EFAULT;
+                        }
+                        if addr_ptr != 0 {
+                            if let Err(e) = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
                             {
-                                return NEG_EFAULT;
+                                return e;
                             }
-                            if addr_ptr != 0 {
-                                if let Err(e) =
-                                    sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
+                            if addr_len_ptr != 0 {
+                                let len_buf = 16u32.to_ne_bytes();
+                                if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                    .and_then(|s| s.copy_from_kernel(&len_buf))
+                                    .is_err()
                                 {
-                                    return e;
-                                }
-                                if addr_len_ptr != 0 {
-                                    let len_buf = 16u32.to_ne_bytes();
-                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
-                                        .is_err()
-                                    {
-                                        return NEG_EFAULT;
-                                    }
+                                    return NEG_EFAULT;
                                 }
                             }
-                            return n as u64;
                         }
-                        if nonblock {
-                            return NEG_EAGAIN;
-                        }
-                        if has_pending_signal() {
-                            return NEG_EINTR;
-                        }
-                        crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
+                        return n as u64;
                     }
-                }
+                    if nonblock {
+                        return NEG_EAGAIN;
+                    }
+                    if has_pending_signal() {
+                        return NEG_EINTR;
+                    }
+                    crate::task::yield_now();
+                },
                 crate::net::SocketProtocol::Icmp => {
                     // Wait for ICMP echo reply
                     use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
                     use core::sync::atomic::Ordering;
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         if PING_REPLY_RECEIVED.load(Ordering::Acquire) {
                             PING_REPLY_RECEIVED.store(false, Ordering::Release);
@@ -12092,7 +12383,9 @@ pub(super) fn sys_recvfrom_socket(
                             // Write tick as 8-byte LE to userspace as reply data
                             let tick_bytes = tick.to_le_bytes();
                             let n = tick_bytes.len().min(capped);
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tick_bytes[..n]).is_err()
+                            if UserSliceWo::new(buf_ptr, tick_bytes[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&tick_bytes[..n]))
+                                .is_err()
                             {
                                 return NEG_EFAULT;
                             }
@@ -12102,7 +12395,8 @@ pub(super) fn sys_recvfrom_socket(
                                 }
                                 if addr_len_ptr != 0 {
                                     let len_buf = 16u32.to_ne_bytes();
-                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                        .and_then(|s| s.copy_from_kernel(&len_buf))
                                         .is_err()
                                     {
                                         return NEG_EFAULT;
@@ -12118,7 +12412,6 @@ pub(super) fn sys_recvfrom_socket(
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -12131,7 +12424,10 @@ pub(super) fn sys_recvfrom_socket(
                 let mut tmp = [0u8; 4096];
                 match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
                     Ok(n) if n > 0 => {
-                        if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                        if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                            .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                            .is_err()
+                        {
                             return NEG_EFAULT;
                         }
                         n as u64
@@ -12140,14 +12436,15 @@ pub(super) fn sys_recvfrom_socket(
                     Err(_) => NEG_EAGAIN,
                 }
             } else {
-                let pid = crate::process::current_pid();
-                let saved_user_rsp = per_core_syscall_user_rsp();
                 loop {
                     let mut tmp = [0u8; 4096];
                     match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
                         Ok(0) => return 0,
                         Ok(n) => {
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &tmp[..n]).is_err() {
+                            if UserSliceWo::new(buf_ptr, tmp[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&tmp[..n]))
+                                .is_err()
+                            {
                                 return NEG_EFAULT;
                             }
                             return n as u64;
@@ -12157,7 +12454,6 @@ pub(super) fn sys_recvfrom_socket(
                                 return NEG_EINTR;
                             }
                             crate::task::yield_now();
-                            restore_caller_context(pid, saved_user_rsp);
                         }
                     }
                 }
@@ -12230,7 +12526,10 @@ pub(super) fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
     };
     if addr_len_ptr != 0 {
         let mut len_buf = [0u8; 4];
-        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+        if UserSliceRo::new(addr_len_ptr, len_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         if u32::from_ne_bytes(len_buf) < 16 {
@@ -12243,7 +12542,10 @@ pub(super) fn sys_getsockname(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
     }
     if addr_len_ptr != 0 {
         let len_buf = 16u32.to_ne_bytes();
-        if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+        if UserSliceWo::new(addr_len_ptr, len_buf.len())
+            .and_then(|s| s.copy_from_kernel(&len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -12266,7 +12568,10 @@ pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
     }
     if addr_len_ptr != 0 {
         let mut len_buf = [0u8; 4];
-        if crate::mm::user_mem::copy_from_user(&mut len_buf, addr_len_ptr).is_err() {
+        if UserSliceRo::new(addr_len_ptr, len_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         if u32::from_ne_bytes(len_buf) < 16 {
@@ -12279,7 +12584,10 @@ pub(super) fn sys_getpeername(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 
     }
     if addr_len_ptr != 0 {
         let len_buf = 16u32.to_ne_bytes();
-        if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf).is_err() {
+        if UserSliceWo::new(addr_len_ptr, len_buf.len())
+            .and_then(|s| s.copy_from_kernel(&len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -12304,7 +12612,10 @@ pub(super) fn sys_setsockopt(
     }
     let val = if optval_ptr != 0 {
         let mut buf = [0u8; 4];
-        if crate::mm::user_mem::copy_from_user(&mut buf, optval_ptr).is_err() {
+        if UserSliceRo::new(optval_ptr, buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         i32::from_ne_bytes(buf)
@@ -12384,7 +12695,10 @@ pub(super) fn sys_getsockopt(
     // Validate caller's buffer size
     if optlen_ptr != 0 {
         let mut len_buf = [0u8; 4];
-        if crate::mm::user_mem::copy_from_user(&mut len_buf, optlen_ptr).is_err() {
+        if UserSliceRo::new(optlen_ptr, len_buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let caller_len = u32::from_ne_bytes(len_buf);
@@ -12397,12 +12711,18 @@ pub(super) fn sys_getsockopt(
         return NEG_EFAULT;
     }
     let buf = val.to_ne_bytes();
-    if crate::mm::user_mem::copy_to_user(optval_ptr, &buf).is_err() {
+    if UserSliceWo::new(optval_ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
         return NEG_EFAULT;
     }
     if optlen_ptr != 0 {
         let len_buf = 4u32.to_ne_bytes();
-        if crate::mm::user_mem::copy_to_user(optlen_ptr, &len_buf).is_err() {
+        if UserSliceWo::new(optlen_ptr, len_buf.len())
+            .and_then(|s| s.copy_from_kernel(&len_buf))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -12733,8 +13053,6 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     } else {
         None // 0 = non-blocking, -1 = indefinite
     };
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
 
     // Read all pollfd structs from userspace once.
     let mut pfds = [[0u8; 8]; 256];
@@ -12743,7 +13061,10 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
             Some(a) => a,
             None => return NEG_EFAULT,
         };
-        if crate::mm::user_mem::copy_from_user(&mut pfds[i], base).is_err() {
+        if UserSliceRo::new(base, pfds[i].len())
+            .and_then(|s| s.copy_to_kernel(&mut pfds[i]))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
     }
@@ -12791,7 +13112,10 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                     Some(a) => a,
                     None => return NEG_EFAULT,
                 };
-                if crate::mm::user_mem::copy_to_user(base, &pfds[i]).is_err() {
+                if UserSliceWo::new(base, pfds[i].len())
+                    .and_then(|s| s.copy_from_kernel(&pfds[i]))
+                    .is_err()
+                {
                     return NEG_EFAULT;
                 }
             }
@@ -12822,7 +13146,6 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         // blocking forever with no wake source.
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -12862,11 +13185,9 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for i in 0..nfds {
                 if let Some(entry) = &entries[i] {
                     fd_deregister_waiter(entry, task_id);
@@ -12889,7 +13210,10 @@ fn read_fd_set(ptr: u64, nfds: usize) -> Result<u32, u64> {
     }
     // fd_set is 128 bytes (1024 bits). We only need the first 4 bytes (32 FDs).
     let mut buf = [0u8; 4];
-    if crate::mm::user_mem::copy_from_user(&mut buf, ptr).is_err() {
+    if UserSliceRo::new(ptr, buf.len())
+        .and_then(|s| s.copy_to_kernel(&mut buf))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     let mask = u32::from_ne_bytes(buf);
@@ -12909,11 +13233,17 @@ fn write_fd_set(ptr: u64, mask: u32) -> Result<(), u64> {
     }
     // Zero the entire 128-byte fd_set, then write our 4 bytes.
     let zero = [0u8; 128];
-    if crate::mm::user_mem::copy_to_user(ptr, &zero).is_err() {
+    if UserSliceWo::new(ptr, zero.len())
+        .and_then(|s| s.copy_from_kernel(&zero))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     let buf = mask.to_ne_bytes();
-    if crate::mm::user_mem::copy_to_user(ptr, &buf).is_err() {
+    if UserSliceWo::new(ptr, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_err()
+    {
         return Err(NEG_EFAULT);
     }
     Ok(())
@@ -12932,7 +13262,10 @@ pub(super) fn sys_select(
         None
     } else {
         let mut tv = [0u8; 16]; // struct timeval: tv_sec (8) + tv_usec (8)
-        if crate::mm::user_mem::copy_from_user(&mut tv, timeout_ptr).is_err() {
+        if UserSliceRo::new(timeout_ptr, tv.len())
+            .and_then(|s| s.copy_to_kernel(&mut tv))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let sec = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
@@ -12988,9 +13321,6 @@ fn select_inner(
             entries[fd] = current_fd_entry(fd);
         }
     }
-
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
 
     loop {
         let mut r_out: u32 = 0;
@@ -13058,7 +13388,6 @@ fn select_inner(
 
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -13099,11 +13428,9 @@ fn select_inner(
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (NULL): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -13130,7 +13457,10 @@ pub(super) fn sys_pselect6(
     // mutating user memory. The 6th arg (sigmask) is ignored.
     let timeout_ms: Option<u64> = if timeout_ptr != 0 {
         let mut ts = [0u8; 16];
-        if crate::mm::user_mem::copy_from_user(&mut ts, timeout_ptr).is_err() {
+        if UserSliceRo::new(timeout_ptr, ts.len())
+            .and_then(|s| s.copy_to_kernel(&mut ts))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
@@ -13317,7 +13647,10 @@ pub(super) fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 
             return NEG_EFAULT;
         }
         let mut ev = [0u8; 12];
-        if crate::mm::user_mem::copy_from_user(&mut ev, event_ptr).is_err() {
+        if UserSliceRo::new(event_ptr, ev.len())
+            .and_then(|s| s.copy_to_kernel(&mut ev))
+            .is_err()
+        {
             return NEG_EFAULT;
         }
         let events = u32::from_ne_bytes([ev[0], ev[1], ev[2], ev[3]]);
@@ -13399,9 +13732,6 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         None => return NEG_EBADF,
     };
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
-
     loop {
         // Scan interest list for ready FDs.
         let mut out_count = 0usize;
@@ -13434,7 +13764,10 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
                     let mut buf = [0u8; 12];
                     buf[0..4].copy_from_slice(&ev_out);
                     buf[4..12].copy_from_slice(&data_out);
-                    if crate::mm::user_mem::copy_to_user(base, &buf).is_err() {
+                    if UserSliceWo::new(base, buf.len())
+                        .and_then(|s| s.copy_from_kernel(&buf))
+                        .is_err()
+                    {
                         return NEG_EFAULT;
                     }
                     out_count += 1;
@@ -13476,7 +13809,6 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         // If no pollable FDs were registered, yield once to avoid infinite blocking.
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -13509,11 +13841,9 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);
@@ -13581,7 +13911,10 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     let src_bytes =
         unsafe { core::slice::from_raw_parts(tmp.as_ptr() as *const u8, write_count * entry_size) };
 
-    if crate::mm::user_mem::copy_to_user(buf_ptr, src_bytes).is_err() {
+    if UserSliceWo::new(buf_ptr, src_bytes.len())
+        .and_then(|s| s.copy_from_kernel(src_bytes))
+        .is_err()
+    {
         return u64::MAX;
     }
 

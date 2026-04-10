@@ -15,16 +15,12 @@ use x86_64::{
     structures::paging::{PageTableFlags, Translate, mapper::TranslateResult},
 };
 
-/// Maximum length (bytes) accepted for a single copy_from_user / copy_to_user
-/// call. Prevents pathological syscall arguments from scanning huge ranges.
-const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
-
 /// Copy `len` bytes from userspace virtual address `src_vaddr` into `dst`.
 ///
 /// Validates each 4 KiB page of the source range using the page tables
 /// (must be `PRESENT` and `USER_ACCESSIBLE`). Returns `Err(())` if any page
 /// is unmapped, the address range is not in canonical user space, or `len`
-/// exceeds `MAX_COPY_LEN`.
+/// exceeds the limit defined in `kernel_core::user_range::MAX_COPY_LEN`.
 ///
 /// # Safety
 ///
@@ -32,19 +28,9 @@ const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
 /// correct and the kernel's page table walk must be coherent with the
 /// currently-active CR3. On single-CPU without kernel preemption this holds
 /// as long as `mm::init` has run.
-pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
+fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
     let len = dst.len();
-    if len == 0 {
-        return Ok(());
-    }
-    if len > MAX_COPY_LEN {
-        return Err(());
-    }
-    // Reject non-canonical or kernel-space pointers.
-    let src_end = src_vaddr.checked_add(len as u64).ok_or(())?;
-    if src_vaddr < 0x1000 || src_end > 0x0000_8000_0000_0000u64 {
-        return Err(());
-    }
+    kernel_core::user_range::validate_user_range(src_vaddr, len)?;
 
     let phys_off = crate::mm::phys_offset();
 
@@ -104,18 +90,9 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 /// be `WRITABLE`. If a page is a CoW (copy-on-write) page (present, user-
 /// accessible, BIT_9 set, but not writable), the CoW fault is resolved
 /// in-place before copying.
-pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
+fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     let len = src.len();
-    if len == 0 {
-        return Ok(());
-    }
-    if len > MAX_COPY_LEN {
-        return Err(());
-    }
-    let dst_end = dst_vaddr.checked_add(len as u64).ok_or(())?;
-    if dst_vaddr < 0x1000 || dst_end > 0x0000_8000_0000_0000u64 {
-        return Err(());
-    }
+    kernel_core::user_range::validate_user_range(dst_vaddr, len)?;
 
     let phys_off = crate::mm::phys_offset();
 
@@ -268,4 +245,209 @@ fn is_user_writable(
         ),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Typed user-buffer wrappers (Phase 52b Track D)
+// ---------------------------------------------------------------------------
+
+/// A validated read-only view of user memory. Kernel can copy data FROM
+/// this user buffer TO a kernel buffer.
+pub struct UserSliceRo {
+    vaddr: u64,
+    len: usize,
+}
+
+/// A validated write-only view of user memory. Kernel can copy data FROM
+/// a kernel buffer INTO this user buffer.
+pub struct UserSliceWo {
+    vaddr: u64,
+    len: usize,
+}
+
+/// A validated read-write view of user memory.
+#[allow(dead_code)]
+pub struct UserSliceRw {
+    vaddr: u64,
+    len: usize,
+}
+
+impl UserSliceRo {
+    /// Validate and create a read-only user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from user memory into a kernel buffer.
+    pub fn copy_to_kernel(&self, dst: &mut [u8]) -> Result<(), ()> {
+        if dst.len() > self.len {
+            return Err(());
+        }
+        copy_from_user(dst, self.vaddr)
+    }
+
+    /// Read a single `Copy` value from user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be a type where every bit pattern is valid (e.g. integer
+    /// primitives, `#[repr(C)]` structs of such types). Using types like
+    /// `bool`, `char`, enums, or `NonZero*` is undefined behavior because
+    /// user-supplied bytes may not form a valid value.
+    #[allow(dead_code)]
+    pub unsafe fn read_val<T: Copy>(&self) -> Result<T, ()> {
+        if core::mem::size_of::<T>() > self.len {
+            return Err(());
+        }
+        let mut buf = [0u8; 256]; // Stack buffer — values > 256 bytes are rejected above
+        let size = core::mem::size_of::<T>();
+        if size > buf.len() {
+            return Err(());
+        }
+        copy_from_user(&mut buf[..size], self.vaddr)?;
+        // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        // Caller guarantees T allows all bit patterns.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+    }
+
+    /// Return the user virtual address.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl UserSliceWo {
+    /// Validate and create a write-only user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from a kernel buffer into user memory.
+    pub fn copy_from_kernel(&self, src: &[u8]) -> Result<(), ()> {
+        if src.len() > self.len {
+            return Err(());
+        }
+        copy_to_user(self.vaddr, src)
+    }
+
+    /// Write a single `Copy` value to user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must not contain padding bytes. Padding is uninitialized memory
+    /// and copying it to userspace leaks kernel stack/register contents.
+    /// Use only with integer primitives or `#[repr(C)]` structs that have
+    /// no padding (e.g. all fields naturally aligned with no gaps).
+    #[allow(dead_code)]
+    pub unsafe fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+        let size = core::mem::size_of::<T>();
+        if size > self.len {
+            return Err(());
+        }
+        // SAFETY: Caller guarantees T has no padding bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
+        copy_to_user(self.vaddr, bytes)
+    }
+
+    /// Return the user virtual address.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[allow(dead_code)]
+impl UserSliceRw {
+    /// Validate and create a read-write user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from user memory into a kernel buffer.
+    pub fn copy_to_kernel(&self, dst: &mut [u8]) -> Result<(), ()> {
+        if dst.len() > self.len {
+            return Err(());
+        }
+        copy_from_user(dst, self.vaddr)
+    }
+
+    /// Copy data from a kernel buffer into user memory.
+    pub fn copy_from_kernel(&self, src: &[u8]) -> Result<(), ()> {
+        if src.len() > self.len {
+            return Err(());
+        }
+        copy_to_user(self.vaddr, src)
+    }
+
+    /// Read a single `Copy` value from user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be a type where every bit pattern is valid (e.g. integer
+    /// primitives, `#[repr(C)]` structs of such types). Using types like
+    /// `bool`, `char`, enums, or `NonZero*` is undefined behavior because
+    /// user-supplied bytes may not form a valid value.
+    pub unsafe fn read_val<T: Copy>(&self) -> Result<T, ()> {
+        if core::mem::size_of::<T>() > self.len {
+            return Err(());
+        }
+        let mut buf = [0u8; 256];
+        let size = core::mem::size_of::<T>();
+        if size > buf.len() {
+            return Err(());
+        }
+        copy_from_user(&mut buf[..size], self.vaddr)?;
+        // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        // Caller guarantees T allows all bit patterns.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+    }
+
+    /// Write a single `Copy` value to user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must not contain padding bytes. Padding is uninitialized memory
+    /// and copying it to userspace leaks kernel stack/register contents.
+    /// Use only with integer primitives or `#[repr(C)]` structs that have
+    /// no padding (e.g. all fields naturally aligned with no gaps).
+    pub unsafe fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+        let size = core::mem::size_of::<T>();
+        if size > self.len {
+            return Err(());
+        }
+        // SAFETY: Caller guarantees T has no padding bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
+        copy_to_user(self.vaddr, bytes)
+    }
+
+    /// Return the user virtual address.
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Validate that a user address range is in canonical user space and within limits.
+///
+/// Delegates to `kernel_core::user_range::validate_user_range` so the kernel
+/// and host tests share a single implementation.
+fn validate_user_range(vaddr: u64, len: usize) -> Result<(), ()> {
+    kernel_core::user_range::validate_user_range(vaddr, len)
 }
