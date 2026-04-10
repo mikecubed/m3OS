@@ -361,64 +361,71 @@ sequenceDiagram
 
 ### 4.8 Frame Allocation: Two-Phase Design
 
+#### Phase 1: Pre-Heap — Intrusive Free List
+
 ```mermaid
 flowchart TD
-    subgraph "Phase 1: Pre-Heap (Intrusive Free List)"
-        A["init(memory_regions)"] --> B["Skip regions < 1 MiB"]
-        B --> C["For each usable frame: push_frame(phys)"]
-        C --> D["Write (next_ptr, FREE_MAGIC) at PHYS_OFFSET + phys"]
-        D --> E["Frame list: head → frame1 → frame2 → ..."]
-    end
+    A["init: memory_regions"] --> B["Skip regions below 1 MiB"]
+    B --> C["For each usable frame: push_frame"]
+    C --> D["Write next_ptr + FREE_MAGIC at PHYS_OFFSET + phys"]
+    D --> E["Frame list: head, frame1, frame2, ..."]
+```
 
-    subgraph "Phase 2: Post-Heap (Buddy Allocator)"
-        F["init_buddy()"] --> G["Drain all frames from free list into Vec"]
-        G --> H["Sort frames for better coalescing"]
-        H --> I["Create BuddyAllocator(total_pfns)"]
-        I --> J["For each frame: buddy.free(pfn, 0)"]
-        J --> K["Buddies auto-coalesce: order 0→1→2→...→9"]
-    end
+#### Phase 2: Post-Heap — Buddy Allocator
 
-    subgraph "Allocation"
-        L["allocate_frame()"] --> M{Buddy available?}
-        M -->|Yes| N["buddy.allocate(0) → PFN"]
-        M -->|No| O["pop_frame() from free list"]
-        N --> P["refcount_inc(phys) → count = 1"]
-        O --> P
-        P --> Q["Return PhysFrame"]
-    end
+```mermaid
+flowchart TD
+    F["init_buddy"] --> G["Drain all frames from free list into Vec"]
+    G --> H["Sort frames for better coalescing"]
+    H --> I["Create BuddyAllocator with total_pfns"]
+    I --> J["For each frame: buddy.free pfn order-0"]
+    J --> K["Buddies auto-coalesce: order 0 up to 9"]
+```
 
-    subgraph "Free"
-        R["free_frame(phys)"] --> S{Refcount init'd?}
-        S -->|Yes| T["refcount_dec(phys)"]
-        T --> U{count > 0?}
-        U -->|Yes| V[Return — frame still shared]
-        U -->|No| W["buddy.free(pfn, 0)"]
-        S -->|No| W
-    end
+#### Allocation and Free Paths
+
+```mermaid
+flowchart TD
+    L["allocate_frame"] --> M{"Buddy\navailable?"}
+    M -->|Yes| N["buddy.allocate order-0 returns PFN"]
+    M -->|No| O["pop_frame from free list"]
+    N --> P["refcount_inc: count = 1"]
+    O --> P
+    P --> Q["Return PhysFrame"]
+
+    R["free_frame"] --> S{"Refcount\ninit'd?"}
+    S -->|Yes| T["refcount_dec"]
+    T --> U{"count\ngreater\nthan 0?"}
+    U -->|Yes| V["Return: frame still shared"]
+    U -->|No| W["buddy.free pfn order-0"]
+    S -->|No| W
 ```
 
 ### 4.9 Buddy Allocator Algorithm
 
+#### Allocation
+
 ```mermaid
 flowchart TD
-    subgraph "allocate(order)"
-        A1["Search order..=MAX_ORDER for free_counts[o] > 0"] --> A2["Pop PFN from free_lists[source_order]"]
-        A2 --> A3["Clear bitmap bit"]
-        A3 --> A4{source_order > order?}
-        A4 -->|Yes| A5["Split: push upper buddy<br/>pfn ^ (1 << intermediate_order)<br/>onto intermediate order's free list"]
-        A5 --> A4
-        A4 -->|No| A6["Return PFN"]
-    end
+    A1["Search upward from order to MAX_ORDER\nfor first non-empty free list"] --> A2["Pop PFN from free_lists at source_order"]
+    A2 --> A3["Clear bitmap bit"]
+    A3 --> A4{"source_order\ngreater than\nrequested?"}
+    A4 -->|Yes| A5["Split: push upper buddy\nonto intermediate free list"]
+    A5 --> A4
+    A4 -->|No| A6["Return PFN"]
+```
 
-    subgraph "free(pfn, order)"
-        F1["Double-free check: is_free(order, pfn)?"] --> F2{order < MAX_ORDER?}
-        F2 -->|Yes| F3["Compute buddy = pfn ^ (1 << order)"]
-        F3 --> F4{Buddy free AND in bounds?}
-        F4 -->|Yes| F5["remove_free(order, buddy) — O(n) linear scan"]
-        F5 --> F6["Recurse: free(min(pfn, buddy), order + 1)"]
-        F4 -->|No| F7["push_free(order, pfn), set bitmap bit"]
-        F2 -->|No| F7
-    end
+#### Free with Buddy Coalescing
+
+```mermaid
+flowchart TD
+    F1["Double-free check via is_free bitmap"] --> F2{"order less\nthan\nMAX_ORDER?"}
+    F2 -->|Yes| F3["Compute buddy via XOR"]
+    F3 --> F4{"Buddy free\nand in\nbounds?"}
+    F4 -->|Yes| F5["remove_free: O-n linear scan"]
+    F5 --> F6["Recurse: free merged block at order+1"]
+    F4 -->|No| F7["push_free, set bitmap bit"]
+    F2 -->|No| F7
 ```
 
 **Performance note:** `remove_free` does a linear scan of the free list at the given order to find and remove the buddy. For heavy churn at order 0, this could become noticeable.

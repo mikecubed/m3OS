@@ -240,14 +240,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["Timer interrupt fires (100 Hz)"] --> B["timer_handler / LAPIC timer ISR"]
-    B --> C["signal_reschedule()"]
-    C --> D["per_core().reschedule.store(true, Release)"]
-    D --> E["Return from interrupt (IRET)"]
+    A["Timer interrupt fires at 100 Hz"] --> B["timer_handler or LAPIC timer ISR"]
+    B --> C["signal_reschedule"]
+    C --> D["Set per-core reschedule flag to true"]
+    D --> E["Return from interrupt via IRET"]
 
     E --> F["Task continues running"]
-    F --> G{Task calls yield_now() or block?}
-    G -->|Yes| H["switch_context → scheduler picks next task"]
+    F --> G{"Task yields\nor blocks?"}
+    G -->|Yes| H["switch_context: scheduler picks next task"]
     G -->|No| I["Task keeps running until it cooperates"]
 
     style I fill:#ff6666,color:#000

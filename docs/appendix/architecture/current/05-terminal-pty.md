@@ -212,34 +212,39 @@ sequenceDiagram
 ### 3.3 PTY Data Flow (SSH Session)
 
 ```mermaid
-flowchart LR
-    subgraph "SSH Client (remote)"
-        C[Terminal emulator]
+flowchart TD
+    subgraph Remote
+        C["Terminal emulator"]
     end
 
-    subgraph "sshd (userspace)"
-        IO[io_task<br/>socket ↔ runner]
-        RELAY[channel_relay_task<br/>PTY ↔ channel]
-        PROG[progress_task<br/>runner.progress()]
+    subgraph sshd
+        IO["io_task"]
+        RELAY["channel_relay_task"]
+        PROG["progress_task"]
     end
 
-    subgraph "Kernel"
-        SOCK[TCP Socket]
-        PTY_M[PTY Master<br/>ring buffers]
-        PTY_S[PTY Slave<br/>termios + edit_buf]
+    subgraph Kernel
+        SOCK["TCP Socket"]
+        PTY_M["PTY Master"]
+        PTY_S["PTY Slave"]
     end
 
-    subgraph "Shell (userspace)"
-        SH[ion / sh0]
+    subgraph Shell
+        SH["ion or sh0"]
     end
 
-    C <-->|SSH packets| SOCK
-    SOCK <-->|read/write| IO
-    IO <-->|input/output_buf| PROG
-    RELAY <-->|read/write_channel| IO
-    RELAY <-->|read/write fd| PTY_M
-    PTY_M <-->|m2s/s2m| PTY_S
-    PTY_S <-->|read/write fd| SH
+    C -->|"SSH packets"| SOCK
+    SOCK -->|"read/write"| IO
+    IO -->|"input/output_buf"| PROG
+    RELAY -->|"read/write_channel"| IO
+    RELAY -->|"read/write fd"| PTY_M
+    PTY_M -->|"m2s/s2m"| PTY_S
+    PTY_S -->|"read/write fd"| SH
+    SH -->|"write"| PTY_S
+    PTY_S -->|"s2m"| PTY_M
+    PTY_M -->|"read"| RELAY
+    IO -->|"write"| SOCK
+    SOCK -->|"SSH packets"| C
 ```
 
 ### 3.4 PTY Master Write (Line Discipline)
@@ -247,27 +252,27 @@ flowchart LR
 ```mermaid
 flowchart TD
     A["sshd writes to PTY master fd"] --> B["Kernel: sys_linux_write for PtyMaster"]
-    B --> C[For each byte]
+    B --> C["For each byte"]
 
-    C --> D{ISIG enabled?}
-    D -->|Yes| E{VINTR / VQUIT / VSUSP?}
-    E -->|Yes| F["Send signal to slave_fg_pgid<br/>(drop/reacquire PTY_TABLE lock)"]
-    E -->|No| G{ICANON enabled?}
+    C --> D{"ISIG\nenabled?"}
+    D -->|Yes| E{"Signal\nchar?"}
+    E -->|Yes| F["Send signal to slave_fg_pgid\ndrop and reacquire PTY_TABLE lock"]
+    E -->|No| G{"ICANON\nenabled?"}
     D -->|No| G
 
-    G -->|Yes| H{Special char?}
-    H -->|VERASE| I["edit_buf.erase_char()<br/>Echo \\x08 \\x20 \\x08 to s2m"]
-    H -->|VKILL| J["edit_buf.kill_line()<br/>Echo per ECHOK"]
-    H -->|VWERASE| K["edit_buf.word_erase()"]
-    H -->|VEOF| L{edit_buf empty?}
+    G -->|Yes| H{"Special\nchar?"}
+    H -->|VERASE| I["edit_buf.erase_char\nEcho BS-SP-BS to s2m"]
+    H -->|VKILL| J["edit_buf.kill_line\nEcho per ECHOK"]
+    H -->|VWERASE| K["edit_buf.word_erase"]
+    H -->|VEOF| L{"edit_buf\nempty?"}
     L -->|Yes| M["Set eof_pending = true"]
-    L -->|No| N["Push \\n, signal line complete"]
-    H -->|"\\n"| O["edit_buf.push(\\n)<br/>Line complete for slave read"]
-    H -->|Regular| P["edit_buf.push(byte)<br/>Echo to s2m if ECHO"]
+    L -->|No| N["Push newline, signal line complete"]
+    H -->|Newline| O["edit_buf.push newline\nLine complete for slave read"]
+    H -->|Regular| P["edit_buf.push byte\nEcho to s2m if ECHO"]
 
-    G -->|No (raw)| Q["Write directly to m2s<br/>Echo to s2m if ECHO"]
+    G -->|"No: raw"| Q["Write directly to m2s\nEcho to s2m if ECHO"]
 
-    C --> R{More bytes?}
+    C --> R{"More\nbytes?"}
     R -->|Yes| C
     R -->|No| S["Wake PTY_SLAVE_WQ"]
 ```
