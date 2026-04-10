@@ -1,11 +1,20 @@
-//! SMP-aware round-robin kernel scheduler.
+//! SMP-aware per-core scheduler with work-stealing.
 //!
-//! # Design (Phase 25)
+//! # Design (Phase 25, refined Phase 52c)
 //!
-//! The scheduler uses a single global task list protected by `SCHEDULER` mutex.
-//! Each core runs its own scheduler loop (`run()`), picking Ready tasks from
-//! the shared list. Per-core state (scheduler RSP, reschedule flag, current
-//! task index) is stored in [`PerCoreData`] and accessed via `gs_base`.
+//! Task state lives in a global `SCHEDULER` (TaskRegistry) protected by a
+//! mutex. The dispatch hot path (`pick_next`) operates entirely on the
+//! per-core run queue without acquiring the global lock. The global lock is
+//! only acquired for:
+//! - Spawn / exit / drain-dead (task lifecycle)
+//! - Reading task state for dispatch (saved_rsp, marking Running)
+//! - Post-switch: saving RSP, clearing switching_out
+//! - Wake / block / IPC operations that modify task state
+//!
+//! When a core's local run queue is empty, it attempts to steal work from
+//! other cores before falling back to its idle task.
+//!
+//! Dead task slots are recycled via a free list to bound memory growth.
 //!
 //! A task voluntarily returns control by calling [`yield_now`], which uses
 //! `switch_context` to the calling core's scheduler RSP.
@@ -79,6 +88,10 @@ pub(crate) struct Scheduler {
     last_run: usize,
     /// Indices of per-core idle tasks. Index by core_id.
     idle_tasks: [Option<usize>; crate::smp::MAX_CORES],
+    /// Free list of dead task indices available for reuse (Phase 52c A.3).
+    /// When a task exits, its index is pushed here. `spawn` pops from this
+    /// list before growing the `tasks` vec.
+    free_list: Vec<usize>,
 }
 
 impl Scheduler {
@@ -87,6 +100,7 @@ impl Scheduler {
             tasks: Vec::new(),
             last_run: 0,
             idle_tasks: [const { None }; crate::smp::MAX_CORES],
+            free_list: Vec::new(),
         }
     }
 
@@ -120,130 +134,51 @@ impl Scheduler {
         self.tasks[idx].server_endpoint
     }
 
-    /// Remove all tasks in the `Dead` state from the task vec.
+    /// Reclaim dead tasks: free their stacks and add their indices to the
+    /// free list for reuse by future spawns (Phase 52c A.3).
     fn drain_dead(&mut self) {
         // With SMP, removing tasks from the vec would invalidate indices held
         // by per-core run queues, current_task_idx, and PENDING_REENQUEUE.
         // Instead, dead tasks remain in the vec and are skipped by pick_next.
         // Their stack memory is released here to avoid leaks.
-        for task in &mut self.tasks {
+        for (i, task) in self.tasks.iter_mut().enumerate() {
             if task.state == TaskState::Dead && !task.switching_out && task.saved_rsp != 0 {
                 let _ = task._stack.take();
                 // Mark as drained so we don't try to free again.
                 task.saved_rsp = 0;
+                // Add to free list for index reuse, unless already there.
+                if !self.free_list.contains(&i) {
+                    self.free_list.push(i);
+                }
             }
         }
     }
 
     /// Pick the next task to run on the given core.
     ///
-    /// First checks the per-core run queue for an O(1) dequeue. Falls back
-    /// to a global round-robin scan if the local queue is empty (handles
-    /// tasks that haven't been assigned to a queue yet). Finally, falls back
-    /// to this core's idle task.
+    /// Phase 52c: Uses ONLY the per-core run queue (no global fallback scan).
+    /// If the local queue is empty, attempts to steal from other cores.
+    /// Falls back to this core's idle task as a last resort.
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
         let core_bit = 1u64 << core_id;
 
-        // Scan local run queue: find the highest-priority (lowest numeric) Ready
-        // task in a single pass, then remove only that entry. No heap allocation.
-        if let Some(data) = crate::smp::get_core_data(core_id) {
-            let mut q = data.run_queue.lock();
-            let mut best_pos: Option<usize> = None;
-            let mut best_prio: u8 = u8::MAX;
-
-            // First pass: discard stale entries from the front while scanning.
-            let mut i = 0;
-            while i < q.len() {
-                let idx = q[i];
-                if idx >= self.tasks.len()
-                    || self.tasks[idx].state != TaskState::Ready
-                    || self.idle_tasks.contains(&Some(idx))
-                    || self.tasks[idx].affinity_mask & core_bit == 0
-                {
-                    // Stale or ineligible entry — discard.
-                    q.remove(i);
-                    continue;
-                }
-                if self.tasks[idx].saved_rsp == 0 {
-                    log::error!(
-                        "[sched] dropping ready task idx={} pid={} name={} with zero saved_rsp",
-                        idx,
-                        self.tasks[idx].pid,
-                        self.tasks[idx].name
-                    );
-                    self.tasks[idx].state = TaskState::Dead;
-                    q.remove(i);
-                    continue;
-                }
-                if self.tasks[idx].priority < best_prio {
-                    best_prio = self.tasks[idx].priority;
-                    best_pos = Some(i);
-                }
-                i += 1;
-            }
-
-            if let Some(pos) = best_pos {
-                let idx = q.remove(pos).unwrap();
-                debug_assert!(
-                    self.tasks[idx].state == TaskState::Ready,
-                    "pick_next: local queue task idx={} not Ready (state={:?})",
-                    idx,
-                    self.tasks[idx].state
-                );
-                debug_assert!(
-                    self.tasks[idx].affinity_mask & core_bit != 0,
-                    "pick_next: local queue task idx={} not allowed on core {}",
-                    idx,
-                    core_id
-                );
-                self.last_run = idx;
-                return Some((self.tasks[idx].saved_rsp, idx));
-            }
+        // Phase 1: Scan local run queue — highest-priority (lowest numeric)
+        // Ready task in a single pass.
+        if let Some(idx) = self.dequeue_local(core_id, core_bit) {
+            self.last_run = idx;
+            return Some((self.tasks[idx].saved_rsp, idx));
         }
 
-        // Fallback: global round-robin scan for unqueued Ready tasks.
-        // Tasks found here have valid saved_rsp because they were re-enqueued
-        // by the scheduler loop AFTER switch_context (not by yield_now).
-        let n = self.tasks.len();
-        if n > 0 {
-            let start = (self.last_run + 1) % n;
-            for i in 0..n {
-                let idx = (start + i) % n;
-                if self.idle_tasks.contains(&Some(idx)) {
-                    continue;
-                }
-                if self.tasks[idx].state == TaskState::Ready
-                    && self.tasks[idx].affinity_mask & core_bit != 0
-                {
-                    if self.tasks[idx].saved_rsp == 0 {
-                        log::error!(
-                            "[sched] dropping globally-scanned ready task idx={} pid={} name={} with zero saved_rsp",
-                            idx,
-                            self.tasks[idx].pid,
-                            self.tasks[idx].name
-                        );
-                        self.tasks[idx].state = TaskState::Dead;
-                        continue;
-                    }
-                    debug_assert!(
-                        self.tasks[idx].state == TaskState::Ready,
-                        "pick_next: global fallback task idx={} not Ready (state={:?})",
-                        idx,
-                        self.tasks[idx].state
-                    );
-                    debug_assert!(
-                        self.tasks[idx].affinity_mask & core_bit != 0,
-                        "pick_next: global fallback task idx={} not allowed on core {}",
-                        idx,
-                        core_id
-                    );
-                    self.last_run = idx;
-                    return Some((self.tasks[idx].saved_rsp, idx));
-                }
-            }
+        // Phase 2: Work-stealing — try to steal one task from another core
+        // (Phase 52c A.2).
+        if let Some(idx) = self.try_steal(core_id, core_bit) {
+            self.tasks[idx].assigned_core = core_id;
+            self.tasks[idx].last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+            self.last_run = idx;
+            return Some((self.tasks[idx].saved_rsp, idx));
         }
 
-        // Fall back to this core's idle task.
+        // Phase 3: Fall back to this core's idle task.
         if let Some(idle_idx) = self.idle_tasks[core_id as usize]
             && self.tasks[idle_idx].state == TaskState::Ready
         {
@@ -254,6 +189,122 @@ impl Scheduler {
                 core_id
             );
             return Some((self.tasks[idle_idx].saved_rsp, idle_idx));
+        }
+
+        None
+    }
+
+    /// Dequeue the highest-priority Ready task from this core's local run queue.
+    /// Removes stale/ineligible entries as it scans.
+    fn dequeue_local(&mut self, core_id: u8, core_bit: u64) -> Option<usize> {
+        let data = crate::smp::get_core_data(core_id)?;
+        let mut q = data.run_queue.lock();
+        let mut best_pos: Option<usize> = None;
+        let mut best_prio: u8 = u8::MAX;
+
+        let mut i = 0;
+        while i < q.len() {
+            let idx = q[i];
+            if idx >= self.tasks.len()
+                || self.tasks[idx].state != TaskState::Ready
+                || self.idle_tasks.contains(&Some(idx))
+                || self.tasks[idx].affinity_mask & core_bit == 0
+            {
+                q.remove(i);
+                continue;
+            }
+            if self.tasks[idx].saved_rsp == 0 {
+                log::error!(
+                    "[sched] dropping ready task idx={} pid={} name={} with zero saved_rsp",
+                    idx,
+                    self.tasks[idx].pid,
+                    self.tasks[idx].name
+                );
+                self.tasks[idx].state = TaskState::Dead;
+                q.remove(i);
+                continue;
+            }
+            if self.tasks[idx].priority < best_prio {
+                best_prio = self.tasks[idx].priority;
+                best_pos = Some(i);
+            }
+            i += 1;
+        }
+
+        if let Some(pos) = best_pos {
+            let idx = q.remove(pos).unwrap();
+            debug_assert!(
+                self.tasks[idx].state == TaskState::Ready,
+                "pick_next: local queue task idx={} not Ready (state={:?})",
+                idx,
+                self.tasks[idx].state
+            );
+            return Some(idx);
+        }
+        None
+    }
+
+    /// Try to steal one task from another core's run queue (Phase 52c A.2).
+    ///
+    /// Iterates over all other cores, preferring the one with the longest
+    /// queue. Steals at most one task, checking affinity before stealing.
+    fn try_steal(&mut self, my_core: u8, my_core_bit: u64) -> Option<usize> {
+        let n = crate::smp::core_count();
+        if n <= 1 {
+            return None;
+        }
+
+        // Find the core with the longest run queue (excluding ourselves).
+        let mut best_core: Option<u8> = None;
+        let mut best_len: usize = 0;
+        for id in 0..n {
+            if id == my_core {
+                continue;
+            }
+            if let Some(data) = crate::smp::get_core_data(id) {
+                let len = data.run_queue.lock().len();
+                if len > best_len {
+                    best_len = len;
+                    best_core = Some(id);
+                }
+            }
+        }
+
+        let victim_core = best_core?;
+        if best_len == 0 {
+            return None;
+        }
+
+        let data = crate::smp::get_core_data(victim_core)?;
+        let mut q = data.run_queue.lock();
+
+        // Find a stealable task: Ready, affinity-compatible with our core,
+        // not an idle task.
+        for i in 0..q.len() {
+            let idx = q[i];
+            if idx >= self.tasks.len() {
+                continue;
+            }
+            let task = &self.tasks[idx];
+            if task.state != TaskState::Ready {
+                continue;
+            }
+            if self.idle_tasks.contains(&Some(idx)) {
+                continue;
+            }
+            if task.affinity_mask & my_core_bit == 0 {
+                continue;
+            }
+            if task.saved_rsp == 0 {
+                continue;
+            }
+            // Steal this task.
+            q.remove(i);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
+                task_idx: idx as u32,
+                core: my_core,
+            });
+            return Some(idx);
         }
 
         None
@@ -345,6 +396,20 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
     }
 }
 
+/// Allocate a slot for a new task, reusing a dead slot from the free list
+/// if available, otherwise appending to the task vec.
+fn alloc_task_slot(sched: &mut Scheduler, task: Task) -> usize {
+    if let Some(idx) = sched.free_list.pop() {
+        // Reuse a dead slot.
+        sched.tasks[idx] = task;
+        idx
+    } else {
+        let idx = sched.tasks.len();
+        sched.tasks.push(task);
+        idx
+    }
+}
+
 /// Spawn a new kernel task. The task is assigned to the least-loaded core
 /// and enqueued to that core's run queue.
 pub fn spawn(entry: fn() -> !, name: &'static str) {
@@ -352,8 +417,7 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
     let mut sched = SCHEDULER.lock();
     let target = least_loaded_core(&sched);
     task.assigned_core = target;
-    let idx = sched.tasks.len();
-    sched.tasks.push(task);
+    let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(target, idx);
 }
@@ -366,8 +430,7 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     let core = crate::smp::per_core().core_id;
     task.assigned_core = core;
     let mut sched = SCHEDULER.lock();
-    let idx = sched.tasks.len();
-    sched.tasks.push(task);
+    let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(core, idx);
 }
@@ -387,8 +450,7 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
         task.fork_ctx.is_some(),
         "spawn_fork_task: fork_ctx missing after set"
     );
-    let idx = sched.tasks.len();
-    sched.tasks.push(task);
+    let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
 
     crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::ForkCtxPublish {
@@ -416,8 +478,7 @@ pub fn spawn_idle_for_core(entry: fn() -> !, core_id: u8) {
     task.assigned_core = core_id;
     task.priority = 30; // Idle priority
     let mut sched = SCHEDULER.lock();
-    let idx = sched.tasks.len();
-    sched.tasks.push(task);
+    let idx = alloc_task_slot(&mut sched, task);
     sched.idle_tasks[core_id as usize] = Some(idx);
 }
 
@@ -889,11 +950,10 @@ pub fn run() -> ! {
             sched.drain_dead();
         }
 
-        // Periodic load balancing (BSP only, every 50 scheduler ticks).
-        // Disabled for now — causes task migration thrashing that interferes
-        // with short-lived userspace processes.  Re-enable once per-task
-        // cooldown or work-stealing is implemented.
-        // if core_id == 0 { maybe_load_balance(); }
+        // Periodic load balancing with per-task cooldown (Phase 52c A.4).
+        if core_id == 0 {
+            maybe_load_balance();
+        }
 
         // Pick the next ready task and atomically mark it Running.
         let next = {
@@ -1061,17 +1121,21 @@ pub fn run() -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Load balancing (Phase 35, Track E)
+// Load balancing (Phase 35 Track E, refined Phase 52c A.4)
 // ---------------------------------------------------------------------------
 
+/// Minimum ticks between migrations for a single task (Phase 52c A.4).
+/// At 100 Hz timer, 100 ticks = 1 second cooldown.
+const MIGRATE_COOLDOWN: u64 = 100;
+
 /// Periodic load balancer tick counter. BSP calls `maybe_load_balance()`
-/// from the timer interrupt path every tick; actual migration happens every
-/// 50 ticks (~500ms at 100 Hz). Note: load balancing is currently disabled
-/// in the scheduler loop due to task migration thrashing (see `run()`).
+/// from the scheduler loop; actual migration happens every 50 ticks
+/// (~500ms at 100 Hz).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Called from the BSP's timer path. Every 50 ticks (~500ms), checks queue
-/// imbalance and migrates one task if the longest queue exceeds the shortest by >2.
+/// Called from the BSP's scheduler loop. Every 50 ticks (~500ms), checks
+/// queue imbalance and migrates one task if the longest queue exceeds the
+/// shortest by >2. Tasks that were recently migrated are skipped (cooldown).
 pub fn maybe_load_balance() {
     let cnt = BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
     if !cnt.is_multiple_of(50) {
@@ -1101,17 +1165,20 @@ pub fn maybe_load_balance() {
     if longest_len <= shortest_len + 2 {
         return; // Balanced enough — require > 2 difference to avoid thrashing.
     }
+    let current_tick = crate::arch::x86_64::interrupts::tick_count();
     // Migrate one task from longest to shortest.
     // Lock ordering: SCHEDULER first, then run_queue (matches pick_next).
     if let Some(src) = crate::smp::get_core_data(longest_core) {
         let sched = SCHEDULER.lock();
         let mut q = src.run_queue.lock();
-        // Find a migratable (non-pinned) task.
+        // Find a migratable (non-pinned, not recently migrated) task.
         let mut found = None;
         for i in 0..q.len() {
             if let Some(&idx) = q.get(i)
                 && idx < sched.tasks.len()
                 && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
+                && current_tick.saturating_sub(sched.tasks[idx].last_migrated_tick)
+                    >= MIGRATE_COOLDOWN
             {
                 found = Some(i);
                 break;
@@ -1122,16 +1189,17 @@ pub fn maybe_load_balance() {
         {
             drop(q);
             drop(sched);
-            // Update assigned_core.
+            // Update assigned_core and migration timestamp.
             {
                 let mut sched = SCHEDULER.lock();
                 if idx < sched.tasks.len() {
                     sched.tasks[idx].assigned_core = shortest_core;
+                    sched.tasks[idx].last_migrated_tick = current_tick;
                 }
             }
             enqueue_to_core(shortest_core, idx);
             log::debug!(
-                "[sched] load balance: task {} moved core {} → {}",
+                "[sched] load balance: task {} moved core {} -> {}",
                 idx,
                 longest_core,
                 shortest_core
