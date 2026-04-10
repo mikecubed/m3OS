@@ -315,6 +315,12 @@ pub fn free_frame(phys: u64) {
             }
         }
     }
+    // Zero the frame before returning to pool to prevent stale data exposure.
+    let phys_offset = FRAME_ALLOCATOR.0.lock().phys_offset;
+    let virt_ptr = (phys_offset + phys) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(virt_ptr, 0, 4096);
+    }
     FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
 
@@ -333,6 +339,15 @@ pub fn free_contiguous(phys: u64, order: usize) {
             if new_count > 0 {
                 return;
             }
+        }
+    }
+    // Zero all frames in the contiguous block before returning to pool.
+    let page_count = 1u64 << order;
+    let phys_offset = FRAME_ALLOCATOR.0.lock().phys_offset;
+    for i in 0..page_count {
+        let virt_ptr = (phys_offset + phys + i * PAGE_SIZE) as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(virt_ptr, 0, 4096);
         }
     }
     FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
