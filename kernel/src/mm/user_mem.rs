@@ -32,7 +32,7 @@ const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
 /// correct and the kernel's page table walk must be coherent with the
 /// currently-active CR3. On single-CPU without kernel preemption this holds
 /// as long as `mm::init` has run.
-pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
+fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
     let len = dst.len();
     if len == 0 {
         return Ok(());
@@ -104,7 +104,7 @@ pub fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 /// be `WRITABLE`. If a page is a CoW (copy-on-write) page (present, user-
 /// accessible, BIT_9 set, but not writable), the CoW fault is resolved
 /// in-place before copying.
-pub fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
+fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     let len = src.len();
     if len == 0 {
         return Ok(());
@@ -296,4 +296,184 @@ fn is_user_writable(
         ),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Typed user-buffer wrappers (Phase 52b Track D)
+// ---------------------------------------------------------------------------
+
+/// A validated read-only view of user memory. Kernel can copy data FROM
+/// this user buffer TO a kernel buffer.
+pub struct UserSliceRo {
+    vaddr: u64,
+    len: usize,
+}
+
+/// A validated write-only view of user memory. Kernel can copy data FROM
+/// a kernel buffer INTO this user buffer.
+pub struct UserSliceWo {
+    vaddr: u64,
+    len: usize,
+}
+
+/// A validated read-write view of user memory.
+#[allow(dead_code)]
+pub struct UserSliceRw {
+    vaddr: u64,
+    len: usize,
+}
+
+impl UserSliceRo {
+    /// Validate and create a read-only user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from user memory into a kernel buffer.
+    pub fn copy_to_kernel(&self, dst: &mut [u8]) -> Result<(), ()> {
+        if dst.len() > self.len {
+            return Err(());
+        }
+        copy_from_user(dst, self.vaddr)
+    }
+
+    /// Read a single `Copy` value from user memory.
+    #[allow(dead_code)]
+    pub fn read_val<T: Copy>(&self) -> Result<T, ()> {
+        if core::mem::size_of::<T>() > self.len {
+            return Err(());
+        }
+        let mut buf = [0u8; 256]; // Stack buffer large enough for any syscall struct
+        let size = core::mem::size_of::<T>();
+        if size > buf.len() {
+            return Err(());
+        }
+        copy_from_user(&mut buf[..size], self.vaddr)?;
+        // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+    }
+
+    /// Return the user virtual address.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl UserSliceWo {
+    /// Validate and create a write-only user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from a kernel buffer into user memory.
+    pub fn copy_from_kernel(&self, src: &[u8]) -> Result<(), ()> {
+        if src.len() > self.len {
+            return Err(());
+        }
+        copy_to_user(self.vaddr, src)
+    }
+
+    /// Write a single `Copy` value to user memory.
+    #[allow(dead_code)]
+    pub fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+        let size = core::mem::size_of::<T>();
+        if size > self.len {
+            return Err(());
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
+        copy_to_user(self.vaddr, bytes)
+    }
+
+    /// Return the user virtual address.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[allow(dead_code)]
+impl UserSliceRw {
+    /// Validate and create a read-write user slice.
+    pub fn new(vaddr: u64, len: usize) -> Result<Self, ()> {
+        validate_user_range(vaddr, len)?;
+        Ok(Self { vaddr, len })
+    }
+
+    /// Copy data from user memory into a kernel buffer.
+    pub fn copy_to_kernel(&self, dst: &mut [u8]) -> Result<(), ()> {
+        if dst.len() > self.len {
+            return Err(());
+        }
+        copy_from_user(dst, self.vaddr)
+    }
+
+    /// Copy data from a kernel buffer into user memory.
+    pub fn copy_from_kernel(&self, src: &[u8]) -> Result<(), ()> {
+        if src.len() > self.len {
+            return Err(());
+        }
+        copy_to_user(self.vaddr, src)
+    }
+
+    /// Read a single `Copy` value from user memory.
+    pub fn read_val<T: Copy>(&self) -> Result<T, ()> {
+        if core::mem::size_of::<T>() > self.len {
+            return Err(());
+        }
+        let mut buf = [0u8; 256];
+        let size = core::mem::size_of::<T>();
+        if size > buf.len() {
+            return Err(());
+        }
+        copy_from_user(&mut buf[..size], self.vaddr)?;
+        // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+    }
+
+    /// Write a single `Copy` value to user memory.
+    pub fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+        let size = core::mem::size_of::<T>();
+        if size > self.len {
+            return Err(());
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
+        copy_to_user(self.vaddr, bytes)
+    }
+
+    /// Return the user virtual address.
+    pub fn addr(&self) -> u64 {
+        self.vaddr
+    }
+    /// Return the validated length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Validate that a user address range is in canonical user space and within limits.
+fn validate_user_range(vaddr: u64, len: usize) -> Result<(), ()> {
+    if len == 0 {
+        return Ok(());
+    }
+    if len > MAX_COPY_LEN {
+        return Err(());
+    }
+    let end = vaddr.checked_add(len as u64).ok_or(())?;
+    if vaddr < 0x1000 || end > 0x0000_8000_0000_0000u64 {
+        return Err(());
+    }
+    Ok(())
 }

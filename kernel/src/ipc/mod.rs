@@ -41,6 +41,8 @@ pub mod message;
 pub mod notification;
 pub mod registry;
 
+use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
+
 pub use capability::{CapError, CapHandle, Capability, CapabilityTable};
 pub use endpoint::EndpointId;
 pub use message::Message;
@@ -363,7 +365,10 @@ fn ipc_register_service(
     }
     let name_len = name_len as usize;
     let mut name_buf = [0u8; 32];
-    if crate::mm::user_mem::copy_from_user(&mut name_buf[..name_len], name_ptr).is_err() {
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
         return u64::MAX;
     }
     let name = match core::str::from_utf8(&name_buf[..name_len]) {
@@ -392,7 +397,10 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
     }
     let name_len = name_len as usize;
     let mut name_buf = [0u8; 32];
-    if crate::mm::user_mem::copy_from_user(&mut name_buf[..name_len], name_ptr).is_err() {
+    if UserSliceRo::new(name_ptr, name_len)
+        .and_then(|s| s.copy_to_kernel(&mut name_buf[..name_len]))
+        .is_err()
+    {
         return u64::MAX;
     }
     let name = match core::str::from_utf8(&name_buf[..name_len]) {
@@ -503,7 +511,10 @@ fn ipc_send_with_bulk(
     // Copy the sender's buffer into kernel memory while the sender's CR3
     // is still active.
     let mut bulk = alloc::vec![0u8; len];
-    if crate::mm::user_mem::copy_from_user(&mut bulk, buf_ptr).is_err() {
+    if UserSliceRo::new(buf_ptr, bulk.len())
+        .and_then(|s| s.copy_to_kernel(&mut bulk))
+        .is_err()
+    {
         return u64::MAX;
     }
 
@@ -557,7 +568,10 @@ fn ipc_recv_msg(
             let off = 8 + i * 8;
             header[off..off + 8].copy_from_slice(&d.to_ne_bytes());
         }
-        if crate::mm::user_mem::copy_to_user(msg_ptr, &header).is_err() {
+        if UserSliceWo::new(msg_ptr, header.len())
+            .and_then(|s| s.copy_from_kernel(&header))
+            .is_err()
+        {
             return u64::MAX;
         }
     }
@@ -567,7 +581,11 @@ fn ipc_recv_msg(
         && let Some(bulk) = scheduler::take_bulk_data(task_id)
     {
         let copy_len = bulk.len().min(buf_len as usize);
-        if copy_len > 0 && crate::mm::user_mem::copy_to_user(buf_ptr, &bulk[..copy_len]).is_err() {
+        if copy_len > 0
+            && UserSliceWo::new(buf_ptr, copy_len)
+                .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+                .is_err()
+        {
             return u64::MAX;
         }
     }
