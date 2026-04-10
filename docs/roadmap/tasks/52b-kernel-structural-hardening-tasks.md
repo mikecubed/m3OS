@@ -215,6 +215,20 @@
 
 ---
 
+## Cross-Phase Dependencies
+
+These completed phases have load-bearing code paths that must be preserved or migrated:
+
+| Phase | Risk | What Must Be Preserved |
+|---|---|---|
+| 36 (Expanded Memory) | `MemoryMapping` struct moves into `AddressSpace` | `mprotect` TLB shootdown path, demand paging |
+| 38 (Filesystem) | `/proc/<pid>/maps` reads VMA list directly | Must update procfs maps generator after VMA restructure |
+| 40 (Threading) | Futex table keyed by `(page_table_root, vaddr)` | **Must update futex key type** when CR3 is wrapped in `AddressSpace` |
+| 43a (Crash Diagnostics) | Assertions guard exact bug class being fixed | Update `pick_next` RSP assertions after task-owned state migration |
+| 43b (Trace Ring) | `TraceRing` stored in `PerCoreData` | Preserve `trace_ring` field if restructuring `PerCoreData` |
+| 43c (Regression/Stress) | Proptest models test scheduler invariants | Update proptest models after per-core scheduler changes |
+| 48 (Security) | `setuid`/`setgid` enforcement in syscall handler | Preserve credential checks when converting to typed `UserBuffer` |
+
 ## Documentation Notes
 
 - All design details are in `docs/appendix/architecture/next/`
