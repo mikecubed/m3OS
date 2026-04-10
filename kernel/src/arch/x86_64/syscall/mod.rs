@@ -3459,7 +3459,7 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 /// enter the kernel via syscall and overwrite the per-core `syscall_user_rsp`
 /// and `syscall_stack_top`. This function restores all per-process state
 /// so that the `sysretq` return path uses the correct values.
-fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
+pub(crate) fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
     let (caller_cr3_phys, kstack_top, fs_base) = {
         let table = crate::process::PROCESS_TABLE.lock();
         let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
@@ -10642,12 +10642,18 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 });
             }
 
+            // Capture per-core syscall state before blocking — after a
+            // context switch the per-core values belong to a different task.
+            let futex_calling_pid = crate::process::current_pid();
+            let futex_saved_user_rsp = per_core_syscall_user_rsp();
+
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
             crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
-            // Woken — return success.
+            // Woken — restore caller context so sysretq uses correct values.
+            restore_caller_context(futex_calling_pid, futex_saved_user_rsp);
             0
         }
 
