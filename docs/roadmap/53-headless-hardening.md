@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-53
-**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅
+**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52b (Kernel Structural Hardening)
 **Builds on:** Turns the now-shipped Rust std, ports, services, and first extracted-service work into a trustworthy headless/reference-system baseline with explicit validation and support boundaries
 **Primary Components:** xtask/src/main.rs, kernel-core, userspace/init, userspace/coreutils-rs, ports, docs/43c-regression-stress-ci.md, docs/45-ports-system.md
 
