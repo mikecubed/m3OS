@@ -3623,6 +3623,10 @@ unsafe fn cow_clone_user_pages(
 
         let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
 
+        // Track the range of CoW-marked pages for SMP shootdown.
+        let mut cow_range_start: u64 = u64::MAX;
+        let mut cow_range_end: u64 = 0;
+
         // Walk indices 0–255 (user half).
         for p4 in 0usize..256 {
             let p4e = &src_pml4[p4];
@@ -3712,6 +3716,13 @@ unsafe fn cow_clone_user_pages(
                         // match (clear WRITABLE, set BIT_9) and bump refcount.
                         if was_writable {
                             pte.set_addr(src_phys, child_flags);
+                            // Track range of CoW-marked pages for SMP shootdown.
+                            if vaddr < cow_range_start {
+                                cow_range_start = vaddr;
+                            }
+                            if vaddr + 4096 > cow_range_end {
+                                cow_range_end = vaddr + 4096;
+                            }
                         }
                         crate::mm::frame_allocator::refcount_inc(src_phys.as_u64());
                     }
@@ -3723,6 +3734,18 @@ unsafe fn cow_clone_user_pages(
         // A full CR3 reload is the simplest approach.
         let (current_cr3, cr3_flags) = Cr3::read();
         Cr3::write(current_cr3, cr3_flags);
+
+        // SMP shootdown: ensure remote cores that have the parent's address
+        // space loaded also see the cleared WRITABLE bits on CoW pages.
+        if cow_range_start < cow_range_end {
+            let parent_pid = crate::process::current_pid();
+            let table = crate::process::PROCESS_TABLE.lock();
+            if let Some(p) = table.find(parent_pid)
+                && let Some(ref addr_space) = p.addr_space
+            {
+                crate::smp::tlb::tlb_shootdown_range(addr_space, cow_range_start, cow_range_end);
+            }
+        }
 
         Ok(())
     }
@@ -7075,9 +7098,19 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
     let freed_count = unmapped_addrs.len();
 
-    // SMP TLB shootdown: invalidate only pages that were actually unmapped.
-    for &page_addr in &unmapped_addrs {
-        crate::smp::tlb::tlb_shootdown(page_addr);
+    // SMP TLB shootdown: batch invalidation for the entire unmapped range.
+    if !unmapped_addrs.is_empty() {
+        let range_start = *unmapped_addrs.iter().min().unwrap();
+        let range_end = *unmapped_addrs.iter().max().unwrap() + 4096;
+        // Use targeted range shootdown via the process's AddressSpace.
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(p) = table.find(pid)
+            && let Some(ref addr_space) = p.addr_space
+        {
+            crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
+        }
+        drop(table);
     }
 
     // Update mapping tracking list: handle full removal, shrink, and split.
@@ -7258,9 +7291,18 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         }
     }
 
-    // TLB shootdown for all changed pages.
-    for &page_addr in &changed_addrs {
-        crate::smp::tlb::tlb_shootdown(page_addr);
+    // Batch TLB shootdown for all changed pages.
+    if !changed_addrs.is_empty() {
+        let range_start = *changed_addrs.iter().min().unwrap();
+        let range_end = *changed_addrs.iter().max().unwrap() + 4096;
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(p) = table.find(pid)
+            && let Some(ref addr_space) = p.addr_space
+        {
+            crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
+        }
+        drop(table);
     }
 
     // Update VMA protection bits and split VMAs at mprotect boundaries.
