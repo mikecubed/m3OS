@@ -3274,6 +3274,19 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     .map(alloc::string::String::from)
                     .collect()
             };
+
+            // Phase 52a: Reset caught signal dispositions to Default on exec
+            // (POSIX semantics). Ignore and Default dispositions are preserved.
+            for action in proc.signal_actions.iter_mut() {
+                if matches!(action, crate::process::SignalAction::Handler { .. }) {
+                    *action = crate::process::SignalAction::Default;
+                }
+            }
+            // Detach from thread-group shared signal actions — the exec'd
+            // process gets its own (already-reset) per-process table.
+            if proc.shared_signal_actions.is_some() {
+                proc.shared_signal_actions = None;
+            }
         }
     }
 
