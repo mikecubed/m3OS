@@ -216,8 +216,8 @@ the new process's data (or zeros if the frame was zeroed). Verify:
 
 ## Phase 52a Fix: Stale Per-Core State on Blocking Paths
 
-The IPC blocking path analysis (Phase 52a, Track A) confirmed that all six
-IPC blocking syscalls (recv, call, reply_recv, notify_wait, recv_msg,
+The IPC blocking path analysis (Phase 52a, Track A) confirmed that all seven
+IPC blocking syscalls (recv, call, reply_recv, notify_wait, call_buf, recv_msg,
 reply_recv_msg) and the FUTEX_WAIT path returned through `sysretq` with a
 stale per-core `syscall_user_rsp` after a context switch. This causes the
 wrong user stack to be restored.

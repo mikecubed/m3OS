@@ -22,7 +22,7 @@
 
 **File:** `kernel/src/ipc/mod.rs`
 **Symbol:** `dispatch`
-**Why it matters:** All six IPC blocking syscalls (recv, call, reply_recv, notify_wait, recv_msg, reply_recv_msg) return with a stale per-core `syscall_user_rsp` after a context switch. This is the confirmed root cause of wrong user RSP on return from blocking IPC.
+**Why it matters:** All seven IPC blocking syscalls (recv, call, reply_recv, notify_wait, call_buf, recv_msg, reply_recv_msg) return with a stale per-core `syscall_user_rsp` after a context switch. This is the confirmed root cause of wrong user RSP on return from blocking IPC.
 
 **Acceptance:**
 - [x] `dispatch()` captures `saved_user_rsp = per_core_syscall_user_rsp()` and `pid = current_pid()` at entry
