@@ -156,10 +156,16 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
     // Count targeted cores first so the pending count is initialized before
     // any IPI is sent — otherwise a remote core can handle the IPI and
     // fetch_sub(1) while SHOOTDOWN_PENDING is still 0, causing underflow.
-    let online = online_core_count();
+    //
+    // Use get_core_data + is_online per bit instead of online_core_count()
+    // as an upper bound — online_core_count() is a count, not a max core_id,
+    // and would skip higher-numbered cores if a lower-numbered core is offline.
     let mut targets = 0u8;
     for core_id in 0..64u8 {
-        if remote_mask & (1u64 << core_id) != 0 && core_id < online {
+        if remote_mask & (1u64 << core_id) != 0
+            && let Some(data) = super::get_core_data(core_id)
+            && data.is_online.load(Ordering::Acquire)
+        {
             targets = targets.saturating_add(1);
         }
     }
@@ -171,8 +177,10 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
     SHOOTDOWN_PENDING.store(targets, Ordering::Release);
 
     // Now that the pending count is visible, send the IPIs.
+    // send_ipi_to_core already checks existence + is_online, matching the
+    // count above.
     for core_id in 0..64u8 {
-        if remote_mask & (1u64 << core_id) != 0 && core_id < online {
+        if remote_mask & (1u64 << core_id) != 0 {
             ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
         }
     }

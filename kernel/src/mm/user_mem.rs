@@ -15,16 +15,12 @@ use x86_64::{
     structures::paging::{PageTableFlags, Translate, mapper::TranslateResult},
 };
 
-/// Maximum length (bytes) accepted for a single copy_from_user / copy_to_user
-/// call. Prevents pathological syscall arguments from scanning huge ranges.
-const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
-
 /// Copy `len` bytes from userspace virtual address `src_vaddr` into `dst`.
 ///
 /// Validates each 4 KiB page of the source range using the page tables
 /// (must be `PRESENT` and `USER_ACCESSIBLE`). Returns `Err(())` if any page
 /// is unmapped, the address range is not in canonical user space, or `len`
-/// exceeds `MAX_COPY_LEN`.
+/// exceeds the limit defined in `kernel_core::user_range::MAX_COPY_LEN`.
 ///
 /// # Safety
 ///
@@ -34,17 +30,7 @@ const MAX_COPY_LEN: usize = 64 * 1024; // 64 KiB
 /// as long as `mm::init` has run.
 fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
     let len = dst.len();
-    if len == 0 {
-        return Ok(());
-    }
-    if len > MAX_COPY_LEN {
-        return Err(());
-    }
-    // Reject non-canonical or kernel-space pointers.
-    let src_end = src_vaddr.checked_add(len as u64).ok_or(())?;
-    if src_vaddr < 0x1000 || src_end > 0x0000_8000_0000_0000u64 {
-        return Err(());
-    }
+    kernel_core::user_range::validate_user_range(src_vaddr, len)?;
 
     let phys_off = crate::mm::phys_offset();
 
@@ -106,16 +92,7 @@ fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 /// in-place before copying.
 fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
     let len = src.len();
-    if len == 0 {
-        return Ok(());
-    }
-    if len > MAX_COPY_LEN {
-        return Err(());
-    }
-    let dst_end = dst_vaddr.checked_add(len as u64).ok_or(())?;
-    if dst_vaddr < 0x1000 || dst_end > 0x0000_8000_0000_0000u64 {
-        return Err(());
-    }
+    kernel_core::user_range::validate_user_range(dst_vaddr, len)?;
 
     let phys_off = crate::mm::phys_offset();
 
@@ -468,16 +445,9 @@ impl UserSliceRw {
 }
 
 /// Validate that a user address range is in canonical user space and within limits.
+///
+/// Delegates to `kernel_core::user_range::validate_user_range` so the kernel
+/// and host tests share a single implementation.
 fn validate_user_range(vaddr: u64, len: usize) -> Result<(), ()> {
-    if len == 0 {
-        return Ok(());
-    }
-    if len > MAX_COPY_LEN {
-        return Err(());
-    }
-    let end = vaddr.checked_add(len as u64).ok_or(())?;
-    if vaddr < 0x1000 || end > 0x0000_8000_0000_0000u64 {
-        return Err(());
-    }
-    Ok(())
+    kernel_core::user_range::validate_user_range(vaddr, len)
 }
