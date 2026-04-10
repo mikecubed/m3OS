@@ -175,6 +175,10 @@ pub struct Task {
     pub system_ticks: u64,
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
+    /// Tick at which this task was last migrated to a different core (Phase 52c).
+    /// Used by the load balancer to enforce a cooldown period and prevent
+    /// migration thrashing.
+    pub last_migrated_tick: u64,
     /// True while the task is returning to the scheduler and its kernel stack
     /// pointer has not been safely published yet.
     pub switching_out: bool,
@@ -220,6 +224,7 @@ impl Task {
             user_ticks: 0,
             system_ticks: 0,
             start_tick: 0,
+            last_migrated_tick: 0,
             switching_out: false,
             wake_after_switch: false,
             user_return: None,
