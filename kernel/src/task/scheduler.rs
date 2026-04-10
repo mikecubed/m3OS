@@ -955,13 +955,46 @@ pub fn run() -> ! {
             let pid = task_pid(_task_idx);
             crate::process::set_current_pid(pid);
             if pid != 0 {
-                let (cr3_phys, kstack, fs) = {
+                let (cr3_phys, kstack, fs, new_as_ptr) = {
                     let table = crate::process::PROCESS_TABLE.lock();
                     match table.find(pid) {
-                        Some(p) => (p.page_table_root, p.kernel_stack_top, p.fs_base),
-                        None => (None, 0, 0),
+                        Some(p) => {
+                            let as_ptr = p
+                                .addr_space
+                                .as_ref()
+                                .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                                .unwrap_or(core::ptr::null());
+                            (
+                                p.addr_space.as_ref().map(|a| a.pml4_phys()),
+                                p.kernel_stack_top,
+                                p.fs_base,
+                                as_ptr,
+                            )
+                        }
+                        None => (None, 0, 0, core::ptr::null()),
                     }
                 };
+                // Track active address space on this core.
+                if crate::smp::is_per_core_ready() {
+                    let pc = crate::smp::per_core();
+                    let old_as_ptr = pc.current_addrspace;
+                    if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                        // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+                        // that is still alive (the owning Process holds the Arc).
+                        unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                    if !new_as_ptr.is_null() {
+                        // SAFETY: new_as_ptr points to an AddressSpace in an Arc
+                        // that is alive while the process is in the process table.
+                        unsafe { &*new_as_ptr }.activate_on_core(core_id);
+                    }
+                    // SAFETY: per_core() returns a reference to the current core's
+                    // data; we only write current_addrspace on the owning core.
+                    let pc_mut =
+                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                    unsafe { (*pc_mut).current_addrspace = new_as_ptr };
+                }
                 // Restore CR3 so the task's user-space pages are mapped.
                 if let Some(cr3) = cr3_phys {
                     unsafe {
@@ -973,6 +1006,17 @@ pub fn run() -> ! {
                         let frame: PhysFrame<Size4KiB> =
                             PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
                         Cr3::write(frame, Cr3Flags::empty());
+                    }
+                    // A.4: Assert CR3 matches the address space after loading.
+                    #[cfg(debug_assertions)]
+                    {
+                        let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
+                        debug_assert_eq!(
+                            loaded_frame.start_address().as_u64(),
+                            cr3.as_u64(),
+                            "CR3 mismatch after load on core {}",
+                            core_id
+                        );
                     }
                 }
                 if kstack != 0 {

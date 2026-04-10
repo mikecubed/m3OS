@@ -125,6 +125,11 @@ pub struct PerCoreData {
     /// 0 = no userspace process (kernel task context).
     pub current_pid: AtomicU32,
 
+    /// Pointer to the AddressSpace currently active on this core.
+    /// Raw pointer because PerCoreData does not own the AddressSpace
+    /// (the Process does via Arc). Null when no user address space is loaded.
+    pub current_addrspace: *const crate::mm::AddressSpace,
+
     /// Fork child entry context — per-core so each core can handle `fork()`
     /// independently without corrupting another core's saved context.
     pub fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx,
@@ -405,6 +410,7 @@ pub fn init_bsp_per_core() {
         syscall_user_r10: 0,
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
+        current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
@@ -514,6 +520,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         syscall_user_r10: 0,
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
+        current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),

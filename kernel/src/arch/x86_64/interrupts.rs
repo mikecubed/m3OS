@@ -59,7 +59,9 @@ fn fault_kill_trampoline() -> ! {
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).and_then(|p| p.page_table_root)
+        table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
     };
     // Restore kernel page table before yielding — same reason as sys_exit.
     crate::mm::restore_kernel_cr3();

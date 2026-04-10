@@ -27,6 +27,7 @@ extern crate alloc;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use crate::mm::AddressSpace;
 use spin::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -525,11 +526,13 @@ pub struct Process {
     pub ppid: Pid,
     /// Current lifecycle state.
     pub state: ProcessState,
-    /// Root physical address of this process's page table.
+    /// This process's virtual address space.
     ///
     /// `None` means the process has not yet been assigned a dedicated
     /// address space and shares the kernel's mappings (pre-Phase 12).
-    pub page_table_root: Option<x86_64::PhysAddr>,
+    /// For threads created with `CLONE_VM`, this is a shared `Arc` clone
+    /// of the parent's address space.
+    pub addr_space: Option<Arc<AddressSpace>>,
     /// Top of this process's kernel-mode stack (virtual address).
     pub kernel_stack_top: u64,
     /// Userspace entry-point virtual address.
@@ -648,7 +651,7 @@ impl Process {
             clear_child_tid: 0,
             ppid: 0,
             state: ProcessState::Ready,
-            page_table_root: None,
+            addr_space: None,
             kernel_stack_top: kstack_top,
             entry_point: entry,
             user_stack_top: stack_top,
@@ -919,7 +922,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: None,
+        addr_space: None,
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -980,7 +983,7 @@ pub fn spawn_process_with_cr3(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(cr3),
+        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1045,7 +1048,7 @@ pub fn spawn_process_with_cr3_and_fds(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(cr3),
+        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1396,7 +1399,10 @@ pub fn fork_child_trampoline() -> ! {
     let (cr3_phys, kstack_top) = {
         let table = PROCESS_TABLE.lock();
         let p = table.find(ctx.pid).expect("fork child: process not found");
-        (p.page_table_root, p.kernel_stack_top)
+        (
+            p.addr_space.as_ref().map(|a| a.pml4_phys()),
+            p.kernel_stack_top,
+        )
     };
 
     debug_assert!(

@@ -1126,6 +1126,33 @@ pub extern "C" fn syscall_handler(
 ) -> u64 {
     use syscall_nr::*;
 
+    // Phase 52b: debug-assert that per-core current_addrspace matches the
+    // calling process's addr_space (catches stale CR3 / process mismatch).
+    #[cfg(debug_assertions)]
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let pid = crate::process::current_pid();
+        if pid != 0 {
+            let expected = {
+                let table = crate::process::PROCESS_TABLE.lock();
+                table
+                    .find(pid)
+                    .and_then(|p| {
+                        p.addr_space
+                            .as_ref()
+                            .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                    })
+                    .unwrap_or_default()
+            };
+            debug_assert!(
+                pc.current_addrspace == expected,
+                "syscall_handler: current_addrspace mismatch for pid {} on core {}",
+                pid,
+                pc.core_id,
+            );
+        }
+    }
+
     // Divergent syscalls never return — handle them first.
     match number {
         SIGRETURN => sys_sigreturn(user_rsp),
@@ -1713,7 +1740,9 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     // Read the dying process's CR3 before we switch away from it.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        table.find(pid).and_then(|p| p.page_table_root)
+        table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
     };
     // Restore kernel page table before yielding so the next scheduled task
     // does not inherit this process's CR3.
@@ -3258,7 +3287,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.page_table_root = Some(x86_64::PhysAddr::new(new_cr3.start_address().as_u64()));
+            proc.addr_space = Some(alloc::sync::Arc::new(crate::mm::AddressSpace::new(
+                x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+            )));
             proc.entry_point = loaded.entry;
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
@@ -3460,17 +3491,36 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
 /// and `syscall_stack_top`. This function restores all per-process state
 /// so that the `sysretq` return path uses the correct values.
 pub(crate) fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
-    let (caller_cr3_phys, kstack_top, fs_base) = {
+    let (caller_cr3_phys, kstack_top, fs_base, new_as_ptr) = {
         let table = crate::process::PROCESS_TABLE.lock();
-        let cr3 = table.find(calling_pid).and_then(|p| p.page_table_root);
-        let kst = table
-            .find(calling_pid)
-            .map(|p| p.kernel_stack_top)
-            .unwrap_or(0);
-        let fsb = table.find(calling_pid).map(|p| p.fs_base).unwrap_or(0);
-        (cr3, kst, fsb)
+        match table.find(calling_pid) {
+            Some(p) => {
+                let cr3 = p.addr_space.as_ref().map(|a| a.pml4_phys());
+                let as_ptr = p
+                    .addr_space
+                    .as_ref()
+                    .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                    .unwrap_or(core::ptr::null());
+                (cr3, p.kernel_stack_top, p.fs_base, as_ptr)
+            }
+            None => (None, 0, 0, core::ptr::null()),
+        }
     };
     if let Some(phys) = caller_cr3_phys {
+        // Update per-core address space tracking.
+        if crate::smp::is_per_core_ready() {
+            let pc = crate::smp::per_core();
+            let old_as_ptr = pc.current_addrspace;
+            if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                unsafe { &*old_as_ptr }.deactivate_on_core(pc.core_id);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            if !new_as_ptr.is_null() {
+                unsafe { &*new_as_ptr }.activate_on_core(pc.core_id);
+            }
+            let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+            unsafe { (*pc_mut).current_addrspace = new_as_ptr };
+        }
         unsafe {
             use x86_64::{
                 registers::control::{Cr3, Cr3Flags},
@@ -6856,7 +6906,10 @@ fn sys_mmap_file_backed(
     // Get the process CR3 for the mapper.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(pid).and_then(|p| p.page_table_root) {
+        match table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
+        {
             Some(phys) => phys,
             None => return NEG_EINVAL,
         }
@@ -7556,7 +7609,10 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     // Get the process page table and map the frames.
     let cr3_phys = {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(pid).and_then(|p| p.page_table_root) {
+        match table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
+        {
             Some(phys) => phys,
             None => {
                 crate::fb::release_console_claim(pid);
@@ -10044,15 +10100,15 @@ fn sys_clone_thread(
         let table = PROCESS_TABLE.lock();
         match table.find(parent_pid) {
             Some(p) => {
-                let cr3 = match p.page_table_root {
-                    Some(cr3) => cr3,
+                let parent_addr_space = match p.addr_space.as_ref() {
+                    Some(a) => alloc::sync::Arc::clone(a),
                     None => {
                         log::warn!("sys_clone_thread: parent has no page table");
                         return NEG_EINVAL;
                     }
                 };
                 Some((
-                    cr3,
+                    parent_addr_space,
                     p.tgid,
                     p.ppid,
                     p.brk_current,
@@ -10080,7 +10136,7 @@ fn sys_clone_thread(
     };
 
     let (
-        parent_cr3,
+        parent_addr_space,
         parent_tgid,
         parent_ppid,
         parent_brk,
@@ -10206,7 +10262,7 @@ fn sys_clone_thread(
         clear_child_tid: child_clear_tid,
         ppid: parent_ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(parent_cr3), // SHARED — same physical page table
+        addr_space: Some(parent_addr_space), // SHARED — same AddressSpace via Arc
         kernel_stack_top: kstack_top,
         entry_point: user_rip,
         user_stack_top: child_stack,
@@ -10558,22 +10614,22 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
     let is_private = (op & FUTEX_PRIVATE_FLAG) != 0;
     let cmd = op & !(FUTEX_PRIVATE_FLAG);
 
-    // Build the futex key: (page_table_root, uaddr).
+    // Build the futex key: (addr_space pml4_phys, uaddr).
     // Private futexes use 0 as root; shared futexes use the real CR3.
-    let page_table_root = if is_private {
+    let futex_root = if is_private {
         0u64
     } else {
         let pid = crate::process::current_pid();
         match crate::process::PROCESS_TABLE
             .lock()
             .find(pid)
-            .and_then(|p| p.page_table_root.map(|a| a.as_u64()))
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))
         {
             Some(root) => root,
-            None => return NEG_EINVAL, // non-private futex requires a page table root
+            None => return NEG_EINVAL, // non-private futex requires an address space
         }
     };
-    let key = (page_table_root, uaddr);
+    let key = (futex_root, uaddr);
 
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
