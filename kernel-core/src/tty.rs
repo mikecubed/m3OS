@@ -492,9 +492,11 @@ impl LineDiscipline {
 
             // Newline: deliver line.
             if byte == b'\n' {
-                let data = &self.edit_buf.buf[..self.edit_buf.len];
-                push_fn(data);
-                self.edit_buf.clear();
+                if !self.edit_buf.is_empty() {
+                    let data = &self.edit_buf.buf[..self.edit_buf.len];
+                    push_fn(data);
+                    self.edit_buf.clear();
+                }
                 push_fn(b"\n");
 
                 let mut echo = SmallVec::new();
@@ -895,6 +897,17 @@ mod tests {
         if let LdiscResult::LineComplete { echo } = result {
             assert_eq!(echo.as_slice(), b"\r\n");
         }
+    }
+
+    #[test]
+    fn ldisc_canonical_empty_newline_no_eof() {
+        // Pressing Enter on an empty line must NOT trigger EOF (push_fn(&[])).
+        // It should just push "\n".
+        let mut ld = LineDiscipline::new();
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        // Only the newline — no empty-slice push.
+        assert_eq!(pushed, b"\n");
     }
 
     #[test]
