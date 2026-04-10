@@ -113,24 +113,11 @@ static IRQ_MAP: [AtomicU8; 16] = [
 ///
 /// The task index (not `TaskId`) is stored because the scheduler needs it for
 /// direct state manipulation without a linear search.
-static ISR_WAITERS: [AtomicI32; MAX_NOTIFS] = [
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-    AtomicI32::new(-1),
-];
+#[allow(clippy::declare_interior_mutable_const)]
+static ISR_WAITERS: [AtomicI32; MAX_NOTIFS] = {
+    const NO_WAITER: AtomicI32 = AtomicI32::new(-1);
+    [NO_WAITER; MAX_NOTIFS]
+};
 
 // ---------------------------------------------------------------------------
 // Mutex-protected waiter state (task context only)
