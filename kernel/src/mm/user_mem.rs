@@ -311,8 +311,15 @@ impl UserSliceRo {
     }
 
     /// Read a single `Copy` value from user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be a type where every bit pattern is valid (e.g. integer
+    /// primitives, `#[repr(C)]` structs of such types). Using types like
+    /// `bool`, `char`, enums, or `NonZero*` is undefined behavior because
+    /// user-supplied bytes may not form a valid value.
     #[allow(dead_code)]
-    pub fn read_val<T: Copy>(&self) -> Result<T, ()> {
+    pub unsafe fn read_val<T: Copy>(&self) -> Result<T, ()> {
         if core::mem::size_of::<T>() > self.len {
             return Err(());
         }
@@ -323,6 +330,7 @@ impl UserSliceRo {
         }
         copy_from_user(&mut buf[..size], self.vaddr)?;
         // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        // Caller guarantees T allows all bit patterns.
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
     }
 
@@ -354,12 +362,20 @@ impl UserSliceWo {
     }
 
     /// Write a single `Copy` value to user memory.
+    ///
+    /// # Safety
+    ///
+    /// `T` must not contain padding bytes. Padding is uninitialized memory
+    /// and copying it to userspace leaks kernel stack/register contents.
+    /// Use only with integer primitives or `#[repr(C)]` structs that have
+    /// no padding (e.g. all fields naturally aligned with no gaps).
     #[allow(dead_code)]
-    pub fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+    pub unsafe fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
         let size = core::mem::size_of::<T>();
         if size > self.len {
             return Err(());
         }
+        // SAFETY: Caller guarantees T has no padding bytes.
         let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
         copy_to_user(self.vaddr, bytes)
     }
@@ -401,7 +417,14 @@ impl UserSliceRw {
     }
 
     /// Read a single `Copy` value from user memory.
-    pub fn read_val<T: Copy>(&self) -> Result<T, ()> {
+    ///
+    /// # Safety
+    ///
+    /// `T` must be a type where every bit pattern is valid (e.g. integer
+    /// primitives, `#[repr(C)]` structs of such types). Using types like
+    /// `bool`, `char`, enums, or `NonZero*` is undefined behavior because
+    /// user-supplied bytes may not form a valid value.
+    pub unsafe fn read_val<T: Copy>(&self) -> Result<T, ()> {
         if core::mem::size_of::<T>() > self.len {
             return Err(());
         }
@@ -412,15 +435,24 @@ impl UserSliceRw {
         }
         copy_from_user(&mut buf[..size], self.vaddr)?;
         // SAFETY: buf[..size] is initialized and size_of::<T>() == size.
+        // Caller guarantees T allows all bit patterns.
         Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
     }
 
     /// Write a single `Copy` value to user memory.
-    pub fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
+    ///
+    /// # Safety
+    ///
+    /// `T` must not contain padding bytes. Padding is uninitialized memory
+    /// and copying it to userspace leaks kernel stack/register contents.
+    /// Use only with integer primitives or `#[repr(C)]` structs that have
+    /// no padding (e.g. all fields naturally aligned with no gaps).
+    pub unsafe fn write_val<T: Copy>(&self, val: &T) -> Result<(), ()> {
         let size = core::mem::size_of::<T>();
         if size > self.len {
             return Err(());
         }
+        // SAFETY: Caller guarantees T has no padding bytes.
         let bytes = unsafe { core::slice::from_raw_parts(val as *const T as *const u8, size) };
         copy_to_user(self.vaddr, bytes)
     }

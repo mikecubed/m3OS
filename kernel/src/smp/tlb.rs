@@ -114,13 +114,14 @@ pub fn tlb_shootdown(addr: u64) {
 pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end: u64) {
     let _lock = SHOOTDOWN_LOCK.lock();
 
-    let page_count = end.saturating_sub(start).div_ceil(4096);
-    let use_cr3_reload = page_count > INVLPG_THRESHOLD;
-
     // Align the range to page boundaries so every page intersecting
     // [start, end) is invalidated, even when start or end are not aligned.
     let aligned_start = start & !(4096 - 1);
     let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
+
+    // Base the threshold decision on the aligned flush range.
+    let page_count = aligned_end.saturating_sub(aligned_start).div_ceil(4096);
+    let use_cr3_reload = page_count > INVLPG_THRESHOLD;
 
     // Local flush first.
     if use_cr3_reload {
@@ -152,22 +153,29 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
     SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
     SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
 
-    // Send IPIs only to targeted cores that are reachable, and count only
-    // those sends so the pending count matches acknowledgments that can arrive.
+    // Count targeted cores first so the pending count is initialized before
+    // any IPI is sent — otherwise a remote core can handle the IPI and
+    // fetch_sub(1) while SHOOTDOWN_PENDING is still 0, causing underflow.
     let online = online_core_count();
-    let mut sent = 0u8;
+    let mut targets = 0u8;
     for core_id in 0..64u8 {
         if remote_mask & (1u64 << core_id) != 0 && core_id < online {
-            ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
-            sent = sent.saturating_add(1);
+            targets = targets.saturating_add(1);
         }
     }
 
-    if sent == 0 {
+    if targets == 0 {
         return;
     }
 
-    SHOOTDOWN_PENDING.store(sent, Ordering::Release);
+    SHOOTDOWN_PENDING.store(targets, Ordering::Release);
+
+    // Now that the pending count is visible, send the IPIs.
+    for core_id in 0..64u8 {
+        if remote_mask & (1u64 << core_id) != 0 && core_id < online {
+            ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+        }
+    }
 
     // Spin-wait for acknowledgment from all targeted cores.
     while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
