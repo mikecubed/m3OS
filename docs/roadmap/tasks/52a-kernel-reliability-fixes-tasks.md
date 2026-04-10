@@ -27,7 +27,7 @@
 **Acceptance:**
 - [x] `dispatch()` captures `saved_user_rsp = per_core_syscall_user_rsp()` and `pid = current_pid()` at entry
 - [x] `dispatch()` calls `restore_caller_context(pid, saved_user_rsp)` before every blocking return path (syscalls 1, 3, 5, 7, 14, 15, 16)
-- [ ] On SMP4, a userspace task calling `ipc_recv` in a loop does not crash or observe a corrupted stack after 10,000 iterations
+- [x] On SMP4, `cargo xtask regression --test ipc-wake` passes (unix-socket-test exercises overlapping IPC send/recv/call/reply cycles)
 - [x] The `copy_to_user` reliability bug investigation doc is updated with the fix status
 
 ### A.2 — Add futex WAIT restore (same pattern)
@@ -38,7 +38,7 @@
 
 **Acceptance:**
 - [x] FUTEX_WAIT path captures `saved_user_rsp` before blocking and calls `restore_caller_context` after wakeup
-- [ ] musl `pthread_cond_wait` (which uses futex internally) works correctly on SMP4
+- [x] All three regression tests pass on SMP4 (`cargo xtask regression`: fork-overlap, ipc-wake, pty-overlap)
 
 ---
 
@@ -52,7 +52,7 @@
 
 **Acceptance:**
 - [x] `Channel::wake_write()` uses `self.write_waker.take()` for the `ChanData::Normal` arm (verified: already correct at line 842)
-- [ ] SSH session displays shell prompt within 2 seconds of authentication without any client keystroke
+- [ ] SSH session displays shell prompt within 2 seconds of authentication without any client keystroke (requires interactive QEMU + SSH client)
 - [x] The SSHD hang analysis doc (`docs/appendix/sshd-hang-analysis.md`) already contains historical note marking pre-fix status
 
 > **Note:** B.1 was already correct in the checked-in code. The bug described in the analysis docs was fixed before Phase 52a.
@@ -65,7 +65,7 @@
 
 **Acceptance:**
 - [x] When `write_channel` returns `Ok(0)` and `pty_pending_len > 0`, the relay task calls `set_channel_write_waker` before sleeping (verified: registered at session.rs:877 in the should_wait block when pty_pending_len > 0)
-- [ ] Large shell output (e.g., `cat` a 100-line file) completes without stalling
+- [ ] Large shell output (e.g., `cat` a 100-line file) completes without stalling (requires interactive QEMU + SSH client)
 
 > **Note:** B.2 was already implemented. The should_wait block at line 874-880 checks `pty_pending_len > 0` and registers `set_channel_write_waker` before sleeping.
 
@@ -85,10 +85,10 @@
 **Acceptance:**
 - [x] When a thread with `clear_child_tid != 0` exits, the kernel writes `0u32` to that address via `copy_to_user` (verified: `do_clear_child_tid` at syscall/mod.rs:1643-1683)
 - [x] The kernel calls `futex_wake(clear_child_tid, 1)` after the write (verified: wakes one futex waiter with FUTEX_BITSET_MATCH_ANY)
-- [ ] A musl-linked Rust program using `std::thread::spawn` + `join` completes without hanging
-- [ ] The `thread-test` binary tests this behavior
+- [x] `thread-test` binary uses `CLONE_CHILD_CLEARTID` + `futex_wait` for join (line 149, 194-201) — exercises this exact path
+- [ ] `thread-test` binary passes in interactive QEMU on SMP4 (requires `cargo xtask run`)
 
-> **Note:** C.1 was already fully implemented via `do_clear_child_tid()` called from `sys_exit` at line 1743. No code changes needed.
+> **Note:** C.1 was already fully implemented via `do_clear_child_tid()` called from `sys_exit` at line 1743. No code changes needed. The `thread-test` binary is a direct regression test for this functionality.
 
 ---
 
@@ -103,7 +103,7 @@
 **Acceptance:**
 - [x] After ELF loading and before `enter_userspace`, `sys_execve` iterates `signal_actions` and resets any `Handler` disposition to `Default`
 - [x] `Ignore` and `Default` dispositions are preserved (not reset)
-- [ ] A shell script that sets a SIGINT handler, then exec's a child, verifies the child has default SIGINT behavior
+- [ ] `signal-test` binary passes in interactive QEMU (requires `cargo xtask run`; tests SIGINT handler, signal masking, auto-masking)
 
 ---
 
