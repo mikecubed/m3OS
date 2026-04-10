@@ -109,13 +109,10 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         None => return err_val,
     };
 
-    // Capture per-core syscall state before any blocking IPC operation.
-    // After a context switch the per-core `syscall_user_rsp` (and related
-    // fields) may belong to a different task.  Blocking IPC paths (1, 3, 5,
-    // 7, 14, 15, 16) must call `restore_caller_context` before returning so
-    // that the `sysretq` path uses the correct values.
-    let calling_pid = crate::process::current_pid();
-    let saved_user_rsp = crate::arch::x86_64::syscall::per_core_syscall_user_rsp();
+    // Per-core syscall state (syscall_user_rsp, syscall_stack_top, FS.base)
+    // is now saved/restored automatically by the scheduler via
+    // UserReturnState, so blocking IPC paths no longer need manual
+    // restore_caller_context calls.
 
     // Syscalls 10, 11, and 12 do not use arg0 as a cap handle — handle them
     // before the cap-lookup preamble.
@@ -192,12 +189,10 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         1 => {
             // ipc_recv(ep_cap_handle) — blocks until a sender arrives.
-            let result = match cap {
+            match cap {
                 Capability::Endpoint(ep_id) => endpoint::recv(task_id, ep_id),
                 _ => u64::MAX,
-            };
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            }
         }
         2 => {
             // ipc_send(ep_cap_handle, label, data0)
@@ -215,15 +210,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         3 => {
             // ipc_call(ep_cap_handle, label, data0) — blocks until reply.
-            let result = match cap {
+            match cap {
                 Capability::Endpoint(ep_id) => {
                     let msg = message::Message::with2(arg1, arg2, 0);
                     endpoint::call(task_id, ep_id, msg)
                 }
                 _ => u64::MAX,
-            };
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            }
         }
         4 => {
             // ipc_reply(reply_cap_handle, label, data0)
@@ -259,19 +252,15 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // Consume reply cap (arg0 already range-checked above).
             let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
             let reply = message::Message::new(arg1);
-            let result = endpoint::reply_recv(task_id, caller_id, ep_id, reply);
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            endpoint::reply_recv(task_id, caller_id, ep_id, reply)
         }
         7 => {
             // notify_wait(notif_cap_handle) — blocks until bits are pending.
             // Errors return 0, not u64::MAX.
-            let result = match cap {
+            match cap {
                 Capability::Notification(notif_id) => notification::wait(task_id, notif_id),
                 _ => 0,
-            };
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            }
         }
         8 => {
             // notify_signal(notif_cap_handle, bits)
@@ -302,24 +291,20 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         14 => {
             // ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len) — blocks until reply.
-            let result = match cap {
+            match cap {
                 Capability::Endpoint(ep_id) => {
                     let msg = message::Message::with2(arg1, arg2, 0);
                     ipc_send_with_bulk(task_id, ep_id, msg, arg3, arg4, true)
                 }
                 _ => u64::MAX,
-            };
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            }
         }
         15 => {
             // ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len) — blocks until a sender arrives.
-            let result = match cap {
+            match cap {
                 Capability::Endpoint(ep_id) => ipc_recv_msg(task_id, ep_id, arg1, arg2, arg3),
                 _ => u64::MAX,
-            };
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            }
         }
         16 => {
             // ipc_reply_recv_msg(reply_cap, reply_label, ep_cap, msg_ptr, buf_ptr, buf_len)
@@ -346,9 +331,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // Read buf_len from the 6th syscall register (r9), capped at
             // MAX_BULK_LEN to match ipc_recv_msg's bounds.
             let buf_len = crate::smp::per_core().syscall_user_r9;
-            let result = ipc_recv_msg(task_id, ep_id, arg3, arg4, buf_len);
-            crate::arch::x86_64::syscall::restore_caller_context(calling_pid, saved_user_rsp);
-            result
+            ipc_recv_msg(task_id, ep_id, arg3, arg4, buf_len)
         }
         _ => u64::MAX,
     }

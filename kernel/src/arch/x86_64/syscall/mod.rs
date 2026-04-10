@@ -1452,7 +1452,6 @@ fn check_pending_signals(syscall_result: u64) {
                             }
                         }
                         crate::process::send_sigchld_to_parent(pid);
-                        let sig_saved_rsp = per_core_syscall_user_rsp();
                         while {
                             let table = crate::process::PROCESS_TABLE.lock();
                             table
@@ -1461,7 +1460,6 @@ fn check_pending_signals(syscall_result: u64) {
                                 .unwrap_or(false)
                         } {
                             crate::task::yield_now();
-                            restore_caller_context(pid, sig_saved_rsp);
                         }
                     }
                     SignalDisposition::Continue | SignalDisposition::Ignore => {}
@@ -2652,13 +2650,9 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         .saturating_mul(1_000_000)
         .saturating_add((nsecs as u64) / 1_000);
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
-
     if sleep_us == 0 {
         // Zero sleep: yield once to be cooperative (standard POSIX behaviour).
         crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
         return 0;
     }
 
@@ -2670,7 +2664,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         let start = crate::arch::x86_64::interrupts::tick_count();
         while crate::arch::x86_64::interrupts::tick_count().wrapping_sub(start) < ticks {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             if has_pending_signal() {
                 return NEG_EINTR;
             }
@@ -2694,7 +2687,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         // which AP DOOM runs on — each yield costs ~10 ms at the AP timer
         // granularity, which is acceptable for multi-millisecond sleeps.
         crate::task::yield_now();
-        restore_caller_context(pid, saved_user_rsp);
         if has_pending_signal() {
             return NEG_EINTR;
         }
@@ -2702,7 +2694,6 @@ pub(super) fn sys_nanosleep(req_ptr: u64) -> u64 {
         let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
         while unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) < sleep_tsc {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             if has_pending_signal() {
                 return NEG_EINTR;
             }
@@ -3359,7 +3350,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
     let target_pid = pid as i64;
     let calling_pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
     const WNOHANG: u64 = 0x1;
     const WUNTRACED: u64 = 0x2;
     let report_stopped = options & WUNTRACED != 0;
@@ -3446,9 +3436,6 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         };
 
         if let Some((child_pid, code_opt, stopped)) = result {
-            // Restore caller context.
-            restore_caller_context(calling_pid, saved_user_rsp);
-
             // Write wstatus.
             if status_ptr != 0 {
                 let wstatus = if stopped {
@@ -3480,68 +3467,6 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
         }
         // Yield and try again.
         crate::task::yield_now();
-        restore_caller_context(calling_pid, saved_user_rsp);
-    }
-}
-
-/// Restore the caller's CR3, kernel stack, and user RSP after a yield.
-///
-/// When a syscall handler calls `yield_now()` to block, another task may
-/// enter the kernel via syscall and overwrite the per-core `syscall_user_rsp`
-/// and `syscall_stack_top`. This function restores all per-process state
-/// so that the `sysretq` return path uses the correct values.
-pub(crate) fn restore_caller_context(calling_pid: crate::process::Pid, saved_user_rsp: u64) {
-    let (caller_cr3_phys, kstack_top, fs_base, new_as_ptr) = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        match table.find(calling_pid) {
-            Some(p) => {
-                let cr3 = p.addr_space.as_ref().map(|a| a.pml4_phys());
-                let as_ptr = p
-                    .addr_space
-                    .as_ref()
-                    .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
-                    .unwrap_or(core::ptr::null());
-                (cr3, p.kernel_stack_top, p.fs_base, as_ptr)
-            }
-            None => (None, 0, 0, core::ptr::null()),
-        }
-    };
-    if let Some(phys) = caller_cr3_phys {
-        // Update per-core address space tracking.
-        if crate::smp::is_per_core_ready() {
-            let pc = crate::smp::per_core();
-            let old_as_ptr = pc.current_addrspace;
-            if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
-                unsafe { &*old_as_ptr }.deactivate_on_core(pc.core_id);
-            }
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            if !new_as_ptr.is_null() {
-                unsafe { &*new_as_ptr }.activate_on_core(pc.core_id);
-            }
-            let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-            unsafe { (*pc_mut).current_addrspace = new_as_ptr };
-        }
-        unsafe {
-            use x86_64::{
-                registers::control::{Cr3, Cr3Flags},
-                structures::paging::PhysFrame,
-            };
-            let frame = PhysFrame::from_start_address(phys).expect("caller cr3 unaligned");
-            Cr3::write(frame, Cr3Flags::empty());
-        }
-    }
-    crate::process::set_current_pid(calling_pid);
-    // Restore per-core syscall state.
-    let data =
-        crate::smp::per_core() as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-    unsafe {
-        (*data).syscall_user_rsp = saved_user_rsp;
-        if kstack_top != 0 {
-            (*data).syscall_stack_top = kstack_top;
-            crate::smp::set_current_core_kernel_stack(kstack_top);
-        }
-        // Restore FS.base (TLS pointer) for this process.
-        x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs_base));
     }
 }
 
@@ -4007,8 +3932,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Read from kernel stdin buffer.
             let capped = (count as usize).min(4096);
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 if crate::stdin::has_data() {
                     let mut tmp = [0u8; 4096];
@@ -4028,7 +3951,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::Stdout => NEG_EBADF,
@@ -4155,8 +4077,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             let pipe_id = *pipe_id;
             let nonblock = entry.nonblock;
             let capped = (count as usize).min(4096);
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until data is available or writer closes.
             loop {
                 let mut tmp = [0u8; 4096];
@@ -4176,7 +4096,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -4249,8 +4168,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Master reads from s2m (slave-to-master) buffer.
             let pty_id = *pty_id;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -4281,7 +4198,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::PtySlave { pty_id } => {
@@ -4291,8 +4207,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             // Slave reads from m2s (master-to-slave) buffer via line discipline.
             let pty_id = *pty_id;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             loop {
                 {
                     let mut table = crate::pty::PTY_TABLE.lock();
@@ -4353,7 +4267,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         FdBackend::Socket { .. } => {
@@ -4366,8 +4279,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
             let handle = *handle;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             let capped = (count as usize).min(4096);
             let sock_type = crate::net::unix::with_unix_socket(handle, |s| s.socket_type);
             match sock_type {
@@ -4391,7 +4302,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     return NEG_EINTR;
                                 }
                                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                                restore_caller_context(pid, saved_user_rsp);
                             }
                             Err(e) => return e as u64, // ENOTCONN, etc.
                         }
@@ -4415,7 +4325,6 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                     return NEG_EINTR;
                                 }
                                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                                restore_caller_context(pid, saved_user_rsp);
                             }
                             Err(e) => return e as u64,
                         }
@@ -4664,8 +4573,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             if crate::mm::user_mem::copy_from_user(&mut buf[..len], buf_ptr).is_err() {
                 return NEG_EFAULT;
             }
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             // Yield-loop until space is available or reader closes.
             loop {
                 match crate::pipe::pipe_write(pipe_id, &buf[..len]) {
@@ -4684,7 +4591,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -4902,8 +4808,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         FdBackend::UnixSocket { handle } => {
             let handle = *handle;
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             let capped = (count as usize).min(4096);
             let mut data = alloc::vec![0u8; capped];
             if crate::mm::user_mem::copy_from_user(&mut data, buf_ptr).is_err() {
@@ -4923,7 +4827,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                 return NEG_EINTR;
                             }
                             crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                            restore_caller_context(pid, saved_user_rsp);
                         }
                         Err(e) => return e as u64, // EPIPE, ENOTCONN, etc.
                     }
@@ -4952,7 +4855,6 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
                                         return NEG_EINTR;
                                     }
                                     crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
-                                    restore_caller_context(pid, saved_user_rsp);
                                 }
                                 Err(e) => return e as u64,
                             }
@@ -10740,18 +10642,11 @@ pub(super) fn sys_futex(uaddr: u64, op: u64, val: u64, val3: u64) -> u64 {
                 });
             }
 
-            // Capture per-core syscall state before blocking — after a
-            // context switch the per-core values belong to a different task.
-            let futex_calling_pid = crate::process::current_pid();
-            let futex_saved_user_rsp = per_core_syscall_user_rsp();
-
             // Atomically check the woken flag and block under the scheduler
             // lock to avoid a missed-wakeup race where a waker sets the flag
             // and calls wake_task() between our check and block.
             crate::task::block_current_on_futex_unless_woken(&woken_flag);
 
-            // Woken — restore caller context so sysretq uses correct values.
-            restore_caller_context(futex_calling_pid, futex_saved_user_rsp);
             0
         }
 
@@ -11192,8 +11087,6 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
             // Block until accepted (state transitions to Connected) or return EAGAIN.
             let nonblock = entry.nonblock;
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
             loop {
                 let state = crate::net::unix::with_unix_socket(handle, |s| s.state);
                 if state == Some(crate::net::unix::UnixSocketState::Connected) {
@@ -11211,7 +11104,6 @@ fn sys_connect_unix(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                     return if nonblock { NEG_EAGAIN } else { NEG_EINTR };
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
         crate::net::unix::UnixSocketType::Datagram => {
@@ -11260,8 +11152,6 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
     }
 
     let nonblock = entry.nonblock;
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
 
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x80000;
@@ -11334,7 +11224,6 @@ fn sys_accept_unix(fd: u64, addr_ptr: u64, addr_len_ptr: u64, flags: u64) -> u64
             return NEG_EINTR;
         }
         crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-        restore_caller_context(pid, saved_user_rsp);
     }
 }
 
@@ -11433,8 +11322,6 @@ fn sys_sendto_unix(
         }
     };
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
     loop {
         match crate::net::unix::unix_dgram_send(sender_path.clone(), target, &data) {
             Ok(n) => {
@@ -11450,7 +11337,6 @@ fn sys_sendto_unix(
                     return NEG_EINTR;
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[target].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
             Err(e) => return e as u64, // ECONNREFUSED, etc.
         }
@@ -11466,8 +11352,6 @@ fn sys_recvfrom_unix(
     addr_ptr: u64,
     addr_len_ptr: u64,
 ) -> u64 {
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = crate::smp::per_core().syscall_user_rsp;
     let capped = (count as usize).min(4096);
     let mut tmp = alloc::vec![0u8; capped];
     loop {
@@ -11489,7 +11373,6 @@ fn sys_recvfrom_unix(
                     return NEG_EINTR;
                 }
                 crate::net::unix::UNIX_SOCKET_WAITQUEUES[handle].sleep();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
     }
@@ -11641,8 +11524,6 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             });
 
             // Block until connected or error
-            let pid = crate::process::current_pid();
-            let saved_user_rsp = per_core_syscall_user_rsp();
             let start_tick = crate::arch::x86_64::interrupts::tick_count();
             loop {
                 let state = crate::net::tcp::state(tcp_idx);
@@ -11677,7 +11558,6 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -11756,8 +11636,6 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
     };
 
     // Block until an incoming connection is established
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
     loop {
         let state = crate::net::tcp::state(tcp_idx);
         match state {
@@ -11855,7 +11733,6 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                     return NEG_EINTR;
                 }
                 crate::task::yield_now();
-                restore_caller_context(pid, saved_user_rsp);
             }
         }
     }
@@ -12095,8 +11972,6 @@ pub(super) fn sys_recvfrom_socket(
                         Some(idx) => idx,
                         None => return NEG_ENOTCONN,
                     };
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         let mut tmp = [0u8; 4096];
                         let n = crate::net::tcp::recv(tcp_idx, &mut tmp[..capped]);
@@ -12137,52 +12012,42 @@ pub(super) fn sys_recvfrom_socket(
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
-                crate::net::SocketProtocol::Udp => {
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
-                    loop {
-                        if let Some(dgram) = crate::net::udp::recv(local_port) {
-                            let n = dgram.data.len().min(capped);
-                            if crate::mm::user_mem::copy_to_user(buf_ptr, &dgram.data[..n]).is_err()
+                crate::net::SocketProtocol::Udp => loop {
+                    if let Some(dgram) = crate::net::udp::recv(local_port) {
+                        let n = dgram.data.len().min(capped);
+                        if crate::mm::user_mem::copy_to_user(buf_ptr, &dgram.data[..n]).is_err() {
+                            return NEG_EFAULT;
+                        }
+                        if addr_ptr != 0 {
+                            if let Err(e) = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
                             {
-                                return NEG_EFAULT;
+                                return e;
                             }
-                            if addr_ptr != 0 {
-                                if let Err(e) =
-                                    sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
+                            if addr_len_ptr != 0 {
+                                let len_buf = 16u32.to_ne_bytes();
+                                if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
+                                    .is_err()
                                 {
-                                    return e;
-                                }
-                                if addr_len_ptr != 0 {
-                                    let len_buf = 16u32.to_ne_bytes();
-                                    if crate::mm::user_mem::copy_to_user(addr_len_ptr, &len_buf)
-                                        .is_err()
-                                    {
-                                        return NEG_EFAULT;
-                                    }
+                                    return NEG_EFAULT;
                                 }
                             }
-                            return n as u64;
                         }
-                        if nonblock {
-                            return NEG_EAGAIN;
-                        }
-                        if has_pending_signal() {
-                            return NEG_EINTR;
-                        }
-                        crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
+                        return n as u64;
                     }
-                }
+                    if nonblock {
+                        return NEG_EAGAIN;
+                    }
+                    if has_pending_signal() {
+                        return NEG_EINTR;
+                    }
+                    crate::task::yield_now();
+                },
                 crate::net::SocketProtocol::Icmp => {
                     // Wait for ICMP echo reply
                     use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
                     use core::sync::atomic::Ordering;
-                    let pid = crate::process::current_pid();
-                    let saved_user_rsp = per_core_syscall_user_rsp();
                     loop {
                         if PING_REPLY_RECEIVED.load(Ordering::Acquire) {
                             PING_REPLY_RECEIVED.store(false, Ordering::Release);
@@ -12216,7 +12081,6 @@ pub(super) fn sys_recvfrom_socket(
                             return NEG_EINTR;
                         }
                         crate::task::yield_now();
-                        restore_caller_context(pid, saved_user_rsp);
                     }
                 }
             }
@@ -12238,8 +12102,6 @@ pub(super) fn sys_recvfrom_socket(
                     Err(_) => NEG_EAGAIN,
                 }
             } else {
-                let pid = crate::process::current_pid();
-                let saved_user_rsp = per_core_syscall_user_rsp();
                 loop {
                     let mut tmp = [0u8; 4096];
                     match crate::pipe::pipe_read(pipe_id, &mut tmp[..len]) {
@@ -12255,7 +12117,6 @@ pub(super) fn sys_recvfrom_socket(
                                 return NEG_EINTR;
                             }
                             crate::task::yield_now();
-                            restore_caller_context(pid, saved_user_rsp);
                         }
                     }
                 }
@@ -12831,8 +12692,6 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
     } else {
         None // 0 = non-blocking, -1 = indefinite
     };
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
 
     // Read all pollfd structs from userspace once.
     let mut pfds = [[0u8; 8]; 256];
@@ -12920,7 +12779,6 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         // blocking forever with no wake source.
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -12960,11 +12818,9 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for i in 0..nfds {
                 if let Some(entry) = &entries[i] {
                     fd_deregister_waiter(entry, task_id);
@@ -13087,9 +12943,6 @@ fn select_inner(
         }
     }
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
-
     loop {
         let mut r_out: u32 = 0;
         let mut w_out: u32 = 0;
@@ -13156,7 +13009,6 @@ fn select_inner(
 
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -13197,11 +13049,9 @@ fn select_inner(
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (NULL): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for fd in 0..nfds {
                 if let Some(entry) = &entries[fd]
                     && combined & (1 << fd) != 0
@@ -13497,9 +13347,6 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         None => return NEG_EBADF,
     };
 
-    let pid = crate::process::current_pid();
-    let saved_user_rsp = per_core_syscall_user_rsp();
-
     loop {
         // Scan interest list for ready FDs.
         let mut out_count = 0usize;
@@ -13574,7 +13421,6 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
         // If no pollable FDs were registered, yield once to avoid infinite blocking.
         if !registered_any {
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
             continue;
         }
 
@@ -13607,11 +13453,9 @@ pub(super) fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout
                 }
             }
             crate::task::yield_now();
-            restore_caller_context(pid, saved_user_rsp);
         } else {
             // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            restore_caller_context(pid, saved_user_rsp);
             for interest in &interests {
                 if let Some(entry) = current_fd_entry(interest.fd) {
                     fd_deregister_waiter(&entry, task_id);

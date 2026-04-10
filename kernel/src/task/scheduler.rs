@@ -506,6 +506,16 @@ pub fn yield_now() {
         // switch_context saves the RSP. This prevents the global fallback from
         // picking up the task with a stale saved_rsp on another core.
         sched.tasks[idx].switching_out = true;
+        // Save per-core user state into the task for scheduler restore.
+        if sched.tasks[idx].pid != 0 {
+            let pc = crate::smp::per_core();
+            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
+                user_rsp: pc.syscall_user_rsp,
+                kernel_stack_top: pc.syscall_stack_top,
+                fs_base: fs,
+            });
+        }
         set_current_task_idx(None);
         idx
     };
@@ -579,6 +589,16 @@ fn block_current(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
+        // Save per-core user state into the task for scheduler restore.
+        if sched.tasks[idx].pid != 0 {
+            let pc = crate::smp::per_core();
+            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
+                user_rsp: pc.syscall_user_rsp,
+                kernel_stack_top: pc.syscall_stack_top,
+                fs_base: fs,
+            });
+        }
         set_current_task_idx(None);
         idx
     };
@@ -612,6 +632,16 @@ fn block_current_unless_message(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
+        // Save per-core user state into the task for scheduler restore.
+        if sched.tasks[idx].pid != 0 {
+            let pc = crate::smp::per_core();
+            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
+                user_rsp: pc.syscall_user_rsp,
+                kernel_stack_top: pc.syscall_stack_top,
+                fs_base: fs,
+            });
+        }
         set_current_task_idx(None);
         idx
     };
@@ -668,6 +698,16 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
+        // Save per-core user state into the task for scheduler restore.
+        if sched.tasks[idx].pid != 0 {
+            let pc = crate::smp::per_core();
+            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
+                user_rsp: pc.syscall_user_rsp,
+                kernel_stack_top: pc.syscall_stack_top,
+                fs_base: fs,
+            });
+        }
         set_current_task_idx(None);
         idx
     };
@@ -693,6 +733,16 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
+        // Save per-core user state into the task for scheduler restore.
+        if sched.tasks[idx].pid != 0 {
+            let pc = crate::smp::per_core();
+            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
+                user_rsp: pc.syscall_user_rsp,
+                kernel_stack_top: pc.syscall_stack_top,
+                fs_base: fs,
+            });
+        }
         set_current_task_idx(None);
         idx
     };
@@ -1026,6 +1076,25 @@ pub fn run() -> ! {
                     }
                 }
                 x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs));
+            }
+        }
+
+        // Restore per-core syscall_user_rsp from the task's UserReturnState.
+        // This eliminates the need for manual restore_caller_context calls
+        // after blocking syscalls.
+        {
+            let sched = SCHEDULER.lock();
+            if let Some(task) = sched.get_task(_task_idx)
+                && let Some(ref urs) = task.user_return
+            {
+                let data = crate::smp::per_core() as *const crate::smp::PerCoreData
+                    as *mut crate::smp::PerCoreData;
+                unsafe {
+                    (*data).syscall_user_rsp = urs.user_rsp;
+                }
+                // kstack and fs_base are already restored from PROCESS_TABLE above,
+                // but we could also use urs values. For now, keep the PROCESS_TABLE
+                // path for those since it's authoritative.
             }
         }
 
