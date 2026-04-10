@@ -437,6 +437,20 @@ fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
     sched.tasks[idx].user_ticks += elapsed;
 }
 
+/// Snapshot per-core user state (RSP, kernel stack, FS base) into the task
+/// so the scheduler can restore it on re-dispatch. No-op for kernel tasks.
+fn save_user_return_state(task: &mut Task) {
+    if task.pid != 0 {
+        let pc = crate::smp::per_core();
+        let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+        task.user_return = Some(crate::task::UserReturnState {
+            user_rsp: pc.syscall_user_rsp,
+            kernel_stack_top: pc.syscall_stack_top,
+            fs_base: fs,
+        });
+    }
+}
+
 /// Per-core pending re-enqueue slot. When a task yields, its index is stored
 /// here instead of being immediately enqueued. The scheduler loop re-enqueues
 /// it AFTER `switch_context` has saved the task's RSP, preventing a race where
@@ -506,16 +520,7 @@ pub fn yield_now() {
         // switch_context saves the RSP. This prevents the global fallback from
         // picking up the task with a stale saved_rsp on another core.
         sched.tasks[idx].switching_out = true;
-        // Save per-core user state into the task for scheduler restore.
-        if sched.tasks[idx].pid != 0 {
-            let pc = crate::smp::per_core();
-            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
-                user_rsp: pc.syscall_user_rsp,
-                kernel_stack_top: pc.syscall_stack_top,
-                fs_base: fs,
-            });
-        }
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -589,16 +594,7 @@ fn block_current(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
-        // Save per-core user state into the task for scheduler restore.
-        if sched.tasks[idx].pid != 0 {
-            let pc = crate::smp::per_core();
-            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
-                user_rsp: pc.syscall_user_rsp,
-                kernel_stack_top: pc.syscall_stack_top,
-                fs_base: fs,
-            });
-        }
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -632,16 +628,7 @@ fn block_current_unless_message(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
-        // Save per-core user state into the task for scheduler restore.
-        if sched.tasks[idx].pid != 0 {
-            let pc = crate::smp::per_core();
-            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
-                user_rsp: pc.syscall_user_rsp,
-                kernel_stack_top: pc.syscall_stack_top,
-                fs_base: fs,
-            });
-        }
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -698,16 +685,7 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
-        // Save per-core user state into the task for scheduler restore.
-        if sched.tasks[idx].pid != 0 {
-            let pc = crate::smp::per_core();
-            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
-                user_rsp: pc.syscall_user_rsp,
-                kernel_stack_top: pc.syscall_stack_top,
-                fs_base: fs,
-            });
-        }
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -733,16 +711,7 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
-        // Save per-core user state into the task for scheduler restore.
-        if sched.tasks[idx].pid != 0 {
-            let pc = crate::smp::per_core();
-            let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            sched.tasks[idx].user_return = Some(crate::task::UserReturnState {
-                user_rsp: pc.syscall_user_rsp,
-                kernel_stack_top: pc.syscall_stack_top,
-                fs_base: fs,
-            });
-        }
+        save_user_return_state(&mut sched.tasks[idx]);
         set_current_task_idx(None);
         idx
     };
@@ -1004,6 +973,21 @@ pub fn run() -> ! {
         {
             let pid = task_pid(_task_idx);
             crate::process::set_current_pid(pid);
+            // When dispatching a kernel-only task (pid==0), deactivate the
+            // previous user AddressSpace on this core so targeted TLB
+            // shootdowns skip it and the pointer doesn't dangle after reap.
+            if pid == 0 && crate::smp::is_per_core_ready() {
+                let pc = crate::smp::per_core();
+                let old_as_ptr = pc.current_addrspace;
+                if !old_as_ptr.is_null() {
+                    // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+                    // that is still alive (the owning Process holds the Arc).
+                    unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                    let pc_mut =
+                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                    unsafe { (*pc_mut).current_addrspace = core::ptr::null() };
+                }
+            }
             if pid != 0 {
                 let (cr3_phys, kstack, fs, new_as_ptr) = {
                     let table = crate::process::PROCESS_TABLE.lock();

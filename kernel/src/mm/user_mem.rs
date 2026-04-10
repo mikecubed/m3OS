@@ -117,20 +117,6 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         return Err(());
     }
 
-    // Phase 52b: snapshot address space generation before copy.
-    let generation_before = if crate::smp::is_per_core_ready() {
-        let as_ptr = crate::smp::per_core().current_addrspace;
-        if !as_ptr.is_null() {
-            // SAFETY: as_ptr was set from a valid Arc<AddressSpace> that is
-            // still alive (the owning Process holds the Arc).
-            Some(unsafe { &*as_ptr }.generation())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let phys_off = crate::mm::phys_offset();
 
     let mut copied = 0usize;
@@ -189,20 +175,6 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
 
         copied += avail;
         vaddr += avail as u64;
-    }
-
-    // Phase 52b: check if generation changed during copy.
-    if let Some(saved_gen) = generation_before
-        && crate::smp::is_per_core_ready()
-    {
-        let as_ptr = crate::smp::per_core().current_addrspace;
-        if !as_ptr.is_null() {
-            // SAFETY: same pointer checked above, still valid.
-            let generation_after = unsafe { &*as_ptr }.generation();
-            if generation_after != saved_gen {
-                log::warn!("copy_to_user: address space generation changed during copy");
-            }
-        }
     }
 
     Ok(())

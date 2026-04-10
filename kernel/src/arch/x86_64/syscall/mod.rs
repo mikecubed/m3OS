@@ -3321,6 +3321,19 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let pid = crate::process::current_pid();
     crate::process::close_cloexec_fds(pid);
 
+    // Deactivate old AddressSpace tracking BEFORE replacing it in the
+    // process table (the old Arc is freed on replacement, so the raw
+    // pointer in current_addrspace would dangle after that).
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let old_as_ptr = pc.current_addrspace;
+        if !old_as_ptr.is_null() {
+            // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
+            // still held by the process entry — not yet replaced.
+            unsafe { &*old_as_ptr }.deactivate_on_core(pc.core_id);
+        }
+    }
+
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
     {
@@ -3358,6 +3371,26 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 proc.shared_signal_actions = None;
             }
         }
+    }
+
+    // Activate the new AddressSpace on this core and update the pointer.
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let core_id = pc.core_id;
+        let new_as_ptr = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            table
+                .find(pid)
+                .and_then(|p| p.addr_space.as_ref())
+                .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
+                .unwrap_or_default()
+        };
+        if !new_as_ptr.is_null() {
+            // SAFETY: new_as_ptr points into the Arc just stored above.
+            unsafe { &*new_as_ptr }.activate_on_core(core_id);
+        }
+        let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+        unsafe { (*pc_mut).current_addrspace = new_as_ptr };
     }
 
     // Switch to the new page table and enter ring 3.

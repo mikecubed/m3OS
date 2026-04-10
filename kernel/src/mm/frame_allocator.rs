@@ -319,7 +319,7 @@ pub fn free_frame(phys: u64) {
     let phys_offset = FRAME_ALLOCATOR.0.lock().phys_offset;
     let virt_ptr = (phys_offset + phys) as *mut u8;
     unsafe {
-        core::ptr::write_bytes(virt_ptr, 0, 4096);
+        core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
     }
     FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
@@ -347,7 +347,7 @@ pub fn free_contiguous(phys: u64, order: usize) {
     for i in 0..page_count {
         let virt_ptr = (phys_offset + phys + i * PAGE_SIZE) as *mut u8;
         unsafe {
-            core::ptr::write_bytes(virt_ptr, 0, 4096);
+            core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
         }
     }
     FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
