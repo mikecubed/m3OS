@@ -976,7 +976,35 @@ pub fn run() -> ! {
             core_id
         );
 
+        // Phase 52: drain per-core ISR wakeup queue (lock-free fast path).
+        // ISRs push task indices here via signal_irq(); we wake them directly
+        // without waiting for the tick-driven drain_pending_waiters().
+        if let Some(data) = crate::smp::get_core_data(core_id) {
+            for task_idx in data.isr_wake_queue.drain() {
+                let enqueue = {
+                    let mut sched = SCHEDULER.lock();
+                    if task_idx < sched.tasks.len() {
+                        let task = &mut sched.tasks[task_idx];
+                        if task.state == TaskState::BlockedOnNotif && !task.switching_out {
+                            task.state = TaskState::Ready;
+                            Some((task.assigned_core, task_idx))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((target_core, idx)) = enqueue {
+                    enqueue_to_core(target_core, idx);
+                }
+            }
+        }
+
         // Drain notification waiters (only BSP does this to avoid contention).
+        // Kept as a safety net: if the ISR wakeup queue was full or the ISR
+        // fired before the waiter registered in ISR_WAITERS, this fallback
+        // will still catch the pending notification.
         if core_id == 0 {
             crate::ipc::notification::drain_pending_waiters();
         }
