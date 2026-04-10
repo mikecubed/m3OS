@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod address_space;
 pub mod buddy;
 pub mod cred;
 pub mod fb;
@@ -19,3 +20,4 @@ pub mod time;
 pub mod trace_ring;
 pub mod tty;
 pub mod types;
+pub mod user_range;
