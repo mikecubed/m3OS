@@ -59,30 +59,23 @@ pub use kernel_core::types::NotifId;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of notification objects.
-pub(super) const MAX_NOTIFS: usize = 16;
+///
+/// Fixed-size because `PENDING` must be accessible from ISR context (lock-free).
+/// Increased from 16 to 64 to accommodate more concurrent notification objects.
+pub(super) const MAX_NOTIFS: usize = 64;
 
 /// Per-notification pending bitfields.
 ///
 /// `PENDING[i]` holds the accumulated unread bits for notification `i`.
 /// Written by [`signal`] / [`signal_irq`] (lock-free); drained by [`wait`].
-static PENDING: [AtomicU64; MAX_NOTIFS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+///
+/// Must remain a fixed-size array — ISR context cannot acquire locks or
+/// allocate, so dynamic `Vec` is not an option.
+#[allow(clippy::declare_interior_mutable_const)]
+static PENDING: [AtomicU64; MAX_NOTIFS] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; MAX_NOTIFS]
+};
 
 /// Lock-free mapping from hardware IRQ line (0–15) to `NotifId`.
 ///
@@ -125,6 +118,11 @@ static WAITERS: Mutex<[Option<TaskId>; MAX_NOTIFS]> = Mutex::new([None; MAX_NOTI
 /// Tracks which notification slots are allocated.
 static ALLOCATED: Mutex<[bool; MAX_NOTIFS]> = Mutex::new([false; MAX_NOTIFS]);
 
+/// Return the notification pool capacity.
+pub fn capacity() -> usize {
+    MAX_NOTIFS
+}
+
 // ---------------------------------------------------------------------------
 // Public API (used from kernel and ipc/mod.rs dispatch)
 // ---------------------------------------------------------------------------
@@ -133,9 +131,7 @@ static ALLOCATED: Mutex<[bool; MAX_NOTIFS]> = Mutex::new([false; MAX_NOTIFS]);
 ///
 /// # Panics
 ///
-/// Panics if all 16 slots are occupied (in both debug and release builds).
-/// Kernel-internal callers (boot-time init) use this; userspace-facing
-/// syscalls should use [`try_create`] instead.
+/// Panics if all 64 slots are occupied (in both debug and release builds).
 pub fn create() -> NotifId {
     try_create().expect("notification registry full")
 }

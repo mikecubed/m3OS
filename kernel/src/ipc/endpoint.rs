@@ -29,7 +29,8 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use spin::Mutex;
+use alloc::vec::Vec;
+use spin::{Lazy, Mutex};
 
 use super::{CapError, Capability, Message};
 use crate::task::{TaskId, scheduler};
@@ -40,39 +41,46 @@ pub use kernel_core::types::EndpointId;
 // Global endpoint registry
 // ---------------------------------------------------------------------------
 
-/// Maximum number of concurrent IPC endpoints.
-pub(super) const MAX_ENDPOINTS: usize = 16;
+/// Initial number of endpoint slots.
+const INITIAL_ENDPOINTS: usize = 16;
+
+/// Number of slots added each time the pool grows.
+const ENDPOINT_GROW_INCREMENT: usize = 16;
 
 /// Global registry of all kernel IPC endpoints.
 ///
 /// Protected by a `Mutex` — IPC operations acquire this lock briefly to
 /// inspect or mutate sender/receiver queues.
-pub static ENDPOINTS: Mutex<EndpointRegistry> = Mutex::new(EndpointRegistry::new());
+///
+/// Uses `spin::Lazy` because `EndpointRegistry::new()` allocates a `Vec`.
+pub static ENDPOINTS: Lazy<Mutex<EndpointRegistry>> =
+    Lazy::new(|| Mutex::new(EndpointRegistry::new()));
 
-/// Container for all [`Endpoint`] objects.
+/// Dynamically growable container for all [`Endpoint`] objects.
 pub struct EndpointRegistry {
-    slots: [Option<Endpoint>; MAX_ENDPOINTS],
+    slots: Vec<Option<Endpoint>>,
 }
 
 impl EndpointRegistry {
-    const fn new() -> Self {
-        // Manual `[None; N]` expansion: `[expr; N]` requires `Copy`, which
-        // `Option<Endpoint>` does not implement (VecDeque is not Copy).
-        EndpointRegistry {
-            slots: [
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
-            ],
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(INITIAL_ENDPOINTS);
+        for _ in 0..INITIAL_ENDPOINTS {
+            slots.push(None);
         }
+        EndpointRegistry { slots }
     }
 
     /// Allocate a new endpoint and return its [`EndpointId`].
     ///
+    /// Scans for a free slot; if none found, grows the pool by
+    /// [`ENDPOINT_GROW_INCREMENT`] and uses the first new slot.
+    ///
+    /// `EndpointId` wraps a `u8`, limiting the maximum to 256 endpoints.
+    ///
     /// # Panics
     ///
-    /// Panics if all 16 slots are occupied (in both debug and release builds).
-    /// Kernel-internal callers (boot-time init) use this; userspace-facing
-    /// syscalls should use [`try_create`] instead.
+    /// Panics if the pool would need to grow beyond 256 endpoints (the `u8`
+    /// limit of `EndpointId`).
     pub fn create(&mut self) -> EndpointId {
         self.try_create().expect("endpoint registry full")
     }
@@ -87,7 +95,15 @@ impl EndpointRegistry {
                 return Some(EndpointId(i as u8));
             }
         }
-        None
+        // No free slot — grow the pool.
+        let old_len = self.slots.len();
+        if old_len >= 256 {
+            return None;
+        }
+        let grow_to = (old_len + ENDPOINT_GROW_INCREMENT).min(256);
+        self.slots.resize_with(grow_to, || None);
+        self.slots[old_len] = Some(Endpoint::new());
+        Some(EndpointId(old_len as u8))
     }
 
     /// Free an endpoint slot so it can be reused.
@@ -103,6 +119,11 @@ impl EndpointRegistry {
     /// Borrow a mutable reference to an endpoint.
     pub fn get_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
         self.slots.get_mut(id.0 as usize)?.as_mut()
+    }
+
+    /// Return the current number of slots (for iteration / diagnostics).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -159,11 +180,8 @@ impl Endpoint {
 /// `label = u64::MAX` on error.  Use this when the server needs the data
 /// payload; use [`recv`] when only the label is needed.
 pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
-    debug_assert!(
-        (ep_id.0 as usize) < MAX_ENDPOINTS,
-        "recv_msg: ep_id {} out of range",
-        ep_id.0
-    );
+    // Bounds check is done by get_mut() below — it returns None for
+    // out-of-range IDs, which is handled by the match.
     let action = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
