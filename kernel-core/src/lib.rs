@@ -9,6 +9,7 @@ pub mod fs;
 pub mod input;
 pub mod ipc;
 pub mod log_ring;
+pub mod mm;
 pub mod net;
 pub mod pipe;
 pub mod prng;

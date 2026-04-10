@@ -236,7 +236,7 @@ fn process_snapshot(pid: u32) -> Option<ProcessSnapshot> {
         cmdline: proc.cmdline.clone(),
         user_stack_top: proc.user_stack_top,
         brk_current: proc.brk_current,
-        mappings: proc.mappings.clone(),
+        mappings: proc.vma_tree.iter().cloned().collect(),
         fd_targets,
     })
 }

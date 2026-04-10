@@ -29,6 +29,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use spin::Mutex;
 
+// Re-export VMA types from kernel-core for host-testability.
+pub use kernel_core::mm::{MemoryMapping, VmaTree};
+
 // ---------------------------------------------------------------------------
 // Current-process tracker (per-core, Phase 35)
 // ---------------------------------------------------------------------------
@@ -592,8 +595,8 @@ pub struct Process {
     pub session_id: u32,
     /// Controlling terminal (Phase 29).
     pub controlling_tty: Option<ControllingTty>,
-    /// Tracked anonymous mmap regions (Phase 33).
-    pub mappings: Vec<MemoryMapping>,
+    /// Tracked anonymous mmap regions (Phase 33). O(log n) lookup via BTreeMap.
+    pub vma_tree: VmaTree,
     /// Last successfully executed binary path, used for procfs.
     pub exec_path: String,
     /// Current argv vector, used for `/proc/<pid>/cmdline`.
@@ -611,18 +614,7 @@ pub struct Process {
     pub shared_signal_actions: Option<Arc<Mutex<[SignalAction; 32]>>>,
 }
 
-/// Describes a contiguous anonymous memory mapping created by `mmap`.
-#[derive(Clone, Debug)]
-pub struct MemoryMapping {
-    /// Starting virtual address (page-aligned).
-    pub start: u64,
-    /// Length in bytes (page-aligned, as recorded by `sys_linux_mmap`).
-    pub len: u64,
-    /// Protection bits (`PROT_READ | PROT_WRITE | PROT_EXEC`).
-    pub prot: u64,
-    /// Mapping flags (`MAP_PRIVATE | MAP_ANONYMOUS`).
-    pub flags: u64,
-}
+// `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
 
 /// Identifies the controlling terminal for a process.
 #[derive(Clone, Debug, PartialEq)]
@@ -674,7 +666,7 @@ impl Process {
             umask: 0o022,
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
-            mappings: Vec::new(),
+            vma_tree: VmaTree::new(),
             exec_path: String::new(),
             cmdline: Vec::new(),
             start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -684,13 +676,9 @@ impl Process {
         }
     }
 
-    /// Find the VMA containing `addr`, if any.
+    /// Find the VMA containing `addr`, if any. O(log n) via BTreeMap.
     pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
-        self.mappings.iter().find(|m| {
-            m.start
-                .checked_add(m.len)
-                .is_some_and(|end| addr >= m.start && addr < end)
-        })
+        self.vma_tree.find_containing(addr)
     }
 
     // -----------------------------------------------------------------
@@ -945,7 +933,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1006,7 +994,7 @@ pub fn spawn_process_with_cr3(
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1071,7 +1059,7 @@ pub fn spawn_process_with_cr3_and_fds(
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
