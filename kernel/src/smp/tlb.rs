@@ -117,6 +117,11 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
     let page_count = end.saturating_sub(start).div_ceil(4096);
     let use_cr3_reload = page_count > INVLPG_THRESHOLD;
 
+    // Align the range to page boundaries so every page intersecting
+    // [start, end) is invalidated, even when start or end are not aligned.
+    let aligned_start = start & !(4096 - 1);
+    let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
+
     // Local flush first.
     if use_cr3_reload {
         // Full TLB flush via CR3 reload.
@@ -126,8 +131,8 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         }
     } else {
         // Per-page invlpg.
-        let mut addr = start;
-        while addr < end {
+        let mut addr = aligned_start;
+        while addr < aligned_end {
             x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
             addr += 4096;
         }
@@ -142,21 +147,27 @@ pub fn tlb_shootdown_range(addr_space: &crate::mm::AddressSpace, start: u64, end
         return; // No remote cores have this address space loaded.
     }
 
-    // Set up range request for the IPI handler.
-    SHOOTDOWN_RANGE_START.store(start, Ordering::Release);
-    SHOOTDOWN_RANGE_END.store(end, Ordering::Release);
+    // Set up range request for the IPI handler (pass aligned boundaries).
+    SHOOTDOWN_RANGE_START.store(aligned_start, Ordering::Release);
+    SHOOTDOWN_RANGE_END.store(aligned_end, Ordering::Release);
     SHOOTDOWN_USE_CR3_RELOAD.store(use_cr3_reload, Ordering::Release);
 
-    // Count target cores.
-    let target_count = remote_mask.count_ones() as u8;
-    SHOOTDOWN_PENDING.store(target_count, Ordering::Release);
-
-    // Send IPI only to targeted cores.
+    // Send IPIs only to targeted cores that are reachable, and count only
+    // those sends so the pending count matches acknowledgments that can arrive.
+    let online = online_core_count();
+    let mut sent = 0u8;
     for core_id in 0..64u8 {
-        if remote_mask & (1u64 << core_id) != 0 {
+        if remote_mask & (1u64 << core_id) != 0 && core_id < online {
             ipi::send_ipi_to_core(core_id, ipi::IPI_TLB_SHOOTDOWN);
+            sent = sent.saturating_add(1);
         }
     }
+
+    if sent == 0 {
+        return;
+    }
+
+    SHOOTDOWN_PENDING.store(sent, Ordering::Release);
 
     // Spin-wait for acknowledgment from all targeted cores.
     while SHOOTDOWN_PENDING.load(Ordering::Acquire) > 0 {
@@ -183,9 +194,12 @@ pub fn handle_tlb_shootdown_ipi() {
             x86_64::registers::control::Cr3::write(frame, flags);
         }
     } else {
-        // Small range: per-page invlpg.
-        let mut addr = start;
-        while addr < end {
+        // Small range: per-page invlpg. Align so every page intersecting
+        // [start, end) is invalidated, mirroring tlb_shootdown_range.
+        let aligned_start = start & !(4096 - 1);
+        let aligned_end = end.saturating_add(4096 - 1) & !(4096 - 1);
+        let mut addr = aligned_start;
+        while addr < aligned_end {
             x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(addr));
             addr += 4096;
         }
