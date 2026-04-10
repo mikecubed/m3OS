@@ -47,7 +47,7 @@
 // Keep dead-code allowance for unused APIs.
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::task::{TaskId, scheduler};
@@ -108,6 +108,38 @@ static IRQ_MAP: [AtomicU8; 16] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Lock-free ISR waiter mirror (Phase 52: ISR-direct wakeup)
+// ---------------------------------------------------------------------------
+
+/// Lock-free mirror of WAITERS holding only the task *index* (into the
+/// scheduler's task vec) for each notification slot.
+///
+/// -1 means no waiter is registered.  Written from task context when `wait()`
+/// registers a waiter; read from ISR context by `signal_irq()` to push the
+/// waiter into the per-core `IsrWakeQueue` without touching any mutex.
+///
+/// The task index (not `TaskId`) is stored because the scheduler needs it for
+/// direct state manipulation without a linear search.
+static ISR_WAITERS: [AtomicI32; MAX_NOTIFS] = [
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+    AtomicI32::new(-1),
+];
+
+// ---------------------------------------------------------------------------
 // Mutex-protected waiter state (task context only)
 // ---------------------------------------------------------------------------
 
@@ -161,6 +193,11 @@ pub fn register_irq(irq: u8, notif_id: NotifId) {
 /// **ISR-safe** — uses only lock-free atomics and does not call `wake_task`.
 /// The waiting task will see the pending bits and return from [`wait`] on its
 /// next scheduler dispatch.
+///
+/// Phase 52 enhancement: if a waiter is registered in `ISR_WAITERS` (lock-free
+/// mirror), push its task index to the current core's `IsrWakeQueue` so the
+/// scheduler can wake it directly on the next loop iteration without waiting
+/// for the tick-driven `drain_pending_waiters()`.
 pub fn signal_irq(irq: u8) {
     let idx = IRQ_MAP
         .get(irq as usize)
@@ -173,6 +210,17 @@ pub fn signal_irq(irq: u8) {
     if let Some(pending) = PENDING.get(idx as usize) {
         pending.fetch_or(1u64 << (irq as u32), Ordering::Release);
     }
+
+    // Phase 52: push waiter to per-core ISR wakeup queue (lock-free).
+    if let Some(isr_waiter) = ISR_WAITERS.get(idx as usize) {
+        let waiter_idx = isr_waiter.load(Ordering::Acquire);
+        if waiter_idx >= 0
+            && let Some(data) = crate::smp::try_per_core()
+        {
+            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+        }
+    }
+
     // Trigger a reschedule so the blocked task runs on the next tick and
     // drains the pending bits from its wait() loop.
     scheduler::signal_reschedule();
@@ -198,7 +246,12 @@ pub fn signal(notif_id: NotifId, bits: u64) {
     // already held by the calling task.
     let waiter = {
         let mut waiters = WAITERS.lock();
-        waiters[idx].take()
+        let w = waiters[idx].take();
+        // Clear the ISR mirror when taking the waiter.
+        if w.is_some() {
+            ISR_WAITERS[idx].store(-1, Ordering::Release);
+        }
+        w
     };
     if let Some(task) = waiter {
         let _ = scheduler::wake_task(task);
@@ -215,9 +268,11 @@ pub fn signal(notif_id: NotifId, bits: u64) {
 /// `signal()` would attempt to wake a dead task.
 pub fn clear_waiter(task_id: TaskId) {
     let mut waiters = WAITERS.lock();
-    for slot in waiters.iter_mut() {
+    for (i, slot) in waiters.iter_mut().enumerate() {
         if *slot == Some(task_id) {
             *slot = None;
+            // Also clear the ISR mirror so signal_irq doesn't push a dead task.
+            ISR_WAITERS[i].store(-1, Ordering::Release);
         }
     }
 }
@@ -246,7 +301,12 @@ pub fn drain_pending_waiters() {
             if PENDING[idx].load(Ordering::Acquire) == 0 {
                 None
             } else {
-                waiters[idx].take()
+                let w = waiters[idx].take();
+                // Clear the ISR mirror when taking the waiter.
+                if w.is_some() {
+                    ISR_WAITERS[idx].store(-1, Ordering::Release);
+                }
+                w
             }
         };
         if let Some(task) = waiter {
@@ -301,6 +361,13 @@ pub fn wait(waiter: TaskId, notif_id: NotifId) -> u64 {
                 notif_id
             );
             waiters[idx] = Some(waiter);
+
+            // Phase 52: populate ISR mirror with the task's scheduler index
+            // so signal_irq() can push it to the per-core wakeup queue
+            // without acquiring any lock.
+            if let Some(task_idx) = scheduler::get_current_task_idx() {
+                ISR_WAITERS[idx].store(task_idx as i32, Ordering::Release);
+            }
         }
         // Release WAITERS lock before blocking; signal() can now wake us.
 
