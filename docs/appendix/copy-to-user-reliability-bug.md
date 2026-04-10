@@ -1,6 +1,6 @@
 # copy_to_user Intermittent Reliability Bug
 
-**Status:** Open
+**Status:** Partially Fixed (Phase 52a)
 **Severity:** High — affects any syscall that writes to a userspace buffer
 **Discovered:** Phase 52 (First Service Extractions)
 **Exposed by:** Moving stdin_feeder to userspace, where termios reads via
@@ -214,6 +214,23 @@ the new process's data (or zeros if the frame was zeroed). Verify:
 | `userspace/stdin_feeder/src/main.rs` | Main loop | Primary victim of the bug |
 | `userspace/login/src/main.rs:436` | `disable_echo` | Secondary victim (poison cascade) |
 
+## Phase 52a Fix: Stale Per-Core State on Blocking Paths
+
+The IPC blocking path analysis (Phase 52a, Track A) confirmed that all seven
+IPC blocking syscalls (recv, call, reply_recv, notify_wait, call_buf, recv_msg,
+reply_recv_msg) and the FUTEX_WAIT path returned through `sysretq` with a
+stale per-core `syscall_user_rsp` after a context switch. This causes the
+wrong user stack to be restored.
+
+**Fix:** Added `restore_caller_context` (restores CR3, PID, user RSP, kernel
+stack top, FS.base) to all seven IPC blocking paths in `kernel/src/ipc/mod.rs`
+dispatch and to the `sys_futex` FUTEX_WAIT path. This matches the existing
+`sys_waitpid` pattern.
+
+This fix addresses the per-core state corruption vector. The underlying
+`copy_to_user` physical-vs-virtual address divergence remains a separate
+open question for Phase 52b (task-owned return state).
+
 ## Related Commits
 
 - `cd5bc5b` — Changed hardcoded 32 to `size_of::<TermiosFlags>()` (initially
@@ -225,3 +242,4 @@ the new process's data (or zeros if the frame was zeroed). Verify:
 - `3c172fd` — Added `GET_TERMIOS_LFLAG` register-return workaround
 - Series of commits switching to `tcgetattr` then to register-return
   syscalls for all three flags
+- Phase 52a: `restore_caller_context` added to IPC dispatch + futex WAIT
