@@ -246,7 +246,7 @@ flowchart TD
     D --> E["Return from interrupt via IRET"]
 
     E --> F["Task continues running"]
-    F --> G{"Task yields\nor blocks?"}
+    F --> G{"Task yields<br/>or blocks?"}
     G -->|Yes| H["switch_context: scheduler picks next task"]
     G -->|No| I["Task keeps running until it cooperates"]
 

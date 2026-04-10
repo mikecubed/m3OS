@@ -386,16 +386,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    L["allocate_frame"] --> M{"Buddy\navailable?"}
+    L["allocate_frame"] --> M{"Buddy<br/>available?"}
     M -->|Yes| N["buddy.allocate order-0 returns PFN"]
     M -->|No| O["pop_frame from free list"]
     N --> P["refcount_inc: count = 1"]
     O --> P
     P --> Q["Return PhysFrame"]
 
-    R["free_frame"] --> S{"Refcount\ninit'd?"}
+    R["free_frame"] --> S{"Refcount<br/>init'd?"}
     S -->|Yes| T["refcount_dec"]
-    T --> U{"count\ngreater\nthan 0?"}
+    T --> U{"count<br/>greater<br/>than 0?"}
     U -->|Yes| V["Return: frame still shared"]
     U -->|No| W["buddy.free pfn order-0"]
     S -->|No| W
@@ -407,10 +407,10 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A1["Search upward from order to MAX_ORDER\nfor first non-empty free list"] --> A2["Pop PFN from free_lists at source_order"]
+    A1["Search upward from order to MAX_ORDER<br/>for first non-empty free list"] --> A2["Pop PFN from free_lists at source_order"]
     A2 --> A3["Clear bitmap bit"]
-    A3 --> A4{"source_order\ngreater than\nrequested?"}
-    A4 -->|Yes| A5["Split: push upper buddy\nonto intermediate free list"]
+    A3 --> A4{"source_order<br/>greater than<br/>requested?"}
+    A4 -->|Yes| A5["Split: push upper buddy<br/>onto intermediate free list"]
     A5 --> A4
     A4 -->|No| A6["Return PFN"]
 ```
@@ -419,9 +419,9 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    F1["Double-free check via is_free bitmap"] --> F2{"order less\nthan\nMAX_ORDER?"}
+    F1["Double-free check via is_free bitmap"] --> F2{"order less<br/>than<br/>MAX_ORDER?"}
     F2 -->|Yes| F3["Compute buddy via XOR"]
-    F3 --> F4{"Buddy free\nand in\nbounds?"}
+    F3 --> F4{"Buddy free<br/>and in<br/>bounds?"}
     F4 -->|Yes| F5["remove_free: O-n linear scan"]
     F5 --> F6["Recurse: free merged block at order+1"]
     F4 -->|No| F7["push_free, set bitmap bit"]

@@ -177,7 +177,7 @@ sequenceDiagram
     alt Signal character (^C, ^Z, ^\)
         SF->>SF: signal_process_group(sig)
     else Canonical mode + newline
-        SF->>STDIN: stdin_push(line_buffer + '\n')
+        SF->>STDIN: stdin_push line_buffer + newline
         STDIN->>STDIN: STDIN_WAITQUEUE.wake_all()
     else Raw mode
         SF->>STDIN: stdin_push(byte)
@@ -254,25 +254,25 @@ flowchart TD
     A["sshd writes to PTY master fd"] --> B["Kernel: sys_linux_write for PtyMaster"]
     B --> C["For each byte"]
 
-    C --> D{"ISIG\nenabled?"}
-    D -->|Yes| E{"Signal\nchar?"}
-    E -->|Yes| F["Send signal to slave_fg_pgid\ndrop and reacquire PTY_TABLE lock"]
-    E -->|No| G{"ICANON\nenabled?"}
+    C --> D{"ISIG<br/>enabled?"}
+    D -->|Yes| E{"Signal<br/>char?"}
+    E -->|Yes| F["Send signal to slave_fg_pgid<br/>drop and reacquire PTY_TABLE lock"]
+    E -->|No| G{"ICANON<br/>enabled?"}
     D -->|No| G
 
-    G -->|Yes| H{"Special\nchar?"}
-    H -->|VERASE| I["edit_buf.erase_char\nEcho BS-SP-BS to s2m"]
-    H -->|VKILL| J["edit_buf.kill_line\nEcho per ECHOK"]
+    G -->|Yes| H{"Special<br/>char?"}
+    H -->|VERASE| I["edit_buf.erase_char<br/>Echo BS-SP-BS to s2m"]
+    H -->|VKILL| J["edit_buf.kill_line<br/>Echo per ECHOK"]
     H -->|VWERASE| K["edit_buf.word_erase"]
-    H -->|VEOF| L{"edit_buf\nempty?"}
+    H -->|VEOF| L{"edit_buf<br/>empty?"}
     L -->|Yes| M["Set eof_pending = true"]
     L -->|No| N["Push newline, signal line complete"]
-    H -->|Newline| O["edit_buf.push newline\nLine complete for slave read"]
-    H -->|Regular| P["edit_buf.push byte\nEcho to s2m if ECHO"]
+    H -->|Newline| O["edit_buf.push newline<br/>Line complete for slave read"]
+    H -->|Regular| P["edit_buf.push byte<br/>Echo to s2m if ECHO"]
 
-    G -->|"No: raw"| Q["Write directly to m2s\nEcho to s2m if ECHO"]
+    G -->|"No: raw"| Q["Write directly to m2s<br/>Echo to s2m if ECHO"]
 
-    C --> R{"More\nbytes?"}
+    C --> R{"More<br/>bytes?"}
     R -->|Yes| C
     R -->|No| S["Wake PTY_SLAVE_WQ"]
 ```

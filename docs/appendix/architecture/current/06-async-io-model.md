@@ -207,32 +207,32 @@ graph TB
 flowchart TD
     A["Shell writes prompt to PTY slave"] --> B["PTY master becomes readable"]
     B --> C["channel_relay_task reads from PTY master"]
-    C --> D{"write_channel\nresult?"}
+    C --> D{"write_channel<br/>result?"}
 
-    D -->|"bytes written"| E["flush_output_locked\nSSH packet queued and flushed"]
+    D -->|"bytes written"| E["flush_output_locked<br/>SSH packet queued and flushed"]
     E --> F["I/O task sends to socket"]
 
     D -->|"zero: backpressure"| G["Stash data in pty_pending"]
-    G --> H["flush_output_locked\nno new packet to flush"]
+    G --> H["flush_output_locked<br/>no new packet to flush"]
     H --> I["Register wakers before sleeping"]
 
     I --> J["set_channel_read_waker"]
-    J --> K{"pty_pending\nnon-empty?"}
-    K -->|Yes| L["set_channel_write_waker\nregistered correctly"]
+    J --> K{"pty_pending<br/>non-empty?"}
+    K -->|Yes| L["set_channel_write_waker<br/>registered correctly"]
     K -->|No| M["Skip write waker"]
 
     L --> N["Sleep on WaitWake for pty_fd POLLIN"]
     M --> N
 
-    N --> O{"What wakes\nrelay?"}
+    N --> O{"What wakes<br/>relay?"}
     O -->|"PTY has new output"| C
     O -->|"Client keystroke"| C
-    O -->|"Channel write space freed"| P{"wake_write\ncorrect?"}
+    O -->|"Channel write space freed"| P{"wake_write<br/>correct?"}
 
     P -->|"Yes"| Q["Retry pty_pending"]
-    P -->|"No: sunset bug"| R["Wakes read_waker instead\nWrong task woken"]
+    P -->|"No: sunset bug"| R["Wakes read_waker instead<br/>Wrong task woken"]
 
-    R --> S["Session appears hung\nuntil client types a key"]
+    R --> S["Session appears hung<br/>until client types a key"]
 
     style R fill:#ff6666,color:#000
     style S fill:#ff6666,color:#000

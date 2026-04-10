@@ -207,11 +207,11 @@ flowchart TD
     subgraph "signal_irq — ISR Context, Lock-Free"
         I1["IRQ_MAP lookup: irq to notif_id"] --> I2["PENDING fetch_or bit for irq"]
         I2 --> I3["signal_reschedule"]
-        I3 --> I4["Does NOT call wake_task\nnot ISR-safe due to scheduler lock"]
+        I3 --> I4["Does NOT call wake_task<br/>not ISR-safe due to scheduler lock"]
     end
 
     subgraph "drain_pending_waiters — BSP Tick"
-        D1["For each notification 0..15:"] --> D2{"PENDING nonzero\nand waiter\nregistered?"}
+        D1["For each notification 0..15:"] --> D2{"PENDING nonzero<br/>and waiter<br/>registered?"}
         D2 -->|Yes| D3["wake_task for waiter"]
         D2 -->|No| D4["Continue"]
     end
