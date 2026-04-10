@@ -3073,7 +3073,7 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 p.umask,
                 p.session_id,
                 p.controlling_tty.clone(),
-                p.mappings.clone(),
+                p.vma_tree.clone(),
                 p.exec_path.clone(),
                 p.cmdline.clone(),
             ),
@@ -3094,7 +3094,7 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
                 0o022,
                 0,
                 Some(crate::process::ControllingTty::Console),
-                alloc::vec::Vec::new(),
+                crate::process::VmaTree::new(),
                 alloc::string::String::new(),
                 alloc::vec::Vec::new(),
             ),
@@ -3144,7 +3144,7 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
             child.umask = parent_umask;
             child.session_id = parent_session_id;
             child.controlling_tty = parent_ctty;
-            child.mappings = parent_mappings;
+            child.vma_tree = parent_mappings;
             child.exec_path = parent_exec_path;
             child.cmdline = parent_cmdline;
         }
@@ -3363,7 +3363,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
             proc.mmap_next = 0;
-            proc.mappings.clear(); // Phase 36: clear stale VMAs from old address space.
+            proc.vma_tree.clear(); // Phase 36: clear stale VMAs from old address space.
             proc.exec_path = alloc::string::String::from(name);
             proc.cmdline = if user_argv.is_empty() {
                 alloc::vec![alloc::string::String::from(name)]
@@ -6921,7 +6921,7 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.mappings.push(crate::process::MemoryMapping {
+            proc.vma_tree.insert(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
                 prot,
@@ -7082,7 +7082,7 @@ fn sys_mmap_file_backed(
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.mappings.push(crate::process::MemoryMapping {
+            proc.vma_tree.insert(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
                 prot,
@@ -7184,53 +7184,16 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         drop(table);
     }
 
-    // Update mapping tracking list: handle full removal, shrink, and split.
+    // Update VMA tree: handle full removal, shrink, and split.
     let pid = crate::process::current_pid();
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            let unmap_start = addr;
-            let unmap_end = addr + total_size;
-            let mut new_mappings = alloc::vec::Vec::new();
-            proc.mappings.retain_mut(|m| {
-                let m_end = m.start + m.len;
-                if m.start >= unmap_end || m_end <= unmap_start {
-                    // No overlap — keep as-is.
-                    return true;
-                }
-                if m.start >= unmap_start && m_end <= unmap_end {
-                    // Fully contained — remove.
-                    return false;
-                }
-                if m.start < unmap_start && m_end > unmap_end {
-                    // Hole punch: split into two mappings.
-                    // Keep the head portion in place.
-                    let tail = crate::process::MemoryMapping {
-                        start: unmap_end,
-                        len: m_end - unmap_end,
-                        prot: m.prot,
-                        flags: m.flags,
-                    };
-                    new_mappings.push(tail);
-                    m.len = unmap_start - m.start;
-                    return true;
-                }
-                if m.start < unmap_start {
-                    // Overlap at tail — shrink.
-                    m.len = unmap_start - m.start;
-                } else {
-                    // Overlap at head — shrink.
-                    let new_start = unmap_end;
-                    m.len = m_end - new_start;
-                    m.start = new_start;
-                }
-                true
-            });
-            proc.mappings.extend(new_mappings);
+            proc.vma_tree.remove_range(addr, total_size);
 
             // The FB mapping is fully gone when no mapping with FB_MAPPING_FLAG
             // survives; a partial unmap leaves a trimmed or split mapping in place.
-            fb_fully_unmapped = !proc.mappings.iter().any(|m| m.flags & FB_MAPPING_FLAG != 0);
+            fb_fully_unmapped = !proc.vma_tree.any(|m| m.flags & FB_MAPPING_FLAG != 0);
         }
     }
 
@@ -7381,60 +7344,8 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            let mut new_mappings = alloc::vec::Vec::new();
-            for m in proc.mappings.iter_mut() {
-                let m_end = m.start + m.len;
-                // Skip non-overlapping VMAs.
-                if m.start >= mprotect_end || m_end <= addr {
-                    continue;
-                }
-                // Fully contained — just update prot.
-                if m.start >= addr && m_end <= mprotect_end {
-                    m.prot = prot;
-                    continue;
-                }
-                // Partial overlap — need to split.
-                if m.start < addr && m_end > mprotect_end {
-                    // Middle split: 3 VMAs (head, middle, tail).
-                    let tail = crate::process::MemoryMapping {
-                        start: mprotect_end,
-                        len: m_end - mprotect_end,
-                        prot: m.prot,
-                        flags: m.flags,
-                    };
-                    let middle = crate::process::MemoryMapping {
-                        start: addr,
-                        len: mprotect_end - addr,
-                        prot,
-                        flags: m.flags,
-                    };
-                    new_mappings.push(middle);
-                    new_mappings.push(tail);
-                    m.len = addr - m.start; // head
-                } else if m.start < addr {
-                    // Overlap at tail of VMA — split into head + modified tail.
-                    let modified = crate::process::MemoryMapping {
-                        start: addr,
-                        len: m_end - addr,
-                        prot,
-                        flags: m.flags,
-                    };
-                    new_mappings.push(modified);
-                    m.len = addr - m.start;
-                } else {
-                    // Overlap at head of VMA — split into modified head + tail.
-                    let tail = crate::process::MemoryMapping {
-                        start: mprotect_end,
-                        len: m_end - mprotect_end,
-                        prot: m.prot,
-                        flags: m.flags,
-                    };
-                    new_mappings.push(tail);
-                    m.len = mprotect_end - m.start;
-                    m.prot = prot;
-                }
-            }
-            proc.mappings.extend(new_mappings);
+            proc.vma_tree
+                .update_range_prot(addr, mprotect_end - addr, prot);
         }
     }
 
@@ -7783,7 +7694,7 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.mappings.push(crate::process::MemoryMapping {
+            proc.vma_tree.insert(crate::process::MemoryMapping {
                 start: virt_addr,
                 len: total_size,
                 prot: 3,                    // PROT_READ | PROT_WRITE
@@ -10328,7 +10239,7 @@ fn sys_clone_thread(
                     p.umask,
                     p.session_id,
                     p.controlling_tty.clone(),
-                    p.mappings.clone(),
+                    p.vma_tree.clone(),
                     p.exec_path.clone(),
                     p.cmdline.clone(),
                     p.fd_table_snapshot(),
@@ -10508,7 +10419,7 @@ fn sys_clone_thread(
         umask: parent_umask,
         session_id: parent_session_id,
         controlling_tty: parent_ctty,
-        mappings: parent_mappings,
+        vma_tree: parent_mappings,
         exec_path: parent_exec_path,
         cmdline: parent_cmdline,
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
