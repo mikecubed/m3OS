@@ -316,7 +316,7 @@ impl UserSliceRo {
         if core::mem::size_of::<T>() > self.len {
             return Err(());
         }
-        let mut buf = [0u8; 256]; // Stack buffer large enough for any syscall struct
+        let mut buf = [0u8; 256]; // Stack buffer — values > 256 bytes are rejected above
         let size = core::mem::size_of::<T>();
         if size > buf.len() {
             return Err(());

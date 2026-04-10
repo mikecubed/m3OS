@@ -46,6 +46,21 @@ fn fault_kill_trampoline() -> ! {
     log::warn!("[fault_kill] trampoline running for pid {}", pid);
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
+    // Deactivate this core's tracked AddressSpace *before* marking Zombie.
+    // Once Zombie, another core can reap() and drop the last Arc, turning
+    // our raw current_addrspace pointer into a dangling reference.
+    if crate::smp::is_per_core_ready() {
+        let pc = crate::smp::per_core();
+        let old_as_ptr = pc.current_addrspace;
+        if !old_as_ptr.is_null() {
+            let core_id = pc.core_id;
+            // SAFETY: Arc<AddressSpace> is still alive — process is not
+            // yet Zombie so reap cannot have been called.
+            unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+            let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+            unsafe { (*pc_mut).current_addrspace = core::ptr::null() };
+        }
+    }
     // Mark the process zombie with SIGSEGV exit code.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
