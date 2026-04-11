@@ -440,13 +440,16 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
         let saved = if t.c_lflag == 0 {
             syscall_lib::Termios {
                 c_iflag: syscall_lib::ICRNL,
-                c_oflag: 0o000005,                                  // OPOST | ONLCR
-                c_cflag: 0o000060 | 0o000200 | 0o000400 | 0o060000, // CS8|CREAD|HUPCL|B38400
+                c_oflag: syscall_lib::OPOST | syscall_lib::ONLCR,
+                c_cflag: syscall_lib::CS8
+                    | syscall_lib::CREAD
+                    | syscall_lib::HUPCL
+                    | syscall_lib::B38400,
                 c_lflag: syscall_lib::ICANON
                     | syscall_lib::ECHO
                     | syscall_lib::ECHOE
                     | syscall_lib::ISIG
-                    | 0o100000, // IEXTEN
+                    | syscall_lib::IEXTEN,
                 c_line: 0,
                 c_cc: t.c_cc, // c_cc might still be correct
             }

@@ -1903,12 +1903,19 @@ fn parse_smoke_test_args(args: &[String]) -> Result<SmokeTestArgs, String> {
 /// Operates line-by-line: any line containing a recognised tag is removed.
 /// Tags recognised: kernel log levels and init service lifecycle prefixes.
 fn strip_background_noise(input: &str) -> String {
-    const TAGS: &[&str] = &[
-        "[INFO]",
-        "[DEBUG]",
-        "[WARN]",
-        "[ERROR]",
-        "[TRACE]",
+    // Kernel log prefixes — always `[LEVEL] [subsystem] message...\n`.
+    // Match the second bracket to avoid false positives on userspace text
+    // that might literally contain `[INFO]`.
+    const LOG_PREFIXES: &[&str] = &[
+        "[INFO] [",
+        "[DEBUG] [",
+        "[WARN] [",
+        "[ERROR] [",
+        "[TRACE] [",
+    ];
+
+    // Init service prefixes.
+    const INIT_PREFIXES: &[&str] = &[
         "init: starting '",
         "init: started '",
         "init: service '",
@@ -1918,14 +1925,32 @@ fn strip_background_noise(input: &str) -> String {
     ];
 
     let mut out = String::with_capacity(input.len());
-    for line in input.split_inclusive('\n') {
-        if !TAGS.iter().any(|tag| line.contains(tag)) {
-            out.push_str(line);
+    let mut pos = 0;
+
+    while pos < input.len() {
+        let remaining = &input[pos..];
+
+        // Check if current position starts a noise fragment.
+        let is_noise = LOG_PREFIXES
+            .iter()
+            .chain(INIT_PREFIXES.iter())
+            .any(|pfx| remaining.starts_with(pfx));
+
+        if is_noise {
+            // Skip everything up to and including the next newline.
+            if let Some(nl) = remaining.find('\n') {
+                pos += nl + 1;
+            } else {
+                pos = input.len();
+            }
+        } else if let Some(c) = remaining.chars().next() {
+            out.push(c);
+            pos += c.len_utf8();
+        } else {
+            break;
         }
     }
-    // Handle trailing content without a newline (incomplete line).
-    // split_inclusive already handles this — if the input doesn't end with
-    // '\n', the last segment is returned without a newline.
+
     out
 }
 
@@ -4612,6 +4637,8 @@ fn fetch_lua_source(ports_src: &Path) {
 /// Phase 45: Fetch zlib source code for the ports system.
 /// Downloads and extracts zlib 1.3.1 to `target/ports-src/lib/zlib/src/`.
 fn fetch_zlib_source(ports_src: &Path) {
+    const ZLIB_SHA256: &str = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23";
+
     let zlib_dir = ports_src.join("lib/zlib/src");
     if zlib_dir.join("zlib.h").exists() {
         println!("ports: zlib source already cached");
@@ -4634,6 +4661,16 @@ fn fetch_zlib_source(ports_src: &Path) {
             eprintln!("warning: failed to download zlib source — skipping zlib port");
             return;
         }
+    }
+
+    // Verify SHA-256 checksum before extracting.
+    if !verify_sha256(&zlib_tar, ZLIB_SHA256) {
+        eprintln!(
+            "warning: zlib tarball verification failed (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
+             Expected SHA-256: {ZLIB_SHA256}"
+        );
+        let _ = fs::remove_file(&zlib_tar);
+        return;
     }
 
     let extract_dir = ports_src.join("zlib-extract");
@@ -6565,9 +6602,46 @@ mod tests {
     }
 
     #[test]
+    fn strip_background_noise_removes_midline_kernel_logs() {
+        // Kernel log injected between "symbolic " and "link" — the exact
+        // pattern that causes CI flakiness.
+        let input = concat!(
+            "  File: /phase38-passwd-link  Size: 11  symbolic ",
+            "[INFO] [munmap] freed 1 pages @ 0x200014f000 (len=0x1000)\n",
+            "link\n",
+        );
+
+        assert_eq!(
+            strip_background_noise(input),
+            "  File: /phase38-passwd-link  Size: 11  symbolic link\n"
+        );
+    }
+
+    #[test]
+    fn strip_background_noise_removes_multiple_midline_injections() {
+        let input = concat!(
+            "root@m3os:# /bin/echo hello >> /tmp/out",
+            "[INFO] [munmap] freed 1 pages @ 0x20002d6000 (len=0x1000)\n",
+            "[INFO] [pipe] created pipe_id=0\n",
+            "\nroot@m3os:# ",
+        );
+
+        assert_eq!(
+            strip_background_noise(input),
+            "root@m3os:# /bin/echo hello >> /tmp/out\nroot@m3os:# "
+        );
+    }
+
+    #[test]
     fn strip_background_noise_keeps_regular_userspace_output() {
         let input = "init: configuration loaded from /etc/init.conf\n";
 
         assert_eq!(strip_background_noise(input), input);
+    }
+
+    #[test]
+    fn strip_background_noise_handles_trailing_noise_without_newline() {
+        let input = "output here[INFO] [fork] p8 fork()";
+        assert_eq!(strip_background_noise(input), "output here");
     }
 }

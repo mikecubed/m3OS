@@ -906,9 +906,13 @@ pub const ISTRIP: u32 = 0o000040;
 
 // c_oflag constants
 pub const OPOST: u32 = 0o000001;
+pub const ONLCR: u32 = 0o000004;
 
 // c_cflag constants
 pub const CS8: u32 = 0o000060;
+pub const CREAD: u32 = 0o000200;
+pub const HUPCL: u32 = 0o000400;
+pub const B38400: u32 = 0o060000;
 
 /// Terminal I/O settings, matching the Linux *kernel* `termios` layout
 /// used by the TCGETS/TCSETS ioctls (36 bytes).
