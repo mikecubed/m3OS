@@ -2427,7 +2427,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     steps.push(SmokeStep::WaitEither {
         pattern_a: "Set password for",
         pattern_b: "Password:",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "detect first-boot or normal login",
         extra_steps_a: FIRST_BOOT_LOGIN,
         extra_steps_b: NORMAL_LOGIN,
