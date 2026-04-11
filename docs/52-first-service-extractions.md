@@ -205,12 +205,30 @@ translation, focus routing) live in userspace.
 - Performance tuning of the IPC boundary is deferred; this phase prioritizes
   correctness and restartability over throughput.
 
+## Sub-Phases
+
+Phase 52's service extraction work exposed kernel bugs and design limitations
+that were addressed in three follow-on sub-phases:
+
+- [Phase 52a -- Kernel Reliability Fixes](./52a-kernel-reliability-fixes.md):
+  Four confirmed bug fixes (stale IPC return state, sunset waker, clear_child_tid,
+  exec signal reset)
+- [Phase 52b -- Kernel Structural Hardening](./52b-kernel-structural-hardening.md):
+  AddressSpace object, typed UserBuffers, task-owned return state, batch TLB,
+  frame zeroing
+- [Phase 52c -- Kernel Architecture Evolution](./52c-kernel-architecture-evolution.md):
+  Per-core scheduler, dynamic IPC pools, unified line discipline, VMA tree,
+  ISR-direct wakeup
+
 ## Related Roadmap Docs
 
 - [Phase 52 roadmap doc](./roadmap/52-first-service-extractions.md)
 - [Phase 52 task doc](./roadmap/tasks/52-first-service-extractions-tasks.md)
-- [Phase 50 — IPC Completion](./50-ipc-completion.md)
-- [Phase 51 — Service Model Maturity](./51-service-model-maturity.md)
+- [Phase 52a roadmap doc](./roadmap/52a-kernel-reliability-fixes.md)
+- [Phase 52b roadmap doc](./roadmap/52b-kernel-structural-hardening.md)
+- [Phase 52c roadmap doc](./roadmap/52c-kernel-architecture-evolution.md)
+- [Phase 50 -- IPC Completion](./50-ipc-completion.md)
+- [Phase 51 -- Service Model Maturity](./51-service-model-maturity.md)
 - [Core Servers (Phase 7)](./07-core-servers.md)
 - [Framebuffer and Shell (Phase 9)](./09-framebuffer-and-shell.md)
 
