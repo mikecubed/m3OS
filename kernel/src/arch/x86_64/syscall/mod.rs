@@ -8114,7 +8114,7 @@ pub(super) fn sys_stdin_signal_eof() -> u64 {
 ///
 /// The byte is processed through TTY0's LineDiscipline which handles iflag
 /// transforms, signal generation, canonical editing, and echo generation.
-/// Echo output goes to the serial console (COM1).
+/// Echo output goes to the active console sinks (serial + framebuffer).
 pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
     let byte = byte_arg as u8;
 
@@ -8149,8 +8149,8 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
                     3 => "^\\",
                     _ => "",
                 };
-                serial_echo_bytes(name.as_bytes());
-                serial_echo_bytes(b"\n");
+                console_echo_bytes(name.as_bytes());
+                console_echo_bytes(b"\n");
                 crate::process::send_signal_to_group(fg, sig as u32);
             } else {
                 // No foreground group — push raw byte.
@@ -8161,10 +8161,10 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
         | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
             if let Some(count) = echo.erase_count() {
                 for _ in 0..count {
-                    serial_echo_bytes(b"\x08 \x08");
+                    console_echo_bytes(b"\x08 \x08");
                 }
             } else if !echo.is_empty() {
-                serial_echo_bytes(echo.as_slice());
+                console_echo_bytes(echo.as_slice());
             }
         }
     }
@@ -8172,7 +8172,27 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
     0
 }
 
-/// Write raw bytes to the serial console (COM1) for echo.
+/// Write raw echo bytes to the serial console and framebuffer console.
+fn console_echo_bytes(bytes: &[u8]) {
+    serial_echo_bytes(bytes);
+    framebuffer_echo_bytes(bytes);
+}
+
+/// Mirror echo bytes to the framebuffer console without heap allocation.
+fn framebuffer_echo_bytes(bytes: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        crate::fb::write_str(s);
+        return;
+    }
+
+    let mut encoded = [0u8; 2];
+    for &byte in bytes {
+        let s = char::from(byte).encode_utf8(&mut encoded);
+        crate::fb::write_str(s);
+    }
+}
+
+/// Write raw bytes to the serial console (COM1).
 fn serial_echo_bytes(bytes: &[u8]) {
     for &b in bytes {
         unsafe {
