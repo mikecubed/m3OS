@@ -8,7 +8,11 @@
 
 ## Milestone Goal
 
-The kernel's memory management, context management, and TLB coherence subsystems are structurally hardened against the classes of bugs discovered during Phase 52. Address-space identity is a first-class object, user buffers are typed at the syscall boundary, syscall return state is task-owned, TLB shootdowns are batched and targeted, and freed frames are zeroed.
+The kernel's memory management, context management, and TLB coherence subsystems
+move onto the structurally hardened path defined by this phase. In the checked-in
+tree, the AddressSpace object, typed user buffers, batched TLB work, and frame
+zeroing landed, while the task-owned return-state contract still needs the 52d
+closure pass to match the original completion story end to end.
 
 ## Post-Phase Audit Note
 
@@ -18,8 +22,15 @@ task-owned return-state migration is still only partially complete in HEAD.
 code still saves state at block points, restores only part of the resume path
 from `Task`, and leaves `kernel_stack_top` / `fs_base` split between `Task`,
 `Process`, and per-core scratch. `AddressSpace::generation` also exists but
-still needs end-to-end mutation and user-copy integration. Phase 52d is the
-follow-up phase for closing those gaps.
+still needs end-to-end mutation and user-copy integration.
+
+Of the items this phase deferred to Phase 52c — per-core scheduler, dynamic IPC
+pools, unified line discipline, VMA tree, ISR wakeup — the 52c post-phase audit
+found that three remain partial in HEAD: the scheduler hot path still acquires
+the global `SCHEDULER` lock, notifications remain fixed-size (`MAX_NOTIFS`)
+rather than fully growable, and `userspace/stdin_feeder` still duplicates
+line-discipline logic in ring 3. Phase 52d either completes those items or
+explicitly re-defers them.
 
 ## Why This Phase Exists
 

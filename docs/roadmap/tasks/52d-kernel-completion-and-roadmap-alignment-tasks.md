@@ -1,6 +1,6 @@
 # Phase 52d — Kernel Completion and Roadmap Alignment: Task List
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-52d
 **Depends on:** Phase 52a (Kernel Reliability Fixes) ✅, Phase 52b (Kernel Structural Hardening) ✅, Phase 52c (Kernel Architecture Evolution) ✅
 **Goal:** Close the audit-verified gaps between the documented outcomes of Phases 52a/52b/52c and the current implementation, then restore trustworthy smoke and regression gates for the Phase 52 kernel surface.
@@ -9,7 +9,7 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit-backed roadmap alignment | — | Planned |
+| A | Audit-backed roadmap alignment | — | In Progress |
 | B | Task-owned return-state completion | — | Planned |
 | C | Keyboard input convergence | B | Planned |
 | D | Scheduler and notification scope reconciliation | A | Planned |
@@ -31,10 +31,10 @@
 **Why it matters:** The roadmap must stop claiming more than the code currently delivers. Engineers should be able to read the 52-series docs and understand which parts are complete, which were superseded, and which still require work.
 
 **Acceptance:**
-- [ ] 52a notes that the manual IPC/futex restore pattern was superseded by the 52b return-state design
-- [ ] 52b notes which Track C items remain partial in the checked-in code
-- [ ] 52c no longer implies that the keyboard path, scheduler hot path, or notification pool are fully complete if they remain open
-- [ ] `docs/roadmap/README.md` includes Phase 52d in both the dependency map and milestone summary
+- [x] 52a notes that the manual IPC/futex restore pattern was superseded by the 52b return-state design
+- [x] 52b notes which Track C items remain partial in the checked-in code
+- [x] 52c no longer implies that the keyboard path, scheduler hot path, or notification pool are fully complete if they remain open
+- [x] `docs/roadmap/README.md` includes Phase 52d in both the dependency map and milestone summary
 
 ### A.2 — Add explicit regression coverage for exec-time signal reset
 
@@ -46,9 +46,9 @@
 **Why it matters:** Phase 52a implemented the POSIX rule that caught signal handlers reset across `exec`, but the current `signal-test` binary does not exercise that behavior directly.
 
 **Acceptance:**
-- [ ] `signal-test` installs a handler, forks or spawns an exec path, and proves the exec'd program does not inherit the handler
-- [ ] The failure mode distinguishes signal-reset bugs from generic exec failure
-- [ ] The test is wired into an existing validation path (`signal-test`, smoke, or regression)
+- [x] `signal-test` installs a handler, forks or spawns an exec path, and proves the exec'd program does not inherit the handler
+- [x] The failure mode distinguishes signal-reset bugs from generic exec failure
+- [x] The test is wired into an existing validation path (`signal-test`, smoke, or regression)
 
 ---
 

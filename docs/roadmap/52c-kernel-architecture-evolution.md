@@ -8,18 +8,36 @@
 
 ## Milestone Goal
 
-The kernel scheduler uses per-core queues with work-stealing, IPC resource pools are dynamically growable, the line discipline is implemented once in the kernel (not duplicated in userspace), VMA lookup is O(log n), and ISR-delivered notifications wake tasks immediately rather than waiting for the next scheduler tick.
+Phase 52c established the architecture direction for per-core scheduling,
+growable IPC resources, a unified kernel-side line discipline, O(log n) VMA
+lookup, and ISR wakeup improvements. In the checked-in tree, the VMA tree,
+growable endpoint/capability tables, `LineDiscipline`, `push_raw_input`, and the
+ISR wake queue landed, but the keyboard path still duplicates policy in
+userspace, the scheduler hot path still relies on the global `SCHEDULER` lock,
+and notifications remain fixed-size for ISR safety.
 
 ## Post-Phase Audit Note
 
 Phase 52c landed several important pieces — `LineDiscipline`, `push_raw_input`,
 the VMA tree, the ISR wake queue, and growable endpoint/capability tables — but
 the post-phase audit found that the checked-in code still diverges from part of
-this phase's completion story. `userspace/stdin_feeder` still duplicates line
-discipline logic, the scheduler hot path still relies on the global
-`SCHEDULER` lock, and notifications remain fixed-size for ISR safety rather than
-fully growable. Phase 52d either completes those claims or explicitly
-re-defers them.
+this phase's completion story in three areas:
+
+1. **Keyboard input path (partial):** `userspace/stdin_feeder` still reads
+   termios flags and implements `ICANON`, `ISIG`, echo, and canonical editing
+   itself instead of forwarding raw scancodes via `push_raw_input`. The kernel
+   `LineDiscipline` exists but is not yet the sole live path for keyboard input.
+
+2. **Scheduler hot path (partial):** The dispatch path still acquires the global
+   `SCHEDULER` lock. Per-core queues and work-stealing are designed but not yet
+   the active dispatch mechanism.
+
+3. **Notification pool (partial):** Notifications remain backed by fixed-size
+   arrays with `MAX_NOTIFS` for ISR safety. A growable pool design exists but
+   has not shipped because safe ISR-context growth requires additional work.
+
+Phase 52d either completes these items or explicitly re-defers them with
+matching code comments.
 
 ## Why This Phase Exists
 
@@ -121,11 +139,11 @@ A `LineDiscipline` struct holds a reference to the TTY state and provides `proce
 
 ## Acceptance Criteria
 
-- Scheduler dispatch path does not acquire a global lock
+- Scheduler dispatch path does not acquire a global lock *(partial — see Post-Phase Audit Note; global lock still acquired in HEAD)*
 - IPC can create more than 16 endpoints without exhaustion
 - A process can hold more than 64 capabilities
-- Only one line discipline implementation exists in the codebase (kernel-side)
-- `stdin_feeder` does not contain any canonical editing, echo, or ISIG logic
+- Only one line discipline implementation exists in the codebase (kernel-side) *(partial — see Post-Phase Audit Note; stdin_feeder still duplicates ldisc logic)*
+- `stdin_feeder` does not contain any canonical editing, echo, or ISIG logic *(partial — see Post-Phase Audit Note)*
 - VMA lookup for a process with 100 mappings is measurably faster than current
 - Keyboard IRQ → kbd_server wakeup latency is under 1ms (not 10ms)
 - `cargo xtask check` and `cargo xtask test` pass

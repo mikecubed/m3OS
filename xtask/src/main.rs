@@ -5569,6 +5569,12 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: pty_overlap_steps,
             timeout_secs: 90,
         },
+        RegressionTest {
+            name: "signal-reset",
+            description: "Exec-time signal disposition reset (POSIX: handlers → SIG_DFL)",
+            guest_steps: signal_reset_steps,
+            timeout_secs: 60,
+        },
     ]
 }
 
@@ -5634,6 +5640,27 @@ fn pty_overlap_steps() -> Vec<SmokeStep> {
         pattern: "passed, 0 failed",
         timeout_secs: 60,
         label: "pty-test 0 failures",
+    });
+    steps
+}
+
+/// Guest steps for the signal-reset regression: boot, login, run signal-test.
+///
+/// The exec_signal_reset test case inside signal-test forks, execs itself with
+/// `--exec-signal-check`, and verifies that SIGUSR1 was reset to SIG_DFL by
+/// execve. The failure mode uses distinct exit codes to distinguish a
+/// signal-reset bug (exit 42) from a generic exec failure (exit 99).
+fn signal_reset_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/signal-test\n",
+        label: "run signal-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "5 passed, 0 failed",
+        timeout_secs: 30,
+        label: "signal-test all pass",
     });
     steps
 }
