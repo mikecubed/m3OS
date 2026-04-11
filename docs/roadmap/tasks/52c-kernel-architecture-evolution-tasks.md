@@ -5,6 +5,11 @@
 **Depends on:** Phase 52b (Kernel Structural Hardening) ✅
 **Goal:** Larger-scale architecture improvements that improve scalability, remove resource limits, and unify duplicated subsystems.
 
+> **Post-phase audit note:** The current implementation still has open 52d
+> follow-up in Track A (global scheduler lock in the hot path), Track C.3
+> (`stdin_feeder` still duplicating line discipline), and the notification-pool
+> story where fixed-size ISR-safe arrays remain in use.
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |

@@ -150,10 +150,11 @@ flowchart TD
     P52 --> P52a["Phase 52a<br/>Kernel Reliability Fixes"]
     P52a --> P52b["Phase 52b<br/>Kernel Structural Hardening"]
     P52b --> P52c["Phase 52c<br/>Kernel Architecture Evolution"]
+    P52c --> P52d["Phase 52d<br/>Kernel Completion & Alignment"]
     P48 --> P53["Phase 53<br/>Headless Hardening"]
     P51 --> P53
-    P52b --> P53
-    P52c --> P54["Phase 54<br/>Deep Serverization"]
+    P52d --> P53
+    P52d --> P54["Phase 54<br/>Deep Serverization"]
     P53 --> P54
 
     %% Hardware, local-system, and release gate phases
@@ -272,6 +273,7 @@ flowchart TD
 | 52a | Kernel Reliability Fixes | Fix stale IPC return state, sunset wake_write, clear_child_tid, exec signal reset | **Complete** | `phase-52a` | [Phase 52a](./52a-kernel-reliability-fixes.md) | [Tasks](./tasks/52a-kernel-reliability-fixes-tasks.md) |
 | 52b | Kernel Structural Hardening | AddressSpace object, typed UserBuffers, task-owned return state, batch TLB, frame zeroing | **Complete** | `phase-52b` | [Phase 52b](./52b-kernel-structural-hardening.md) | [Tasks](./tasks/52b-kernel-structural-hardening-tasks.md) |
 | 52c | Kernel Architecture Evolution | Per-core scheduler, dynamic IPC pools, unified line discipline, VMA tree, ISR wakeup | **Complete** | `phase-52c` | [Phase 52c](./52c-kernel-architecture-evolution.md) | [Tasks](./tasks/52c-kernel-architecture-evolution-tasks.md) |
+| 52d | Kernel Completion and Roadmap Alignment | Audit-backed closure of the unfinished or overstated 52a/52b/52c work before later hardening phases | Planned | `phase-52d` | [Phase 52d](./52d-kernel-completion-and-roadmap-alignment.md) | [Tasks](./tasks/52d-kernel-completion-and-roadmap-alignment-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
 | 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
 

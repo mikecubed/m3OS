@@ -5,6 +5,11 @@
 **Depends on:** Phase 52a (Kernel Reliability Fixes)
 **Goal:** Replace fragile per-core scratch patterns with structurally sound alternatives, making the classes of bugs found in Phase 52 impossible rather than merely fixed.
 
+> **Post-phase audit note:** The checked-in code contains the major Phase 52b
+> structures, but the current implementation still has open 52d follow-up in
+> Track C (save-at-entry and single-authority restore) and in the activation of
+> generation-based user-copy diagnostics.
+
 ## Track Layout
 
 | Track | Scope | Dependencies | Status |

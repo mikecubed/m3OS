@@ -10,6 +10,17 @@
 
 The kernel scheduler uses per-core queues with work-stealing, IPC resource pools are dynamically growable, the line discipline is implemented once in the kernel (not duplicated in userspace), VMA lookup is O(log n), and ISR-delivered notifications wake tasks immediately rather than waiting for the next scheduler tick.
 
+## Post-Phase Audit Note
+
+Phase 52c landed several important pieces — `LineDiscipline`, `push_raw_input`,
+the VMA tree, the ISR wake queue, and growable endpoint/capability tables — but
+the post-phase audit found that the checked-in code still diverges from part of
+this phase's completion story. `userspace/stdin_feeder` still duplicates line
+discipline logic, the scheduler hot path still relies on the global
+`SCHEDULER` lock, and notifications remain fixed-size for ISR safety rather than
+fully growable. Phase 52d either completes those claims or explicitly
+re-defers them.
+
 ## Why This Phase Exists
 
 Phase 52b addresses the structural patterns that caused the Phase 52 bugs. This phase goes further, addressing scalability bottlenecks and design limitations that would otherwise constrain Phase 53+ work:

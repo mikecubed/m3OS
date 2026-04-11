@@ -10,6 +10,14 @@
 
 All four confirmed kernel bugs from the Phase 52 bug investigations are fixed, with targeted regression tests proving each fix.
 
+## Post-Phase Audit Note
+
+Phase 52a's `restore_caller_context` work was the correct stop-gap when it
+landed, but the current codebase no longer uses that exact mechanism on the
+main IPC/futex resume paths. Phase 52b replaced it with scheduler-restored
+task-owned return state, and Phase 52d records that handoff explicitly while
+adding the missing regression coverage for the exec-time signal-reset contract.
+
 ## Why This Phase Exists
 
 Phase 52's service extractions exposed two independent bug investigations:

@@ -10,6 +10,17 @@
 
 The kernel's memory management, context management, and TLB coherence subsystems are structurally hardened against the classes of bugs discovered during Phase 52. Address-space identity is a first-class object, user buffers are typed at the syscall boundary, syscall return state is task-owned, TLB shootdowns are batched and targeted, and freed frames are zeroed.
 
+## Post-Phase Audit Note
+
+Most of Phase 52b landed as designed, but the post-phase audit found that the
+task-owned return-state migration is still only partially complete in HEAD.
+`UserReturnState` exists and the manual restore sites are gone, yet the checked-in
+code still saves state at block points, restores only part of the resume path
+from `Task`, and leaves `kernel_stack_top` / `fs_base` split between `Task`,
+`Process`, and per-core scratch. `AddressSpace::generation` also exists but
+still needs end-to-end mutation and user-copy integration. Phase 52d is the
+follow-up phase for closing those gaps.
+
 ## Why This Phase Exists
 
 The Phase 52 bug investigations revealed that the `copy_to_user` reliability bug and the SSHD hang are symptoms of deeper structural patterns:
