@@ -1,31 +1,33 @@
 current-task: Phase 52d parallel implementation batch on feat/phase-52d targeting feat/phase-52
-current-phase: track-b-merged
-next-action: launch Tracks C and D on feat/phase-52d
+current-phase: track-c-merged
+next-action: launch Track E on feat/phase-52d
 workspace: feat/phase-52d
-last-updated: 2026-04-11T06:56:56+00:00
+last-updated: 2026-04-11T07:18:00+00:00
 
 ## Decisions
 - Track A is merged into feat/phase-52d.
 - Track B is merged into feat/phase-52d after the expanded shared-address-space correctness pass cleared review.
-- Tracks C and D are both dependency-ready on the updated integration branch.
-- Track E remains blocked on Tracks C and D.
+- Track C is merged into feat/phase-52d after moving canonical escape filtering into the kernel line discipline.
+- Track D is merged into feat/phase-52d after re-baselining scheduler/notification scope and fixing the notification-threshold diagnostic.
+- Track E is now the only remaining dependency-ready implementation track.
 
 ## Files Touched
-- kernel/src/task/mod.rs
+- docs/appendix/copy-to-user-reliability-bug.md
+- docs/roadmap/52c-kernel-architecture-evolution.md
+- docs/roadmap/52d-kernel-completion-and-roadmap-alignment.md
+- docs/roadmap/tasks/52c-kernel-architecture-evolution-tasks.md
+- kernel-core/src/tty.rs
 - kernel/src/task/scheduler.rs
+- kernel/src/ipc/notification.rs
 - kernel/src/arch/x86_64/syscall/mod.rs
-- kernel/src/mm/mod.rs
-- kernel/src/mm/user_mem.rs
-- kernel/src/mm/user_space.rs
-- kernel/src/arch/x86_64/interrupts.rs
-- kernel/src/mm/paging.rs
-- kernel/src/process/mod.rs
+- userspace/stdin_feeder/src/main.rs
+- userspace/syscall-lib/src/lib.rs
 
 ## Open Questions
 - none
 
 ## Blockers
-- none
+- `cargo xtask smoke-test --timeout 180` still times out before the login prompt on the merged feat/phase-52d baseline; Track E owns this remaining release-gate blocker.
 
 ## Failed Hypotheses
 - none
