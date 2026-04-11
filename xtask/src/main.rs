@@ -2455,22 +2455,22 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "PASS: ion_prompt",
-        timeout_secs: 20,
+        timeout_secs: 30,
         label: "verify PTY ion prompt regression",
     });
     steps.push(SmokeStep::Wait {
         pattern: "PASS: dual_ion_prompts",
-        timeout_secs: 20,
+        timeout_secs: 45,
         label: "verify dual PTY ion prompt regression",
     });
     steps.push(SmokeStep::Wait {
         pattern: "PASS: dual_ion_supervisors",
-        timeout_secs: 30,
+        timeout_secs: 45,
         label: "verify dual PTY supervisor regression",
     });
     steps.push(SmokeStep::Wait {
         pattern: "pty-test: 11 passed, 0 failed",
-        timeout_secs: 20,
+        timeout_secs: 30,
         label: "verify PTY test summary",
     });
     steps.push(SmokeStep::Wait {

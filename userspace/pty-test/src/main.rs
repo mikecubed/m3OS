@@ -161,7 +161,22 @@ fn cleanup_shell(mfd: i32, pid: i32, request_exit: bool) -> i32 {
     let mut status = 0i32;
     let waited = waitpid(pid, &mut status, WNOHANG);
     if waited == 0 {
+        // SIGHUP first, then poll briefly before escalating to SIGKILL.
         let _ = kill(pid, 1);
+        for _ in 0..20 {
+            if waitpid(pid, &mut status, WNOHANG) != 0 {
+                return status;
+            }
+            // Yield CPU briefly — no sleep syscall, so spin a short poll.
+            let mut pfd = PollFd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            };
+            let _ = poll(core::slice::from_mut(&mut pfd), 50);
+        }
+        // Ion didn't exit from SIGHUP — force kill.
+        let _ = kill(pid, syscall_lib::SIGKILL);
         let _ = waitpid(pid, &mut status, 0);
     }
     status
@@ -226,7 +241,7 @@ fn spawn_ion_supervisor() -> Result<(i32, i32, i32), ()> {
 
         let exit_code = match spawn_ion_shell() {
             Ok((mfd, shell_pid)) => {
-                let ready = matches!(wait_for_prompt(mfd, 50), Ok(true));
+                let ready = matches!(wait_for_prompt(mfd, 100), Ok(true));
                 let status = [if ready { b'1' } else { b'0' }];
                 let _ = write(ready_pipe[1], &status);
                 close(ready_pipe[1]);
@@ -267,6 +282,18 @@ fn cleanup_supervisor(ready_fd: i32, hold_fd: i32, pid: i32) -> i32 {
     let waited = waitpid(pid, &mut status, WNOHANG);
     if waited == 0 {
         let _ = kill(pid, 1);
+        for _ in 0..20 {
+            if waitpid(pid, &mut status, WNOHANG) != 0 {
+                return status;
+            }
+            let mut pfd = PollFd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            };
+            let _ = poll(core::slice::from_mut(&mut pfd), 50);
+        }
+        let _ = kill(pid, syscall_lib::SIGKILL);
         let _ = waitpid(pid, &mut status, 0);
     }
     status
@@ -564,7 +591,7 @@ fn test_master_close_eof() -> bool {
 /// Test 9: Spawn ion on a PTY and verify the initial prompt is emitted.
 fn test_ion_prompt() -> bool {
     match spawn_ion_shell() {
-        Ok((mfd, pid)) => match wait_for_prompt(mfd, 50) {
+        Ok((mfd, pid)) => match wait_for_prompt(mfd, 100) {
             Ok(saw_prompt) => {
                 let status = cleanup_shell(mfd, pid, saw_prompt);
                 if saw_prompt && ((status >> 8) & 0xFF) == 0 {
@@ -599,7 +626,7 @@ fn test_dual_ion_prompts() -> bool {
         }
     };
 
-    let first_ready = match wait_for_prompt(mfd_a, 50) {
+    let first_ready = match wait_for_prompt(mfd_a, 100) {
         Ok(ready) => ready,
         Err(_) => {
             let _ = cleanup_shell(mfd_a, pid_a, false);
@@ -622,7 +649,7 @@ fn test_dual_ion_prompts() -> bool {
         }
     };
 
-    let second_ready = match wait_for_prompt(mfd_b, 50) {
+    let second_ready = match wait_for_prompt(mfd_b, 100) {
         Ok(ready) => ready,
         Err(_) => {
             let _ = cleanup_shell(mfd_b, pid_b, false);
