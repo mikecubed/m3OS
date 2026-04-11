@@ -36,7 +36,7 @@ static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 
 fn bump_current_addr_space_generation() {
     if let Some(addr_space) = crate::process::current_addr_space() {
-        addr_space.bump_generation();
+        unsafe { addr_space.as_ref() }.bump_generation();
     }
 }
 
@@ -110,7 +110,8 @@ pub fn resolve_cow_fault(vaddr: u64) -> bool {
     let addr_space = crate::process::current_addr_space();
     let mut old_phys_to_free = None;
     {
-        let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
         let (cr3_frame, _) = Cr3::read();
         let pml4_phys = cr3_frame.start_address().as_u64();
@@ -184,7 +185,7 @@ pub fn resolve_cow_fault(vaddr: u64) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(addr_space, vaddr, vaddr + 4096);
+        crate::smp::tlb::tlb_shootdown_range(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
     } else {
         x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
     }
@@ -298,7 +299,8 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let addr_space = crate::process::current_addr_space();
     let page_base = vaddr & !0xFFF;
     let mapped = {
-        let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
         demand_map_user_page_locked(vaddr, prot)
     };
     if !mapped {
@@ -307,7 +309,11 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(addr_space, page_base, page_base + 4096);
+        crate::smp::tlb::tlb_shootdown_range(
+            unsafe { addr_space.as_ref() },
+            page_base,
+            page_base + 4096,
+        );
     }
     bump_current_addr_space_generation();
     true
@@ -326,7 +332,8 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     let addr_space = crate::process::current_addr_space();
     let page_base = vaddr & !0xFFF;
     let mapped = {
-        let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
         let Some(prot) = crate::process::shared_vma_prot(pid, vaddr) else {
             return false;
@@ -346,7 +353,11 @@ fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
     if crate::smp::is_per_core_ready()
         && let Some(addr_space) = addr_space
     {
-        crate::smp::tlb::tlb_shootdown_range(addr_space, page_base, page_base + 4096);
+        crate::smp::tlb::tlb_shootdown_range(
+            unsafe { addr_space.as_ref() },
+            page_base,
+            page_base + 4096,
+        );
     }
     bump_current_addr_space_generation();
     true

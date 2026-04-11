@@ -2226,6 +2226,31 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     }
 }
 
+fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
+    let mut sa = [0u8; 32];
+    match action {
+        crate::process::SignalAction::Default => {
+            sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
+        }
+        crate::process::SignalAction::Ignore => {
+            sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
+        }
+        crate::process::SignalAction::Handler {
+            entry,
+            mask,
+            flags,
+            restorer,
+        } => {
+            sa[0..8].copy_from_slice(&entry.to_ne_bytes());
+            sa[8..16].copy_from_slice(&flags.to_ne_bytes());
+            sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
+            // Convert kernel mask back to userspace (0-indexed).
+            sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
+        }
+    }
+    sa
+}
+
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
@@ -2253,45 +2278,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     };
 
     let pid = crate::process::current_pid();
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    let proc = match table.find_mut(pid) {
-        Some(p) => p,
-        None => return NEG_EINVAL,
-    };
-
-    // POSIX requires sigaction to be atomic: if copying out oldact faults,
-    // the signal disposition must remain unchanged.
-    if oldact_ptr != 0 {
-        let mut old_sa = [0u8; 32];
-        match proc.sigaction_get(sig as usize) {
-            crate::process::SignalAction::Default => {
-                old_sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
-            }
-            crate::process::SignalAction::Ignore => {
-                old_sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
-            }
-            crate::process::SignalAction::Handler {
-                entry,
-                mask,
-                flags,
-                restorer,
-            } => {
-                old_sa[0..8].copy_from_slice(&entry.to_ne_bytes());
-                old_sa[8..16].copy_from_slice(&flags.to_ne_bytes());
-                old_sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
-                // Convert kernel mask back to userspace (0-indexed).
-                old_sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
-            }
-        }
-        if UserSliceWo::new(oldact_ptr, old_sa.len())
-            .and_then(|s| s.copy_from_kernel(&old_sa))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-    }
-
-    if let Some(sa) = new_sa_bytes {
+    let new_action = if let Some(sa) = new_sa_bytes {
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
         let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
         let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
@@ -2309,7 +2296,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         // (signal-number-indexed).
         let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
-        let new_action = match handler_addr {
+        Some(match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
             _ => {
@@ -2331,6 +2318,69 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
                     restorer: effective_restorer,
                 }
             }
+        })
+    } else {
+        None
+    };
+
+    // Snapshot/copy the old action outside PROCESS_TABLE so user faults cannot
+    // reenter the lock. When replacing the action, retry until the copied-out
+    // snapshot still matches the action we are about to overwrite.
+    if oldact_ptr != 0 {
+        if let Some(new_action) = new_action {
+            loop {
+                let old_action = {
+                    let table = crate::process::PROCESS_TABLE.lock();
+                    let proc = match table.find(pid) {
+                        Some(p) => p,
+                        None => return NEG_EINVAL,
+                    };
+                    proc.sigaction_get(sig as usize)
+                };
+                let old_sa = encode_rt_sigaction(old_action);
+                if UserSliceWo::new(oldact_ptr, old_sa.len())
+                    .and_then(|s| s.copy_from_kernel(&old_sa))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                let proc = match table.find_mut(pid) {
+                    Some(p) => p,
+                    None => return NEG_EINVAL,
+                };
+                if proc.sigaction_get(sig as usize) != old_action {
+                    continue;
+                }
+                proc.sigaction_set(sig as usize, new_action);
+                return 0;
+            }
+        }
+
+        let old_action = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            let proc = match table.find(pid) {
+                Some(p) => p,
+                None => return NEG_EINVAL,
+            };
+            proc.sigaction_get(sig as usize)
+        };
+        let old_sa = encode_rt_sigaction(old_action);
+        if UserSliceWo::new(oldact_ptr, old_sa.len())
+            .and_then(|s| s.copy_from_kernel(&old_sa))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
+    if let Some(new_action) = new_action {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
         };
         proc.sigaction_set(sig as usize, new_action);
     }

@@ -25,7 +25,10 @@ pub mod futex;
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::mm::AddressSpace;
 use spin::Mutex;
@@ -62,20 +65,17 @@ pub fn set_current_pid(pid: Pid) {
     }
 }
 
-/// Return the current core's active user address space, if any.
+/// Return a non-null pointer to the current core's active user address space, if any.
 ///
 /// When SMP per-core state is live, this uses the scheduler-maintained
 /// `current_addrspace` pointer so fault-time paths do not need to reenter the
 /// process table just to serialize page-table mutations. Before per-core state
 /// exists, it falls back to the current process table entry.
-pub fn current_addr_space() -> Option<&'static AddressSpace> {
+pub fn current_addr_space() -> Option<NonNull<AddressSpace>> {
     if crate::smp::is_per_core_ready() {
         let ptr = crate::smp::per_core().current_addrspace;
         if !ptr.is_null() {
-            // SAFETY: the scheduler only publishes this pointer while the
-            // corresponding process is the active userspace context on this
-            // core, and clears it before the address space can be reaped.
-            return Some(unsafe { &*ptr });
+            return NonNull::new(ptr.cast_mut());
         }
     }
 
@@ -93,10 +93,10 @@ pub fn current_addr_space() -> Option<&'static AddressSpace> {
         })
     }?;
 
-    // SAFETY: before per-core state exists the kernel is still effectively
-    // single-core, so the current process entry cannot be concurrently reaped
-    // between the table lookup and this dereference.
-    Some(unsafe { &*ptr })
+    // Before per-core state exists the kernel is still effectively single-core,
+    // so the current process entry cannot be concurrently reaped before callers
+    // immediately dereference this pointer in a tightly-scoped unsafe block.
+    NonNull::new(ptr as *mut AddressSpace)
 }
 
 #[allow(unused_imports)]

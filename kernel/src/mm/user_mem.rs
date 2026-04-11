@@ -59,7 +59,8 @@ fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
         let mut need_demand_fault = false;
         {
             let addr_space = addr_space_no_lock();
-            let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+            let _page_table_guard =
+                addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
             let translated = {
                 let mapper = unsafe { crate::mm::paging::get_mapper() };
@@ -139,7 +140,8 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
 
         let action = {
             let addr_space = addr_space_no_lock();
-            let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+            let _page_table_guard =
+                addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
             let mapper = unsafe { crate::mm::paging::get_mapper() };
             if is_user_writable(&mapper, VirtAddr::new(page_base)) {
@@ -262,14 +264,11 @@ fn is_user_writable(
 /// may already hold `PROCESS_TABLE`. If the per-core pointer is not yet
 /// populated, callers skip the page-table lock for that copy; per-page
 /// validation still catches unmapped pages.
-fn addr_space_no_lock() -> Option<&'static crate::mm::AddressSpace> {
+fn addr_space_no_lock() -> Option<core::ptr::NonNull<crate::mm::AddressSpace>> {
     if crate::smp::is_per_core_ready() {
         let ptr = crate::smp::per_core().current_addrspace;
         if !ptr.is_null() {
-            // SAFETY: the scheduler publishes this pointer only while the
-            // corresponding address space is active on this core, and clears
-            // it before the address space can be reaped.
-            return Some(unsafe { &*ptr });
+            return core::ptr::NonNull::new(ptr.cast_mut());
         }
     }
     None
@@ -291,11 +290,8 @@ fn addr_space_no_lock() -> Option<&'static crate::mm::AddressSpace> {
 fn addr_space_generation() -> Option<u64> {
     if crate::smp::is_per_core_ready() {
         let ptr = crate::smp::per_core().current_addrspace;
-        if !ptr.is_null() {
-            // SAFETY: the scheduler publishes this pointer only while the
-            // corresponding address space is active on this core, and clears
-            // it before the address space can be reaped.
-            return Some(unsafe { &*ptr }.generation());
+        if let Some(addr_space) = core::ptr::NonNull::new(ptr.cast_mut()) {
+            return Some(unsafe { addr_space.as_ref() }.generation());
         }
     }
     None
