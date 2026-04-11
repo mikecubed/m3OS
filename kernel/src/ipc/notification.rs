@@ -251,9 +251,14 @@ pub fn signal_irq(irq: u8) {
     }
 
     // Phase 52: push waiter to per-core ISR wakeup queue (lock-free).
+    // Use compare_exchange to atomically claim the waiter, preventing
+    // duplicate pushes when multiple IRQs arrive before the task wakes.
     if let Some(isr_waiter) = ISR_WAITERS.get(idx as usize) {
         let waiter_idx = isr_waiter.load(Ordering::Acquire);
         if waiter_idx >= 0
+            && isr_waiter
+                .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
             && let Some(data) = crate::smp::try_per_core()
         {
             let _ = data.isr_wake_queue.push(waiter_idx as usize);
