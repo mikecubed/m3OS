@@ -8,17 +8,18 @@
 ## Overview
 
 Phase 52c addresses five scalability bottlenecks and design limitations that
-would constrain Phase 53+ work. The global scheduler lock is replaced with
-per-core dispatch and work-stealing. IPC resource pools become dynamically
-growable. The duplicated line discipline is unified into a single kernel module.
-VMA lookup becomes O(log n). And ISR-delivered notifications wake tasks
-immediately rather than waiting for the next scheduler tick.
+would constrain Phase 53+ work. It introduced per-core run queues and
+work-stealing, growable endpoint/capability/service tables, a shared kernel
+line-discipline path, O(log n) VMA lookup, and ISR-delivered wake queues.
+Phase 52d then closed the live keyboard-path convergence and recorded the two
+remaining honest limits: dispatch still acquires the global `SCHEDULER` lock,
+and notifications remain fixed-size for ISR safety.
 
 ## What This Doc Covers
 
-- Per-core scheduler dispatch with work-stealing and task slot reuse
-- Dynamic IPC resource pools (endpoints, capabilities, notifications, services)
-- Unified kernel-side line discipline with push_raw_input syscall
+- Per-core scheduler dispatch infrastructure with work-stealing and task slot reuse
+- Growable IPC resource pools for endpoints, capabilities, and services
+- Unified kernel-side line discipline with the `push_raw_input` keyboard path
 - BTreeMap-backed VMA tree for O(log n) address lookup
 - ISR-direct notification wakeup via lock-free per-core queues
 
@@ -27,9 +28,11 @@ immediately rather than waiting for the next scheduler tick.
 ### Per-core scheduler with work-stealing (Track A)
 
 The single global `SCHEDULER: Mutex<Scheduler>` was the dispatch hot-path
-bottleneck. `pick_next()` now uses only the per-core `run_queue` without
-acquiring the global lock. The global lock is reserved for spawn, exit, and
-task state reads.
+bottleneck. Phase 52c landed the per-core `run_queue`, work-stealing, migration
+cooldowns, and dead-slot recycling that reduce cross-core contention. The Phase
+52d audit clarified that the dispatch hot path still acquires the global lock
+for task-state reads and transitions, so true lock-free per-core dispatch
+remains later work.
 
 When a core's local queue is empty, it steals from the busiest other core's
 queue (affinity-checked). Dead task slots are recycled via a free list with
@@ -58,8 +61,9 @@ a callback for pushed data and a `LdiscResult` enum for echo and signal output.
 `TtyState` wraps `LineDiscipline` instead of separate termios/edit_buf fields.
 The `serial_stdin_feeder_task` delegates to `ldisc.process_byte()`. A new
 `push_raw_input` syscall (0x1010) lets the userspace `stdin_feeder` send
-decoded bytes directly to the kernel's line discipline, eliminating all
-duplicated processing.
+decoded bytes directly to the kernel's line discipline. Phase 52d then reduced
+`stdin_feeder` to a pure scancode-to-byte bridge so the live keyboard path also
+stopped duplicating terminal policy in userspace.
 
 ### VMA tree structure (Track D)
 
@@ -114,11 +118,14 @@ the queue was full or the ISR fired before the waiter registered.
 - The line discipline is minimal (N_TTY-compatible). Multi-ldisc switching and
   SLIP/PPP disciplines are out of scope.
 - VMA tree uses BTreeMap, not Linux's maple tree or a custom interval tree.
+- True lock-free per-core dispatch was re-deferred in Phase 52d even though the
+  per-core queueing/work-stealing infrastructure from this phase remains active.
 
 ## Related Roadmap Docs
 
 - [Phase 52c roadmap doc](./roadmap/52c-kernel-architecture-evolution.md)
 - [Phase 52c task doc](./roadmap/tasks/52c-kernel-architecture-evolution-tasks.md)
+- [Phase 52d -- Kernel Completion and Roadmap Alignment](./52d-kernel-completion-and-roadmap-alignment.md)
 - [Phase 52b -- Kernel Structural Hardening](./52b-kernel-structural-hardening.md)
 - [Phase 52a -- Kernel Reliability Fixes](./52a-kernel-reliability-fixes.md)
 - [Phase 52 -- First Service Extractions](./52-first-service-extractions.md)

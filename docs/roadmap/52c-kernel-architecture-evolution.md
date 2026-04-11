@@ -11,33 +11,30 @@
 Phase 52c established the architecture direction for per-core scheduling,
 growable IPC resources, a unified kernel-side line discipline, O(log n) VMA
 lookup, and ISR wakeup improvements. In the checked-in tree, the VMA tree,
-growable endpoint/capability tables, `LineDiscipline`, `push_raw_input`, and the
-ISR wake queue landed, but the keyboard path still duplicates policy in
-userspace, the scheduler hot path still relies on the global `SCHEDULER` lock,
-and notifications remain fixed-size for ISR safety.
+growable endpoint/capability/service tables, `LineDiscipline`, the live
+`push_raw_input` keyboard path, and the ISR wake queue all landed. Phase 52d
+then recorded the remaining honest limits: the scheduler hot path still relies
+on the global `SCHEDULER` lock, and notifications remain fixed-size for ISR
+safety.
 
 ## Post-Phase Audit Note
 
 Phase 52c landed several important pieces — `LineDiscipline`, `push_raw_input`,
-the VMA tree, the ISR wake queue, and growable endpoint/capability tables — but
-the post-phase audit found that the checked-in code still diverges from part of
-this phase's completion story in three areas:
+the VMA tree, the ISR wake queue, and growable endpoint/capability tables. The
+post-phase audit originally found three mismatches between the implementation
+and the completion story; Phase 52d closed that audit as follows:
 
-1. **Keyboard input path (partial):** `userspace/stdin_feeder` still reads
-   termios flags and implements `ICANON`, `ISIG`, echo, and canonical editing
-   itself instead of forwarding raw scancodes via `push_raw_input`. The kernel
-   `LineDiscipline` exists but is not yet the sole live path for keyboard input.
+1. **Keyboard input path:** Completed. `userspace/stdin_feeder` now forwards raw
+   bytes and escape sequences via `push_raw_input`, so the kernel
+   `LineDiscipline` is the sole live line-discipline path for keyboard input.
 
-2. **Scheduler hot path (partial):** The dispatch path still acquires the global
-   `SCHEDULER` lock. Per-core queues and work-stealing are designed but not yet
-   the active dispatch mechanism.
+2. **Scheduler hot path:** Explicitly deferred. The dispatch path still acquires
+   the global `SCHEDULER` lock for task-state reads and transitions even though
+   per-core queues, work-stealing, load balancing, and slot reuse are active.
 
-3. **Notification pool (partial):** Notifications remain backed by fixed-size
-   arrays with `MAX_NOTIFS` for ISR safety. A growable pool design exists but
-   has not shipped because safe ISR-context growth requires additional work.
-
-Phase 52d either completes these items or explicitly re-defers them with
-matching code comments.
+3. **Notification pool:** Explicitly deferred. Notifications remain backed by a
+   fixed-size `MAX_NOTIFS = 64` array because the allocator and waiter mirrors
+   must remain ISR-safe and lock-free.
 
 ## Why This Phase Exists
 

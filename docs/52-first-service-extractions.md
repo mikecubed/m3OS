@@ -14,7 +14,7 @@
 ## Overview
 
 Phase 52 proves that the m3OS microkernel architecture is real by extracting
-console rendering and keyboard input translation from kernel-resident tasks into
+console rendering and keyboard input handling from kernel-resident tasks into
 supervised ring-3 services. After this phase, the system demonstrates that
 user-visible subsystems can cross the ring-0 boundary, communicate through the
 Phase 50 IPC contract, and be restarted by the Phase 51 service manager without
@@ -25,7 +25,7 @@ rebooting the machine.
 - What stayed in the kernel vs. what moved to userspace
 - Console service architecture and rendering ownership
 - Keyboard service architecture and IPC-based scancode delivery
-- Stdin feeder extraction and line discipline in userspace
+- Stdin feeder extraction and kernel-side line-discipline convergence
 - Restart and reconnection behavior
 - TTY buffer dual-routing design
 - Boundary measurements (TBD pending QEMU testing)
@@ -41,6 +41,7 @@ hardware access:
 | Framebuffer mapping | Physical MMIO region must be mapped by the kernel; only the kernel can create page-table entries for device memory |
 | IRQ handler for keyboard | ISR must run in ring 0 to read PS/2 port 0x60, acknowledge the interrupt, and send EOI |
 | Scancode ring buffer | Populated by the ISR; drained by the kbd_server notification path |
+| Shared TTY line discipline | Canonical editing, echo, and signal generation now live in one kernel path used by both serial and keyboard input |
 | Stdin buffer (kernel-side) | Maintains a dual-routing path so that legacy stdin reads continue to work alongside the new IPC-based keyboard service |
 | Notification objects | Kernel-owned; used to wake the ring-3 kbd_server when IRQ1 fires |
 
@@ -66,23 +67,24 @@ The console service owns all rendering policy:
 
 ### Keyboard service (`kbd_server`)
 
-The keyboard service owns input translation and event delivery:
+The keyboard service owns IRQ-driven scancode delivery:
 
 - Waits on a kernel notification object bound to IRQ1
 - Drains the scancode ring buffer when notified
-- Translates raw PS/2 scancodes to key events
-- Delivers events to subscribed clients via IPC
+- Serves raw PS/2 scancodes to clients via `KBD_READ` IPC replies
 - Registers as `"kbd"` in the service registry
 
 ### Stdin feeder / line discipline
 
 The stdin feeder bridges the keyboard scancode path with the legacy stdin path:
 
-- Reads scancodes via the kernel keyboard-scancode syscall (PS/2 ring buffer)
-- Translates raw scancodes to characters using a US-QWERTY lookup table
-- Performs line discipline processing (echo, backspace, line buffering)
-- Feeds processed input into the kernel stdin buffer for processes that read
-  from fd 0 using traditional `sys_read`
+- Looks up the `"kbd"` service and reads scancodes over IPC
+- Translates raw scancodes to bytes or VT100 escape sequences
+- Forwards each byte to the kernel via `push_raw_input`
+- Does **not** implement `ICANON`, `ISIG`, echo, or canonical editing in
+  userspace; the kernel `LineDiscipline` handles that policy
+- Feeds the processed byte stream into the kernel TTY/stdin path for processes
+  that still read from fd 0 using traditional `sys_read`
 
 This dual-routing design means existing programs (shell, coreutils, editors)
 continue to work without modification while the system transitions to
@@ -95,14 +97,18 @@ A key design decision is the TTY buffer dual-routing model:
 ```
 IRQ1 → kernel scancode buffer → notification → kbd_server (ring 3)
                                                     ↓
-                                            stdin feeder (ring 3)
+                                            stdin_feeder (ring 3)
+                                                    ↓
+                                            push_raw_input syscall
+                                                    ↓
+                                     kernel line discipline / TTY buffer
                                                     ↓
                                             kernel stdin buffer ← legacy sys_read
 ```
 
 This allows:
 
-1. IPC-aware clients to receive key events directly from kbd_server
+1. IPC-aware clients to receive raw keyboard scancodes directly from kbd_server
 2. Legacy programs to read from stdin as before
 3. The transition to be gradual -- no big-bang ABI break required
 
@@ -179,16 +185,20 @@ what was explicitly granted.
 ### Minimal kernel mediation
 
 The kernel's role is narrowed to: map hardware, handle IRQs, maintain ring
-buffers, and deliver notifications. All policy decisions (rendering, input
-translation, focus routing) live in userspace.
+buffers, deliver notifications, and run the shared TTY line discipline used by
+both serial and keyboard input. Rendering, service lifecycle, scancode delivery,
+and focus routing still live in userspace.
 
 ## Key Files
 
 | File | Purpose |
 |---|---|
 | `userspace/console_server/src/main.rs` | Ring-3 console rendering service |
-| `userspace/kbd_server/src/main.rs` | Ring-3 keyboard input translation service |
+| `userspace/kbd_server/src/main.rs` | Ring-3 keyboard scancode service |
+| `userspace/stdin_feeder/src/main.rs` | Ring-3 scancode-to-byte bridge that forwards via `push_raw_input` |
 | `userspace/init/src/main.rs` | Service manager integration for extracted services |
+| `kernel-core/src/tty.rs` | Shared kernel line discipline for serial and keyboard input |
+| `kernel/src/arch/x86_64/syscall/mod.rs` | `push_raw_input` entry point and TTY-facing syscall glue |
 | `kernel/src/main.rs` | Narrowed kernel-side mediation (FB mapping, IRQ, buffers) |
 | `kernel/src/ipc/mod.rs` | Registry and capability infrastructure |
 | `kernel/initrd/etc/services.d/console.conf` | Console service definition |
@@ -208,7 +218,7 @@ translation, focus routing) live in userspace.
 ## Sub-Phases
 
 Phase 52's service extraction work exposed kernel bugs and design limitations
-that were addressed in three follow-on sub-phases:
+that were addressed in four follow-on sub-phases:
 
 - [Phase 52a -- Kernel Reliability Fixes](./52a-kernel-reliability-fixes.md):
   Four confirmed bug fixes (stale IPC return state, sunset waker, clear_child_tid,
@@ -219,6 +229,8 @@ that were addressed in three follow-on sub-phases:
 - [Phase 52c -- Kernel Architecture Evolution](./52c-kernel-architecture-evolution.md):
   Per-core scheduler, dynamic IPC pools, unified line discipline, VMA tree,
   ISR-direct wakeup
+- [Phase 52d -- Kernel Completion and Roadmap Alignment](./52d-kernel-completion-and-roadmap-alignment.md):
+  Return-state closure, keyboard-path convergence, late bootfixes, and release-gate/initrd cleanup
 
 ## Related Roadmap Docs
 
@@ -227,6 +239,7 @@ that were addressed in three follow-on sub-phases:
 - [Phase 52a roadmap doc](./roadmap/52a-kernel-reliability-fixes.md)
 - [Phase 52b roadmap doc](./roadmap/52b-kernel-structural-hardening.md)
 - [Phase 52c roadmap doc](./roadmap/52c-kernel-architecture-evolution.md)
+- [Phase 52d roadmap doc](./roadmap/52d-kernel-completion-and-roadmap-alignment.md)
 - [Phase 50 -- IPC Completion](./50-ipc-completion.md)
 - [Phase 51 -- Service Model Maturity](./51-service-model-maturity.md)
 - [Core Servers (Phase 7)](./07-core-servers.md)

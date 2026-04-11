@@ -5,14 +5,12 @@
 **Depends on:** Phase 52b (Kernel Structural Hardening) ✅
 **Goal:** Larger-scale architecture improvements that improve scalability, remove resource limits, and unify duplicated subsystems.
 
-> **Post-phase audit note (Phase 52d Track A + Track D):** The current
-> implementation still has open items: Track A.1 acceptance item "dispatch hot
-> path does not acquire any global lock" is unchecked — the global `SCHEDULER`
-> lock is acquired on every dispatch iteration; Track B.3 notification pool
-> remains fixed-size (`MAX_NOTIFS = 64`) for ISR safety rather than dynamically
-> growable; Track C.3 `stdin_feeder` still duplicates line discipline in
-> userspace.  See Phase 52d Track D for the reconciliation rationale and
-> Phase 52d Track C for the keyboard convergence plan.
+> **Post-phase audit note (closed in Phase 52d):** Track C.3 is now complete in
+> HEAD: `stdin_feeder` forwards raw bytes via `push_raw_input` and no longer
+> duplicates line discipline in userspace. The remaining unchecked items are
+> intentional deferrals: Track A.1 still acquires the global `SCHEDULER` lock
+> on each dispatch iteration, and Track B.3 keeps a fixed-size
+> `MAX_NOTIFS = 64` pool for ISR safety. Phase 52d records the final rationale.
 
 ## Track Layout
 
