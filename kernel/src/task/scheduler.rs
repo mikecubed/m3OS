@@ -1,20 +1,54 @@
-//! SMP-aware per-core scheduler with work-stealing.
+//! SMP-aware scheduler with per-core run queues and work-stealing.
 //!
-//! # Design (Phase 25, refined Phase 52c)
+//! # Design (Phase 25, refined Phase 52c, audited Phase 52d)
 //!
-//! Task state lives in a global `SCHEDULER` (TaskRegistry) protected by a
-//! mutex. The dispatch hot path (`pick_next`) operates entirely on the
-//! per-core run queue without acquiring the global lock. The global lock is
-//! only acquired for:
-//! - Spawn / exit / drain-dead (task lifecycle)
-//! - Reading task state for dispatch (saved_rsp, marking Running)
-//! - Post-switch: saving RSP, clearing switching_out
-//! - Wake / block / IPC operations that modify task state
+//! ## Global lock and per-core queues
 //!
-//! When a core's local run queue is empty, it attempts to steal work from
-//! other cores before falling back to its idle task.
+//! All task state lives in a global `SCHEDULER: Mutex<Scheduler>`. The
+//! global lock is acquired on every dispatch iteration for:
+//!
+//! - **Task selection** (`pick_next`): reads per-core run queues (which are
+//!   per-core `Mutex<VecDeque>` inside `PerCoreData`) and validates task
+//!   state/saved_rsp from the global `tasks` vec.
+//! - **State transitions**: marking the selected task `Running`, marking
+//!   yielded/blocked tasks, and handling `switching_out` / `wake_after_switch`.
+//! - **ISR wake drain**: waking tasks pushed to the per-core `IsrWakeQueue`
+//!   by `signal_irq()`.
+//! - **Post-switch bookkeeping**: saving the outgoing task's RSP, clearing
+//!   `switching_out`, and re-enqueueing yielded tasks.
+//! - **Lifecycle**: spawn, exit, drain-dead, capability/IPC operations.
+//!
+//! The per-core infrastructure (run queues, `IsrWakeQueue`, reschedule
+//! flags, `current_task_idx`) avoids *some* cross-core contention — each
+//! core selects from its own queue and ISR wakeups are pushed lock-free —
+//! but the global `SCHEDULER` lock is still acquired in the dispatch hot
+//! path for every task state read/write.
+//!
+//! **True per-core scheduling** (where the dispatch hot path never acquires
+//! a global lock) is deferred to a future phase. It requires splitting the
+//! `tasks` vec into per-core task ownership or a lock-free task registry,
+//! which is a larger architectural change than Phase 52c/52d scope.
+//!
+//! ## Work-stealing (Phase 52c A.2)
+//!
+//! When a core's local run queue is empty, `pick_next` calls `try_steal`
+//! to take one ready task from the longest other-core queue, provided the
+//! task's affinity mask permits running on the stealing core. The stolen
+//! task's `assigned_core` and `last_migrated_tick` are updated.
+//!
+//! ## Load balancing (Phase 52c A.4)
+//!
+//! The BSP runs `maybe_load_balance()` every 50 scheduler ticks (~500 ms
+//! at 100 Hz). If the longest run queue exceeds the shortest by more than
+//! 2 entries, one task is migrated — skipping any task whose
+//! `last_migrated_tick` is within `MIGRATE_COOLDOWN` (100 ticks / ~1 s).
+//!
+//! ## Dead-slot recycling (Phase 52c A.3)
 //!
 //! Dead task slots are recycled via a free list to bound memory growth.
+//! `drain_dead` runs on the BSP each scheduler iteration.
+//!
+//! ## Voluntary yield and ISR-triggered reschedule
 //!
 //! A task voluntarily returns control by calling [`yield_now`], which uses
 //! `switch_context` to the calling core's scheduler RSP.
@@ -156,9 +190,13 @@ impl Scheduler {
 
     /// Pick the next task to run on the given core.
     ///
-    /// Phase 52c: Uses ONLY the per-core run queue (no global fallback scan).
-    /// If the local queue is empty, attempts to steal from other cores.
-    /// Falls back to this core's idle task as a last resort.
+    /// Selects from the per-core run queue (highest priority first), then
+    /// attempts work-stealing from other cores, then falls back to the
+    /// idle task.
+    ///
+    /// NOTE: this method is called while the caller holds `SCHEDULER.lock()`,
+    /// so it has access to the full `tasks` vec for state validation. True
+    /// lock-free per-core dispatch is deferred (see module-level doc).
     fn pick_next(&mut self, core_id: u8) -> Option<(u64, usize)> {
         let core_bit = 1u64 << core_id;
 
@@ -1025,8 +1063,10 @@ pub fn server_endpoint(id: TaskId) -> Option<EndpointId> {
 
 /// The main scheduler loop. Called once per core. Never returns.
 ///
-/// Each core runs its own instance, using per-core RESCHEDULE flag and
-/// scheduler RSP. Tasks are picked from the shared global task list.
+/// Each core runs its own instance. The per-core reschedule flag gates
+/// iteration; per-core run queues provide task selection locality. However,
+/// the global `SCHEDULER` lock is acquired on each iteration for task state
+/// reads, state transitions, and post-switch bookkeeping (see module doc).
 pub fn run() -> ! {
     let core_id = crate::smp::per_core().core_id;
 

@@ -92,6 +92,24 @@ the missing work or explicitly moves the unshipped design back into a later
 phase. The goal is that roadmap text, code comments, and implementation agree
 about the scheduler and notification model.
 
+**Phase 52d Track D resolution:**
+
+- **Scheduler:** The global `SCHEDULER` lock remains on the dispatch hot path.
+  Per-core run queues, work-stealing, load-balancing with migration cooldown,
+  and dead-slot recycling are all active and provide dispatch locality. But
+  task state transitions (marking Running, saving RSP, clearing switching_out)
+  still require the global lock. True lock-free per-core dispatch — where the
+  hot path never acquires the global lock — is explicitly deferred because it
+  requires splitting the `tasks` vec into per-core ownership or a lock-free
+  task registry, which is a larger change than 52c/52d scope.
+
+- **Notifications:** The notification pool remains fixed-size (`MAX_NOTIFS = 64`)
+  because `PENDING` and `ISR_WAITERS` must be ISR-safe (lock-free atomics only).
+  A growable pool would require allocation or lock-based indirection that is not
+  safe in interrupt context. The fixed-size constraint is documented in
+  `kernel/src/ipc/notification.rs` with exhaustion diagnostics (warning at 75%
+  capacity, warning on full exhaustion). 64 slots cover foreseeable demand.
+
 ### Validation and regression closure
 
 Repair the Phase 52 smoke/regression flows so failures in login, fork, ion
@@ -120,8 +138,16 @@ longer depends on special termios workaround syscalls.
 
 `kernel/src/task/scheduler.rs` and `kernel/src/ipc/notification.rs` currently
 mix real 52c improvements (`IsrWakeQueue`, load-balance cooldowns, growable
-endpoints/caps) with still-global or fixed-size behavior. 52d documents the
-actual model and either finishes or explicitly re-defers the remaining pieces.
+endpoints/caps, per-core run queues, work-stealing) with still-global or
+fixed-size behavior (global `SCHEDULER` lock on dispatch, `MAX_NOTIFS = 64`
+fixed-size notification pool). 52d Track D reconciles these by:
+
+- Rewriting the scheduler module-level doc to truthfully describe what the
+  global lock covers and what per-core infrastructure provides
+- Documenting the fixed-size notification constraint with ISR-safety rationale
+- Adding exhaustion diagnostics to `try_create`
+- Correcting the 52c acceptance criteria and task checkboxes
+- Explicitly deferring true lock-free dispatch and growable notifications
 
 ### `xtask` smoke/regression harness
 
@@ -176,6 +202,9 @@ these gates as first-class evidence for closing the phase.
   `LineDiscipline`
 - The current scheduler/notification design is either implemented as documented
   or explicitly re-deferred in the roadmap with matching code comments
+  *(Track D: global scheduler lock re-deferred with truthful code/doc comments;
+  fixed-size notification pool documented with ISR-safety rationale and
+  exhaustion diagnostics)*
 - The exec-time signal-reset behavior has explicit regression coverage
 - `cargo xtask check` passes
 - `cargo xtask smoke-test --timeout 180` passes
@@ -198,7 +227,14 @@ these gates as first-class evidence for closing the phase.
 
 - Full fair scheduling or EEVDF/CFS-style runtime accounting
 - Cluster-aware or NUMA-aware work-stealing policy
-- A growable ISR-safe notification pool if a sound design is not ready during
-  52d
+- **True per-core scheduling** (lock-free dispatch hot path) — per-core run
+  queues and work-stealing landed in 52c, but the global `SCHEDULER` lock is
+  still acquired on every dispatch iteration for task state reads and
+  transitions; splitting task ownership per-core requires a larger
+  architectural change deferred past Phase 52
+- **Growable ISR-safe notification pool** — a sound design (two-level: fixed
+  ISR-visible fast table + growable overflow) exists conceptually but is not
+  needed at current scale (`MAX_NOTIFS = 64` covers foreseeable demand);
+  exhaustion diagnostics are in place
 - Broader cleanup of compatibility/debugging syscalls that are not exercised by
   in-tree code after the Phase 52 closure work is complete
