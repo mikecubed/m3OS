@@ -11,6 +11,8 @@ use syscall_lib::{
     pipe, poll, read, setsid, waitpid, write, write_str,
 };
 
+syscall_lib::entry_point!(pty_main);
+
 /// TIOCGPTN — get PTY number.
 const TIOCGPTN: usize = 0x80045430;
 /// TIOCSPTLCK — lock/unlock PTY slave.
@@ -729,14 +731,19 @@ fn test_dual_ion_supervisors() -> bool {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
-    write_str(1, "pty-test: Phase 29 PTY subsystem tests\n");
+fn pty_main(args: &[&str]) -> i32 {
+    let quick = args.contains(&"--quick");
+
+    if quick {
+        write_str(1, "pty-test: Phase 29 PTY subsystem tests (quick)\n");
+    } else {
+        write_str(1, "pty-test: Phase 29 PTY subsystem tests\n");
+    }
 
     let mut passed = 0u32;
     let mut failed = 0u32;
 
-    let tests: [fn() -> bool; 11] = [
+    let quick_tests: [fn() -> bool; 8] = [
         test_ptmx_open,
         test_tiocgptn,
         test_slave_open,
@@ -745,16 +752,27 @@ pub extern "C" fn _start() -> ! {
         test_s2m_io,
         test_multiple_ptys,
         test_master_close_eof,
+    ];
+    let ion_tests: [fn() -> bool; 3] = [
         test_ion_prompt,
         test_dual_ion_prompts,
         test_dual_ion_supervisors,
     ];
 
-    for test in &tests {
+    for test in &quick_tests {
         if test() {
             passed += 1;
         } else {
             failed += 1;
+        }
+    }
+    if !quick {
+        for test in &ion_tests {
+            if test() {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
         }
     }
 
@@ -764,7 +782,7 @@ pub extern "C" fn _start() -> ! {
     syscall_lib::write_u64(1, failed as u64);
     write_str(1, " failed\n");
 
-    if failed == 0 { exit(0) } else { exit(1) }
+    if failed == 0 { 0 } else { 1 }
 }
 
 #[panic_handler]

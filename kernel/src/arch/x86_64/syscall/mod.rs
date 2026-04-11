@@ -2237,6 +2237,21 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
+    // Copy user buffers outside PROCESS_TABLE so fault-time user copies do not
+    // reenter the process table lock.
+    let new_sa_bytes: Option<[u8; 32]> = if act_ptr != 0 {
+        let mut sa = [0u8; 32];
+        if UserSliceRo::new(act_ptr, sa.len())
+            .and_then(|s| s.copy_to_kernel(&mut sa))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        Some(sa)
+    } else {
+        None
+    };
+
     let pid = crate::process::current_pid();
     let mut table = crate::process::PROCESS_TABLE.lock();
     let proc = match table.find_mut(pid) {
@@ -2244,8 +2259,8 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         None => return NEG_EINVAL,
     };
 
-    // Write old action if requested.
-    // Linux struct sigaction layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes
+    // POSIX requires sigaction to be atomic: if copying out oldact faults,
+    // the signal disposition must remain unchanged.
     if oldact_ptr != 0 {
         let mut old_sa = [0u8; 32];
         match proc.sigaction_get(sig as usize) {
@@ -2276,15 +2291,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         }
     }
 
-    // Read new action if provided.
-    if act_ptr != 0 {
-        let mut sa = [0u8; 32];
-        if UserSliceRo::new(act_ptr, sa.len())
-            .and_then(|s| s.copy_to_kernel(&mut sa))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
+    if let Some(sa) = new_sa_bytes {
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
         let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
         let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
@@ -2298,15 +2305,14 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         if sa_restorer != 0 && sa_restorer >= USER_LIMIT {
             return NEG_EINVAL;
         }
-        // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
+        // Convert userspace mask (0-indexed) to kernel mask
+        // (signal-number-indexed).
         let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
         let new_action = match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
             _ => {
-                // Warn if SA_RESTORER is missing — musl always sets it.
-                // Without a restorer, the handler cannot return to sigreturn.
                 let effective_restorer = if sa_flags & SA_RESTORER != 0 {
                     sa_restorer
                 } else {

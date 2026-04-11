@@ -58,7 +58,7 @@ fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 
         let mut need_demand_fault = false;
         {
-            let addr_space = crate::process::current_addr_space();
+            let addr_space = addr_space_no_lock();
             let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
 
             let translated = {
@@ -138,7 +138,7 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         }
 
         let action = {
-            let addr_space = crate::process::current_addr_space();
+            let addr_space = addr_space_no_lock();
             let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
 
             let mapper = unsafe { crate::mm::paging::get_mapper() };
@@ -255,20 +255,50 @@ fn is_user_writable(
 // Phase 52d B.3: address-space generation helpers for user-copy diagnostics
 // ---------------------------------------------------------------------------
 
+/// Return the current address space using only the per-core pointer — never
+/// acquiring `PROCESS_TABLE`.
+///
+/// Called from the hot copy paths (`copy_from_user` / `copy_to_user`) which
+/// may already hold `PROCESS_TABLE`. If the per-core pointer is not yet
+/// populated, callers skip the page-table lock for that copy; per-page
+/// validation still catches unmapped pages.
+fn addr_space_no_lock() -> Option<&'static crate::mm::AddressSpace> {
+    if crate::smp::is_per_core_ready() {
+        let ptr = crate::smp::per_core().current_addrspace;
+        if !ptr.is_null() {
+            // SAFETY: the scheduler publishes this pointer only while the
+            // corresponding address space is active on this core, and clears
+            // it before the address space can be reaped.
+            return Some(unsafe { &*ptr });
+        }
+    }
+    None
+}
+
 /// Read the current process's address-space generation counter.
 ///
 /// Returns `None` if the process has no dedicated address space (kernel tasks,
 /// early-boot processes) — generation tracking is effectively disabled for
 /// those.
+///
+/// # Deadlock avoidance
+///
+/// `copy_from_user` / `copy_to_user` are used by syscalls that may already
+/// hold `PROCESS_TABLE` (for example, signal-disposition updates). Re-entering
+/// that lock here would deadlock immediately, so generation tracking reads only
+/// the per-core published address-space pointer. If that pointer is not yet
+/// available, generation diagnostics are skipped for this copy.
 fn addr_space_generation() -> Option<u64> {
-    let pid = crate::process::current_pid();
-    if pid == 0 {
-        return None;
+    if crate::smp::is_per_core_ready() {
+        let ptr = crate::smp::per_core().current_addrspace;
+        if !ptr.is_null() {
+            // SAFETY: the scheduler publishes this pointer only while the
+            // corresponding address space is active on this core, and clears
+            // it before the address space can be reaped.
+            return Some(unsafe { &*ptr }.generation());
+        }
     }
-    let table = crate::process::PROCESS_TABLE.lock();
-    table
-        .find(pid)
-        .and_then(|p| p.addr_space.as_ref().map(|a| a.generation()))
+    None
 }
 
 /// Compare the starting generation plus the copy's expected local bumps with

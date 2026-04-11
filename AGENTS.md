@@ -150,7 +150,7 @@ Adding a new userspace binary requires changes in **four** places. Missing any o
 
 1. **Workspace member** — add the crate to `Cargo.toml` `members` list
 2. **xtask build pipeline** — add to the `bins` array in `xtask/src/main.rs` (`build_userspace` function, ~line 141). Set `needs_alloc = true` if the crate depends on `alloc` (e.g., uses `kernel-core` or `Vec`/`Box`/`String`). If `needs_alloc` is true, the binary must define a `#[global_allocator]` (use `syscall_lib::heap::BrkAllocator`) and enable the `alloc` feature on `syscall-lib`.
-3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Without this, `execve` returns ENOENT.
+3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Generated binaries are staged by `xtask` under `target/generated-initrd/`; checked-in static initrd assets remain under `kernel/initrd/`. Without the ramdisk entry, `execve` returns ENOENT.
 4. **Service config (if daemon)** — add a `.conf` file to the ext2 data disk builder in `xtask/src/main.rs` (`populate_ext2_files` function) AND to the `KNOWN_CONFIGS` fallback list in `userspace/init/src/main.rs`. Run `cargo xtask clean` to recreate the disk.
 
 ### Kernel Source Layout
@@ -178,7 +178,8 @@ kernel/src/
   process/             # process management (fork, exec, exit, wait, threads, futex)
   smp/                 # AP boot, IPI, TLB shootdown
   task/                # scheduler (SMP-aware round-robin)
-kernel/initrd/           # pre-built ELF binaries embedded as initial ramdisk
+kernel/initrd/           # static initrd assets checked into source
+target/generated-initrd/ # xtask-staged generated binaries embedded by ramdisk
 ```
 
 ### kernel-core Source Layout

@@ -206,9 +206,12 @@ these gates as first-class evidence for closing the phase.
   fixed-size notification pool documented with ISR-safety rationale and
   exhaustion diagnostics)*
 - The exec-time signal-reset behavior has explicit regression coverage
+- The keyboard input path (serial→TTY→stdin→shell) has explicit regression
+  coverage (`kbd-echo`)
 - `cargo xtask check` passes
 - `cargo xtask smoke-test --timeout 180` passes
-- `cargo xtask regression --timeout 90` passes
+- `cargo xtask regression --timeout 90` passes (fork-overlap, ipc-wake,
+  pty-overlap, signal-reset, kbd-echo)
 
 ## Companion Task List
 
