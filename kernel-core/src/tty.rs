@@ -352,6 +352,24 @@ pub enum LdiscResult {
 }
 
 // ---------------------------------------------------------------------------
+// Escape sequence parser state (canonical mode only)
+// ---------------------------------------------------------------------------
+
+/// Tracks multi-byte VT100 escape sequences so the line discipline can
+/// silently discard them in canonical mode.  In raw/non-canonical mode
+/// the state machine is bypassed entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscState {
+    /// Normal input processing.
+    Normal,
+    /// Received ESC (0x1b); waiting for `[` (CSI) or `O` (SS3).
+    Esc,
+    /// Inside a CSI (`ESC [`) or SS3 (`ESC O`) sequence; consuming
+    /// parameter/intermediate bytes until a final byte (0x40..=0x7E).
+    Csi,
+}
+
+// ---------------------------------------------------------------------------
 // LineDiscipline — unified line editing + termios processing
 // ---------------------------------------------------------------------------
 
@@ -363,6 +381,8 @@ pub enum LdiscResult {
 pub struct LineDiscipline {
     pub termios: Termios,
     pub edit_buf: EditBuffer,
+    /// Escape sequence parser state for canonical-mode filtering.
+    esc_state: EscState,
 }
 
 impl Default for LineDiscipline {
@@ -377,6 +397,7 @@ impl LineDiscipline {
         LineDiscipline {
             termios: Termios::default_cooked(),
             edit_buf: EditBuffer::new(),
+            esc_state: EscState::Normal,
         }
     }
 
@@ -432,7 +453,50 @@ impl LineDiscipline {
             }
         }
 
-        // 3. ICANON: canonical mode editing.
+        // 3. Canonical mode: discard VT100 escape sequences.
+        //
+        // When input arrives byte-by-byte (as from stdin_feeder), multi-byte
+        // escape sequences (e.g. ESC [ A for Up Arrow) must not be buffered
+        // as literal characters — that would corrupt canonical-mode input
+        // for programs like login.  A small state machine silently consumes
+        // complete CSI (ESC [) and SS3 (ESC O) sequences.  In raw mode the
+        // state machine is never entered, preserving pass-through semantics.
+        if canonical {
+            match self.esc_state {
+                EscState::Normal => {
+                    if byte == 0x1b {
+                        self.esc_state = EscState::Esc;
+                        return LdiscResult::Consumed;
+                    }
+                    // Fall through to regular canonical processing.
+                }
+                EscState::Esc => {
+                    if byte == b'[' || byte == b'O' {
+                        self.esc_state = EscState::Csi;
+                        return LdiscResult::Consumed;
+                    }
+                    // Not a recognised escape introducer.  The ESC was already
+                    // consumed; let this byte receive normal processing.
+                    self.esc_state = EscState::Normal;
+                }
+                EscState::Csi => {
+                    // Parameter (0x30..=0x3F) and intermediate (0x20..=0x2F)
+                    // bytes: stay inside the sequence.
+                    if (0x20..=0x3F).contains(&byte) {
+                        return LdiscResult::Consumed;
+                    }
+                    // Final byte (0x40..=0x7E): sequence complete.
+                    if (0x40..=0x7E).contains(&byte) {
+                        self.esc_state = EscState::Normal;
+                        return LdiscResult::Consumed;
+                    }
+                    // Unexpected byte — abort sequence, process normally.
+                    self.esc_state = EscState::Normal;
+                }
+            }
+        }
+
+        // 4. ICANON: canonical mode editing.
         if canonical {
             // VERASE (backspace/DEL/0x08)
             if byte == c_cc[VERASE] || byte == 0x7F || byte == 0x08 {
@@ -518,7 +582,7 @@ impl LineDiscipline {
             return LdiscResult::Pushed { echo };
         }
 
-        // 4. Raw mode: push byte directly.
+        // 5. Raw mode: push byte directly.
         push_fn(&[byte]);
         let mut echo = SmallVec::new();
         if echo_on {
@@ -1028,5 +1092,120 @@ mod tests {
     fn smallvec_erase_echo() {
         let sv = SmallVec::erase_echo(5);
         assert_eq!(sv.erase_count(), Some(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Escape sequence filtering in canonical mode (C-review-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ldisc_canonical_discards_arrow_up() {
+        let mut ld = LineDiscipline::new();
+        // ESC [ A (Up Arrow) — all three bytes should be consumed.
+        for &b in b"\x1b[A" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        // Edit buffer must be empty.
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_csi_tilde_sequences() {
+        let mut ld = LineDiscipline::new();
+        // ESC [ 3 ~ (Delete key)
+        for &b in b"\x1b[3~" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+
+        // ESC [ 5 ~ (Page Up)
+        for &b in b"\x1b[5~" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_ss3_sequence() {
+        let mut ld = LineDiscipline::new();
+        // ESC O P (F1 on some terminals)
+        for &b in b"\x1bOP" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_lone_esc() {
+        let mut ld = LineDiscipline::new();
+        // Lone ESC followed by a regular letter: ESC is consumed,
+        // the letter gets normal processing.
+        let (result, pushed) = collect_pushed(&mut ld, 0x1b);
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+
+        // Next regular char should be processed normally (buffered).
+        let (result, _) = collect_pushed(&mut ld, b'x');
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(ld.edit_buf.as_slice(), b"x");
+    }
+
+    #[test]
+    fn ldisc_canonical_escape_does_not_corrupt_following_input() {
+        let mut ld = LineDiscipline::new();
+        // Type "ab", then Up Arrow, then "cd\n".
+        for &b in b"ab" {
+            collect_pushed(&mut ld, b);
+        }
+        for &b in b"\x1b[A" {
+            collect_pushed(&mut ld, b);
+        }
+        for &b in b"cd" {
+            collect_pushed(&mut ld, b);
+        }
+        // Edit buffer should contain only "abcd", no escape bytes.
+        assert_eq!(ld.edit_buf.as_slice(), b"abcd");
+
+        // Deliver line.
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        assert_eq!(pushed, b"abcd\n");
+    }
+
+    #[test]
+    fn ldisc_raw_mode_passes_escape_sequences() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag &= !ECHO;
+        ld.termios.c_lflag &= !ISIG;
+
+        // ESC [ A should pass through in raw mode.
+        let mut all_pushed = Vec::new();
+        for &b in b"\x1b[A" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Pushed { .. }));
+            all_pushed.extend(pushed);
+        }
+        assert_eq!(all_pushed, b"\x1b[A");
+    }
+
+    #[test]
+    fn ldisc_canonical_multiple_escape_sequences() {
+        let mut ld = LineDiscipline::new();
+        // Two consecutive arrow sequences should both be discarded.
+        for &b in b"\x1b[A\x1b[B" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
     }
 }

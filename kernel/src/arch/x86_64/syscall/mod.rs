@@ -1111,7 +1111,11 @@ mod syscall_nr {
     pub const GET_TERMIOS_FLAGS: u64 = 0x100B;
     /// Phase 52: signal EOF on kernel stdin from userspace.
     pub const STDIN_SIGNAL_EOF: u64 = 0x100C;
-    /// Phase 52: get individual termios fields as direct return values.
+    /// Temporary compatibility: direct register-return termios field reads.
+    /// Introduced as a `copy_to_user` reliability workaround (Phase 52).
+    /// No in-tree binary depends on these after Phase 52d Track C converged
+    /// keyboard input on `PUSH_RAW_INPUT`.  Retained for out-of-tree or
+    /// diagnostic use only; prefer `tcgetattr` or the kernel line discipline.
     pub const GET_TERMIOS_LFLAG: u64 = 0x100D;
     pub const GET_TERMIOS_IFLAG: u64 = 0x100E;
     pub const GET_TERMIOS_OFLAG: u64 = 0x100F;
@@ -1449,6 +1453,7 @@ pub extern "C" fn syscall_handler(
         READ_KBD_SCANCODE => sys_read_kbd_scancode(),
         GET_TERMIOS_FLAGS => sys_get_termios_flags(arg0, arg1),
         STDIN_SIGNAL_EOF => sys_stdin_signal_eof(),
+        // Temporary compatibility — no in-tree callers after Phase 52d Track C.
         GET_TERMIOS_LFLAG => crate::tty::TTY0.lock().ldisc.termios.c_lflag as u64,
         GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().ldisc.termios.c_iflag as u64,
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,

@@ -106,11 +106,18 @@ the userspace virtual address will see the same physical frame.
 
 ## Working Workarounds (in place)
 
-### Register-return syscalls for stdin_feeder
+### Register-return syscalls for stdin_feeder (superseded)
 `GET_TERMIOS_LFLAG` (0x100D), `GET_TERMIOS_IFLAG` (0x100E),
 `GET_TERMIOS_OFLAG` (0x100F) return individual termios fields directly in
 `rax`. No buffer, no `copy_to_user`. The `c_cc` array is cached once at
 startup via `tcgetattr`.
+
+**Phase 52d Track C update:** No in-tree binary depends on these syscalls.
+`stdin_feeder` was simplified to a raw-input bridge that forwards bytes via
+`push_raw_input`, delegating all terminal policy to the kernel-side
+`LineDiscipline`. The register-return syscalls are retained as temporary
+compatibility interfaces for out-of-tree or diagnostic use and are marked
+`#[deprecated]` in `syscall-lib`.
 
 ### Login termios validation
 `disable_echo()` in the login binary validates the saved termios: if
