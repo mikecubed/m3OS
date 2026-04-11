@@ -498,9 +498,38 @@ fn accumulate_ticks(sched: &mut Scheduler, idx: usize) {
     sched.tasks[idx].user_ticks += elapsed;
 }
 
-/// Snapshot per-core user state (RSP, kernel stack, FS base) into the task
-/// so the scheduler can restore it on re-dispatch. No-op for kernel tasks.
-fn save_user_return_state(task: &mut Task) {
+fn current_user_return_addr_space_snapshot(pid: u32) -> (u64, u64) {
+    if pid == 0 {
+        return (0, 0);
+    }
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => {
+            let cr3 = p
+                .addr_space
+                .as_ref()
+                .map(|a| a.pml4_phys().as_u64())
+                .unwrap_or(0);
+            let as_gen = p.addr_space.as_ref().map(|a| a.generation()).unwrap_or(0);
+            (cr3, as_gen)
+        }
+        None => (0, 0),
+    }
+}
+
+/// Snapshot per-core user state into the task's `UserReturnState`.
+///
+/// Phase 52d: this is now a **secondary** save path.  The authoritative
+/// snapshot is taken at syscall entry (see `snapshot_user_return_state` in
+/// `syscall/mod.rs`).  Block/yield sites call this only as a safety net
+/// for kernel-originated yields that bypass `syscall_handler` (e.g.
+/// `signal_reschedule` during IRQ-driven preemption).  For normal syscall
+/// paths the snapshot is already populated and this call merely refreshes
+/// the FS.base which may have been modified by `ARCH_SET_FS`.
+///
+/// The caller passes the address-space metadata in so this helper never
+/// takes `PROCESS_TABLE` while `SCHEDULER` is already locked.
+fn save_user_return_state(task: &mut Task, cr3_phys: u64, addr_space_gen: u64) {
     if task.pid != 0 {
         let pc = crate::smp::per_core();
         let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
@@ -508,6 +537,8 @@ fn save_user_return_state(task: &mut Task) {
             user_rsp: pc.syscall_user_rsp,
             kernel_stack_top: pc.syscall_stack_top,
             fs_base: fs,
+            cr3_phys,
+            addr_space_gen,
         });
     }
 }
@@ -564,6 +595,8 @@ fn take_per_core_switch_save_rsp(core_id: usize) -> u64 {
 
 /// Yield the current task back to the scheduler.
 pub fn yield_now() {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
@@ -581,7 +614,11 @@ pub fn yield_now() {
         // switch_context saves the RSP. This prevents the global fallback from
         // picking up the task with a stale saved_rsp on another core.
         sched.tasks[idx].switching_out = true;
-        save_user_return_state(&mut sched.tasks[idx]);
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
         set_current_task_idx(None);
         idx
     };
@@ -614,6 +651,15 @@ pub fn set_current_task_pid(pid: u32) {
     }
 }
 
+/// Phase 52d B.1: set the current task's `UserReturnState` from the
+/// syscall entry snapshot.  Called by `snapshot_user_return_state` in
+/// `arch/x86_64/syscall/mod.rs`.
+pub fn set_current_user_return(urs: crate::task::UserReturnState) {
+    if let Some(idx) = get_current_task_idx() {
+        SCHEDULER.lock().tasks[idx].user_return = Some(urs);
+    }
+}
+
 pub fn take_current_task_fork_ctx() -> Option<crate::process::ForkChildCtx> {
     let idx = get_current_task_idx()?;
     SCHEDULER.lock().tasks[idx].fork_ctx.take()
@@ -640,6 +686,8 @@ pub fn current_task_id() -> Option<TaskId> {
 
 /// Helper: block the current task with the given state.
 fn block_current(state: TaskState) {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
@@ -655,7 +703,11 @@ fn block_current(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
-        save_user_return_state(&mut sched.tasks[idx]);
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
         set_current_task_idx(None);
         idx
     };
@@ -677,6 +729,8 @@ fn block_current(state: TaskState) {
 }
 
 fn block_current_unless_message(state: TaskState) {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         let idx = match get_current_task_idx() {
@@ -689,7 +743,11 @@ fn block_current_unless_message(state: TaskState) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = state;
         sched.tasks[idx].switching_out = true;
-        save_user_return_state(&mut sched.tasks[idx]);
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
         set_current_task_idx(None);
         idx
     };
@@ -734,6 +792,8 @@ pub fn block_current_on_futex() {
 /// `wake_task()` call cannot slip between the flag check and the state
 /// transition, which would cause a missed wakeup.
 pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
@@ -746,7 +806,11 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnFutex;
         sched.tasks[idx].switching_out = true;
-        save_user_return_state(&mut sched.tasks[idx]);
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
         set_current_task_idx(None);
         idx
     };
@@ -760,6 +824,8 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
@@ -772,7 +838,11 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
-        save_user_return_state(&mut sched.tasks[idx]);
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
         set_current_task_idx(None);
         idx
     };
@@ -1056,117 +1126,146 @@ pub fn run() -> ! {
         );
 
         // Restore per-core process context for the dispatched task.
-        // Read the task's PID and update: current_pid, CR3, TSS.RSP0,
-        // syscall_stack_top, and FS.base.
+        //
+        // Phase 52d B.2: all thread-local return-state fields (user_rsp,
+        // kernel_stack_top, fs_base, CR3) are now restored from the task's
+        // `UserReturnState` — the single authoritative source of truth set
+        // at syscall entry (B.1).  The `Process` table is only consulted
+        // for the address-space pointer needed for TLB tracking.
         {
             let pid = task_pid(_task_idx);
             crate::process::set_current_pid(pid);
-            // When dispatching a kernel-only task (pid==0), deactivate the
-            // previous user AddressSpace on this core so targeted TLB
-            // shootdowns skip it and the pointer doesn't dangle after reap.
-            if pid == 0 && crate::smp::is_per_core_ready() {
-                let pc = crate::smp::per_core();
-                let old_as_ptr = pc.current_addrspace;
-                if !old_as_ptr.is_null() {
-                    // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
-                    // that is still alive (the owning Process holds the Arc).
-                    unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
-                    let pc_mut =
-                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-                    unsafe { (*pc_mut).current_addrspace = core::ptr::null() };
-                }
-            }
+            let old_as_ptr = if crate::smp::is_per_core_ready() {
+                crate::smp::per_core().current_addrspace
+            } else {
+                core::ptr::null()
+            };
+            let mut new_as_ptr: *const crate::mm::AddressSpace = core::ptr::null();
             if pid != 0 {
-                let (cr3_phys, kstack, fs, new_as_ptr) = {
+                // Read the task's UserReturnState (authoritative source).
+                let urs = {
+                    let sched = SCHEDULER.lock();
+                    sched.get_task(_task_idx).and_then(|t| t.user_return)
+                };
+                // Read the address-space pointer for TLB tracking — still
+                // derived from Process because the raw pointer management
+                // is a per-core concern, not part of the resume contract.
+                new_as_ptr = {
                     let table = crate::process::PROCESS_TABLE.lock();
-                    match table.find(pid) {
-                        Some(p) => {
-                            let as_ptr = p
-                                .addr_space
+                    table
+                        .find(pid)
+                        .and_then(|p| {
+                            p.addr_space
                                 .as_ref()
                                 .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
-                                .unwrap_or(core::ptr::null());
-                            (
+                        })
+                        .unwrap_or_default()
+                };
+
+                if let Some(urs) = urs {
+                    // Restore CR3 from task-owned state.
+                    if urs.cr3_phys != 0 {
+                        unsafe {
+                            use x86_64::{
+                                PhysAddr,
+                                registers::control::{Cr3, Cr3Flags},
+                                structures::paging::{PhysFrame, Size4KiB},
+                            };
+                            let frame: PhysFrame<Size4KiB> =
+                                PhysFrame::containing_address(PhysAddr::new(urs.cr3_phys));
+                            Cr3::write(frame, Cr3Flags::empty());
+                        }
+                        #[cfg(debug_assertions)]
+                        {
+                            let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
+                            debug_assert_eq!(
+                                loaded_frame.start_address().as_u64(),
+                                urs.cr3_phys,
+                                "CR3 mismatch after load on core {}",
+                                core_id
+                            );
+                        }
+                    }
+                    // Restore kernel stack top (TSS.RSP0 + per-core SYSCALL_STACK_TOP).
+                    if urs.kernel_stack_top != 0 {
+                        crate::smp::set_current_core_kernel_stack(urs.kernel_stack_top);
+                        unsafe {
+                            crate::arch::x86_64::syscall::set_per_core_syscall_stack_top(
+                                urs.kernel_stack_top,
+                            );
+                        }
+                    }
+                    // Restore FS.base (TLS pointer).
+                    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(
+                        urs.fs_base,
+                    ));
+                    // Restore per-core syscall_user_rsp.
+                    let data = crate::smp::per_core() as *const crate::smp::PerCoreData
+                        as *mut crate::smp::PerCoreData;
+                    unsafe {
+                        (*data).syscall_user_rsp = urs.user_rsp;
+                    }
+                } else {
+                    // Fallback for tasks that have not yet entered syscall_handler
+                    // (e.g. freshly forked children before first dispatch).
+                    // Read from PROCESS_TABLE as the legacy path.
+                    let (cr3_phys, kstack, fs) = {
+                        let table = crate::process::PROCESS_TABLE.lock();
+                        match table.find(pid) {
+                            Some(p) => (
                                 p.addr_space.as_ref().map(|a| a.pml4_phys()),
                                 p.kernel_stack_top,
                                 p.fs_base,
-                                as_ptr,
-                            )
+                            ),
+                            None => (None, 0, 0),
                         }
-                        None => (None, 0, 0, core::ptr::null()),
+                    };
+                    if let Some(cr3) = cr3_phys {
+                        unsafe {
+                            use x86_64::{
+                                PhysAddr,
+                                registers::control::{Cr3, Cr3Flags},
+                                structures::paging::{PhysFrame, Size4KiB},
+                            };
+                            let frame: PhysFrame<Size4KiB> =
+                                PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
+                            Cr3::write(frame, Cr3Flags::empty());
+                        }
                     }
-                };
-                // Track active address space on this core.
-                if crate::smp::is_per_core_ready() {
-                    let pc = crate::smp::per_core();
-                    let old_as_ptr = pc.current_addrspace;
-                    if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
-                        // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
-                        // that is still alive (the owning Process holds the Arc).
-                        unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                    if kstack != 0 {
+                        crate::smp::set_current_core_kernel_stack(kstack);
+                        unsafe {
+                            crate::arch::x86_64::syscall::set_per_core_syscall_stack_top(kstack);
+                        }
                     }
-                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if !new_as_ptr.is_null() {
-                        // SAFETY: new_as_ptr points to an AddressSpace in an Arc
-                        // that is alive while the process is in the process table.
-                        unsafe { &*new_as_ptr }.activate_on_core(core_id);
-                    }
-                    // SAFETY: per_core() returns a reference to the current core's
-                    // data; we only write current_addrspace on the owning core.
-                    let pc_mut =
-                        pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-                    unsafe { (*pc_mut).current_addrspace = new_as_ptr };
+                    x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs));
+                    // Log a diagnostic — this path should only be hit during
+                    // first dispatch of a new task.
+                    log::trace!(
+                        "[sched] dispatch task {} pid={} via PROCESS_TABLE fallback on core {}",
+                        _task_idx,
+                        pid,
+                        core_id
+                    );
                 }
-                // Restore CR3 so the task's user-space pages are mapped.
-                if let Some(cr3) = cr3_phys {
-                    unsafe {
-                        use x86_64::{
-                            PhysAddr,
-                            registers::control::{Cr3, Cr3Flags},
-                            structures::paging::{PhysFrame, Size4KiB},
-                        };
-                        let frame: PhysFrame<Size4KiB> =
-                            PhysFrame::containing_address(PhysAddr::new(cr3.as_u64()));
-                        Cr3::write(frame, Cr3Flags::empty());
-                    }
-                    // A.4: Assert CR3 matches the address space after loading.
-                    #[cfg(debug_assertions)]
-                    {
-                        let (loaded_frame, _) = x86_64::registers::control::Cr3::read();
-                        debug_assert_eq!(
-                            loaded_frame.start_address().as_u64(),
-                            cr3.as_u64(),
-                            "CR3 mismatch after load on core {}",
-                            core_id
-                        );
-                    }
-                }
-                if kstack != 0 {
-                    crate::smp::set_current_core_kernel_stack(kstack);
-                    unsafe {
-                        crate::arch::x86_64::syscall::set_per_core_syscall_stack_top(kstack);
-                    }
-                }
-                x86_64::registers::model_specific::FsBase::write(x86_64::VirtAddr::new(fs));
             }
-        }
-
-        // Restore per-core syscall_user_rsp from the task's UserReturnState.
-        // This eliminates the need for manual restore_caller_context calls
-        // after blocking syscalls.
-        {
-            let sched = SCHEDULER.lock();
-            if let Some(task) = sched.get_task(_task_idx)
-                && let Some(ref urs) = task.user_return
-            {
-                let data = crate::smp::per_core() as *const crate::smp::PerCoreData
-                    as *mut crate::smp::PerCoreData;
-                unsafe {
-                    (*data).syscall_user_rsp = urs.user_rsp;
+            // Update active-core tracking only after the new CR3 is actually
+            // loaded on this core. Otherwise targeted TLB shootdowns can skip
+            // the still-active old address space.
+            if crate::smp::is_per_core_ready() {
+                if pid == 0 && !old_as_ptr.is_null() {
+                    crate::mm::restore_kernel_cr3();
                 }
-                // kstack and fs_base are already restored from PROCESS_TABLE above,
-                // but we could also use urs values. For now, keep the PROCESS_TABLE
-                // path for those since it's authoritative.
+                let pc = crate::smp::per_core();
+                if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                    unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                if !new_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                    unsafe { &*new_as_ptr }.activate_on_core(core_id);
+                }
+                let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+                unsafe { (*pc_mut).current_addrspace = new_as_ptr };
             }
         }
 

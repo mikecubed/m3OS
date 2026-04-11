@@ -22,6 +22,16 @@ use x86_64::{
 /// is unmapped, the address range is not in canonical user space, or `len`
 /// exceeds the limit defined in `kernel_core::user_range::MAX_COPY_LEN`.
 ///
+/// # Phase 52d B.3 — generation tracking
+///
+/// Snapshots the address-space generation counter before the copy loop and
+/// checks it again afterward.  A mismatch means a mapping-mutating operation
+/// (mmap/munmap/mprotect/CoW) raced with this copy.  On SMP this is
+/// possible if another thread in the same address space calls munmap while
+/// this thread is mid-copy.  The mismatch is logged as a diagnostic — the
+/// copy result is still returned because the per-page validation already
+/// catches unmapped pages.
+///
 /// # Safety
 ///
 /// The physical-memory offset (from `crate::mm::phys_offset()`) must be
@@ -34,6 +44,10 @@ fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
 
     let phys_off = crate::mm::phys_offset();
 
+    // Phase 52d B.3: snapshot generation before copy.
+    let gen_before = addr_space_generation();
+    let mut local_bumps = 0u64;
+
     let mut copied = 0usize;
     let mut vaddr = src_vaddr;
 
@@ -42,44 +56,52 @@ fn copy_from_user(dst: &mut [u8], src_vaddr: u64) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        // Translate the page and validate flags. Acquire a short-lived mapper
-        // per iteration so it is dropped before any demand-fault call that
-        // mutates the page tables.
-        let translated = {
-            let mapper = unsafe { crate::mm::paging::get_mapper() };
-            mapper.translate_addr(VirtAddr::new(page_base))
-        };
-        let phys = match translated {
-            Some(p) => p,
-            None => {
-                if !try_demand_fault(page_base) {
+        let mut need_demand_fault = false;
+        {
+            let addr_space = crate::process::current_addr_space();
+            let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+
+            let translated = {
+                let mapper = unsafe { crate::mm::paging::get_mapper() };
+                mapper.translate_addr(VirtAddr::new(page_base))
+            };
+
+            if let Some(phys) = translated {
+                let mapper = unsafe { crate::mm::paging::get_mapper() };
+                if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
                     return Err(());
                 }
-                let mapper = unsafe { crate::mm::paging::get_mapper() };
-                mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?
-            }
-        };
 
-        {
-            let mapper = unsafe { crate::mm::paging::get_mapper() };
-            if !is_user_accessible(&mapper, VirtAddr::new(page_base)) {
-                return Err(());
+                let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
+                // SAFETY: frame_virt is a kernel virtual address for a mapped
+                // frame, and the address-space lock pins the translation for the
+                // duration of this copy chunk.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        frame_virt as *const u8,
+                        dst[copied..].as_mut_ptr(),
+                        avail,
+                    );
+                }
+            } else {
+                need_demand_fault = true;
             }
         }
 
-        let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
-        // SAFETY: frame_virt is a kernel virtual address for a mapped frame.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame_virt as *const u8,
-                dst[copied..].as_mut_ptr(),
-                avail,
-            );
+        if need_demand_fault {
+            if !try_demand_fault(page_base) {
+                return Err(());
+            }
+            local_bumps = local_bumps.saturating_add(1);
+            continue;
         }
 
         copied += avail;
         vaddr += avail as u64;
     }
+
+    // Phase 52d B.3: check generation after copy.
+    report_generation_divergence(gen_before, local_bumps, "copy_from_user", src_vaddr, len);
 
     Ok(())
 }
@@ -96,6 +118,10 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
 
     let phys_off = crate::mm::phys_offset();
 
+    // Phase 52d B.3: snapshot generation before copy.
+    let gen_before = addr_space_generation();
+    let mut local_bumps = 0u64;
+
     let mut copied = 0usize;
     let mut vaddr = dst_vaddr;
 
@@ -104,31 +130,24 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
         let page_base = vaddr & !0xFFF;
         let avail = (0x1000 - page_offset).min(len - copied);
 
-        // Re-acquire mapper each iteration because CoW resolution
-        // modifies the page tables (invalidating the mapper's view).
-        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        enum PageWriteAction {
+            Copied,
+            NeedDemandFault,
+            NeedCow,
+            Fault,
+        }
 
-        if !is_user_writable(&mapper, VirtAddr::new(page_base)) {
-            // Phase 36: try demand-faulting if the page is not present at all.
-            // Only demand-fault for writable VMAs — read-only VMAs should fail
-            // with EFAULT to avoid allocating frames that can never be written.
-            if mapper.translate_addr(VirtAddr::new(page_base)).is_none() {
-                if try_demand_fault_writable(page_base) {
-                    // Page now exists — re-check writability on next iteration.
-                    continue;
-                }
-                return Err(());
-            }
-            // Check for CoW page: present + user-accessible + BIT_9 marker.
-            if is_cow_page(&mapper, VirtAddr::new(page_base)) {
-                if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
-                    log::warn!("[copy_to_user] OOM resolving CoW at {:#x}", page_base);
-                    return Err(()); // OOM — callers return EFAULT (no ENOMEM path yet)
-                }
-                // Page is now writable — re-translate after CoW resolution.
-                let mapper = unsafe { crate::mm::paging::get_mapper() };
+        let action = {
+            let addr_space = crate::process::current_addr_space();
+            let _page_table_guard = addr_space.map(|addr_space| addr_space.lock_page_tables());
+
+            let mapper = unsafe { crate::mm::paging::get_mapper() };
+            if is_user_writable(&mapper, VirtAddr::new(page_base)) {
                 let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
                 let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
+                // SAFETY: frame_virt is a kernel virtual address for a mapped
+                // writable frame, and the address-space lock pins the
+                // translation for the duration of this copy chunk.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         src[copied..].as_ptr(),
@@ -136,23 +155,42 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
                         avail,
                     );
                 }
+                PageWriteAction::Copied
+            } else if mapper.translate_addr(VirtAddr::new(page_base)).is_none() {
+                PageWriteAction::NeedDemandFault
+            } else if is_cow_page(&mapper, VirtAddr::new(page_base)) {
+                PageWriteAction::NeedCow
+            } else {
+                PageWriteAction::Fault
+            }
+        };
+
+        match action {
+            PageWriteAction::Copied => {
                 copied += avail;
                 vaddr += avail as u64;
+            }
+            PageWriteAction::NeedDemandFault => {
+                if try_demand_fault_writable(page_base) {
+                    local_bumps = local_bumps.saturating_add(1);
+                    continue;
+                }
+                return Err(());
+            }
+            PageWriteAction::NeedCow => {
+                if !crate::arch::x86_64::interrupts::resolve_cow_fault(page_base) {
+                    log::warn!("[copy_to_user] OOM resolving CoW at {:#x}", page_base);
+                    return Err(()); // OOM — callers return EFAULT (no ENOMEM path yet)
+                }
+                local_bumps = local_bumps.saturating_add(1);
                 continue;
             }
-            return Err(());
+            PageWriteAction::Fault => return Err(()),
         }
-
-        let phys = mapper.translate_addr(VirtAddr::new(page_base)).ok_or(())?;
-        let frame_virt = phys_off + phys.as_u64() + page_offset as u64;
-        // SAFETY: frame_virt is a kernel virtual address for a mapped writable frame.
-        unsafe {
-            core::ptr::copy_nonoverlapping(src[copied..].as_ptr(), frame_virt as *mut u8, avail);
-        }
-
-        copied += avail;
-        vaddr += avail as u64;
     }
+
+    // Phase 52d B.3: check generation after copy.
+    report_generation_divergence(gen_before, local_bumps, "copy_to_user", dst_vaddr, len);
 
     Ok(())
 }
@@ -161,22 +199,7 @@ fn copy_to_user(dst_vaddr: u64, src: &[u8]) -> Result<(), ()> {
 /// Used by `copy_to_user` to avoid allocating frames for read-only VMAs
 /// that would immediately fail the writability check.
 fn try_demand_fault_writable(page_base: u64) -> bool {
-    let pid = crate::process::current_pid();
-    let vma_prot = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        table
-            .find(pid)
-            .and_then(|p| p.find_vma(page_base))
-            .map(|m| m.prot)
-    };
-    const PROT_WRITE: u64 = 0x2;
-    if let Some(prot) = vma_prot {
-        if prot & PROT_WRITE == 0 {
-            return false; // VMA is not writable — fail with EFAULT.
-        }
-        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
-    }
-    false
+    crate::arch::x86_64::interrupts::demand_map_vma_page_from_kernel(page_base, true)
 }
 
 /// Phase 36: demand-fault a user page if it is in a valid VMA but not yet
@@ -186,26 +209,7 @@ fn try_demand_fault_writable(page_base: u64) -> bool {
 /// Returns `true` if the page was successfully demand-mapped; `false` if the
 /// address is not in any VMA or allocation failed.
 fn try_demand_fault(page_base: u64) -> bool {
-    let pid = crate::process::current_pid();
-    let vma_prot = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        table
-            .find(pid)
-            .and_then(|p| p.find_vma(page_base))
-            .map(|m| m.prot)
-    };
-    if let Some(prot) = vma_prot {
-        // Never demand-map PROT_NONE pages — they are guard pages that must
-        // remain inaccessible.
-        const PROT_READ: u64 = 0x1;
-        const PROT_WRITE: u64 = 0x2;
-        const PROT_EXEC: u64 = 0x4;
-        if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
-            return false;
-        }
-        return crate::arch::x86_64::interrupts::demand_map_user_page_from_kernel(page_base, prot);
-    }
-    false
+    crate::arch::x86_64::interrupts::demand_map_vma_page_from_kernel(page_base, false)
 }
 
 /// Check whether the page at `vaddr` is a CoW page (present, user-accessible,
@@ -244,6 +248,62 @@ fn is_user_writable(
             PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
         ),
         _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 52d B.3: address-space generation helpers for user-copy diagnostics
+// ---------------------------------------------------------------------------
+
+/// Read the current process's address-space generation counter.
+///
+/// Returns `None` if the process has no dedicated address space (kernel tasks,
+/// early-boot processes) — generation tracking is effectively disabled for
+/// those.
+fn addr_space_generation() -> Option<u64> {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return None;
+    }
+    let table = crate::process::PROCESS_TABLE.lock();
+    table
+        .find(pid)
+        .and_then(|p| p.addr_space.as_ref().map(|a| a.generation()))
+}
+
+/// Compare the starting generation plus the copy's expected local bumps with
+/// the current address-space generation.
+///
+/// `local_bumps` counts mapping mutations triggered by the copy itself
+/// (demand faults or CoW resolution).  A mismatch after subtracting those
+/// expected local changes indicates a concurrent or otherwise untracked
+/// mapping mutation while the copy was in flight.
+fn report_generation_divergence(
+    gen_before: Option<u64>,
+    local_bumps: u64,
+    caller: &str,
+    vaddr: u64,
+    len: usize,
+) {
+    let Some(gen_before) = gen_before else {
+        return;
+    };
+    let Some(gen_after) = addr_space_generation() else {
+        return;
+    };
+    let expected_after = gen_before.saturating_add(local_bumps);
+    if gen_after != expected_after {
+        log::warn!(
+            "[user_mem] {}: address-space generation divergence (gen {} -> {}, expected {} after {} local bumps) \
+             during copy at {:#x} len={:#x} — concurrent or untracked mapping mutation detected",
+            caller,
+            gen_before,
+            gen_after,
+            expected_after,
+            local_bumps,
+            vaddr,
+            len,
+        );
     }
 }
 
