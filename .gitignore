@@ -14,6 +14,10 @@
 # Generated initrd binaries are now staged under target/generated-initrd/ by
 # cargo xtask, so /target covers them.
 
+# Local agent/orchestration session artifacts
+.agent/
+.workflow-orchestration/artifacts/
+
 # QEMU runtime files
 *.qcow2
 *.fd
