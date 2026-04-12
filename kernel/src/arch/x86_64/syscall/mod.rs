@@ -1212,6 +1212,8 @@ pub extern "C" fn syscall_handler(
         }
     }
 
+    maybe_quiesce_current_group_exit();
+
     // Divergent syscalls never return — handle them first.
     match number {
         SIGRETURN => sys_sigreturn(user_rsp),
@@ -1475,6 +1477,8 @@ pub extern "C" fn syscall_handler(
             NEG_ENOSYS
         }
     };
+
+    maybe_quiesce_current_group_exit();
 
     // Phase 14/19: check pending signals before returning to userspace.
     // If a user handler is delivered, this diverges and never returns.
@@ -1778,6 +1782,41 @@ fn do_clear_child_tid(pid: crate::process::Pid) {
     }
 }
 
+fn maybe_quiesce_current_group_exit() {
+    if crate::task::scheduler::take_current_group_exit_request() {
+        crate::mm::restore_kernel_cr3();
+        crate::task::mark_current_dead();
+    }
+}
+
+pub(crate) fn forced_group_exit_trampoline() -> ! {
+    x86_64::instructions::interrupts::disable();
+    let _ = crate::task::scheduler::take_current_group_exit_request();
+    crate::mm::restore_kernel_cr3();
+    crate::task::mark_current_dead();
+}
+
+fn try_finalize_quiesced_exit_group_sibling(
+    tg: &alloc::sync::Arc<crate::process::ThreadGroup>,
+    sibling_tid: crate::process::Pid,
+) -> bool {
+    if !crate::task::scheduler::quiesce_task_for_remote_reap_by_pid(sibling_tid) {
+        return false;
+    }
+    let process_present = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(sibling_tid).is_some()
+    };
+    if process_present {
+        do_clear_child_tid(sibling_tid);
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let _ = table.reap(sibling_tid);
+    }
+    let mut members = tg.members.lock();
+    members.retain(|&tid| tid != sibling_tid);
+    true
+}
+
 /// Perform full process exit cleanup: close FDs, mark zombie, send SIGCHLD,
 /// free page table.  Called when a single-threaded process exits or when the
 /// last thread in a thread group exits.
@@ -1908,8 +1947,9 @@ pub(super) fn sys_exit(code: i32) -> ! {
 /// `exit_group(code)` — terminate all threads in the thread group (syscall 231).
 ///
 /// For single-threaded processes: identical to `sys_exit`.
-/// For thread groups: kills all sibling threads first, then the caller does
-/// full process cleanup as the last thread standing.
+/// For thread groups: quiesces any still-running siblings first, reaps only
+/// siblings that are confirmed off-core, then performs the caller's final
+/// process cleanup once it is the last thread standing.
 pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
     log::info!("[p{}] exit_group({})", pid, code);
@@ -1922,30 +1962,67 @@ pub(super) fn sys_exit_group(code: i32) -> ! {
         };
 
         if let Some(tg) = thread_group {
+            if let Err(owner_pid) = tg.exit_owner.compare_exchange(
+                0,
+                pid,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            ) {
+                log::info!(
+                    "[p{}] exit_group: owner {} already tearing down thread group",
+                    pid,
+                    owner_pid
+                );
+                crate::mm::restore_kernel_cr3();
+                crate::task::mark_current_dead();
+            }
+
             // Collect sibling TIDs (everyone except us).
             let siblings: alloc::vec::Vec<u32> = {
                 let members = tg.members.lock();
                 members.iter().copied().filter(|&tid| tid != pid).collect()
             };
 
-            // Kill each sibling thread.
-            for sibling_tid in &siblings {
-                // Perform clear_child_tid wake for the sibling.
-                do_clear_child_tid(*sibling_tid);
-                // Remove sibling from process table (shared resources stay via Arc).
-                {
-                    let mut table = crate::process::PROCESS_TABLE.lock();
-                    table.reap(*sibling_tid);
+            let mut pending_remote = alloc::vec::Vec::new();
+            for sibling_tid in siblings {
+                if try_finalize_quiesced_exit_group_sibling(&tg, sibling_tid) {
+                    continue;
                 }
-                // Mark sibling's scheduler task as Dead.
-                crate::task::mark_task_dead_by_pid(*sibling_tid);
+                if !crate::task::scheduler::request_group_exit_by_pid(sibling_tid) {
+                    log::info!(
+                        "[p{}] exit_group: waiting for sibling {} scheduler task publication",
+                        pid,
+                        sibling_tid
+                    );
+                }
+                pending_remote.push(sibling_tid);
             }
 
-            // Clear the members list — only we remain, and we're about to exit.
-            {
-                let mut members = tg.members.lock();
-                members.clear();
+            while !pending_remote.is_empty() {
+                if crate::smp::is_per_core_ready() {
+                    crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_RESCHEDULE);
+                }
+
+                let mut i = 0;
+                while i < pending_remote.len() {
+                    if try_finalize_quiesced_exit_group_sibling(&tg, pending_remote[i]) {
+                        pending_remote.swap_remove(i);
+                    } else {
+                        let _ =
+                            crate::task::scheduler::request_group_exit_by_pid(pending_remote[i]);
+                        i += 1;
+                    }
+                }
+
+                if !pending_remote.is_empty() {
+                    crate::task::yield_now();
+                }
             }
+
+            // Only the caller remains, and it is about to perform the final
+            // group teardown.
+            let mut members = tg.members.lock();
+            members.clear();
         }
 
         // Now do our own clear_child_tid + full exit.
@@ -10675,22 +10752,42 @@ fn sys_clone_thread(
         }
     };
 
-    // Allocate child PID (also serves as TID).
-    let child_pid = crate::process::alloc_pid_pub();
     let child_tgid = parent_tgid;
 
     // Create or join the ThreadGroup.
-    let thread_group = match parent_thread_group {
+    let (child_pid, thread_group) = match parent_thread_group {
         Some(tg) => {
-            // Parent already in a thread group — add child.
-            tg.members.lock().push(child_pid);
-            tg
+            if tg.exit_owner.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                log::warn!(
+                    "sys_clone_thread: parent {} thread group is exiting",
+                    parent_pid
+                );
+                return NEG_EBUSY;
+            }
+            // Parent already in a thread group — add child unless teardown
+            // claimed ownership while we raced to the membership lock.
+            let child_pid = {
+                let mut members = tg.members.lock();
+                if tg.exit_owner.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                    log::warn!(
+                        "sys_clone_thread: parent {} thread group began exit during clone",
+                        parent_pid
+                    );
+                    return NEG_EBUSY;
+                }
+                let child_pid = crate::process::alloc_pid_pub();
+                members.push(child_pid);
+                child_pid
+            };
+            (child_pid, tg)
         }
         None => {
             // First thread creation — create a new group with parent as leader.
+            let child_pid = crate::process::alloc_pid_pub();
             let tg = Arc::new(ThreadGroup {
                 leader_tid: parent_tgid,
                 members: spin::Mutex::new(alloc::vec![parent_tgid, child_pid]),
+                exit_owner: core::sync::atomic::AtomicU32::new(0),
             });
             // Set the parent's thread_group under lock.
             {
@@ -10699,7 +10796,7 @@ fn sys_clone_thread(
                     p.thread_group = Some(tg.clone());
                 }
             }
-            tg
+            (child_pid, tg)
         }
     };
 

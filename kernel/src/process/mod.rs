@@ -549,6 +549,9 @@ pub struct ThreadGroup {
     pub leader_tid: u32,
     /// All TIDs that belong to this group (including the leader).
     pub members: Mutex<Vec<u32>>,
+    /// PID of the thread currently performing `exit_group()` teardown.
+    /// 0 means no teardown is in progress.
+    pub exit_owner: AtomicU32,
 }
 
 // ---------------------------------------------------------------------------

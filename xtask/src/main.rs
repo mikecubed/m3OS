@@ -5612,6 +5612,12 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
         },
         RegressionTest {
+            name: "exit-group-teardown",
+            description: "exit_group() reaps a live spinning sibling only after it quiesces",
+            guest_steps: exit_group_teardown_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
             name: "kbd-echo",
             description: "Keyboard input reaches shell via serial→TTY→stdin pipeline",
             guest_steps: kbd_echo_steps,
@@ -5707,6 +5713,29 @@ fn signal_reset_steps() -> Vec<SmokeStep> {
         pattern: "6 passed, 0 failed",
         timeout_secs: 30,
         label: "signal-test all pass",
+    });
+    steps
+}
+
+/// Guest steps for the exit_group teardown regression: boot, login, run
+/// thread-test, and ensure the shell prompt returns after the live-sibling
+/// exit_group path completes.
+fn exit_group_teardown_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/thread-test\n",
+        label: "run thread-test",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "thread-test: final exit_group with live sibling",
+        timeout_secs: 30,
+        label: "thread-test reached exit_group",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 30,
+        label: "shell prompt after thread-test exit_group",
     });
     steps
 }

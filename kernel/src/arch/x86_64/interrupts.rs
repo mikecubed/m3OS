@@ -540,6 +540,46 @@ extern "x86-interrupt" fn page_fault_handler(
     crate::hlt_loop();
 }
 
+fn maybe_redirect_group_exit_trampoline(stack_frame: &mut InterruptStackFrame) {
+    if stack_frame.code_segment.rpl() != x86_64::PrivilegeLevel::Ring3
+        || !crate::smp::is_per_core_ready()
+    {
+        return;
+    }
+
+    let task_idx = crate::smp::per_core()
+        .current_task_idx
+        .load(Ordering::Relaxed);
+    let should_redirect = if let Some(guard) = crate::task::try_lock_scheduler() {
+        task_idx >= 0
+            && guard
+                .get_task(task_idx as usize)
+                .map(|task| task.group_exit_pending)
+                .unwrap_or(false)
+    } else {
+        false
+    };
+    if !should_redirect {
+        return;
+    }
+
+    let kernel_rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) kernel_rsp);
+    }
+    unsafe {
+        stack_frame.as_mut().update(|f| {
+            f.instruction_pointer = VirtAddr::new(
+                crate::arch::x86_64::syscall::forced_group_exit_trampoline as *const () as u64,
+            );
+            f.code_segment = gdt::kernel_code_selector();
+            f.cpu_flags &= !x86_64::registers::rflags::RFlags::INTERRUPT_FLAG;
+            f.stack_pointer = VirtAddr::new(kernel_rsp);
+            f.stack_segment = gdt::kernel_data_selector();
+        });
+    }
+}
+
 extern "x86-interrupt" fn general_protection_fault_handler(
     mut stack_frame: InterruptStackFrame,
     _err: u64,
@@ -668,7 +708,7 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(mut stack_frame: InterruptStackFrame) {
     // Only the BSP increments the global tick counter. APs have their own
     // per-1ms LAPIC timers that drive the scheduler but must not skew the
     // global wall-clock tick count (which nanosleep and uptime rely on).
@@ -680,6 +720,7 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     crate::task::signal_reschedule();
+    maybe_redirect_group_exit_trampoline(&mut stack_frame);
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
     } else {
@@ -868,8 +909,9 @@ extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
 ///
 /// Sets the reschedule flag on the receiving core, causing the scheduler to
 /// pick the next ready task on the next opportunity.
-extern "x86-interrupt" fn reschedule_ipi_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStackFrame) {
     crate::task::signal_reschedule();
+    maybe_redirect_group_exit_trampoline(&mut stack_frame);
     super::apic::lapic_eoi();
 }
 

@@ -207,6 +207,9 @@ pub struct Task {
     /// Set once per-task IPC teardown has run so deferred dead-task cleanup
     /// can avoid double-cleaning the same task.
     pub ipc_cleaned: bool,
+    /// Set when another thread in the group calls `exit_group()` and this task
+    /// must quiesce on its own core before the caller reaps its process entry.
+    pub group_exit_pending: bool,
     /// User-mode return state saved when this task yields and restored by the
     /// scheduler on re-dispatch.  `None` for kernel-only tasks or before the
     /// first yield from a userspace context.
@@ -251,6 +254,7 @@ impl Task {
             switching_out: false,
             wake_after_switch: false,
             ipc_cleaned: false,
+            group_exit_pending: false,
             user_return: None,
             fork_ctx: None,
             _stack: Some(stack),

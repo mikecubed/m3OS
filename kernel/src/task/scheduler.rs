@@ -145,6 +145,10 @@ impl Scheduler {
         self.tasks.get(idx)
     }
 
+    fn find_by_pid(&self, pid: u32) -> Option<usize> {
+        self.tasks.iter().position(|t| t.pid == pid)
+    }
+
     /// Return the index of the task with the given [`TaskId`], if present.
     fn find(&self, id: TaskId) -> Option<usize> {
         self.tasks.iter().position(|t| t.id == id)
@@ -576,6 +580,10 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     task.assigned_core = current_core;
+    // Publish the child PID before the first dispatch so pid-based lifecycle
+    // operations (for example exit_group teardown) can target the task even if
+    // it has not reached fork_child_trampoline yet.
+    task.pid = fork_pid;
     task.fork_ctx = Some(ctx);
     debug_assert!(
         task.fork_ctx.is_some(),
@@ -1057,12 +1065,56 @@ pub fn mark_current_dead() -> ! {
 pub fn mark_task_dead_by_pid(pid: u32) -> bool {
     let mut sched = SCHEDULER.lock();
     for task in sched.tasks.iter_mut() {
-        if task.pid == pid && task.state != TaskState::Dead {
-            task.state = TaskState::Dead;
+        if task.pid == pid {
+            task.group_exit_pending = false;
+            if task.state != TaskState::Dead {
+                task.state = TaskState::Dead;
+            }
             return true;
         }
     }
     false
+}
+
+/// Request that the task with `pid` stop itself on its own core.
+pub fn request_group_exit_by_pid(pid: u32) -> bool {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find_by_pid(pid) {
+        sched.tasks[idx].group_exit_pending = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// Consume the current task's pending `exit_group()` stop request.
+pub fn take_current_group_exit_request() -> bool {
+    let idx = match get_current_task_idx() {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let mut sched = SCHEDULER.lock();
+    if idx >= sched.tasks.len() {
+        return false;
+    }
+    let pending = sched.tasks[idx].group_exit_pending;
+    sched.tasks[idx].group_exit_pending = false;
+    pending
+}
+
+/// Atomically confirm that a sibling is off-core and mark it dead so it can
+/// be reaped by another thread in the same group.
+pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
+    let mut sched = SCHEDULER.lock();
+    let Some(idx) = sched.find_by_pid(pid) else {
+        return false;
+    };
+    if sched.task_current_on_any_core(idx) || sched.tasks[idx].switching_out {
+        return false;
+    }
+    sched.tasks[idx].state = TaskState::Dead;
+    sched.tasks[idx].group_exit_pending = false;
+    true
 }
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.

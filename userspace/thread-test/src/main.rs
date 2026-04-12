@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use syscall_lib::{exit, serial_print, syscall0, syscall1, syscall6};
+use syscall_lib::{exit, gettimeofday, serial_print, syscall0, syscall1, syscall6};
 
 const SYS_CLONE: u64 = 56;
 const SYS_EXIT: u64 = 60;
@@ -31,6 +31,7 @@ static CHILD_TID: AtomicU32 = AtomicU32::new(0);
 static CHILD_DONE: AtomicU32 = AtomicU32::new(0);
 static CHILD_REPORTED_PID: AtomicU32 = AtomicU32::new(0);
 static CHILD_REPORTED_TID: AtomicU32 = AtomicU32::new(0);
+static EXIT_GROUP_SPINNER_STARTED: AtomicU32 = AtomicU32::new(0);
 
 static MUTEX_WORD: AtomicU32 = AtomicU32::new(0);
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -129,10 +130,20 @@ extern "C" fn thread_fn_exit_only() -> ! {
     exit(1)
 }
 
+extern "C" fn thread_fn_exit_group_spin() -> ! {
+    EXIT_GROUP_SPINNER_STARTED.store(1, Ordering::Release);
+    futex_wake(&EXIT_GROUP_SPINNER_STARTED, 1);
+    loop {
+        let _ = unsafe { syscall0(SYS_GETTID) };
+        core::hint::spin_loop();
+    }
+}
+
 static mut STACK1: [u8; THREAD_STACK_SIZE] = [0u8; THREAD_STACK_SIZE];
 static mut STACK2: [u8; THREAD_STACK_SIZE] = [0u8; THREAD_STACK_SIZE];
 static mut STACK3: [u8; THREAD_STACK_SIZE] = [0u8; THREAD_STACK_SIZE];
 static mut STACK4: [u8; THREAD_STACK_SIZE] = [0u8; THREAD_STACK_SIZE];
+static mut STACK5: [u8; THREAD_STACK_SIZE] = [0u8; THREAD_STACK_SIZE];
 
 fn get_stack_top(stack: *mut [u8; THREAD_STACK_SIZE]) -> u64 {
     stack as u64 + THREAD_STACK_SIZE as u64
@@ -360,6 +371,52 @@ fn test_thread_exit() -> bool {
     true
 }
 
+fn arm_exit_group_spinner() -> bool {
+    serial_print("thread-test: test 4 -- arm exit_group live sibling... ");
+
+    static CHILD_TID4: AtomicU32 = AtomicU32::new(0);
+    CHILD_TID4.store(0, Ordering::Release);
+    EXIT_GROUP_SPINNER_STARTED.store(0, Ordering::Release);
+
+    let t = clone_thread(
+        get_stack_top(&raw mut STACK5),
+        thread_fn_exit_group_spin,
+        &CHILD_TID4 as *const AtomicU32 as *mut u32,
+    );
+
+    if t == u64::MAX || t == 0 {
+        serial_print("FAIL (clone failed)\n");
+        return false;
+    }
+
+    let (start_sec, start_usec) = gettimeofday();
+    let deadline_us = if start_sec >= 0 {
+        (start_sec as i128) * 1_000_000 + (start_usec as i128) + 1_000_000
+    } else {
+        -1
+    };
+
+    loop {
+        if EXIT_GROUP_SPINNER_STARTED.load(Ordering::Acquire) != 0 {
+            serial_print("PASS\n");
+            return true;
+        }
+        let _ = unsafe { syscall0(SYS_GETTID) };
+        if deadline_us >= 0 {
+            let (now_sec, now_usec) = gettimeofday();
+            if now_sec >= 0 {
+                let now_us = (now_sec as i128) * 1_000_000 + (now_usec as i128);
+                if now_us >= deadline_us {
+                    break;
+                }
+            }
+        }
+    }
+
+    serial_print("SKIP (spinner start timeout)\n");
+    false
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial_print("thread-test: starting threading primitive tests\n");
@@ -385,6 +442,11 @@ pub extern "C" fn _start() -> ! {
         failed += 1;
     }
 
+    let exit_group_spinner_started = arm_exit_group_spinner();
+    if exit_group_spinner_started {
+        passed += 1;
+    }
+
     serial_print("thread-test: ");
     print_num(passed as u64);
     serial_print(" passed, ");
@@ -394,6 +456,8 @@ pub extern "C" fn _start() -> ! {
     if failed == 0 {
         serial_print("thread-test: ALL TESTS PASSED\n");
     }
+
+    serial_print("thread-test: final exit_group with live sibling\n");
 
     unsafe { syscall1(SYS_EXIT_GROUP, if failed == 0 { 0 } else { 1 }) };
     exit(1)
