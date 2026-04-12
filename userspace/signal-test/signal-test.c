@@ -264,7 +264,7 @@ static int exec_signal_check(void) {
     return 42;
 }
 
-/* ---- Test 5: exec-time signal reset (POSIX: exec resets Handler → Default) ---- */
+/* ---- Test 6: exec-time signal reset (POSIX: exec resets Handler → Default) ---- */
 
 static void test_exec_signal_reset(void) {
     struct sigaction sa;

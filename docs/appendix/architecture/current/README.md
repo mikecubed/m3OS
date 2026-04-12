@@ -1,6 +1,6 @@
 # m3OS Current Architecture Reference
 
-**Version:** Kernel v0.51.0 (Phase 52)
+**Version:** Kernel v0.52.0 (Phase 52)
 **Date:** 2026-04-10
 **Purpose:** Detailed documentation of the current m3OS kernel architecture, focusing on subsystems identified in the `copy_to_user` reliability bug investigation and the SSHD hang analysis.
 
