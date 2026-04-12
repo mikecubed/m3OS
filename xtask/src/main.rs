@@ -2135,6 +2135,36 @@ fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Re
     rx
 }
 
+fn drain_serial_until_idle(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    serial_buf: &mut String,
+    idle_threshold: std::time::Duration,
+    idle_cap: std::time::Duration,
+) {
+    let idle_start = std::time::Instant::now();
+    let mut last_data = std::time::Instant::now();
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(chunk) => {
+                let text = String::from_utf8_lossy(&chunk);
+                serial_buf.push_str(&text);
+                last_data = std::time::Instant::now();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if last_data.elapsed() >= idle_threshold {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if idle_start.elapsed() >= idle_cap {
+            break;
+        }
+    }
+}
+
 /// Run an expect-style smoke test script against a running QEMU instance.
 ///
 /// Returns `Ok(())` on success or `Err(message)` on failure.
@@ -2254,28 +2284,12 @@ fn run_smoke_script(
                 // Drain serial output until 150ms of silence before sending
                 // input.  This ensures the shell/terminal has finished all
                 // prompt rendering (ANSI escapes, cursor repositioning).
-                let idle_threshold = std::time::Duration::from_millis(150);
-                let idle_cap = std::time::Duration::from_secs(2);
-                let idle_start = std::time::Instant::now();
-                let mut last_data = std::time::Instant::now();
-                loop {
-                    match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                        Ok(chunk) => {
-                            let text = String::from_utf8_lossy(&chunk);
-                            serial_buf.push_str(&text);
-                            last_data = std::time::Instant::now();
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if last_data.elapsed() >= idle_threshold {
-                                break;
-                            }
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                    if idle_start.elapsed() >= idle_cap {
-                        break; // cap to avoid stalling on noisy kernel logs
-                    }
-                }
+                drain_serial_until_idle(
+                    &rx,
+                    &mut serial_buf,
+                    std::time::Duration::from_millis(150),
+                    std::time::Duration::from_secs(2),
+                );
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
                     if stdin.write_all(input.as_bytes()).is_err() {
@@ -6041,6 +6055,12 @@ fn run_smoke_steps_with_capture(
                 }
             }
             SmokeStep::Send { input, label } => {
+                drain_serial_until_idle(
+                    rx,
+                    &mut serial_buf,
+                    std::time::Duration::from_millis(150),
+                    std::time::Duration::from_secs(2),
+                );
                 let stdin = child
                     .stdin
                     .as_mut()
@@ -6805,5 +6825,25 @@ mod tests {
         assert!(matches!(mode, SerialMatchMode::Cleaned));
         drain_serial_through_match(&mut serial, &stripped, mode, match_end);
         assert_eq!(serial, " main.o util.o\nroot@m3os:/home/project# ");
+    }
+
+    #[test]
+    fn drain_serial_until_idle_keeps_reading_until_quiet() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(b"login:".to_vec()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tx.send(b" Password:".to_vec()).unwrap();
+        });
+
+        let mut serial = String::new();
+        drain_serial_until_idle(
+            &rx,
+            &mut serial,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(200),
+        );
+
+        assert_eq!(serial, "login: Password:");
     }
 }
