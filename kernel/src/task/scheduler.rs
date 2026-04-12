@@ -1366,7 +1366,7 @@ pub fn run() -> ! {
             // Keep a live Arc guard so the AddressSpace is not freed
             // between the PROCESS_TABLE lock drop and the later
             // activate/deactivate calls.
-            let mut _new_as_guard: Option<alloc::sync::Arc<crate::mm::AddressSpace>> = None;
+            let mut new_as_guard: Option<alloc::sync::Arc<crate::mm::AddressSpace>> = None;
             if pid != 0 {
                 // Read the task's UserReturnState (authoritative source).
                 let urs = {
@@ -1376,11 +1376,11 @@ pub fn run() -> ! {
                 // Read the address-space pointer for TLB tracking — still
                 // derived from Process because the raw pointer management
                 // is a per-core concern, not part of the resume contract.
-                _new_as_guard = {
+                new_as_guard = {
                     let table = crate::process::PROCESS_TABLE.lock();
                     table.find(pid).and_then(|p| p.addr_space.clone())
                 };
-                new_as_ptr = _new_as_guard
+                new_as_ptr = new_as_guard
                     .as_deref()
                     .map(|a| a as *const crate::mm::AddressSpace)
                     .unwrap_or_default();
@@ -1484,8 +1484,10 @@ pub fn run() -> ! {
                     unsafe { &*old_as_ptr }.deactivate_on_core(core_id);
                 }
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                if !new_as_ptr.is_null() && old_as_ptr != new_as_ptr {
-                    unsafe { &*new_as_ptr }.activate_on_core(core_id);
+                if let Some(new_as) = new_as_guard.as_deref()
+                    && old_as_ptr != new_as_ptr
+                {
+                    new_as.activate_on_core(core_id);
                 }
                 let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
                 unsafe { (*pc_mut).current_addrspace = new_as_ptr };
