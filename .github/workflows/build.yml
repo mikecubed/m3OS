@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -27,7 +27,7 @@ jobs:
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -37,7 +37,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: TCC build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             target/tcc-src
@@ -54,12 +54,12 @@ jobs:
           rm -f target/x86_64-unknown-none/release/disk.img
           cargo xtask smoke-test --timeout 180
 
-      - name: Regression tests (fork-overlap, ipc-wake, pty-overlap)
+      - name: Regression tests (fork-overlap, ipc-wake, pty-overlap, signal-reset, kbd-echo)
         run: cargo xtask regression --timeout 90
 
       - name: Upload regression artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: regression-artifacts
           path: target/regression/

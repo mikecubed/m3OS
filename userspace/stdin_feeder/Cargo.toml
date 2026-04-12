@@ -1,0 +1,11 @@
+[package]
+name = "stdin_feeder"
+version = "0.52.0"
+edition = "2024"
+
+[[bin]]
+name = "stdin_feeder"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

@@ -136,6 +136,13 @@ flowchart TD
     P46 --> P48["Phase 48 Tasks"]
     P48 --> P49["Phase 49 Tasks"]
     P49 --> P50["Phase 50 Tasks"]
+    P46 --> P51["Phase 51 Tasks"]
+    P50 --> P51
+    P51 --> P52["Phase 52 Tasks"]
+    P52 --> P52a["Phase 52a Tasks"]
+    P52a --> P52b["Phase 52b Tasks"]
+    P52b --> P52c["Phase 52c Tasks"]
+    P52c --> P52d["Phase 52d Tasks"]
 ```
 
 ## Task Documents
@@ -234,14 +241,19 @@ flowchart TD
 | 49 | Architectural Declaration | Complete | `phase-49` | [Tasks](./49-architectural-declaration-tasks.md) |
 | 50 | IPC Completion | Complete | `phase-50` | [Tasks](./50-ipc-completion-tasks.md) |
 
-### Convergence Phases (in progress)
+### Convergence Phases
 
 | Phase | Focus | Status | Source Ref | Task List |
 |---|---|---|---|---|
 | 51 | Service model maturity (contract, restart, shutdown, admin) | In Progress | `phase-51` | [Tasks](./51-service-model-maturity-tasks.md) |
+| 52 | First service extractions (console, keyboard to ring 3) | In Progress | `phase-52` | [Tasks](./52-first-service-extractions-tasks.md) |
+| 52a | Kernel reliability fixes | Complete | `phase-52a` | [Tasks](./52a-kernel-reliability-fixes-tasks.md) |
+| 52b | Kernel structural hardening | Complete | `phase-52b` | [Tasks](./52b-kernel-structural-hardening-tasks.md) |
+| 52c | Kernel architecture evolution | Complete | `phase-52c` | [Tasks](./52c-kernel-architecture-evolution-tasks.md) |
+| 52d | Kernel completion and roadmap alignment | Complete | `phase-52d` | [Tasks](./52d-kernel-completion-and-roadmap-alignment-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **52 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **53 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

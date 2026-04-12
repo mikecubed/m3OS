@@ -22,7 +22,7 @@ pub mod tlb;
 extern crate alloc;
 
 use alloc::{boxed::Box, collections::VecDeque};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::{
     VirtAddr,
@@ -48,6 +48,94 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5; // 20 KiB
 
 /// Size of the dedicated syscall/kernel stack per core (same as BSP).
 const SYSCALL_STACK_SIZE: usize = 4096 * 4; // 16 KiB
+
+// ---------------------------------------------------------------------------
+// ISR wakeup queue (lock-free, per-core)
+// ---------------------------------------------------------------------------
+
+/// Per-core lock-free ISR wakeup queue.
+///
+/// ISR context pushes task indices (lock-free SPSC producer).
+/// Scheduler loop drains entries (single consumer).
+///
+/// The ring buffer holds up to 31 entries (one slot is always unused to
+/// distinguish full from empty). `u64::MAX` is the sentinel for empty slots.
+/// On overflow the push is silently dropped -- the fallback
+/// `drain_pending_waiters()` in the scheduler loop will catch it.
+pub struct IsrWakeQueue {
+    buffer: [AtomicU64; 32],
+    /// Write position (ISR advances).
+    head: AtomicUsize,
+    /// Read position (scheduler advances).
+    tail: AtomicUsize,
+}
+
+/// Sentinel value stored in empty ring-buffer slots.
+const ISR_WAKE_EMPTY: u64 = u64::MAX;
+
+impl IsrWakeQueue {
+    /// Create a new empty queue with all slots set to the empty sentinel.
+    #[allow(clippy::declare_interior_mutable_const)]
+    pub const fn new() -> Self {
+        // const-init each AtomicU64 to the sentinel value.
+        const EMPTY: AtomicU64 = AtomicU64::new(ISR_WAKE_EMPTY);
+        Self {
+            buffer: [EMPTY; 32],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push a task index to the queue (lock-free, ISR-safe).
+    ///
+    /// Returns `false` if the queue is full (no panic from ISR context!).
+    pub fn push(&self, task_idx: usize) -> bool {
+        let head = self.head.load(Ordering::Relaxed);
+        let next = (head + 1) % 32;
+        // Full when next would collide with the consumer's tail.
+        if next == self.tail.load(Ordering::Acquire) {
+            return false;
+        }
+        self.buffer[head].store(task_idx as u64, Ordering::Relaxed);
+        self.head.store(next, Ordering::Release);
+        true
+    }
+
+    /// Drain all pending entries. Yields task indices until the queue is empty.
+    ///
+    /// Only called from the scheduler loop on the owning core (single consumer).
+    pub fn drain(&self) -> IsrWakeDrain<'_> {
+        IsrWakeDrain { queue: self }
+    }
+}
+
+/// Iterator returned by [`IsrWakeQueue::drain`].
+pub struct IsrWakeDrain<'a> {
+    queue: &'a IsrWakeQueue,
+}
+
+impl Iterator for IsrWakeDrain<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let tail = self.queue.tail.load(Ordering::Relaxed);
+        let head = self.queue.head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let val = self.queue.buffer[tail].load(Ordering::Relaxed);
+        // Reset the slot to the sentinel (not strictly required but hygienic).
+        self.queue.buffer[tail].store(ISR_WAKE_EMPTY, Ordering::Relaxed);
+        let next_tail = (tail + 1) % 32;
+        self.queue.tail.store(next_tail, Ordering::Release);
+        if val == ISR_WAKE_EMPTY {
+            // Sentinel should never appear in a valid entry; skip it.
+            self.next()
+        } else {
+            Some(val as usize)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-core data
@@ -125,9 +213,22 @@ pub struct PerCoreData {
     /// 0 = no userspace process (kernel task context).
     pub current_pid: AtomicU32,
 
+    /// Pointer to the AddressSpace currently active on this core.
+    /// Raw pointer because PerCoreData does not own the AddressSpace
+    /// (the Process does via Arc). Null when no user address space is loaded.
+    pub current_addrspace: *const crate::mm::AddressSpace,
+
     /// Fork child entry context — per-core so each core can handle `fork()`
     /// independently without corrupting another core's saved context.
     pub fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx,
+
+    // ----- Phase 52: per-core ISR wakeup queue -----
+    /// Lock-free queue for ISR-to-scheduler wakeup delivery.
+    ///
+    /// ISRs (e.g. keyboard interrupt via `signal_irq`) push task indices here.
+    /// The scheduler loop drains entries on each iteration, waking blocked tasks
+    /// without requiring the ISR to acquire any mutex.
+    pub isr_wake_queue: IsrWakeQueue,
 
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
@@ -205,6 +306,21 @@ static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// it's set.
 pub fn is_per_core_ready() -> bool {
     SMP_INITIALIZED.load(Ordering::Acquire)
+}
+
+/// Return a reference to the calling core's [`PerCoreData`], or `None` if
+/// per-core data has not been initialized yet.
+///
+/// Safe to call from ISR context — never panics.
+pub fn try_per_core() -> Option<&'static PerCoreData> {
+    if !SMP_INITIALIZED.load(Ordering::Acquire) {
+        return None;
+    }
+    let ptr = read_gs_base();
+    if ptr == 0 {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const PerCoreData) })
 }
 
 /// Return a reference to the calling core's [`PerCoreData`].
@@ -405,7 +521,9 @@ pub fn init_bsp_per_core() {
         syscall_user_r10: 0,
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
+        current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
+        isr_wake_queue: IsrWakeQueue::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
@@ -514,7 +632,9 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         syscall_user_r10: 0,
         syscall_user_rflags: 0,
         current_pid: AtomicU32::new(0),
+        current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
+        isr_wake_queue: IsrWakeQueue::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));

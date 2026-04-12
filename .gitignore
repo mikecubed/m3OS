@@ -11,10 +11,12 @@
 /m3os.key
 /m3os.crt
 
-# Generated userspace ELF binaries (produced by cargo xtask / build_userspace_bins).
-# Also includes musl-compiled C binaries (build_musl_bins).
-# Built from source at build time; committing binaries creates noisy diffs.
-/kernel/initrd/*.elf
+# Generated initrd binaries are now staged under target/generated-initrd/ by
+# cargo xtask, so /target covers them.
+
+# Local agent/orchestration session artifacts
+.agent/
+.workflow-orchestration/artifacts/
 
 # QEMU runtime files
 *.qcow2
@@ -35,4 +37,3 @@ Thumbs.db
 
 # DOOM shareware WAD (auto-downloaded to target/; not committed)
 doom1.wad
-kernel/initrd/doom.commit

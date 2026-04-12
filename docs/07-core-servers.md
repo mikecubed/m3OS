@@ -311,8 +311,22 @@ dependency-ordered boot, automatic restart, and system logging.
 
 ---
 
+## Phase 52 Update: Console and Keyboard Extracted to Ring 3
+
+As of Phase 52 (First Service Extractions), ring-3 `console_server` and
+`kbd_server` binaries have been added as supervised userspace services.
+However, the kernel still runs its own `console_server_task` and
+`kbd_server_task` in parallel during the transition period.  The kernel
+tasks will be removed once the userspace services fully handle all
+rendering and scancode delivery through IPC.  The kernel retains the
+minimal privileged substrate: framebuffer mapping, IRQ handling, scancode
+ring buffer, and notification delivery.  See
+[docs/52-first-service-extractions.md](./52-first-service-extractions.md)
+for the full extraction design.
+
 ## See Also
 
 - `docs/06-ipc.md` — IPC model, message format, capabilities, and notification objects
+- `docs/52-first-service-extractions.md` — Phase 52 console and keyboard extraction
 - `docs/roadmap/07-core-servers.md` — phase milestone plan and acceptance criteria
 - `docs/roadmap/README.md` — overall project milestones and phase scope

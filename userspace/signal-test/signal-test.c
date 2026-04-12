@@ -5,15 +5,20 @@
  *   2. Block SIGUSR1, send it, verify NOT delivered, unblock, verify delivered
  *   3. rt_sigaction rejects SIGKILL and SIGSTOP
  *   4. Signal auto-masking: handler cannot re-enter itself
+ *   5. rt_sigaction is atomic when oldact copy faults
+ *   6. Exec-time signal reset: exec'd child does not inherit custom handlers
  *
  * Compiled with musl-gcc -static.
  * Exit code 0 = all tests passed; non-zero = failure count.
  */
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -182,13 +187,154 @@ static void test_auto_masking(void) {
 
 /* ---- main ---- */
 
-int main(void) {
+static void atomicity_old_handler(int sig) {
+    (void)sig;
+}
+
+static void atomicity_new_handler(int sig) {
+    (void)sig;
+}
+
+/* ---- Test 5: sigaction must not partially succeed on EFAULT ---- */
+
+static void test_sigaction_atomicity(void) {
+    struct sigaction old_sa, new_sa, current_sa, reset_sa;
+    memset(&old_sa, 0, sizeof(old_sa));
+    memset(&new_sa, 0, sizeof(new_sa));
+    memset(&current_sa, 0, sizeof(current_sa));
+    memset(&reset_sa, 0, sizeof(reset_sa));
+
+    old_sa.sa_handler = atomicity_old_handler;
+    old_sa.sa_flags = SA_RESTORER;
+    new_sa.sa_handler = atomicity_new_handler;
+    new_sa.sa_flags = SA_RESTORER;
+    reset_sa.sa_handler = SIG_DFL;
+    reset_sa.sa_flags = SA_RESTORER;
+
+    if (sigaction(SIGUSR1, &old_sa, NULL) != 0) {
+        fail("sigaction_atomicity", "failed to install baseline handler");
+        return;
+    }
+
+    errno = 0;
+    if (syscall(SYS_rt_sigaction,
+                SIGUSR1,
+                &new_sa,
+                (struct sigaction *)1,
+                sizeof(sigset_t)) == 0) {
+        fail("sigaction_atomicity", "rt_sigaction unexpectedly accepted invalid oldact");
+        sigaction(SIGUSR1, &reset_sa, NULL);
+        return;
+    }
+    if (errno != EFAULT) {
+        fail("sigaction_atomicity", "rt_sigaction returned wrong errno for invalid oldact");
+        sigaction(SIGUSR1, &reset_sa, NULL);
+        return;
+    }
+    if (sigaction(SIGUSR1, NULL, &current_sa) != 0) {
+        fail("sigaction_atomicity", "failed to query current handler");
+        sigaction(SIGUSR1, &reset_sa, NULL);
+        return;
+    }
+    if (current_sa.sa_handler == atomicity_old_handler)
+        pass("sigaction_atomicity");
+    else
+        fail("sigaction_atomicity", "handler changed despite EFAULT");
+
+    sigaction(SIGUSR1, &reset_sa, NULL);
+}
+
+/* Called when invoked as: signal-test --exec-signal-check
+   Tests that the parent's custom SIGUSR1 handler was reset to SIG_DFL by exec.
+   Exit 0 = handler was reset (correct).
+   Exit 42 = handler survived exec (signal-reset bug).
+   Exit 99 = could not query signal disposition (generic failure). */
+static int exec_signal_check(void) {
+    struct sigaction old;
+    memset(&old, 0, sizeof(old));
+    if (sigaction(SIGUSR1, NULL, &old) != 0) {
+        fputs("[signal-test:exec-check] sigaction query failed\n", stdout);
+        return 99;
+    }
+    if (old.sa_handler == SIG_DFL) {
+        fputs("[signal-test:exec-check] SIGUSR1 is SIG_DFL after exec (correct)\n", stdout);
+        return 0;
+    }
+    fputs("[signal-test:exec-check] SIGUSR1 is NOT SIG_DFL after exec (BUG)\n", stdout);
+    return 42;
+}
+
+/* ---- Test 6: exec-time signal reset (POSIX: exec resets Handler → Default) ---- */
+
+static void test_exec_signal_reset(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigusr1_handler;
+    sa.sa_flags = SA_RESTORER;
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) {
+        fail("exec_signal_reset", "sigaction failed");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fail("exec_signal_reset", "fork failed");
+        sa.sa_handler = SIG_DFL;
+        sigaction(SIGUSR1, &sa, NULL);
+        return;
+    }
+
+    if (pid == 0) {
+        /* Child: exec self with --exec-signal-check. */
+        char *args[] = {"signal-test", "--exec-signal-check", NULL};
+        execve("/bin/signal-test", args, NULL);
+        /* If execve itself fails, exit with a distinct code. */
+        _exit(99);
+    }
+
+    /* Parent: wait for child and interpret the exit status. */
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        fail("exec_signal_reset", "waitpid failed");
+    } else if (WIFEXITED(status)) {
+        int code = WEXITSTATUS(status);
+        if (code == 0)
+            pass("exec_signal_reset");
+        else if (code == 42)
+            fail("exec_signal_reset",
+                 "handler inherited across exec (signal-reset bug)");
+        else if (code == 99)
+            fail("exec_signal_reset",
+                 "execve or sigaction query failed (not a signal-reset bug)");
+        else
+            fail("exec_signal_reset",
+                 "unexpected exit code from exec'd child");
+    } else if (WIFSIGNALED(status)) {
+        fail("exec_signal_reset",
+             "exec'd child killed by signal (not a signal-reset bug)");
+    } else {
+        fail("exec_signal_reset", "unexpected wait status");
+    }
+
+    /* Restore default. */
+    sa.sa_handler = SIG_DFL;
+    sigaction(SIGUSR1, &sa, NULL);
+}
+
+int main(int argc, char *argv[]) {
+    /* If invoked as exec'd child for the signal-reset regression, run only
+       that check and exit immediately. */
+    if (argc >= 2 && strcmp(argv[1], "--exec-signal-check") == 0)
+        return exec_signal_check();
+
     printf("[signal-test] starting\n");
 
     test_sigint_handler();
     test_signal_masking();
     test_uncatchable();
     test_auto_masking();
+    test_sigaction_atomicity();
+    test_exec_signal_reset();
 
     printf("[signal-test] results: %d passed, %d failed\n",
            tests_passed, tests_failed);

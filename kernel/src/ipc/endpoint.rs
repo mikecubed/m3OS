@@ -29,7 +29,8 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
-use spin::Mutex;
+use alloc::vec::Vec;
+use spin::{Lazy, Mutex};
 
 use super::{CapError, Capability, Message};
 use crate::task::{TaskId, scheduler};
@@ -40,50 +41,151 @@ pub use kernel_core::types::EndpointId;
 // Global endpoint registry
 // ---------------------------------------------------------------------------
 
-/// Maximum number of concurrent IPC endpoints.
-pub(super) const MAX_ENDPOINTS: usize = 16;
+/// Initial number of endpoint slots.
+const INITIAL_ENDPOINTS: usize = 16;
+
+/// Number of slots added each time the pool grows.
+const ENDPOINT_GROW_INCREMENT: usize = 16;
 
 /// Global registry of all kernel IPC endpoints.
 ///
 /// Protected by a `Mutex` — IPC operations acquire this lock briefly to
 /// inspect or mutate sender/receiver queues.
-pub static ENDPOINTS: Mutex<EndpointRegistry> = Mutex::new(EndpointRegistry::new());
+///
+/// Uses `spin::Lazy` because `EndpointRegistry::new()` allocates a `Vec`.
+pub static ENDPOINTS: Lazy<Mutex<EndpointRegistry>> =
+    Lazy::new(|| Mutex::new(EndpointRegistry::new()));
 
-/// Container for all [`Endpoint`] objects.
+/// Dynamically growable container for all [`Endpoint`] objects.
 pub struct EndpointRegistry {
-    slots: [Option<Endpoint>; MAX_ENDPOINTS],
+    slots: Vec<Option<Endpoint>>,
 }
 
 impl EndpointRegistry {
-    const fn new() -> Self {
-        // Manual `[None; N]` expansion: `[expr; N]` requires `Copy`, which
-        // `Option<Endpoint>` does not implement (VecDeque is not Copy).
-        EndpointRegistry {
-            slots: [
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
-            ],
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(INITIAL_ENDPOINTS);
+        for _ in 0..INITIAL_ENDPOINTS {
+            slots.push(None);
         }
+        EndpointRegistry { slots }
     }
 
     /// Allocate a new endpoint and return its [`EndpointId`].
     ///
+    /// Scans for a free slot; if none found, grows the pool by
+    /// [`ENDPOINT_GROW_INCREMENT`] and uses the first new slot.
+    ///
+    /// `EndpointId` wraps a `u8`, limiting the maximum to 256 endpoints.
+    ///
     /// # Panics
     ///
-    /// Panics if all 16 slots are occupied (in both debug and release builds).
+    /// Panics if the pool would need to grow beyond 256 endpoints (the `u8`
+    /// limit of `EndpointId`).
     pub fn create(&mut self) -> EndpointId {
+        self.try_create().expect("endpoint registry full")
+    }
+
+    /// Fallible version of [`create`] — returns `None` when all slots are
+    /// occupied instead of panicking.  Used by userspace-facing syscalls to
+    /// avoid kernel DoS via endpoint exhaustion.
+    pub fn try_create(&mut self) -> Option<EndpointId> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(Endpoint::new());
-                return EndpointId(i as u8);
+                return Some(EndpointId(i as u8));
             }
         }
-        panic!("endpoint registry full");
+        // No free slot — grow the pool.
+        let old_len = self.slots.len();
+        if old_len >= 256 {
+            return None;
+        }
+        let grow_to = (old_len + ENDPOINT_GROW_INCREMENT).min(256);
+        self.slots.resize_with(grow_to, || None);
+        self.slots[old_len] = Some(Endpoint::new());
+        Some(EndpointId(old_len as u8))
+    }
+
+    /// Like [`try_create`] but records the owning task so the endpoint can
+    /// be reclaimed on task exit.  Used by the `create_endpoint` syscall.
+    pub fn try_create_owned(&mut self, owner: TaskId) -> Option<EndpointId> {
+        let id = self.try_create()?;
+        if let Some(ep) = self.get_mut(id) {
+            ep.owner = Some(owner);
+        }
+        Some(id)
+    }
+
+    /// Free an endpoint slot so it can be reused.
+    ///
+    /// Used to roll back a `try_create` when the subsequent capability insert
+    /// fails, preventing permanent slot leaks from userspace syscalls.
+    pub fn destroy(&mut self, id: EndpointId) {
+        if let Some(slot) = self.slots.get_mut(id.0 as usize) {
+            *slot = None;
+        }
     }
 
     /// Borrow a mutable reference to an endpoint.
     pub fn get_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
         self.slots.get_mut(id.0 as usize)?.as_mut()
+    }
+
+    /// Close all endpoints owned by `task_id`.
+    ///
+    /// Closed endpoints stay tombstoned until no live task still holds a cap
+    /// to their [`EndpointId`]. That prevents stale caps from aliasing a later
+    /// endpoint that reuses the same slot.
+    ///
+    /// Returns the blocked peers stranded on those endpoints so the caller can
+    /// wake them **after** releasing the registry lock.
+    pub(super) fn close_owned_by(&mut self, task_id: TaskId) -> (Vec<StrandedSender>, Vec<TaskId>) {
+        let mut stranded_senders = Vec::new();
+        let mut stranded_receivers = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(ep) = slot
+                && ep.owner == Some(task_id)
+            {
+                ep.owner = None;
+                ep.closed = true;
+                stranded_receivers.extend(ep.receivers.drain(..));
+                for mut ps in ep.senders.drain(..) {
+                    stranded_senders.push(StrandedSender {
+                        task: ps.task,
+                        cap: ps.msg.cap.take(),
+                    });
+                }
+            }
+        }
+        (stranded_senders, stranded_receivers)
+    }
+
+    /// Return the IDs of endpoints currently tombstoned by owner exit.
+    pub(super) fn closed_ids(&self) -> Vec<EndpointId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref()
+                    .filter(|ep| ep.closed)
+                    .map(|_| EndpointId(i as u8))
+            })
+            .collect()
+    }
+
+    /// Return whether any queued send currently carries `ep_id` as an attached
+    /// capability inside its message.
+    pub(super) fn queued_message_holds_endpoint(&self, ep_id: EndpointId) -> bool {
+        self.slots.iter().flatten().any(|ep| {
+            ep.senders.iter().any(
+                |pending| matches!(pending.msg.cap, Some(Capability::Endpoint(id)) if id == ep_id),
+            )
+        })
+    }
+
+    /// Return the current number of slots (for iteration / diagnostics).
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -103,6 +205,13 @@ pub struct Endpoint {
     pub(super) senders: VecDeque<PendingSend>,
     /// Tasks blocked waiting to *receive* a message.
     pub(super) receivers: VecDeque<TaskId>,
+    /// Owner task for user-created endpoints (`Some`), or `None` for
+    /// kernel-created static endpoints.  Used for reclamation on task exit.
+    pub(super) owner: Option<TaskId>,
+    /// Tombstone bit set when the owner exits while foreign caps may still
+    /// reference this [`EndpointId`]. Closed endpoints reject new IPC until
+    /// the slot can be safely reclaimed.
+    pub(super) closed: bool,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
@@ -114,11 +223,19 @@ pub(super) struct PendingSend {
     pub(super) wants_reply: bool,
 }
 
+/// Sender stranded on an endpoint that closed while it was blocked.
+pub(super) struct StrandedSender {
+    pub(super) task: TaskId,
+    pub(super) cap: Option<Capability>,
+}
+
 impl Endpoint {
     const fn new() -> Self {
         Endpoint {
             senders: VecDeque::new(),
             receivers: VecDeque::new(),
+            owner: None,
+            closed: false,
         }
     }
 }
@@ -140,16 +257,13 @@ impl Endpoint {
 /// `label = u64::MAX` on error.  Use this when the server needs the data
 /// payload; use [`recv`] when only the label is needed.
 pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
-    debug_assert!(
-        (ep_id.0 as usize) < MAX_ENDPOINTS,
-        "recv_msg: ep_id {} out of range",
-        ep_id.0
-    );
+    // Bounds check is done by get_mut() below — it returns None for
+    // out-of-range IDs, which is handled by the match.
     let action = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return Message::new(u64::MAX),
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
         };
         if let Some(pending) = ep.senders.pop_front() {
             Some(pending)
@@ -199,11 +313,13 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
             }
             // Deliver the message to the receiver now that all caps are in place.
             scheduler::deliver_message(receiver, pending.msg);
+            transfer_bulk(pending.task, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::MessageDelivered {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
             });
             if !pending.wants_reply {
+                scheduler::complete_send(pending.task);
                 let _ = scheduler::wake_task(pending.task);
             }
         }
@@ -247,6 +363,16 @@ pub fn recv(receiver: TaskId, ep_id: EndpointId) -> u64 {
     recv_msg(receiver, ep_id).label
 }
 
+/// Transfer any pending bulk data from `src` to `dst` task.
+///
+/// Called alongside `deliver_message` to move the sender's bulk payload to
+/// the receiver's slot.  No-op if no bulk data is pending.
+fn transfer_bulk(src: TaskId, dst: TaskId) {
+    if let Some(bulk) = scheduler::take_bulk_data(src) {
+        scheduler::deliver_bulk(dst, bulk);
+    }
+}
+
 /// Send a message to an endpoint.
 ///
 /// If a receiver is already waiting, deliver directly and wake it.
@@ -259,8 +385,8 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return false,
+            Some(e) if !e.closed => e,
+            _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
             Some(receiver)
@@ -277,6 +403,7 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     match matched_receiver {
         Some(receiver) => {
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
@@ -294,7 +421,14 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send();
+            scheduler::block_current_on_send_unless_completed();
+            if let Some(msg) = scheduler::take_message(sender) {
+                debug_assert!(
+                    msg.label == u64::MAX,
+                    "[ipc] send: woke with unexpected pending message"
+                );
+                return false;
+            }
         }
     }
     true
@@ -309,8 +443,8 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return Message::new(u64::MAX),
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
         };
 
         if let Some(receiver) = ep.receivers.pop_front() {
@@ -335,16 +469,21 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                 // Put the receiver back at the front of the queue so it
                 // remains blocked on the endpoint as if this call never arrived.
                 let mut reg = ENDPOINTS.lock();
-                if let Some(ep) = reg.get_mut(ep_id) {
+                if let Some(ep) = reg.get_mut(ep_id)
+                    && !ep.closed
+                {
                     ep.receivers.push_front(receiver);
                 } else {
-                    // Endpoint was destroyed; wake receiver to avoid leaving it blocked.
+                    // Endpoint was closed or destroyed; wake receiver with an
+                    // explicit IPC error so it does not remain stranded.
                     drop(reg);
+                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
                     let _ = scheduler::wake_task(receiver);
                 }
                 return Message::new(u64::MAX);
             }
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(caller, receiver);
             let _ = scheduler::wake_task(receiver);
         }
         None => {
@@ -475,8 +614,8 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return false,
+            Some(e) if !e.closed => e,
+            _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
             Some(receiver)
@@ -496,12 +635,19 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
             if transfer_cap(sender, receiver, &mut msg).is_err() {
                 // Put receiver back — act as if the send never happened.
                 let mut reg = ENDPOINTS.lock();
-                if let Some(ep) = reg.get_mut(ep_id) {
+                if let Some(ep) = reg.get_mut(ep_id)
+                    && !ep.closed
+                {
                     ep.receivers.push_front(receiver);
+                } else {
+                    drop(reg);
+                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
+                    let _ = scheduler::wake_task(receiver);
                 }
                 return false;
             }
             scheduler::deliver_message(receiver, msg);
+            transfer_bulk(sender, receiver);
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SendWake {
                 task_idx: receiver.0 as u32,
                 ep: ep_id.0 as u32,
@@ -513,7 +659,14 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send();
+            scheduler::block_current_on_send_unless_completed();
+            if let Some(msg) = scheduler::take_message(sender) {
+                debug_assert!(
+                    msg.label == u64::MAX,
+                    "[ipc] send_with_cap: woke with unexpected pending message"
+                );
+                return false;
+            }
         }
     }
     true

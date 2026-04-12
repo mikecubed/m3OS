@@ -1,0 +1,11 @@
+[package]
+name = "kbd_server"
+version = "0.52.0"
+edition = "2024"
+
+[[bin]]
+name = "kbd_server"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

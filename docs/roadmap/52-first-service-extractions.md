@@ -1,6 +1,6 @@
 # Phase 52 - First Service Extractions
 
-**Status:** Planned
+**Status:** In Progress
 **Source Ref:** phase-52
 **Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 20 (Userspace Init and Shell) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅
 **Builds on:** Uses the finished IPC path and matured service model to move the first genuinely important kernel-resident services into restartable ring-3 processes
@@ -112,7 +112,7 @@ The extracted services must be declared, supervised, and observable through the 
 
 ## Companion Task List
 
-- Phase 52 task list — defer until implementation planning begins.
+- [Phase 52 task list](./tasks/52-first-service-extractions-tasks.md)
 
 ## How Real OS Implementations Differ
 

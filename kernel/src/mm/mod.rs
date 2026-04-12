@@ -12,11 +12,69 @@ pub mod user_mem;
 pub mod user_space;
 
 use bootloader_api::BootInfo;
-use spin::Once;
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::{Mutex, MutexGuard, Once};
 use x86_64::{
-    VirtAddr,
+    PhysAddr, VirtAddr,
     structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
+
+// ---------------------------------------------------------------------------
+// First-class address space object (Phase 52b, Track A)
+// ---------------------------------------------------------------------------
+
+/// A process's virtual address space descriptor.
+///
+/// Wraps the PML4 physical address with metadata for TLB shootdown
+/// optimization (generation counter) and multi-core tracking.
+pub struct AddressSpace {
+    pml4_phys: PhysAddr,
+    generation: AtomicU64,
+    active_on_cores: AtomicU64,
+    page_table_lock: Mutex<()>,
+}
+
+#[allow(dead_code)]
+impl AddressSpace {
+    pub fn new(pml4_phys: PhysAddr) -> Self {
+        Self {
+            pml4_phys,
+            generation: AtomicU64::new(0),
+            active_on_cores: AtomicU64::new(0),
+            page_table_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn pml4_phys(&self) -> PhysAddr {
+        self.pml4_phys
+    }
+
+    pub fn activate_on_core(&self, core_id: u8) {
+        self.active_on_cores
+            .fetch_or(1u64 << core_id, Ordering::Release);
+    }
+
+    pub fn deactivate_on_core(&self, core_id: u8) {
+        self.active_on_cores
+            .fetch_and(!(1u64 << core_id), Ordering::Release);
+    }
+
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn active_cores(&self) -> u64 {
+        self.active_on_cores.load(Ordering::Acquire)
+    }
+
+    pub fn lock_page_tables(&self) -> MutexGuard<'_, ()> {
+        self.page_table_lock.lock()
+    }
+}
 
 static PHYS_OFFSET: Once<u64> = Once::new();
 

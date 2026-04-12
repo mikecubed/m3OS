@@ -286,6 +286,341 @@ impl EditBuffer {
 }
 
 // ---------------------------------------------------------------------------
+// SmallVec — fixed-capacity byte buffer (no alloc)
+// ---------------------------------------------------------------------------
+
+/// A small fixed-capacity byte buffer for echo output.
+/// Avoids heap allocation in the line discipline hot path.
+pub struct SmallVec {
+    buf: [u8; 8],
+    len: u8,
+}
+
+impl Default for SmallVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SmallVec {
+    /// Create an empty SmallVec.
+    pub const fn new() -> Self {
+        SmallVec {
+            buf: [0u8; 8],
+            len: 0,
+        }
+    }
+
+    /// Push a byte. Silently drops if full.
+    pub fn push(&mut self, b: u8) {
+        if (self.len as usize) < self.buf.len() {
+            self.buf[self.len as usize] = b;
+            self.len += 1;
+        }
+    }
+
+    /// Current contents as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    /// Number of bytes stored.
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Returns true if empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LdiscResult — outcome of processing one byte
+// ---------------------------------------------------------------------------
+
+/// Result of processing one byte through the line discipline.
+pub enum LdiscResult {
+    /// Byte consumed internally (e.g., IGNCR, edit buffer operation).
+    Consumed,
+    /// Signal should be generated (SIGINT=2, SIGTSTP=20, SIGQUIT=3).
+    Signal(u8),
+    /// Byte(s) pushed to stdin buffer. The `echo` field contains bytes to echo.
+    Pushed { echo: SmallVec },
+    /// Line completed (newline/EOF). Data has been pushed. Echo bytes provided.
+    LineComplete { echo: SmallVec },
+}
+
+// ---------------------------------------------------------------------------
+// Escape sequence parser state (canonical mode only)
+// ---------------------------------------------------------------------------
+
+/// Tracks multi-byte VT100 escape sequences so the line discipline can
+/// silently discard them in canonical mode.  In raw/non-canonical mode
+/// the state machine is bypassed entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscState {
+    /// Normal input processing.
+    Normal,
+    /// Received ESC (0x1b); waiting for `[` (CSI) or `O` (SS3).
+    Esc,
+    /// Inside a CSI (`ESC [`) or SS3 (`ESC O`) sequence; consuming
+    /// parameter/intermediate bytes until a final byte (0x40..=0x7E).
+    Csi,
+}
+
+// ---------------------------------------------------------------------------
+// LineDiscipline — unified line editing + termios processing
+// ---------------------------------------------------------------------------
+
+/// Unified line discipline that owns termios state and edit buffer.
+///
+/// All input processing (iflag transforms, signal generation, canonical
+/// editing, echo generation) lives here so it can be unit-tested on the
+/// host without QEMU.
+pub struct LineDiscipline {
+    pub termios: Termios,
+    pub edit_buf: EditBuffer,
+    /// Escape sequence parser state for canonical-mode filtering.
+    esc_state: EscState,
+}
+
+impl Default for LineDiscipline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LineDiscipline {
+    /// Create a new LineDiscipline with default cooked-mode termios.
+    pub const fn new() -> Self {
+        LineDiscipline {
+            termios: Termios::default_cooked(),
+            edit_buf: EditBuffer::new(),
+            esc_state: EscState::Normal,
+        }
+    }
+
+    /// Process one input byte through the line discipline.
+    ///
+    /// `push_fn` is called for each byte or slice that should be delivered
+    /// to the stdin buffer. This callback decouples the discipline from
+    /// kernel internals, making it testable on the host.
+    ///
+    /// Returns an `LdiscResult` indicating what the caller should do
+    /// (deliver signal, echo bytes, etc.).
+    pub fn process_byte(&mut self, byte: u8, push_fn: &mut dyn FnMut(&[u8])) -> LdiscResult {
+        let c_lflag = self.termios.c_lflag;
+        let c_iflag = self.termios.c_iflag;
+        let c_oflag = self.termios.c_oflag;
+        let c_cc = self.termios.c_cc;
+        let canonical = c_lflag & ICANON != 0;
+        let echo_on = c_lflag & ECHO != 0;
+        let isig = c_lflag & ISIG != 0;
+
+        // 1. Apply iflag transforms (ICRNL, INLCR, IGNCR).
+        let byte = if (c_iflag & INLCR != 0) && byte == b'\n' {
+            b'\r'
+        } else {
+            byte
+        };
+        let byte = if (c_iflag & IGNCR != 0) && byte == b'\r' {
+            return LdiscResult::Consumed;
+        } else if (c_iflag & ICRNL != 0) && byte == b'\r' {
+            b'\n'
+        } else {
+            byte
+        };
+
+        // 2. Check ISIG (signal generation from c_cc).
+        if isig {
+            let signal = if byte == c_cc[VINTR] {
+                Some(2u8) // SIGINT
+            } else if byte == c_cc[VSUSP] {
+                Some(20u8) // SIGTSTP
+            } else if byte == c_cc[VQUIT] {
+                Some(3u8) // SIGQUIT
+            } else {
+                None
+            };
+
+            if let Some(sig) = signal {
+                // Clear edit buffer in canonical mode before signal.
+                if canonical {
+                    self.edit_buf.clear();
+                }
+                return LdiscResult::Signal(sig);
+            }
+        }
+
+        // 3. Canonical mode: discard VT100 escape sequences.
+        //
+        // When input arrives byte-by-byte (as from stdin_feeder), multi-byte
+        // escape sequences (e.g. ESC [ A for Up Arrow) must not be buffered
+        // as literal characters — that would corrupt canonical-mode input
+        // for programs like login.  A small state machine silently consumes
+        // complete CSI (ESC [) and SS3 (ESC O) sequences.  In raw mode the
+        // state machine is never entered, preserving pass-through semantics.
+        if canonical {
+            match self.esc_state {
+                EscState::Normal => {
+                    if byte == 0x1b {
+                        self.esc_state = EscState::Esc;
+                        return LdiscResult::Consumed;
+                    }
+                    // Fall through to regular canonical processing.
+                }
+                EscState::Esc => {
+                    if byte == b'[' || byte == b'O' {
+                        self.esc_state = EscState::Csi;
+                        return LdiscResult::Consumed;
+                    }
+                    // Not a recognised escape introducer.  The ESC was already
+                    // consumed; let this byte receive normal processing.
+                    self.esc_state = EscState::Normal;
+                }
+                EscState::Csi => {
+                    // Parameter (0x30..=0x3F) and intermediate (0x20..=0x2F)
+                    // bytes: stay inside the sequence.
+                    if (0x20..=0x3F).contains(&byte) {
+                        return LdiscResult::Consumed;
+                    }
+                    // Final byte (0x40..=0x7E): sequence complete.
+                    if (0x40..=0x7E).contains(&byte) {
+                        self.esc_state = EscState::Normal;
+                        return LdiscResult::Consumed;
+                    }
+                    // Unexpected byte — abort sequence, process normally.
+                    self.esc_state = EscState::Normal;
+                }
+            }
+        }
+
+        // 4. ICANON: canonical mode editing.
+        if canonical {
+            // VERASE (backspace/DEL/0x08)
+            if byte == c_cc[VERASE] || byte == 0x7F || byte == 0x08 {
+                let erased = self.edit_buf.erase_char();
+                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
+                    let mut echo = SmallVec::new();
+                    echo.push(0x08); // BS
+                    echo.push(b' ');
+                    echo.push(0x08); // BS
+                    return LdiscResult::Pushed { echo };
+                }
+                return LdiscResult::Consumed;
+            }
+
+            // VKILL (^U)
+            if byte == c_cc[VKILL] {
+                let n = self.edit_buf.kill_line();
+                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
+                    // Use erase_echo encoding: marker + count, caller
+                    // repeats \x08 \x08 that many times.
+                    return LdiscResult::Pushed {
+                        echo: SmallVec::erase_echo(n),
+                    };
+                }
+                return LdiscResult::Consumed;
+            }
+
+            // VWERASE (^W)
+            if byte == c_cc[VWERASE] {
+                let n = self.edit_buf.word_erase();
+                if n > 0 && echo_on {
+                    return LdiscResult::Pushed {
+                        echo: SmallVec::erase_echo(n),
+                    };
+                }
+                return LdiscResult::Consumed;
+            }
+
+            // VEOF (^D)
+            if byte == c_cc[VEOF] {
+                if self.edit_buf.is_empty() {
+                    // Signal EOF: push empty slice.
+                    push_fn(&[]);
+                    return LdiscResult::LineComplete {
+                        echo: SmallVec::new(),
+                    };
+                } else {
+                    // Flush buffer contents without appending newline.
+                    let data = &self.edit_buf.buf[..self.edit_buf.len];
+                    push_fn(data);
+                    self.edit_buf.clear();
+                    return LdiscResult::LineComplete {
+                        echo: SmallVec::new(),
+                    };
+                }
+            }
+
+            // Newline: deliver line.
+            if byte == b'\n' {
+                if !self.edit_buf.is_empty() {
+                    let data = &self.edit_buf.buf[..self.edit_buf.len];
+                    push_fn(data);
+                    self.edit_buf.clear();
+                }
+                push_fn(b"\n");
+
+                let mut echo = SmallVec::new();
+                if echo_on || (c_lflag & ECHONL != 0) {
+                    if c_oflag & ONLCR != 0 {
+                        echo.push(b'\r');
+                    }
+                    echo.push(b'\n');
+                }
+                return LdiscResult::LineComplete { echo };
+            }
+
+            // Regular character: buffer it.
+            self.edit_buf.push(byte);
+            let mut echo = SmallVec::new();
+            if echo_on {
+                echo.push(byte);
+            }
+            return LdiscResult::Pushed { echo };
+        }
+
+        // 5. Raw mode: push byte directly.
+        push_fn(&[byte]);
+        let mut echo = SmallVec::new();
+        if echo_on {
+            if c_oflag & ONLCR != 0 && byte == b'\n' {
+                echo.push(b'\r');
+                echo.push(b'\n');
+            } else {
+                echo.push(byte);
+            }
+        }
+        LdiscResult::Pushed { echo }
+    }
+}
+
+impl SmallVec {
+    /// Create a SmallVec encoding an erase-echo request.
+    ///
+    /// Byte 0 is a marker (0xFF), byte 1 is the repeat count (capped at 255).
+    /// The caller should emit `\x08 \x08` repeated `count` times.
+    pub fn erase_echo(count: usize) -> Self {
+        let mut sv = SmallVec::new();
+        sv.push(0xFF); // marker: erase-echo
+        sv.push(if count > 255 { 255 } else { count as u8 });
+        sv
+    }
+
+    /// Check if this SmallVec is an erase-echo marker.
+    /// Returns the repeat count if so.
+    pub fn erase_count(&self) -> Option<usize> {
+        if self.len >= 2 && self.buf[0] == 0xFF {
+            Some(self.buf[1] as usize)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -377,5 +712,500 @@ mod tests {
         assert_eq!(eb.erase_char(), None);
         assert_eq!(eb.kill_line(), 0);
         assert_eq!(eb.word_erase(), 0);
+    }
+
+    #[test]
+    fn edit_buffer_drain_partial() {
+        let mut eb = EditBuffer::new();
+        for &b in b"hello world" {
+            eb.push(b);
+        }
+        eb.drain(6); // Remove "hello "
+        assert_eq!(eb.as_slice(), b"world");
+    }
+
+    #[test]
+    fn edit_buffer_drain_all() {
+        let mut eb = EditBuffer::new();
+        for &b in b"abc" {
+            eb.push(b);
+        }
+        eb.drain(3);
+        assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn edit_buffer_drain_more_than_len() {
+        let mut eb = EditBuffer::new();
+        for &b in b"ab" {
+            eb.push(b);
+        }
+        eb.drain(100); // Should clamp to len
+        assert!(eb.is_empty());
+    }
+
+    #[test]
+    fn edit_buffer_drain_zero() {
+        let mut eb = EditBuffer::new();
+        for &b in b"abc" {
+            eb.push(b);
+        }
+        eb.drain(0);
+        assert_eq!(eb.as_slice(), b"abc");
+    }
+
+    #[test]
+    fn edit_buffer_overflow() {
+        let mut eb = EditBuffer::new();
+        // Fill to capacity (4096 bytes)
+        for _ in 0..4096 {
+            assert!(eb.push(b'x'));
+        }
+        // One more should fail
+        assert!(!eb.push(b'y'));
+        assert_eq!(eb.as_slice().len(), 4096);
+    }
+
+    #[test]
+    fn edit_buffer_clear() {
+        let mut eb = EditBuffer::new();
+        for &b in b"test" {
+            eb.push(b);
+        }
+        eb.clear();
+        assert!(eb.is_empty());
+        assert_eq!(eb.as_slice(), b"");
+    }
+
+    // -----------------------------------------------------------------------
+    // LineDiscipline tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: collect all bytes pushed via push_fn.
+    fn collect_pushed(ldisc: &mut LineDiscipline, byte: u8) -> (LdiscResult, Vec<u8>) {
+        let mut pushed = Vec::new();
+        let result = ldisc.process_byte(byte, &mut |data| {
+            pushed.extend_from_slice(data);
+        });
+        (result, pushed)
+    }
+
+    #[test]
+    fn ldisc_icrnl_translates_cr_to_nl() {
+        let mut ld = LineDiscipline::new();
+        // Default termios has ICRNL set and is canonical.
+        assert!(ld.termios.c_iflag & ICRNL != 0);
+        let (result, pushed) = collect_pushed(&mut ld, b'\r');
+        // CR should become NL. In canonical mode, NL triggers line flush.
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        // The pushed data should contain the newline.
+        assert!(pushed.contains(&b'\n'));
+    }
+
+    #[test]
+    fn ldisc_igncr_drops_cr() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_iflag |= IGNCR;
+        let (result, pushed) = collect_pushed(&mut ld, b'\r');
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+    }
+
+    #[test]
+    fn ldisc_inlcr_translates_nl_to_cr() {
+        let mut ld = LineDiscipline::new();
+        // Disable ICANON so we can see raw push behavior.
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_iflag = INLCR; // Only INLCR, no ICRNL.
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![b'\r']);
+    }
+
+    #[test]
+    fn ldisc_isig_ctrl_c_generates_sigint() {
+        let mut ld = LineDiscipline::new();
+        assert!(ld.termios.is_isig());
+        let (result, pushed) = collect_pushed(&mut ld, 0x03); // ^C = VINTR
+        assert!(matches!(result, LdiscResult::Signal(2)));
+        assert!(pushed.is_empty());
+    }
+
+    #[test]
+    fn ldisc_isig_ctrl_z_generates_sigtstp() {
+        let mut ld = LineDiscipline::new();
+        let (result, _) = collect_pushed(&mut ld, 0x1A); // ^Z = VSUSP
+        assert!(matches!(result, LdiscResult::Signal(20)));
+    }
+
+    #[test]
+    fn ldisc_isig_ctrl_backslash_generates_sigquit() {
+        let mut ld = LineDiscipline::new();
+        let (result, _) = collect_pushed(&mut ld, 0x1C); // ^\ = VQUIT
+        assert!(matches!(result, LdiscResult::Signal(3)));
+    }
+
+    #[test]
+    fn ldisc_isig_clears_edit_buf_on_signal() {
+        let mut ld = LineDiscipline::new();
+        // Type some chars first.
+        collect_pushed(&mut ld, b'a');
+        collect_pushed(&mut ld, b'b');
+        assert_eq!(ld.edit_buf.len, 2);
+        // Send ^C — should clear edit buffer.
+        collect_pushed(&mut ld, 0x03);
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_backspace_editing() {
+        let mut ld = LineDiscipline::new();
+        // Type "abc"
+        collect_pushed(&mut ld, b'a');
+        collect_pushed(&mut ld, b'b');
+        collect_pushed(&mut ld, b'c');
+        assert_eq!(ld.edit_buf.as_slice(), b"abc");
+
+        // Backspace (DEL = 0x7F)
+        let (result, _) = collect_pushed(&mut ld, 0x7F);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(ld.edit_buf.as_slice(), b"ab");
+
+        // Check echo contains erase sequence.
+        if let LdiscResult::Pushed { echo } = result {
+            // Should be BS SP BS.
+            assert_eq!(echo.as_slice(), &[0x08, b' ', 0x08]);
+        }
+    }
+
+    #[test]
+    fn ldisc_canonical_kill_line() {
+        let mut ld = LineDiscipline::new();
+        // Default termios does not include ECHOK; set it explicitly.
+        ld.termios.c_lflag |= ECHOK;
+        for &b in b"hello" {
+            collect_pushed(&mut ld, b);
+        }
+        assert_eq!(ld.edit_buf.len, 5);
+
+        // ^U = VKILL
+        let (result, _) = collect_pushed(&mut ld, 0x15);
+        assert!(ld.edit_buf.is_empty());
+        if let LdiscResult::Pushed { echo } = result {
+            // Should be erase-echo marker with count=5.
+            assert_eq!(echo.erase_count(), Some(5));
+        } else {
+            panic!("expected Pushed with erase echo");
+        }
+    }
+
+    #[test]
+    fn ldisc_canonical_word_erase() {
+        let mut ld = LineDiscipline::new();
+        for &b in b"hello world" {
+            collect_pushed(&mut ld, b);
+        }
+
+        // ^W = VWERASE — should erase "world" (5 chars).
+        let (result, _) = collect_pushed(&mut ld, 0x17);
+        assert_eq!(ld.edit_buf.as_slice(), b"hello ");
+        if let LdiscResult::Pushed { echo } = result {
+            assert_eq!(echo.erase_count(), Some(5));
+        } else {
+            panic!("expected Pushed with erase echo");
+        }
+    }
+
+    #[test]
+    fn ldisc_veof_empty_buffer_signals_eof() {
+        let mut ld = LineDiscipline::new();
+        let mut pushed = Vec::new();
+        let result = ld.process_byte(0x04, &mut |data| {
+            pushed.push(data.to_vec());
+        });
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        // push_fn should have been called with empty slice.
+        assert_eq!(pushed.len(), 1);
+        assert!(pushed[0].is_empty());
+    }
+
+    #[test]
+    fn ldisc_veof_nonempty_buffer_flushes() {
+        let mut ld = LineDiscipline::new();
+        collect_pushed(&mut ld, b'a');
+        collect_pushed(&mut ld, b'b');
+
+        let mut pushed = Vec::new();
+        let result = ld.process_byte(0x04, &mut |data| {
+            pushed.extend_from_slice(data);
+        });
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        assert_eq!(pushed, b"ab");
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_newline_delivers_line() {
+        let mut ld = LineDiscipline::new();
+        for &b in b"hi" {
+            collect_pushed(&mut ld, b);
+        }
+
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        // Should push "hi\n".
+        assert_eq!(pushed, b"hi\n");
+        assert!(ld.edit_buf.is_empty());
+
+        // Check echo contains \r\n (ONLCR is set by default).
+        if let LdiscResult::LineComplete { echo } = result {
+            assert_eq!(echo.as_slice(), b"\r\n");
+        }
+    }
+
+    #[test]
+    fn ldisc_canonical_empty_newline_no_eof() {
+        // Pressing Enter on an empty line must NOT trigger EOF (push_fn(&[])).
+        // It should just push "\n".
+        let mut ld = LineDiscipline::new();
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        // Only the newline — no empty-slice push.
+        assert_eq!(pushed, b"\n");
+    }
+
+    #[test]
+    fn ldisc_canonical_regular_char_echo() {
+        let mut ld = LineDiscipline::new();
+        let (result, _) = collect_pushed(&mut ld, b'x');
+        if let LdiscResult::Pushed { echo } = result {
+            assert_eq!(echo.as_slice(), b"x");
+        } else {
+            panic!("expected Pushed");
+        }
+        assert_eq!(ld.edit_buf.as_slice(), b"x");
+    }
+
+    #[test]
+    fn ldisc_canonical_no_echo() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ECHO;
+        let (result, _) = collect_pushed(&mut ld, b'x');
+        if let LdiscResult::Pushed { echo } = result {
+            assert!(echo.is_empty());
+        } else {
+            panic!("expected Pushed");
+        }
+    }
+
+    #[test]
+    fn ldisc_raw_mode_passthrough() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag &= !ISIG;
+        ld.termios.c_lflag &= !ECHO;
+
+        let (result, pushed) = collect_pushed(&mut ld, b'z');
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![b'z']);
+    }
+
+    #[test]
+    fn ldisc_raw_mode_echo_with_onlcr() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag |= ECHO;
+        ld.termios.c_oflag |= ONLCR;
+
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert_eq!(pushed, vec![b'\n']);
+        if let LdiscResult::Pushed { echo } = result {
+            assert_eq!(echo.as_slice(), b"\r\n");
+        } else {
+            panic!("expected Pushed");
+        }
+    }
+
+    #[test]
+    fn ldisc_raw_mode_regular_echo() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag |= ECHO;
+
+        let (result, pushed) = collect_pushed(&mut ld, b'A');
+        assert_eq!(pushed, vec![b'A']);
+        if let LdiscResult::Pushed { echo } = result {
+            assert_eq!(echo.as_slice(), b"A");
+        } else {
+            panic!("expected Pushed");
+        }
+    }
+
+    #[test]
+    fn ldisc_isig_disabled_passes_signal_chars() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ISIG;
+        ld.termios.c_lflag &= !ICANON;
+
+        // ^C should pass through as regular byte.
+        let (result, pushed) = collect_pushed(&mut ld, 0x03);
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(pushed, vec![0x03]);
+    }
+
+    #[test]
+    fn ldisc_echonl_without_echo() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ECHO;
+        ld.termios.c_lflag |= ECHONL;
+
+        let (result, _) = collect_pushed(&mut ld, b'\n');
+        if let LdiscResult::LineComplete { echo } = result {
+            // ECHONL should cause newline echo even when ECHO is off.
+            assert!(!echo.is_empty());
+        } else {
+            panic!("expected LineComplete");
+        }
+    }
+
+    #[test]
+    fn smallvec_basic() {
+        let mut sv = SmallVec::new();
+        assert!(sv.is_empty());
+        sv.push(b'a');
+        sv.push(b'b');
+        assert_eq!(sv.len(), 2);
+        assert_eq!(sv.as_slice(), b"ab");
+    }
+
+    #[test]
+    fn smallvec_overflow_drops() {
+        let mut sv = SmallVec::new();
+        for i in 0..10 {
+            sv.push(i);
+        }
+        // Only first 8 should be stored.
+        assert_eq!(sv.len(), 8);
+    }
+
+    #[test]
+    fn smallvec_erase_echo() {
+        let sv = SmallVec::erase_echo(5);
+        assert_eq!(sv.erase_count(), Some(5));
+    }
+
+    // -----------------------------------------------------------------------
+    // Escape sequence filtering in canonical mode (C-review-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ldisc_canonical_discards_arrow_up() {
+        let mut ld = LineDiscipline::new();
+        // ESC [ A (Up Arrow) — all three bytes should be consumed.
+        for &b in b"\x1b[A" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        // Edit buffer must be empty.
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_csi_tilde_sequences() {
+        let mut ld = LineDiscipline::new();
+        // ESC [ 3 ~ (Delete key)
+        for &b in b"\x1b[3~" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+
+        // ESC [ 5 ~ (Page Up)
+        for &b in b"\x1b[5~" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_ss3_sequence() {
+        let mut ld = LineDiscipline::new();
+        // ESC O P (F1 on some terminals)
+        for &b in b"\x1bOP" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn ldisc_canonical_discards_lone_esc() {
+        let mut ld = LineDiscipline::new();
+        // Lone ESC followed by a regular letter: ESC is consumed,
+        // the letter gets normal processing.
+        let (result, pushed) = collect_pushed(&mut ld, 0x1b);
+        assert!(matches!(result, LdiscResult::Consumed));
+        assert!(pushed.is_empty());
+
+        // Next regular char should be processed normally (buffered).
+        let (result, _) = collect_pushed(&mut ld, b'x');
+        assert!(matches!(result, LdiscResult::Pushed { .. }));
+        assert_eq!(ld.edit_buf.as_slice(), b"x");
+    }
+
+    #[test]
+    fn ldisc_canonical_escape_does_not_corrupt_following_input() {
+        let mut ld = LineDiscipline::new();
+        // Type "ab", then Up Arrow, then "cd\n".
+        for &b in b"ab" {
+            collect_pushed(&mut ld, b);
+        }
+        for &b in b"\x1b[A" {
+            collect_pushed(&mut ld, b);
+        }
+        for &b in b"cd" {
+            collect_pushed(&mut ld, b);
+        }
+        // Edit buffer should contain only "abcd", no escape bytes.
+        assert_eq!(ld.edit_buf.as_slice(), b"abcd");
+
+        // Deliver line.
+        let (result, pushed) = collect_pushed(&mut ld, b'\n');
+        assert!(matches!(result, LdiscResult::LineComplete { .. }));
+        assert_eq!(pushed, b"abcd\n");
+    }
+
+    #[test]
+    fn ldisc_raw_mode_passes_escape_sequences() {
+        let mut ld = LineDiscipline::new();
+        ld.termios.c_lflag &= !ICANON;
+        ld.termios.c_lflag &= !ECHO;
+        ld.termios.c_lflag &= !ISIG;
+
+        // ESC [ A should pass through in raw mode.
+        let mut all_pushed = Vec::new();
+        for &b in b"\x1b[A" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Pushed { .. }));
+            all_pushed.extend(pushed);
+        }
+        assert_eq!(all_pushed, b"\x1b[A");
+    }
+
+    #[test]
+    fn ldisc_canonical_multiple_escape_sequences() {
+        let mut ld = LineDiscipline::new();
+        // Two consecutive arrow sequences should both be discarded.
+        for &b in b"\x1b[A\x1b[B" {
+            let (result, pushed) = collect_pushed(&mut ld, b);
+            assert!(matches!(result, LdiscResult::Consumed));
+            assert!(pushed.is_empty());
+        }
+        assert!(ld.edit_buf.is_empty());
     }
 }

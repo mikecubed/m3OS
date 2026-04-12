@@ -217,9 +217,22 @@ for `FILE_READ` in `docs/08-storage-and-vfs.md`.
 
 ---
 
+## Phase 52 Update: Framebuffer Rendering Extraction (In Progress)
+
+Phase 52 (First Service Extractions) adds a ring-3 `console_server` binary
+that maps the framebuffer and registers as the `"console"` IPC service.
+However, the userspace IPC ABI does not yet support delivering message
+payloads, so `CONSOLE_WRITE` handling is currently stubbed.  The kernel
+still performs all actual text rendering via its `console_server_task`
+during this transition.  Once message payload delivery is wired up, the
+kernel task will be removed and all rendering will move to userspace.  See
+[docs/52-first-service-extractions.md](./52-first-service-extractions.md) for
+the full extraction design.
+
 ## See Also
 
 - `docs/07-core-servers.md` — console_server, kbd_server (Phase 7 foundation)
 - `docs/08-storage-and-vfs.md` — VFS and fat_server (Phase 8 foundation)
+- `docs/52-first-service-extractions.md` — Phase 52 console and keyboard extraction
 - `docs/roadmap/09-framebuffer-and-shell.md` — phase milestone and acceptance criteria
 - `docs/roadmap/tasks/09-framebuffer-and-shell-tasks.md` — per-task breakdown

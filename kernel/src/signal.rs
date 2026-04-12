@@ -24,6 +24,8 @@
 //! [low addresses]
 //! ```
 
+use crate::mm::user_mem::{UserSliceRo, UserSliceWo};
+
 /// Saved user-space register state, read from the kernel syscall stack.
 ///
 /// **Must be `#[repr(C)]`** — the `restore_and_enter_userspace` asm stub
@@ -206,13 +208,19 @@ pub fn setup_signal_frame(
 
     // Zero-fill the frame, then write fields.
     let frame_buf = [0u8; SIGFRAME_SIZE];
-    if crate::mm::user_mem::copy_to_user(frame_rsp, &frame_buf).is_err() {
+    if UserSliceWo::new(frame_rsp, frame_buf.len())
+        .and_then(|s| s.copy_from_kernel(&frame_buf))
+        .is_err()
+    {
         return None;
     }
 
     // Helper: write a u64 at frame_rsp + offset.
     let write_u64 = |off: usize, val: u64| -> bool {
-        crate::mm::user_mem::copy_to_user(frame_rsp + off as u64, &val.to_ne_bytes()).is_ok()
+        let bytes = val.to_ne_bytes();
+        UserSliceWo::new(frame_rsp + off as u64, bytes.len())
+            .and_then(|s| s.copy_from_kernel(&bytes))
+            .is_ok()
     };
 
     // pretcode — return address for the handler, points to __restore_rt.
@@ -288,7 +296,9 @@ pub fn restore_sigframe(user_rsp: u64) -> Option<(SavedUserRegs, u64)> {
     // Helper: read a u64 from frame_rsp + offset.
     let read_u64 = |off: usize| -> Option<u64> {
         let mut buf = [0u8; 8];
-        crate::mm::user_mem::copy_from_user(&mut buf, frame_rsp + off as u64).ok()?;
+        UserSliceRo::new(frame_rsp + off as u64, buf.len())
+            .and_then(|s| s.copy_to_kernel(&mut buf))
+            .ok()?;
         Some(u64::from_ne_bytes(buf))
     };
 
@@ -329,5 +339,7 @@ pub fn write_sigframe_uc_stack(frame_rsp: u64, ss_sp: u64, ss_flags: u32, ss_siz
     buf[8..12].copy_from_slice(&ss_flags.to_ne_bytes());
     // bytes 12..16 = padding (zero)
     buf[16..24].copy_from_slice(&ss_size.to_ne_bytes());
-    crate::mm::user_mem::copy_to_user(frame_rsp + OFF_UC_STACK as u64, &buf).is_ok()
+    UserSliceWo::new(frame_rsp + OFF_UC_STACK as u64, buf.len())
+        .and_then(|s| s.copy_from_kernel(&buf))
+        .is_ok()
 }

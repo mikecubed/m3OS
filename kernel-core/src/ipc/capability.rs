@@ -1,3 +1,6 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::types::{EndpointId, NotifId, TaskId};
 
 /// An opaque integer index into a [`CapabilityTable`].
@@ -31,27 +34,36 @@ pub enum CapError {
     InvalidHandle,
     /// The slot holds a capability of a different type than requested.
     WrongType,
-    /// All 64 slots are occupied; cannot insert a new capability.
+    /// No free slot and growth failed or is not applicable.
     TableFull,
 }
 
-/// Fixed-size per-process capability table (64 slots).
+/// Initial number of capability slots per process.
+const INITIAL_CAP_SLOTS: usize = 64;
+
+/// Number of slots added each time the table grows.
+const CAP_GROW_INCREMENT: usize = 64;
+
+/// Dynamically growable per-process capability table.
+///
+/// Starts with [`INITIAL_CAP_SLOTS`] slots and grows by
+/// [`CAP_GROW_INCREMENT`] when all existing slots are occupied.
 pub struct CapabilityTable {
-    slots: [Option<Capability>; Self::SIZE],
+    slots: Vec<Option<Capability>>,
 }
 
 impl CapabilityTable {
-    /// Maximum number of capabilities a single process may hold.
-    pub const SIZE: usize = 64;
+    /// Initial capacity (kept as a public constant for test compatibility).
+    pub const INITIAL_SIZE: usize = INITIAL_CAP_SLOTS;
 
-    /// Create an empty capability table.
-    pub const fn new() -> Self {
+    /// Create an empty capability table with the default initial capacity.
+    pub fn new() -> Self {
         CapabilityTable {
-            slots: [None; Self::SIZE],
+            slots: vec![None; INITIAL_CAP_SLOTS],
         }
     }
 
-    /// Insert a capability and return its handle.
+    /// Insert a capability into the first free slot, growing if necessary.
     pub fn insert(&mut self, cap: Capability) -> Result<CapHandle, CapError> {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
@@ -59,15 +71,22 @@ impl CapabilityTable {
                 return Ok(i as CapHandle);
             }
         }
-        Err(CapError::TableFull)
+        // All slots occupied — grow the table.
+        let old_len = self.slots.len();
+        self.slots.resize(old_len + CAP_GROW_INCREMENT, None);
+        self.slots[old_len] = Some(cap);
+        Ok(old_len as CapHandle)
     }
 
-    /// Insert a capability at a specific slot (used during task initialisation).
+    /// Insert a capability at a specific slot, growing if necessary.
     pub fn insert_at(&mut self, handle: CapHandle, cap: Capability) -> Result<(), CapError> {
-        let slot = self
-            .slots
-            .get_mut(handle as usize)
-            .ok_or(CapError::InvalidHandle)?;
+        let idx = handle as usize;
+        // Grow the table if the requested handle is beyond the current length.
+        if idx >= self.slots.len() {
+            let new_len = idx + 1;
+            self.slots.resize(new_len, None);
+        }
+        let slot = &mut self.slots[idx];
         if slot.is_some() {
             return Err(CapError::TableFull);
         }
@@ -115,6 +134,43 @@ impl CapabilityTable {
 
         Ok(dest_handle)
     }
+
+    /// Return whether the table currently holds a capability for `ep_id`.
+    pub fn contains_endpoint(&self, ep_id: EndpointId) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|cap| matches!(cap, Capability::Endpoint(id) if *id == ep_id))
+    }
+
+    /// Return the callers currently referenced by reply capabilities.
+    pub fn reply_targets(&self) -> Vec<TaskId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|cap| match cap {
+                Capability::Reply(task) => Some(*task),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the notification IDs currently held in the table.
+    pub fn notification_ids(&self) -> Vec<NotifId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|cap| match cap {
+                Capability::Notification(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the current number of slots (for diagnostic / test use).
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 impl Default for CapabilityTable {
@@ -145,10 +201,41 @@ mod tests {
     }
 
     #[test]
+    fn contains_endpoint_detects_only_matching_endpoints() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Notification(NotifId(3))).unwrap();
+        table.insert(Capability::Endpoint(EndpointId(7))).unwrap();
+        assert!(table.contains_endpoint(EndpointId(7)));
+        assert!(!table.contains_endpoint(EndpointId(8)));
+    }
+
+    #[test]
+    fn reply_targets_collects_only_reply_caps() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Reply(TaskId(11))).unwrap();
+        table.insert(Capability::Endpoint(EndpointId(3))).unwrap();
+        table.insert(Capability::Reply(TaskId(29))).unwrap();
+        assert_eq!(table.reply_targets(), vec![TaskId(11), TaskId(29)]);
+    }
+
+    #[test]
+    fn notification_ids_collect_only_notification_caps() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Notification(NotifId(2))).unwrap();
+        table.insert(Capability::Reply(TaskId(11))).unwrap();
+        table.insert(Capability::Notification(NotifId(7))).unwrap();
+        assert_eq!(table.notification_ids(), vec![NotifId(2), NotifId(7)]);
+    }
+
+    #[test]
     fn invalid_handle() {
         let table = CapabilityTable::new();
         assert_eq!(table.get(0), Err(CapError::InvalidHandle));
-        assert_eq!(table.get(100), Err(CapError::InvalidHandle));
+        // Beyond initial capacity — still returns InvalidHandle (not panic).
+        assert_eq!(
+            table.get(INITIAL_CAP_SLOTS as CapHandle + 100),
+            Err(CapError::InvalidHandle)
+        );
     }
 
     #[test]
@@ -160,17 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn table_full() {
+    fn table_grows_beyond_initial_capacity() {
         let mut table = CapabilityTable::new();
-        for i in 0..CapabilityTable::SIZE {
+        // Fill all initial slots.
+        for i in 0..INITIAL_CAP_SLOTS {
             table
                 .insert(Capability::Endpoint(EndpointId(i as u8)))
                 .unwrap();
         }
-        assert_eq!(
-            table.insert(Capability::Endpoint(EndpointId(99))),
-            Err(CapError::TableFull)
-        );
+        // One more insert should succeed by growing the table.
+        let handle = table.insert(Capability::Endpoint(EndpointId(99))).unwrap();
+        assert_eq!(handle, INITIAL_CAP_SLOTS as CapHandle);
+        assert_eq!(table.get(handle), Ok(Capability::Endpoint(EndpointId(99))));
+        // The table should have grown.
+        assert!(table.capacity() > INITIAL_CAP_SLOTS);
     }
 
     #[test]
@@ -184,12 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_at_out_of_range() {
+    fn insert_at_beyond_initial_capacity_grows() {
         let mut table = CapabilityTable::new();
-        assert_eq!(
-            table.insert_at(100, Capability::Endpoint(EndpointId(0))),
-            Err(CapError::InvalidHandle)
-        );
+        // Inserting at handle 100 (beyond initial 64 slots) should grow.
+        let cap = Capability::Endpoint(EndpointId(0));
+        table.insert_at(100, cap).unwrap();
+        assert_eq!(table.get(100), Ok(cap));
+        assert!(table.capacity() >= 101);
     }
 
     #[test]
@@ -207,7 +298,7 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let table = CapabilityTable::default();
-        for i in 0..CapabilityTable::SIZE {
+        for i in 0..CapabilityTable::INITIAL_SIZE {
             assert_eq!(table.get(i as CapHandle), Err(CapError::InvalidHandle));
         }
     }
@@ -230,12 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn grant_to_full_table_returns_table_full() {
+    fn grant_to_full_table_grows_destination() {
         let mut src = CapabilityTable::new();
         let mut dst = CapabilityTable::new();
 
-        // Fill the destination table.
-        for i in 0..CapabilityTable::SIZE {
+        // Fill all initial slots of the destination table.
+        for i in 0..INITIAL_CAP_SLOTS {
             dst.insert(Capability::Notification(NotifId(i as u8)))
                 .unwrap();
         }
@@ -243,10 +334,13 @@ mod tests {
         let cap = Capability::Endpoint(EndpointId(1));
         let src_handle = src.insert(cap).unwrap();
 
-        // Grant must fail with TableFull.
-        assert_eq!(src.grant(src_handle, &mut dst), Err(CapError::TableFull));
-        // Source must still have the capability (no side effects).
-        assert_eq!(src.get(src_handle), Ok(cap));
+        // Grant now succeeds because the destination table grows.
+        let dst_handle = src.grant(src_handle, &mut dst).unwrap();
+        assert_eq!(dst.get(dst_handle), Ok(cap));
+        // Source slot is cleared after grant.
+        assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
+        // Destination grew beyond its initial capacity.
+        assert!(dst.capacity() > INITIAL_CAP_SLOTS);
     }
 
     #[test]
@@ -307,6 +401,34 @@ mod tests {
         assert_eq!(src.get(src_handle), Err(CapError::InvalidHandle));
         // Destination has the exact same capability.
         assert_eq!(dst.get(dst_handle), Ok(cap));
+    }
+
+    #[test]
+    fn insert_128_capabilities_succeeds() {
+        let mut table = CapabilityTable::new();
+        for i in 0..128u32 {
+            let cap = Capability::Endpoint(EndpointId((i % 256) as u8));
+            let handle = table.insert(cap).unwrap();
+            assert_eq!(handle, i);
+        }
+        assert!(table.capacity() >= 128);
+        // Verify a cap in the grown region.
+        assert_eq!(table.get(100), Ok(Capability::Endpoint(EndpointId(100))));
+    }
+
+    #[test]
+    fn freed_slots_are_reused() {
+        let mut table = CapabilityTable::new();
+        let cap = Capability::Endpoint(EndpointId(1));
+        let h0 = table.insert(cap).unwrap();
+        let h1 = table.insert(cap).unwrap();
+        // Free slot 0.
+        table.remove(h0).unwrap();
+        // Next insert should reuse slot 0.
+        let h2 = table.insert(cap).unwrap();
+        assert_eq!(h2, h0);
+        // h1 is still valid.
+        assert_eq!(table.get(h1), Ok(cap));
     }
 
     #[test]

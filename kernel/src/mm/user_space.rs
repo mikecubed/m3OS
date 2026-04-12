@@ -86,13 +86,24 @@ pub unsafe fn map_user_frames(
             "map_user_frames: virt_base must be 4 KiB-aligned"
         );
         let mut alloc = GlobalFrameAlloc;
+        let mut mapped_pages = alloc::vec::Vec::new();
         for (i, &frame) in frames.iter().enumerate() {
             let vaddr = VirtAddr::new(virt_base + i as u64 * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
-            mapper
-                .map_to(page, frame, flags, &mut alloc)
-                .map_err(|_| "map_to failed")?
-                .flush();
+            match mapper.map_to(page, frame, flags, &mut alloc) {
+                Ok(flush) => {
+                    flush.flush();
+                    mapped_pages.push(page);
+                }
+                Err(_) => {
+                    while let Some(mapped_page) = mapped_pages.pop() {
+                        if let Ok((_frame, flush)) = mapper.unmap(mapped_page) {
+                            flush.flush();
+                        }
+                    }
+                    return Err("map_to failed");
+                }
+            }
         }
         Ok(())
     }

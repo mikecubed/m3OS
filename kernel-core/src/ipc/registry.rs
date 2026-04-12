@@ -1,7 +1,13 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::types::EndpointId;
 
-/// Maximum number of services that can be registered simultaneously.
-pub const MAX_SERVICES: usize = 16;
+/// Initial number of service registry slots.
+const INITIAL_SERVICES: usize = 16;
+
+/// Number of slots added each time the registry grows.
+const REGISTRY_GROW_INCREMENT: usize = 16;
 
 /// Maximum byte length of a service name.
 pub const MAX_NAME_LEN: usize = 32;
@@ -9,7 +15,7 @@ pub const MAX_NAME_LEN: usize = 32;
 /// Errors returned by registry operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryError {
-    /// The registry already holds [`MAX_SERVICES`] entries.
+    /// No free slot could be found (should not normally happen with growable pool).
     Full,
     /// The supplied name exceeds [`MAX_NAME_LEN`] bytes.
     NameTooLong,
@@ -35,19 +41,25 @@ impl Entry {
     }
 }
 
-/// Service registry — static name-to-endpoint mapping with ownership tracking.
+/// Dynamically growable service registry — name-to-endpoint mapping with
+/// ownership tracking.
 pub struct Registry {
-    entries: [Option<Entry>; MAX_SERVICES],
+    entries: Vec<Option<Entry>>,
     count: usize,
 }
 
 impl Registry {
-    /// Create a new empty registry.
-    pub const fn new() -> Self {
+    /// Create a new empty registry with the default initial capacity.
+    pub fn new() -> Self {
         Registry {
-            entries: [None; MAX_SERVICES],
+            entries: vec![None; INITIAL_SERVICES],
             count: 0,
         }
+    }
+
+    /// Return the current slot capacity (for diagnostics / tests).
+    pub fn capacity(&self) -> usize {
+        self.entries.len()
     }
 
     /// Register a named service endpoint (kernel-owned, no specific task owner).
@@ -64,6 +76,8 @@ impl Registry {
     /// different task, returns [`RegistryError::AlreadyExists`]. If the same
     /// name exists with the same owner (re-registration), the endpoint is
     /// updated in place.
+    ///
+    /// Grows the internal slot array if no free slot is available.
     pub fn register_with_owner(
         &mut self,
         name: &str,
@@ -83,14 +97,20 @@ impl Registry {
                     slot.ep_id = ep_id;
                     return Ok(());
                 }
+                if slot.owner == 0 && owner != 0 {
+                    // Userspace takeover of a kernel-owned placeholder entry.
+                    // This enables the boot→userspace service handoff: the
+                    // kernel registers an early-boot endpoint (owner=0) that a
+                    // ring-3 service can replace once it starts.
+                    slot.ep_id = ep_id;
+                    slot.owner = owner;
+                    return Ok(());
+                }
                 return Err(RegistryError::AlreadyExists);
             }
         }
 
-        if self.count >= MAX_SERVICES {
-            return Err(RegistryError::Full);
-        }
-
+        // Find a free slot.
         for slot in self.entries.iter_mut() {
             if slot.is_none() {
                 let mut entry_name = [0u8; MAX_NAME_LEN];
@@ -106,7 +126,19 @@ impl Registry {
             }
         }
 
-        Err(RegistryError::Full)
+        // No free slot — grow the pool and use the first new slot.
+        let old_len = self.entries.len();
+        self.entries.resize(old_len + REGISTRY_GROW_INCREMENT, None);
+        let mut entry_name = [0u8; MAX_NAME_LEN];
+        entry_name[..name_bytes.len()].copy_from_slice(name_bytes);
+        self.entries[old_len] = Some(Entry {
+            name: entry_name,
+            name_len: name_bytes.len(),
+            ep_id,
+            owner,
+        });
+        self.count += 1;
+        Ok(())
     }
 
     /// Replace a dead task's service entry with a new registration.
@@ -135,6 +167,21 @@ impl Registry {
         }
 
         Err(RegistryError::NotFound)
+    }
+
+    /// Remove all registry entries owned by a specific task.
+    ///
+    /// Called during task exit cleanup so that a restarted service can
+    /// re-register the same name without hitting [`RegistryError::AlreadyExists`].
+    pub fn remove_by_owner(&mut self, owner: u64) {
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot
+                && entry.owner == owner
+            {
+                *slot = None;
+                self.count -= 1;
+            }
+        }
     }
 
     /// Look up a named service endpoint.
@@ -198,21 +245,51 @@ mod tests {
     }
 
     #[test]
-    fn registry_full() {
+    fn registry_grows_beyond_initial_capacity() {
         let mut reg = Registry::new();
-        for i in 0..MAX_SERVICES {
+        let initial_cap = reg.capacity();
+        // Fill all initial slots.
+        for i in 0..initial_cap {
             let name = alloc::format!("svc{}", i);
             reg.register(&name, EndpointId(i as u8)).unwrap();
         }
-        assert_eq!(
-            reg.register("overflow", EndpointId(99)),
-            Err(RegistryError::Full)
-        );
+        // One more registration should succeed by growing.
+        reg.register("overflow", EndpointId(99)).unwrap();
+        assert_eq!(reg.lookup("overflow"), Some(EndpointId(99)));
+        assert!(reg.capacity() > initial_cap);
     }
 
     #[test]
-    fn max_services_is_at_least_16() {
-        assert!(MAX_SERVICES >= 16);
+    fn initial_capacity_is_at_least_16() {
+        let reg = Registry::new();
+        assert!(reg.capacity() >= 16);
+    }
+
+    #[test]
+    fn register_32_services_succeeds() {
+        let mut reg = Registry::new();
+        for i in 0..32 {
+            let name = alloc::format!("svc{}", i);
+            reg.register(&name, EndpointId(i as u8)).unwrap();
+        }
+        // All 32 should be findable.
+        for i in 0..32 {
+            let name = alloc::format!("svc{}", i);
+            assert_eq!(reg.lookup(&name), Some(EndpointId(i as u8)));
+        }
+    }
+
+    #[test]
+    fn freed_registry_slots_are_reused() {
+        let mut reg = Registry::new();
+        // Register and then unregister by replacing with a new owner (simulates free).
+        reg.register_with_owner("tmp", EndpointId(1), 10).unwrap();
+        let cap_before = reg.capacity();
+        // Replace (acts like free + re-register).
+        reg.replace_service("tmp", EndpointId(2), 10, 20).unwrap();
+        assert_eq!(reg.lookup("tmp"), Some(EndpointId(2)));
+        // Capacity should not have grown.
+        assert_eq!(reg.capacity(), cap_before);
     }
 
     #[test]
@@ -322,5 +399,69 @@ mod tests {
 
         // Original service unchanged.
         assert_eq!(reg.lookup("alive"), Some(EndpointId(1)));
+    }
+
+    // --- Phase 52: remove_by_owner tests ---
+
+    #[test]
+    fn remove_by_owner_clears_owned_entries() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc1", EndpointId(1), 10).unwrap();
+        reg.register_with_owner("svc2", EndpointId(2), 10).unwrap();
+        reg.register_with_owner("svc3", EndpointId(3), 20).unwrap();
+
+        reg.remove_by_owner(10);
+
+        assert_eq!(reg.lookup("svc1"), None);
+        assert_eq!(reg.lookup("svc2"), None);
+        assert_eq!(reg.lookup("svc3"), Some(EndpointId(3)));
+    }
+
+    #[test]
+    fn remove_by_owner_allows_reregistration() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("console", EndpointId(1), 10)
+            .unwrap();
+
+        // Simulate task 10 dying.
+        reg.remove_by_owner(10);
+
+        // New task 20 can now register the same name.
+        reg.register_with_owner("console", EndpointId(2), 20)
+            .unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn remove_by_owner_no_op_for_unknown_owner() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+        reg.remove_by_owner(999);
+        assert_eq!(reg.lookup("svc"), Some(EndpointId(1)));
+    }
+
+    #[test]
+    fn userspace_takeover_of_kernel_entry() {
+        let mut reg = Registry::new();
+        // Kernel registers a placeholder (owner=0).
+        reg.register("console", EndpointId(1)).unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(1)));
+
+        // Userspace task 42 takes over the kernel entry.
+        reg.register_with_owner("console", EndpointId(2), 42)
+            .unwrap();
+        assert_eq!(reg.lookup("console"), Some(EndpointId(2)));
+    }
+
+    #[test]
+    fn userspace_cannot_takeover_other_userspace_entry() {
+        let mut reg = Registry::new();
+        reg.register_with_owner("svc", EndpointId(1), 10).unwrap();
+
+        // Task 20 cannot take over task 10's entry.
+        assert_eq!(
+            reg.register_with_owner("svc", EndpointId(2), 20),
+            Err(RegistryError::AlreadyExists)
+        );
     }
 }

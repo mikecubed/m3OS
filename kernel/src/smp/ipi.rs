@@ -79,3 +79,16 @@ pub fn send_ipi_all_excluding_self(vector: u8) {
 pub fn send_reschedule_ipi(target_apic_id: u8) {
     send_ipi(target_apic_id, IPI_RESCHEDULE);
 }
+
+/// Send an IPI with the given vector to a specific logical core ID.
+///
+/// Looks up the core's APIC ID from the per-core data table and delegates
+/// to `send_ipi`. Returns without sending if the core ID is invalid or
+/// the core is not yet online.
+pub fn send_ipi_to_core(core_id: u8, vector: u8) {
+    if let Some(data) = super::get_core_data(core_id)
+        && data.is_online.load(core::sync::atomic::Ordering::Acquire)
+    {
+        send_ipi(data.apic_id, vector);
+    }
+}

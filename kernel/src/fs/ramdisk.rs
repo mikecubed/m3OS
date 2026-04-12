@@ -52,107 +52,127 @@ impl RamdiskNode {
 // File payloads — each include_bytes! appears exactly once.
 // ---------------------------------------------------------------------------
 
-static HELLO_TXT: &[u8] = include_bytes!("../../initrd/hello.txt");
-static README_TXT: &[u8] = include_bytes!("../../initrd/readme.txt");
-static EXIT0_ELF: &[u8] = include_bytes!("../../initrd/exit0");
-static FORK_TEST_ELF: &[u8] = include_bytes!("../../initrd/fork-test");
-static ECHO_ARGS_ELF: &[u8] = include_bytes!("../../initrd/echo-args");
-static HELLO_ELF: &[u8] = include_bytes!("../../initrd/hello");
-static TMPFS_TEST_ELF: &[u8] = include_bytes!("../../initrd/tmpfs-test");
-static ECHO_ELF: &[u8] = include_bytes!("../../initrd/echo");
-static TRUE_ELF: &[u8] = include_bytes!("../../initrd/true");
-static FALSE_ELF: &[u8] = include_bytes!("../../initrd/false");
-static CAT_ELF: &[u8] = include_bytes!("../../initrd/cat");
-static LS_ELF: &[u8] = include_bytes!("../../initrd/ls");
-static PWD_ELF: &[u8] = include_bytes!("../../initrd/pwd");
-static MKDIR_ELF: &[u8] = include_bytes!("../../initrd/mkdir");
-static RMDIR_ELF: &[u8] = include_bytes!("../../initrd/rmdir");
-static RM_ELF: &[u8] = include_bytes!("../../initrd/rm");
-static CP_ELF: &[u8] = include_bytes!("../../initrd/cp");
-static MV_ELF: &[u8] = include_bytes!("../../initrd/mv");
-static ENV_ELF: &[u8] = include_bytes!("../../initrd/env");
-static SLEEP_ELF: &[u8] = include_bytes!("../../initrd/sleep");
-static GREP_ELF: &[u8] = include_bytes!("../../initrd/grep");
-static SIGNAL_TEST_ELF: &[u8] = include_bytes!("../../initrd/signal-test");
-static PROMPT_ELF: &[u8] = include_bytes!("../../initrd/PROMPT");
-static STDIN_TEST_ELF: &[u8] = include_bytes!("../../initrd/stdin-test");
-static INIT_ELF: &[u8] = include_bytes!("../../initrd/init");
-static SH0_ELF: &[u8] = include_bytes!("../../initrd/sh0");
-static ION_ELF: &[u8] = include_bytes!("../../initrd/ion");
-static EDIT_ELF: &[u8] = include_bytes!("../../initrd/edit");
-static LOGIN_ELF: &[u8] = include_bytes!("../../initrd/login");
-static SU_ELF: &[u8] = include_bytes!("../../initrd/su");
-static PASSWD_ELF: &[u8] = include_bytes!("../../initrd/passwd");
-static ADDUSER_ELF: &[u8] = include_bytes!("../../initrd/adduser");
-static ID_ELF: &[u8] = include_bytes!("../../initrd/id");
-static WHOAMI_ELF: &[u8] = include_bytes!("../../initrd/whoami");
-static TELNETD_ELF: &[u8] = include_bytes!("../../initrd/telnetd");
+macro_rules! static_initrd_asset {
+    ($path:literal) => {
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/initrd/", $path))
+    };
+}
+
+macro_rules! generated_initrd_asset {
+    ($path:literal) => {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/generated-initrd/",
+            $path
+        ))
+    };
+}
+
+static HELLO_TXT: &[u8] = static_initrd_asset!("hello.txt");
+static README_TXT: &[u8] = static_initrd_asset!("readme.txt");
+static EXIT0_ELF: &[u8] = generated_initrd_asset!("exit0");
+static FORK_TEST_ELF: &[u8] = generated_initrd_asset!("fork-test");
+static ECHO_ARGS_ELF: &[u8] = generated_initrd_asset!("echo-args");
+static HELLO_ELF: &[u8] = generated_initrd_asset!("hello");
+static TMPFS_TEST_ELF: &[u8] = generated_initrd_asset!("tmpfs-test");
+static ECHO_ELF: &[u8] = generated_initrd_asset!("echo");
+static TRUE_ELF: &[u8] = generated_initrd_asset!("true");
+static FALSE_ELF: &[u8] = generated_initrd_asset!("false");
+static CAT_ELF: &[u8] = generated_initrd_asset!("cat");
+static LS_ELF: &[u8] = generated_initrd_asset!("ls");
+static PWD_ELF: &[u8] = generated_initrd_asset!("pwd");
+static MKDIR_ELF: &[u8] = generated_initrd_asset!("mkdir");
+static RMDIR_ELF: &[u8] = generated_initrd_asset!("rmdir");
+static RM_ELF: &[u8] = generated_initrd_asset!("rm");
+static CP_ELF: &[u8] = generated_initrd_asset!("cp");
+static MV_ELF: &[u8] = generated_initrd_asset!("mv");
+static ENV_ELF: &[u8] = generated_initrd_asset!("env");
+static SLEEP_ELF: &[u8] = generated_initrd_asset!("sleep");
+static GREP_ELF: &[u8] = generated_initrd_asset!("grep");
+static SIGNAL_TEST_ELF: &[u8] = generated_initrd_asset!("signal-test");
+static PROMPT_ELF: &[u8] = generated_initrd_asset!("PROMPT");
+static STDIN_TEST_ELF: &[u8] = generated_initrd_asset!("stdin-test");
+static INIT_ELF: &[u8] = generated_initrd_asset!("init");
+static SH0_ELF: &[u8] = generated_initrd_asset!("sh0");
+static ION_ELF: &[u8] = generated_initrd_asset!("ion");
+static EDIT_ELF: &[u8] = generated_initrd_asset!("edit");
+static LOGIN_ELF: &[u8] = generated_initrd_asset!("login");
+static SU_ELF: &[u8] = generated_initrd_asset!("su");
+static PASSWD_ELF: &[u8] = generated_initrd_asset!("passwd");
+static ADDUSER_ELF: &[u8] = generated_initrd_asset!("adduser");
+static ID_ELF: &[u8] = generated_initrd_asset!("id");
+static WHOAMI_ELF: &[u8] = generated_initrd_asset!("whoami");
+static TELNETD_ELF: &[u8] = generated_initrd_asset!("telnetd");
 // Phase 43: SSH server
-static SSHD_ELF: &[u8] = include_bytes!("../../initrd/sshd");
+static SSHD_ELF: &[u8] = generated_initrd_asset!("sshd");
 // Phase 32: build tools and utilities
-static TOUCH_ELF: &[u8] = include_bytes!("../../initrd/touch");
-static STAT_ELF: &[u8] = include_bytes!("../../initrd/stat");
-static LN_ELF: &[u8] = include_bytes!("../../initrd/ln");
-static READLINK_ELF: &[u8] = include_bytes!("../../initrd/readlink");
-static WC_ELF: &[u8] = include_bytes!("../../initrd/wc");
-static AR_ELF: &[u8] = include_bytes!("../../initrd/ar");
-static INSTALL_ELF: &[u8] = include_bytes!("../../initrd/install");
-static MEMINFO_ELF: &[u8] = include_bytes!("../../initrd/meminfo");
-static MMAP_LEAK_TEST_ELF: &[u8] = include_bytes!("../../initrd/mmap-leak-test");
-static MAKE_ELF: &[u8] = include_bytes!("../../initrd/make");
-static HEAD_ELF: &[u8] = include_bytes!("../../initrd/head");
-static TAIL_ELF: &[u8] = include_bytes!("../../initrd/tail");
-static TEE_ELF: &[u8] = include_bytes!("../../initrd/tee");
-static CHMOD_ELF: &[u8] = include_bytes!("../../initrd/chmod");
-static CHOWN_ELF: &[u8] = include_bytes!("../../initrd/chown");
-static SORT_ELF: &[u8] = include_bytes!("../../initrd/sort");
-static UNIQ_ELF: &[u8] = include_bytes!("../../initrd/uniq");
-static CUT_ELF: &[u8] = include_bytes!("../../initrd/cut");
-static TR_ELF: &[u8] = include_bytes!("../../initrd/tr");
-static SED_ELF: &[u8] = include_bytes!("../../initrd/sed");
-static FILE_ELF: &[u8] = include_bytes!("../../initrd/file");
-static HEXDUMP_ELF: &[u8] = include_bytes!("../../initrd/hexdump");
-static DU_ELF: &[u8] = include_bytes!("../../initrd/du");
-static DF_ELF: &[u8] = include_bytes!("../../initrd/df");
-static FIND_ELF: &[u8] = include_bytes!("../../initrd/find");
-static XARGS_ELF: &[u8] = include_bytes!("../../initrd/xargs");
-static FREE_ELF: &[u8] = include_bytes!("../../initrd/free");
-static DMESG_ELF: &[u8] = include_bytes!("../../initrd/dmesg");
-static MOUNT_ELF: &[u8] = include_bytes!("../../initrd/mount");
-static UMOUNT_ELF: &[u8] = include_bytes!("../../initrd/umount");
-static KILL_ELF: &[u8] = include_bytes!("../../initrd/kill");
-static PS_ELF: &[u8] = include_bytes!("../../initrd/ps");
-static STRINGS_ELF: &[u8] = include_bytes!("../../initrd/strings");
-static CAL_ELF: &[u8] = include_bytes!("../../initrd/cal");
-static DIFF_ELF: &[u8] = include_bytes!("../../initrd/diff");
-static PATCH_ELF: &[u8] = include_bytes!("../../initrd/patch");
-static LESS_ELF: &[u8] = include_bytes!("../../initrd/less");
+static TOUCH_ELF: &[u8] = generated_initrd_asset!("touch");
+static STAT_ELF: &[u8] = generated_initrd_asset!("stat");
+static LN_ELF: &[u8] = generated_initrd_asset!("ln");
+static READLINK_ELF: &[u8] = generated_initrd_asset!("readlink");
+static WC_ELF: &[u8] = generated_initrd_asset!("wc");
+static AR_ELF: &[u8] = generated_initrd_asset!("ar");
+static INSTALL_ELF: &[u8] = generated_initrd_asset!("install");
+static MEMINFO_ELF: &[u8] = generated_initrd_asset!("meminfo");
+static MMAP_LEAK_TEST_ELF: &[u8] = generated_initrd_asset!("mmap-leak-test");
+static MAKE_ELF: &[u8] = generated_initrd_asset!("make");
+static HEAD_ELF: &[u8] = generated_initrd_asset!("head");
+static TAIL_ELF: &[u8] = generated_initrd_asset!("tail");
+static TEE_ELF: &[u8] = generated_initrd_asset!("tee");
+static CHMOD_ELF: &[u8] = generated_initrd_asset!("chmod");
+static CHOWN_ELF: &[u8] = generated_initrd_asset!("chown");
+static SORT_ELF: &[u8] = generated_initrd_asset!("sort");
+static UNIQ_ELF: &[u8] = generated_initrd_asset!("uniq");
+static CUT_ELF: &[u8] = generated_initrd_asset!("cut");
+static TR_ELF: &[u8] = generated_initrd_asset!("tr");
+static SED_ELF: &[u8] = generated_initrd_asset!("sed");
+static FILE_ELF: &[u8] = generated_initrd_asset!("file");
+static HEXDUMP_ELF: &[u8] = generated_initrd_asset!("hexdump");
+static DU_ELF: &[u8] = generated_initrd_asset!("du");
+static DF_ELF: &[u8] = generated_initrd_asset!("df");
+static FIND_ELF: &[u8] = generated_initrd_asset!("find");
+static XARGS_ELF: &[u8] = generated_initrd_asset!("xargs");
+static FREE_ELF: &[u8] = generated_initrd_asset!("free");
+static DMESG_ELF: &[u8] = generated_initrd_asset!("dmesg");
+static MOUNT_ELF: &[u8] = generated_initrd_asset!("mount");
+static UMOUNT_ELF: &[u8] = generated_initrd_asset!("umount");
+static KILL_ELF: &[u8] = generated_initrd_asset!("kill");
+static PS_ELF: &[u8] = generated_initrd_asset!("ps");
+static STRINGS_ELF: &[u8] = generated_initrd_asset!("strings");
+static CAL_ELF: &[u8] = generated_initrd_asset!("cal");
+static DIFF_ELF: &[u8] = generated_initrd_asset!("diff");
+static PATCH_ELF: &[u8] = generated_initrd_asset!("patch");
+static LESS_ELF: &[u8] = generated_initrd_asset!("less");
 // Phase 23: ping
-static PING_ELF: &[u8] = include_bytes!("../../initrd/ping");
+static PING_ELF: &[u8] = generated_initrd_asset!("ping");
 // Phase 29: PTY test
-static PTY_TEST_ELF: &[u8] = include_bytes!("../../initrd/pty-test");
+static PTY_TEST_ELF: &[u8] = generated_initrd_asset!("pty-test");
 // Phase 34: timekeeping utilities
-static DATE_ELF: &[u8] = include_bytes!("../../initrd/date");
-static UPTIME_ELF: &[u8] = include_bytes!("../../initrd/uptime");
+static DATE_ELF: &[u8] = generated_initrd_asset!("date");
+static UPTIME_ELF: &[u8] = generated_initrd_asset!("uptime");
 // Phase 39: Unix domain socket test
-static UNIX_SOCKET_TEST_ELF: &[u8] = include_bytes!("../../initrd/unix-socket-test");
+static UNIX_SOCKET_TEST_ELF: &[u8] = generated_initrd_asset!("unix-socket-test");
 // Phase 40: threading test
-static THREAD_TEST_ELF: &[u8] = include_bytes!("../../initrd/thread-test");
+static THREAD_TEST_ELF: &[u8] = generated_initrd_asset!("thread-test");
 // Phase 42: crypto primitives
-static CRYPTO_TEST_ELF: &[u8] = include_bytes!("../../initrd/crypto-test");
-static SHA256SUM_ELF: &[u8] = include_bytes!("../../initrd/sha256sum");
-static GENKEY_ELF: &[u8] = include_bytes!("../../initrd/genkey");
+static CRYPTO_TEST_ELF: &[u8] = generated_initrd_asset!("crypto-test");
+static SHA256SUM_ELF: &[u8] = generated_initrd_asset!("sha256sum");
+static GENKEY_ELF: &[u8] = generated_initrd_asset!("genkey");
 // Phase 44: musl-linked Rust std programs
-static HELLO_RUST_ELF: &[u8] = include_bytes!("../../initrd/hello-rust");
-static SYSINFO_RUST_ELF: &[u8] = include_bytes!("../../initrd/sysinfo-rust");
-static HTTPD_RUST_ELF: &[u8] = include_bytes!("../../initrd/httpd-rust");
-static CALC_RUST_ELF: &[u8] = include_bytes!("../../initrd/calc-rust");
-static TODO_RUST_ELF: &[u8] = include_bytes!("../../initrd/todo-rust");
+static HELLO_RUST_ELF: &[u8] = generated_initrd_asset!("hello-rust");
+static SYSINFO_RUST_ELF: &[u8] = generated_initrd_asset!("sysinfo-rust");
+static HTTPD_RUST_ELF: &[u8] = generated_initrd_asset!("httpd-rust");
+static CALC_RUST_ELF: &[u8] = generated_initrd_asset!("calc-rust");
+static TODO_RUST_ELF: &[u8] = generated_initrd_asset!("todo-rust");
 // Phase 46: background daemons managed by init
-static SYSLOGD_ELF: &[u8] = include_bytes!("../../initrd/syslogd");
-static CROND_ELF: &[u8] = include_bytes!("../../initrd/crond");
+static SYSLOGD_ELF: &[u8] = generated_initrd_asset!("syslogd");
+static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
+// Phase 52: ring-3 extracted services
+static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
+static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
+static STDIN_FEEDER_ELF: &[u8] = generated_initrd_asset!("stdin_feeder");
 // Phase 47: DOOM binary
-static DOOM_BIN: &[u8] = include_bytes!("../../initrd/doom");
+static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -252,6 +272,25 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     ("crond", RamdiskNode::File { content: CROND_ELF }),
+    // Phase 52: ring-3 extracted services
+    (
+        "console_server",
+        RamdiskNode::File {
+            content: CONSOLE_SERVER_ELF,
+        },
+    ),
+    (
+        "kbd_server",
+        RamdiskNode::File {
+            content: KBD_SERVER_ELF,
+        },
+    ),
+    (
+        "stdin_feeder",
+        RamdiskNode::File {
+            content: STDIN_FEEDER_ELF,
+        },
+    ),
     // Phase 32: build tools and utilities
     ("touch", RamdiskNode::File { content: TOUCH_ELF }),
     ("stat", RamdiskNode::File { content: STAT_ELF }),

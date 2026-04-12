@@ -147,10 +147,14 @@ flowchart TD
     P46 --> P51["Phase 51<br/>Service Model Maturity"]
     P50 --> P51
     P51 --> P52["Phase 52<br/>First Service Extractions"]
+    P52 --> P52a["Phase 52a<br/>Kernel Reliability Fixes"]
+    P52a --> P52b["Phase 52b<br/>Kernel Structural Hardening"]
+    P52b --> P52c["Phase 52c<br/>Kernel Architecture Evolution"]
+    P52c --> P52d["Phase 52d<br/>Kernel Completion & Alignment"]
     P48 --> P53["Phase 53<br/>Headless Hardening"]
     P51 --> P53
-    P52 --> P53
-    P52 --> P54["Phase 54<br/>Deep Serverization"]
+    P52d --> P53
+    P52d --> P54["Phase 54<br/>Deep Serverization"]
     P53 --> P54
 
     %% Hardware, local-system, and release gate phases
@@ -265,7 +269,11 @@ flowchart TD
 | 49 | Architectural Declaration | Make the kernel/userspace boundary explicit and enforceable | Complete | `phase-49` | [Phase 49](./49-architectural-declaration.md) | [Tasks](./tasks/49-architectural-declaration-tasks.md) |
 | 50 | IPC Completion | Capability grants, bulk-data transport (copy + page grants), ring-3-safe registry, server-loop failure semantics | Complete | `phase-50` | [Phase 50](./50-ipc-completion.md) | [Tasks](./tasks/50-ipc-completion-tasks.md) |
 | 51 | Service Model Maturity | Turn the Phase 46 service baseline into a trusted lifecycle model | In Progress | `phase-51` | [Phase 51](./51-service-model-maturity.md) | [Tasks](./tasks/51-service-model-maturity-tasks.md) |
-| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | Planned | `phase-52` | [Phase 52](./52-first-service-extractions.md) | Deferred until implementation planning |
+| 52 | First Service Extractions | Move the first visible core services into supervised ring-3 processes | In Progress | `phase-52` | [Phase 52](./52-first-service-extractions.md) | [Tasks](./tasks/52-first-service-extractions-tasks.md) |
+| 52a | Kernel Reliability Fixes | Fix stale IPC return state, sunset wake_write, clear_child_tid, exec signal reset | **Complete** | `phase-52a` | [Phase 52a](./52a-kernel-reliability-fixes.md) | [Tasks](./tasks/52a-kernel-reliability-fixes-tasks.md) |
+| 52b | Kernel Structural Hardening | AddressSpace object, typed UserBuffers, batch TLB, frame zeroing, and partial task-owned return-state groundwork | **Complete** | `phase-52b` | [Phase 52b](./52b-kernel-structural-hardening.md) | [Tasks](./tasks/52b-kernel-structural-hardening-tasks.md) |
+| 52c | Kernel Architecture Evolution | VMA tree, growable endpoint/capability tables, unified line-discipline infrastructure, ISR wakeup, and deferred scheduler/keyboard/notification closure | **Complete** | `phase-52c` | [Phase 52c](./52c-kernel-architecture-evolution.md) | [Tasks](./tasks/52c-kernel-architecture-evolution-tasks.md) |
+| 52d | Kernel Completion and Roadmap Alignment | Audit-backed closure of the unfinished or overstated 52a/52b/52c work, integrated boot blockers, and release-gate drift before later hardening phases | Complete | `phase-52d` | [Phase 52d](./52d-kernel-completion-and-roadmap-alignment.md) | [Tasks](./tasks/52d-kernel-completion-and-roadmap-alignment-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
 | 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
 

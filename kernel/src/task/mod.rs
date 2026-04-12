@@ -60,12 +60,12 @@ pub mod wait_queue;
 pub use scheduler::{
     block_current_on_futex, block_current_on_futex_unless_woken, block_current_on_notif,
     block_current_on_recv, block_current_on_reply, block_current_on_send,
-    block_current_unless_woken, current_task_id, deliver_message, insert_cap, mark_current_dead,
-    mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run, server_endpoint,
-    set_current_task_pid, set_server_endpoint, signal_reschedule, spawn, spawn_fork_task,
-    spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice, sys_sched_getaffinity,
-    sys_sched_setaffinity, take_current_task_fork_ctx, take_message, task_cap, wake_task,
-    yield_now,
+    block_current_unless_woken, current_task_id, deliver_bulk, deliver_message, insert_cap,
+    mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
+    server_endpoint, set_current_task_pid, set_current_user_return, set_server_endpoint,
+    signal_reschedule, spawn, spawn_fork_task, spawn_idle, spawn_idle_for_core,
+    spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data,
+    take_current_task_fork_ctx, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +91,36 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // ---------------------------------------------------------------------------
 
 // TaskId is re-exported from kernel_core::types above.
+
+// ---------------------------------------------------------------------------
+// Task user-return state
+// ---------------------------------------------------------------------------
+
+/// User-mode return state saved at syscall entry and restored by the
+/// scheduler on re-dispatch.  Captures the complete per-task resume
+/// contract in one place, eliminating split ownership between `Task`,
+/// `Process`, and `PerCoreData`.
+///
+/// # Phase 52d invariant
+///
+/// `syscall_handler` snapshots this struct once before any blocking or
+/// yield path.  The scheduler restores `user_rsp`, `kernel_stack_top`,
+/// `fs_base`, and `cr3_phys` exclusively from this struct for userspace
+/// tasks (pid != 0).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserReturnState {
+    /// User-mode RSP at syscall entry.
+    pub user_rsp: u64,
+    /// Kernel stack top for TSS.RSP0 / SYSCALL stack.
+    pub kernel_stack_top: u64,
+    /// FS.base MSR value (TLS pointer).
+    pub fs_base: u64,
+    /// Physical address of the PML4 (CR3).  0 means no dedicated address space.
+    pub cr3_phys: u64,
+    /// Address-space generation counter at the time of snapshot (Phase 52d B.3).
+    /// Used by user-copy diagnostics to detect concurrent mapping mutations.
+    pub addr_space_gen: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Task state
@@ -136,6 +166,15 @@ pub struct Task {
     /// `None` when the task has not yet been sent a message.  Set by the
     /// sender/IPC core; consumed by `take_message` after the task wakes.
     pub pending_msg: Option<Message>,
+    /// Bulk data attached to the pending message (Phase 52).
+    ///
+    /// Set alongside `pending_msg` when a sender uses `ipc_send_buf` or
+    /// `ipc_call_buf`.  Consumed by `take_bulk_data` after the receiver
+    /// wakes.  `None` for messages without bulk payloads.
+    pub pending_bulk: Option<alloc::vec::Vec<u8>>,
+    /// Sticky completion flag for `send()` / `send_with_cap()` so a receiver
+    /// can acknowledge a consumed send even if the sender has not blocked yet.
+    pub send_completed: bool,
     /// Endpoint this task is the "server" of (used by `reply_recv` to find
     /// the endpoint to block on after replying).
     pub server_endpoint: Option<crate::ipc::EndpointId>,
@@ -155,12 +194,26 @@ pub struct Task {
     pub system_ticks: u64,
     /// Tick count when this task was last dispatched.
     pub start_tick: u64,
+    /// Tick at which this task was last migrated to a different core (Phase 52c).
+    /// Used by the load balancer to enforce a cooldown period and prevent
+    /// migration thrashing.
+    pub last_migrated_tick: u64,
     /// True while the task is returning to the scheduler and its kernel stack
     /// pointer has not been safely published yet.
     pub switching_out: bool,
     /// Set by a wakeup that arrives while `switching_out` is true so the
     /// scheduler can enqueue the task after `switch_context` completes.
     pub wake_after_switch: bool,
+    /// Set once per-task IPC teardown has run so deferred dead-task cleanup
+    /// can avoid double-cleaning the same task.
+    pub ipc_cleaned: bool,
+    /// Set when another thread in the group calls `exit_group()` and this task
+    /// must quiesce on its own core before the caller reaps its process entry.
+    pub group_exit_pending: bool,
+    /// User-mode return state saved when this task yields and restored by the
+    /// scheduler on re-dispatch.  `None` for kernel-only tasks or before the
+    /// first yield from a userspace context.
+    pub user_return: Option<UserReturnState>,
     /// Userspace register frame restored by `fork_child_trampoline`, if this
     /// task was spawned to finish a fork/clone handoff.
     fork_ctx: Option<crate::process::ForkChildCtx>,
@@ -187,6 +240,8 @@ impl Task {
             saved_rsp,
             caps: CapabilityTable::new(),
             pending_msg: None,
+            pending_bulk: None,
+            send_completed: false,
             server_endpoint: None,
             assigned_core: 0,
             pid: 0,                  // Set by fork_child_trampoline for userspace tasks
@@ -195,8 +250,12 @@ impl Task {
             user_ticks: 0,
             system_ticks: 0,
             start_tick: 0,
+            last_migrated_tick: 0,
             switching_out: false,
             wake_after_switch: false,
+            ipc_cleaned: false,
+            group_exit_pending: false,
+            user_return: None,
             fork_ctx: None,
             _stack: Some(stack),
         }

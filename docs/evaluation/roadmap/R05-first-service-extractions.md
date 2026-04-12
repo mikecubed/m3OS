@@ -1,8 +1,8 @@
 # Release Phase R05 — First Service Extractions
 
-**Status:** Proposed  
-**Depends on:** [R03 — IPC Completion](./R03-ipc-completion.md),
-[R04 — Service Model](./R04-service-model.md)  
+**Status:** In Progress (Phase 52)  
+**Depends on:** [R03 — IPC Completion](./R03-ipc-completion.md) (Complete),
+[R04 — Service Model](./R04-service-model.md) (In Progress)  
 **Official roadmap phases covered:** [Phase 7](../../roadmap/07-core-servers.md),
 [Phase 9](../../roadmap/09-framebuffer-and-shell.md),
 [Phase 15](../../roadmap/15-hardware-discovery.md),
@@ -100,9 +100,23 @@ microkernel purity in the abstract.
 - [Phase 7 — Core Servers](../../roadmap/07-core-servers.md)
 - [Phase 9 — Framebuffer and Shell](../../roadmap/09-framebuffer-and-shell.md)
 
+## Implementation Progress (Phase 52)
+
+Phase 52 is actively implementing this release phase. Key decisions made:
+
+- **Console and keyboard** are the first extraction targets, as recommended
+- **Stdin feeder** bridges IPC-based keyboard events to the legacy stdin path
+  via a dual-routing TTY buffer design
+- **Owner-based registry** from Phase 50 enables atomic service re-registration
+  on restart
+- **Display ownership** is deferred to Phase 56; this phase focuses on text
+  console rendering only
+
+See [docs/52-first-service-extractions.md](../../52-first-service-extractions.md)
+and [Phase 52 roadmap doc](../../roadmap/52-first-service-extractions.md) for
+the full design.
+
 ## Open Questions
 
-- Should the first extracted input service expose raw events, cooked events, or
-  both?
 - Is display ownership introduced here in a minimal form, or only in the later
-  dedicated display phase?
+  dedicated display phase? **Resolved: deferred to Phase 56.**

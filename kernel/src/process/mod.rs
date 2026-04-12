@@ -25,9 +25,16 @@ pub mod futex;
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
+use crate::mm::AddressSpace;
 use spin::Mutex;
+
+// Re-export VMA types from kernel-core for host-testability.
+pub use kernel_core::mm::{MemoryMapping, VmaTree};
 
 // ---------------------------------------------------------------------------
 // Current-process tracker (per-core, Phase 35)
@@ -56,6 +63,40 @@ pub fn set_current_pid(pid: Pid) {
     } else {
         CURRENT_PID_LEGACY.store(pid, Ordering::Relaxed);
     }
+}
+
+/// Return a non-null pointer to the current core's active user address space, if any.
+///
+/// When SMP per-core state is live, this uses the scheduler-maintained
+/// `current_addrspace` pointer so fault-time paths do not need to reenter the
+/// process table just to serialize page-table mutations. Before per-core state
+/// exists, it falls back to the current process table entry.
+pub fn current_addr_space() -> Option<NonNull<AddressSpace>> {
+    if crate::smp::is_per_core_ready() {
+        let ptr = crate::smp::per_core().current_addrspace;
+        if !ptr.is_null() {
+            return NonNull::new(ptr.cast_mut());
+        }
+    }
+
+    let pid = current_pid();
+    if pid == 0 {
+        return None;
+    }
+
+    let ptr = {
+        let table = PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| {
+            p.addr_space
+                .as_ref()
+                .map(|addr_space| addr_space.as_ref() as *const AddressSpace)
+        })
+    }?;
+
+    // Before per-core state exists the kernel is still effectively single-core,
+    // so the current process entry cannot be concurrently reaped before callers
+    // immediately dereference this pointer in a tightly-scoped unsafe block.
+    NonNull::new(ptr as *mut AddressSpace)
 }
 
 #[allow(unused_imports)]
@@ -508,6 +549,9 @@ pub struct ThreadGroup {
     pub leader_tid: u32,
     /// All TIDs that belong to this group (including the leader).
     pub members: Mutex<Vec<u32>>,
+    /// PID of the thread currently performing `exit_group()` teardown.
+    /// 0 means no teardown is in progress.
+    pub exit_owner: AtomicU32,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,11 +569,13 @@ pub struct Process {
     pub ppid: Pid,
     /// Current lifecycle state.
     pub state: ProcessState,
-    /// Root physical address of this process's page table.
+    /// This process's virtual address space.
     ///
     /// `None` means the process has not yet been assigned a dedicated
     /// address space and shares the kernel's mappings (pre-Phase 12).
-    pub page_table_root: Option<x86_64::PhysAddr>,
+    /// For threads created with `CLONE_VM`, this is a shared `Arc` clone
+    /// of the parent's address space.
+    pub addr_space: Option<Arc<AddressSpace>>,
     /// Top of this process's kernel-mode stack (virtual address).
     pub kernel_stack_top: u64,
     /// Userspace entry-point virtual address.
@@ -592,8 +638,8 @@ pub struct Process {
     pub session_id: u32,
     /// Controlling terminal (Phase 29).
     pub controlling_tty: Option<ControllingTty>,
-    /// Tracked anonymous mmap regions (Phase 33).
-    pub mappings: Vec<MemoryMapping>,
+    /// Tracked anonymous mmap regions (Phase 33). O(log n) lookup via BTreeMap.
+    pub vma_tree: VmaTree,
     /// Last successfully executed binary path, used for procfs.
     pub exec_path: String,
     /// Current argv vector, used for `/proc/<pid>/cmdline`.
@@ -611,18 +657,7 @@ pub struct Process {
     pub shared_signal_actions: Option<Arc<Mutex<[SignalAction; 32]>>>,
 }
 
-/// Describes a contiguous anonymous memory mapping created by `mmap`.
-#[derive(Clone, Debug)]
-pub struct MemoryMapping {
-    /// Starting virtual address (page-aligned).
-    pub start: u64,
-    /// Length in bytes (page-aligned, as recorded by `sys_linux_mmap`).
-    pub len: u64,
-    /// Protection bits (`PROT_READ | PROT_WRITE | PROT_EXEC`).
-    pub prot: u64,
-    /// Mapping flags (`MAP_PRIVATE | MAP_ANONYMOUS`).
-    pub flags: u64,
-}
+// `MemoryMapping` is now defined in `kernel_core::mm` and re-exported above.
 
 /// Identifies the controlling terminal for a process.
 #[derive(Clone, Debug, PartialEq)]
@@ -648,7 +683,7 @@ impl Process {
             clear_child_tid: 0,
             ppid: 0,
             state: ProcessState::Ready,
-            page_table_root: None,
+            addr_space: None,
             kernel_stack_top: kstack_top,
             entry_point: entry,
             user_stack_top: stack_top,
@@ -674,7 +709,7 @@ impl Process {
             umask: 0o022,
             session_id: pid,
             controlling_tty: Some(ControllingTty::Console),
-            mappings: Vec::new(),
+            vma_tree: VmaTree::new(),
             exec_path: String::new(),
             cmdline: Vec::new(),
             start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -684,13 +719,9 @@ impl Process {
         }
     }
 
-    /// Find the VMA containing `addr`, if any.
+    /// Find the VMA containing `addr`, if any. O(log n) via BTreeMap.
     pub fn find_vma(&self, addr: u64) -> Option<&MemoryMapping> {
-        self.mappings.iter().find(|m| {
-            m.start
-                .checked_add(m.len)
-                .is_some_and(|end| addr >= m.start && addr < end)
-        })
+        self.vma_tree.find_containing(addr)
     }
 
     // -----------------------------------------------------------------
@@ -851,6 +882,13 @@ pub(crate) fn alloc_kernel_stack_pub() -> u64 {
 /// Global process table.  All modifications go through `PROCESS_TABLE.lock()`.
 pub static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
 
+fn canonical_mm_index(processes: &[Process], tgid: u32) -> Option<usize> {
+    processes
+        .iter()
+        .position(|p| p.pid == tgid)
+        .or_else(|| processes.iter().position(|p| p.tgid == tgid))
+}
+
 /// The kernel's process table — a flat list of all live [`Process`] entries.
 pub struct ProcessTable {
     processes: Vec<Process>,
@@ -900,6 +938,48 @@ impl ProcessTable {
     }
 }
 
+#[allow(dead_code)]
+pub fn shared_mm_snapshot(pid: Pid) -> Option<(u64, u64, VmaTree)> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    let proc = &table.processes[idx];
+    Some((proc.brk_current, proc.mmap_next, proc.vma_tree.clone()))
+}
+
+pub fn shared_vma_prot(pid: Pid, addr: u64) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    table.processes[idx].find_vma(addr).map(|m| m.prot)
+}
+
+pub fn with_shared_mm_mut<R, F>(pid: Pid, f: F) -> Option<R>
+where
+    F: FnOnce(&mut u64, &mut u64, &mut VmaTree) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+
+    let mut brk_current = table.processes[idx].brk_current;
+    let mut mmap_next = table.processes[idx].mmap_next;
+    let mut vma_tree = table.processes[idx].vma_tree.clone();
+    let result = f(&mut brk_current, &mut mmap_next, &mut vma_tree);
+
+    for proc in table.processes.iter_mut().filter(|p| p.tgid == tgid) {
+        proc.brk_current = brk_current;
+        proc.mmap_next = mmap_next;
+        proc.vma_tree = vma_tree.clone();
+    }
+
+    Some(result)
+}
+
+pub fn sync_shared_mm_state(pid: Pid) {
+    let _ = with_shared_mm_mut(pid, |_brk_current, _mmap_next, _vma_tree| {});
+}
+
 // ---------------------------------------------------------------------------
 // Public helper
 // ---------------------------------------------------------------------------
@@ -919,7 +999,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: None,
+        addr_space: None,
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -945,7 +1025,7 @@ pub fn spawn_process(ppid: Pid, entry_point: u64, user_stack_top: u64) -> Pid {
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -980,7 +1060,7 @@ pub fn spawn_process_with_cr3(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(cr3),
+        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1006,7 +1086,7 @@ pub fn spawn_process_with_cr3(
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1045,7 +1125,7 @@ pub fn spawn_process_with_cr3_and_fds(
         clear_child_tid: 0,
         ppid,
         state: ProcessState::Ready,
-        page_table_root: Some(cr3),
+        addr_space: Some(Arc::new(AddressSpace::new(cr3))),
         kernel_stack_top: kstack_top,
         entry_point,
         user_stack_top,
@@ -1071,7 +1151,7 @@ pub fn spawn_process_with_cr3_and_fds(
         umask: 0o022,
         session_id: pid,
         controlling_tty: Some(ControllingTty::Console),
-        mappings: Vec::new(),
+        vma_tree: VmaTree::new(),
         exec_path: String::new(),
         cmdline: Vec::new(),
         start_ticks: crate::arch::x86_64::interrupts::tick_count(),
@@ -1396,7 +1476,10 @@ pub fn fork_child_trampoline() -> ! {
     let (cr3_phys, kstack_top) = {
         let table = PROCESS_TABLE.lock();
         let p = table.find(ctx.pid).expect("fork child: process not found");
-        (p.page_table_root, p.kernel_stack_top)
+        (
+            p.addr_space.as_ref().map(|a| a.pml4_phys()),
+            p.kernel_stack_top,
+        )
     };
 
     debug_assert!(

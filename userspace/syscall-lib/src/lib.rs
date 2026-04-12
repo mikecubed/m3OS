@@ -259,6 +259,400 @@ pub const SYS_FRAMEBUFFER_MMAP: u64 = 0x1006;
 /// Phase 47: raw scancode read syscall.
 pub const SYS_READ_SCANCODE: u64 = 0x1007;
 
+/// Phase 52: push bytes into kernel stdin from userspace.
+pub const SYS_STDIN_PUSH: u64 = 0x1008;
+
+/// Phase 52: signal a foreground process group from userspace.
+pub const SYS_SIGNAL_PROCESS_GROUP: u64 = 0x1009;
+
+/// Phase 52: read one scancode from the TTY keyboard buffer (for kbd service).
+pub const SYS_READ_KBD_SCANCODE: u64 = 0x100A;
+
+// ===========================================================================
+// IPC syscall numbers (Phase 50)
+// ===========================================================================
+
+/// IPC recv: block until a message arrives on the endpoint.
+pub const SYS_IPC_RECV: u64 = 0x1100;
+
+/// IPC send: send a message to an endpoint (no reply expected).
+pub const SYS_IPC_SEND: u64 = 0x1101;
+
+/// IPC call: send a message and block for a reply.
+pub const SYS_IPC_CALL: u64 = 0x1102;
+
+/// IPC reply: send a reply to a caller.
+pub const SYS_IPC_REPLY: u64 = 0x1103;
+
+/// IPC reply_recv: reply to a caller and immediately wait for the next message.
+pub const SYS_IPC_REPLY_RECV: u64 = 0x1104;
+
+/// Grant a capability to another task.
+pub const SYS_CAP_GRANT: u64 = 0x1105;
+
+/// Wait on a notification capability.
+pub const SYS_NOTIFY_WAIT: u64 = 0x1106;
+
+/// Signal a notification capability.
+pub const SYS_NOTIFY_SIGNAL: u64 = 0x1107;
+
+/// Register a named service in the IPC registry.
+pub const SYS_IPC_REGISTER_SERVICE: u64 = 0x1108;
+
+/// Look up a named service in the IPC registry.
+pub const SYS_IPC_LOOKUP_SERVICE: u64 = 0x1109;
+
+/// Create a notification for a hardware IRQ and return a cap handle.
+pub const SYS_CREATE_IRQ_NOTIFICATION: u64 = 0x110A;
+
+/// Create a new IPC endpoint and return a cap handle.
+pub const SYS_CREATE_ENDPOINT: u64 = 0x110B;
+
+/// Send a message with an attached bulk-data buffer (fire-and-forget).
+pub const SYS_IPC_SEND_BUF: u64 = 0x110C;
+
+/// Send a message with an attached bulk-data buffer and wait for reply.
+pub const SYS_IPC_CALL_BUF: u64 = 0x110D;
+
+/// Receive a message with full data words and optional bulk payload.
+pub const SYS_IPC_RECV_MSG: u64 = 0x110E;
+
+/// Reply then receive with full data words and optional bulk payload.
+pub const SYS_IPC_REPLY_RECV_MSG: u64 = 0x110F;
+
+// ===========================================================================
+// IPC wrappers (Phase 52)
+// ===========================================================================
+
+/// IPC message data: 4 u64 words.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IpcMessage {
+    pub label: u64,
+    pub data: [u64; 4],
+}
+
+impl IpcMessage {
+    pub const fn new(label: u64) -> Self {
+        Self {
+            label,
+            data: [0; 4],
+        }
+    }
+}
+
+/// Receive a message on an endpoint capability.
+///
+/// `ep_cap_handle` is the handle of an Endpoint capability in the caller's
+/// capability table. Blocks until a message is available. Returns the
+/// message label on success, or `u64::MAX` on error.
+pub fn ipc_recv(ep_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_IPC_RECV, ep_cap_handle as u64) }
+}
+
+/// Send a message to an endpoint (fire-and-forget, no reply).
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_send(ep_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_SEND, ep_cap_handle as u64, label, data0) }
+}
+
+/// Send a message and block waiting for a reply (RPC-style call).
+///
+/// Returns the reply label on success, `u64::MAX` on error.
+pub fn ipc_call(ep_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_CALL, ep_cap_handle as u64, label, data0) }
+}
+
+/// Reply to a caller using a one-shot reply capability.
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_reply(reply_cap_handle: u32, label: u64, data0: u64) -> u64 {
+    unsafe { syscall3(SYS_IPC_REPLY, reply_cap_handle as u64, label, data0) }
+}
+
+/// Reply to a caller and immediately wait for the next message on an endpoint.
+///
+/// Returns the next message label on success, `u64::MAX` on error.
+pub fn ipc_reply_recv(reply_cap_handle: u32, label: u64, ep_cap_handle: u32) -> u64 {
+    unsafe {
+        syscall3(
+            SYS_IPC_REPLY_RECV,
+            reply_cap_handle as u64,
+            label,
+            ep_cap_handle as u64,
+        )
+    }
+}
+
+/// Register a named service endpoint in the IPC registry.
+///
+/// `ep_cap_handle` is the handle of the Endpoint capability to register.
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_register_service(ep_cap_handle: u32, name: &str) -> u64 {
+    unsafe {
+        syscall3(
+            SYS_IPC_REGISTER_SERVICE,
+            ep_cap_handle as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    }
+}
+
+/// Look up a named service in the IPC registry.
+///
+/// On success, inserts an Endpoint capability into the caller's capability
+/// table and returns the new handle. Returns `u64::MAX` on error.
+pub fn ipc_lookup_service(name: &str) -> u64 {
+    unsafe {
+        syscall2(
+            SYS_IPC_LOOKUP_SERVICE,
+            name.as_ptr() as u64,
+            name.len() as u64,
+        )
+    }
+}
+
+/// Wait on a notification capability. Blocks until at least one bit is set.
+///
+/// Returns the pending-bit word on success, or 0 on error.
+pub fn notify_wait(notif_cap_handle: u32) -> u64 {
+    unsafe { syscall1(SYS_NOTIFY_WAIT, notif_cap_handle as u64) }
+}
+
+/// Signal a notification capability with the given bits.
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn notify_signal(notif_cap_handle: u32, bits: u64) -> u64 {
+    unsafe { syscall2(SYS_NOTIFY_SIGNAL, notif_cap_handle as u64, bits) }
+}
+
+/// Create a new IPC endpoint.
+///
+/// Returns the new cap handle on success, `u64::MAX` on error.
+pub fn create_endpoint() -> u64 {
+    unsafe { syscall0(SYS_CREATE_ENDPOINT) }
+}
+
+/// Create a notification registered for a hardware IRQ and return a cap handle.
+///
+/// Only IRQ 1 (keyboard) is currently supported.
+/// Returns the new cap handle on success, `u64::MAX` on error.
+pub fn create_irq_notification(irq: u32) -> u64 {
+    unsafe { syscall1(SYS_CREATE_IRQ_NOTIFICATION, irq as u64) }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk-data IPC wrappers (Phase 52)
+// ---------------------------------------------------------------------------
+
+/// Send a message with an attached bulk-data buffer (fire-and-forget).
+///
+/// The kernel copies `buf` from this process's address space, attaches it
+/// to the IPC message, and delivers both to the endpoint receiver.
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_send_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_SEND_BUF,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    }
+}
+
+/// Send a message with an attached bulk-data buffer and wait for a reply.
+///
+/// Like [`ipc_call`] but additionally copies `buf` from this process's
+/// address space and delivers it alongside the message.
+/// Returns the reply label on success, `u64::MAX` on error.
+pub fn ipc_call_buf(ep_cap_handle: u32, label: u64, data0: u64, buf: &[u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_CALL_BUF,
+            ep_cap_handle as u64,
+            label,
+            data0,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    }
+}
+
+/// Receive a message with full data words and optional bulk payload.
+///
+/// Blocks until a message arrives on the endpoint.  The kernel writes
+/// the [`IpcMessage`] header (label + data[0..4]) to `msg` and copies
+/// any attached bulk data into `buf`.  Returns the label on success,
+/// `u64::MAX` on error.
+pub fn ipc_recv_msg(ep_cap_handle: u32, msg: &mut IpcMessage, buf: &mut [u8]) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_RECV_MSG,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// Reply to a caller and immediately receive the next message with bulk data.
+///
+/// Combines reply + recv_msg in one syscall.  The reply carries only a
+/// label (no bulk data in the reply direction).  The received message
+/// header is written to `msg` and any bulk payload to `buf`.
+/// Returns the next message label on success, `u64::MAX` on error.
+pub fn ipc_reply_recv_msg(
+    reply_cap_handle: u32,
+    reply_label: u64,
+    ep_cap_handle: u32,
+    msg: &mut IpcMessage,
+    buf: &mut [u8],
+) -> u64 {
+    unsafe {
+        syscall6(
+            SYS_IPC_REPLY_RECV_MSG,
+            reply_cap_handle as u64,
+            reply_label,
+            ep_cap_handle as u64,
+            msg as *mut IpcMessage as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Push bytes from a userspace buffer into the kernel stdin buffer.
+///
+/// Returns 0 on success, negative errno on error.
+pub fn stdin_push(buf: &[u8]) -> isize {
+    unsafe { syscall2(SYS_STDIN_PUSH, buf.as_ptr() as u64, buf.len() as u64) as isize }
+}
+
+/// Read one scancode from the TTY keyboard buffer (non-blocking).
+///
+/// Returns the scancode, or 0 if the buffer is empty.
+pub fn read_kbd_scancode() -> u8 {
+    unsafe { syscall0(SYS_READ_KBD_SCANCODE) as u8 }
+}
+
+/// Signal the foreground process group with the given signal number.
+///
+/// Returns 0 on success.
+pub fn signal_process_group(sig: u32) -> isize {
+    unsafe { syscall2(SYS_SIGNAL_PROCESS_GROUP, sig as u64, 0) as isize }
+}
+
+/// Phase 52: get termios c_lflag, c_iflag, c_oflag, and c_cc from TTY0.
+pub const SYS_GET_TERMIOS_FLAGS: u64 = 0x100B;
+
+/// Phase 52: signal EOF on kernel stdin.
+pub const SYS_STDIN_SIGNAL_EOF: u64 = 0x100C;
+
+/// Termios flags returned by `get_termios_flags`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TermiosFlags {
+    pub c_lflag: u32,
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cc: [u8; 19],
+    /// Padding to match the kernel's 32-byte `sys_get_termios_flags` layout.
+    pub _pad: u8,
+}
+
+impl TermiosFlags {
+    pub const fn zeroed() -> Self {
+        Self {
+            c_lflag: 0,
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cc: [0; 19],
+            _pad: 0,
+        }
+    }
+}
+
+/// Query termios flags from the kernel's TTY0.
+///
+/// Returns 0 on success and fills the provided struct.
+///
+/// Uses a compiler fence after the syscall to force a reload of the struct
+/// from memory. Without this, the optimizer may cache the pre-zeroed values
+/// because the syscall asm block passes the buffer as a raw integer, severing
+/// the pointer provenance that would tell the compiler the buffer is modified.
+pub fn get_termios_flags(out: &mut TermiosFlags) -> isize {
+    let buf = out as *mut TermiosFlags as *mut u8;
+    let ret = unsafe {
+        syscall2(
+            SYS_GET_TERMIOS_FLAGS,
+            buf as u64,
+            core::mem::size_of::<TermiosFlags>() as u64,
+        ) as isize
+    };
+    // Force the compiler to reload `out` from memory after the syscall.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    ret
+}
+
+/// Signal EOF on the kernel stdin buffer.
+///
+/// Causes the next `read(0, ...)` to return 0.
+pub fn stdin_signal_eof() -> isize {
+    unsafe { syscall0(SYS_STDIN_SIGNAL_EOF) as isize }
+}
+
+/// Syscall numbers for direct termios field reads (return value in rax).
+///
+/// **Temporary compatibility only** — introduced as a workaround for the
+/// `copy_to_user` intermittent reliability bug (see
+/// `docs/appendix/copy-to-user-reliability-bug.md`).  No in-tree binary
+/// depends on these after Phase 52d Track C converged keyboard input on
+/// `push_raw_input`.  Retained only for out-of-tree or diagnostic use.
+/// Prefer `tcgetattr` or kernel-side line discipline for new code.
+pub const SYS_GET_TERMIOS_LFLAG: u64 = 0x100D;
+pub const SYS_GET_TERMIOS_IFLAG: u64 = 0x100E;
+pub const SYS_GET_TERMIOS_OFLAG: u64 = 0x100F;
+
+/// Get TTY0 c_lflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
+pub fn get_termios_lflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_LFLAG) as u32 }
+}
+
+/// Get TTY0 c_iflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
+pub fn get_termios_iflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_IFLAG) as u32 }
+}
+
+/// Get TTY0 c_oflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
+pub fn get_termios_oflag() -> u32 {
+    unsafe { syscall0(SYS_GET_TERMIOS_OFLAG) as u32 }
+}
+
+/// Phase 52c: push raw input byte through kernel line discipline.
+pub const SYS_PUSH_RAW_INPUT: u64 = 0x1010;
+
 // ===========================================================================
 // Socket syscall numbers (Phase 23)
 // ===========================================================================
@@ -482,6 +876,7 @@ pub const SEEK_END: usize = 2;
 
 pub const SIGHUP: i32 = 1;
 pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
 pub const SIGKILL: i32 = 9;
 pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
@@ -530,9 +925,13 @@ pub const ISTRIP: u32 = 0o000040;
 
 // c_oflag constants
 pub const OPOST: u32 = 0o000001;
+pub const ONLCR: u32 = 0o000004;
 
 // c_cflag constants
 pub const CS8: u32 = 0o000060;
+pub const CREAD: u32 = 0o000200;
+pub const HUPCL: u32 = 0o000400;
+pub const B38400: u32 = 0o060000;
 
 /// Terminal I/O settings, matching the Linux *kernel* `termios` layout
 /// used by the TCGETS/TCSETS ioctls (36 bytes).
@@ -1339,6 +1738,15 @@ pub fn framebuffer_mmap() -> u64 {
 /// Returns the scancode (0x01–0xFF), or 0 if no key is pending.
 pub fn read_scancode() -> u64 {
     unsafe { syscall0(SYS_READ_SCANCODE) }
+}
+
+/// Push a single raw input byte through the kernel's line discipline.
+///
+/// The kernel processes the byte through TTY0's LineDiscipline (iflag
+/// transforms, signal generation, canonical editing, echo) and delivers
+/// the result to stdin.
+pub fn push_raw_input(byte: u8) -> i64 {
+    unsafe { syscall1(SYS_PUSH_RAW_INPUT, byte as u64) as i64 }
 }
 
 /// Write a string slice to a file descriptor.

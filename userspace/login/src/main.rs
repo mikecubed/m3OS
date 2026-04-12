@@ -53,7 +53,6 @@ fn login_once() {
 
     // Check if account is locked (first-boot setup).
     if is_locked_account(&shadow_buf[..shadow_len], username) {
-        let _ = write(STDOUT_FILENO, b"\n");
         write_str(STDOUT_FILENO, "Account requires initial password setup.\n");
         write_str(STDOUT_FILENO, "Set password for ");
         let _ = write(STDOUT_FILENO, username);
@@ -89,7 +88,6 @@ fn login_once() {
         // Fall through to authenticated login.
     } else {
         // Normal login — prompt for password.
-        let _ = write(STDOUT_FILENO, b"\n");
         write_str(STDOUT_FILENO, "Password: ");
         let saved = disable_echo();
         let mut pw_input = [0u8; 128];
@@ -427,13 +425,41 @@ fn copy_with_nul(src: &[u8], dst: &mut [u8]) -> usize {
     n + 1
 }
 
-/// Disable echo on stdin (set raw mode).
+/// Disable echo on stdin for password entry.
+///
+/// Saves the current termios and clears ECHO. On restore, the saved
+/// termios is validated — if all four flag fields are zero (clearly
+/// corrupt `tcgetattr` output from a known kernel copy_to_user bug),
+/// we fall back to sensible cooked-mode defaults. A valid raw-mode
+/// termios (c_lflag == 0 but c_cflag != 0) is preserved as-is.
 fn disable_echo() -> Option<syscall_lib::Termios> {
     if let Ok(t) = syscall_lib::tcgetattr(0) {
-        let mut raw = t;
+        // Detect fully-zeroed struct from a copy_to_user bug: all four
+        // flag fields zero is not a legitimate termios configuration
+        // (c_cflag must carry baud + char-size bits for any real TTY).
+        let saved = if t.c_iflag == 0 && t.c_oflag == 0 && t.c_cflag == 0 && t.c_lflag == 0 {
+            syscall_lib::Termios {
+                c_iflag: syscall_lib::ICRNL,
+                c_oflag: syscall_lib::OPOST | syscall_lib::ONLCR,
+                c_cflag: syscall_lib::CS8
+                    | syscall_lib::CREAD
+                    | syscall_lib::HUPCL
+                    | syscall_lib::B38400,
+                c_lflag: syscall_lib::ICANON
+                    | syscall_lib::ECHO
+                    | syscall_lib::ECHOE
+                    | syscall_lib::ISIG
+                    | syscall_lib::IEXTEN,
+                c_line: 0,
+                c_cc: t.c_cc,
+            }
+        } else {
+            t
+        };
+        let mut raw = saved;
         raw.c_lflag &= !(syscall_lib::ECHO | syscall_lib::ECHOE);
         let _ = syscall_lib::tcsetattr(0, &raw);
-        Some(t)
+        Some(saved)
     } else {
         None
     }

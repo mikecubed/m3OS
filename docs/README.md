@@ -54,6 +54,11 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Architectural Declaration](./49-architectural-declaration.md) | 49 | Syscall decomposition, keep/move/transition matrix, userspace-first rule |
 | [IPC Completion](./50-ipc-completion.md) | 50 | Capability grants, bulk-data transport, ring-3-safe registry, server-loop failure semantics |
 | [Service Model Maturity](./51-service-model-maturity.md) | 51 | Stable service contract, restart backoff, crash classification, shutdown ordering, admin hardening |
+| [First Service Extractions](./52-first-service-extractions.md) | 52 | Console and keyboard extracted to ring-3 services, restart behavior, IPC-based input/output |
+| [Kernel Reliability Fixes](./52a-kernel-reliability-fixes.md) | 52a | Stale resume-state, sunset waker, clear_child_tid, and exec signal-reset fixes |
+| [Kernel Structural Hardening](./52b-kernel-structural-hardening.md) | 52b | AddressSpace, typed user buffers, task-owned return state, batched TLB, frame zeroing |
+| [Kernel Architecture Evolution](./52c-kernel-architecture-evolution.md) | 52c | VMA tree, growable IPC tables, kernel line-discipline infrastructure, ISR wakeups |
+| [Kernel Completion and Roadmap Alignment](./52d-kernel-completion-and-roadmap-alignment.md) | 52d | Return-state closure, keyboard convergence, bootfixes, and release-gate/initrd cleanup |
 
 ### Roadmap
 
