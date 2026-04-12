@@ -422,7 +422,7 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
 ///
 /// Returns the new capability handle on success, or `u64::MAX` on error.
 fn ipc_create_endpoint(task_id: crate::task::TaskId) -> u64 {
-    let ep_id = match endpoint::ENDPOINTS.lock().try_create() {
+    let ep_id = match endpoint::ENDPOINTS.lock().try_create_owned(task_id) {
         Some(id) => id,
         None => return u64::MAX,
     };

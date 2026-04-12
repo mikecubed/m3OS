@@ -106,6 +106,16 @@ impl EndpointRegistry {
         Some(EndpointId(old_len as u8))
     }
 
+    /// Like [`try_create`] but records the owning task so the endpoint can
+    /// be reclaimed on task exit.  Used by the `create_endpoint` syscall.
+    pub fn try_create_owned(&mut self, owner: TaskId) -> Option<EndpointId> {
+        let id = self.try_create()?;
+        if let Some(ep) = self.get_mut(id) {
+            ep.owner = Some(owner);
+        }
+        Some(id)
+    }
+
     /// Free an endpoint slot so it can be reused.
     ///
     /// Used to roll back a `try_create` when the subsequent capability insert
@@ -119,6 +129,19 @@ impl EndpointRegistry {
     /// Borrow a mutable reference to an endpoint.
     pub fn get_mut(&mut self, id: EndpointId) -> Option<&mut Endpoint> {
         self.slots.get_mut(id.0 as usize)?.as_mut()
+    }
+
+    /// Destroy all endpoints owned by `task_id`, returning their slots to
+    /// the free pool.  Kernel-created endpoints (`owner == None`) are not
+    /// affected.
+    pub fn destroy_owned_by(&mut self, task_id: TaskId) {
+        for slot in self.slots.iter_mut() {
+            if let Some(ep) = slot
+                && ep.owner == Some(task_id)
+            {
+                *slot = None;
+            }
+        }
     }
 
     /// Return the current number of slots (for iteration / diagnostics).
@@ -143,6 +166,9 @@ pub struct Endpoint {
     pub(super) senders: VecDeque<PendingSend>,
     /// Tasks blocked waiting to *receive* a message.
     pub(super) receivers: VecDeque<TaskId>,
+    /// Owner task for user-created endpoints (`Some`), or `None` for
+    /// kernel-created static endpoints.  Used for reclamation on task exit.
+    pub(super) owner: Option<TaskId>,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
@@ -159,6 +185,7 @@ impl Endpoint {
         Endpoint {
             senders: VecDeque::new(),
             receivers: VecDeque::new(),
+            owner: None,
         }
     }
 }

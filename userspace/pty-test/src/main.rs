@@ -164,7 +164,7 @@ fn cleanup_shell(mfd: i32, pid: i32, request_exit: bool) -> i32 {
     let waited = waitpid(pid, &mut status, WNOHANG);
     if waited == 0 {
         // SIGHUP first, then poll briefly before escalating to SIGKILL.
-        let _ = kill(pid, 1);
+        let _ = kill(pid, syscall_lib::SIGHUP);
         for _ in 0..20 {
             if waitpid(pid, &mut status, WNOHANG) != 0 {
                 return status;
@@ -283,7 +283,7 @@ fn cleanup_supervisor(ready_fd: i32, hold_fd: i32, pid: i32) -> i32 {
     let mut status = 0i32;
     let waited = waitpid(pid, &mut status, WNOHANG);
     if waited == 0 {
-        let _ = kill(pid, 1);
+        let _ = kill(pid, syscall_lib::SIGHUP);
         for _ in 0..20 {
             if waitpid(pid, &mut status, WNOHANG) != 0 {
                 return status;

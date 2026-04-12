@@ -253,14 +253,14 @@ static int exec_signal_check(void) {
     struct sigaction old;
     memset(&old, 0, sizeof(old));
     if (sigaction(SIGUSR1, NULL, &old) != 0) {
-        printf("[signal-test:exec-check] sigaction query failed\n");
+        fputs("[signal-test:exec-check] sigaction query failed\n", stdout);
         return 99;
     }
     if (old.sa_handler == SIG_DFL) {
-        printf("[signal-test:exec-check] SIGUSR1 is SIG_DFL after exec (correct)\n");
+        fputs("[signal-test:exec-check] SIGUSR1 is SIG_DFL after exec (correct)\n", stdout);
         return 0;
     }
-    printf("[signal-test:exec-check] SIGUSR1 is NOT SIG_DFL after exec (BUG)\n");
+    fputs("[signal-test:exec-check] SIGUSR1 is NOT SIG_DFL after exec (BUG)\n", stdout);
     return 42;
 }
 

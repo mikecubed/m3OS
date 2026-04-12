@@ -428,14 +428,16 @@ fn copy_with_nul(src: &[u8], dst: &mut [u8]) -> usize {
 /// Disable echo on stdin for password entry.
 ///
 /// Saves the current termios and clears ECHO. On restore, the saved
-/// termios is validated — if copy_to_user delivered zeros (known
-/// intermittent kernel bug), we fall back to sensible cooked-mode
-/// defaults to prevent poisoning the terminal state.
+/// termios is validated — if all four flag fields are zero (clearly
+/// corrupt `tcgetattr` output from a known kernel copy_to_user bug),
+/// we fall back to sensible cooked-mode defaults. A valid raw-mode
+/// termios (c_lflag == 0 but c_cflag != 0) is preserved as-is.
 fn disable_echo() -> Option<syscall_lib::Termios> {
     if let Ok(t) = syscall_lib::tcgetattr(0) {
-        // Validate: c_lflag should never be 0 for a console TTY.
-        // If tcgetattr returned zeros (copy_to_user bug), use defaults.
-        let saved = if t.c_lflag == 0 {
+        // Detect fully-zeroed struct from a copy_to_user bug: all four
+        // flag fields zero is not a legitimate termios configuration
+        // (c_cflag must carry baud + char-size bits for any real TTY).
+        let saved = if t.c_iflag == 0 && t.c_oflag == 0 && t.c_cflag == 0 && t.c_lflag == 0 {
             syscall_lib::Termios {
                 c_iflag: syscall_lib::ICRNL,
                 c_oflag: syscall_lib::OPOST | syscall_lib::ONLCR,
@@ -449,7 +451,7 @@ fn disable_echo() -> Option<syscall_lib::Termios> {
                     | syscall_lib::ISIG
                     | syscall_lib::IEXTEN,
                 c_line: 0,
-                c_cc: t.c_cc, // c_cc might still be correct
+                c_cc: t.c_cc,
             }
         } else {
             t

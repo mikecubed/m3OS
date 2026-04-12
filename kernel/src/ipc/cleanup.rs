@@ -13,12 +13,14 @@ use super::notification;
 /// Must be called **before** closing FDs in `do_full_process_exit` so that
 /// IPC peers see the error promptly.
 pub fn cleanup_task_ipc(task_id: TaskId) {
-    // 1. Clean up endpoint queues.
+    // 1. Clean up endpoint queues and reclaim user-created endpoints.
     //
     // Walk every endpoint and remove the dying task from both sender and
     // receiver queues.  For senders with `wants_reply == true` (i.e. the
     // dying task was in a `call`), the pending send is simply dropped —
     // the task will never consume a reply anyway.
+    // After draining queues, destroy endpoints owned by this task so their
+    // slots return to the free pool.
     {
         let mut reg = ENDPOINTS.lock();
         let slot_count = reg.slot_count();
@@ -32,6 +34,7 @@ pub fn cleanup_task_ipc(task_id: TaskId) {
                 ep.senders.retain(|ps| ps.task != task_id);
             }
         }
+        reg.destroy_owned_by(task_id);
     }
 
     // 2. Clean up notification waiters.
