@@ -7,6 +7,26 @@
 //! blocks until at least one bit is set, then atomically clears and returns
 //! the pending bits.
 //!
+//! # Pool capacity and ISR-safety constraint
+//!
+//! The notification pool is **fixed-size** (`MAX_NOTIFS = 64`).  This is a
+//! deliberate design choice, not a missing feature:
+//!
+//! - `PENDING` and `ISR_WAITERS` must be accessible from ISR context using
+//!   only lock-free atomics.  A growable `Vec` requires allocation or
+//!   reallocation, neither of which is safe in an interrupt handler.
+//! - A lock-free growable structure (e.g. a concurrent hash map or RCU-
+//!   protected indirection) would add significant complexity for a pool
+//!   that currently needs fewer than 10 active slots.
+//! - 64 slots comfortably cover the foreseeable notification demand (one
+//!   per IRQ line, one per keyboard/timer/network device, plus userspace
+//!   IPC notifications).  Exhaustion is diagnosed at runtime.
+//!
+//! If a future phase requires more than 64 concurrent notification objects,
+//! the recommended path is a two-level indirection: a fixed-size ISR-visible
+//! fast table backed by a growable overflow pool accessed only from task
+//! context.  This is explicitly deferred.
+//!
 //! # ISR-safety design
 //!
 //! [`signal_irq`] is called from the keyboard interrupt handler and must not
@@ -15,22 +35,31 @@
 //!
 //! To achieve this, the module separates its state into two layers:
 //!
-//! - **Lock-free layer** (`PENDING`, `IRQ_MAP`): plain `AtomicU64`/`AtomicU8`
-//!   arrays indexed by `NotifId`.  Safe to read/write from interrupt handlers.
-//! - **Mutex-protected layer** (`WAITERS`): holds the `Option<TaskId>` for the
-//!   task currently blocked in [`wait`].  Only accessed from task context,
-//!   never from interrupt handlers.
+//! - **Lock-free layer** (`PENDING`, `IRQ_MAP`, `ISR_WAITERS`): plain
+//!   `AtomicU64`/`AtomicU8`/`AtomicI32` arrays indexed by `NotifId`.
+//!   Safe to read/write from interrupt handlers.
+//! - **Mutex-protected layer** (`WAITERS`, `ALLOCATED`): holds waiter and
+//!   allocation state.  Only accessed from task context, never from
+//!   interrupt handlers.
 //!
 //! [`signal_irq`] exclusively uses the lock-free layer.  It sets bits in
-//! `PENDING` and calls [`signal_reschedule`] to ensure the waiting task is
-//! eventually rescheduled.  On its next run the task drains `PENDING` and
-//! returns the accumulated bits without any further IPC.
+//! `PENDING` and pushes the waiter to the per-core `IsrWakeQueue` (if
+//! registered in `ISR_WAITERS`), then calls [`signal_reschedule`] to ensure
+//! the waiting task is eventually rescheduled.
 //!
 //! [`signal`] (used from the `notify_signal` syscall in task context) follows
 //! the same lock-free bit-set, then additionally attempts to wake the waiter
 //! via the mutex-protected `WAITERS` layer.  Because it runs in task context
 //! (with no scheduler lock held), the scheduler-lock acquisition inside
 //! [`wake_task`] is safe.
+//!
+//! # Exhaustion behavior
+//!
+//! - [`try_create`] returns `None` when all 64 slots are occupied.  A
+//!   diagnostic `log::warn` is emitted on exhaustion.
+//! - [`create`] panics on exhaustion (used for kernel-internal allocations
+//!   where failure is not recoverable).
+//! - Userspace-facing syscalls use `try_create` and return an error code.
 //!
 //! # Typical use: IRQ delivery
 //!
@@ -60,8 +89,10 @@ pub use kernel_core::types::NotifId;
 
 /// Maximum number of notification objects.
 ///
-/// Fixed-size because `PENDING` must be accessible from ISR context (lock-free).
-/// Increased from 16 to 64 to accommodate more concurrent notification objects.
+/// Fixed at 64 because `PENDING` and `ISR_WAITERS` must be accessible from
+/// ISR context using only lock-free atomics.  A growable pool would require
+/// allocation or lock-based indirection, neither of which is ISR-safe.
+/// See the module-level doc for the full rationale and deferred design.
 pub(super) const MAX_NOTIFS: usize = 64;
 
 /// Per-notification pending bitfields.
@@ -142,6 +173,11 @@ pub fn capacity() -> usize {
     MAX_NOTIFS
 }
 
+/// Return the number of currently allocated notification slots.
+pub fn allocated_count() -> usize {
+    ALLOCATED.lock().iter().filter(|&&b| b).count()
+}
+
 // ---------------------------------------------------------------------------
 // Public API (used from kernel and ipc/mod.rs dispatch)
 // ---------------------------------------------------------------------------
@@ -163,9 +199,23 @@ pub fn try_create() -> Option<NotifId> {
     for (i, slot) in alloc.iter_mut().enumerate() {
         if !*slot {
             *slot = true;
+            // Warn once when pool usage crosses the 75% threshold.
+            let in_use = alloc.iter().filter(|&&b| b).count();
+            if in_use == MAX_NOTIFS * 3 / 4 {
+                log::warn!(
+                    "[ipc::notification] pool at {}/{} (75% threshold crossed)",
+                    in_use,
+                    MAX_NOTIFS,
+                );
+            }
             return Some(NotifId(i as u8));
         }
     }
+    log::warn!(
+        "[ipc::notification] pool exhausted ({}/{} slots in use)",
+        MAX_NOTIFS,
+        MAX_NOTIFS
+    );
     None
 }
 
@@ -230,13 +280,11 @@ pub fn try_register_irq(irq: u8, notif_id: NotifId) -> bool {
 /// Deliver a hardware IRQ to its registered notification object.
 ///
 /// **ISR-safe** — uses only lock-free atomics and does not call `wake_task`.
-/// The waiting task will see the pending bits and return from [`wait`] on its
-/// next scheduler dispatch.
-///
-/// Phase 52 enhancement: if a waiter is registered in `ISR_WAITERS` (lock-free
-/// mirror), push its task index to the current core's `IsrWakeQueue` so the
-/// scheduler can wake it directly on the next loop iteration without waiting
-/// for the tick-driven `drain_pending_waiters()`.
+/// If a waiter is registered in `ISR_WAITERS`, its task index is pushed to
+/// the current core's `IsrWakeQueue` so the scheduler can wake it on the
+/// next loop iteration (sub-ms latency).  If the ISR wake queue is full or
+/// the waiter was not yet registered, the fallback `drain_pending_waiters()`
+/// on the BSP will catch it on the next tick (~10 ms).
 pub fn signal_irq(irq: u8) {
     let idx = IRQ_MAP
         .get(irq as usize)

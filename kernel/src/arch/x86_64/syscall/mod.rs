@@ -774,6 +774,47 @@ pub(crate) fn per_core_syscall_user_rsp() -> u64 {
     crate::smp::per_core().syscall_user_rsp
 }
 
+/// Phase 52d B.1: snapshot the current per-core user state into the
+/// running task's `UserReturnState`.
+///
+/// Called once at the top of `syscall_handler`, before any blocking or
+/// yield path, so that the task carries an authoritative resume contract
+/// regardless of which code path it takes.  Block/yield helpers in the
+/// scheduler still call `save_user_return_state` as a safety net (e.g.
+/// for IRQ-driven preemption that bypasses `syscall_handler`), but this
+/// entry-point snapshot is the primary source of truth.
+fn snapshot_user_return_state() {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return; // kernel tasks have no user return state
+    }
+    let pc = crate::smp::per_core();
+    let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
+    let (cr3, as_gen) = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        match table.find(pid) {
+            Some(p) => {
+                let cr3 = p
+                    .addr_space
+                    .as_ref()
+                    .map(|a| a.pml4_phys().as_u64())
+                    .unwrap_or(0);
+                let as_gen = p.addr_space.as_ref().map(|a| a.generation()).unwrap_or(0);
+                (cr3, as_gen)
+            }
+            None => (0, 0),
+        }
+    };
+    let urs = crate::task::UserReturnState {
+        user_rsp: pc.syscall_user_rsp,
+        kernel_stack_top: pc.syscall_stack_top,
+        fs_base: fs,
+        cr3_phys: cr3,
+        addr_space_gen: as_gen,
+    };
+    crate::task::scheduler::set_current_user_return(urs);
+}
+
 /// Update the per-core `syscall_stack_top` (e.g. on process switch).
 ///
 /// # Safety
@@ -1070,7 +1111,11 @@ mod syscall_nr {
     pub const GET_TERMIOS_FLAGS: u64 = 0x100B;
     /// Phase 52: signal EOF on kernel stdin from userspace.
     pub const STDIN_SIGNAL_EOF: u64 = 0x100C;
-    /// Phase 52: get individual termios fields as direct return values.
+    /// Temporary compatibility: direct register-return termios field reads.
+    /// Introduced as a `copy_to_user` reliability workaround (Phase 52).
+    /// No in-tree binary depends on these after Phase 52d Track C converged
+    /// keyboard input on `PUSH_RAW_INPUT`.  Retained for out-of-tree or
+    /// diagnostic use only; prefer `tcgetattr` or the kernel line discipline.
     pub const GET_TERMIOS_LFLAG: u64 = 0x100D;
     pub const GET_TERMIOS_IFLAG: u64 = 0x100E;
     pub const GET_TERMIOS_OFLAG: u64 = 0x100F;
@@ -1132,6 +1177,13 @@ pub extern "C" fn syscall_handler(
     user_rsp: u64,
 ) -> u64 {
     use syscall_nr::*;
+
+    // Phase 52d B.1: snapshot user return state once at syscall entry,
+    // before any blocking or yield path can run.  This makes the task's
+    // `UserReturnState` the authoritative source of truth for the
+    // scheduler's restore path — block/yield sites no longer need to be
+    // the primary save point.
+    snapshot_user_return_state();
 
     // Phase 52b: debug-assert that per-core current_addrspace matches the
     // calling process's addr_space (catches stale CR3 / process mismatch).
@@ -1401,6 +1453,7 @@ pub extern "C" fn syscall_handler(
         READ_KBD_SCANCODE => sys_read_kbd_scancode(),
         GET_TERMIOS_FLAGS => sys_get_termios_flags(arg0, arg1),
         STDIN_SIGNAL_EOF => sys_stdin_signal_eof(),
+        // Temporary compatibility — no in-tree callers after Phase 52d Track C.
         GET_TERMIOS_LFLAG => crate::tty::TTY0.lock().ldisc.termios.c_lflag as u64,
         GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().ldisc.termios.c_iflag as u64,
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
@@ -2173,6 +2226,31 @@ unsafe fn restore_and_enter_userspace(regs: &crate::signal::SavedUserRegs) -> ! 
     }
 }
 
+fn encode_rt_sigaction(action: crate::process::SignalAction) -> [u8; 32] {
+    let mut sa = [0u8; 32];
+    match action {
+        crate::process::SignalAction::Default => {
+            sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
+        }
+        crate::process::SignalAction::Ignore => {
+            sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
+        }
+        crate::process::SignalAction::Handler {
+            entry,
+            mask,
+            flags,
+            restorer,
+        } => {
+            sa[0..8].copy_from_slice(&entry.to_ne_bytes());
+            sa[8..16].copy_from_slice(&flags.to_ne_bytes());
+            sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
+            // Convert kernel mask back to userspace (0-indexed).
+            sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
+        }
+    }
+    sa
+}
+
 /// `rt_sigaction(sig, act, oldact, sigsetsize)` — install/query signal handler (syscall 13).
 pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
     let sig = sig as u32;
@@ -2184,47 +2262,9 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    let pid = crate::process::current_pid();
-    let mut table = crate::process::PROCESS_TABLE.lock();
-    let proc = match table.find_mut(pid) {
-        Some(p) => p,
-        None => return NEG_EINVAL,
-    };
-
-    // Write old action if requested.
-    // Linux struct sigaction layout: sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8) = 32 bytes
-    if oldact_ptr != 0 {
-        let mut old_sa = [0u8; 32];
-        match proc.sigaction_get(sig as usize) {
-            crate::process::SignalAction::Default => {
-                old_sa[0..8].copy_from_slice(&0u64.to_ne_bytes()); // SIG_DFL
-            }
-            crate::process::SignalAction::Ignore => {
-                old_sa[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SIG_IGN
-            }
-            crate::process::SignalAction::Handler {
-                entry,
-                mask,
-                flags,
-                restorer,
-            } => {
-                old_sa[0..8].copy_from_slice(&entry.to_ne_bytes());
-                old_sa[8..16].copy_from_slice(&flags.to_ne_bytes());
-                old_sa[16..24].copy_from_slice(&restorer.to_ne_bytes());
-                // Convert kernel mask back to userspace (0-indexed).
-                old_sa[24..32].copy_from_slice(&(mask >> 1).to_ne_bytes());
-            }
-        }
-        if UserSliceWo::new(oldact_ptr, old_sa.len())
-            .and_then(|s| s.copy_from_kernel(&old_sa))
-            .is_err()
-        {
-            return NEG_EFAULT;
-        }
-    }
-
-    // Read new action if provided.
-    if act_ptr != 0 {
+    // Copy user buffers outside PROCESS_TABLE so fault-time user copies do not
+    // reenter the process table lock.
+    let new_sa_bytes: Option<[u8; 32]> = if act_ptr != 0 {
         let mut sa = [0u8; 32];
         if UserSliceRo::new(act_ptr, sa.len())
             .and_then(|s| s.copy_to_kernel(&mut sa))
@@ -2232,6 +2272,13 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         {
             return NEG_EFAULT;
         }
+        Some(sa)
+    } else {
+        None
+    };
+
+    let pid = crate::process::current_pid();
+    let new_action = if let Some(sa) = new_sa_bytes {
         let handler_addr = u64::from_ne_bytes(sa[0..8].try_into().unwrap());
         let sa_flags = u64::from_ne_bytes(sa[8..16].try_into().unwrap());
         let sa_restorer = u64::from_ne_bytes(sa[16..24].try_into().unwrap());
@@ -2245,15 +2292,14 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
         if sa_restorer != 0 && sa_restorer >= USER_LIMIT {
             return NEG_EINVAL;
         }
-        // Convert userspace mask (0-indexed) to kernel mask (signal-number-indexed).
+        // Convert userspace mask (0-indexed) to kernel mask
+        // (signal-number-indexed).
         let sa_mask = u64::from_ne_bytes(sa[24..32].try_into().unwrap()) << 1;
 
-        let new_action = match handler_addr {
+        Some(match handler_addr {
             0 => crate::process::SignalAction::Default, // SIG_DFL
             1 => crate::process::SignalAction::Ignore,  // SIG_IGN
             _ => {
-                // Warn if SA_RESTORER is missing — musl always sets it.
-                // Without a restorer, the handler cannot return to sigreturn.
                 let effective_restorer = if sa_flags & SA_RESTORER != 0 {
                     sa_restorer
                 } else {
@@ -2272,6 +2318,69 @@ pub(super) fn sys_rt_sigaction(sig: u64, act_ptr: u64, oldact_ptr: u64) -> u64 {
                     restorer: effective_restorer,
                 }
             }
+        })
+    } else {
+        None
+    };
+
+    // Snapshot/copy the old action outside PROCESS_TABLE so user faults cannot
+    // reenter the lock. When replacing the action, retry until the copied-out
+    // snapshot still matches the action we are about to overwrite.
+    if oldact_ptr != 0 {
+        if let Some(new_action) = new_action {
+            loop {
+                let old_action = {
+                    let table = crate::process::PROCESS_TABLE.lock();
+                    let proc = match table.find(pid) {
+                        Some(p) => p,
+                        None => return NEG_EINVAL,
+                    };
+                    proc.sigaction_get(sig as usize)
+                };
+                let old_sa = encode_rt_sigaction(old_action);
+                if UserSliceWo::new(oldact_ptr, old_sa.len())
+                    .and_then(|s| s.copy_from_kernel(&old_sa))
+                    .is_err()
+                {
+                    return NEG_EFAULT;
+                }
+
+                let mut table = crate::process::PROCESS_TABLE.lock();
+                let proc = match table.find_mut(pid) {
+                    Some(p) => p,
+                    None => return NEG_EINVAL,
+                };
+                if proc.sigaction_get(sig as usize) != old_action {
+                    continue;
+                }
+                proc.sigaction_set(sig as usize, new_action);
+                return 0;
+            }
+        }
+
+        let old_action = {
+            let table = crate::process::PROCESS_TABLE.lock();
+            let proc = match table.find(pid) {
+                Some(p) => p,
+                None => return NEG_EINVAL,
+            };
+            proc.sigaction_get(sig as usize)
+        };
+        let old_sa = encode_rt_sigaction(old_action);
+        if UserSliceWo::new(oldact_ptr, old_sa.len())
+            .and_then(|s| s.copy_from_kernel(&old_sa))
+            .is_err()
+        {
+            return NEG_EFAULT;
+        }
+        return 0;
+    }
+
+    if let Some(new_action) = new_action {
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        let proc = match table.find_mut(pid) {
+            Some(p) => p,
+            None => return NEG_EINVAL,
         };
         proc.sigaction_set(sig as usize, new_action);
     }
@@ -3039,6 +3148,14 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         crate::mm::free_process_page_table(child_cr3.start_address().as_u64());
         return u64::MAX;
     }
+    {
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(parent) = table.find(crate::process::current_pid())
+            && let Some(ref addr_space) = parent.addr_space
+        {
+            addr_space.bump_generation();
+        }
+    }
 
     // Inherit parent's brk/mmap state and FD table so the child's heap
     // and file descriptors are consistent with the copied address space.
@@ -3282,7 +3399,35 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
     let name: &str = &resolved_name;
-    log::info!("[p{}] execve({})", crate::process::current_pid(), name);
+    let pid = crate::process::current_pid();
+    log::info!("[p{}] execve({})", pid, name);
+    // Until exec() grows full "single surviving thread" semantics, only allow
+    // it from the canonical single-threaded TGID owner. Otherwise shared-mm
+    // metadata would remain anchored on a different Process entry.
+    let exec_thread_state = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).map(|proc| {
+            let has_other_members = proc
+                .thread_group
+                .as_ref()
+                .map(|tg| tg.members.lock().iter().any(|&tid| tid != pid))
+                .unwrap_or(false);
+            let is_canonical_exec_owner = proc.pid == proc.tgid;
+            (has_other_members, is_canonical_exec_owner, proc.tgid)
+        })
+    };
+    if let Some((has_other_members, is_canonical_exec_owner, tgid)) = exec_thread_state
+        && (has_other_members || !is_canonical_exec_owner)
+    {
+        log::warn!(
+            "[execve] rejecting thread-group exec for pid {} (tgid={}, has_other_members={}, canonical_owner={})",
+            pid,
+            tgid,
+            has_other_members,
+            is_canonical_exec_owner
+        );
+        return NEG_EBUSY;
+    }
     let data: &[u8] = match (exec_static, exec_owned.as_deref()) {
         (Some(data), None) => data,
         (None, Some(data)) => data,
@@ -3338,30 +3483,30 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     // Close file descriptors with FD_CLOEXEC set.
-    let pid = crate::process::current_pid();
     crate::process::close_cloexec_fds(pid);
 
-    // Deactivate old AddressSpace tracking BEFORE replacing it in the
-    // process table (the old Arc is freed on replacement, so the raw
-    // pointer in current_addrspace would dangle after that).
-    if crate::smp::is_per_core_ready() {
-        let pc = crate::smp::per_core();
-        let old_as_ptr = pc.current_addrspace;
-        if !old_as_ptr.is_null() {
-            // SAFETY: old_as_ptr was set from a valid Arc<AddressSpace>
-            // still held by the process entry — not yet replaced.
-            unsafe { &*old_as_ptr }.deactivate_on_core(pc.core_id);
-        }
-    }
+    // Keep the old AddressSpace alive across the CR3 switch. The process table
+    // replacement below drops its Arc, but this core still runs on the old CR3
+    // until `Cr3::write(new_cr3)` completes.
+    let _old_addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+    let old_as_ptr = _old_addr_space
+        .as_ref()
+        .map(|addr_space| addr_space.as_ref() as *const crate::mm::AddressSpace)
+        .unwrap_or(core::ptr::null());
+    let new_addr_space = alloc::sync::Arc::new(crate::mm::AddressSpace::new(
+        x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
+    ));
+    let new_as_ptr = alloc::sync::Arc::as_ptr(&new_addr_space);
 
     // Update the process entry with the new CR3 and entry point.
     // Reset brk/mmap state since the address space is completely replaced.
     {
         let mut table = crate::process::PROCESS_TABLE.lock();
         if let Some(proc) = table.find_mut(pid) {
-            proc.addr_space = Some(alloc::sync::Arc::new(crate::mm::AddressSpace::new(
-                x86_64::PhysAddr::new(new_cr3.start_address().as_u64()),
-            )));
+            proc.addr_space = Some(new_addr_space.clone());
             proc.entry_point = loaded.entry;
             proc.user_stack_top = user_rsp;
             proc.brk_current = 0;
@@ -3393,26 +3538,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     }
 
-    // Activate the new AddressSpace on this core and update the pointer.
-    if crate::smp::is_per_core_ready() {
-        let pc = crate::smp::per_core();
-        let core_id = pc.core_id;
-        let new_as_ptr = {
-            let table = crate::process::PROCESS_TABLE.lock();
-            table
-                .find(pid)
-                .and_then(|p| p.addr_space.as_ref())
-                .map(|a| a.as_ref() as *const crate::mm::AddressSpace)
-                .unwrap_or_default()
-        };
-        if !new_as_ptr.is_null() {
-            // SAFETY: new_as_ptr points into the Arc just stored above.
-            unsafe { &*new_as_ptr }.activate_on_core(core_id);
-        }
-        let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
-        unsafe { (*pc_mut).current_addrspace = new_as_ptr };
-    }
-
     // Switch to the new page table and enter ring 3.
     // SAFETY: new_cr3 is valid, entry and user_rsp are within it.
     unsafe {
@@ -3421,6 +3546,21 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         let (old_cr3, _) = Cr3::read();
         let old_cr3_phys = old_cr3.start_address().as_u64();
         Cr3::write(new_cr3, Cr3Flags::empty());
+        if crate::smp::is_per_core_ready() {
+            let pc = crate::smp::per_core();
+            let core_id = pc.core_id;
+            if !old_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                // SAFETY: `_old_addr_space` keeps the old AddressSpace alive
+                // until after this core has switched away from its CR3.
+                (&*old_as_ptr).deactivate_on_core(core_id);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            if !new_as_ptr.is_null() && old_as_ptr != new_as_ptr {
+                (&*new_as_ptr).activate_on_core(core_id);
+            }
+            let pc_mut = pc as *const crate::smp::PerCoreData as *mut crate::smp::PerCoreData;
+            (*pc_mut).current_addrspace = new_as_ptr;
+        }
         // Free the old page table's user-space frames now that CR3 no longer
         // points to it. The bump allocator makes this a no-op today; the
         // real reclamation happens in Phase 13 when a free list is added.
@@ -6879,40 +7019,37 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 
     let pid = crate::process::current_pid();
 
-    // Determine base address: use process mmap_next or default ANON_MMAP_BASE.
-    let base = {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        let proc = match table.find_mut(pid) {
-            Some(p) => p,
-            None => return NEG_EINVAL,
-        };
-        if proc.mmap_next == 0 {
-            proc.mmap_next = ANON_MMAP_BASE;
-        }
-        // Hint address is ignored: always allocate linearly.
-        let _ = addr_hint;
-        let base = proc.mmap_next;
-        let total_size = match pages.checked_mul(4096) {
-            Some(s) => s,
-            None => return NEG_EINVAL,
-        };
-        proc.mmap_next = match base.checked_add(total_size) {
-            Some(v) => v,
-            None => return NEG_EINVAL,
-        };
-        base
-    };
-
-    // Validate that the entire range fits in canonical user space (< 0x0000_8000_0000_0000).
     let total_size = match pages.checked_mul(4096) {
         Some(s) => s,
         None => return NEG_EINVAL,
     };
+    // Hint address is ignored: always allocate linearly.
+    let _ = addr_hint;
+    // Determine base address: use process mmap_next or default ANON_MMAP_BASE.
+    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+    let base =
+        match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            let current = if *mmap_next == 0 {
+                ANON_MMAP_BASE
+            } else {
+                *mmap_next
+            };
+            let next = current
+                .checked_add(total_size)
+                .filter(|v| *v <= USER_SPACE_END)?;
+            *mmap_next = next;
+            Some(current)
+        }) {
+            Some(Some(base)) => base,
+            _ => return NEG_EINVAL,
+        };
+
+    // Validate that the entire range fits in canonical user space (< 0x0000_8000_0000_0000).
     let range_end = match base.checked_add(total_size) {
         Some(e) => e,
         None => return NEG_EINVAL,
     };
-    if range_end > 0x0000_8000_0000_0000 {
+    if range_end > USER_SPACE_END {
         return NEG_EINVAL;
     }
 
@@ -6922,14 +7059,21 @@ pub(super) fn sys_linux_mmap(addr_hint: u64, len: u64, prot: u64) -> u64 {
 
     // Record the mapping in the process's tracking list.
     {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.vma_tree.insert(crate::process::MemoryMapping {
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
                 prot,
                 flags,
             });
+        });
+        // Phase 52d B.3: bump generation — the address space changed
+        // (new VMA, pages will be demand-faulted).
+        let table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find(pid)
+            && let Some(ref addr_space) = proc.addr_space
+        {
+            addr_space.bump_generation();
         }
     }
 
@@ -6980,118 +7124,133 @@ fn sys_mmap_file_backed(
 
     let pid = crate::process::current_pid();
     let phys_off = crate::mm::phys_offset();
-
-    // Claim a virtual address range.
-    let base = {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        let proc = match table.find_mut(pid) {
-            Some(p) => p,
-            None => return NEG_EINVAL,
-        };
-        if proc.mmap_next == 0 {
-            proc.mmap_next = ANON_MMAP_BASE;
-        }
-        let b = proc.mmap_next;
-        let end = match b.checked_add(total_size) {
-            Some(v) if v <= 0x0000_8000_0000_0000 => v,
-            _ => return NEG_EINVAL,
-        };
-        proc.mmap_next = end;
-        b
-    };
-
-    // Get the process CR3 for the mapper.
-    let cr3_phys = {
+    let addr_space = {
         let table = crate::process::PROCESS_TABLE.lock();
-        match table
-            .find(pid)
-            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
-        {
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+    let base = {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        // Claim a virtual address range.
+        let base =
+            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                let current = if *mmap_next == 0 {
+                    ANON_MMAP_BASE
+                } else {
+                    *mmap_next
+                };
+                let end = current
+                    .checked_add(total_size)
+                    .filter(|v| *v <= 0x0000_8000_0000_0000)?;
+                *mmap_next = end;
+                Some(current)
+            }) {
+                Some(Some(base)) => base,
+                _ => return NEG_EINVAL,
+            };
+        let reservation_end = base + total_size;
+
+        // Get the process CR3 for the mapper.
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
             Some(phys) => phys,
             None => return NEG_EINVAL,
-        }
-    };
-    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
-        Ok(f) => f,
-        Err(_) => return NEG_EINVAL,
-    };
-
-    // Allocate frames, fill from file, map into page table.
-    let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
-    let mut page_buf = alloc::vec![0u8; 4096];
-
-    for i in 0..pages {
-        let frame = match crate::mm::frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => {
-                log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
-                // Roll back already-allocated frames.
-                for f in &mapped_frames {
-                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
-                }
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(proc) = table.find_mut(pid) {
-                    proc.mmap_next = base;
-                }
-                return NEG_ENOMEM;
-            }
+        };
+        let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+            Ok(f) => f,
+            Err(_) => return NEG_EINVAL,
         };
 
-        // Zero the frame then fill from file.
-        let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-        unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
+        // Allocate frames, fill from file, map into page table.
+        let mut mapped_frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = alloc::vec::Vec::new();
+        let mut page_buf = alloc::vec![0u8; 4096];
 
-        let read_offset = file_offset + (i as usize) * 4096;
-        match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
-            Ok(n) if n > 0 => unsafe {
-                core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
-            },
-            Ok(_) => {} // EOF or past-end page — leave zeroed
-            Err(e) => {
-                // I/O error — clean up and abort.
-                crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
-                for f in &mapped_frames {
-                    crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+        for i in 0..pages {
+            let frame = match crate::mm::frame_allocator::allocate_frame() {
+                Some(f) => f,
+                None => {
+                    log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
+                    // Roll back already-allocated frames.
+                    for f in &mapped_frames {
+                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                    }
+                    let _ = crate::process::with_shared_mm_mut(
+                        pid,
+                        |_brk_current, mmap_next, _vma_tree| {
+                            if *mmap_next == reservation_end {
+                                *mmap_next = base;
+                            }
+                        },
+                    );
+                    return NEG_ENOMEM;
                 }
-                let mut table = crate::process::PROCESS_TABLE.lock();
-                if let Some(proc) = table.find_mut(pid) {
-                    proc.mmap_next = base;
+            };
+
+            // Zero the frame then fill from file.
+            let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
+            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
+
+            let read_offset = file_offset + (i as usize) * 4096;
+            match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
+                Ok(n) if n > 0 => unsafe {
+                    core::ptr::copy_nonoverlapping(page_buf.as_ptr(), frame_ptr, n);
+                },
+                Ok(_) => {} // EOF or past-end page — leave zeroed
+                Err(e) => {
+                    // I/O error — clean up and abort.
+                    crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                    for f in &mapped_frames {
+                        crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+                    }
+                    let _ = crate::process::with_shared_mm_mut(
+                        pid,
+                        |_brk_current, mmap_next, _vma_tree| {
+                            if *mmap_next == reservation_end {
+                                *mmap_next = base;
+                            }
+                        },
+                    );
+                    return e as u64;
                 }
-                return e as u64;
             }
+
+            mapped_frames.push(frame);
         }
 
-        mapped_frames.push(frame);
-    }
-
-    // Map all frames into the process page table.
-    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
-    if unsafe {
-        crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
-    }
-    .is_err()
-    {
-        for f in &mapped_frames {
-            crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+        // Map all frames into the process page table.
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+        if unsafe {
+            crate::mm::user_space::map_user_frames(&mut mapper, base, &mapped_frames, pt_flags)
         }
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.mmap_next = base;
+        .is_err()
+        {
+            for f in &mapped_frames {
+                crate::mm::frame_allocator::free_frame(f.start_address().as_u64());
+            }
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = base;
+                    }
+                });
+            return NEG_EINVAL;
         }
-        return NEG_EINVAL;
-    }
 
-    // Record the VMA.
-    {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.vma_tree.insert(crate::process::MemoryMapping {
+        // Record the VMA while the page-table mutation lock is still held.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
                 start: base,
                 len: total_size,
                 prot,
                 flags,
             });
-        }
+        });
+        base
+    };
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, base, base + total_size);
+        addr_space.bump_generation();
     }
 
     log::info!(
@@ -7126,48 +7285,130 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
         return NEG_EINVAL;
     }
 
-    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
-
-    // SAFETY: current CR3 is the calling process's page table; this is the
-    // same approach used by sys_linux_mmap.
-    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+    use x86_64::registers::control::Cr3;
+    use x86_64::structures::paging::{Mapper, Page, PageTable, PageTableFlags, Size4KiB};
+    let pid = crate::process::current_pid();
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
 
     let mut unmapped_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut frames_to_free: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     let mut device_frame_unmapped = false;
     let mut fb_fully_unmapped = false;
-    for i in 0..pages {
-        let page_addr = addr + (i as u64 * 4096);
-        let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
+    let mut vma_changed = false;
+    {
+        // SAFETY: current CR3 is the calling process's page table; this is the
+        // same approach used by sys_linux_mmap.
+        let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
 
-        // Read PTE flags *before* unmapping to detect device-mapped pages.
-        // BIT_11 marks MMIO / hardware frames (e.g. UEFI framebuffer) that are
-        // not owned by the frame allocator and must not be freed.
-        let is_device_frame = {
-            use x86_64::structures::paging::Translate as _;
-            use x86_64::structures::paging::mapper::TranslateResult;
-            match mapper.translate(x86_64::VirtAddr::new(page_addr)) {
-                TranslateResult::Mapped { flags, .. } => flags.contains(PageTableFlags::BIT_11),
-                _ => false,
-            }
-        };
+        for i in 0..pages {
+            let page_addr = addr + (i as u64 * 4096);
+            let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(page_addr));
 
-        // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
-        match mapper.unmap(page) {
-            Ok((frame, flush)) => {
-                // Skip the local TLB flush here — we batch a single shootdown
-                // (which includes a local invlpg) after the loop.
-                flush.ignore();
+            let guard_frame = unsafe {
+                let phys_off = crate::mm::phys_offset();
+                let phys_offset_va = x86_64::VirtAddr::new(phys_off);
+                let (cr3_frame, _) = Cr3::read();
+                let pml4_phys = cr3_frame.start_address().as_u64();
+
+                let p4_idx = ((page_addr >> 39) & 0x1FF) as usize;
+                let p3_idx = ((page_addr >> 30) & 0x1FF) as usize;
+                let p2_idx = ((page_addr >> 21) & 0x1FF) as usize;
+                let p1_idx = ((page_addr >> 12) & 0x1FF) as usize;
+
+                let pml4: &mut PageTable =
+                    &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
+                if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+                    None
+                } else {
+                    let pdpt: &mut PageTable = &mut *(phys_offset_va
+                        + pml4[p4_idx].addr().as_u64())
+                    .as_mut_ptr::<PageTable>();
+                    if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                        None
+                    } else {
+                        let pd: &mut PageTable = &mut *(phys_offset_va
+                            + pdpt[p3_idx].addr().as_u64())
+                        .as_mut_ptr::<PageTable>();
+                        if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                            None
+                        } else {
+                            let pt: &mut PageTable = &mut *(phys_offset_va
+                                + pd[p2_idx].addr().as_u64())
+                            .as_mut_ptr::<PageTable>();
+                            let flags = pt[p1_idx].flags();
+                            if flags.contains(PageTableFlags::BIT_10)
+                                && !flags.contains(PageTableFlags::PRESENT)
+                            {
+                                let frame_phys = pt[p1_idx].addr().as_u64();
+                                pt[p1_idx].set_unused();
+                                Some((frame_phys, flags.contains(PageTableFlags::BIT_11)))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some((frame_phys, is_device_frame)) = guard_frame {
                 if !is_device_frame {
-                    // Only return system-RAM frames to the allocator.
-                    crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                    frames_to_free.push(frame_phys);
                 } else {
                     device_frame_unmapped = true;
                 }
                 unmapped_addrs.push(page_addr);
+                continue;
             }
-            Err(_) => {
-                // Page wasn't mapped — skip silently.
+
+            // Read PTE flags *before* unmapping to detect device-mapped pages.
+            // BIT_11 marks MMIO / hardware frames (e.g. UEFI framebuffer) that are
+            // not owned by the frame allocator and must not be freed.
+            let is_device_frame = {
+                use x86_64::structures::paging::Translate as _;
+                use x86_64::structures::paging::mapper::TranslateResult;
+                match mapper.translate(x86_64::VirtAddr::new(page_addr)) {
+                    TranslateResult::Mapped { flags, .. } => flags.contains(PageTableFlags::BIT_11),
+                    _ => false,
+                }
+            };
+
+            // Try to unmap — silently skip pages that aren't mapped (POSIX allows this).
+            match mapper.unmap(page) {
+                Ok((frame, flush)) => {
+                    // Skip the local TLB flush here — we batch a single shootdown
+                    // (which includes a local invlpg) after the loop.
+                    flush.ignore();
+                    if !is_device_frame {
+                        // Only return system-RAM frames to the allocator after the
+                        // batched shootdown has invalidated every stale translation.
+                        frames_to_free.push(frame.start_address().as_u64());
+                    } else {
+                        device_frame_unmapped = true;
+                    }
+                    unmapped_addrs.push(page_addr);
+                }
+                Err(_) => {
+                    // Page wasn't mapped — skip silently.
+                }
             }
+        }
+
+        // Update VMA tree: handle full removal, shrink, and split.
+        if let Some((changed, fb_gone)) =
+            crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+                let removed = vma_tree.remove_range(addr, total_size);
+                let changed = !removed.is_empty();
+                let fb_gone = !vma_tree.any(|m| m.flags & FB_MAPPING_FLAG != 0);
+                (changed, fb_gone)
+            })
+        {
+            vma_changed = changed;
+            fb_fully_unmapped = fb_gone;
         }
     }
     let freed_count = unmapped_addrs.len();
@@ -7176,28 +7417,17 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     if !unmapped_addrs.is_empty() {
         let range_start = *unmapped_addrs.iter().min().unwrap();
         let range_end = *unmapped_addrs.iter().max().unwrap() + 4096;
-        // Use targeted range shootdown via the process's AddressSpace.
-        let pid = crate::process::current_pid();
-        let table = crate::process::PROCESS_TABLE.lock();
-        if let Some(p) = table.find(pid)
-            && let Some(ref addr_space) = p.addr_space
-        {
+        if let Some(addr_space) = addr_space.as_ref() {
             crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
         }
-        drop(table);
     }
-
-    // Update VMA tree: handle full removal, shrink, and split.
-    let pid = crate::process::current_pid();
+    for frame_phys in frames_to_free {
+        crate::mm::frame_allocator::free_frame(frame_phys);
+    }
+    if (!unmapped_addrs.is_empty() || vma_changed)
+        && let Some(addr_space) = addr_space.as_ref()
     {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.vma_tree.remove_range(addr, total_size);
-
-            // The FB mapping is fully gone when no mapping with FB_MAPPING_FLAG
-            // survives; a partial unmap leaves a trimmed or split mapping in place.
-            fb_fully_unmapped = !proc.vma_tree.any(|m| m.flags & FB_MAPPING_FLAG != 0);
-        }
+        addr_space.bump_generation();
     }
 
     if freed_count > 0 {
@@ -7260,6 +7490,11 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 
     let (cr3_frame, _) = Cr3::read();
     let pml4_phys = cr3_frame.start_address().as_u64();
+    let pid = crate::process::current_pid();
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
 
     // Build the new PTE flags from prot.
     let mut new_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -7274,57 +7509,92 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 
     let pages = total_size / 4096;
     let mut changed_addrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut vma_changed = false;
+    {
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
 
-    for i in 0..pages {
-        let page_addr = addr + i * 4096;
-        let p4_idx = ((page_addr >> 39) & 0x1FF) as usize;
-        let p3_idx = ((page_addr >> 30) & 0x1FF) as usize;
-        let p2_idx = ((page_addr >> 21) & 0x1FF) as usize;
-        let p1_idx = ((page_addr >> 12) & 0x1FF) as usize;
+        for i in 0..pages {
+            let page_addr = addr + i * 4096;
+            let p4_idx = ((page_addr >> 39) & 0x1FF) as usize;
+            let p3_idx = ((page_addr >> 30) & 0x1FF) as usize;
+            let p2_idx = ((page_addr >> 21) & 0x1FF) as usize;
+            let p1_idx = ((page_addr >> 12) & 0x1FF) as usize;
 
-        unsafe {
-            let pml4: &mut PageTable = &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
-            if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
-                continue; // Not yet demand-mapped — VMA prot update suffices.
-            }
-            let pdpt: &mut PageTable =
-                &mut *(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
-            if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
-                continue;
-            }
-            let pd: &mut PageTable =
-                &mut *(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
-            if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
-                continue;
-            }
-            let pt: &mut PageTable =
-                &mut *(phys_offset_va + pd[p2_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
-            if !pt[p1_idx].flags().contains(PageTableFlags::PRESENT) && !is_prot_none {
-                continue; // Not yet demand-mapped.
-            }
-
-            if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
+            unsafe {
+                let pml4: &mut PageTable =
+                    &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
+                if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
+                    continue; // Not yet demand-mapped — VMA prot update suffices.
+                }
+                let pdpt: &mut PageTable =
+                    &mut *(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+                if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                let pd: &mut PageTable =
+                    &mut *(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+                if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                let pt: &mut PageTable =
+                    &mut *(phys_offset_va + pd[p2_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
                 let old_flags = pt[p1_idx].flags();
-                let old_addr = pt[p1_idx].addr();
-                let is_cow = old_flags.contains(PageTableFlags::BIT_9);
-                let final_flags = if is_prot_none {
-                    // Clear PRESENT to make the page trap on any access.
-                    (old_flags & !PageTableFlags::PRESENT & !PageTableFlags::WRITABLE)
-                        | PageTableFlags::BIT_10 // mark as guard page
-                } else {
-                    // Preserve CoW marker. If the page is CoW, keep it
-                    // non-writable — the CoW fault handler will make it
-                    // writable after copying.
-                    let mut f = new_flags;
-                    if is_cow {
-                        f |= PageTableFlags::BIT_9;
-                        f &= !PageTableFlags::WRITABLE;
+                let is_guard_page = old_flags.contains(PageTableFlags::BIT_10);
+                if !old_flags.contains(PageTableFlags::PRESENT) && !is_guard_page && !is_prot_none {
+                    continue; // Not yet demand-mapped.
+                }
+
+                if old_flags.contains(PageTableFlags::PRESENT) || is_guard_page {
+                    let old_addr = pt[p1_idx].addr();
+                    let is_cow = old_flags.contains(PageTableFlags::BIT_9);
+                    let mut final_flags = old_flags;
+                    if is_prot_none {
+                        // Clear PRESENT to make the page trap on any access.
+                        final_flags &= !PageTableFlags::PRESENT;
+                        final_flags &= !PageTableFlags::WRITABLE;
+                        final_flags |= PageTableFlags::BIT_10; // mark as guard page
+                    } else {
+                        final_flags |= PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+                        final_flags &= !PageTableFlags::BIT_10;
+                        // Preserve CoW marker. If the page is CoW, keep it
+                        // non-writable — the CoW fault handler will make it
+                        // writable after copying.
+                        final_flags &= !PageTableFlags::WRITABLE;
+                        if !is_cow && new_flags.contains(PageTableFlags::WRITABLE) {
+                            final_flags |= PageTableFlags::WRITABLE;
+                        }
+                        final_flags &= !PageTableFlags::NO_EXECUTE;
+                        if new_flags.contains(PageTableFlags::NO_EXECUTE) {
+                            final_flags |= PageTableFlags::NO_EXECUTE;
+                        }
+                        if is_cow {
+                            final_flags |= PageTableFlags::BIT_9;
+                        }
                     }
-                    f
-                };
-                pt[p1_idx].set_addr(old_addr, final_flags);
-                changed_addrs.push(page_addr);
+                    if final_flags != old_flags {
+                        pt[p1_idx].set_addr(old_addr, final_flags);
+                        changed_addrs.push(page_addr);
+                    }
+                }
             }
+        }
+
+        // Update VMA protection bits and split VMAs at mprotect boundaries.
+        if let Some(changed) =
+            crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+                let changed = vma_tree.any(|m| {
+                    let m_end = m.start.saturating_add(m.len);
+                    m.start < mprotect_end && m_end > addr && m.prot != prot
+                });
+                if changed {
+                    vma_tree.update_range_prot(addr, mprotect_end - addr, prot);
+                }
+                changed
+            })
+        {
+            vma_changed = changed;
         }
     }
 
@@ -7332,24 +7602,15 @@ pub(super) fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     if !changed_addrs.is_empty() {
         let range_start = *changed_addrs.iter().min().unwrap();
         let range_end = *changed_addrs.iter().max().unwrap() + 4096;
-        let pid = crate::process::current_pid();
-        let table = crate::process::PROCESS_TABLE.lock();
-        if let Some(p) = table.find(pid)
-            && let Some(ref addr_space) = p.addr_space
-        {
+        if let Some(addr_space) = addr_space.as_ref() {
             crate::smp::tlb::tlb_shootdown_range(addr_space, range_start, range_end);
         }
-        drop(table);
     }
 
-    // Update VMA protection bits and split VMAs at mprotect boundaries.
-    let pid = crate::process::current_pid();
+    if (!changed_addrs.is_empty() || vma_changed)
+        && let Some(addr_space) = addr_space.as_ref()
     {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.vma_tree
-                .update_range_prot(addr, mprotect_end - addr, prot);
-        }
+        addr_space.bump_generation();
     }
 
     0
@@ -7601,7 +7862,10 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
     }
 
     let pid = crate::process::current_pid();
-
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
     // Atomically claim the framebuffer via compare-and-swap before touching
     // page tables.  This eliminates the TOCTOU window that the old two-step
     // check-then-store had: two racing processes can no longer both observe
@@ -7610,100 +7874,99 @@ pub(super) fn sys_framebuffer_mmap() -> u64 {
         return NEG_EBUSY;
     }
 
-    // Determine the virtual address for the mapping in the process address space.
-    // Release the console claim on any early error so another process can retry.
     let virt_addr = {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        let proc = match table.find_mut(pid) {
-            Some(p) => p,
-            None => {
-                crate::fb::release_console_claim(pid);
-                return NEG_EINVAL;
-            }
-        };
-        if proc.mmap_next == 0 {
-            proc.mmap_next = ANON_MMAP_BASE;
-        }
-        // Round up to page boundary.
-        let base = (proc.mmap_next + 4095) & !4095;
-        // Guard against pushing mmap_next past the canonical user-space limit.
-        const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
-        let end = match base.checked_add(total_size) {
-            Some(v) if v <= USER_SPACE_END => v,
-            _ => {
-                crate::fb::release_console_claim(pid);
-                return NEG_EINVAL;
-            }
-        };
-        proc.mmap_next = end;
-        base
-    };
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
 
-    // Get the process page table and map the frames.
-    let cr3_phys = {
-        let table = crate::process::PROCESS_TABLE.lock();
-        match table
-            .find(pid)
-            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys()))
-        {
+        // Determine the virtual address for the mapping in the process address
+        // space. Release the console claim on any early error so another
+        // process can retry.
+        let virt_addr =
+            match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                let current = if *mmap_next == 0 {
+                    ANON_MMAP_BASE
+                } else {
+                    *mmap_next
+                };
+                let base = (current + 4095) & !4095;
+                // Guard against pushing mmap_next past the canonical user-space limit.
+                const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+                let end = base
+                    .checked_add(total_size)
+                    .filter(|v| *v <= USER_SPACE_END)?;
+                *mmap_next = end;
+                Some(base)
+            }) {
+                Some(Some(base)) => base,
+                _ => {
+                    crate::fb::release_console_claim(pid);
+                    return NEG_EINVAL;
+                }
+            };
+        let reservation_end = virt_addr + total_size;
+
+        // Get the process page table and map the frames.
+        let cr3_phys = match addr_space.as_ref().map(|a| a.pml4_phys()) {
             Some(phys) => phys,
             None => {
                 crate::fb::release_console_claim(pid);
                 return NEG_EINVAL;
             }
-        }
-    };
+        };
 
-    let cr3_frame = match x86_64::structures::paging::PhysFrame::<
-        x86_64::structures::paging::Size4KiB,
-    >::from_start_address(cr3_phys)
-    {
-        Ok(f) => f,
-        Err(_) => {
+        let cr3_frame = match x86_64::structures::paging::PhysFrame::<
+            x86_64::structures::paging::Size4KiB,
+        >::from_start_address(cr3_phys)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                crate::fb::release_console_claim(pid);
+                return NEG_EINVAL;
+            }
+        };
+
+        let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+
+        use x86_64::structures::paging::PageTableFlags;
+        // BIT_11 is an OS-available bit used here to mark "device/hardware frame —
+        // do not return to the frame allocator on process teardown".  The frame
+        // allocator only owns system-RAM frames; the UEFI framebuffer is MMIO.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::BIT_11;
+
+        if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
+            .is_err()
+        {
+            // Roll back the reservation only if no later mapping has advanced
+            // the shared cursor since this mapping claimed the range.
+            let _ =
+                crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+                    if *mmap_next == reservation_end {
+                        *mmap_next = virt_addr;
+                    }
+                });
             crate::fb::release_console_claim(pid);
             return NEG_EINVAL;
         }
-    };
 
-    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
-
-    use x86_64::structures::paging::PageTableFlags;
-    // BIT_11 is an OS-available bit used here to mark "device/hardware frame —
-    // do not return to the frame allocator on process teardown".  The frame
-    // allocator only owns system-RAM frames; the UEFI framebuffer is MMIO.
-    let flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE
-        | PageTableFlags::BIT_11;
-
-    if unsafe { crate::mm::user_space::map_user_frames(&mut mapper, virt_addr, &frames, flags) }
-        .is_err()
-    {
-        // Roll back mmap_next so the virtual address range is not leaked on
-        // mapping failure.  Any pages already mapped in the page table before
-        // the failure will be cleaned up by free_process_page_table on exit.
-        {
-            let mut table = crate::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.find_mut(pid) {
-                proc.mmap_next = virt_addr;
-            }
-        }
-        crate::fb::release_console_claim(pid);
-        return NEG_EINVAL;
-    }
-
-    // Record the mapping in the process table.
-    {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(proc) = table.find_mut(pid) {
-            proc.vma_tree.insert(crate::process::MemoryMapping {
+        // Record the mapping in the process table while the page-table lock is held.
+        let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+            vma_tree.insert(crate::process::MemoryMapping {
                 start: virt_addr,
                 len: total_size,
                 prot: 3,                    // PROT_READ | PROT_WRITE
                 flags: 1 | FB_MAPPING_FLAG, // MAP_SHARED + internal FB marker
             });
-        }
+        });
+        virt_addr
+    };
+    if let Some(addr_space) = addr_space.as_ref() {
+        crate::smp::tlb::tlb_shootdown_range(addr_space, virt_addr, virt_addr + total_size);
+        addr_space.bump_generation();
     }
 
     // Ownership was claimed atomically at the top of this function via
@@ -7851,7 +8114,7 @@ pub(super) fn sys_stdin_signal_eof() -> u64 {
 ///
 /// The byte is processed through TTY0's LineDiscipline which handles iflag
 /// transforms, signal generation, canonical editing, and echo generation.
-/// Echo output goes to the serial console (COM1).
+/// Echo output goes to the active console sinks (serial + framebuffer).
 pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
     let byte = byte_arg as u8;
 
@@ -7886,8 +8149,8 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
                     3 => "^\\",
                     _ => "",
                 };
-                serial_echo_bytes(name.as_bytes());
-                serial_echo_bytes(b"\n");
+                console_echo_bytes(name.as_bytes());
+                console_echo_bytes(b"\n");
                 crate::process::send_signal_to_group(fg, sig as u32);
             } else {
                 // No foreground group — push raw byte.
@@ -7898,10 +8161,10 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
         | kernel_core::tty::LdiscResult::LineComplete { ref echo } => {
             if let Some(count) = echo.erase_count() {
                 for _ in 0..count {
-                    serial_echo_bytes(b"\x08 \x08");
+                    console_echo_bytes(b"\x08 \x08");
                 }
             } else if !echo.is_empty() {
-                serial_echo_bytes(echo.as_slice());
+                console_echo_bytes(echo.as_slice());
             }
         }
     }
@@ -7909,7 +8172,27 @@ pub(super) fn sys_push_raw_input(byte_arg: u64) -> u64 {
     0
 }
 
-/// Write raw bytes to the serial console (COM1) for echo.
+/// Write raw echo bytes to the serial console and framebuffer console.
+fn console_echo_bytes(bytes: &[u8]) {
+    serial_echo_bytes(bytes);
+    framebuffer_echo_bytes(bytes);
+}
+
+/// Mirror echo bytes to the framebuffer console without heap allocation.
+fn framebuffer_echo_bytes(bytes: &[u8]) {
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        crate::fb::write_str(s);
+        return;
+    }
+
+    let mut encoded = [0u8; 2];
+    for &byte in bytes {
+        let s = char::from(byte).encode_utf8(&mut encoded);
+        crate::fb::write_str(s);
+    }
+}
+
+/// Write raw bytes to the serial console (COM1).
 fn serial_echo_bytes(bytes: &[u8]) {
     for &b in bytes {
         unsafe {
@@ -7925,86 +8208,111 @@ fn serial_echo_bytes(bytes: &[u8]) {
 
 pub(super) fn sys_linux_brk(addr: u64) -> u64 {
     let pid = crate::process::current_pid();
-
-    // Always initialise brk_current to BRK_BASE if it is still 0, regardless
-    // of the requested addr.  This ensures that even a first call with a
-    // nonzero addr has a valid base to grow from, and if page mapping fails
-    // later we still have a consistent brk_current.
+    let addr_space = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
+    };
+    let mut result = 0;
+    let mut shootdown_end = 0;
+    let mut grew_any = false;
     let current = {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        match table.find_mut(pid) {
-            Some(p) => {
-                if p.brk_current == 0 {
-                    p.brk_current = BRK_BASE;
+        let _page_table_guard = addr_space
+            .as_ref()
+            .map(|addr_space| addr_space.lock_page_tables());
+
+        // Always initialise brk_current to BRK_BASE if it is still 0, regardless
+        // of the requested addr.  This ensures that even a first call with a
+        // nonzero addr has a valid base to grow from, and if page mapping fails
+        // later we still have a consistent brk_current.
+        let current_brk =
+            match crate::process::with_shared_mm_mut(pid, |brk_current, _mmap_next, _vma_tree| {
+                if *brk_current == 0 {
+                    *brk_current = BRK_BASE;
                 }
-                p.brk_current
+                *brk_current
+            }) {
+                Some(current) => current,
+                None => return 0,
+            };
+
+        // brk(0) or no-advance: just return current break.
+        if addr == 0 || addr <= current_brk {
+            result = current_brk;
+        } else {
+            // Align new break up to page boundary.
+            let new_brk = match addr.checked_add(0xFFF) {
+                Some(v) => v & !0xFFF,
+                None => {
+                    result = current_brk;
+                    0
+                }
+            };
+            // Reject non-canonical / kernel-range addresses.
+            if result == 0 && new_brk > 0x0000_7FFF_FFFF_FFFF {
+                result = current_brk;
             }
-            None => return 0,
+            if result == 0 {
+                let pages_needed = (new_brk - current_brk) / 4096;
+
+                use x86_64::{VirtAddr, structures::paging::PageTableFlags};
+                let flags = PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE;
+                let phys_off = crate::mm::phys_offset();
+                let mut committed_brk = current_brk;
+
+                for i in 0..pages_needed {
+                    let vaddr = VirtAddr::new(current_brk + i * 4096);
+                    let frame = match crate::mm::frame_allocator::allocate_frame() {
+                        Some(f) => f,
+                        None => {
+                            log::warn!("[brk] out of frames at page {}/{}", i, pages_needed);
+                            result = committed_brk;
+                            break;
+                        }
+                    };
+                    unsafe {
+                        let ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
+                        core::ptr::write_bytes(ptr, 0, 4096);
+                    }
+                    if unsafe {
+                        crate::mm::paging::map_current_user_page_locked(vaddr, frame, flags)
+                    }
+                    .is_err()
+                    {
+                        log::warn!("[brk] map_current_user_page failed at page {}", i);
+                        crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
+                        result = committed_brk;
+                        break;
+                    }
+                    committed_brk = current_brk + (i + 1) * 4096;
+                    let _ = crate::process::with_shared_mm_mut(
+                        pid,
+                        |brk_current, _mmap_next, _vma_tree| *brk_current = committed_brk,
+                    );
+                    grew_any = true;
+                }
+
+                if result == 0 {
+                    result = committed_brk;
+                }
+                shootdown_end = committed_brk;
+            }
         }
+        current_brk
     };
 
-    // brk(0) or no-advance: just return current break.
-    if addr == 0 || addr <= current {
-        return current;
-    }
-
-    // Align new break up to page boundary.
-    let new_brk = match addr.checked_add(0xFFF) {
-        Some(v) => v & !0xFFF,
-        None => return current,
-    };
-    // Reject non-canonical / kernel-range addresses.
-    if new_brk > 0x0000_7FFF_FFFF_FFFF {
-        return current;
-    }
-    let pages_needed = (new_brk - current) / 4096;
-
-    use x86_64::{
-        VirtAddr,
-        structures::paging::{Mapper, Page, PageTableFlags, Size4KiB},
-    };
-    let flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE
-        | PageTableFlags::NO_EXECUTE;
-    // SAFETY: current CR3 is the process's page table.
-    let mut mapper = unsafe { crate::mm::paging::get_mapper() };
-    let mut frame_alloc = crate::mm::paging::GlobalFrameAlloc;
-    let phys_off = crate::mm::phys_offset();
-
-    for i in 0..pages_needed {
-        let vaddr = VirtAddr::new(current + i * 4096);
-        let page: Page<Size4KiB> = Page::containing_address(vaddr);
-        let frame = match crate::mm::frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => {
-                log::warn!("[brk] out of frames at page {}/{}", i, pages_needed);
-                return current; // return old brk to signal failure
-            }
-        };
-        unsafe {
-            let ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-            core::ptr::write_bytes(ptr, 0, 4096);
-        }
-        // SAFETY: mapper covers current CR3; frame was just allocated; page is unmapped.
-        match unsafe { mapper.map_to(page, frame, flags, &mut frame_alloc) } {
-            Ok(flush) => flush.flush(),
-            Err(_) => {
-                log::warn!("[brk] map_to failed at page {}", i);
-                return current;
-            }
-        }
-    }
-
+    if grew_any
+        && shootdown_end > current
+        && let Some(addr_space) = addr_space.as_ref()
     {
-        let mut table = crate::process::PROCESS_TABLE.lock();
-        if let Some(p) = table.find_mut(pid) {
-            p.brk_current = new_brk;
-        }
+        crate::smp::tlb::tlb_shootdown_range(addr_space, current, shootdown_end);
+        addr_space.bump_generation();
     }
 
     // Omit per-call log to avoid flooding serial during high-alloc workloads.
-    new_brk
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -10511,6 +10819,7 @@ fn sys_clone_thread(
     };
 
     PROCESS_TABLE.lock().insert(child_proc);
+    crate::process::sync_shared_mm_state(child_pid);
 
     // CLONE_PARENT_SETTID: write child TID to parent_tidptr in userspace.
     if flags & CLONE_PARENT_SETTID != 0 && parent_tidptr != 0 {

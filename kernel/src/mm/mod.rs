@@ -13,7 +13,7 @@ pub mod user_space;
 
 use bootloader_api::BootInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Once;
+use spin::{Mutex, MutexGuard, Once};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::paging::{OffsetPageTable, PageTable, PhysFrame, Size4KiB},
@@ -31,6 +31,7 @@ pub struct AddressSpace {
     pml4_phys: PhysAddr,
     generation: AtomicU64,
     active_on_cores: AtomicU64,
+    page_table_lock: Mutex<()>,
 }
 
 #[allow(dead_code)]
@@ -40,6 +41,7 @@ impl AddressSpace {
             pml4_phys,
             generation: AtomicU64::new(0),
             active_on_cores: AtomicU64::new(0),
+            page_table_lock: Mutex::new(()),
         }
     }
 
@@ -67,6 +69,10 @@ impl AddressSpace {
 
     pub fn active_cores(&self) -> u64 {
         self.active_on_cores.load(Ordering::Acquire)
+    }
+
+    pub fn lock_page_tables(&self) -> MutexGuard<'_, ()> {
+        self.page_table_lock.lock()
     }
 }
 

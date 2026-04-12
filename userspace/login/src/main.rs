@@ -53,7 +53,6 @@ fn login_once() {
 
     // Check if account is locked (first-boot setup).
     if is_locked_account(&shadow_buf[..shadow_len], username) {
-        let _ = write(STDOUT_FILENO, b"\n");
         write_str(STDOUT_FILENO, "Account requires initial password setup.\n");
         write_str(STDOUT_FILENO, "Set password for ");
         let _ = write(STDOUT_FILENO, username);
@@ -89,7 +88,6 @@ fn login_once() {
         // Fall through to authenticated login.
     } else {
         // Normal login — prompt for password.
-        let _ = write(STDOUT_FILENO, b"\n");
         write_str(STDOUT_FILENO, "Password: ");
         let saved = disable_echo();
         let mut pw_input = [0u8; 128];

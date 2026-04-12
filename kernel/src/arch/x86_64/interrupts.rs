@@ -34,6 +34,12 @@ static FAULT_KILL_PID: AtomicU32 = AtomicU32::new(0);
 // CoW fault resolution (P17-T031, T032, T033)
 // ---------------------------------------------------------------------------
 
+fn bump_current_addr_space_generation() {
+    if let Some(addr_space) = crate::process::current_addr_space() {
+        unsafe { addr_space.as_ref() }.bump_generation();
+    }
+}
+
 /// Ring-0 trampoline that runs *outside* interrupt context.
 ///
 /// The exception handler redirects IRET here so that locking and
@@ -93,148 +99,107 @@ fn fault_kill_trampoline() -> ! {
 /// Reads the current PTE, allocates a fresh frame, copies the page contents,
 /// maps the new frame as writable, and decrements the old frame's refcount.
 ///
-/// Returns `true` on success, `false` if frame allocation fails (OOM).
+/// Returns `true` on success, `false` if the faulting mapping is no longer a
+/// CoW page or if frame allocation fails (OOM).
 pub fn resolve_cow_fault(vaddr: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
 
     let phys_off = crate::mm::phys_offset();
     let phys_offset = VirtAddr::new(phys_off);
+    let addr_space = crate::process::current_addr_space();
+    let mut old_phys_to_free = None;
+    {
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
 
-    let (cr3_frame, _) = Cr3::read();
-    let pml4_phys = cr3_frame.start_address().as_u64();
+        let (cr3_frame, _) = Cr3::read();
+        let pml4_phys = cr3_frame.start_address().as_u64();
 
-    // Walk the page table to find the PTE for the faulting address.
-    let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
+        // Walk the page table to find the PTE for the faulting address.
+        let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
-    unsafe {
-        let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
-        let p4e = &pml4[p4_idx];
-        if !p4e.flags().contains(PageTableFlags::PRESENT) {
-            panic!("CoW: PML4 entry not present for {:#x}", vaddr);
+        unsafe {
+            let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
+            let p4e = &pml4[p4_idx];
+            if !p4e.flags().contains(PageTableFlags::PRESENT) {
+                return false;
+            }
+
+            let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
+            let p3e = &pdpt[p3_idx];
+            if !p3e.flags().contains(PageTableFlags::PRESENT) {
+                return false;
+            }
+
+            let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
+            let p2e = &pd[p2_idx];
+            if !p2e.flags().contains(PageTableFlags::PRESENT) {
+                return false;
+            }
+
+            let pt: &mut PageTable =
+                &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
+            let pte = &mut pt[p1_idx];
+            let pte_flags = pte.flags();
+            if !pte_flags.contains(PageTableFlags::PRESENT)
+                || !pte_flags.contains(PageTableFlags::BIT_9)
+                || pte_flags.contains(PageTableFlags::WRITABLE)
+            {
+                return false;
+            }
+
+            let old_phys = pte.addr().as_u64();
+            let old_refcount = crate::mm::frame_allocator::refcount_get(old_phys);
+
+            if old_refcount <= 1 {
+                // P17-T033: fast path — sole owner, just remap as writable
+                // and clear the CoW marker bit.
+                let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
+                pte.set_addr(pte.addr(), flags);
+            } else {
+                // Allocate a fresh frame. If out of memory, return false so the
+                // page fault handler falls through to the kill path instead of
+                // panicking the kernel (user-triggerable OOM must not be a DoS).
+                let new_frame = match crate::mm::frame_allocator::allocate_frame() {
+                    Some(f) => f,
+                    None => return false,
+                };
+                let new_phys = new_frame.start_address().as_u64();
+
+                let src = (phys_off + old_phys) as *const u8;
+                let dst = (phys_off + new_phys) as *mut u8;
+                core::ptr::copy_nonoverlapping(src, dst, 4096);
+
+                // Map the new frame writable, clear the CoW marker.
+                let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
+                pte.set_addr(new_frame.start_address(), flags);
+                old_phys_to_free = Some(old_phys);
+            }
         }
+    }
 
-        let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
-        let p3e = &pdpt[p3_idx];
-        if !p3e.flags().contains(PageTableFlags::PRESENT) {
-            panic!("CoW: PDPT entry not present for {:#x}", vaddr);
-        }
-
-        let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
-        let p2e = &pd[p2_idx];
-        if !p2e.flags().contains(PageTableFlags::PRESENT) {
-            panic!("CoW: PD entry not present for {:#x}", vaddr);
-        }
-
-        let pt: &mut PageTable =
-            &mut *(phys_offset + p2e.addr().as_u64()).as_mut_ptr::<PageTable>();
-        let pte = &mut pt[p1_idx];
-        if !pte.flags().contains(PageTableFlags::PRESENT) {
-            panic!("CoW: PT entry not present for {:#x}", vaddr);
-        }
-
-        let old_phys = pte.addr().as_u64();
-        let old_refcount = crate::mm::frame_allocator::refcount_get(old_phys);
-
-        if old_refcount <= 1 {
-            // P17-T033: fast path — sole owner, just remap as writable
-            // and clear the CoW marker bit.
-            let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
-            pte.set_addr(pte.addr(), flags);
-            x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
-            return true;
-        }
-
-        // Allocate a fresh frame. If out of memory, return false so the
-        // page fault handler falls through to the kill path instead of
-        // panicking the kernel (user-triggerable OOM must not be a DoS).
-        let new_frame = match crate::mm::frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => return false,
-        };
-        let new_phys = new_frame.start_address().as_u64();
-
-        let src = (phys_off + old_phys) as *const u8;
-        let dst = (phys_off + new_phys) as *mut u8;
-        core::ptr::copy_nonoverlapping(src, dst, 4096);
-
-        // Map the new frame writable, clear the CoW marker.
-        let flags = (pte.flags() | PageTableFlags::WRITABLE) & !PageTableFlags::BIT_9;
-        pte.set_addr(new_frame.start_address(), flags);
-
-        // Flush TLB for this address.
+    if crate::smp::is_per_core_ready()
+        && let Some(addr_space) = addr_space
+    {
+        crate::smp::tlb::tlb_shootdown_range(unsafe { addr_space.as_ref() }, vaddr, vaddr + 4096);
+    } else {
         x86_64::instructions::tlb::flush(VirtAddr::new(vaddr));
-
-        // Decrement the old frame's refcount (may free it if no other sharers).
+    }
+    if let Some(old_phys) = old_phys_to_free {
         crate::mm::frame_allocator::free_frame(old_phys);
     }
+    bump_current_addr_space_generation();
     true
 }
 
-/// Check whether the PTE for `vaddr` has the CoW marker bit (BIT_9) set.
-///
-/// Called from the page fault ISR (interrupts disabled, single CPU).
-fn has_cow_marker(vaddr: u64) -> bool {
+/// Check whether the PTE for `vaddr` has the guard-page marker bit (BIT_10) set.
+fn has_guard_marker(vaddr: u64) -> bool {
     use x86_64::registers::control::Cr3;
     use x86_64::structures::paging::{PageTable, PageTableFlags};
-
-    let phys_off = crate::mm::phys_offset();
-    let phys_offset = VirtAddr::new(phys_off);
-
-    let (cr3_frame, _) = Cr3::read();
-    let pml4_phys = cr3_frame.start_address().as_u64();
-
-    let p4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let p3_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        let pml4: &PageTable = &*(phys_offset + pml4_phys).as_ptr::<PageTable>();
-        let p4e = &pml4[p4_idx];
-        if !p4e.flags().contains(PageTableFlags::PRESENT) {
-            return false;
-        }
-        let pdpt: &PageTable = &*(phys_offset + p4e.addr().as_u64()).as_ptr::<PageTable>();
-        let p3e = &pdpt[p3_idx];
-        if !p3e.flags().contains(PageTableFlags::PRESENT) {
-            return false;
-        }
-        let pd: &PageTable = &*(phys_offset + p3e.addr().as_u64()).as_ptr::<PageTable>();
-        let p2e = &pd[p2_idx];
-        if !p2e.flags().contains(PageTableFlags::PRESENT) {
-            return false;
-        }
-        let pt: &PageTable = &*(phys_offset + p2e.addr().as_u64()).as_ptr::<PageTable>();
-        let pte = &pt[p1_idx];
-        pte.flags().contains(PageTableFlags::BIT_9)
-    }
-}
-
-/// Public entry point for kernel-context demand paging (e.g. `copy_from_user`
-/// encountering a lazy mmap page). Delegates to `demand_map_user_page`.
-pub fn demand_map_user_page_from_kernel(vaddr: u64, prot: u64) -> bool {
-    demand_map_user_page(vaddr, prot)
-}
-
-/// Demand-page a single 4 KiB user-accessible frame at the page containing
-/// `vaddr`. Used for stack growth, VMA demand faults, and any other lazy
-/// mapping.
-///
-/// `prot` uses POSIX constants: `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
-/// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
-///
-/// Called from the page fault ISR and from kernel-context demand faulting.
-/// Returns `true` on success, `false` on OOM.
-fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
-    use x86_64::registers::control::Cr3;
-    use x86_64::structures::paging::{PageTable, PageTableFlags};
-
-    const PROT_WRITE: u64 = 0x2;
-    const PROT_EXEC: u64 = 0x4;
 
     let phys_off = crate::mm::phys_offset();
     let phys_offset_va = VirtAddr::new(phys_off);
@@ -247,73 +212,154 @@ fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
     let p2_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let p1_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
-    // Intermediate page table levels always get full user-writable permissions.
-    let user_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
     unsafe {
-        let pml4: &mut PageTable = &mut *(phys_offset_va + pml4_phys).as_mut_ptr::<PageTable>();
+        let pml4: &PageTable = &*(phys_offset_va + pml4_phys).as_ptr::<PageTable>();
         if !pml4[p4_idx].flags().contains(PageTableFlags::PRESENT) {
-            let frame = match crate::mm::frame_allocator::allocate_frame() {
-                Some(f) => f,
-                None => return false,
-            };
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pml4[p4_idx].set_addr(frame.start_address(), user_flags);
+            return false;
         }
-
-        let pdpt: &mut PageTable =
-            &mut *(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+        let pdpt: &PageTable =
+            &*(phys_offset_va + pml4[p4_idx].addr().as_u64()).as_ptr::<PageTable>();
         if !pdpt[p3_idx].flags().contains(PageTableFlags::PRESENT) {
-            let frame = match crate::mm::frame_allocator::allocate_frame() {
-                Some(f) => f,
-                None => return false,
-            };
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pdpt[p3_idx].set_addr(frame.start_address(), user_flags);
+            return false;
         }
-
-        let pd: &mut PageTable =
-            &mut *(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
+        let pd: &PageTable =
+            &*(phys_offset_va + pdpt[p3_idx].addr().as_u64()).as_ptr::<PageTable>();
         if !pd[p2_idx].flags().contains(PageTableFlags::PRESENT) {
-            let frame = match crate::mm::frame_allocator::allocate_frame() {
-                Some(f) => f,
-                None => return false,
-            };
-            let frame_phys = frame.start_address().as_u64();
-            core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-            pd[p2_idx].set_addr(frame.start_address(), user_flags);
+            return false;
         }
+        let pt: &PageTable = &*(phys_offset_va + pd[p2_idx].addr().as_u64()).as_ptr::<PageTable>();
+        pt[p1_idx].flags().contains(PageTableFlags::BIT_10)
+    }
+}
 
-        let pt: &mut PageTable =
-            &mut *(phys_offset_va + pd[p2_idx].addr().as_u64()).as_mut_ptr::<PageTable>();
-        if pt[p1_idx].flags().contains(PageTableFlags::PRESENT) {
-            // Already mapped — this shouldn't happen for demand paging.
+/// Public entry point for kernel-context VMA demand paging.
+///
+/// Revalidates the current VMA metadata while holding the address-space
+/// mutation lock so concurrent `munmap` / `mprotect` cannot publish stale
+/// permissions across the lock boundary.
+pub fn demand_map_vma_page_from_kernel(vaddr: u64, require_write: bool) -> bool {
+    demand_map_vma_page(vaddr, require_write)
+}
+
+/// Demand-page a single 4 KiB user-accessible frame at the page containing
+/// `vaddr`. Used for stack growth, VMA demand faults, and any other lazy
+/// mapping.
+///
+/// `prot` uses POSIX constants: `PROT_READ=1`, `PROT_WRITE=2`, `PROT_EXEC=4`.
+/// Pass `0x3` (`PROT_READ|PROT_WRITE`) for stack pages.
+///
+/// Called from the page fault ISR and from kernel-context demand faulting.
+/// Returns `true` on success, `false` on OOM.
+fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::structures::paging::Translate as _;
+
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    let phys_off = crate::mm::phys_offset();
+    let page_vaddr = VirtAddr::new(vaddr & !0xFFF);
+
+    {
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        if mapper.translate_addr(page_vaddr).is_some() {
+            return true;
+        }
+    }
+
+    // Allocate a fresh zeroed frame for the data page.
+    let frame = match crate::mm::frame_allocator::allocate_frame() {
+        Some(f) => f,
+        None => return false,
+    };
+    let frame_phys = frame.start_address().as_u64();
+    unsafe {
+        core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
+    }
+
+    // Build PTE flags from the POSIX prot bits.
+    let mut data_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    if prot & PROT_WRITE != 0 {
+        data_flags |= PageTableFlags::WRITABLE;
+    }
+    if prot & PROT_EXEC == 0 {
+        data_flags |= PageTableFlags::NO_EXECUTE;
+    }
+
+    if unsafe { crate::mm::paging::map_current_user_page_locked(page_vaddr, frame, data_flags) }
+        .is_err()
+    {
+        crate::mm::frame_allocator::free_frame(frame_phys);
+        return false;
+    }
+    true
+}
+
+fn demand_map_user_page(vaddr: u64, prot: u64) -> bool {
+    let addr_space = crate::process::current_addr_space();
+    let page_base = vaddr & !0xFFF;
+    let mapped = {
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+        demand_map_user_page_locked(vaddr, prot)
+    };
+    if !mapped {
+        return false;
+    }
+    if crate::smp::is_per_core_ready()
+        && let Some(addr_space) = addr_space
+    {
+        crate::smp::tlb::tlb_shootdown_range(
+            unsafe { addr_space.as_ref() },
+            page_base,
+            page_base + 4096,
+        );
+    }
+    bump_current_addr_space_generation();
+    true
+}
+
+fn demand_map_vma_page(vaddr: u64, require_write: bool) -> bool {
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const PROT_EXEC: u64 = 0x4;
+
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return false;
+    }
+
+    let addr_space = crate::process::current_addr_space();
+    let page_base = vaddr & !0xFFF;
+    let mapped = {
+        let _page_table_guard =
+            addr_space.map(|addr_space| unsafe { addr_space.as_ref() }.lock_page_tables());
+
+        let Some(prot) = crate::process::shared_vma_prot(pid, vaddr) else {
+            return false;
+        };
+
+        let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
+        let write_ok = !require_write || prot & PROT_WRITE != 0;
+        if !any_access || !write_ok {
             return false;
         }
 
-        // Allocate a fresh zeroed frame for the data page.
-        let frame = match crate::mm::frame_allocator::allocate_frame() {
-            Some(f) => f,
-            None => return false,
-        };
-        let frame_phys = frame.start_address().as_u64();
-        core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-
-        // Build PTE flags from the POSIX prot bits.
-        let mut data_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if prot & PROT_WRITE != 0 {
-            data_flags |= PageTableFlags::WRITABLE;
-        }
-        if prot & PROT_EXEC == 0 {
-            data_flags |= PageTableFlags::NO_EXECUTE;
-        }
-        pt[p1_idx].set_addr(frame.start_address(), data_flags);
-
-        x86_64::instructions::tlb::flush(VirtAddr::new(vaddr & !0xFFF));
+        demand_map_user_page_locked(vaddr, prot)
+    };
+    if !mapped {
+        return false;
     }
+    if crate::smp::is_per_core_ready()
+        && let Some(addr_space) = addr_space
+    {
+        crate::smp::tlb::tlb_shootdown_range(
+            unsafe { addr_space.as_ref() },
+            page_base,
+            page_base + 4096,
+        );
+    }
+    bump_current_addr_space_generation();
     true
 }
 
@@ -383,15 +429,14 @@ extern "x86-interrupt" fn page_fault_handler(
             && let Ok(fault_vaddr) = addr
         {
             let fault_addr_u64 = fault_vaddr.as_u64();
-            if has_cow_marker(fault_addr_u64) {
-                // CoW fault — resolve directly in the ISR. Safe because
-                // the fault is from ring 3 (no kernel locks held) and
-                // we're on a single CPU. On OOM, fall through to kill.
-                if resolve_cow_fault(fault_addr_u64) {
-                    return;
-                }
-                // OOM during CoW — fall through to kill the process.
+            // CoW fault — revalidate and resolve directly in the ISR. Safe
+            // because the fault is from ring 3 (no kernel locks held), and
+            // the CoW path serializes its page-table mutation under the
+            // current address-space lock before issuing TLB shootdowns.
+            if resolve_cow_fault(fault_addr_u64) {
+                return;
             }
+            // OOM or no-longer-CoW mapping — fall through to other handlers / kill.
         }
 
         // Demand-paging for the stack region: musl's __init_tls and malloc
@@ -409,6 +454,7 @@ extern "x86-interrupt" fn page_fault_handler(
             const DEMAND_LIMIT: u64 = 8 * 1024 * 1024; // 8 MiB
             if fault_addr_u64 >= stack_bottom
                 && fault_addr_u64 < stack_top + DEMAND_LIMIT
+                && !has_guard_marker(fault_addr_u64)
                 && demand_map_user_page(fault_addr_u64, 0x3)
             // PROT_READ|PROT_WRITE
             {
@@ -420,25 +466,8 @@ extern "x86-interrupt" fn page_fault_handler(
         // If the fault address is inside a valid VMA, allocate a frame on demand.
         if !is_present && let Ok(fault_vaddr) = addr {
             let fault_addr_u64 = fault_vaddr.as_u64();
-            let pid = crate::process::current_pid();
-            let vma_prot = {
-                let table = crate::process::PROCESS_TABLE.lock();
-                table
-                    .find(pid)
-                    .and_then(|p| p.find_vma(fault_addr_u64))
-                    .map(|m| m.prot)
-            };
-            if let Some(prot) = vma_prot {
-                const PROT_READ: u64 = 0x1;
-                const PROT_WRITE: u64 = 0x2;
-                const PROT_EXEC: u64 = 0x4;
-                // PROT_NONE pages must trap — never demand-map them.
-                let any_access = prot & (PROT_READ | PROT_WRITE | PROT_EXEC) != 0;
-                // A write fault to a read-only VMA is a genuine violation.
-                let write_ok = !is_write || prot & PROT_WRITE != 0;
-                if any_access && write_ok && demand_map_user_page(fault_addr_u64, prot) {
-                    return;
-                }
+            if demand_map_vma_page(fault_addr_u64, is_write) {
+                return;
             }
         }
 

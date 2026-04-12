@@ -8,18 +8,25 @@
 
 ## Milestone Goal
 
-The kernel's memory management, context management, and TLB coherence subsystems are structurally hardened against the classes of bugs discovered during Phase 52. Address-space identity is a first-class object, user buffers are typed at the syscall boundary, syscall return state is task-owned, TLB shootdowns are batched and targeted, and freed frames are zeroed.
+The kernel's memory management, context management, and TLB coherence subsystems
+move onto the structurally hardened path defined by this phase. In the checked-in
+tree, the AddressSpace object, typed user buffers, batched TLB work, and frame
+zeroing landed, and Phase 52d completed the remaining closure work so the
+task-owned return-state and generation-tracking story now matches the shipped
+implementation end to end.
 
 ## Post-Phase Audit Note
 
-Most of Phase 52b landed as designed, but the post-phase audit found that the
-task-owned return-state migration is still only partially complete in HEAD.
-`UserReturnState` exists and the manual restore sites are gone, yet the checked-in
-code still saves state at block points, restores only part of the resume path
-from `Task`, and leaves `kernel_stack_top` / `fs_base` split between `Task`,
-`Process`, and per-core scratch. `AddressSpace::generation` also exists but
-still needs end-to-end mutation and user-copy integration. Phase 52d is the
-follow-up phase for closing those gaps.
+Most of Phase 52b landed as designed, and the follow-up audit gaps are now
+closed. Phase 52d moved the primary `UserReturnState` snapshot to syscall
+entry, made scheduler dispatch the authoritative restore path for resumed
+userspace tasks, and activated `AddressSpace::generation` bump/report plumbing
+across mapping mutations and user-copy diagnostics.
+
+Of the items this phase deferred to Phase 52c — per-core scheduler, dynamic IPC
+pools, unified line discipline, VMA tree, ISR wakeup — Phase 52d completed the
+keyboard-path convergence while explicitly re-deferring the still-unshipped
+lock-free scheduler hot path and growable notification pool.
 
 ## Why This Phase Exists
 

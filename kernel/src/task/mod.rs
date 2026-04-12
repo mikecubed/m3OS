@@ -62,10 +62,10 @@ pub use scheduler::{
     block_current_on_recv, block_current_on_reply, block_current_on_send,
     block_current_unless_woken, current_task_id, deliver_bulk, deliver_message, insert_cap,
     mark_current_dead, mark_task_dead_by_pid, maybe_load_balance, remove_task_cap, run,
-    server_endpoint, set_current_task_pid, set_server_endpoint, signal_reschedule, spawn,
-    spawn_fork_task, spawn_idle, spawn_idle_for_core, spawn_on_current_core, sys_nice,
-    sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data, take_current_task_fork_ctx,
-    take_message, task_cap, wake_task, yield_now,
+    server_endpoint, set_current_task_pid, set_current_user_return, set_server_endpoint,
+    signal_reschedule, spawn, spawn_fork_task, spawn_idle, spawn_idle_for_core,
+    spawn_on_current_core, sys_nice, sys_sched_getaffinity, sys_sched_setaffinity, take_bulk_data,
+    take_current_task_fork_ctx, take_message, task_cap, wake_task, yield_now,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,14 +96,30 @@ pub(crate) const KERNEL_STACK_SIZE: usize = 4096 * 8; // 32 KiB
 // Task user-return state
 // ---------------------------------------------------------------------------
 
-/// User-mode return state saved when a task yields and restored by the
-/// scheduler on re-dispatch. Eliminates the need for manual
-/// `restore_caller_context` calls after blocking syscalls.
+/// User-mode return state saved at syscall entry and restored by the
+/// scheduler on re-dispatch.  Captures the complete per-task resume
+/// contract in one place, eliminating split ownership between `Task`,
+/// `Process`, and `PerCoreData`.
+///
+/// # Phase 52d invariant
+///
+/// `syscall_handler` snapshots this struct once before any blocking or
+/// yield path.  The scheduler restores `user_rsp`, `kernel_stack_top`,
+/// `fs_base`, and `cr3_phys` exclusively from this struct for userspace
+/// tasks (pid != 0).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UserReturnState {
+    /// User-mode RSP at syscall entry.
     pub user_rsp: u64,
+    /// Kernel stack top for TSS.RSP0 / SYSCALL stack.
     pub kernel_stack_top: u64,
+    /// FS.base MSR value (TLS pointer).
     pub fs_base: u64,
+    /// Physical address of the PML4 (CR3).  0 means no dedicated address space.
+    pub cr3_phys: u64,
+    /// Address-space generation counter at the time of snapshot (Phase 52d B.3).
+    /// Used by user-copy diagnostics to detect concurrent mapping mutations.
+    pub addr_space_gen: u64,
 }
 
 // ---------------------------------------------------------------------------

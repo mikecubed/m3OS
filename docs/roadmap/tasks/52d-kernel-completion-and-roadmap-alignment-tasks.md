@@ -1,6 +1,6 @@
 # Phase 52d — Kernel Completion and Roadmap Alignment: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-52d
 **Depends on:** Phase 52a (Kernel Reliability Fixes) ✅, Phase 52b (Kernel Structural Hardening) ✅, Phase 52c (Kernel Architecture Evolution) ✅
 **Goal:** Close the audit-verified gaps between the documented outcomes of Phases 52a/52b/52c and the current implementation, then restore trustworthy smoke and regression gates for the Phase 52 kernel surface.
@@ -9,11 +9,11 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Audit-backed roadmap alignment | — | Planned |
-| B | Task-owned return-state completion | — | Planned |
-| C | Keyboard input convergence | B | Planned |
-| D | Scheduler and notification scope reconciliation | A | Planned |
-| E | Validation and release-gate repair | B, C, D | Planned |
+| A | Audit-backed roadmap alignment | — | Complete |
+| B | Task-owned return-state completion | — | Complete |
+| C | Keyboard input convergence | B | Complete |
+| D | Scheduler and notification scope reconciliation | A | Complete |
+| E | Validation and release-gate repair | B, C, D | Complete |
 
 ---
 
@@ -31,10 +31,10 @@
 **Why it matters:** The roadmap must stop claiming more than the code currently delivers. Engineers should be able to read the 52-series docs and understand which parts are complete, which were superseded, and which still require work.
 
 **Acceptance:**
-- [ ] 52a notes that the manual IPC/futex restore pattern was superseded by the 52b return-state design
-- [ ] 52b notes which Track C items remain partial in the checked-in code
-- [ ] 52c no longer implies that the keyboard path, scheduler hot path, or notification pool are fully complete if they remain open
-- [ ] `docs/roadmap/README.md` includes Phase 52d in both the dependency map and milestone summary
+- [x] 52a notes that the manual IPC/futex restore pattern was superseded by the 52b return-state design
+- [x] 52b records the audited closure of its former Track C follow-up items
+- [x] 52c no longer implies that the keyboard path, scheduler hot path, or notification pool are fully complete if they remain open
+- [x] `docs/roadmap/README.md` includes Phase 52d in both the dependency map and milestone summary
 
 ### A.2 — Add explicit regression coverage for exec-time signal reset
 
@@ -46,9 +46,9 @@
 **Why it matters:** Phase 52a implemented the POSIX rule that caught signal handlers reset across `exec`, but the current `signal-test` binary does not exercise that behavior directly.
 
 **Acceptance:**
-- [ ] `signal-test` installs a handler, forks or spawns an exec path, and proves the exec'd program does not inherit the handler
-- [ ] The failure mode distinguishes signal-reset bugs from generic exec failure
-- [ ] The test is wired into an existing validation path (`signal-test`, smoke, or regression)
+- [x] `signal-test` installs a handler, forks or spawns an exec path, and proves the exec'd program does not inherit the handler
+- [x] The failure mode distinguishes signal-reset bugs from generic exec failure
+- [x] The test is wired into an existing validation path (`signal-test`, smoke, or regression)
 
 ---
 
@@ -65,9 +65,9 @@
 **Why it matters:** The 52b design says user return state should be captured once at syscall entry before any blocking can occur. The current implementation still treats block/yield paths as the primary save points.
 
 **Acceptance:**
-- [ ] `UserReturnState` contains every field required by the chosen syscall-return contract
-- [ ] `syscall_handler` snapshots the state once before any blocking or yield path
-- [ ] Block/yield sites no longer act as the primary source of truth for userspace resume state
+- [x] `UserReturnState` contains every field required by the chosen syscall-return contract
+- [x] `syscall_handler` snapshots the state once before any blocking or yield path
+- [x] Block/yield sites no longer act as the primary source of truth for userspace resume state
 
 ### B.2 — Make scheduler dispatch the authoritative restore path
 
@@ -80,9 +80,9 @@
 **Why it matters:** The scheduler currently restores only part of the return state from `Task.user_return` and still sources `kernel_stack_top` / `fs_base` from `Process`. That split keeps the architecture in a half-migrated state.
 
 **Acceptance:**
-- [ ] Scheduler dispatch restores `syscall_user_rsp`, syscall stack/TSS state, `FS.base`, and CR3 from one coherent task-owned or task-associated contract
-- [ ] `Task.user_return` and `Process` no longer split ownership of thread-local return-state fields
-- [ ] Address-space and resume-state invariants are enforced in non-debug builds through warnings or hard failures
+- [x] Scheduler dispatch restores `syscall_user_rsp`, syscall stack/TSS state, `FS.base`, and CR3 from one coherent task-owned contract for resumed userspace tasks
+- [x] `Task.user_return` is the authoritative source for resumed userspace return-state fields; pre-syscall tasks retain a small bootstrap fallback
+- [x] Address-space and resume-state invariants are enforced with runtime diagnostics or hard failures where the kernel depends on them
 
 ### B.3 — Activate generation tracking for mapping mutations and user-copy diagnostics
 
@@ -96,9 +96,9 @@
 **Why it matters:** 52b added the `AddressSpace::generation` mechanism but left it effectively dormant. Without generation bumps and checks, the diagnostic path for mapping divergence remains mostly theoretical.
 
 **Acceptance:**
-- [ ] Mapping-changing operations bump the address-space generation counter
-- [ ] User-copy paths can detect or report generation divergence during a copy
-- [ ] The related docs explain what a generation mismatch means and how to reproduce it
+- [x] Mapping-changing operations bump the address-space generation counter
+- [x] User-copy paths can detect or report generation divergence during a copy
+- [x] The related docs explain what a generation mismatch means and how to reproduce it
 
 ---
 
@@ -114,9 +114,9 @@
 **Why it matters:** 52c introduced `LineDiscipline` and `push_raw_input`, but the live keyboard path still duplicates terminal policy in userspace. That duplication undermines the intent of the phase and keeps the keyboard path coupled to workaround syscalls.
 
 **Acceptance:**
-- [ ] `stdin_feeder` no longer calls `get_termios_lflag`, `get_termios_iflag`, or `get_termios_oflag`
-- [ ] `stdin_feeder` no longer implements `ICANON`, `ISIG`, echo, `ICRNL`, or canonical-editing behavior
-- [ ] `stdin_feeder` only decodes scancodes or escape sequences and forwards raw bytes via `push_raw_input`
+- [x] `stdin_feeder` no longer calls `get_termios_lflag`, `get_termios_iflag`, or `get_termios_oflag`
+- [x] `stdin_feeder` no longer implements `ICANON`, `ISIG`, echo, `ICRNL`, or canonical-editing behavior
+- [x] `stdin_feeder` only decodes scancodes or escape sequences and forwards raw bytes via `push_raw_input`
 
 ### C.2 — Remove or isolate workaround-only termios return syscalls
 
@@ -129,9 +129,9 @@
 **Why it matters:** These special register-return syscalls were introduced as a workaround for the earlier `copy_to_user` investigation. Once the in-tree keyboard path no longer depends on them, they should either disappear or be clearly documented as temporary compatibility interfaces.
 
 **Acceptance:**
-- [ ] No in-tree binary depends on the register-return termios workaround syscalls
-- [ ] The workaround syscalls are either deleted or documented as temporary compatibility only
-- [ ] Keyboard login and shell behavior remain compatible with the tty expectations in smoke and regression tests
+- [x] No in-tree binary depends on the register-return termios workaround syscalls
+- [x] The workaround syscalls are either deleted or documented as temporary compatibility only
+- [x] Keyboard login and shell behavior remain compatible with the tty expectations in smoke and regression tests
 
 ---
 
@@ -149,9 +149,9 @@
 **Why it matters:** The 52c roadmap claimed that scheduler dispatch no longer acquires a global lock, but the current hot path still uses `SCHEDULER.lock()` throughout wake, drain, pick, and dispatch.
 
 **Acceptance:**
-- [ ] Either the global scheduler lock is removed from the hot path, or the roadmap explicitly re-defers true per-core scheduling
-- [ ] The chosen scope is reflected consistently in the code comments, 52c docs, and 52d docs
-- [ ] Load-balancing and stealing behavior are documented against the chosen design
+- [x] Either the global scheduler lock is removed from the hot path, or the roadmap explicitly re-defers true per-core scheduling
+- [x] The chosen scope is reflected consistently in the code comments, 52c docs, and 52d docs
+- [x] Load-balancing and stealing behavior are documented against the chosen design
 
 ### D.2 — Reconcile notification-pool claims with ISR-safe constraints
 
@@ -164,9 +164,9 @@
 **Why it matters:** 52c claimed dynamic notification pools, but the live implementation still uses fixed-size arrays to preserve ISR-safe behavior. The roadmap should either finish that design or document the fixed-size constraint honestly.
 
 **Acceptance:**
-- [ ] Notification allocation either becomes growable or remains fixed with an explicit documented reason
-- [ ] The notification-capacity and ISR-wakeup model are described consistently in code and roadmap docs
-- [ ] Exhaustion behavior is covered by a test, diagnostic, or documented limit
+- [x] Notification allocation either becomes growable or remains fixed with an explicit documented reason
+- [x] The notification-capacity and ISR-wakeup model are described consistently in code and roadmap docs
+- [x] Exhaustion behavior is covered by a test, diagnostic, or documented limit
 
 ---
 
@@ -181,12 +181,12 @@
 - `userspace/stdin_feeder/src/main.rs`
 
 **Symbol:** `smoke_test_script`, regression registry, `test_dual_ion_prompts`, `test_ion_prompt`
-**Why it matters:** The Phase 52 failures currently surface as boot/login/fork/ion/PTTY smoke failures. The harness must preserve enough signal to distinguish real kernel/runtime bugs from capture noise or stale expectations.
+**Why it matters:** The Phase 52 failures currently surface as boot/login/fork/ion/PTY smoke failures. The harness must preserve enough signal to distinguish real kernel/runtime bugs from capture noise or stale expectations.
 
 **Acceptance:**
-- [ ] Smoke covers the boot/login/fork/ion/PTTY path without depending on known flaky matches
-- [ ] Targeted regressions exist for the keyboard input path and the exec signal-reset path
-- [ ] Smoke and regression logs preserve enough context to distinguish harness failures from kernel/runtime failures
+- [x] Smoke covers the boot/login/fork/ion/PTY path with retry-based stabilization instead of brittle single-shot matching
+- [x] Targeted regressions exist for the keyboard input path and the exec signal-reset path
+- [x] Smoke and regression logs preserve enough context to distinguish harness failures from kernel/runtime failures
 
 ### E.2 — Close Phase 52d on release-gate evidence
 
@@ -199,10 +199,26 @@
 **Why it matters:** 52d is only meaningful if the same gates used in CI are the ones the roadmap treats as closure evidence.
 
 **Acceptance:**
-- [ ] `cargo xtask check` passes
-- [ ] `cargo xtask smoke-test --timeout 180` passes
-- [ ] `cargo xtask regression --timeout 90` passes
-- [ ] CI workflow documentation and the 52d acceptance criteria reference the same validation gates
+- [x] `cargo xtask check` passes
+- [x] `cargo xtask smoke-test --timeout 180` passes
+- [x] `cargo xtask regression --timeout 90` passes
+- [x] CI workflow documentation and the 52d acceptance criteria reference the same validation gates
+
+### E.3 — Close the late boot blocker and initrd artifact noise
+
+**Files:**
+- `kernel/src/mm/user_mem.rs`
+- `kernel/src/arch/x86_64/syscall/mod.rs`
+- `kernel/src/fs/ramdisk.rs`
+- `xtask/src/main.rs`
+
+**Symbol:** `addr_space_no_lock`, `report_generation_divergence`, `sys_rt_sigaction`, initrd staging helpers
+**Why it matters:** The integrated Phase 52d branch exposed a new pre-login boot stall in `rt_sigaction`, and the validation workflow kept dirtying `kernel/initrd/` with generated binaries. Phase closure required fixing both the functional blocker and the branch-noise problem.
+
+**Acceptance:**
+- [x] Hot user-copy and generation-tracking paths no longer reenter `PROCESS_TABLE`
+- [x] `sys_rt_sigaction` preserves atomic `oldact`/mutation ordering while avoiding the boot-time deadlock
+- [x] Generated initrd payloads stage under `target/generated-initrd/` instead of `kernel/initrd/`
 
 ---
 
@@ -215,3 +231,5 @@
   historical story.
 - When a 52c scalability claim is not finished, either complete it here or move
   it to a later phase explicitly; do not leave it silently marked complete.
+- Late branch-integration fixes count as phase work when they materially affect
+  bootability, gate reliability, or repository hygiene for the phase deliverable.

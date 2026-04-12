@@ -1,40 +1,16 @@
-//! Userspace stdin feeder for m3OS (Phase 52, Track E).
+//! Userspace stdin feeder for m3OS (Phase 52d, Track C).
 //!
 //! Obtains scancodes from the `kbd_server` service via IPC (`KBD_READ`),
-//! translates them to characters using a US-QWERTY lookup table, implements
-//! a line discipline (canonical mode editing, signal characters, echo), and
-//! pushes processed bytes into the kernel stdin buffer via `stdin_push`.
+//! translates them to raw bytes using a US-QWERTY lookup table, and forwards
+//! each byte to the kernel via `push_raw_input`.
 //!
-//! This is the ring-3 replacement for the kernel-resident `stdin_feeder_task`
-//! in `kernel/src/main.rs`.
+//! All terminal policy (canonical editing, echo, signal generation, ICRNL)
+//! is handled by the kernel-side `LineDiscipline` in `push_raw_input`.
+//! This binary is a pure scancode-to-byte bridge.
 #![no_std]
 #![no_main]
 
-use syscall_lib::{SIGINT, SIGQUIT, SIGTSTP, STDOUT_FILENO};
-
-// ---------------------------------------------------------------------------
-// Termios flag constants (mirrored from kernel-core/src/tty.rs)
-// ---------------------------------------------------------------------------
-
-const ISIG: u32 = 0o000001;
-const ICANON: u32 = 0o000002;
-const ECHO: u32 = 0o000010;
-const ECHOE: u32 = 0o000020;
-const ECHOK: u32 = 0o000040;
-const ECHONL: u32 = 0o000100;
-
-const ICRNL: u32 = 0o000400;
-
-const ONLCR: u32 = 0o000004;
-
-// c_cc indices
-const VINTR: usize = 0;
-const VQUIT: usize = 1;
-const VERASE: usize = 2;
-const VKILL: usize = 3;
-const VEOF: usize = 4;
-const VSUSP: usize = 10;
-const VWERASE: usize = 14;
+use syscall_lib::STDOUT_FILENO;
 
 // ---------------------------------------------------------------------------
 // Scancode translation (US-QWERTY, ported from kernel/src/main.rs)
@@ -99,92 +75,6 @@ fn scancode_to_char(sc: u8, shift: bool) -> Option<char> {
 }
 
 // ---------------------------------------------------------------------------
-// Line editing buffer (simplified EditBuffer for userspace)
-// ---------------------------------------------------------------------------
-
-struct EditBuffer {
-    buf: [u8; 4096],
-    len: usize,
-}
-
-impl EditBuffer {
-    const fn new() -> Self {
-        Self {
-            buf: [0u8; 4096],
-            len: 0,
-        }
-    }
-
-    fn push(&mut self, b: u8) -> bool {
-        if self.len < self.buf.len() {
-            self.buf[self.len] = b;
-            self.len += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn erase_char(&mut self) -> Option<u8> {
-        if self.len > 0 {
-            self.len -= 1;
-            Some(self.buf[self.len])
-        } else {
-            None
-        }
-    }
-
-    fn kill_line(&mut self) -> usize {
-        let n = self.len;
-        self.len = 0;
-        n
-    }
-
-    fn word_erase(&mut self) -> usize {
-        let orig = self.len;
-        // Skip trailing spaces.
-        while self.len > 0 && self.buf[self.len - 1] == b' ' {
-            self.len -= 1;
-        }
-        // Erase non-space characters.
-        while self.len > 0 && self.buf[self.len - 1] != b' ' {
-            self.len -= 1;
-        }
-        orig - self.len
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.buf[..self.len]
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Echo helper
-// ---------------------------------------------------------------------------
-
-/// Write a string to stdout (fd 1). The kernel's sys_write routes this
-/// through the console for display output.
-fn echo(s: &str) {
-    syscall_lib::write_str(STDOUT_FILENO, s);
-}
-
-/// Write a single byte to stdout.
-fn echo_byte(b: u8) {
-    let buf = [b];
-    if let Ok(s) = core::str::from_utf8(&buf) {
-        echo(s);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -216,17 +106,10 @@ fn program_main(_args: &[&str]) -> i32 {
         h as u32
     };
 
-    // Cache c_cc at startup — these control characters rarely change.
-    let c_cc_arr = match syscall_lib::tcgetattr(0) {
-        Ok(t) => t.c_cc,
-        Err(_) => [0u8; syscall_lib::NCCS],
-    };
-
     syscall_lib::write_str(STDOUT_FILENO, "stdin_feeder: ready\n");
 
     let mut shift = false;
     let mut ctrl = false;
-    let mut edit_buf = EditBuffer::new();
 
     loop {
         // Request one scancode from kbd_server via IPC.  This blocks until
@@ -256,16 +139,8 @@ fn program_main(_args: &[&str]) -> i32 {
             continue;
         }
 
-        // Read termios flags via direct register-return syscalls.
-        // These bypass copy_to_user which has an intermittent reliability
-        // issue — see the copy_to_user investigation notes in this PR.
-        let c_lflag = syscall_lib::get_termios_lflag();
-        let c_iflag = syscall_lib::get_termios_iflag();
-        let c_oflag = syscall_lib::get_termios_oflag();
-
-        let canonical = c_lflag & ICANON != 0;
-
-        // VT100 escape sequences for special keys.
+        // VT100 escape sequences for special keys — forward each byte
+        // through the kernel line discipline.
         let escape_seq: Option<&[u8]> = match sc {
             0x48 => Some(b"\x1b[A"),  // Arrow Up
             0x50 => Some(b"\x1b[B"),  // Arrow Down
@@ -281,17 +156,15 @@ fn program_main(_args: &[&str]) -> i32 {
         };
 
         if let Some(seq) = escape_seq {
-            if canonical {
-                // In cooked mode, escape sequences are not useful — skip.
-                continue;
+            for &b in seq {
+                syscall_lib::push_raw_input(b);
             }
-            syscall_lib::stdin_push(seq);
             continue;
         }
 
-        // Convert scancode to byte.
+        // Convert scancode to a raw byte.
         let byte = if sc == 0x1C {
-            b'\r' // Enter key produces CR; ICRNL translates to LF
+            b'\r' // Enter key produces CR; kernel ICRNL translates to LF
         } else if sc == 0x0F {
             b'\t' // Tab
         } else if sc == 0x0E {
@@ -313,125 +186,8 @@ fn program_main(_args: &[&str]) -> i32 {
             }
         };
 
-        let echo_on = c_lflag & ECHO != 0;
-        let isig = c_lflag & ISIG != 0;
-
-        // ICRNL: translate CR to NL on input.
-        let byte = if (c_iflag & ICRNL != 0) && byte == b'\r' {
-            b'\n'
-        } else {
-            byte
-        };
-
-        // ISIG: check signal characters from c_cc.
-        if isig {
-            let signal = if byte == c_cc_arr[VINTR] {
-                Some((SIGINT as u32, "^C"))
-            } else if byte == c_cc_arr[VSUSP] {
-                Some((SIGTSTP as u32, "^Z"))
-            } else if byte == c_cc_arr[VQUIT] {
-                Some((SIGQUIT as u32, "^\\"))
-            } else {
-                None
-            };
-
-            if let Some((sig, name)) = signal {
-                // Clear edit buffer in canonical mode.
-                if canonical {
-                    edit_buf.clear();
-                }
-                echo(name);
-                echo("\n");
-                syscall_lib::signal_process_group(sig);
-                continue;
-            }
-        }
-
-        if canonical {
-            // Cooked mode: buffer in edit_buf, deliver on newline or EOF.
-
-            // VERASE (backspace/DEL)
-            if byte == c_cc_arr[VERASE] || byte == 0x7F {
-                let erased = edit_buf.erase_char();
-                if erased.is_some() && echo_on && (c_lflag & ECHOE != 0) {
-                    echo("\x08 \x08");
-                }
-                continue;
-            }
-
-            // VKILL (^U)
-            if byte == c_cc_arr[VKILL] {
-                let n = edit_buf.kill_line();
-                if n > 0 && echo_on && (c_lflag & ECHOK != 0) {
-                    for _ in 0..n {
-                        echo("\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VWERASE (^W)
-            if byte == c_cc_arr[VWERASE] {
-                let n = edit_buf.word_erase();
-                if n > 0 && echo_on {
-                    for _ in 0..n {
-                        echo("\x08 \x08");
-                    }
-                }
-                continue;
-            }
-
-            // VEOF (^D)
-            if byte == c_cc_arr[VEOF] {
-                if edit_buf.is_empty() {
-                    syscall_lib::stdin_signal_eof();
-                } else {
-                    // Non-empty: flush buffer without appending newline.
-                    let data = edit_buf.as_slice();
-                    syscall_lib::stdin_push(data);
-                    edit_buf.clear();
-                }
-                continue;
-            }
-
-            // Newline: deliver line.
-            if byte == b'\n' {
-                let data = edit_buf.as_slice();
-                syscall_lib::stdin_push(data);
-                edit_buf.clear();
-                let nl = [b'\n'];
-                syscall_lib::stdin_push(&nl);
-
-                // Echo newline.
-                if echo_on || (c_lflag & ECHONL != 0) {
-                    if c_oflag & ONLCR != 0 {
-                        echo("\r\n");
-                    } else {
-                        echo("\n");
-                    }
-                }
-                continue;
-            }
-
-            // Regular character: buffer it.
-            edit_buf.push(byte);
-
-            if echo_on {
-                echo_byte(byte);
-            }
-        } else {
-            // Raw / cbreak mode: push byte immediately.
-            let buf = [byte];
-            syscall_lib::stdin_push(&buf);
-
-            if echo_on {
-                if c_oflag & ONLCR != 0 && byte == b'\n' {
-                    echo("\r\n");
-                } else {
-                    echo_byte(byte);
-                }
-            }
-        }
+        // Forward raw byte to the kernel line discipline.
+        syscall_lib::push_raw_input(byte);
     }
 }
 

@@ -8,18 +8,33 @@
 
 ## Milestone Goal
 
-The kernel scheduler uses per-core queues with work-stealing, IPC resource pools are dynamically growable, the line discipline is implemented once in the kernel (not duplicated in userspace), VMA lookup is O(log n), and ISR-delivered notifications wake tasks immediately rather than waiting for the next scheduler tick.
+Phase 52c established the architecture direction for per-core scheduling,
+growable IPC resources, a unified kernel-side line discipline, O(log n) VMA
+lookup, and ISR wakeup improvements. In the checked-in tree, the VMA tree,
+growable endpoint/capability/service tables, `LineDiscipline`, the live
+`push_raw_input` keyboard path, and the ISR wake queue all landed. Phase 52d
+then recorded the remaining honest limits: the scheduler hot path still relies
+on the global `SCHEDULER` lock, and notifications remain fixed-size for ISR
+safety.
 
 ## Post-Phase Audit Note
 
 Phase 52c landed several important pieces — `LineDiscipline`, `push_raw_input`,
-the VMA tree, the ISR wake queue, and growable endpoint/capability tables — but
-the post-phase audit found that the checked-in code still diverges from part of
-this phase's completion story. `userspace/stdin_feeder` still duplicates line
-discipline logic, the scheduler hot path still relies on the global
-`SCHEDULER` lock, and notifications remain fixed-size for ISR safety rather than
-fully growable. Phase 52d either completes those claims or explicitly
-re-defers them.
+the VMA tree, the ISR wake queue, and growable endpoint/capability tables. The
+post-phase audit originally found three mismatches between the implementation
+and the completion story; Phase 52d closed that audit as follows:
+
+1. **Keyboard input path:** Completed. `userspace/stdin_feeder` now forwards raw
+   bytes and escape sequences via `push_raw_input`, so the kernel
+   `LineDiscipline` is the sole live line-discipline path for keyboard input.
+
+2. **Scheduler hot path:** Explicitly deferred. The dispatch path still acquires
+   the global `SCHEDULER` lock for task-state reads and transitions even though
+   per-core queues, work-stealing, load balancing, and slot reuse are active.
+
+3. **Notification pool:** Explicitly deferred. Notifications remain backed by a
+   fixed-size `MAX_NOTIFS = 64` array because the allocator and waiter mirrors
+   must remain ISR-safe and lock-free.
 
 ## Why This Phase Exists
 
@@ -47,12 +62,27 @@ These are not bugs — they are design limitations that become increasingly cost
 
 Replace the single global `SCHEDULER: Mutex<Scheduler>` with per-core scheduler state. Each core has a local ready queue and a steal-enabled queue. Work-stealing balances load without a global lock on the dispatch hot path.
 
+**Shipped state (audited Phase 52d):** Per-core run queues, work-stealing
+(`try_steal`), load-balancing with per-task migration cooldown, and dead-slot
+recycling all landed.  However, the global `SCHEDULER` lock is still acquired
+on every dispatch iteration for task state reads, state transitions, and
+post-switch bookkeeping.  True lock-free per-core dispatch — where the hot path
+never acquires the global lock — is deferred (see Phase 52d Track D).
+
 **Design reference:** `docs/appendix/architecture/next/04-scheduler-smp.md` Section 1.
 **Comparison:** Zircon hybrid fair+deadline scheduler with per-CPU queues and cluster-aware stealing (`scheduler.cc`).
 
 ### Dynamic IPC resource pools
 
 Replace the fixed-size arrays (`MAX_ENDPOINTS = 16`, `MAX_NOTIFS = 16`, `MAX_SERVICES = 16`, `CapabilityTable.slots = [Option; 64]`) with growable pools backed by slab allocation or `Vec`. Free IDs are recycled via a free list.
+
+**Shipped state (audited Phase 52d):** Endpoints and capabilities are now
+growable (`Vec`-backed with free-list recycling).  The service registry is
+growable.  **Notifications remain fixed-size** (`MAX_NOTIFS = 64`) because
+`PENDING` and `ISR_WAITERS` must be accessible from ISR context using only
+lock-free atomics; a growable pool would require allocation or lock-based
+indirection that is not ISR-safe.  The fixed-size constraint is documented
+in `kernel/src/ipc/notification.rs` with exhaustion diagnostics.
 
 **Design reference:** `docs/appendix/architecture/next/03-ipc-and-wakeups.md` Section 2.
 **Comparison:** Zircon handle table (growable, per-process). seL4 CNode tree (arbitrarily deep).
@@ -75,6 +105,13 @@ Replace `Vec<MemoryMapping>` with a `BTreeMap<u64, MemoryMapping>` keyed by star
 
 Replace the tick-dependent `drain_pending_waiters()` mechanism with a per-core lock-free wakeup queue. ISRs push task IDs to the queue (lock-free, no scheduler lock needed). The scheduler drains the queue on every iteration, not just on timer ticks.
 
+**Shipped state (audited Phase 52d):** The per-core `IsrWakeQueue` and
+`ISR_WAITERS` lock-free mirror are implemented.  `signal_irq` pushes the
+waiter to the ISR wake queue when available; the scheduler drains it each
+iteration.  `drain_pending_waiters()` is retained as a BSP-only safety
+fallback for edge cases (queue full, or waiter not yet registered when the
+IRQ fired).
+
 **Design reference:** `docs/appendix/architecture/next/03-ipc-and-wakeups.md` Section 3.
 **Comparison:** seL4 immediate notification delivery; Zircon interrupt ports.
 
@@ -82,11 +119,15 @@ Replace the tick-dependent `drain_pending_waiters()` mechanism with a per-core l
 
 ### Per-core scheduler
 
-Each `PerCoreData` gains a `PerCoreScheduler` struct with `local_queue: VecDeque<TaskHandle>` and `steal_queue: Mutex<VecDeque<TaskHandle>>`. `pick_next()` checks local queue, then steal queue, then steals from other cores. The global `TaskRegistry` is only used for spawn and exit, not the dispatch hot path.
+Each `PerCoreData` has a `run_queue: Mutex<VecDeque<usize>>` and an
+`IsrWakeQueue`. `pick_next()` checks the local queue, then steals from other
+cores, then falls back to the idle task. The global `SCHEDULER` lock is still
+acquired on each dispatch iteration for task state reads and transitions;
+true lock-free per-core dispatch is deferred.
 
 ### ISR wake queue
 
-A per-core `IsrWakeQueue` is a fixed-size ring buffer of `AtomicU64` entries. The ISR pushes a task ID (lock-free SPSC). The scheduler drains all entries on every loop iteration and calls `wake_task` under the per-core scheduler lock (not the global lock).
+A per-core `IsrWakeQueue` is a fixed-size ring buffer of `AtomicU64` entries. The ISR pushes a task index (lock-free SPSC via `compare_exchange` to prevent duplicates). The scheduler drains all entries on every loop iteration and calls `wake_task` under the global `SCHEDULER` lock. `drain_pending_waiters()` is retained on the BSP as a safety fallback.
 
 ### LineDiscipline module
 
@@ -121,11 +162,11 @@ A `LineDiscipline` struct holds a reference to the TTY state and provides `proce
 
 ## Acceptance Criteria
 
-- Scheduler dispatch path does not acquire a global lock
+- Scheduler dispatch path does not acquire a global lock *(deferred — see Post-Phase Audit Note; global lock still acquired in HEAD; per-core run queues and work-stealing provide dispatch locality but task state transitions require the global SCHEDULER lock; true lock-free per-core dispatch deferred to a future phase)*
 - IPC can create more than 16 endpoints without exhaustion
 - A process can hold more than 64 capabilities
-- Only one line discipline implementation exists in the codebase (kernel-side)
-- `stdin_feeder` does not contain any canonical editing, echo, or ISIG logic
+- Only one line discipline implementation exists in the codebase (kernel-side) *(partial — see Post-Phase Audit Note; stdin_feeder still duplicates ldisc logic)*
+- `stdin_feeder` does not contain any canonical editing, echo, or ISIG logic *(partial — see Post-Phase Audit Note)*
 - VMA lookup for a process with 100 mappings is measurably faster than current
 - Keyboard IRQ → kbd_server wakeup latency is under 1ms (not 10ms)
 - `cargo xtask check` and `cargo xtask test` pass
@@ -145,6 +186,8 @@ A `LineDiscipline` struct holds a reference to the TTY state and provides `proce
 ## Deferred Until Later
 
 - Full fair scheduler with virtual runtime (Zircon WAVL / Linux CFS) — current priority + round-robin is sufficient
+- **True per-core scheduling** (lock-free dispatch hot path) — per-core run queues and work-stealing landed, but task state transitions still require the global `SCHEDULER` lock; splitting task ownership per-core is a larger architectural change deferred past Phase 52
+- **Growable notification pool** — notifications remain fixed-size (`MAX_NOTIFS = 64`) because ISR-safe access requires lock-free fixed-size arrays; a two-level design (fixed ISR-visible table + growable overflow) is possible but not needed at current scale
 - Atomic `reply_recv` (seL4-style) — nice optimization but not critical
 - Preemptive scheduling from interrupt context — requires deeper `switch_context` redesign
 - Dynamic PTY pool — can grow the fixed array to a larger number as a simpler intermediate step

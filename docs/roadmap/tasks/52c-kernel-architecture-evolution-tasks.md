@@ -5,10 +5,12 @@
 **Depends on:** Phase 52b (Kernel Structural Hardening) ✅
 **Goal:** Larger-scale architecture improvements that improve scalability, remove resource limits, and unify duplicated subsystems.
 
-> **Post-phase audit note:** The current implementation still has open 52d
-> follow-up in Track A (global scheduler lock in the hot path), Track C.3
-> (`stdin_feeder` still duplicating line discipline), and the notification-pool
-> story where fixed-size ISR-safe arrays remain in use.
+> **Post-phase audit note (closed in Phase 52d):** Track C.3 is now complete in
+> HEAD: `stdin_feeder` forwards raw bytes via `push_raw_input` and no longer
+> duplicates line discipline in userspace. The remaining unchecked items are
+> intentional deferrals: Track A.1 still acquires the global `SCHEDULER` lock
+> on each dispatch iteration, and Track B.3 keeps a fixed-size
+> `MAX_NOTIFS = 64` pool for ISR safety. Phase 52d records the final rationale.
 
 ## Track Layout
 
@@ -37,7 +39,7 @@
 - [x] `PerCoreScheduler` has `local_queue: VecDeque<TaskHandle>` and `steal_queue: Mutex<VecDeque<TaskHandle>>`
 - [x] `TaskRegistry` holds the global `Vec<Task>` (spawn/exit only, not dispatch hot path)
 - [x] `pick_next` checks local queue, then steal queue, then steals from other cores
-- [x] The dispatch hot path does not acquire any global lock
+- [ ] The dispatch hot path does not acquire any global lock *(deferred — per-core run queues landed but the global `SCHEDULER` lock is still acquired on each dispatch iteration for task state reads and transitions; see Phase 52d Track D)*
 
 ### A.2 — Implement work-stealing
 
@@ -109,9 +111,9 @@
 **Why it matters:** `MAX_NOTIFS = 16` and `MAX_SERVICES = 16` limit the number of IRQ-driven services and named services.
 
 **Acceptance:**
-- [x] Notification pool grows dynamically (slab or Vec)
+- [ ] Notification pool grows dynamically (slab or Vec) *(deferred — fixed-size `MAX_NOTIFS = 64` retained because ISR-safe access requires lock-free fixed-size arrays; exhaustion diagnostics added in Phase 52d Track D; see `kernel/src/ipc/notification.rs` module doc for full rationale)*
 - [x] Service registry grows dynamically
-- [x] Creating 32 notifications and 32 services succeeds
+- [ ] Creating 32 notifications and 32 services succeeds *(32 notifications succeed — the pool is 64 slots — but growth is not dynamic; the acceptance criterion as written implied dynamic growth)*
 
 ---
 
@@ -206,7 +208,7 @@
 
 **Acceptance:**
 - [x] Scheduler loop drains `IsrWakeQueue` before `pick_next`
-- [x] For each drained task ID, calls `wake_task(id)` under the per-core scheduler lock
+- [x] For each drained task ID, calls `wake_task(id)` under the global `SCHEDULER` lock *(originally stated "per-core scheduler lock" — corrected to match the actual implementation which uses the global lock)*
 - [x] `drain_pending_waiters()` tick-based path is removed or demoted to a safety fallback
 - [x] Keyboard IRQ to kbd_server wakeup latency is under 1ms
 

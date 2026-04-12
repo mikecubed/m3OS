@@ -25,7 +25,10 @@ pub mod futex;
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::mm::AddressSpace;
 use spin::Mutex;
@@ -60,6 +63,40 @@ pub fn set_current_pid(pid: Pid) {
     } else {
         CURRENT_PID_LEGACY.store(pid, Ordering::Relaxed);
     }
+}
+
+/// Return a non-null pointer to the current core's active user address space, if any.
+///
+/// When SMP per-core state is live, this uses the scheduler-maintained
+/// `current_addrspace` pointer so fault-time paths do not need to reenter the
+/// process table just to serialize page-table mutations. Before per-core state
+/// exists, it falls back to the current process table entry.
+pub fn current_addr_space() -> Option<NonNull<AddressSpace>> {
+    if crate::smp::is_per_core_ready() {
+        let ptr = crate::smp::per_core().current_addrspace;
+        if !ptr.is_null() {
+            return NonNull::new(ptr.cast_mut());
+        }
+    }
+
+    let pid = current_pid();
+    if pid == 0 {
+        return None;
+    }
+
+    let ptr = {
+        let table = PROCESS_TABLE.lock();
+        table.find(pid).and_then(|p| {
+            p.addr_space
+                .as_ref()
+                .map(|addr_space| addr_space.as_ref() as *const AddressSpace)
+        })
+    }?;
+
+    // Before per-core state exists the kernel is still effectively single-core,
+    // so the current process entry cannot be concurrently reaped before callers
+    // immediately dereference this pointer in a tightly-scoped unsafe block.
+    NonNull::new(ptr as *mut AddressSpace)
 }
 
 #[allow(unused_imports)]
@@ -842,6 +879,13 @@ pub(crate) fn alloc_kernel_stack_pub() -> u64 {
 /// Global process table.  All modifications go through `PROCESS_TABLE.lock()`.
 pub static PROCESS_TABLE: Mutex<ProcessTable> = Mutex::new(ProcessTable::new());
 
+fn canonical_mm_index(processes: &[Process], tgid: u32) -> Option<usize> {
+    processes
+        .iter()
+        .position(|p| p.pid == tgid)
+        .or_else(|| processes.iter().position(|p| p.tgid == tgid))
+}
+
 /// The kernel's process table — a flat list of all live [`Process`] entries.
 pub struct ProcessTable {
     processes: Vec<Process>,
@@ -889,6 +933,48 @@ impl ProcessTable {
             None
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn shared_mm_snapshot(pid: Pid) -> Option<(u64, u64, VmaTree)> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    let proc = &table.processes[idx];
+    Some((proc.brk_current, proc.mmap_next, proc.vma_tree.clone()))
+}
+
+pub fn shared_vma_prot(pid: Pid, addr: u64) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+    table.processes[idx].find_vma(addr).map(|m| m.prot)
+}
+
+pub fn with_shared_mm_mut<R, F>(pid: Pid, f: F) -> Option<R>
+where
+    F: FnOnce(&mut u64, &mut u64, &mut VmaTree) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    let tgid = table.find(pid)?.tgid;
+    let idx = canonical_mm_index(&table.processes, tgid)?;
+
+    let mut brk_current = table.processes[idx].brk_current;
+    let mut mmap_next = table.processes[idx].mmap_next;
+    let mut vma_tree = table.processes[idx].vma_tree.clone();
+    let result = f(&mut brk_current, &mut mmap_next, &mut vma_tree);
+
+    for proc in table.processes.iter_mut().filter(|p| p.tgid == tgid) {
+        proc.brk_current = brk_current;
+        proc.mmap_next = mmap_next;
+        proc.vma_tree = vma_tree.clone();
+    }
+
+    Some(result)
+}
+
+pub fn sync_shared_mm_state(pid: Pid) {
+    let _ = with_shared_mm_mut(pid, |_brk_current, _mmap_next, _vma_tree| {});
 }
 
 // ---------------------------------------------------------------------------

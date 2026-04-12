@@ -612,21 +612,40 @@ pub fn stdin_signal_eof() -> isize {
 }
 
 /// Syscall numbers for direct termios field reads (return value in rax).
+///
+/// **Temporary compatibility only** — introduced as a workaround for the
+/// `copy_to_user` intermittent reliability bug (see
+/// `docs/appendix/copy-to-user-reliability-bug.md`).  No in-tree binary
+/// depends on these after Phase 52d Track C converged keyboard input on
+/// `push_raw_input`.  Retained only for out-of-tree or diagnostic use.
+/// Prefer `tcgetattr` or kernel-side line discipline for new code.
 pub const SYS_GET_TERMIOS_LFLAG: u64 = 0x100D;
 pub const SYS_GET_TERMIOS_IFLAG: u64 = 0x100E;
 pub const SYS_GET_TERMIOS_OFLAG: u64 = 0x100F;
 
 /// Get TTY0 c_lflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
 pub fn get_termios_lflag() -> u32 {
     unsafe { syscall0(SYS_GET_TERMIOS_LFLAG) as u32 }
 }
 
 /// Get TTY0 c_iflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
 pub fn get_termios_iflag() -> u32 {
     unsafe { syscall0(SYS_GET_TERMIOS_IFLAG) as u32 }
 }
 
 /// Get TTY0 c_oflag directly as a return value.
+///
+/// **Deprecated** — temporary `copy_to_user` workaround.
+/// No in-tree binary calls this after Phase 52d Track C.
+#[deprecated(note = "temporary copy_to_user workaround; use tcgetattr or push_raw_input")]
 pub fn get_termios_oflag() -> u32 {
     unsafe { syscall0(SYS_GET_TERMIOS_OFLAG) as u32 }
 }

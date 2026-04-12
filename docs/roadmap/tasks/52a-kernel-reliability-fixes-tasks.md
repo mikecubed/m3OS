@@ -8,8 +8,8 @@
 > **Post-phase audit note:** Track A documents the historical Phase 52a
 > stop-gap (`restore_caller_context` around IPC/futex blocking paths). The
 > current implementation in HEAD uses the Phase 52b scheduler-driven return
-> state path instead. Phase 52d is the authoritative follow-up for the current
-> implementation and the remaining exec-time signal-reset regression coverage.
+> state path instead. Phase 52d is the authoritative closure for that handoff
+> and for the exec-time signal-reset regression coverage.
 
 ## Track Layout
 
