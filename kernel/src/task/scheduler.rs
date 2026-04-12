@@ -34,7 +34,8 @@
 //! When a core's local run queue is empty, `pick_next` calls `try_steal`
 //! to take one ready task from the longest other-core queue, provided the
 //! task's affinity mask permits running on the stealing core. The stolen
-//! task's `assigned_core` and `last_migrated_tick` are updated.
+//! task's `assigned_core` and `last_migrated_tick` are updated, and recently
+//! assigned, woken, or yielded tasks are skipped until the cooldown expires.
 //!
 //! ## Load balancing (Phase 52c A.4)
 //!
@@ -424,6 +425,18 @@ impl Scheduler {
             if task.state != TaskState::Ready {
                 continue;
             }
+            // Fresh fork/clone children carry a task-local fork_ctx until their
+            // first dispatch through fork_child_trampoline. Keep them on the
+            // spawning core so the parent's immediate wait/read-yield loop
+            // can't starve them behind background work on another CPU.
+            if task.fork_ctx.is_some() {
+                continue;
+            }
+            if crate::arch::x86_64::interrupts::tick_count().saturating_sub(task.last_migrated_tick)
+                < MIGRATE_COOLDOWN
+            {
+                continue;
+            }
             if self.idle_tasks.contains(&Some(idx)) {
                 continue;
             }
@@ -552,6 +565,7 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
     let mut sched = SCHEDULER.lock();
     let target = least_loaded_core(&sched);
     task.assigned_core = target;
+    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(target, idx);
@@ -564,6 +578,7 @@ pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     let mut task = Task::new(entry, name);
     let core = crate::smp::per_core().core_id;
     task.assigned_core = core;
+    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
     let mut sched = SCHEDULER.lock();
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
@@ -580,6 +595,7 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
     task.assigned_core = current_core;
+    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
     // Publish the child PID before the first dispatch so pid-based lifecycle
     // operations (for example exit_group teardown) can target the task even if
     // it has not reached fork_child_trampoline yet.
@@ -1137,9 +1153,13 @@ pub fn wake_task(id: TaskId) -> bool {
                     let prev_state = sched.tasks[idx].state as u8;
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
+                        sched.tasks[idx].last_migrated_tick =
+                            crate::arch::x86_64::interrupts::tick_count();
                         (None, true)
                     } else {
                         sched.tasks[idx].state = TaskState::Ready;
+                        sched.tasks[idx].last_migrated_tick =
+                            crate::arch::x86_64::interrupts::tick_count();
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
                             true,
@@ -1619,6 +1639,9 @@ pub fn run() -> ! {
 
                     if (wake_after_switch && blocked) || reenqueue_after_yield {
                         task.state = TaskState::Ready;
+                        if reenqueue_after_yield {
+                            task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+                        }
                         Some((task.assigned_core, sidx))
                     } else {
                         None
@@ -1690,11 +1713,13 @@ pub fn maybe_load_balance() {
     if let Some(src) = crate::smp::get_core_data(longest_core) {
         let sched = SCHEDULER.lock();
         let mut q = src.run_queue.lock();
-        // Find a migratable (non-pinned, not recently migrated) task.
+        // Find a migratable task: affinity-compatible, not pinned by fork_ctx,
+        // and not recently assigned/woken/yielded on its current core.
         let mut found = None;
         for i in 0..q.len() {
             if let Some(&idx) = q.get(i)
                 && idx < sched.tasks.len()
+                && sched.tasks[idx].fork_ctx.is_none()
                 && sched.tasks[idx].affinity_mask & (1u64 << shortest_core) != 0
                 && current_tick.saturating_sub(sched.tasks[idx].last_migrated_tick)
                     >= MIGRATE_COOLDOWN
