@@ -135,6 +135,38 @@ impl CapabilityTable {
         Ok(dest_handle)
     }
 
+    /// Return whether the table currently holds a capability for `ep_id`.
+    pub fn contains_endpoint(&self, ep_id: EndpointId) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|cap| matches!(cap, Capability::Endpoint(id) if *id == ep_id))
+    }
+
+    /// Return the callers currently referenced by reply capabilities.
+    pub fn reply_targets(&self) -> Vec<TaskId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|cap| match cap {
+                Capability::Reply(task) => Some(*task),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the notification IDs currently held in the table.
+    pub fn notification_ids(&self) -> Vec<NotifId> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter_map(|cap| match cap {
+                Capability::Notification(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Return the current number of slots (for diagnostic / test use).
     pub fn capacity(&self) -> usize {
         self.slots.len()
@@ -166,6 +198,33 @@ mod tests {
         let handle = table.insert(cap).unwrap();
         assert_eq!(table.remove(handle), Ok(cap));
         assert_eq!(table.get(handle), Err(CapError::InvalidHandle));
+    }
+
+    #[test]
+    fn contains_endpoint_detects_only_matching_endpoints() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Notification(NotifId(3))).unwrap();
+        table.insert(Capability::Endpoint(EndpointId(7))).unwrap();
+        assert!(table.contains_endpoint(EndpointId(7)));
+        assert!(!table.contains_endpoint(EndpointId(8)));
+    }
+
+    #[test]
+    fn reply_targets_collects_only_reply_caps() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Reply(TaskId(11))).unwrap();
+        table.insert(Capability::Endpoint(EndpointId(3))).unwrap();
+        table.insert(Capability::Reply(TaskId(29))).unwrap();
+        assert_eq!(table.reply_targets(), vec![TaskId(11), TaskId(29)]);
+    }
+
+    #[test]
+    fn notification_ids_collect_only_notification_caps() {
+        let mut table = CapabilityTable::new();
+        table.insert(Capability::Notification(NotifId(2))).unwrap();
+        table.insert(Capability::Reply(TaskId(11))).unwrap();
+        table.insert(Capability::Notification(NotifId(7))).unwrap();
+        assert_eq!(table.notification_ids(), vec![NotifId(2), NotifId(7)]);
     }
 
     #[test]

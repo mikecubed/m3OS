@@ -131,17 +131,56 @@ impl EndpointRegistry {
         self.slots.get_mut(id.0 as usize)?.as_mut()
     }
 
-    /// Destroy all endpoints owned by `task_id`, returning their slots to
-    /// the free pool.  Kernel-created endpoints (`owner == None`) are not
-    /// affected.
-    pub fn destroy_owned_by(&mut self, task_id: TaskId) {
+    /// Close all endpoints owned by `task_id`.
+    ///
+    /// Closed endpoints stay tombstoned until no live task still holds a cap
+    /// to their [`EndpointId`]. That prevents stale caps from aliasing a later
+    /// endpoint that reuses the same slot.
+    ///
+    /// Returns the blocked peers stranded on those endpoints so the caller can
+    /// wake them **after** releasing the registry lock.
+    pub(super) fn close_owned_by(&mut self, task_id: TaskId) -> (Vec<StrandedSender>, Vec<TaskId>) {
+        let mut stranded_senders = Vec::new();
+        let mut stranded_receivers = Vec::new();
         for slot in self.slots.iter_mut() {
             if let Some(ep) = slot
                 && ep.owner == Some(task_id)
             {
-                *slot = None;
+                ep.owner = None;
+                ep.closed = true;
+                stranded_receivers.extend(ep.receivers.drain(..));
+                for mut ps in ep.senders.drain(..) {
+                    stranded_senders.push(StrandedSender {
+                        task: ps.task,
+                        cap: ps.msg.cap.take(),
+                    });
+                }
             }
         }
+        (stranded_senders, stranded_receivers)
+    }
+
+    /// Return the IDs of endpoints currently tombstoned by owner exit.
+    pub(super) fn closed_ids(&self) -> Vec<EndpointId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                slot.as_ref()
+                    .filter(|ep| ep.closed)
+                    .map(|_| EndpointId(i as u8))
+            })
+            .collect()
+    }
+
+    /// Return whether any queued send currently carries `ep_id` as an attached
+    /// capability inside its message.
+    pub(super) fn queued_message_holds_endpoint(&self, ep_id: EndpointId) -> bool {
+        self.slots.iter().flatten().any(|ep| {
+            ep.senders.iter().any(
+                |pending| matches!(pending.msg.cap, Some(Capability::Endpoint(id)) if id == ep_id),
+            )
+        })
     }
 
     /// Return the current number of slots (for iteration / diagnostics).
@@ -169,6 +208,10 @@ pub struct Endpoint {
     /// Owner task for user-created endpoints (`Some`), or `None` for
     /// kernel-created static endpoints.  Used for reclamation on task exit.
     pub(super) owner: Option<TaskId>,
+    /// Tombstone bit set when the owner exits while foreign caps may still
+    /// reference this [`EndpointId`]. Closed endpoints reject new IPC until
+    /// the slot can be safely reclaimed.
+    pub(super) closed: bool,
 }
 
 /// A task that is blocked trying to send (or `call`) on an endpoint.
@@ -180,12 +223,19 @@ pub(super) struct PendingSend {
     pub(super) wants_reply: bool,
 }
 
+/// Sender stranded on an endpoint that closed while it was blocked.
+pub(super) struct StrandedSender {
+    pub(super) task: TaskId,
+    pub(super) cap: Option<Capability>,
+}
+
 impl Endpoint {
     const fn new() -> Self {
         Endpoint {
             senders: VecDeque::new(),
             receivers: VecDeque::new(),
             owner: None,
+            closed: false,
         }
     }
 }
@@ -212,8 +262,8 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
     let action = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return Message::new(u64::MAX),
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
         };
         if let Some(pending) = ep.senders.pop_front() {
             Some(pending)
@@ -269,6 +319,7 @@ pub fn recv_msg(receiver: TaskId, ep_id: EndpointId) -> Message {
                 ep: ep_id.0 as u32,
             });
             if !pending.wants_reply {
+                scheduler::complete_send(pending.task);
                 let _ = scheduler::wake_task(pending.task);
             }
         }
@@ -334,8 +385,8 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return false,
+            Some(e) if !e.closed => e,
+            _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
             Some(receiver)
@@ -370,7 +421,14 @@ pub fn send(sender: TaskId, ep_id: EndpointId, msg: Message) -> bool {
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send();
+            scheduler::block_current_on_send_unless_completed();
+            if let Some(msg) = scheduler::take_message(sender) {
+                debug_assert!(
+                    msg.label == u64::MAX,
+                    "[ipc] send: woke with unexpected pending message"
+                );
+                return false;
+            }
         }
     }
     true
@@ -385,8 +443,8 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return Message::new(u64::MAX),
+            Some(e) if !e.closed => e,
+            _ => return Message::new(u64::MAX),
         };
 
         if let Some(receiver) = ep.receivers.pop_front() {
@@ -411,11 +469,15 @@ pub fn call_msg(caller: TaskId, ep_id: EndpointId, msg: Message) -> Message {
                 // Put the receiver back at the front of the queue so it
                 // remains blocked on the endpoint as if this call never arrived.
                 let mut reg = ENDPOINTS.lock();
-                if let Some(ep) = reg.get_mut(ep_id) {
+                if let Some(ep) = reg.get_mut(ep_id)
+                    && !ep.closed
+                {
                     ep.receivers.push_front(receiver);
                 } else {
-                    // Endpoint was destroyed; wake receiver to avoid leaving it blocked.
+                    // Endpoint was closed or destroyed; wake receiver with an
+                    // explicit IPC error so it does not remain stranded.
                     drop(reg);
+                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
                     let _ = scheduler::wake_task(receiver);
                 }
                 return Message::new(u64::MAX);
@@ -552,8 +614,8 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
     let matched_receiver = {
         let mut reg = ENDPOINTS.lock();
         let ep = match reg.get_mut(ep_id) {
-            Some(e) => e,
-            None => return false,
+            Some(e) if !e.closed => e,
+            _ => return false,
         };
         if let Some(receiver) = ep.receivers.pop_front() {
             Some(receiver)
@@ -573,8 +635,14 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
             if transfer_cap(sender, receiver, &mut msg).is_err() {
                 // Put receiver back — act as if the send never happened.
                 let mut reg = ENDPOINTS.lock();
-                if let Some(ep) = reg.get_mut(ep_id) {
+                if let Some(ep) = reg.get_mut(ep_id)
+                    && !ep.closed
+                {
                     ep.receivers.push_front(receiver);
+                } else {
+                    drop(reg);
+                    scheduler::deliver_message(receiver, Message::new(u64::MAX));
+                    let _ = scheduler::wake_task(receiver);
                 }
                 return false;
             }
@@ -591,7 +659,14 @@ pub fn send_with_cap(sender: TaskId, ep_id: EndpointId, mut msg: Message) -> boo
                 task_idx: sender.0 as u32,
                 ep: ep_id.0 as u32,
             });
-            scheduler::block_current_on_send();
+            scheduler::block_current_on_send_unless_completed();
+            if let Some(msg) = scheduler::take_message(sender) {
+                debug_assert!(
+                    msg.label == u64::MAX,
+                    "[ipc] send_with_cap: woke with unexpected pending message"
+                );
+                return false;
+            }
         }
     }
     true

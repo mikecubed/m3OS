@@ -172,6 +172,9 @@ pub struct Task {
     /// `ipc_call_buf`.  Consumed by `take_bulk_data` after the receiver
     /// wakes.  `None` for messages without bulk payloads.
     pub pending_bulk: Option<alloc::vec::Vec<u8>>,
+    /// Sticky completion flag for `send()` / `send_with_cap()` so a receiver
+    /// can acknowledge a consumed send even if the sender has not blocked yet.
+    pub send_completed: bool,
     /// Endpoint this task is the "server" of (used by `reply_recv` to find
     /// the endpoint to block on after replying).
     pub server_endpoint: Option<crate::ipc::EndpointId>,
@@ -201,6 +204,9 @@ pub struct Task {
     /// Set by a wakeup that arrives while `switching_out` is true so the
     /// scheduler can enqueue the task after `switch_context` completes.
     pub wake_after_switch: bool,
+    /// Set once per-task IPC teardown has run so deferred dead-task cleanup
+    /// can avoid double-cleaning the same task.
+    pub ipc_cleaned: bool,
     /// User-mode return state saved when this task yields and restored by the
     /// scheduler on re-dispatch.  `None` for kernel-only tasks or before the
     /// first yield from a userspace context.
@@ -232,6 +238,7 @@ impl Task {
             caps: CapabilityTable::new(),
             pending_msg: None,
             pending_bulk: None,
+            send_completed: false,
             server_endpoint: None,
             assigned_core: 0,
             pid: 0,                  // Set by fork_child_trampoline for userspace tasks
@@ -243,6 +250,7 @@ impl Task {
             last_migrated_tick: 0,
             switching_out: false,
             wake_after_switch: false,
+            ipc_cleaned: false,
             user_return: None,
             fork_ctx: None,
             _stack: Some(stack),

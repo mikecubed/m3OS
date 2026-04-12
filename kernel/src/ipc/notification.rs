@@ -230,6 +230,32 @@ pub fn free(id: NotifId) {
     }
 }
 
+/// Fully release a notification object held by a dying task.
+///
+/// This clears any waiter state, drops IRQ mappings that still point at this
+/// notification, resets pending bits, and returns the slot to the allocator.
+pub fn release(id: NotifId) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let idx = id.0 as usize;
+        if idx >= MAX_NOTIFS {
+            return;
+        }
+
+        for slot in &IRQ_MAP {
+            let _ = slot.compare_exchange(id.0, 0xff, Ordering::AcqRel, Ordering::Acquire);
+        }
+
+        {
+            let mut waiters = WAITERS.lock();
+            waiters[idx] = None;
+        }
+        ISR_WAITERS[idx].store(-1, Ordering::Release);
+        PENDING[idx].store(0, Ordering::Release);
+
+        free(id);
+    });
+}
+
 /// Remove an IRQ→notification mapping, resetting the IRQ line to unregistered.
 ///
 /// Used to roll back a `register_irq` when the subsequent capability insert

@@ -145,20 +145,10 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         6 => {
             // sys_cap_grant(source_handle, target_task_id)
             // `cap` was already looked up from arg0 above — we know it's valid.
-            // Now remove it from the caller and insert into the target.
+            // Transfer it under the scheduler lock so endpoint cleanup cannot
+            // observe a holderless gap and reclaim a tombstone too early.
             let target_id = TaskId(arg1);
-
-            // Validate target task exists by trying to look up handle 0 in its
-            // cap table.  If the task doesn't exist, task_cap returns
-            // InvalidHandle — but that could also mean slot 0 is empty.
-            // Instead, try a remove + insert sequence: remove from caller
-            // first, attempt insert into target, and roll back on failure.
-            let removed = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
-                Ok(c) => c,
-                Err(_) => return u64::MAX,
-            };
-
-            match scheduler::insert_cap(target_id, removed) {
+            match scheduler::grant_task_cap(task_id, arg0 as CapHandle, target_id) {
                 Ok(new_handle) => {
                     log::trace!(
                         "[ipc] sys_cap_grant: task {} -> task {} (new handle {})",
@@ -168,25 +158,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                     );
                     u64::from(new_handle)
                 }
-                Err(_) => {
-                    // Roll back: re-insert into the caller's table at the
-                    // original slot so there are no side effects.
-                    //
-                    // NOTE: The remove+insert sequence is not atomic across
-                    // capability tables — another core can briefly observe
-                    // the capability absent from the source.  A future
-                    // improvement could hold the scheduler lock across the
-                    // entire grant operation.
-                    if let Err(e) = scheduler::insert_cap_at(task_id, arg0 as CapHandle, removed) {
-                        log::error!(
-                            "[ipc] sys_cap_grant: CRITICAL rollback failed for task {} handle {} ({:?}) — capability lost",
-                            task_id.0,
-                            arg0,
-                            e,
-                        );
-                    }
-                    u64::MAX
-                }
+                Err(_) => u64::MAX,
             }
         }
         1 => {
@@ -407,13 +379,11 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
-    let ep_id = match registry::lookup(name) {
-        Some(id) => id,
-        None => return u64::MAX,
-    };
-    match crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id)) {
-        Ok(handle) => u64::from(handle),
-        Err(_) => u64::MAX,
+    match registry::with_lookup(name, |ep_id| {
+        crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id))
+    }) {
+        Some(Ok(handle)) => u64::from(handle),
+        Some(Err(_)) | None => u64::MAX,
     }
 }
 
@@ -528,7 +498,11 @@ fn ipc_send_with_bulk(
     scheduler::deliver_bulk(task_id, bulk);
 
     if is_call {
-        endpoint::call(task_id, ep_id, msg)
+        let reply = endpoint::call(task_id, ep_id, msg);
+        if reply == u64::MAX {
+            let _ = scheduler::take_bulk_data(task_id);
+        }
+        reply
     } else if endpoint::send(task_id, ep_id, msg) {
         0
     } else {

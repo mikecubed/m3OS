@@ -1873,6 +1873,9 @@ pub(super) fn sys_exit(code: i32) -> ! {
 
             if !is_last {
                 // Non-last thread: minimal cleanup only.
+                if let Some(task_id) = crate::task::scheduler::current_task_id() {
+                    crate::ipc::cleanup::cleanup_task_ipc(task_id);
+                }
                 if pid == tgid {
                     // Group leader: keep as zombie placeholder so TGID lookups
                     // still work for remaining threads.

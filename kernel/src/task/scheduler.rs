@@ -65,7 +65,7 @@ use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 use super::{Task, TaskId, TaskState, switch_context};
-use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message};
+use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
 // ---------------------------------------------------------------------------
 // Statics
@@ -162,10 +162,96 @@ impl Scheduler {
         self.tasks[idx].caps.remove(handle)
     }
 
+    /// Atomically transfer a capability between two live tasks while holding
+    /// the scheduler lock so concurrent cleanup cannot observe a holderless gap.
+    pub fn grant_cap(
+        &mut self,
+        source_id: TaskId,
+        source_handle: CapHandle,
+        target_id: TaskId,
+    ) -> Result<CapHandle, CapError> {
+        let source_idx = self.find(source_id).ok_or(CapError::InvalidHandle)?;
+        let target_idx = self.find(target_id).ok_or(CapError::InvalidHandle)?;
+
+        if source_idx == target_idx {
+            let cap = self.tasks[source_idx].caps.remove(source_handle)?;
+            match self.tasks[source_idx].caps.insert(cap) {
+                Ok(handle) => Ok(handle),
+                Err(err) => {
+                    let _ = self.tasks[source_idx].caps.insert_at(source_handle, cap);
+                    Err(err)
+                }
+            }
+        } else if source_idx < target_idx {
+            let (before_target, from_target) = self.tasks.split_at_mut(target_idx);
+            before_target[source_idx]
+                .caps
+                .grant(source_handle, &mut from_target[0].caps)
+        } else {
+            let (before_source, from_source) = self.tasks.split_at_mut(source_idx);
+            from_source[0]
+                .caps
+                .grant(source_handle, &mut before_source[target_idx].caps)
+        }
+    }
+
     /// Return the server endpoint registered for this task.
     pub fn server_endpoint(&self, id: TaskId) -> Option<EndpointId> {
         let idx = self.find(id)?;
         self.tasks[idx].server_endpoint
+    }
+
+    /// Return whether any live task other than `excluding` still holds a cap
+    /// to `ep_id`.
+    pub fn other_task_holds_endpoint_cap(&self, excluding: TaskId, ep_id: EndpointId) -> bool {
+        self.tasks.iter().any(|task| {
+            task.id != excluding
+                && task.state != TaskState::Dead
+                && task.caps.contains_endpoint(ep_id)
+        })
+    }
+
+    /// Return the callers currently waiting on reply capabilities held by
+    /// `id`.
+    pub fn reply_waiters(&self, id: TaskId) -> alloc::vec::Vec<TaskId> {
+        self.find(id)
+            .map(|idx| self.tasks[idx].caps.reply_targets())
+            .unwrap_or_default()
+    }
+
+    /// Return the notification capabilities currently held by `id`.
+    pub fn notification_caps(&self, id: TaskId) -> alloc::vec::Vec<NotifId> {
+        self.find(id)
+            .map(|idx| self.tasks[idx].caps.notification_ids())
+            .unwrap_or_default()
+    }
+
+    fn task_current_on_any_core(&self, task_idx: usize) -> bool {
+        for core_id in 0..crate::smp::core_count() {
+            if let Some(data) = crate::smp::get_core_data(core_id)
+                && data.current_task_idx.load(Ordering::Acquire) == task_idx as i32
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return dead tasks that still need per-task IPC teardown, but only once
+    /// they are no longer running on any core.
+    pub fn pending_dead_ipc_cleanup(&self) -> alloc::vec::Vec<TaskId> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .filter(|(idx, task)| {
+                task.state == TaskState::Dead
+                    && !task.ipc_cleaned
+                    && !task.switching_out
+                    && task.saved_rsp != 0
+                    && !self.task_current_on_any_core(*idx)
+            })
+            .map(|(_, task)| task.id)
+            .collect()
     }
 
     /// Reclaim dead tasks: free their stacks and add their indices to the
@@ -175,8 +261,15 @@ impl Scheduler {
         // by per-core run queues, current_task_idx, and PENDING_REENQUEUE.
         // Instead, dead tasks remain in the vec and are skipped by pick_next.
         // Their stack memory is released here to avoid leaks.
-        for (i, task) in self.tasks.iter_mut().enumerate() {
-            if task.state == TaskState::Dead && !task.switching_out && task.saved_rsp != 0 {
+        for i in 0..self.tasks.len() {
+            let task_current = self.task_current_on_any_core(i);
+            let task = &mut self.tasks[i];
+            if task.state == TaskState::Dead
+                && task.ipc_cleaned
+                && !task.switching_out
+                && task.saved_rsp != 0
+                && !task_current
+            {
                 let _ = task._stack.take();
                 // Mark as drained so we don't try to free again.
                 task.saved_rsp = 0;
@@ -722,6 +815,12 @@ pub fn current_task_id() -> Option<TaskId> {
     Some(sched.tasks[idx].id)
 }
 
+/// Return dead tasks whose IPC state still needs deferred cleanup.
+pub fn dead_tasks_needing_ipc_cleanup() -> alloc::vec::Vec<TaskId> {
+    let sched = SCHEDULER.lock();
+    sched.pending_dead_ipc_cleanup()
+}
+
 /// Helper: block the current task with the given state.
 fn block_current(state: TaskState) {
     let addr_space_snapshot =
@@ -806,6 +905,41 @@ pub fn block_current_on_recv_unless_message() {
 
 pub fn block_current_on_send() {
     block_current(TaskState::BlockedOnSend);
+}
+
+pub fn block_current_on_send_unless_completed() {
+    let addr_space_snapshot =
+        current_user_return_addr_space_snapshot(crate::process::current_pid());
+    let idx = {
+        let mut sched = SCHEDULER.lock();
+        let idx = match get_current_task_idx() {
+            Some(i) => i,
+            None => return,
+        };
+        if sched.tasks[idx].pending_msg.is_some() || sched.tasks[idx].send_completed {
+            sched.tasks[idx].send_completed = false;
+            return;
+        }
+        accumulate_ticks(&mut sched, idx);
+        sched.tasks[idx].state = TaskState::BlockedOnSend;
+        sched.tasks[idx].switching_out = true;
+        save_user_return_state(
+            &mut sched.tasks[idx],
+            addr_space_snapshot.0,
+            addr_space_snapshot.1,
+        );
+        set_current_task_idx(None);
+        idx
+    };
+    PENDING_SWITCH_OUT[crate::smp::per_core().core_id as usize]
+        .store(idx as i32, Ordering::Release);
+    per_core_reschedule().store(true, Ordering::Relaxed);
+    let sched_rsp = per_core_scheduler_rsp();
+    unsafe { switch_context(per_core_switch_save_rsp_ptr(), sched_rsp) };
+    let mut sched = SCHEDULER.lock();
+    if idx < sched.tasks.len() {
+        sched.tasks[idx].send_completed = false;
+    }
 }
 
 pub fn block_current_on_notif() {
@@ -1005,6 +1139,14 @@ pub fn deliver_bulk(id: TaskId, data: alloc::vec::Vec<u8>) {
     }
 }
 
+/// Mark that a blocked or soon-to-block sender has had its message consumed.
+pub fn complete_send(id: TaskId) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].send_completed = true;
+    }
+}
+
 /// Remove and return the pending bulk data for a task (Phase 52).
 pub fn take_bulk_data(id: TaskId) -> Option<alloc::vec::Vec<u8>> {
     let mut sched = SCHEDULER.lock();
@@ -1047,6 +1189,16 @@ pub fn remove_task_cap(id: TaskId, handle: CapHandle) -> Result<Capability, CapE
     sched.remove_cap(id, handle)
 }
 
+/// Atomically transfer a capability between two tasks.
+pub fn grant_task_cap(
+    source_id: TaskId,
+    source_handle: CapHandle,
+    target_id: TaskId,
+) -> Result<CapHandle, CapError> {
+    let mut sched = SCHEDULER.lock();
+    sched.grant_cap(source_id, source_handle, target_id)
+}
+
 /// Register the endpoint this task acts as server for.
 pub fn set_server_endpoint(id: TaskId, ep_id: EndpointId) {
     let mut sched = SCHEDULER.lock();
@@ -1059,6 +1211,33 @@ pub fn set_server_endpoint(id: TaskId, ep_id: EndpointId) {
 pub fn server_endpoint(id: TaskId) -> Option<EndpointId> {
     let sched = SCHEDULER.lock();
     sched.server_endpoint(id)
+}
+
+/// Return the notification capabilities currently held by `id`.
+pub fn task_notification_caps(id: TaskId) -> alloc::vec::Vec<NotifId> {
+    let sched = SCHEDULER.lock();
+    sched.notification_caps(id)
+}
+
+/// Mark that per-task IPC teardown has completed for `id`.
+pub fn mark_ipc_cleaned(id: TaskId) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id) {
+        sched.tasks[idx].ipc_cleaned = true;
+    }
+}
+
+/// Return whether any live task other than `excluding` still holds a cap to
+/// `ep_id`.
+pub fn other_task_holds_endpoint_cap(excluding: TaskId, ep_id: EndpointId) -> bool {
+    let sched = SCHEDULER.lock();
+    sched.other_task_holds_endpoint_cap(excluding, ep_id)
+}
+
+/// Return the callers currently waiting on reply capabilities held by `id`.
+pub fn reply_waiters(id: TaskId) -> alloc::vec::Vec<TaskId> {
+    let sched = SCHEDULER.lock();
+    sched.reply_waiters(id)
 }
 
 /// The main scheduler loop. Called once per core. Never returns.
@@ -1121,6 +1300,9 @@ pub fn run() -> ! {
 
         // Remove dead tasks (BSP only to avoid contention).
         if core_id == 0 {
+            for task_id in dead_tasks_needing_ipc_cleanup() {
+                crate::ipc::cleanup::cleanup_task_ipc(task_id);
+            }
             let mut sched = SCHEDULER.lock();
             sched.drain_dead();
         }

@@ -43,3 +43,11 @@ pub fn remove_by_owner(owner: u64) {
 pub fn lookup(name: &str) -> Option<EndpointId> {
     REGISTRY.lock().lookup(name)
 }
+
+/// Look up a named service endpoint and run `f` while the registry lock is
+/// still held. This lets callers couple the lookup with follow-up bookkeeping
+/// so cleanup cannot remove or recycle the service entry in between.
+pub fn with_lookup<R>(name: &str, f: impl FnOnce(EndpointId) -> R) -> Option<R> {
+    let reg = REGISTRY.lock();
+    reg.lookup(name).map(f)
+}
