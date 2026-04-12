@@ -17,3 +17,7 @@ Research for redesigning m3OS memory allocation into a modern, SMP-safe, high-pe
 - All surveyed production systems converge on: lock-free per-CPU fast path + batched slow path + global buddy cold path.
 - Recommended architecture: UMA-style magazines + SLUB-style embedded freelist + Linux PCP-style page cache + Theseus-style type-state frames.
 - Expected 10-50x improvement on object allocation throughput with near-linear SMP scaling.
+
+## Roadmap
+
+This research informs [Phase 53a — Kernel Memory Modernization](../roadmap/53a-kernel-memory-modernization.md) ([tasks](../roadmap/tasks/53a-kernel-memory-modernization-tasks.md)).
