@@ -240,6 +240,11 @@ pub struct PerCoreData {
     /// Only accessed by the owning core (with interrupts masked).
     pub slab_magazines: core::cell::UnsafeCell<crate::mm::slab::PerCpuMagazines>,
 
+    // ----- Phase 53a: per-CPU cross-CPU free lists (E.1) -----
+    /// Per-size-class atomic MPSC free lists for cross-CPU slab frees.
+    /// Any CPU may CAS-push to these lists; only the owning core collects.
+    pub cross_cpu_free: crate::mm::slab::CrossCpuFreeLists,
+
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
@@ -536,6 +541,7 @@ pub fn init_bsp_per_core() {
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
         slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
+        cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
@@ -649,6 +655,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
         slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
+        cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));

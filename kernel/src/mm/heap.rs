@@ -25,7 +25,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use kernel_core::size_class::{NUM_SIZE_CLASSES, SIZE_CLASSES, size_to_class};
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -46,43 +46,50 @@ static DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 // Page-backed allocation metadata (dense side table, C.1)
 // ---------------------------------------------------------------------------
 
-const PAGE_META_NONE: u8 = 0;
-const PAGE_META_LARGE_TAG: u8 = 0x80;
+const PAGE_META_NONE: u16 = 0;
+const PAGE_META_LARGE_TAG: u16 = 0x8000;
 
 /// Per-page metadata for post-cutover allocator ownership in the physmap.
 ///
-/// Encoding:
-/// - `0`: untracked / bootstrap / not owned by the cutover allocator
-/// - `1..=NUM_SIZE_CLASSES`: slab-backed page owned by that size class
-/// - `0x80 | (order + 1)`: head page of a page-backed large allocation
+/// Encoding (u16):
+/// - `0x0000`: untracked / bootstrap / not owned by the cutover allocator
+/// - Slab page: `(owning_cpu << 8) | (class_idx + 1)` — bits 0–7 hold the
+///   size-class tag (1..=NUM_SIZE_CLASSES), bits 8–11 hold the owning CPU ID
+///   (0..15, fits MAX_CORES=16).
+/// - Large page: `0x8000 | (order + 1)` — bit 15 set, bits 0–14 hold the
+///   buddy order.
+///
+/// Storing owning CPU out-of-line keeps the full 4096-byte page available
+/// for slab objects (E.2 acceptance criteria).
 #[repr(transparent)]
-struct PageMeta(AtomicU8);
+struct PageMeta(AtomicU16);
 
 impl PageMeta {
     const fn new() -> Self {
-        Self(AtomicU8::new(PAGE_META_NONE))
+        Self(AtomicU16::new(PAGE_META_NONE))
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageMetaKind {
-    Slab { class_idx: usize },
+    Slab { class_idx: usize, owning_cpu: u8 },
     Large { order: usize },
 }
 
 #[inline]
-fn encode_slab_meta(class_idx: usize) -> u8 {
+fn encode_slab_meta(class_idx: usize, owning_cpu: u8) -> u16 {
     debug_assert!(class_idx < NUM_SIZE_CLASSES);
-    (class_idx as u8) + 1
+    debug_assert!((owning_cpu as usize) < crate::smp::MAX_CORES);
+    ((owning_cpu as u16) << 8) | (class_idx as u16 + 1)
 }
 
 #[inline]
-fn encode_large_meta(order: usize) -> u8 {
-    PAGE_META_LARGE_TAG | ((order as u8) + 1)
+fn encode_large_meta(order: usize) -> u16 {
+    PAGE_META_LARGE_TAG | ((order as u16) + 1)
 }
 
 #[inline]
-fn decode_page_meta(raw: u8) -> Option<PageMetaKind> {
+fn decode_page_meta(raw: u16) -> Option<PageMetaKind> {
     if raw == PAGE_META_NONE {
         return None;
     }
@@ -91,8 +98,11 @@ fn decode_page_meta(raw: u8) -> Option<PageMetaKind> {
             order: ((raw & !PAGE_META_LARGE_TAG) - 1) as usize,
         })
     } else {
+        let class_idx = ((raw & 0xFF) - 1) as usize;
+        let owning_cpu = (raw >> 8) as u8;
         Some(PageMetaKind::Slab {
-            class_idx: (raw - 1) as usize,
+            class_idx,
+            owning_cpu,
         })
     }
 }
@@ -323,14 +333,14 @@ fn page_meta_for_ptr(ptr: *mut u8) -> Option<PageMetaKind> {
     decode_page_meta(raw)
 }
 
-pub(crate) fn register_slab_page(phys: u64, class_idx: usize) {
+pub(crate) fn register_slab_page(phys: u64, class_idx: usize, owning_cpu: u8) {
     let pfn = (phys / 4096) as usize;
     if let Some(entry) = page_meta_entry(pfn) {
         entry
             .0
             .compare_exchange(
                 PAGE_META_NONE,
-                encode_slab_meta(class_idx),
+                encode_slab_meta(class_idx, owning_cpu),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -418,7 +428,7 @@ fn large_dealloc(ptr: *mut u8) {
     };
     let order = match decode_page_meta(raw) {
         Some(PageMetaKind::Large { order }) => order,
-        Some(PageMetaKind::Slab { class_idx }) => {
+        Some(PageMetaKind::Slab { class_idx, .. }) => {
             log::error!(
                 "[heap] large_dealloc: slab metadata for class {} found at ptr {:#x}",
                 class_idx,
@@ -446,7 +456,7 @@ fn large_dealloc(ptr: *mut u8) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AllocationBackend {
     Bootstrap,
-    Slab(usize),
+    Slab { class_idx: usize, owning_cpu: u8 },
     Large,
 }
 
@@ -456,7 +466,13 @@ fn classify_allocation(ptr: *mut u8) -> Option<AllocationBackend> {
         return Some(AllocationBackend::Bootstrap);
     }
     match page_meta_for_ptr(ptr)? {
-        PageMetaKind::Slab { class_idx } => Some(AllocationBackend::Slab(class_idx)),
+        PageMetaKind::Slab {
+            class_idx,
+            owning_cpu,
+        } => Some(AllocationBackend::Slab {
+            class_idx,
+            owning_cpu,
+        }),
         PageMetaKind::Large { .. } => Some(AllocationBackend::Large),
     }
 }
@@ -512,9 +528,12 @@ unsafe impl GlobalAlloc for SizeClassAllocator {
             Some(AllocationBackend::Bootstrap) => unsafe {
                 self.bootstrap.dealloc(ptr, layout);
             },
-            Some(AllocationBackend::Slab(class_idx)) => {
+            Some(AllocationBackend::Slab {
+                class_idx,
+                owning_cpu,
+            }) => {
                 enter_slab();
-                super::slab::magazine_free(class_idx, ptr);
+                super::slab::magazine_free(class_idx, ptr, owning_cpu);
                 leave_slab();
             }
             Some(AllocationBackend::Large) => {

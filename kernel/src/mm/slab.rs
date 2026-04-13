@@ -1,4 +1,4 @@
-//! Kernel slab allocator with per-CPU magazine caching (Phase 53a, Track B.3).
+//! Kernel slab allocator with per-CPU magazine caching (Phase 53a, Tracks B.3 + E).
 //!
 //! Each CPU owns a [`PerCpuMagazines`] with two magazines (loaded + previous)
 //! per size class.  Allocation and free fast paths operate lock-free under
@@ -6,9 +6,19 @@
 //! to the underlying [`SlabCache`] when the local magazines are exhausted or
 //! full.
 //!
+//! ## Cross-CPU free routing (Track E.1 / E.2)
+//!
+//! Every slab page is tagged in the dense `PageMeta` side table with its
+//! owning CPU and size class (stored out-of-line so 4096-byte objects remain
+//! usable).  When `slab_free` detects that the freed object belongs to a
+//! different CPU, it CAS-pushes the pointer onto the victim CPU's lock-free
+//! MPSC [`CrossCpuFreeList`] (one per size class per CPU).  The owning CPU
+//! batch-collects via `take_all` on its next magazine refill.
+//!
 //! The named slab caches (`task_cache`, `fd_cache`, …) are preserved for
 //! compatibility with existing callers and the stats surface.
 
+use kernel_core::cross_cpu_free::CrossCpuFreeList;
 use kernel_core::magazine::{Magazine, MagazineDepot};
 #[allow(unused_imports)]
 use kernel_core::size_class::size_to_class;
@@ -75,6 +85,49 @@ impl PerCpuMagazines {
 unsafe impl Send for PerCpuMagazines {}
 
 // ---------------------------------------------------------------------------
+// Per-CPU cross-CPU free lists (E.1)
+// ---------------------------------------------------------------------------
+
+/// Per-CPU atomic free list heads for cross-CPU slab frees.
+///
+/// When CPU B frees an object owned by CPU A, it CAS-pushes to
+/// `lists[class_idx]` on CPU A's `CrossCpuFreeLists`.  CPU A collects
+/// the entire queue with `take_all` on its next allocation refill.
+///
+/// All operations are lock-free and allocation-free (safe from ISR-disabled
+/// magazine paths and any CPU context).
+pub struct CrossCpuFreeLists {
+    pub lists: [CrossCpuFreeList; NUM_SIZE_CLASSES],
+}
+
+impl CrossCpuFreeLists {
+    pub const fn new() -> Self {
+        Self {
+            lists: [
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+                CrossCpuFreeList::new(),
+            ],
+        }
+    }
+}
+
+// Safety: CrossCpuFreeLists contains only AtomicPtr fields and is designed
+// for concurrent access from any CPU.
+unsafe impl Send for CrossCpuFreeLists {}
+unsafe impl Sync for CrossCpuFreeLists {}
+
+// ---------------------------------------------------------------------------
 // Global depot + backing slab caches (one per size class)
 // ---------------------------------------------------------------------------
 
@@ -132,11 +185,16 @@ fn slab_page_alloc() -> Option<usize> {
 ///
 /// Unlike the generic named-cache helper above, this tags the backing page in
 /// the heap allocator's dense metadata table so `GlobalAlloc::dealloc` can
-/// recover the owning size class from the object address.
+/// recover the owning size class and owning CPU from the object address.
 fn size_class_page_alloc(class_idx: usize) -> Option<usize> {
     let frame = crate::mm::frame_allocator::allocate_frame()?;
     let phys = frame.start_address().as_u64();
-    crate::mm::heap::register_slab_page(phys, class_idx);
+    let cpu_id = if crate::smp::is_per_core_ready() {
+        crate::smp::per_core().core_id
+    } else {
+        0
+    };
+    crate::mm::heap::register_slab_page(phys, class_idx, cpu_id);
     Some((crate::mm::phys_offset() + phys) as usize)
 }
 
@@ -185,8 +243,9 @@ pub fn caches() -> &'static KernelSlabCaches {
 ///
 /// 1. Pop from `loaded` magazine (no lock, no atomic).
 /// 2. If loaded empty, swap loaded ↔ previous and retry.
-/// 3. If both empty, exchange empty magazine for full from depot (depot lock).
-/// 4. If depot empty, batch-fill a magazine from the backing slab (slab lock).
+/// 3. Drain this CPU's cross-CPU free list for this size class (E.1).
+/// 4. Exchange empty magazine for full from depot (depot lock).
+/// 5. If depot empty, batch-fill a magazine from the backing slab (slab lock).
 ///
 /// All steps run with interrupts masked to prevent ISR reentrancy.
 ///
@@ -206,7 +265,8 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
     }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mags = unsafe { &mut *crate::smp::per_core().slab_magazines.get() };
+        let core = crate::smp::per_core();
+        let mags = unsafe { &mut *core.slab_magazines.get() };
         let pair = &mut mags.pairs[class_idx];
 
         // 1. Try loaded magazine.
@@ -220,7 +280,33 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
             return Some(ptr);
         }
 
-        // 3. Exchange empty magazine for full from depot.
+        // 3. Drain cross-CPU free list (E.1 batch collect).
+        let chain = core.cross_cpu_free.lists[class_idx].take_all();
+        if !chain.is_null() {
+            let mut node = chain;
+            while !node.is_null() {
+                // Read next-pointer before pushing (magazine doesn't modify object).
+                let next = unsafe { (node as *const *mut u8).read() };
+                if pair.loaded.push(node).is_err() {
+                    // Magazine full — push excess back to cross-CPU list.
+                    // push() overwrites node's intrusive ptr, so read next first.
+                    unsafe { core.cross_cpu_free.lists[class_idx].push(node) };
+                    let mut rest = next;
+                    while !rest.is_null() {
+                        let n = unsafe { (rest as *const *mut u8).read() };
+                        unsafe { core.cross_cpu_free.lists[class_idx].push(rest) };
+                        rest = n;
+                    }
+                    break;
+                }
+                node = next;
+            }
+            if let Some(ptr) = pair.loaded.pop() {
+                return Some(ptr);
+            }
+        }
+
+        // 4. Exchange empty magazine for full from depot.
         let state = &sc_state()[class_idx];
         let empty_mag = core::mem::replace(&mut pair.loaded, Magazine::new());
         match state.depot.exchange_empty_for_full(empty_mag) {
@@ -233,7 +319,7 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
             }
         }
 
-        // 4. Depot empty — batch-fill from the slab layer.
+        // 5. Depot empty — batch-fill from the slab layer.
         let mut slab = state.slab.lock();
         // Fill the loaded magazine from the slab.
         while !pair.loaded.is_full() {
@@ -249,24 +335,25 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
 
 /// Free an object back via the per-CPU magazine layer.
 ///
-/// The call hierarchy mirrors allocation:
+/// `owning_cpu` is the CPU that owns the slab page containing `ptr` (read
+/// from the dense `PageMeta` side table by the caller).
+///
+/// ## Routing (Track E.2)
+///
+/// - **Same CPU** (`owning_cpu == current`): push to local magazine (fast
+///   path, no atomics beyond interrupt masking).
+/// - **Different CPU**: CAS-push to the victim CPU's per-size-class
+///   [`CrossCpuFreeList`] — lock-free and allocation-free.
+///
+/// The local-magazine hierarchy mirrors allocation:
 ///
 /// 1. Push to `previous` magazine (no lock, no atomic).
 /// 2. If previous full, swap loaded ↔ previous and retry.
 /// 3. If both full, exchange full magazine for empty from depot (depot lock).
 /// 4. If depot has no empties, drain full magazine back to slab (slab lock)
 ///    and deposit the now-empty magazine back so it can be reused.
-///
-/// # Cross-CPU free safety
-///
-/// Track E (cross-CPU atomic free lists) is not yet implemented.  For now,
-/// frees always go to the *calling* CPU's magazines.  This means an object
-/// allocated on CPU A but freed on CPU B ends up in CPU B's magazine for that
-/// size class — functionally correct (the slab layer does not assume per-CPU
-/// ownership of individual objects) but suboptimal for cache locality.  Track E
-/// will add MPSC atomic free lists to route cross-CPU frees to the home CPU.
 #[allow(dead_code)]
-pub fn magazine_free(class_idx: usize, ptr: *mut u8) {
+pub fn magazine_free(class_idx: usize, ptr: *mut u8, owning_cpu: u8) {
     debug_assert!(class_idx < NUM_SIZE_CLASSES);
 
     if !crate::smp::is_per_core_ready() {
@@ -275,7 +362,22 @@ pub fn magazine_free(class_idx: usize, ptr: *mut u8) {
     }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mags = unsafe { &mut *crate::smp::per_core().slab_magazines.get() };
+        let core = crate::smp::per_core();
+
+        // E.2: route based on page ownership.
+        if core.core_id != owning_cpu {
+            // Cross-CPU free: CAS push to victim CPU's atomic free list.
+            if let Some(victim) = crate::smp::get_core_data(owning_cpu) {
+                // Safety: ptr is a freed slab object with at least size_of::<*mut u8>()
+                // bytes (guaranteed by slab minimum object size).
+                unsafe { victim.cross_cpu_free.lists[class_idx].push(ptr) };
+                return;
+            }
+            // Victim CPU not initialized — fall through to local magazine.
+        }
+
+        // Same-CPU free: push to local magazine (fast path).
+        let mags = unsafe { &mut *core.slab_magazines.get() };
         let pair = &mut mags.pairs[class_idx];
 
         // 1. Try previous magazine.

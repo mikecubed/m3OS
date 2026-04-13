@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod address_space;
 pub mod buddy;
 pub mod cred;
+pub mod cross_cpu_free;
 pub mod fb;
 pub mod fs;
 pub mod input;
