@@ -34,13 +34,15 @@ Phase 53 can feed into Phase 58.
 ### 1. Boot and login
 
 The system boots unattended in QEMU (serial-only mode) and reaches a `login:`
-prompt. The operator logs in as `root`. On first boot, the login flow prompts
-for initial password creation (Phase 48: no baked-in default credentials). On
-subsequent boots, the operator supplies the stored password.
+prompt. The operator logs in as `root` using the pre-seeded password. The
+shipped image includes working password hashes for `root` and `user` accounts
+(seeded by `xtask`); the login binary also supports initial password creation
+when a shadow entry is locked (`!`), but the default image ships with active
+hashes, not locked accounts.
 
 **Phase 48 security floor exercised here:** kernel-enforced `setuid`/`setgid`
-transitions, `getrandom()`-backed salted password hashes, no default plaintext
-credentials.
+transitions, `getrandom()`-backed salted password hashes, shadow-file-based
+authentication.
 
 ### 2. Service inspection and control
 
@@ -61,9 +63,9 @@ classification, per-service shutdown timeouts, and init-to-syslog integration
 The operator confirms persistent storage is mounted and writable:
 
 ```
-ls /data                # ext2 data partition present
-touch /data/test && rm /data/test   # write/remove round-trip
-mount                   # inspect current mounts (FAT32 root, ext2 data, tmpfs)
+ls /root                # ext2 root filesystem is writable
+touch /root/test && rm /root/test   # write/remove round-trip
+mount                   # inspect current mounts (ext2 root, tmpfs)
 ```
 
 ### 4. Log inspection
@@ -71,7 +73,7 @@ mount                   # inspect current mounts (FAT32 root, ext2 data, tmpfs)
 System logs are accessible through the syslog socket and on-disk files:
 
 ```
-cat /var/log/syslog     # read aggregated system log
+cat /var/log/messages   # read aggregated system log
 logger "test message"   # inject a message via /dev/log
 ```
 
@@ -131,16 +133,16 @@ or "regression" are not sufficient; the bundle names the exact commands.
 | Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests pass |
 | Unit + property tests | `cargo test -p kernel-core` | Host-side pure-logic invariants hold |
 | QEMU boot smoke test | `cargo xtask smoke-test` | Boot → login → shell → TCC compile round-trip |
-| Regression suite | `cargo xtask regression` | SMP-sensitive paths (fork, IPC, PTY, SSH) pass |
-| Stress suite (CI nightly) | `cargo xtask stress --iterations 50` | No timing-dependent failures across repeated runs |
+| Regression suite | `cargo xtask regression` | SMP-sensitive paths (fork, IPC, PTY, signal, exit-group, kbd-echo) pass |
+| Stress suite (CI nightly) | `cargo xtask stress --test fork-overlap --iterations 50` | No timing-dependent failures across repeated runs |
 
 ### Manual checks (performed once per release-candidate image)
 
 | Check | Procedure | Pass criterion |
 |---|---|---|
 | Service lifecycle | `service list`, `service status sshd`, `service restart crond` | Services enumerate, report status, restart cleanly |
-| Storage round-trip | `touch /data/test && cat /data/test && rm /data/test` | Write, read, delete succeed on ext2 |
-| Log pipeline | `logger "gate check" && grep "gate check" /var/log/syslog` | Message appears in syslog |
+| Storage round-trip | `touch /root/test && cat /root/test && rm /root/test` | Write, read, delete succeed on ext2 root |
+| Log pipeline | `logger "gate check" && grep "gate check" /var/log/messages` | Message appears in system log |
 | SSH remote login | Connect from host via `ssh -p 2222 root@localhost` | Session opens, shell prompt appears |
 | Shutdown/reboot | `shutdown` from shell | QEMU exits cleanly, no panic in serial log |
 | Reboot | `reboot` from shell | System returns to login prompt |
@@ -164,9 +166,9 @@ into automation where practical.
 | Authentication | Local login with salted password hashes; `passwd`, `adduser`, `su` |
 | Remote admin | SSH (default); telnet only with explicit opt-in build flag |
 | Service management | `service list/status/start/stop/restart/enable/disable` via init PID 1 |
-| Logging | syslogd via `/dev/log` Unix socket; `logger` CLI; `/var/log/syslog` |
+| Logging | syslogd via `/dev/log` Unix socket; `logger` CLI; `/var/log/messages` |
 | Scheduling | crond with standard crontab format |
-| Storage | FAT32 root (ramdisk), ext2 data partition, tmpfs |
+| Storage | ext2 root filesystem (VirtIO-blk), tmpfs |
 | Build tooling | TCC (C compiler), `make`/`pdpmake`, `ar`, `install` |
 | Rust std path | musl-linked cross-compiled binaries (`hello-rust`, `sysinfo-rust`, etc.) |
 | Ports | `port install/remove/list` with bundled source and dependency resolution |

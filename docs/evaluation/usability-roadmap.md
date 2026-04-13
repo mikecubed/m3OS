@@ -86,14 +86,14 @@ Stage 1 is anchored by the single normal operator path documented in
 [Phase 53 § Supported Headless/Reference Workflow](../../roadmap/53-headless-hardening.md#supported-headlessreference-workflow).
 That path covers:
 
-1. **Boot and login** — unattended boot to `login:` prompt, first-boot password
-   creation or stored-password login (Phase 48 security floor: kernel-enforced
-   identity transitions, `getrandom()`-backed salted hashes, no default
-   credentials).
+1. **Boot and login** — unattended boot to `login:` prompt, login with
+   pre-seeded password (Phase 48 security floor: kernel-enforced identity
+   transitions, `getrandom()`-backed salted hashes, shadow-file-based
+   authentication).
 2. **Service inspection and control** — `service list/status/start/stop/restart`
    via init PID 1 supervision (Phase 46/51 baseline).
-3. **Storage verification** — ext2 data partition write/read/delete round-trip.
-4. **Log inspection** — `logger` + `/var/log/syslog` via syslogd.
+3. **Storage verification** — ext2 root filesystem write/read/delete round-trip.
+4. **Log inspection** — `logger` + `/var/log/messages` via syslogd.
 5. **Package and build basics** — TCC compilation, ports install, Rust std
    binaries.
 6. **Failure recovery** — crash diagnostics, trace rings, `service restart`.
@@ -118,7 +118,7 @@ Stage 1 readiness is proven by the gate bundle in
 | Automated | Unit + property tests | `cargo test -p kernel-core` |
 | Automated | Boot smoke test | `cargo xtask smoke-test` |
 | Automated | Regression suite | `cargo xtask regression` |
-| Automated | Stress suite (nightly) | `cargo xtask stress --iterations 50` |
+| Automated | Stress suite (nightly) | `cargo xtask stress --test fork-overlap --iterations 50` |
 | Manual | Service lifecycle, SSH login, storage, logs, shutdown, reboot, failure recovery | See Phase 53 manual-check table |
 
 ### Support boundary
