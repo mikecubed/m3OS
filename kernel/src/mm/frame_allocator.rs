@@ -195,8 +195,14 @@ fn with_local_page_cache<T>(f: impl FnOnce(&mut PerCpuPageCache) -> T) -> Result
     let Some(_guard) = LocalPageCacheGuard::try_enter() else {
         return Err(());
     };
-    let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
-    Ok(f(cache))
+    let per_core = crate::smp::per_core();
+    let cache = unsafe { &mut *per_core.page_cache.get() };
+    let result = f(cache);
+    // Sync atomic shadow counter so remote cores can read it without UB.
+    per_core
+        .page_cache_count
+        .store(cache.len() as usize, Ordering::Release);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -453,6 +459,19 @@ struct LockedFrameAllocator(Mutex<FrameAllocator>);
 static FRAME_ALLOCATOR: LockedFrameAllocator =
     LockedFrameAllocator(Mutex::new(FrameAllocator::new()));
 
+/// Acquire the global frame allocator lock with interrupts masked.
+///
+/// Masking interrupts prevents the IPI cache-drain handler from deadlocking
+/// against a lock holder on the same core.  All post-init lock acquisitions
+/// outside an existing `without_interrupts` scope must go through this helper.
+#[inline]
+fn with_frame_alloc_irq_safe<T>(f: impl FnOnce(&mut FrameAllocator) -> T) -> T {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut alloc = FRAME_ALLOCATOR.0.lock();
+        f(&mut alloc)
+    })
+}
+
 static FRAME_ALLOC_INIT: AtomicBool = AtomicBool::new(false);
 
 /// Cached physical-memory offset — constant after `init()`, read without the
@@ -632,7 +651,7 @@ pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
 /// hidden pages before the allocation gives up.
 #[allow(dead_code)]
 pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
-    if let Some(frame) = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order) {
+    if let Some(frame) = with_frame_alloc_irq_safe(|alloc| alloc.allocate_contiguous(order)) {
         if REFCOUNT_INIT.load(Ordering::Acquire) {
             refcount_inc(frame.start_address().as_u64());
         }
@@ -642,7 +661,7 @@ pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
     // Retry after allocator-local reclaim so order-0 hoarding can coalesce.
     super::heap::reclaim_allocator_local_caches("high-order frame allocation");
 
-    let frame = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order)?;
+    let frame = with_frame_alloc_irq_safe(|alloc| alloc.allocate_contiguous(order))?;
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         refcount_inc(frame.start_address().as_u64());
     }
@@ -742,7 +761,7 @@ pub(crate) fn free_frame_direct(phys: u64) {
     if !release_last_reference(phys) {
         return;
     }
-    FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
+    with_frame_alloc_irq_safe(|alloc| alloc.free_to_pool(phys));
 }
 
 /// Free a contiguous block of `1 << order` pages.
@@ -754,7 +773,7 @@ pub fn free_contiguous(phys: u64, order: usize) {
     if !release_last_reference(phys) {
         return;
     }
-    FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
+    with_frame_alloc_irq_safe(|alloc| alloc.free_contiguous(phys, order));
 }
 
 // ---------------------------------------------------------------------------
@@ -778,13 +797,15 @@ fn drain_local_page_cache_to_pool() -> usize {
     }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+        let per_core = crate::smp::per_core();
+        let cache = unsafe { &mut *per_core.page_cache.get() };
         let n = cache.len() as usize;
         if n > 0 {
             let mut alloc = FRAME_ALLOCATOR.0.lock();
             cache.drain_to(n, |frame_phys| {
                 alloc.free_to_pool(frame_phys);
             });
+            per_core.page_cache_count.store(0, Ordering::Release);
         }
         n
     })
@@ -884,7 +905,7 @@ pub fn handle_cache_drain_ipi() {
 /// immediately allocatable without draining per-CPU caches, use
 /// `frame_stats().free_frames`.
 pub fn available_count() -> usize {
-    FRAME_ALLOCATOR.0.lock().current_free_count() + per_cpu_cached_total()
+    with_frame_alloc_irq_safe(|alloc| alloc.current_free_count()) + per_cpu_cached_total()
 }
 
 /// Compatibility accessor for older callers that interpreted "free" as
@@ -896,17 +917,20 @@ pub fn free_count() -> usize {
 
 /// Returns the total number of usable frames discovered at boot.
 pub fn total_frames() -> usize {
-    FRAME_ALLOCATOR.0.lock().total_frames
+    with_frame_alloc_irq_safe(|alloc| alloc.total_frames)
 }
 
 /// Returns the highest physical frame number from the memory map.
 ///
 /// Used by the heap allocator to size the dense page-metadata side table.
 pub fn max_frame_number() -> usize {
-    FRAME_ALLOCATOR.0.lock().max_frame_number as usize
+    with_frame_alloc_irq_safe(|alloc| alloc.max_frame_number as usize)
 }
 
 /// Sum of frames currently held in all per-CPU page caches.
+///
+/// Reads each core's atomic shadow counter rather than the `UnsafeCell`
+/// page-cache contents, avoiding a data race on remote non-atomic fields.
 fn per_cpu_cached_total() -> usize {
     if !crate::smp::is_per_core_ready() {
         return 0;
@@ -916,8 +940,7 @@ fn per_cpu_cached_total() -> usize {
         if let Some(data) = crate::smp::get_core_data(cid)
             && data.is_online.load(Ordering::Acquire)
         {
-            let cache = unsafe { &*data.page_cache.get() };
-            total += cache.len() as usize;
+            total += data.page_cache_count.load(Ordering::Acquire);
         }
     }
     total
@@ -954,13 +977,18 @@ pub struct FrameStats {
 /// (immediately allocatable).  Per-CPU cached pages are excluded from free but
 /// included in `available_frames` because they are reclaimable.
 pub fn frame_stats() -> FrameStats {
-    let alloc = FRAME_ALLOCATOR.0.lock();
-    let total = alloc.total_frames;
-    let (buddy_free, by_order) = if let Some(ref buddy) = alloc.buddy {
-        (buddy.free_count(), buddy.free_count_by_order())
-    } else {
-        (alloc.free_count, [0; kernel_core::buddy::MAX_ORDER + 1])
-    };
+    let (total, buddy_free, by_order) = with_frame_alloc_irq_safe(|alloc| {
+        let total = alloc.total_frames;
+        if let Some(ref buddy) = alloc.buddy {
+            (total, buddy.free_count(), buddy.free_count_by_order())
+        } else {
+            (
+                total,
+                alloc.free_count,
+                [0; kernel_core::buddy::MAX_ORDER + 1],
+            )
+        }
+    });
     let cached = per_cpu_cached_total();
     let available = buddy_free + cached;
     FrameStats {
@@ -1171,5 +1199,52 @@ mod tests {
             before, after
         );
         drop(held);
+    }
+
+    #[test_case]
+    fn irq_safe_lock_masks_interrupts() {
+        ensure_test_per_core();
+        // Verify the helper runs the closure with interrupts disabled.
+        let irq_was_off =
+            with_frame_alloc_irq_safe(|_alloc| !x86_64::instructions::interrupts::are_enabled());
+        assert!(
+            irq_was_off,
+            "with_frame_alloc_irq_safe must mask interrupts while holding the lock"
+        );
+    }
+
+    #[test_case]
+    fn page_cache_shadow_count_tracks_ops() {
+        ensure_test_per_core();
+        let per_core = crate::smp::per_core();
+
+        // After drain, both real count and shadow should be 0.
+        drain_per_cpu_caches();
+        assert_eq!(
+            per_core.page_cache_count.load(Ordering::Acquire),
+            0,
+            "shadow should be 0 after drain"
+        );
+
+        // Allocate + free to push frames into the local cache.
+        let a = allocate_frame().expect("a");
+        let b = allocate_frame().expect("b");
+        free_frame(a.start_address().as_u64());
+        free_frame(b.start_address().as_u64());
+
+        let shadow = per_core.page_cache_count.load(Ordering::Acquire);
+        assert!(
+            shadow >= 2,
+            "shadow should reflect cached frames after free, got {}",
+            shadow
+        );
+
+        // Drain again — shadow must return to 0.
+        drain_per_cpu_caches();
+        assert_eq!(
+            per_core.page_cache_count.load(Ordering::Acquire),
+            0,
+            "shadow should be 0 after second drain"
+        );
     }
 }

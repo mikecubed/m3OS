@@ -235,6 +235,11 @@ pub struct PerCoreData {
     /// Only accessed by the owning core (with interrupts masked).
     pub page_cache: core::cell::UnsafeCell<crate::mm::frame_allocator::PerCpuPageCache>,
 
+    /// Atomic shadow of the per-CPU page cache count.  Updated by the owning
+    /// core whenever the local page cache is mutated.  Read by remote cores
+    /// for statistics (avoids UB from reading the non-atomic `UnsafeCell`).
+    pub page_cache_count: AtomicUsize,
+
     // ----- Phase 53a: per-CPU slab magazines (B.3) -----
     /// Per-CPU magazine pairs for each of the 13 slab size classes.
     /// Only accessed by the owning core (with interrupts masked).
@@ -540,6 +545,7 @@ pub fn init_bsp_per_core() {
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
+        page_cache_count: AtomicUsize::new(0),
         slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
         cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
@@ -654,6 +660,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
+        page_cache_count: AtomicUsize::new(0),
         slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
         cross_cpu_free: crate::mm::slab::CrossCpuFreeLists::new(),
         #[cfg(feature = "trace")]
