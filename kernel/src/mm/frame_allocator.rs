@@ -3,20 +3,25 @@
 //! # Zero-before-exposure invariant (D.4)
 //!
 //! The kernel guarantees that **no frame reaches user-visible address space
-//! containing stale data from a prior allocation**.  Enforcement is on the
-//! *allocation* side, not the free side:
+//! containing stale data from a prior allocation**.  Enforcement strategy:
 //!
 //! * [`allocate_frame_zeroed`] / [`allocate_contiguous_zeroed`] — allocate and
-//!   zero in one step.  **Use these for any frame that will become user-visible**
-//!   (data pages, stack pages, demand-paged pages, brk growth, mmap pages).
+//!   zero in one step.  **Standard path for any frame that will become
+//!   user-visible** (data pages, stack pages, demand-paged pages, brk growth,
+//!   mmap pages, ELF segment pages).  All audited user-facing callsites in
+//!   `demand_map_user_page_locked`, `map_user_stack`, `map_load_segment`,
+//!   `sys_linux_brk`, `sys_mmap_file_backed`, and `map_user_pages` use this
+//!   path.
 //!
 //! * [`allocate_frame`] / [`allocate_contiguous`] — raw allocation, **no
-//!   zeroing**.  Safe for kernel-internal uses (heap backing, DMA buffers,
+//!   zeroing**.  Acceptable when the caller **fully overwrites** the frame
+//!   before user exposure (e.g., `copy_nonoverlapping` in `resolve_cow_fault`)
+//!   or when the frame is kernel-internal (heap backing, DMA buffers,
 //!   page-table frames that the caller zeroes explicitly).
 //!
 //! `free_frame` and `free_contiguous` do **not** zero on free.  The stale
 //! content is harmless because every user-facing path goes through a zeroed
-//! allocation or an explicit `copy_nonoverlapping` (CoW).
+//! allocation or an explicit full-page copy (CoW).
 
 extern crate alloc;
 
@@ -314,10 +319,11 @@ pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
 
 /// Allocate a single 4 KiB frame and zero its contents.
 ///
-/// This is the **mandatory** path for any frame that will become visible to
+/// This is the **standard** path for any frame that will become visible to
 /// user-space (data pages, stack pages, demand-paged pages, brk growth, mmap
-/// pages).  Callers that need a non-zeroed frame (kernel heap, DMA, page
-/// tables with their own zeroing) should use [`allocate_frame`] instead.
+/// pages, ELF segment pages).  Callers that fully overwrite the frame before
+/// user exposure (CoW `copy_nonoverlapping`) or need a kernel-internal frame
+/// (heap, DMA, page tables) may use [`allocate_frame`] instead.
 ///
 /// See module-level docs for the full zero-before-exposure invariant.
 pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {

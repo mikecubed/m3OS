@@ -303,7 +303,9 @@ unsafe fn map_load_segment(
             let vaddr = VirtAddr::new(page_va_start);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
 
-            let frame = frame_allocator::allocate_frame().ok_or(ElfError::OutOfFrames)?;
+            // Zero-before-exposure (D.4): user-visible ELF frame; pre-zeroed
+            // so BSS/padding regions are clean (P11-T004).
+            let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             // Map the page; use ignore() since mapper may not be the current CR3.
             mapper
@@ -314,9 +316,6 @@ unsafe fn map_load_segment(
             // Write to the physical frame via the physical-memory offset.
             // This is valid regardless of which CR3 is active.
             let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-
-            // Zero the entire frame first (covers BSS, P11-T004).
-            core::ptr::write_bytes(frame_ptr, 0, 4096);
 
             // Copy file bytes that fall within this page.
             let page_va_end = page_va_start + 4096;
@@ -343,7 +342,7 @@ unsafe fn map_load_segment(
                 let dst = core::slice::from_raw_parts_mut(frame_ptr.add(frame_off), copy_len);
                 dst.copy_from_slice(src);
             }
-            // BSS portion already zeroed by write_bytes.
+            // BSS portion already zeroed by allocate_frame_zeroed.
         }
 
         Ok(())
@@ -357,12 +356,10 @@ unsafe fn map_load_segment(
 /// Map `STACK_PAGES` pages for the user stack plus one unmapped guard page
 /// (P11-T005).
 ///
-/// All frame writes go through `phys_off`, so this works for any `mapper`.
-///
 /// # Safety
 /// `mapper` must have exclusive access to its PML4; the stack range must be
 /// unmapped.
-unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>, phys_off: u64) -> Result<u64, ElfError> {
+unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>) -> Result<u64, ElfError> {
     unsafe {
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
@@ -379,16 +376,13 @@ unsafe fn map_user_stack(mapper: &mut OffsetPageTable<'_>, phys_off: u64) -> Res
             let vaddr = VirtAddr::new(ELF_STACK_TOP - STACK_PAGES * 4096 + i * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
 
-            let frame = frame_allocator::allocate_frame().ok_or(ElfError::OutOfFrames)?;
+            // Zero-before-exposure (D.4): user-visible stack frame.
+            let frame = frame_allocator::allocate_frame_zeroed().ok_or(ElfError::OutOfFrames)?;
 
             mapper
                 .map_to(page, frame, flags, &mut frame_alloc)
                 .map_err(|_| ElfError::MappingFailed("map_to failed for stack page"))?
                 .ignore();
-
-            // Zero via physical offset.
-            let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-            core::ptr::write_bytes(frame_ptr, 0, 4096);
         }
 
         // Guard page = ELF_STACK_TOP - (STACK_PAGES + 1) * 4096 — intentionally
@@ -667,7 +661,7 @@ pub unsafe fn load_elf_into(
             );
         }
 
-        let stack_top = map_user_stack(mapper, phys_off)?;
+        let stack_top = map_user_stack(mapper)?;
 
         // Compute the virtual address of the program header table in the loaded
         // image.  The phdrs sit at file offset e_phoff, which falls inside the

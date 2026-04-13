@@ -927,58 +927,86 @@ mod tests {
         }
     }
 
-    /// D.4: Demand-page allocation pattern — exercises the exact code path
-    /// used by demand_map_user_page_locked: allocate_frame() + manual zero.
-    /// A regression that removes the write_bytes(0) would fail here.
+    /// D.4: map_user_pages end-to-end — exercises the real `map_user_pages`
+    /// function (which calls `allocate_frame_zeroed` internally).  Poisons
+    /// frames first so that any failure to zero would leave stale data.
+    /// Verifies the mapped physical frames are clean via the physical offset.
     #[test_case]
-    fn zero_exposure_demand_page_pattern() {
+    fn zero_exposure_map_user_pages_e2e() {
         use crate::mm::frame_allocator;
+        use x86_64::structures::paging::{Mapper, PageTableFlags, Translate};
         let phys_off = crate::mm::phys_offset();
 
-        // Poison a frame and free it so the pool has stale data.
-        let poison = frame_allocator::allocate_frame().expect("alloc poison");
-        let p_phys = poison.start_address().as_u64();
-        unsafe {
-            core::ptr::write_bytes((phys_off + p_phys) as *mut u8, 0xCC, 4096);
+        // Poison 4 frames and return them to the pool.
+        for pattern in [0xCC_u8, 0xDD, 0xEE, 0xFF] {
+            let f = frame_allocator::allocate_frame().expect("alloc poison");
+            let phys = f.start_address().as_u64();
+            unsafe { core::ptr::write_bytes((phys_off + phys) as *mut u8, pattern, 4096) };
+            frame_allocator::free_frame(phys);
         }
-        frame_allocator::free_frame(p_phys);
 
-        // Replicate the demand_map_user_page_locked pattern:
-        // allocate_frame() then write_bytes(0).
-        let frame = frame_allocator::allocate_frame().expect("demand alloc");
-        let f_phys = frame.start_address().as_u64();
-        let ptr = (phys_off + f_phys) as *mut u8;
-        // This is the exact zeroing that demand_map_user_page_locked performs.
+        // Call the real map_user_pages which allocates via allocate_frame_zeroed.
+        const TEST_VBASE: u64 = 0x0000_7FFE_0000_0000;
+        const N_PAGES: u64 = 4;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        let mut mapper = unsafe { crate::mm::paging::get_mapper() };
         unsafe {
-            core::ptr::write_bytes(ptr, 0, 4096);
+            crate::mm::user_space::map_user_pages(&mut mapper, TEST_VBASE, N_PAGES, flags)
+                .expect("map_user_pages failed");
         }
-        let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, 4096) };
-        assert!(
-            data.iter().all(|&b| b == 0),
-            "demand-page pattern: frame {:#x} not zero after manual clear",
-            f_phys
-        );
-        frame_allocator::free_frame(f_phys);
+
+        // Read back each mapped frame via physical offset and verify zero.
+        let mut frame_addrs = [0u64; N_PAGES as usize];
+        for i in 0..N_PAGES {
+            let vaddr = x86_64::VirtAddr::new(TEST_VBASE + i * 4096);
+            let paddr = mapper
+                .translate_addr(vaddr)
+                .expect("page not mapped after map_user_pages");
+            frame_addrs[i as usize] = paddr.as_u64() & !0xFFF;
+            let data = unsafe {
+                core::slice::from_raw_parts((phys_off + frame_addrs[i as usize]) as *const u8, 4096)
+            };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "map_user_pages: stale data in page {} (frame {:#x})",
+                i,
+                frame_addrs[i as usize]
+            );
+        }
+
+        // Cleanup: unmap and free.
+        for i in 0..N_PAGES {
+            let vaddr = x86_64::VirtAddr::new(TEST_VBASE + i * 4096);
+            let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size4KiB>::containing_address(vaddr);
+            if let Ok((_frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+            frame_allocator::free_frame(frame_addrs[i as usize]);
+        }
     }
 
-    /// D.4: CoW fork copy integrity — when resolve_cow_fault copies a
-    /// parent page into a fresh frame, the destination must contain
-    /// exactly the parent's data and no stale bytes from a prior occupant.
+    /// D.4: resolve_cow_fault end-to-end — sets up a real CoW-marked page in
+    /// the current address space, calls the real `resolve_cow_fault`, and
+    /// verifies that the new frame contains the parent's data with no stale
+    /// content leakage.
     #[test_case]
-    fn zero_exposure_cow_copy_integrity() {
+    fn zero_exposure_resolve_cow_e2e() {
         use crate::mm::frame_allocator;
+        use x86_64::structures::paging::{Mapper, PageTableFlags, Translate};
         let phys_off = crate::mm::phys_offset();
 
-        // Simulate stale data in the destination frame.
-        let stale = frame_allocator::allocate_frame().expect("alloc stale dest");
-        let s_phys = stale.start_address().as_u64();
-        unsafe {
-            core::ptr::write_bytes((phys_off + s_phys) as *mut u8, 0xBE, 4096);
-        }
-        frame_allocator::free_frame(s_phys);
+        // Poison a frame and return it so the pool has stale data for the CoW
+        // destination.
+        let stale = frame_allocator::allocate_frame().expect("alloc stale");
+        let stale_phys = stale.start_address().as_u64();
+        unsafe { core::ptr::write_bytes((phys_off + stale_phys) as *mut u8, 0xBE, 4096) };
+        frame_allocator::free_frame(stale_phys);
 
-        // Allocate the "parent" page with a known pattern: sequential bytes
-        // so every offset is distinguishable.
+        // Allocate the "parent" frame and fill with a distinguishable pattern.
         let parent = frame_allocator::allocate_frame().expect("alloc parent");
         let parent_phys = parent.start_address().as_u64();
         let parent_ptr = (phys_off + parent_phys) as *mut u8;
@@ -986,29 +1014,63 @@ mod tests {
             unsafe { parent_ptr.add(i as usize).write((i & 0xFF) as u8) };
         }
 
-        // Allocate the "child" frame (may reuse the stale frame).
-        let child = frame_allocator::allocate_frame().expect("alloc child");
-        let child_phys = child.start_address().as_u64();
-        let child_ptr = (phys_off + child_phys) as *mut u8;
+        // Bump refcount to 2 so resolve_cow_fault takes the copy path.
+        frame_allocator::refcount_inc(parent_phys);
 
-        // Replicate resolve_cow_fault: copy_nonoverlapping parent → child.
+        // Map the parent frame at a test user-space address with CoW flags:
+        // PRESENT | USER_ACCESSIBLE | BIT_9 (CoW marker) | !WRITABLE.
+        const COW_TEST_VADDR: u64 = 0x0000_7FFD_0000_0000;
+        let cow_flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::BIT_9;
+        let vaddr = x86_64::VirtAddr::new(COW_TEST_VADDR);
         unsafe {
-            core::ptr::copy_nonoverlapping(parent_ptr as *const u8, child_ptr, 4096);
+            crate::mm::paging::map_current_user_page_locked(vaddr, parent, cow_flags)
+                .expect("map CoW page failed");
         }
 
-        // Verify every byte matches the parent — no stale 0xBE leaked through.
-        let child_data = unsafe { core::slice::from_raw_parts(child_ptr as *const u8, 4096) };
-        for (i, &byte) in child_data.iter().enumerate() {
+        // Call the real resolve_cow_fault — this allocates a new frame, copies
+        // parent data, and remaps the PTE as writable.
+        let resolved = crate::arch::x86_64::interrupts::resolve_cow_fault(COW_TEST_VADDR);
+        assert!(resolved, "resolve_cow_fault returned false");
+
+        // Find the new physical frame via translation.
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        let new_paddr = mapper
+            .translate_addr(vaddr)
+            .expect("page not mapped after resolve_cow_fault");
+        let new_phys = new_paddr.as_u64() & !0xFFF;
+
+        // The new frame must differ from the parent (a copy was made).
+        assert_ne!(
+            new_phys, parent_phys,
+            "resolve_cow_fault should have allocated a new frame"
+        );
+
+        // Verify every byte in the new frame matches the parent's pattern.
+        let new_data =
+            unsafe { core::slice::from_raw_parts((phys_off + new_phys) as *const u8, 4096) };
+        for (i, &byte) in new_data.iter().enumerate() {
             let expected = (i & 0xFF) as u8;
             assert_eq!(
                 byte, expected,
-                "CoW copy mismatch at offset {}: got {:#x}, expected {:#x} (child frame {:#x})",
-                i, byte, expected, child_phys
+                "CoW copy mismatch at offset {}: got {:#x}, expected {:#x} (new frame {:#x})",
+                i, byte, expected, new_phys
             );
         }
 
+        // Cleanup: unmap the page and free both frames.
+        let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size4KiB>::containing_address(vaddr);
+        drop(mapper);
+        let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+        if let Ok((_f, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+        frame_allocator::free_frame(new_phys);
+        // Parent frame had refcount bumped to 2; resolve_cow_fault decremented
+        // to 1 via free_frame.  Decrement once more to actually free.
         frame_allocator::free_frame(parent_phys);
-        frame_allocator::free_frame(child_phys);
     }
 
     /// D.4: munmap + reuse — after freeing a batch of dirty frames
