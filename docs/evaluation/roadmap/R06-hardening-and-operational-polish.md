@@ -38,6 +38,13 @@ hardening, and service enable/disable controls. The work here is therefore
 about hardening shipped capabilities and deciding which remaining gaps are true
 release blockers.
 
+The headless/reference baseline is now explicitly defined in
+[Phase 53 § Supported Headless/Reference Workflow](../../roadmap/53-headless-hardening.md#supported-headlessreference-workflow)
+and validated by the gate bundle in
+[Phase 53 § Gate Bundle](../../roadmap/53-headless-hardening.md#gate-bundle).
+This release phase succeeds when those gates pass, not when features are merely
+present.
+
 ```mermaid
 flowchart TD
     A["Security floor repaired"] --> B["Managed services"]
@@ -93,16 +100,22 @@ After this phase, m3OS has a strong candidate story for a **safer headless or
 reference-system release**: boot, log in, manage services, build or port
 software, diagnose failures, and trust the validation story enough to ship.
 
+The claim is bounded by the [Phase 53 support boundary](../../roadmap/53-headless-hardening.md#support-boundary):
+QEMU x86_64 with OVMF, SSH-first remote admin, the shipped ports and Rust std
+path, and the exact gate bundle documented in Phase 53. GUI, broad hardware,
+outbound HTTPS/DNS tooling, and large runtime ecosystems remain post-1.0 work.
+
 ## Acceptance Criteria
 
-- Stage 1 readiness from [Usability Roadmap](../usability-roadmap.md) is
-  materially satisfied
+- The supported headless/reference workflow from [Phase 53](../../roadmap/53-headless-hardening.md#supported-headlessreference-workflow) is exercised end-to-end
+- The full gate bundle (automated + manual checks) from [Phase 53 § Gate Bundle](../../roadmap/53-headless-hardening.md#gate-bundle) passes on a post-Phase 53a image
 - Rust std-based guest programs are part of the normal documented workflow
 - Ports and image-building behavior are deterministic enough for repeated use
 - The release docs explicitly describe which remote/outbound workflows are
-  supported at 1.0 and which are deferred
-- Smoke, regression, and stress results are treated as meaningful release gates
+  supported at 1.0 (SSH-first; telnet opt-in only) and which are deferred
+  (HTTPS clients, DNS, git, GitHub tooling)
 - Security documentation and operator documentation match the shipped behavior
+- Phase 53 is not marked complete until the gate bundle passes on the allocator-sensitive baseline after Phase 53a
 
 ## Key Cross-Links
 
@@ -115,7 +128,11 @@ software, diagnose failures, and trust the validation story enough to ship.
 
 ## Open Questions
 
-- Which networking conveniences are true 1.0 gates, and which are merely
-  attractive for post-1.0 tooling?
-- Should larger developer tools such as `gh` or full git-over-HTTPS be treated
-  as 1.0 goals or as 1.x conveniences?
+- ~~Which networking conveniences are true 1.0 gates, and which are merely
+  attractive for post-1.0 tooling?~~ **Resolved:** outbound HTTPS/TLS clients,
+  DNS resolution, git, and GitHub tooling are explicitly deferred to post-1.0.
+  SSH is the supported remote-admin path; telnet is opt-in only. See
+  [Phase 53 § Support Boundary](../../roadmap/53-headless-hardening.md#support-boundary).
+- ~~Should larger developer tools such as `gh` or full git-over-HTTPS be treated
+  as 1.0 goals or as 1.x conveniences?~~ **Resolved:** deferred to post-1.0
+  (Phase 59–62).

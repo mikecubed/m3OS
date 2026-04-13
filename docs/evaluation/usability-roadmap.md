@@ -80,6 +80,66 @@ Evidence for that claim:
 
 Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly security and maturity gaps in shipped systems, not the absence of the service layer itself.
 
+### Supported headless/reference workflow (Stage 1 definition)
+
+Stage 1 is anchored by the single normal operator path documented in
+[Phase 53 § Supported Headless/Reference Workflow](../../roadmap/53-headless-hardening.md#supported-headlessreference-workflow).
+That path covers:
+
+1. **Boot and login** — unattended boot to `login:` prompt, first-boot password
+   creation or stored-password login (Phase 48 security floor: kernel-enforced
+   identity transitions, `getrandom()`-backed salted hashes, no default
+   credentials).
+2. **Service inspection and control** — `service list/status/start/stop/restart`
+   via init PID 1 supervision (Phase 46/51 baseline).
+3. **Storage verification** — ext2 data partition write/read/delete round-trip.
+4. **Log inspection** — `logger` + `/var/log/syslog` via syslogd.
+5. **Package and build basics** — TCC compilation, ports install, Rust std
+   binaries.
+6. **Failure recovery** — crash diagnostics, trace rings, `service restart`.
+7. **Clean shutdown and reboot** — `shutdown` / `reboot` with orderly service
+   stop and orphan reaping.
+
+### Remote administration posture
+
+- **SSH** is the default and supported remote-admin path.
+- **Telnet** is available only with an explicit opt-in build flag
+  (`cargo xtask image --enable-telnet`) and is not part of the headless release
+  claim.
+
+### Gate bundle (Stage 1 validation)
+
+Stage 1 readiness is proven by the gate bundle in
+[Phase 53 § Gate Bundle](../../roadmap/53-headless-hardening.md#gate-bundle):
+
+| Tier | Gate | Command or procedure |
+|---|---|---|
+| Automated | Static analysis | `cargo xtask check` |
+| Automated | Unit + property tests | `cargo test -p kernel-core` |
+| Automated | Boot smoke test | `cargo xtask smoke-test` |
+| Automated | Regression suite | `cargo xtask regression` |
+| Automated | Stress suite (nightly) | `cargo xtask stress --iterations 50` |
+| Manual | Service lifecycle, SSH login, storage, logs, shutdown, reboot, failure recovery | See Phase 53 manual-check table |
+
+### Support boundary
+
+Stage 1 supports exactly the headless/reference scope listed in
+[Phase 53 § Support Boundary](../../roadmap/53-headless-hardening.md#support-boundary).
+The following are **explicitly out of scope** for Stage 1:
+
+- GUI / display compositor / graphical session
+- Broad hardware certification (bare-metal, non-QEMU)
+- Large runtime ecosystems (Python, Node.js, JVM)
+- Outbound HTTPS/TLS client tooling, DNS, git, GitHub integration
+- Dynamic linking, package feeds, full POSIX compliance
+
+### Phase 53 / 53a closure rule
+
+Stage 1 is not satisfied until the gate bundle passes on an image that includes
+the Phase 53a allocator changes. The gates are defined now; the passing evidence
+is produced after Phase 53a lands. This closure rule is shared with Phase 53 and
+Phase 58.
+
 ### Detailed Stage 1 work breakdown
 
 | Track | Needed outcome | Why it belongs in Stage 1 |
@@ -99,7 +159,8 @@ Call Stage 1 achieved only when all of these are true:
 3. service restart, shutdown, and reboot are first-class operations
 4. logs survive long enough to diagnose failures and are accessible sanely
 5. Rust std-based guest programs are part of the normal workflow
-6. smoke/regression runs are reliable enough to trust as release gates
+6. the full gate bundle (automated + manual) passes on a post-Phase 53a image
+7. the support boundary is documented and narrow enough to feed Phase 58
 
 ## Stage 2: local desktop substrate
 

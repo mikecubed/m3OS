@@ -23,6 +23,202 @@ This phase exists to make the headless/reference-system claim honest before the 
 - See how ports, Rust std binaries, services, and diagnostics interact in day-to-day system use.
 - Understand why release discipline is a prerequisite for later scope growth.
 
+---
+
+## Supported Headless/Reference Workflow
+
+The following workflow is the single normal operator path through the headless
+system. Every step must be exercised by the gate bundle (§ Gate Bundle) before
+Phase 53 can feed into Phase 58.
+
+### 1. Boot and login
+
+The system boots unattended in QEMU (serial-only mode) and reaches a `login:`
+prompt. The operator logs in as `root`. On first boot, the login flow prompts
+for initial password creation (Phase 48: no baked-in default credentials). On
+subsequent boots, the operator supplies the stored password.
+
+**Phase 48 security floor exercised here:** kernel-enforced `setuid`/`setgid`
+transitions, `getrandom()`-backed salted password hashes, no default plaintext
+credentials.
+
+### 2. Service inspection and control
+
+After login the operator verifies managed services:
+
+```
+service list            # enumerate supervised daemons
+service status sshd     # inspect a specific service
+service restart crond   # restart a daemon with backoff
+```
+
+The init daemon (PID 1) supervises services with restart backoff, crash
+classification, per-service shutdown timeouts, and init-to-syslog integration
+(Phase 46/51 baseline).
+
+### 3. Storage verification
+
+The operator confirms persistent storage is mounted and writable:
+
+```
+ls /data                # ext2 data partition present
+touch /data/test && rm /data/test   # write/remove round-trip
+mount                   # inspect current mounts (FAT32 root, ext2 data, tmpfs)
+```
+
+### 4. Log inspection
+
+System logs are accessible through the syslog socket and on-disk files:
+
+```
+cat /var/log/syslog     # read aggregated system log
+logger "test message"   # inject a message via /dev/log
+```
+
+### 5. Package and build basics
+
+The Rust std cross-compilation path and ports system are usable for routine
+builds:
+
+```
+tcc --version                                # TCC is available
+tcc -static /usr/src/hello.c -o /tmp/hello   # compile + run a C program
+```
+
+Ports (`port install lua`, `port install bc`) and Rust std binaries
+(`hello-rust`, `sysinfo-rust`) are expected to work when attempted; reliability
+of the fetch/build/install cycle is covered by Tracks B–C.
+
+### 6. Failure recovery
+
+The operator can diagnose a misbehaving service or crashed process using crash
+diagnostics (Phase 43a), trace ring dumps (Phase 43b), and serial log output.
+Service restart via `service restart <name>` returns the daemon to a known
+state.
+
+### 7. Clean shutdown and reboot
+
+```
+shutdown                # orderly halt — init stops services in dependency order
+reboot                  # orderly reboot — same sequence, then warm restart
+```
+
+Phase 48 security floor exercised here: orphan reaping, per-service stop
+timeouts, signal-based termination sequence.
+
+### Remote administration posture
+
+- **SSH** is the default and supported remote-administration path (Phase 43 +
+  Phase 48 hardening). The system generates host keys with `getrandom()`-backed
+  entropy at first boot.
+- **Telnet** is available only when the image is built with the explicit
+  `--enable-telnet` flag (`cargo xtask image --enable-telnet`). It is a
+  non-default testing/debugging posture and is **not** part of the supported
+  headless release claim.
+
+---
+
+## Gate Bundle
+
+The gate bundle is the concrete set of automation and manual checks that must
+pass before Phase 53 claims headless readiness. Generic references to "smoke"
+or "regression" are not sufficient; the bundle names the exact commands.
+
+### Automated gates
+
+| Gate | Command | What it proves |
+|---|---|---|
+| Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests pass |
+| Unit + property tests | `cargo test -p kernel-core` | Host-side pure-logic invariants hold |
+| QEMU boot smoke test | `cargo xtask smoke-test` | Boot → login → shell → TCC compile round-trip |
+| Regression suite | `cargo xtask regression` | SMP-sensitive paths (fork, IPC, PTY, SSH) pass |
+| Stress suite (CI nightly) | `cargo xtask stress --iterations 50` | No timing-dependent failures across repeated runs |
+
+### Manual checks (performed once per release-candidate image)
+
+| Check | Procedure | Pass criterion |
+|---|---|---|
+| Service lifecycle | `service list`, `service status sshd`, `service restart crond` | Services enumerate, report status, restart cleanly |
+| Storage round-trip | `touch /data/test && cat /data/test && rm /data/test` | Write, read, delete succeed on ext2 |
+| Log pipeline | `logger "gate check" && grep "gate check" /var/log/syslog` | Message appears in syslog |
+| SSH remote login | Connect from host via `ssh -p 2222 root@localhost` | Session opens, shell prompt appears |
+| Shutdown/reboot | `shutdown` from shell | QEMU exits cleanly, no panic in serial log |
+| Reboot | `reboot` from shell | System returns to login prompt |
+| Failure recovery | `service stop sshd && service start sshd` | Service stops and restarts without side effects |
+
+### Gate status
+
+The automated gates exist today (Phase 43c). The manual checks are documented
+here as a repeatable operator checklist. Track B turns additional manual checks
+into automation where practical.
+
+---
+
+## Support Boundary
+
+### What is supported in the headless/reference release
+
+| Area | Supported scope |
+|---|---|
+| Boot target | QEMU x86_64 with OVMF (UEFI), serial-only or SDL GUI modes |
+| Authentication | Local login with salted password hashes; `passwd`, `adduser`, `su` |
+| Remote admin | SSH (default); telnet only with explicit opt-in build flag |
+| Service management | `service list/status/start/stop/restart/enable/disable` via init PID 1 |
+| Logging | syslogd via `/dev/log` Unix socket; `logger` CLI; `/var/log/syslog` |
+| Scheduling | crond with standard crontab format |
+| Storage | FAT32 root (ramdisk), ext2 data partition, tmpfs |
+| Build tooling | TCC (C compiler), `make`/`pdpmake`, `ar`, `install` |
+| Rust std path | musl-linked cross-compiled binaries (`hello-rust`, `sysinfo-rust`, etc.) |
+| Ports | `port install/remove/list` with bundled source and dependency resolution |
+| Diagnostics | Crash diagnostics (Phase 43a), trace rings (Phase 43b), serial log |
+| Shutdown/reboot | Orderly `shutdown` and `reboot` with orphan reaping and service stop |
+
+### What is explicitly NOT supported (non-goals for Phase 53)
+
+| Area | Status | When |
+|---|---|---|
+| GUI / display compositor / graphical session | Out of scope | Phase 56–57 |
+| Mouse input or audio | Out of scope | Phase 56–57 |
+| Broad hardware certification (bare-metal, non-QEMU) | Out of scope | Phase 55 |
+| Large runtime ecosystems (Python, Node.js, JVM) | Out of scope | Post-1.0 (Phase 59–62) |
+| Outbound HTTPS/TLS client tooling | Deferred | Post-1.0 |
+| `git`, `gh`, GitHub integration | Deferred | Post-1.0 |
+| DNS resolution and general outbound networking | Deferred | Post-1.0 |
+| Package feeds / remote package repositories | Deferred | Post-1.0 |
+| Dynamic linking / shared libraries | Deferred | Post-1.0 |
+| Full POSIX compliance testing | Deferred | Post-1.0 |
+
+The support boundary is intentionally narrow. Phase 58 (Release 1.0 Gate) builds
+on exactly this bounded baseline rather than assuming broader coverage.
+
+---
+
+## Phase 53 / Phase 53a Closure Contract
+
+Phase 53 defines the headless gates. Phase 53a modernizes the kernel memory
+subsystem (per-CPU page cache, magazine slab allocator, SMP-scalable
+allocation). These are related but have distinct closure rules:
+
+| Decision | Defined by Phase 53 (now) | Satisfied after Phase 53a |
+|---|---|---|
+| Supported headless workflow | ✅ Defined above | — |
+| Gate bundle (exact commands and checks) | ✅ Defined above | — |
+| Support boundary and non-goals | ✅ Defined above | — |
+| Operator workflow documentation | Tracks C–D | — |
+| Automated gates pass on the allocator-sensitive baseline | — | ✅ Must pass after 53a lands |
+| Stress suite shows no allocator regressions | — | ✅ Must pass after 53a lands |
+| Phase 53 marked "Complete" | — | Only after 53a satisfies published gates |
+
+**Closure rule:** Phase 53 may not be marked complete until the full gate bundle
+passes on an image that includes the Phase 53a allocator changes. The gate
+definitions are fixed now; the evidence is produced after 53a.
+
+This rule applies identically in the evaluation docs
+(`docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`) and in the
+release gate (`docs/roadmap/58-release-1-0-gate.md`).
+
+---
+
 ## Feature Scope
 
 ### Validation and release-gate discipline
@@ -54,46 +250,47 @@ Write down what the headless/reference system promises and what it still does no
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Security floor | Phase 48 fixes are complete and validated in the normal boot/admin flow | Pull missing hardening or smoke coverage into this phase |
-| Service lifecycle | Phase 51 supervision and Phase 52 extraction behavior are stable enough for operator use | Add missing restart, status, or recovery work |
-| Tooling baseline | Phase 44 and 45 flows are reproducible enough for the release story | Pull missing packaging or runtime cleanup into this phase |
-| Validation story | Regression, stress, and smoke tests cover the workflows being claimed | Add the missing release-gate coverage instead of hand-waving it |
+| Security floor | Phase 48 fixes are complete and validated in the normal boot/admin flow (see § Supported Headless/Reference Workflow steps 1 and 7) | Pull missing hardening or smoke coverage into this phase |
+| Service lifecycle | Phase 51 supervision and Phase 52 extraction behavior are stable enough for operator use (see § Supported Headless/Reference Workflow step 2) | Add missing restart, status, or recovery work |
+| Tooling baseline | Phase 44 and 45 flows are reproducible enough for the release story (see § Supported Headless/Reference Workflow step 5) | Pull missing packaging or runtime cleanup into this phase |
+| Validation story | All gates in § Gate Bundle pass on an image including Phase 53a allocator changes | Add the missing release-gate coverage instead of hand-waving it |
 
-**Planning note:** This phase defines the release gates that allocator work in
-Phase 53a must eventually satisfy. The dependency on Phase 53a is about closing
-the final headless/reference claim, not about drafting the gates; write the
-gates early enough that 53a has a concrete validation target.
+**Closure rule (repeated for emphasis):** Phase 53 is not complete until the
+gate bundle passes on the post-53a allocator baseline. The gate definitions are
+published now; the passing evidence is produced after Phase 53a lands. No
+documentation may imply that Phase 53 is already complete before that evidence
+exists.
 
 ## Important Components and How They Work
 
 ### Validation pipeline and release gates
 
-The validation story is part of the product. This phase should define which `xtask`, smoke, regression, and recovery workflows anchor the supported headless claim.
+The gate bundle (§ Gate Bundle) is part of the product. It names exact `cargo xtask` commands and manual operator checks that anchor the headless claim. The automated tier uses Phase 43c infrastructure (`smoke-test`, `regression`, `stress`); the manual tier covers service lifecycle, SSH login, storage, logs, shutdown, and failure recovery.
 
 ### Operator-visible system model
 
-Services, logs, package behavior, and boot/shutdown flows together define whether the system is understandable enough to operate deliberately. This phase should turn those workflows into documented normal paths.
+Services, logs, package behavior, and boot/shutdown flows together define whether the system is understandable enough to operate deliberately. The supported headless workflow (§ Supported Headless/Reference Workflow) is the single documented normal path through these subsystems.
 
 ### Support matrix and expectation management
 
-Release quality is partly about saying no. The phase should clearly define what m3OS supports in its headless/reference mode and what remains later work.
+Release quality is partly about saying no. The support boundary (§ Support Boundary) defines what m3OS supports in its headless/reference mode and what remains later work. Phase 58 builds on exactly this boundary.
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 43c by turning validation infrastructure into explicit release gates.
+- Builds on Phase 43c by turning validation infrastructure into the exact gate bundle documented above.
 - Builds on Phases 44 and 45 by treating Rust std support and ports as part of the real supported environment.
 - Builds on Phases 46, 50, and 51 by turning the service model and extracted-service story into an operator-facing system.
-- Uses Phase 53a as allocator-sensitive infrastructure that must satisfy the same published headless gates before the release claim closes.
-- Depends on Phase 48 so headless readiness is not built on an unsafe trust floor.
+- Uses Phase 53a as allocator-sensitive infrastructure that must satisfy the same published headless gates before the release claim closes (see § Phase 53 / Phase 53a Closure Contract).
+- Depends on Phase 48 so the security floor is exercised in the normal boot/admin path, not bolted on as an afterthought.
 
 ## Implementation Outline
 
-1. Define the supported headless/reference workflows and the validation gates that prove them.
-2. Audit the Rust std and ports flows for the release story and fix the rough edges that block routine use.
-3. Harden service/logging/admin workflows into documented normal operations.
-4. Add recovery and failure-diagnosis guidance for the supported headless system.
-5. Write down the support boundary and non-goals for the headless/reference release story.
-6. Update top-level docs, subsystem docs, and evaluation docs to align with the new claim.
+1. Define the supported headless/reference workflow, gate bundle, and support boundary (Track A — this document).
+2. Turn the gate bundle into repeatable automation and evidence capture (Track B).
+3. Audit the Rust std and ports flows for the release story and fix the rough edges that block routine use (Track C).
+4. Harden service/logging/admin workflows into documented normal operations (Track D).
+5. Update learning docs, subsystem docs, and evaluation docs to align with the new claim (Track E).
+6. Collect closure evidence after Phase 53a and align version references (Track F).
 
 ## Learning Documentation Requirement
 
@@ -110,15 +307,19 @@ Release quality is partly about saying no. The phase should clearly define what 
 
 ## Acceptance Criteria
 
-- There is a documented and repeatable headless/reference validation path covering boot, login, services, logs, package/install basics, and shutdown.
-- The supported Rust std and ports workflows behave predictably enough for routine use in the stated support matrix.
-- Operator-facing docs explain how to inspect services, read logs, recover from common failures, and shut the system down cleanly.
-- The project explicitly documents what is supported in the headless/reference story and what remains later work.
-- The release claim for this phase is backed by the same validation gates the docs describe.
+- The supported headless/reference workflow (§ above) is a single documented normal-operator path covering boot/login, service inspection/control, storage verification, log inspection, package/build basics, failure recovery, and clean shutdown/reboot.
+- The gate bundle names exact `cargo xtask` commands and manual checks, not generic references to smoke/regression.
+- The docs state where the Phase 48 security floor is exercised in the normal boot/admin path (steps 1 and 7).
+- SSH is the documented default remote-admin path; telnet is documented as a non-default testing posture only.
+- Broad outbound developer tooling (HTTPS clients, git, DNS) is explicitly deferred as a non-goal.
+- GUI/local-session features, broad hardware certification, and large runtime ecosystems are explicitly out of scope.
+- The support boundary is narrow enough to feed Phase 58 without reopening Phase 53 scope.
+- The Phase 53 / Phase 53a closure contract states which decisions are defined now versus satisfied only after the published gates pass on the allocator-sensitive baseline.
+- No documentation implies that Phase 53 is already complete before the gate bundle passes on the post-53a image.
 
 ## Companion Task List
 
-- Phase 53 task list — defer until implementation planning begins.
+- [Phase 53 Task List](./tasks/53-headless-hardening-tasks.md)
 
 ## How Real OS Implementations Differ
 
@@ -128,7 +329,10 @@ Release quality is partly about saying no. The phase should clearly define what 
 
 ## Deferred Until Later
 
-- Broad outbound developer networking and GitHub tooling
-- Full desktop/session support
-- Large third-party runtime ecosystems
-- Broad hardware certification beyond the reference matrix
+- Broad outbound developer networking (HTTPS/TLS clients, DNS resolution, git remotes, GitHub tooling)
+- GUI / display compositor / graphical session / local desktop
+- Mouse input, audio output
+- Large third-party runtime ecosystems (Python, Node.js, JVM)
+- Broad hardware certification beyond QEMU x86_64 with OVMF
+- Package feeds, remote package repositories, dynamic linking
+- Full POSIX compliance testing

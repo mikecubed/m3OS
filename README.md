@@ -49,3 +49,14 @@ Full documentation lives in [`docs/`](docs/README.md):
 - **Safety by default** — `unsafe` only at hardware boundaries, always wrapped.
 - **Incremental** — Each phase produces a runnable artifact.
 - **Self-contained** — No large third-party runtimes.
+
+## Headless/Reference System
+
+m3OS targets a **headless/reference baseline** as its primary supported
+configuration: boot in QEMU, log in, manage services, build software, diagnose
+failures, and shut down cleanly. SSH is the default remote-admin path; telnet
+is available only with an explicit opt-in build flag.
+
+See [`docs/roadmap/53-headless-hardening.md`](docs/roadmap/53-headless-hardening.md)
+for the supported workflow, validation gate bundle, and support boundary.
+GUI, broad hardware certification, and large runtime ecosystems are later work.
