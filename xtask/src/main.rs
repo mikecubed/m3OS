@@ -13,8 +13,6 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
-const KERNEL_CORE_HOST_TEST_CMD: &str =
-    "cargo test -p kernel-core --target x86_64-unknown-linux-gnu";
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -1593,7 +1591,9 @@ fn cmd_check() {
         .expect("failed to run kernel-core tests");
 
     if !status.success() {
-        eprintln!("kernel-core host tests failed — rerun `{KERNEL_CORE_HOST_TEST_CMD}`");
+        eprintln!(
+            "kernel-core host tests failed — rerun `cargo test -p kernel-core --target {KERNEL_CORE_HOST_TARGET}`"
+        );
         std::process::exit(1);
     }
 
