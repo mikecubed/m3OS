@@ -22,18 +22,48 @@
 //! `free_frame` and `free_contiguous` do **not** zero on free.  The stale
 //! content is harmless because every user-facing path goes through a zeroed
 //! allocation or an explicit full-page copy (CoW).
+//!
+//! # Minimal allocation-context contract (F.1)
+//!
+//! Phase 53a documents a two-tier contract even though full GFP-style flags are
+//! deferred:
+//!
+//! * [`AllocationContext::IrqSensitive`] — hard IRQ, IPI, or page-fault-adjacent
+//!   callers. Per-CPU page-cache mutations run inside `without_interrupts` and a
+//!   same-core non-reentrancy guard. If the guard is already held, the call
+//!   bypasses the local cache and uses the cold path instead of corrupting
+//!   CPU-local state.
+//! * [`AllocationContext::Sleepable`] — task/syscall context. Callers may
+//!   tolerate cold-path lock spinning, perform higher-level reclaim, or retry
+//!   after `None`.
+//!
+//! The frame allocator still uses spin locks only, so "sleepable" here means
+//! "allowed to take the contended cold path / retry", not that the allocator
+//! literally sleeps today.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use kernel_core::buddy::BuddyAllocator;
 use spin::Mutex;
 use x86_64::PhysAddr;
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 const PAGE_SIZE: u64 = 4096;
+
+/// Minimal allocation-context contract for Phase 53a Track F.1.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationContext {
+    /// Task or syscall context that may tolerate cold-path contention, reclaim,
+    /// or retry when an allocation attempt returns `None`.
+    Sleepable,
+    /// Hard-IRQ, IPI, or page-fault-adjacent context that must avoid re-entering
+    /// CPU-local allocator state while it is already being mutated on this core.
+    IrqSensitive,
+}
 
 // ---------------------------------------------------------------------------
 // Per-CPU page cache (A.1)
@@ -132,6 +162,78 @@ impl PerCpuPageCache {
             f(self.frames[self.count as usize]);
         }
         to_drain
+    }
+}
+
+/// Same-core non-reentrancy guard for per-CPU page-cache mutations.
+static PAGE_CACHE_GUARD: AtomicU64 = AtomicU64::new(0);
+
+struct LocalPageCacheGuard {
+    mask: u64,
+}
+
+impl LocalPageCacheGuard {
+    #[inline]
+    fn try_enter() -> Option<Self> {
+        let mask = 1u64 << (crate::smp::per_core().core_id as u64);
+        let prev = PAGE_CACHE_GUARD.fetch_or(mask, Ordering::AcqRel);
+        if prev & mask != 0 {
+            return None;
+        }
+        Some(Self { mask })
+    }
+}
+
+impl Drop for LocalPageCacheGuard {
+    fn drop(&mut self) {
+        PAGE_CACHE_GUARD.fetch_and(!self.mask, Ordering::Release);
+    }
+}
+
+#[inline]
+fn with_local_page_cache<T>(f: impl FnOnce(&mut PerCpuPageCache) -> T) -> Result<T, ()> {
+    let Some(_guard) = LocalPageCacheGuard::try_enter() else {
+        return Err(());
+    };
+    let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+    Ok(f(cache))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum FrameHotPathProbe {
+    None = 0,
+    AllocateHit = 1,
+    FreePush = 2,
+}
+
+#[cfg(test)]
+static FRAME_HOT_PATH_PROBE: AtomicU8 = AtomicU8::new(FrameHotPathProbe::None as u8);
+#[cfg(test)]
+static FRAME_HOT_PATH_PROBE_PHYS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn arm_frame_hot_path_probe(probe: FrameHotPathProbe, phys: u64) {
+    FRAME_HOT_PATH_PROBE_PHYS.store(phys, Ordering::Release);
+    FRAME_HOT_PATH_PROBE.store(probe as u8, Ordering::Release);
+}
+
+#[cfg(test)]
+fn run_frame_hot_path_probe(expected: FrameHotPathProbe) {
+    if FRAME_HOT_PATH_PROBE
+        .compare_exchange(
+            expected as u8,
+            FrameHotPathProbe::None as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let phys = FRAME_HOT_PATH_PROBE_PHYS.swap(0, Ordering::AcqRel);
+        if phys != 0 {
+            free_frame(phys);
+        }
     }
 }
 
@@ -408,31 +510,76 @@ pub fn init_buddy() {
     );
 }
 
+/// Allocate a single 4 KiB frame.
+///
+/// # Minimal allocation-context contract (F.1)
+///
+/// - [`AllocationContext::IrqSensitive`] callers get a guarded fast path:
+///   cache-hit mutations run with interrupts masked and a same-core guard. A
+///   re-entrant entry bypasses the page cache and goes straight to the global
+///   buddy/free-list path instead of touching CPU-local state twice.
+/// - [`AllocationContext::Sleepable`] callers may tolerate a cache miss, higher
+///   level reclaim, or retry after `None`.
+///
+/// # Slow-path behavior
+///
+/// The refill path batch-allocates from `FRAME_ALLOCATOR`. It does **not**
+/// sleep, but it may spin on the global allocator lock and it performs exactly
+/// one refill attempt before returning `None`.
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
-    // Fast path: try per-CPU page cache (A.2).
-    // Mask interrupts to prevent reentrancy from ISRs that might allocate.
     if crate::smp::is_per_core_ready() {
         let result = x86_64::instructions::interrupts::without_interrupts(|| {
-            let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
-            if let Some(phys) = cache.pop() {
-                return Some(phys);
+            match with_local_page_cache(|cache| {
+                if let Some(phys) = cache.pop() {
+                    #[cfg(test)]
+                    run_frame_hot_path_probe(FrameHotPathProbe::AllocateHit);
+                    return Some(phys);
+                }
+                None
+            }) {
+                Ok(Some(phys)) => return Some(phys),
+                Err(()) => {
+                    let frame = FRAME_ALLOCATOR.0.lock().allocate()?;
+                    return Some(frame.start_address().as_u64());
+                }
+                Ok(None) => {}
             }
-            // Cache empty — batch refill from the buddy under the global lock.
-            let mut alloc = FRAME_ALLOCATOR.0.lock();
-            let mut first: Option<u64> = None;
-            for _ in 0..BATCH_SIZE {
-                if let Some(frame) = alloc.allocate() {
-                    let phys = frame.start_address().as_u64();
-                    if first.is_none() {
-                        first = Some(phys);
+
+            let mut refill = [0u64; BATCH_SIZE];
+            let mut refill_count = 0usize;
+            {
+                let mut alloc = FRAME_ALLOCATOR.0.lock();
+                for slot in &mut refill {
+                    if let Some(frame) = alloc.allocate() {
+                        *slot = frame.start_address().as_u64();
+                        refill_count += 1;
                     } else {
-                        cache.push(phys);
+                        break;
                     }
-                } else {
-                    break;
                 }
             }
-            first
+
+            if refill_count == 0 {
+                return None;
+            }
+
+            if refill_count > 1 {
+                match with_local_page_cache(|cache| {
+                    for phys in &refill[1..refill_count] {
+                        cache.push(*phys);
+                    }
+                }) {
+                    Ok(()) => {}
+                    Err(()) => {
+                        let mut alloc = FRAME_ALLOCATOR.0.lock();
+                        for phys in &refill[1..refill_count] {
+                            alloc.free_to_pool(*phys);
+                        }
+                    }
+                }
+            }
+
+            Some(refill[0])
         });
         if let Some(phys) = result {
             if REFCOUNT_INIT.load(Ordering::Acquire) {
@@ -522,17 +669,26 @@ pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
 /// Return a frame to the allocator.
 ///
 /// If refcounting is initialized, decrements the reference count first.
-/// The frame is only pushed onto the free list when the count reaches zero.
-/// Frames allocated before refcounting was enabled (refcount == 0) are freed
-/// directly without decrementing.
+/// The frame is only reclaimed when the count reaches zero. Frames allocated
+/// before refcounting was enabled (refcount == 0) are freed directly.
 ///
-/// Fast path (A.3): pushes to the per-CPU page cache with interrupts masked.
-/// If the cache exceeds the high watermark (48 of 64), batch-drains 32 frames
-/// back to the buddy allocator under the global lock.
+/// # Minimal allocation-context contract (F.1)
+///
+/// - [`AllocationContext::IrqSensitive`] callers mutate the local page cache
+///   with interrupts masked and a same-core guard. A re-entrant free bypasses
+///   the cache and returns directly to the buddy/free-list pool.
+/// - [`AllocationContext::Sleepable`] callers may tolerate cache-overflow
+///   drains that briefly spin on the global allocator lock.
+///
+/// # Slow-path behavior
+///
+/// When the cache exceeds the high watermark, the allocator drains a batch of
+/// 32 frames back to the buddy. This path does **not** sleep and does not
+/// retry; it may briefly spin on `FRAME_ALLOCATOR`.
 ///
 /// Does **not** zero the frame — the zero-before-exposure invariant is
-/// enforced on the allocation side via [`allocate_frame_zeroed`].
-/// Panics on double-free (frame already on the free list).
+/// enforced on the allocation side via [`allocate_frame_zeroed`]. Panics on
+/// double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
     // Use refcounting when available.
     if REFCOUNT_INIT.load(Ordering::Acquire) {
@@ -548,18 +704,34 @@ pub fn free_frame(phys: u64) {
         }
     }
 
-    // Fast path: push to per-CPU cache (A.3).
     if crate::smp::is_per_core_ready() {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
-            cache.push(phys);
+            let mut drained = [0u64; BATCH_SIZE];
+            match with_local_page_cache(|cache| {
+                cache.push(phys);
+                #[cfg(test)]
+                run_frame_hot_path_probe(FrameHotPathProbe::FreePush);
 
-            // If cache exceeds the high watermark, batch-drain to the buddy.
-            if cache.len() as usize > HIGH_WATERMARK {
-                let mut alloc = FRAME_ALLOCATOR.0.lock();
-                cache.drain_to(BATCH_SIZE, |frame_phys| {
-                    alloc.free_to_pool(frame_phys);
-                });
+                let mut drained_count = 0usize;
+                if cache.len() as usize > HIGH_WATERMARK {
+                    cache.drain_to(BATCH_SIZE, |frame_phys| {
+                        drained[drained_count] = frame_phys;
+                        drained_count += 1;
+                    });
+                }
+                drained_count
+            }) {
+                Ok(drain_count) => {
+                    if drain_count > 0 {
+                        let mut alloc = FRAME_ALLOCATOR.0.lock();
+                        for frame_phys in &drained[..drain_count] {
+                            alloc.free_to_pool(*frame_phys);
+                        }
+                    }
+                }
+                Err(()) => {
+                    FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
+                }
             }
         });
         return;
@@ -592,8 +764,6 @@ pub fn free_contiguous(phys: u64, order: usize) {
 // ---------------------------------------------------------------------------
 // Per-CPU cache drain (A.4)
 // ---------------------------------------------------------------------------
-
-use core::sync::atomic::AtomicU8;
 
 /// Atomic counter used by `drain_per_cpu_caches` to wait for IPI-driven
 /// remote drains to complete.  Each remote core decrements this after
@@ -873,4 +1043,61 @@ fn align_up(addr: u64, align: u64) -> u64 {
 #[inline]
 fn align_down(addr: u64, align: u64) -> u64 {
     addr & !(align - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ensure_test_per_core() {
+        if !crate::smp::is_per_core_ready() {
+            crate::smp::init_bsp_per_core();
+        }
+        drain_per_cpu_caches();
+    }
+
+    #[test_case]
+    fn allocate_frame_hot_path_tolerates_reentrant_free() {
+        ensure_test_per_core();
+        let before = available_count();
+
+        let cached_a = allocate_frame().expect("cached_a");
+        let cached_b = allocate_frame().expect("cached_b");
+        free_frame(cached_a.start_address().as_u64());
+        free_frame(cached_b.start_address().as_u64());
+
+        let nested = allocate_frame().expect("nested frame");
+        let nested_phys = nested.start_address().as_u64();
+        arm_frame_hot_path_probe(FrameHotPathProbe::AllocateHit, nested_phys);
+
+        let outer = allocate_frame().expect("outer frame");
+        free_frame(outer.start_address().as_u64());
+
+        assert_eq!(
+            available_count(),
+            before,
+            "reentrant free during allocate_frame cache hit leaked frames"
+        );
+        drain_per_cpu_caches();
+    }
+
+    #[test_case]
+    fn free_frame_hot_path_tolerates_reentrant_free() {
+        ensure_test_per_core();
+        let before = available_count();
+
+        let outer = allocate_frame().expect("outer frame");
+        let nested = allocate_frame().expect("nested frame");
+        let nested_phys = nested.start_address().as_u64();
+        arm_frame_hot_path_probe(FrameHotPathProbe::FreePush, nested_phys);
+
+        free_frame(outer.start_address().as_u64());
+
+        assert_eq!(
+            available_count(),
+            before,
+            "reentrant free during free_frame cache push leaked frames"
+        );
+        drain_per_cpu_caches();
+    }
 }

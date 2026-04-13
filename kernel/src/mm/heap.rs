@@ -129,7 +129,7 @@ fn core_bit() -> u64 {
     if !crate::smp::is_per_core_ready() {
         1 // bit 0 for the sole boot CPU
     } else {
-        1u64 << (crate::smp::current_core_id() & 63)
+        1u64 << (crate::smp::per_core().core_id as u64 & 63)
     }
 }
 

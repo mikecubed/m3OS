@@ -17,7 +17,24 @@
 //!
 //! The named slab caches (`task_cache`, `fd_cache`, …) are preserved for
 //! compatibility with existing callers and the stats surface.
+//!
+//! ## Minimal allocation-context contract (Track F.1)
+//!
+//! The slab magazine layer follows the same two-tier contract as
+//! [`crate::mm::frame_allocator::AllocationContext`]:
+//!
+//! * **IRQ-sensitive / page-fault-adjacent callers** rely on the guarded local
+//!   magazine fast path (`without_interrupts` + same-core guard). Re-entrant
+//!   allocs bypass magazines and try the direct slab path; re-entrant frees
+//!   fall back to the owner CPU's lock-free queue instead of touching magazine
+//!   state twice.
+//! * **Sleepable callers** may tolerate the depot/slab cold path and retry after
+//!   `None`.
+//!
+//! Cold paths still use spin locks only, so "sleepable" here means "allowed to
+//! take the contended cold path", not that the allocator literally sleeps.
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_core::cross_cpu_free::CrossCpuFreeList;
 use kernel_core::magazine::{Magazine, MagazineDepot};
 #[allow(unused_imports)]
@@ -83,6 +100,71 @@ impl PerCpuMagazines {
 // Safety: PerCpuMagazines is only accessed by its owning core with interrupts
 // masked.  The raw pointers inside Magazine are opaque handles.
 unsafe impl Send for PerCpuMagazines {}
+
+/// Same-core non-reentrancy guard for per-CPU magazine mutations.
+static MAGAZINE_GUARD: AtomicU64 = AtomicU64::new(0);
+
+struct LocalMagazineGuard {
+    mask: u64,
+}
+
+impl LocalMagazineGuard {
+    #[inline]
+    fn try_enter() -> Option<Self> {
+        let mask = 1u64 << (crate::smp::per_core().core_id as u64);
+        let prev = MAGAZINE_GUARD.fetch_or(mask, Ordering::AcqRel);
+        if prev & mask != 0 {
+            return None;
+        }
+        Some(Self { mask })
+    }
+}
+
+impl Drop for LocalMagazineGuard {
+    fn drop(&mut self) {
+        MAGAZINE_GUARD.fetch_and(!self.mask, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum MagazineHotPathProbe {
+    None = 0,
+    AllocateHit = 1,
+    FreePush = 2,
+}
+
+#[cfg(test)]
+static MAGAZINE_HOT_PATH_PROBE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(MagazineHotPathProbe::None as u8);
+#[cfg(test)]
+static MAGAZINE_HOT_PATH_PTR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn arm_magazine_hot_path_probe(probe: MagazineHotPathProbe, ptr: *mut u8) {
+    MAGAZINE_HOT_PATH_PTR.store(ptr as usize, Ordering::Release);
+    MAGAZINE_HOT_PATH_PROBE.store(probe as u8, Ordering::Release);
+}
+
+#[cfg(test)]
+fn run_magazine_hot_path_probe(expected: MagazineHotPathProbe, class_idx: usize) {
+    if MAGAZINE_HOT_PATH_PROBE
+        .compare_exchange(
+            expected as u8,
+            MagazineHotPathProbe::None as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        let ptr = MAGAZINE_HOT_PATH_PTR.swap(0, Ordering::AcqRel) as *mut u8;
+        if !ptr.is_null() {
+            magazine_free(class_idx, ptr, crate::smp::per_core().core_id);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-CPU cross-CPU free lists (E.1)
@@ -251,6 +333,21 @@ pub fn caches() -> &'static KernelSlabCaches {
 ///
 /// Returns the virtual address of the allocated object, or `None` on OOM.
 ///
+/// # Minimal allocation-context contract (F.1)
+///
+/// - [`crate::mm::frame_allocator::AllocationContext::IrqSensitive`] callers
+///   get a guarded local-magazine fast path. If a same-core re-entrant entry
+///   is detected, allocation bypasses magazines and attempts a direct slab
+///   allocation instead.
+/// - [`crate::mm::frame_allocator::AllocationContext::Sleepable`] callers may
+///   tolerate depot/slab lock spinning and retry after `None`.
+///
+/// # Slow-path behavior
+///
+/// The depot exchange and slab refill paths do **not** sleep, but they may
+/// spin on the depot or slab lock. The allocator performs one depot exchange
+/// and one slab-fill attempt before returning `None`.
+///
 /// # Safety contract
 ///
 /// The caller must ensure `class_idx` is a valid index (0..NUM_SIZE_CLASSES).
@@ -265,18 +362,25 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
     }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(_local_guard) = LocalMagazineGuard::try_enter() else {
+            return slab_alloc_reentrant_fallback(class_idx);
+        };
         let core = crate::smp::per_core();
         let mags = unsafe { &mut *core.slab_magazines.get() };
         let pair = &mut mags.pairs[class_idx];
 
         // 1. Try loaded magazine.
         if let Some(ptr) = pair.loaded.pop() {
+            #[cfg(test)]
+            run_magazine_hot_path_probe(MagazineHotPathProbe::AllocateHit, class_idx);
             return Some(ptr);
         }
 
         // 2. Swap loaded ↔ previous, retry.
         core::mem::swap(&mut pair.loaded, &mut pair.previous);
         if let Some(ptr) = pair.loaded.pop() {
+            #[cfg(test)]
+            run_magazine_hot_path_probe(MagazineHotPathProbe::AllocateHit, class_idx);
             return Some(ptr);
         }
 
@@ -302,6 +406,8 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
                 node = next;
             }
             if let Some(ptr) = pair.loaded.pop() {
+                #[cfg(test)]
+                run_magazine_hot_path_probe(MagazineHotPathProbe::AllocateHit, class_idx);
                 return Some(ptr);
             }
         }
@@ -352,6 +458,21 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
 /// 3. If both full, exchange full magazine for empty from depot (depot lock).
 /// 4. If depot has no empties, drain full magazine back to slab (slab lock)
 ///    and deposit the now-empty magazine back so it can be reused.
+///
+/// # Minimal allocation-context contract (F.1)
+///
+/// - [`crate::mm::frame_allocator::AllocationContext::IrqSensitive`] callers
+///   mutate the local magazine pair under `without_interrupts` plus the
+///   same-core guard. A same-core re-entrant free bypasses magazines and falls
+///   back to direct slab free or the owner CPU's lock-free queue.
+/// - [`crate::mm::frame_allocator::AllocationContext::Sleepable`] callers may
+///   tolerate depot/slab lock spinning when a full magazine must be drained.
+///
+/// # Slow-path behavior
+///
+/// The depot exchange and slab drain paths do **not** sleep, but they may spin
+/// on the depot/slab lock. `magazine_free` does not retry; once the object is
+/// queued or returned to the backing slab, the call is finished.
 #[allow(dead_code)]
 pub fn magazine_free(class_idx: usize, ptr: *mut u8, owning_cpu: u8) {
     debug_assert!(class_idx < NUM_SIZE_CLASSES);
@@ -362,6 +483,10 @@ pub fn magazine_free(class_idx: usize, ptr: *mut u8, owning_cpu: u8) {
     }
 
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(_local_guard) = LocalMagazineGuard::try_enter() else {
+            slab_free_reentrant_fallback(class_idx, ptr, owning_cpu);
+            return;
+        };
         let core = crate::smp::per_core();
 
         // E.2: route based on page ownership.
@@ -382,12 +507,16 @@ pub fn magazine_free(class_idx: usize, ptr: *mut u8, owning_cpu: u8) {
 
         // 1. Try previous magazine.
         if pair.previous.push(ptr).is_ok() {
+            #[cfg(test)]
+            run_magazine_hot_path_probe(MagazineHotPathProbe::FreePush, class_idx);
             return;
         }
 
         // 2. Swap loaded ↔ previous, retry.
         core::mem::swap(&mut pair.loaded, &mut pair.previous);
         if pair.previous.push(ptr).is_ok() {
+            #[cfg(test)]
+            run_magazine_hot_path_probe(MagazineHotPathProbe::FreePush, class_idx);
             return;
         }
 
@@ -429,12 +558,43 @@ fn slab_alloc_fallback(class_idx: usize) -> Option<*mut u8> {
         .map(|a| a as *mut u8)
 }
 
+fn slab_alloc_reentrant_fallback(class_idx: usize) -> Option<*mut u8> {
+    let state = &sc_state()[class_idx];
+    let mut slab = state.slab.try_lock()?;
+    slab.allocate(&mut || size_class_page_alloc(class_idx))
+        .map(|a| a as *mut u8)
+}
+
 /// Direct slab free (pre-SMP fallback).
 #[allow(dead_code)]
 fn slab_free_fallback(class_idx: usize, ptr: *mut u8) {
     let state = &sc_state()[class_idx];
     let mut slab = state.slab.lock();
     slab.free(ptr as usize);
+}
+
+fn slab_free_reentrant_fallback(class_idx: usize, ptr: *mut u8, owning_cpu: u8) {
+    let state = &sc_state()[class_idx];
+    let current_cpu = crate::smp::per_core().core_id;
+
+    if owning_cpu == current_cpu
+        && let Some(mut slab) = state.slab.try_lock()
+    {
+        slab.free(ptr as usize);
+        return;
+    }
+
+    if let Some(victim) = crate::smp::get_core_data(owning_cpu) {
+        unsafe { victim.cross_cpu_free.lists[class_idx].push(ptr) };
+        return;
+    }
+
+    if let Some(mut slab) = state.slab.try_lock() {
+        slab.free(ptr as usize);
+        return;
+    }
+
+    panic!("reentrant slab free fallback could not make progress");
 }
 
 // ---------------------------------------------------------------------------
@@ -468,4 +628,89 @@ pub fn all_slab_stats() -> AllSlabStats {
 pub fn size_class_slab_stats() -> [kernel_core::slab::SlabStats; NUM_SIZE_CLASSES] {
     let state = sc_state();
     core::array::from_fn(|i| state[i].slab.lock().stats())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ensure_test_per_core() {
+        if !crate::smp::is_per_core_ready() {
+            crate::smp::init_bsp_per_core();
+        }
+    }
+
+    fn drain_local_magazines_for_test(class_idx: usize) {
+        ensure_test_per_core();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let Some(_guard) = LocalMagazineGuard::try_enter() else {
+                panic!("test drain re-entered local magazine guard");
+            };
+            let core = crate::smp::per_core();
+            let state = &sc_state()[class_idx];
+            let mut slab = state.slab.lock();
+
+            let mut node = core.cross_cpu_free.lists[class_idx].take_all();
+            while !node.is_null() {
+                let next = unsafe { (node as *const *mut u8).read() };
+                slab.free(node as usize);
+                node = next;
+            }
+
+            let mags = unsafe { &mut *core.slab_magazines.get() };
+            let pair = &mut mags.pairs[class_idx];
+            while let Some(obj) = pair.loaded.pop() {
+                slab.free(obj as usize);
+            }
+            while let Some(obj) = pair.previous.pop() {
+                slab.free(obj as usize);
+            }
+        });
+    }
+
+    #[test_case]
+    fn magazine_alloc_hot_path_tolerates_reentrant_free() {
+        ensure_test_per_core();
+        let class_idx = size_to_class(64).expect("64-byte class");
+        drain_local_magazines_for_test(class_idx);
+
+        let before = sc_state()[class_idx].slab.lock().stats().active_objects;
+        let current_cpu = crate::smp::per_core().core_id;
+
+        let nested = magazine_alloc(class_idx).expect("nested object");
+        arm_magazine_hot_path_probe(MagazineHotPathProbe::AllocateHit, nested);
+
+        let outer = magazine_alloc(class_idx).expect("outer object");
+        magazine_free(class_idx, outer, current_cpu);
+
+        drain_local_magazines_for_test(class_idx);
+        let after = sc_state()[class_idx].slab.lock().stats().active_objects;
+        assert_eq!(
+            after, before,
+            "reentrant free during magazine_alloc hot path leaked slab objects"
+        );
+    }
+
+    #[test_case]
+    fn magazine_free_hot_path_tolerates_reentrant_free() {
+        ensure_test_per_core();
+        let class_idx = size_to_class(64).expect("64-byte class");
+        drain_local_magazines_for_test(class_idx);
+
+        let before = sc_state()[class_idx].slab.lock().stats().active_objects;
+        let current_cpu = crate::smp::per_core().core_id;
+
+        let outer = magazine_alloc(class_idx).expect("outer object");
+        let nested = magazine_alloc(class_idx).expect("nested object");
+        arm_magazine_hot_path_probe(MagazineHotPathProbe::FreePush, nested);
+
+        magazine_free(class_idx, outer, current_cpu);
+
+        drain_local_magazines_for_test(class_idx);
+        let after = sc_state()[class_idx].slab.lock().stats().active_objects;
+        assert_eq!(
+            after, before,
+            "reentrant free during magazine_free hot path leaked slab objects"
+        );
+    }
 }

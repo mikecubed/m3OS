@@ -59,6 +59,17 @@ When a CPU frees an object allocated on a different CPU's slab, it pushes to the
 
 Make the allocator safe to land incrementally. Define the minimal allocation-context contract for page-fault/IRQ-sensitive callers, add allocator-local reclaim before high-order/OOM failure, preserve stats and `/proc/meminfo` / `sys_meminfo` semantics across the cutover, and add a kill switch plus concurrency validation (including loom for new Acquire/Release queues).
 
+### Minimal allocation-context contract (Track F.1)
+
+Phase 53a adopts a deliberately small contract before full GFP-style flags exist:
+
+| Context | Contract |
+|---|---|
+| **IRQ-sensitive / page-fault-adjacent** | Local per-CPU page-cache and magazine mutations run with interrupts masked plus a same-core non-reentrancy guard. Re-entrant allocs bypass CPU-local caches/magazines and use a best-effort cold path (or fail with `None`); re-entrant slab frees route to the owner CPU's lock-free queue rather than touching magazine state twice. |
+| **Sleepable** | Callers may tolerate the contended cold path, trigger reclaim, or retry after `None`. Future reclaim that might sleep is restricted to this context. |
+
+Cold paths still use spin locks only today, so "sleepable" means "allowed to take the contended path / retry" rather than "allocator literally sleeps already."
+
 ## Important Components and How They Work
 
 ### Per-CPU page cache (`kernel/src/mm/frame_allocator.rs`)
