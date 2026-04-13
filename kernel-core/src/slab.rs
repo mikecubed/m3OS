@@ -159,6 +159,9 @@ pub struct SlabCache {
     /// Span indices that have ≥ 1 free slot (the *partial list*).
     /// Full slabs leave this list and re-enter when an object is freed.
     partial_list: Vec<usize>,
+    /// Sorted by base address: `(base, span_idx)`.  Enables O(log n)
+    /// lookup from any object address to its owning span.
+    span_lookup: Vec<(usize, usize)>,
 }
 
 impl SlabCache {
@@ -207,6 +210,7 @@ impl SlabCache {
             secret,
             spans: Vec::new(),
             partial_list: Vec::new(),
+            span_lookup: Vec::new(),
         }
     }
 
@@ -307,14 +311,18 @@ impl SlabCache {
             let base = self.spans[span_idx].base;
             let last_idx = self.spans.len() - 1;
             if span_idx != last_idx {
+                let moved_base = self.spans[last_idx].base;
                 let moved_partial_idx = self.spans[last_idx].partial_idx;
                 self.spans.swap(span_idx, last_idx);
                 if moved_partial_idx != NOT_IN_PARTIAL {
                     self.partial_list[moved_partial_idx] = span_idx;
                     self.spans[span_idx].partial_idx = moved_partial_idx;
                 }
+                // Update the moved span's index in the lookup table.
+                self.span_lookup_update_idx(moved_base, span_idx);
             }
             self.spans.pop();
+            self.span_lookup_remove(base);
             reclaim_page(base);
             reclaimed += 1;
         }
@@ -352,6 +360,7 @@ impl SlabCache {
             partial_idx: NOT_IN_PARTIAL,
         });
 
+        self.span_lookup_insert(base, span_idx);
         self.add_to_partial_list(span_idx);
         span_idx
     }
@@ -400,18 +409,25 @@ impl SlabCache {
         Some(head)
     }
 
-    /// Find which span contains `addr`.
+    /// Find which span contains `addr` — O(log n) via binary search on
+    /// the base-address-sorted `span_lookup` table.
     fn find_span_index(&self, addr: usize) -> Option<usize> {
-        for (i, span) in self.spans.iter().enumerate() {
-            if addr >= span.base && addr < span.base + self.page_size {
-                assert!(
-                    (addr - span.base).is_multiple_of(self.object_size),
-                    "SlabCache: addr not aligned to object_size",
-                );
-                return Some(i);
-            }
+        // `partition_point` returns the first index where base > addr,
+        // so the candidate (largest base ≤ addr) is at pos - 1.
+        let pos = self.span_lookup.partition_point(|&(b, _)| b <= addr);
+        if pos == 0 {
+            return None;
         }
-        None
+        let (base, span_idx) = self.span_lookup[pos - 1];
+        if addr < base + self.page_size {
+            assert!(
+                (addr - base).is_multiple_of(self.object_size),
+                "SlabCache: addr not aligned to object_size",
+            );
+            Some(span_idx)
+        } else {
+            None
+        }
     }
 
     fn slot_index_for_addr(&self, span_idx: usize, addr: usize) -> usize {
@@ -475,6 +491,35 @@ impl SlabCache {
         }
         self.partial_list.pop();
         self.spans[span_idx].partial_idx = NOT_IN_PARTIAL;
+    }
+
+    // ── Span lookup table helpers ───────────────────────────────────
+
+    /// Insert `(base, span_idx)` into the sorted lookup table.
+    fn span_lookup_insert(&mut self, base: usize, span_idx: usize) {
+        let pos = self.span_lookup.partition_point(|&(b, _)| b < base);
+        self.span_lookup.insert(pos, (base, span_idx));
+    }
+
+    /// Remove the entry for `base` from the sorted lookup table.
+    fn span_lookup_remove(&mut self, base: usize) {
+        let pos = self.span_lookup.partition_point(|&(b, _)| b < base);
+        debug_assert!(
+            pos < self.span_lookup.len() && self.span_lookup[pos].0 == base,
+            "span_lookup_remove: base not found",
+        );
+        self.span_lookup.remove(pos);
+    }
+
+    /// Update the span index stored for `base` after a swap-remove in
+    /// the `spans` vec.
+    fn span_lookup_update_idx(&mut self, base: usize, new_span_idx: usize) {
+        let pos = self.span_lookup.partition_point(|&(b, _)| b < base);
+        debug_assert!(
+            pos < self.span_lookup.len() && self.span_lookup[pos].0 == base,
+            "span_lookup_update_idx: base not found",
+        );
+        self.span_lookup[pos].1 = new_span_idx;
     }
 }
 
@@ -834,5 +879,87 @@ mod tests {
         assert_eq!(cache.reclaim_empty(|_| {}), 1);
         assert_eq!(cache.stats().total_slabs, 0);
         assert!(cache.partial_list.is_empty());
+    }
+
+    // ── Span lookup tests ───────────────────────────────────────────────
+
+    #[test]
+    fn span_lookup_finds_spans_regardless_of_insertion_order() {
+        // Use object_size == page_size so each allocation creates a new span.
+        let page_size = 4096;
+        let mut bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; page_size]).collect();
+        // Sort buffers by address so we can hand them out in reverse.
+        bufs.sort_by_key(|b| b.as_ptr() as usize);
+
+        let mut cache = SlabCache::new(page_size, page_size);
+
+        // Feed pages in descending base-address order.
+        let mut idx = bufs.len();
+        let mut alloc = || {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+            Some(bufs[idx].as_ptr() as usize)
+        };
+
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            addrs.push(cache.allocate(&mut alloc).unwrap());
+        }
+
+        // Verify every allocated address resolves to the correct span.
+        for &a in &addrs {
+            let span_idx = cache
+                .find_span_index(a)
+                .expect("address must be found in lookup");
+            assert_eq!(cache.spans[span_idx].base, a);
+        }
+
+        // Verify the lookup table itself is sorted.
+        for w in cache.span_lookup.windows(2) {
+            assert!(w[0].0 < w[1].0, "span_lookup must stay sorted by base");
+        }
+    }
+
+    #[test]
+    fn span_lookup_consistent_after_reclaim_swaps() {
+        let page_size = 4096;
+        let mut pool = PagePool::new(page_size);
+        let mut cache = SlabCache::new(page_size, page_size); // 1 object per slab
+
+        // Create 5 single-object spans.
+        let mut addrs: Vec<usize> = (0..5)
+            .map(|_| cache.allocate(&mut pool.allocator()).unwrap())
+            .collect();
+        assert_eq!(cache.spans.len(), 5);
+        assert_eq!(cache.span_lookup.len(), 5);
+
+        // Free spans 0 and 2 (non-contiguous) so reclaim will swap-remove.
+        cache.free(addrs[0]);
+        cache.free(addrs[2]);
+        let reclaimed = cache.reclaim_empty(|_| {});
+        assert_eq!(reclaimed, 2);
+        assert_eq!(cache.spans.len(), 3);
+        assert_eq!(cache.span_lookup.len(), 3);
+
+        // The surviving addresses (indices 1, 3, 4) must still resolve.
+        addrs.remove(2);
+        addrs.remove(0);
+        for &a in &addrs {
+            let span_idx = cache
+                .find_span_index(a)
+                .expect("surviving address must resolve after reclaim");
+            assert_eq!(cache.spans[span_idx].base, a);
+        }
+
+        // Allocate and free through the survivors to check full round-trip.
+        for &a in &addrs {
+            cache.free(a);
+        }
+        let reclaimed = cache.reclaim_empty(|_| {});
+        assert_eq!(reclaimed, 3);
+        assert_eq!(cache.spans.len(), 0);
+        assert!(cache.span_lookup.is_empty());
     }
 }
