@@ -42,6 +42,12 @@ const PAGE_SIZE: u64 = 4096;
 /// Maximum number of cached frames per CPU.
 pub const PER_CPU_PAGE_CACHE_CAP: usize = 64;
 
+/// Number of frames to transfer in a single batch refill or drain.
+const BATCH_SIZE: usize = 32;
+
+/// When the cache fill level exceeds this, a batch drain is triggered on free.
+const HIGH_WATERMARK: usize = 48;
+
 /// Per-CPU cache of recently freed physical frames.
 ///
 /// Each core maintains a small stack of physical page addresses so that the
@@ -60,7 +66,6 @@ pub struct PerCpuPageCache {
     count: u32,
 }
 
-#[allow(dead_code)]
 impl PerCpuPageCache {
     /// Create an empty cache.
     pub const fn new() -> Self {
@@ -78,14 +83,55 @@ impl PerCpuPageCache {
 
     /// Returns `true` if the cache contains no frames.
     #[inline]
+    #[expect(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns `true` if the cache is at capacity.
     #[inline]
+    #[expect(dead_code)]
     pub fn is_full(&self) -> bool {
         self.count as usize >= PER_CPU_PAGE_CACHE_CAP
+    }
+
+    /// Pop one frame from the cache.  Returns `None` if empty.
+    #[inline]
+    pub fn pop(&mut self) -> Option<u64> {
+        if self.count == 0 {
+            return None;
+        }
+        self.count -= 1;
+        Some(self.frames[self.count as usize])
+    }
+
+    /// Push one frame onto the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is full.
+    #[inline]
+    pub fn push(&mut self, phys: u64) {
+        debug_assert!(
+            (self.count as usize) < PER_CPU_PAGE_CACHE_CAP,
+            "PerCpuPageCache::push: cache is full"
+        );
+        self.frames[self.count as usize] = phys;
+        self.count += 1;
+    }
+
+    /// Drain up to `n` frames from the cache into a callback.
+    ///
+    /// Pops from the top of the stack and invokes `f` for each frame.
+    /// Returns the number of frames actually drained.
+    #[inline]
+    pub fn drain_to(&mut self, n: usize, mut f: impl FnMut(u64)) -> usize {
+        let to_drain = n.min(self.count as usize);
+        for _ in 0..to_drain {
+            self.count -= 1;
+            f(self.frames[self.count as usize]);
+        }
+        to_drain
     }
 }
 
@@ -363,8 +409,43 @@ pub fn init_buddy() {
 }
 
 pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
+    // Fast path: try per-CPU page cache (A.2).
+    // Mask interrupts to prevent reentrancy from ISRs that might allocate.
+    if crate::smp::is_per_core_ready() {
+        let result = x86_64::instructions::interrupts::without_interrupts(|| {
+            let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+            if let Some(phys) = cache.pop() {
+                return Some(phys);
+            }
+            // Cache empty — batch refill from the buddy under the global lock.
+            let mut alloc = FRAME_ALLOCATOR.0.lock();
+            let mut first: Option<u64> = None;
+            for _ in 0..BATCH_SIZE {
+                if let Some(frame) = alloc.allocate() {
+                    let phys = frame.start_address().as_u64();
+                    if first.is_none() {
+                        first = Some(phys);
+                    } else {
+                        cache.push(phys);
+                    }
+                } else {
+                    break;
+                }
+            }
+            first
+        });
+        if let Some(phys) = result {
+            if REFCOUNT_INIT.load(Ordering::Acquire) {
+                refcount_inc(phys);
+            }
+            let addr = PhysAddr::new(phys);
+            return Some(PhysFrame::containing_address(addr));
+        }
+        return None;
+    }
+
+    // Pre-SMP / BSP fallback — go straight to the buddy.
     let frame = FRAME_ALLOCATOR.0.lock().allocate()?;
-    // Set refcount to 1 for freshly allocated frames.
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         refcount_inc(frame.start_address().as_u64());
     }
@@ -396,8 +477,22 @@ pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
 ///
 /// Returns the base frame. Sets refcount for the base frame only.
 /// Only available after buddy allocator initialization.
+///
+/// On failure, drains per-CPU page caches (A.4) and retries once, since
+/// hoarded single-page frames may be coalesced by the buddy into the
+/// requested high-order block.
 #[allow(dead_code)]
 pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
+    if let Some(frame) = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order) {
+        if REFCOUNT_INIT.load(Ordering::Acquire) {
+            refcount_inc(frame.start_address().as_u64());
+        }
+        return Some(frame);
+    }
+
+    // Retry after draining per-CPU caches so the buddy can coalesce.
+    drain_per_cpu_caches();
+
     let frame = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order)?;
     if REFCOUNT_INIT.load(Ordering::Acquire) {
         refcount_inc(frame.start_address().as_u64());
@@ -431,6 +526,10 @@ pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
 /// Frames allocated before refcounting was enabled (refcount == 0) are freed
 /// directly without decrementing.
 ///
+/// Fast path (A.3): pushes to the per-CPU page cache with interrupts masked.
+/// If the cache exceeds the high watermark (48 of 64), batch-drains 32 frames
+/// back to the buddy allocator under the global lock.
+///
 /// Does **not** zero the frame — the zero-before-exposure invariant is
 /// enforced on the allocation side via [`allocate_frame_zeroed`].
 /// Panics on double-free (frame already on the free list).
@@ -448,6 +547,25 @@ pub fn free_frame(phys: u64) {
             }
         }
     }
+
+    // Fast path: push to per-CPU cache (A.3).
+    if crate::smp::is_per_core_ready() {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+            cache.push(phys);
+
+            // If cache exceeds the high watermark, batch-drain to the buddy.
+            if cache.len() as usize > HIGH_WATERMARK {
+                let mut alloc = FRAME_ALLOCATOR.0.lock();
+                cache.drain_to(BATCH_SIZE, |frame_phys| {
+                    alloc.free_to_pool(frame_phys);
+                });
+            }
+        });
+        return;
+    }
+
+    // Pre-SMP fallback.
     FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
 
@@ -471,14 +589,133 @@ pub fn free_contiguous(phys: u64, order: usize) {
     FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
 }
 
+// ---------------------------------------------------------------------------
+// Per-CPU cache drain (A.4)
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::AtomicU8;
+
+/// Atomic counter used by `drain_per_cpu_caches` to wait for IPI-driven
+/// remote drains to complete.  Each remote core decrements this after
+/// flushing its local cache.
+static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
+
+/// Drain per-CPU page caches across all cores and return frames to the buddy.
+///
+/// Each CPU's cache is only mutated by its owning core — remote CPUs are
+/// notified via a dedicated IPI (`IPI_CACHE_DRAIN`, vector 0xFC) and drain
+/// their own cache in the handler.  The calling core drains its own cache
+/// directly.
+///
+/// # Interrupt safety
+///
+/// The caller must not hold the `FRAME_ALLOCATOR` lock.  The local drain
+/// runs with interrupts masked.  Remote cores drain under the IPI handler
+/// which also masks interrupts implicitly.
+///
+/// # Ordering
+///
+/// 1. Set `DRAIN_PENDING` to the number of remote online cores.
+/// 2. Drain the local core's cache under `without_interrupts`.
+/// 3. Send `IPI_CACHE_DRAIN` to all other cores.
+/// 4. Spin-wait until `DRAIN_PENDING` reaches 0.
+pub fn drain_per_cpu_caches() {
+    if !crate::smp::is_per_core_ready() {
+        return;
+    }
+
+    let core_count = crate::smp::core_count();
+
+    // Drain local cache.
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+        let n = cache.len() as usize;
+        if n > 0 {
+            let mut alloc = FRAME_ALLOCATOR.0.lock();
+            cache.drain_to(n, |frame_phys| {
+                alloc.free_to_pool(frame_phys);
+            });
+        }
+    });
+
+    if core_count <= 1 {
+        return;
+    }
+
+    // Count online remote cores.
+    let my_core = crate::smp::per_core().core_id;
+    let mut remote_count: u8 = 0;
+    for cid in 0..core_count {
+        if cid == my_core {
+            continue;
+        }
+        if let Some(data) = crate::smp::get_core_data(cid)
+            && data.is_online.load(Ordering::Acquire)
+        {
+            remote_count += 1;
+        }
+    }
+
+    if remote_count == 0 {
+        return;
+    }
+
+    DRAIN_PENDING.store(remote_count, Ordering::Release);
+    crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+
+    // Spin-wait for all remote cores to complete their drain.
+    while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+
+    log::debug!(
+        "[mm] drained per-CPU page caches on {} remote core(s)",
+        remote_count
+    );
+}
+
+/// Handle a cache-drain IPI on the receiving core.
+///
+/// Called from the IDT handler for `IPI_CACHE_DRAIN`.  Drains the local
+/// per-CPU page cache into the buddy allocator, then decrements
+/// `DRAIN_PENDING` to signal completion to the initiator.
+pub fn handle_cache_drain_ipi() {
+    let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+    let n = cache.len() as usize;
+    if n > 0 {
+        let mut alloc = FRAME_ALLOCATOR.0.lock();
+        cache.drain_to(n, |frame_phys| {
+            alloc.free_to_pool(frame_phys);
+        });
+    }
+    DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
+}
+
 /// Returns the number of frames currently free.
 pub fn free_count() -> usize {
-    FRAME_ALLOCATOR.0.lock().current_free_count()
+    FRAME_ALLOCATOR.0.lock().current_free_count() + per_cpu_cached_total()
 }
 
 /// Returns the total number of usable frames discovered at boot.
 pub fn total_frames() -> usize {
     FRAME_ALLOCATOR.0.lock().total_frames
+}
+
+/// Sum of frames currently held in all per-CPU page caches.
+fn per_cpu_cached_total() -> usize {
+    if !crate::smp::is_per_core_ready() {
+        return 0;
+    }
+    let mut total: usize = 0;
+    for cid in 0..crate::smp::core_count() {
+        if let Some(data) = crate::smp::get_core_data(cid)
+            && data.is_online.load(Ordering::Acquire)
+        {
+            let cache = unsafe { &*data.page_cache.get() };
+            total += cache.len() as usize;
+        }
+    }
+    total
 }
 
 /// Frame allocator statistics snapshot.
@@ -487,22 +724,27 @@ pub struct FrameStats {
     pub free_frames: usize,
     pub allocated_frames: usize,
     pub free_by_order: [usize; kernel_core::buddy::MAX_ORDER + 1],
+    /// Frames currently held in per-CPU page caches (already counted in `free_frames`).
+    pub per_cpu_cached: usize,
 }
 
 /// Returns a snapshot of frame allocator statistics.
 pub fn frame_stats() -> FrameStats {
     let alloc = FRAME_ALLOCATOR.0.lock();
     let total = alloc.total_frames;
-    let (free, by_order) = if let Some(ref buddy) = alloc.buddy {
+    let (buddy_free, by_order) = if let Some(ref buddy) = alloc.buddy {
         (buddy.free_count(), buddy.free_count_by_order())
     } else {
         (alloc.free_count, [0; kernel_core::buddy::MAX_ORDER + 1])
     };
+    let cached = per_cpu_cached_total();
+    let free = buddy_free + cached;
     FrameStats {
         total_frames: total,
         free_frames: free,
         allocated_frames: total.saturating_sub(free),
         free_by_order: by_order,
+        per_cpu_cached: cached,
     }
 }
 

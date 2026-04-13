@@ -388,6 +388,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // SMP IPI vectors (Phase 25).
     idt[crate::smp::ipi::IPI_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
     idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
+    idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
 
     idt
 });
@@ -916,6 +917,15 @@ extern "x86-interrupt" fn reschedule_ipi_handler(mut stack_frame: InterruptStack
 /// synchronization are managed by the TLB shootdown request in `smp::tlb`.
 extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStackFrame) {
     crate::smp::tlb::handle_tlb_shootdown_ipi();
+    super::apic::lapic_eoi();
+}
+
+/// Per-CPU page-cache drain IPI handler (vector 0xFC).
+///
+/// Flushes this core's per-CPU page cache back to the buddy allocator.
+/// The handler runs on the owning core, so mutating the cache is safe.
+extern "x86-interrupt" fn cache_drain_ipi_handler(_stack_frame: InterruptStackFrame) {
+    crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();
 }
 

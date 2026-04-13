@@ -1221,15 +1221,19 @@ mod tests {
             .map(|(order, &count)| count * (1 << order))
             .sum();
         assert_eq!(
-            order_sum, stats.free_frames,
-            "buddy order sum ({}) != free_frames ({})",
-            order_sum, stats.free_frames
+            order_sum + stats.per_cpu_cached,
+            stats.free_frames,
+            "buddy order sum ({}) + per_cpu_cached ({}) != free_frames ({})",
+            order_sum,
+            stats.per_cpu_cached,
+            stats.free_frames
         );
         serial_println!(
-            "frame stats: total={} free={} allocated={}",
+            "frame stats: total={} free={} allocated={} per_cpu_cached={}",
             stats.total_frames,
             stats.free_frames,
-            stats.allocated_frames
+            stats.allocated_frames,
+            stats.per_cpu_cached
         );
     }
 
