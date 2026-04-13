@@ -1,4 +1,3 @@
-use alloc::vec;
 use alloc::vec::Vec;
 use core::mem;
 
@@ -10,6 +9,13 @@ const FREELIST_END: usize = 0;
 /// [`SpanMeta::partial_idx`] value when the span is **not** in the partial
 /// list (i.e. the slab is full).
 const NOT_IN_PARTIAL: usize = usize::MAX;
+
+/// Inline bitmap capacity for per-span allocation state.
+///
+/// 8 words covers a 4 KiB slab page with the minimum supported 8-byte object
+/// size (512 objects / 64 bits per word) and avoids recursive heap allocations
+/// when the embedding allocator itself uses `SlabCache`.
+const INLINE_BITMAP_WORDS: usize = 8;
 
 // ── D.5 — Encoded freelist pointer hardening ────────────────────────────
 
@@ -88,6 +94,46 @@ pub struct SlabStats {
     pub free_slots: usize,
 }
 
+struct AllocBitmap {
+    words: [u64; INLINE_BITMAP_WORDS],
+    word_len: usize,
+}
+
+impl AllocBitmap {
+    fn new(total_objects: usize) -> Self {
+        let word_len = total_objects.div_ceil(64);
+        assert!(
+            word_len <= INLINE_BITMAP_WORDS,
+            "SlabCache: alloc bitmap requires too many words",
+        );
+        Self {
+            words: [0; INLINE_BITMAP_WORDS],
+            word_len,
+        }
+    }
+
+    #[inline]
+    fn contains(&self, slot_index: usize) -> bool {
+        let word = slot_index / 64;
+        let bit = slot_index % 64;
+        debug_assert!(word < self.word_len);
+        self.words[word] & (1u64 << bit) != 0
+    }
+
+    #[inline]
+    fn set(&mut self, slot_index: usize, allocated: bool) {
+        let word = slot_index / 64;
+        let bit = slot_index % 64;
+        let mask = 1u64 << bit;
+        debug_assert!(word < self.word_len);
+        if allocated {
+            self.words[word] |= mask;
+        } else {
+            self.words[word] &= !mask;
+        }
+    }
+}
+
 // ── Out-of-line span metadata ───────────────────────────────────────────
 
 /// Metadata for one slab page, stored **outside** the page itself.
@@ -106,7 +152,7 @@ struct SpanMeta {
     /// Total object capacity of this slab.
     total_objects: usize,
     /// Allocation-state bitmap: bit set iff the slot is currently allocated.
-    alloc_bitmap: Vec<u64>,
+    alloc_bitmap: AllocBitmap,
     /// Owning CPU ID (reserved for future per-CPU slab affinity).
     #[allow(dead_code)]
     owning_cpu: usize,
@@ -321,7 +367,6 @@ impl SlabCache {
         let span_idx = self.spans.partition_point(|span| span.base < base);
         let total = self.objects_per_slab;
         let freelist_key = self.freelist_key;
-        let bitmap_words = total.div_ceil(64);
 
         // Thread the freelist from last slot back to first so that
         // allocations walk forward through memory (cache-friendly).
@@ -340,7 +385,7 @@ impl SlabCache {
                 freelist_head: next_addr, // == base (first slot)
                 inuse_count: 0,
                 total_objects: total,
-                alloc_bitmap: vec![0u64; bitmap_words],
+                alloc_bitmap: AllocBitmap::new(total),
                 owning_cpu: 0,
                 size_class: self.object_size,
                 partial_idx: NOT_IN_PARTIAL,
@@ -433,20 +478,11 @@ impl SlabCache {
     }
 
     fn slot_is_allocated(&self, span_idx: usize, slot_index: usize) -> bool {
-        let word = slot_index / 64;
-        let bit = slot_index % 64;
-        self.spans[span_idx].alloc_bitmap[word] & (1u64 << bit) != 0
+        self.spans[span_idx].alloc_bitmap.contains(slot_index)
     }
 
     fn set_slot_allocated(&mut self, span_idx: usize, slot_index: usize, allocated: bool) {
-        let word = slot_index / 64;
-        let bit = slot_index % 64;
-        let mask = 1u64 << bit;
-        if allocated {
-            self.spans[span_idx].alloc_bitmap[word] |= mask;
-        } else {
-            self.spans[span_idx].alloc_bitmap[word] &= !mask;
-        }
+        self.spans[span_idx].alloc_bitmap.set(slot_index, allocated);
     }
 
     fn assert_slot_is_free(&self, span_idx: usize, addr: usize, label: &str) {
@@ -939,5 +975,29 @@ mod tests {
         let reclaimed = cache.reclaim_empty(|_| {});
         assert_eq!(reclaimed, 3);
         assert_eq!(cache.spans.len(), 0);
+    }
+
+    #[test]
+    fn reclaim_empty_supports_min_object_size_bitmap() {
+        let object_size = mem::size_of::<usize>();
+        let page_size = 4096;
+        let mut pool = PagePool::new(page_size);
+        let mut cache = SlabCache::new(object_size, page_size);
+        let mut addrs = Vec::new();
+
+        for _ in 0..(page_size / object_size) {
+            addrs.push(
+                cache
+                    .allocate(&mut pool.allocator())
+                    .expect("minimal-object slab allocation"),
+            );
+        }
+
+        for addr in addrs {
+            cache.free(addr);
+        }
+
+        assert_eq!(cache.reclaim_empty(|_| {}), 1);
+        assert_eq!(cache.stats().total_slabs, 0);
     }
 }

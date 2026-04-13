@@ -805,6 +805,8 @@ pub fn size_class_slab_stats() -> [kernel_core::slab::SlabStats; NUM_SIZE_CLASSE
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+
     use super::*;
 
     fn ensure_test_per_core() {
@@ -885,5 +887,35 @@ mod tests {
             after, before,
             "reentrant free during magazine_free hot path leaked slab objects"
         );
+    }
+
+    #[test_case]
+    fn global_alloc_slab_reclaim_does_not_leak_bootstrap_heap() {
+        ensure_test_per_core();
+        let class_idx = size_to_class(64).expect("64-byte class");
+        drain_local_magazines_for_test(class_idx);
+        let _ = collect_remote_frees();
+        let _ = reclaim_empty_slabs();
+
+        drop(Box::new([0u8; 64]));
+        let _ = collect_remote_frees();
+        let _ = reclaim_empty_slabs();
+
+        let baseline = crate::mm::heap::heap_stats();
+        for cycle in 0..4 {
+            drop(Box::new([0u8; 64]));
+            let _ = collect_remote_frees();
+            let _ = reclaim_empty_slabs();
+
+            let after = crate::mm::heap::heap_stats();
+            assert_eq!(
+                after.slab_pages, baseline.slab_pages,
+                "slab reclaim left extra pages allocated on cycle {cycle}"
+            );
+            assert_eq!(
+                after.used_bytes, baseline.used_bytes,
+                "slab reclaim leaked bootstrap heap bytes on cycle {cycle}"
+            );
+        }
     }
 }
