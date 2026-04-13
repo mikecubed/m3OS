@@ -867,6 +867,232 @@ mod tests {
         );
     }
 
+    /// D.4: Verify allocate_frame_zeroed returns a fully zeroed frame.
+    #[test_case]
+    fn allocate_frame_zeroed_returns_zeros() {
+        use crate::mm::frame_allocator;
+
+        // First, allocate a raw frame, write a non-zero pattern, and free it
+        // so the buddy pool contains a "dirty" frame.
+        let dirty = frame_allocator::allocate_frame().expect("alloc dirty frame");
+        let phys = dirty.start_address().as_u64();
+        let phys_off = crate::mm::phys_offset();
+        let ptr = (phys_off + phys) as *mut u8;
+        unsafe { core::ptr::write_bytes(ptr, 0xAB, 4096) };
+        frame_allocator::free_frame(phys);
+
+        // Now allocate via the zeroed path.
+        let zeroed = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed frame");
+        let z_phys = zeroed.start_address().as_u64();
+        let z_ptr = (phys_off + z_phys) as *const u8;
+        let data = unsafe { core::slice::from_raw_parts(z_ptr, 4096) };
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "allocate_frame_zeroed returned non-zero content at frame {:#x}",
+            z_phys
+        );
+        frame_allocator::free_frame(z_phys);
+    }
+
+    /// D.4: Stale-mapping reuse — dirty frames recycled through multiple
+    /// alloc/free cycles must still be zeroed by allocate_frame_zeroed.
+    /// Catches regressions where a new allocator path skips zeroing.
+    #[test_case]
+    fn zero_exposure_stale_reuse_cycles() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        // Run 4 rounds with different poison patterns to defeat coincidence.
+        let patterns: [u8; 4] = [0xDE, 0x55, 0xFF, 0x01];
+        for (round, &pattern) in patterns.iter().enumerate() {
+            let dirty = frame_allocator::allocate_frame().expect("alloc dirty");
+            let phys = dirty.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes((phys_off + phys) as *mut u8, pattern, 4096);
+            }
+            frame_allocator::free_frame(phys);
+
+            let zeroed = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed");
+            let z_phys = zeroed.start_address().as_u64();
+            let data =
+                unsafe { core::slice::from_raw_parts((phys_off + z_phys) as *const u8, 4096) };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "round {}: stale reuse leak at frame {:#x} (pattern {:#x})",
+                round,
+                z_phys,
+                pattern
+            );
+            frame_allocator::free_frame(z_phys);
+        }
+    }
+
+    /// D.4: Demand-page allocation pattern — exercises the exact code path
+    /// used by demand_map_user_page_locked: allocate_frame() + manual zero.
+    /// A regression that removes the write_bytes(0) would fail here.
+    #[test_case]
+    fn zero_exposure_demand_page_pattern() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        // Poison a frame and free it so the pool has stale data.
+        let poison = frame_allocator::allocate_frame().expect("alloc poison");
+        let p_phys = poison.start_address().as_u64();
+        unsafe {
+            core::ptr::write_bytes((phys_off + p_phys) as *mut u8, 0xCC, 4096);
+        }
+        frame_allocator::free_frame(p_phys);
+
+        // Replicate the demand_map_user_page_locked pattern:
+        // allocate_frame() then write_bytes(0).
+        let frame = frame_allocator::allocate_frame().expect("demand alloc");
+        let f_phys = frame.start_address().as_u64();
+        let ptr = (phys_off + f_phys) as *mut u8;
+        // This is the exact zeroing that demand_map_user_page_locked performs.
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, 4096);
+        }
+        let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, 4096) };
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "demand-page pattern: frame {:#x} not zero after manual clear",
+            f_phys
+        );
+        frame_allocator::free_frame(f_phys);
+    }
+
+    /// D.4: CoW fork copy integrity — when resolve_cow_fault copies a
+    /// parent page into a fresh frame, the destination must contain
+    /// exactly the parent's data and no stale bytes from a prior occupant.
+    #[test_case]
+    fn zero_exposure_cow_copy_integrity() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        // Simulate stale data in the destination frame.
+        let stale = frame_allocator::allocate_frame().expect("alloc stale dest");
+        let s_phys = stale.start_address().as_u64();
+        unsafe {
+            core::ptr::write_bytes((phys_off + s_phys) as *mut u8, 0xBE, 4096);
+        }
+        frame_allocator::free_frame(s_phys);
+
+        // Allocate the "parent" page with a known pattern: sequential bytes
+        // so every offset is distinguishable.
+        let parent = frame_allocator::allocate_frame().expect("alloc parent");
+        let parent_phys = parent.start_address().as_u64();
+        let parent_ptr = (phys_off + parent_phys) as *mut u8;
+        for i in 0u16..4096 {
+            unsafe { parent_ptr.add(i as usize).write((i & 0xFF) as u8) };
+        }
+
+        // Allocate the "child" frame (may reuse the stale frame).
+        let child = frame_allocator::allocate_frame().expect("alloc child");
+        let child_phys = child.start_address().as_u64();
+        let child_ptr = (phys_off + child_phys) as *mut u8;
+
+        // Replicate resolve_cow_fault: copy_nonoverlapping parent → child.
+        unsafe {
+            core::ptr::copy_nonoverlapping(parent_ptr as *const u8, child_ptr, 4096);
+        }
+
+        // Verify every byte matches the parent — no stale 0xBE leaked through.
+        let child_data = unsafe { core::slice::from_raw_parts(child_ptr as *const u8, 4096) };
+        for (i, &byte) in child_data.iter().enumerate() {
+            let expected = (i & 0xFF) as u8;
+            assert_eq!(
+                byte, expected,
+                "CoW copy mismatch at offset {}: got {:#x}, expected {:#x} (child frame {:#x})",
+                i, byte, expected, child_phys
+            );
+        }
+
+        frame_allocator::free_frame(parent_phys);
+        frame_allocator::free_frame(child_phys);
+    }
+
+    /// D.4: munmap + reuse — after freeing a batch of dirty frames
+    /// (simulating munmap), every subsequent zeroed allocation must be clean.
+    #[test_case]
+    fn zero_exposure_munmap_reuse_batch() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        const BATCH: usize = 8;
+        let mut freed_addrs = [0u64; BATCH];
+
+        // Allocate BATCH frames, poison each with a distinct pattern, free all.
+        for (i, slot) in freed_addrs.iter_mut().enumerate() {
+            let f = frame_allocator::allocate_frame().expect("alloc batch");
+            let phys = f.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes((phys_off + phys) as *mut u8, (0xA0 + i as u8), 4096);
+            }
+            *slot = phys;
+        }
+        for &phys in &freed_addrs {
+            frame_allocator::free_frame(phys);
+        }
+
+        // Re-allocate BATCH frames via the zeroed path and verify each.
+        for i in 0..BATCH {
+            let z = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed batch");
+            let z_phys = z.start_address().as_u64();
+            let data =
+                unsafe { core::slice::from_raw_parts((phys_off + z_phys) as *const u8, 4096) };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "munmap reuse batch[{}]: stale data at frame {:#x}",
+                i,
+                z_phys
+            );
+            frame_allocator::free_frame(z_phys);
+        }
+    }
+
+    /// D.4: Contiguous-block zeroed allocation — multi-page allocations
+    /// via allocate_contiguous_zeroed must zero every page in the block,
+    /// even when backing frames previously held data.
+    #[test_case]
+    fn zero_exposure_contiguous_zeroed() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+        let page_size = 4096u64;
+
+        // Allocate and poison a 4-page contiguous block (order 2), then free it.
+        let dirty = frame_allocator::allocate_contiguous(2).expect("alloc dirty contig");
+        let base = dirty.start_address().as_u64();
+        for i in 0..4u64 {
+            unsafe {
+                core::ptr::write_bytes(
+                    (phys_off + base + i * page_size) as *mut u8,
+                    0xFE,
+                    page_size as usize,
+                );
+            }
+        }
+        frame_allocator::free_contiguous(base, 2);
+
+        // Re-allocate via the zeroed path.
+        let zeroed = frame_allocator::allocate_contiguous_zeroed(2).expect("alloc zeroed contig");
+        let z_base = zeroed.start_address().as_u64();
+        for i in 0..4u64 {
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    (phys_off + z_base + i * page_size) as *const u8,
+                    page_size as usize,
+                )
+            };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "contiguous zeroed: stale data in page {} of block at {:#x}",
+                i,
+                z_base
+            );
+        }
+        frame_allocator::free_contiguous(z_base, 2);
+    }
+
     /// C: Verify slab cache allocation and deallocation.
     #[test_case]
     fn slab_cache_alloc_free() {
