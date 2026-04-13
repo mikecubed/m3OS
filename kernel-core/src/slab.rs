@@ -110,6 +110,8 @@ struct SpanMeta {
     inuse_count: usize,
     /// Total object capacity of this slab.
     total_objects: usize,
+    /// Allocation-state bitmap: bit set iff the slot is currently allocated.
+    alloc_bitmap: Vec<u64>,
     /// Owning CPU ID (reserved for future per-CPU slab affinity).
     #[allow(dead_code)]
     owning_cpu: usize,
@@ -245,6 +247,12 @@ impl SlabCache {
         let span_idx = self
             .find_span_index(addr)
             .expect("SlabCache::free: address not found in any slab");
+        let slot_index = self.slot_index_for_addr(span_idx, addr);
+        assert!(
+            self.slot_is_allocated(span_idx, slot_index),
+            "SlabCache::free: double-free of address {:#x}",
+            addr,
+        );
 
         let was_full = self.spans[span_idx].is_full();
 
@@ -257,6 +265,7 @@ impl SlabCache {
             write_encoded_ptr(addr, old_head, secret);
         }
         self.spans[span_idx].freelist_head = addr;
+        self.set_slot_allocated(span_idx, slot_index, false);
         self.spans[span_idx].inuse_count -= 1;
 
         // A formerly-full slab re-enters the partial list.
@@ -291,6 +300,7 @@ impl SlabCache {
         let span_idx = self.spans.len();
         let total = self.objects_per_slab;
         let secret = self.secret;
+        let bitmap_words = total.div_ceil(64);
 
         // Thread the freelist from last slot back to first so that
         // allocations walk forward through memory (cache-friendly).
@@ -307,6 +317,7 @@ impl SlabCache {
             freelist_head: next_addr, // == base (first slot)
             inuse_count: 0,
             total_objects: total,
+            alloc_bitmap: vec![0u64; bitmap_words],
             owning_cpu: 0,
             size_class: self.object_size,
             partial_idx: NOT_IN_PARTIAL,
@@ -323,6 +334,14 @@ impl SlabCache {
             return None;
         }
 
+        validate_freelist_ptr(
+            head,
+            self.spans[span_idx].base,
+            self.page_size,
+            self.object_size,
+        );
+        self.assert_slot_is_free(span_idx, head, "freelist_head");
+
         // Read and decode the next pointer from the head object.
         let secret = self.secret;
         // Safety: head is a freelist address within a valid slab page.
@@ -335,8 +354,13 @@ impl SlabCache {
             self.page_size,
             self.object_size,
         );
+        if next != FREELIST_END {
+            self.assert_slot_is_free(span_idx, next, "freelist_next");
+        }
 
         self.spans[span_idx].freelist_head = next;
+        let slot_index = self.slot_index_for_addr(span_idx, head);
+        self.set_slot_allocated(span_idx, slot_index, true);
         self.spans[span_idx].inuse_count += 1;
 
         // If the slab just became full, remove it from the partial list.
@@ -351,7 +375,7 @@ impl SlabCache {
     fn find_span_index(&self, addr: usize) -> Option<usize> {
         for (i, span) in self.spans.iter().enumerate() {
             if addr >= span.base && addr < span.base + self.page_size {
-                debug_assert!(
+                assert!(
                     (addr - span.base).is_multiple_of(self.object_size),
                     "SlabCache: addr {:#x} not aligned to object_size {}",
                     addr,
@@ -361,6 +385,52 @@ impl SlabCache {
             }
         }
         None
+    }
+
+    fn slot_index_for_addr(&self, span_idx: usize, addr: usize) -> usize {
+        let span = &self.spans[span_idx];
+        let offset = addr - span.base;
+        assert!(
+            offset.is_multiple_of(self.object_size),
+            "SlabCache: addr {:#x} not aligned to object_size {}",
+            addr,
+            self.object_size,
+        );
+        let slot_index = offset / self.object_size;
+        assert!(
+            slot_index < span.total_objects,
+            "SlabCache: addr {:#x} lies outside object slots for object_size {}",
+            addr,
+            self.object_size,
+        );
+        slot_index
+    }
+
+    fn slot_is_allocated(&self, span_idx: usize, slot_index: usize) -> bool {
+        let word = slot_index / 64;
+        let bit = slot_index % 64;
+        self.spans[span_idx].alloc_bitmap[word] & (1u64 << bit) != 0
+    }
+
+    fn set_slot_allocated(&mut self, span_idx: usize, slot_index: usize, allocated: bool) {
+        let word = slot_index / 64;
+        let bit = slot_index % 64;
+        let mask = 1u64 << bit;
+        if allocated {
+            self.spans[span_idx].alloc_bitmap[word] |= mask;
+        } else {
+            self.spans[span_idx].alloc_bitmap[word] &= !mask;
+        }
+    }
+
+    fn assert_slot_is_free(&self, span_idx: usize, addr: usize, label: &str) {
+        let slot_index = self.slot_index_for_addr(span_idx, addr);
+        assert!(
+            !self.slot_is_allocated(span_idx, slot_index),
+            "D.5 corruption: {} {:#x} points to allocated slot",
+            label,
+            addr,
+        );
     }
 
     /// Add `span_idx` to the partial list.
@@ -627,6 +697,70 @@ mod tests {
         unsafe { (slot1 as *mut usize).write(0xBAD_BAD_BAD) };
 
         // Next allocate pops slot 1, reads the corrupted pointer → panic.
+        let _ = cache.allocate(&mut pool.allocator());
+    }
+
+    #[test]
+    #[should_panic(expected = "double-free")]
+    fn double_free_panics() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(64, 4096);
+        let addr = cache.allocate(&mut pool.allocator()).unwrap();
+
+        cache.free(addr);
+        cache.free(addr);
+    }
+
+    #[test]
+    #[should_panic(expected = "not aligned")]
+    fn misaligned_free_panics() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(64, 4096);
+        let addr = cache.allocate(&mut pool.allocator()).unwrap();
+
+        cache.free(addr + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside object slots")]
+    fn free_from_wasted_page_tail_panics() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(48, 4096);
+        let addr = cache.allocate(&mut pool.allocator()).unwrap();
+        let span_idx = cache.find_span_index(addr).unwrap();
+        let invalid_addr = cache.spans[span_idx].base + cache.spans[span_idx].total_objects * 48;
+
+        cache.free(invalid_addr);
+    }
+
+    #[test]
+    #[should_panic(expected = "D.5 corruption")]
+    fn d5_corruption_detected_on_invalid_head() {
+        let mut pool = PagePool::new(4096);
+        let secret = 0xFEED_FACE_1234_5678_u64 as usize;
+        let mut cache = SlabCache::with_secret(64, 4096, secret);
+        let addr = cache.allocate(&mut pool.allocator()).unwrap();
+
+        cache.free(addr);
+        let span_idx = cache.find_span_index(addr).unwrap();
+        cache.spans[span_idx].freelist_head = addr + 1;
+
+        let _ = cache.allocate(&mut pool.allocator());
+    }
+
+    #[test]
+    #[should_panic(expected = "allocated slot")]
+    fn d5_corruption_detected_when_head_points_to_allocated_slot() {
+        let mut pool = PagePool::new(4096);
+        let secret = 0x1357_9BDF_2468_ACED_u64 as usize;
+        let mut cache = SlabCache::with_secret(64, 4096, secret);
+        let first = cache.allocate(&mut pool.allocator()).unwrap();
+        let second = cache.allocate(&mut pool.allocator()).unwrap();
+
+        cache.free(first);
+        let span_idx = cache.find_span_index(first).unwrap();
+        cache.spans[span_idx].freelist_head = second;
+
         let _ = cache.allocate(&mut pool.allocator());
     }
 
