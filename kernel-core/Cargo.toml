@@ -4,6 +4,7 @@ version = "0.52.0"
 edition = "2024"
 
 [dependencies]
+spin = "0.9.8"
 
 [dev-dependencies]
 proptest = "1"
