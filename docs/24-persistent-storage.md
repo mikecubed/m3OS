@@ -6,26 +6,50 @@
 
 ## Overview
 
-Phase 24 gives m3OS a persistent block device: a 64 MB FAT32 data partition on a
-virtio-blk disk, mounted at `/data` during boot. Files written to `/data` survive
-reboots because they are stored on the QEMU disk image (`disk.img`) rather than in RAM.
+Phase 24 gives m3OS persistent block storage via a virtio-blk disk. The current
+storage model uses an **ext2 filesystem mounted at `/`** as the root filesystem.
+Init mounts the ext2 volume at boot (`mount /dev/blk0 / ext2`), making all paths
+— `/etc`, `/var`, `/home` — persistent across reboots (backed by the QEMU disk
+image `disk.img`).
+
+The original Phase 24 implementation used a 64 MB FAT32 partition mounted at
+`/data`. The FAT32 path routing (`/data/...` → FAT32 volume) remains as a legacy
+fallback, but all new code and service configuration targets the ext2 root.
+
+**What persists where:**
+
+| Path | Backend | Persistent? | Notes |
+|---|---|---|---|
+| `/bin`, `/sbin` | Ramdisk overlay | No | Built-in binaries; overlays ext2 |
+| `/etc/services.d/` | ext2 (root) | Yes | Service definitions |
+| `/var/log/messages` | ext2 (root) | Yes | syslogd output |
+| `/var/log/kern.log` | ext2 (root) | Yes | Kernel log archive |
+| `/var/run/` | ext2 (root) | Yes | Runtime state (PID files, status) |
+| `/tmp` | tmpfs | No | Cleared on reboot |
+| `/data/...` | FAT32 (legacy) | Yes | Legacy mount; not used by services |
+
+**Checking storage health**: `df /` shows ext2 capacity and usage. `stat <path>`
+confirms whether a file is on the ext2 volume. If init reports "/ mount failed",
+the ext2 partition may be corrupted — recreate the disk with `cargo xtask clean`
+followed by `cargo xtask run`.
 
 ## Architecture
 
 ```
 userspace                     kernel                          QEMU
 ─────────                     ──────                          ────
-open("/data/x", O_CREAT)  →  sys_linux_open()
-                              ├── fat32_relative_path()
-                              └── Fat32Volume::create_file()
+open("/etc/foo", O_CREAT) →  sys_linux_open()
+                              ├── ext2 inode lookup
+                              └── Ext2Volume::write()
                                   └── virtio_blk::write_sectors()  →  disk.img
 ```
 
 All persistent storage I/O flows through three layers:
-1. **Syscall routing** — `fat32_relative_path()` matches `/data/...` paths and
-   dispatches to the FAT32 volume driver (same pattern as `/tmp` → tmpfs)
-2. **FAT32 volume driver** (`kernel/src/fs/fat32.rs`) — BPB parsing, cluster chain
-   management, directory entry CRUD
+1. **Syscall routing** — paths are resolved against the ext2 root filesystem.
+   The ramdisk overlays `/bin` and `/sbin` (built-in binaries take precedence).
+   Legacy `/data/...` paths are routed to the FAT32 volume if mounted.
+2. **ext2 volume driver** (`kernel/src/fs/ext2.rs`) — superblock, block groups,
+   inode CRUD, directory operations, block allocation
 3. **virtio-blk driver** (`kernel/src/blk/virtio_blk.rs`) — sector-level I/O via
    legacy virtio PCI interface
 
@@ -145,28 +169,70 @@ use a buffer cache with periodic writeback and fsync barriers.
 | Register | Value |
 |---|---|
 | rax | 165 (SYS_MOUNT) |
-| rdi | source path pointer (ignored for vfat) |
+| rdi | source path pointer (e.g. `/dev/blk0`) |
 | rsi | target mount point path pointer |
-| rdx | filesystem type string pointer |
+| rdx | filesystem type string pointer (`"ext2"` or `"vfat"`) |
 
 Returns 0 on success, negative errno on failure:
-- `-EINVAL` if fstype is not "vfat"
-- `-ENODEV` if no FAT32 partition found on virtio-blk
-- `-EIO` if FAT32 mount fails
+- `-EINVAL` if fstype is not `"ext2"` or `"vfat"`
+- `-ENODEV` if no matching partition found on virtio-blk
+- `-EIO` if mount fails
 
 ### Supported Filesystem Types
 
-Only `"vfat"` (FAT32) is currently supported. The syscall probes the MBR partition
-table on the virtio-blk device, finds the first FAT32 partition (type 0x0B or 0x0C),
-and mounts it as a `Fat32Volume`.
+- **`"ext2"`** — probes the MBR partition table for a Linux partition (type 0x83)
+  and mounts it via the ext2 volume driver. Init uses this at boot:
+  `mount("/dev/blk0", "/", "ext2")`.
+- **`"vfat"`** (legacy) — probes for a FAT32 partition (type 0x0B or 0x0C) and
+  mounts it as a `Fat32Volume` at `/data`.
 
 ### VFS Path Routing
 
-Instead of a traditional mount table, path routing is implemented directly in the
-syscall layer using prefix matching:
-- `/tmp/...` → tmpfs (existing)
-- `/data/...` → FAT32 volume (Phase 24)
-- Everything else → ramdisk
+Path routing combines the ext2 root with ramdisk overlays and legacy FAT32:
+- `/bin/...`, `/sbin/...` → ramdisk first (built-in binaries overlay ext2)
+- `/tmp/...` → tmpfs
+- `/data/...` → FAT32 volume (legacy, if mounted)
+- Everything else → ext2 root filesystem
 
-The `Fat32Disk` fd backend stores the relative path, start cluster, file size, and
-parent directory cluster for each open file, enabling read/write/seek operations.
+The ext2 root is the primary persistent store. The ramdisk overlay ensures that
+built-in kernel binaries (linked into the kernel image) are always available even
+if the ext2 disk is missing or corrupt.
+
+## Headless Operator Workflow
+
+The supported headless/reference path verifies storage from the running system
+rather than from host-side image tooling:
+
+```bash
+mount
+df /
+df -h /
+echo "storage-ok" > /root/storage-test
+cat /root/storage-test
+rm /root/storage-test
+stat /var/log/messages
+```
+
+These checks answer the three operator questions that matter for Phase 53:
+
+| Question | Command | Expected result |
+|---|---|---|
+| Is the writable filesystem mounted? | `mount`, `df /` | ext2 mounted at `/` |
+| Can I write persistent data? | `echo ... > /root/storage-test` | create/read/remove succeeds |
+| Are service-backed files really on persistent storage? | `stat /var/log/messages` | file exists on the ext2 root |
+
+Interpret the results against the current image model:
+- `/` is the persistent ext2 root backed by `disk.img`
+- `/tmp` is tmpfs and is cleared on reboot
+- `/bin` and `/sbin` are ramdisk overlays, so built-in binaries stay available
+  even if the ext2 image is damaged
+
+When storage-backed workflows fail, inspect the same evidence trail the services
+use:
+- `mount` and `df` to confirm the ext2 root is present and has space
+- serial output from init/syslogd for mount or `/var/log` creation failures
+- `/var/log/messages` and `/var/log/kern.log` if syslogd was able to start
+
+If the ext2 image is corrupted or the writable path is no longer trustworthy,
+recreate it with `cargo xtask run --fresh` (or `cargo xtask clean` followed by a
+normal run).

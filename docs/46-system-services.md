@@ -70,10 +70,48 @@ Each transition is driven by a process event (SIGCHLD, fork success) or operator
 command (service start/stop). The `Stopped` variant carries the exit code so the
 restart policy can distinguish clean exits from crashes.
 
+**Wire-format state strings**: Init writes service status to
+`/var/run/services.status` as one line per service. The `service` command reads
+this file. The wire strings that appear in `service list` output are:
+
+| Wire string | Meaning |
+|---|---|
+| `never-started` | Service is defined but has not been started yet |
+| `starting` | `fork()` succeeded; process is initializing |
+| `running` | Process is alive and serving |
+| `stopping` | SIGTERM sent; waiting for exit |
+| `stopped:<code>` | Process exited with the given code (e.g. `stopped:0`) |
+| `stopped:-<code>` | Process killed by signal (e.g. `stopped:-9` for SIGKILL) |
+| `permanently-stopped` | Exceeded `max_restart` or has an unresolvable dependency |
+
+`service list` shows the raw wire string in the STATUS column.
+`service status <name>` splits it into separate `State:` and `Last exit:` fields
+for readability.
+
 **Restart cap** (`max_restart`, inspired by rustysd's `max_deaths`, MIT): A
 crashing service is restarted up to `max_restart` times (default 10). After that,
 it transitions to `PermanentlyStopped` and is no longer restarted. This prevents
 a broken binary from consuming all system resources in a crash loop.
+
+**Normal operator path**:
+
+```bash
+service list            # enumerate managed services
+service status sshd     # inspect one service in detail
+service restart crond   # bounce a daemon after fixing config
+service disable telnetd # create a .disabled marker for next boot
+service enable telnetd  # remove the marker so it can start again
+```
+
+`service list` now includes disabled services as `disabled` entries so operators
+can distinguish "configured but suppressed" from "not installed". `service status
+<name>` shows the same state vocabulary and, for `disabled` or
+`permanently-stopped`, prints the next recovery step inline.
+
+Only `service list` and `service status` are read-only. `start`, `stop`,
+`restart`, `enable`, and `disable` require UID 0 and fail with
+`service: <action> requires root privileges` when attempted as an unprivileged
+user.
 
 **Reverse-dependency shutdown**: Rather than pre-computing a reverse topological
 sort, shutdown iteratively finds a running service whose `required_by` dependents
@@ -92,11 +130,51 @@ prefixed with `<priority>` (RFC 3164 format). syslogd:
 4. Formats: `YYYY-MM-DD HH:MM:SS hostname tag: message`
 5. Appends to `/var/log/messages`
 
-Kernel messages are separately drained and written to `/var/log/kern.log`.
+Kernel messages are separately drained from `/proc/kmsg` (or `/dev/kmsg`) and
+written to `/var/log/kern.log`.
 
 The `logger` command provides a shell interface to syslog: it opens a SOCK_DGRAM
 socket, formats a message with the given tag and priority, and sends it to
 `/dev/log`.
+
+### Logging Evidence Trail
+
+An operator has three complementary views of system activity:
+
+| What to check | Command or path | Source | Survives reboot? |
+|---|---|---|---|
+| Kernel ring buffer | `dmesg` (reads `/proc/kmsg`) | Kernel log buffer (in-memory) | No |
+| Userspace service logs | `cat /var/log/messages` | syslogd via `/dev/log` socket | Yes (ext2 root) |
+| Kernel log archive | `cat /var/log/kern.log` | syslogd drains `/proc/kmsg` | Yes (ext2 root) |
+
+Both `/var/log/messages` and `/var/log/kern.log` live on the ext2 root filesystem
+mounted at `/`. Because ext2 is persistent (backed by `disk.img`), these logs
+survive reboots. syslogd creates `/var` and `/var/log` on startup if they do not
+exist.
+
+**When syslogd is not running**: The `/dev/log` socket does not exist. Any
+`logger` invocation will fail with "failed to send to /dev/log (is syslogd
+running?)". Kernel messages are still available via `dmesg` since the kernel ring
+buffer is independent of syslogd. Service stdout/stderr from init is visible on
+the console.
+
+The quickest operator recovery path is:
+
+```bash
+service status syslogd
+service restart syslogd
+logger -t smoke "log pipeline check"
+grep "log pipeline check" /var/log/messages
+```
+
+**syslogd startup diagnostics** (printed to stdout):
+- `syslogd: starting` — daemon is initializing
+- `syslogd: warning: cannot create /var` or `/var/log` — directory creation failed
+  (log files will also fail to open)
+- `syslogd: failed to bind /dev/log` — socket bind failed; daemon exits
+- `syslogd: cannot open /var/log/messages` or `/var/log/kern.log` — file open
+  failed (likely a filesystem issue); daemon exits
+- `syslogd: ready` — socket bound, log files open, entering main loop
 
 ### Cron Scheduling (crond)
 
@@ -129,6 +207,24 @@ The `sys_reboot()` syscall (number 169, matching Linux) accepts a command:
 Only UID 0 can invoke it. The `shutdown` and `reboot` commands signal init
 (SIGTERM) to stop all services, wait briefly, then call `sys_reboot()`.
 
+**Normal operator path**:
+
+```bash
+shutdown    # orderly halt
+reboot      # orderly restart
+```
+
+Both commands require UID 0. Today they signal init, wait 3 seconds in
+userspace, then invoke `sys_reboot()`. During that window init stops services in
+reverse dependency order and gives each service its configured `stop_timeout`
+(default 5 seconds) before escalating to SIGKILL.
+
+If shutdown is partial or slow, the evidence trail remains operator-visible:
+- serial output from init shows `init: stopping ...` / `init: force-killing ...`
+- `/var/run/services.status` records the last known service states
+- `/var/log/messages` and `/var/log/kern.log` preserve the surviving syslog trail
+  on the ext2 root filesystem
+
 ## Key Files
 
 | File | Purpose |
@@ -137,7 +233,8 @@ Only UID 0 can invoke it. The `shutdown` and `reboot` commands signal init
 | `userspace/syslogd/src/main.rs` | System logging daemon: /dev/log socket, log formatting, file output |
 | `userspace/crond/src/main.rs` | Cron daemon: crontab parser, scheduler, job executor |
 | `userspace/coreutils-rs/src/service.rs` | `service` command: list, status, start, stop, restart |
-| `userspace/coreutils-rs/src/logger.rs` | `logger` command: send messages to syslog |
+| `userspace/coreutils-rs/src/logger.rs` | `logger` command: send messages to syslog via `/dev/log` |
+| `userspace/coreutils-rs/src/dmesg.rs` | `dmesg` command: print kernel ring buffer from `/proc/kmsg` |
 | `userspace/coreutils-rs/src/shutdown.rs` | `shutdown` command: halt the system |
 | `userspace/coreutils-rs/src/reboot_cmd.rs` | `reboot` command: restart the system |
 | `userspace/coreutils-rs/src/hostname.rs` | `hostname` command: get/set hostname |

@@ -1459,7 +1459,42 @@ impl ServiceManager {
             i += 1;
         }
 
+        self.write_disabled_entries(fd as i32);
         close(fd as i32);
+    }
+
+    /// Append disabled services so they remain visible to `service list`.
+    fn write_disabled_entries(&self, fd: i32) {
+        for path in KNOWN_CONFIGS {
+            let prefix = b"/etc/services.d/";
+            let suffix = b".conf\0";
+            if path.len() <= prefix.len() + suffix.len() {
+                continue;
+            }
+            let name = &path[prefix.len()..path.len() - suffix.len()];
+
+            let mut already_loaded = false;
+            let mut i = 0;
+            while i < self.count {
+                if self.services[i].active && self.services[i].name.eq_bytes(name) {
+                    already_loaded = true;
+                    break;
+                }
+                i += 1;
+            }
+            if already_loaded || !Self::is_disabled(name) {
+                continue;
+            }
+
+            let cfg_fd = open(path, O_RDONLY, 0);
+            if cfg_fd < 0 {
+                continue;
+            }
+            close(cfg_fd as i32);
+
+            write(fd, name);
+            write_str(fd, " disabled pid=0 restarts=0 changed=0\n");
+        }
     }
 
     /// Create the control command file with root-only permissions (mode 0600).
