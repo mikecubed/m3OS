@@ -230,6 +230,11 @@ pub struct PerCoreData {
     /// without requiring the ISR to acquire any mutex.
     pub isr_wake_queue: IsrWakeQueue,
 
+    // ----- Phase 53a: per-CPU page cache (A.1) -----
+    /// Per-CPU cache of physical frames for lock-free fast-path allocation/free.
+    /// Only accessed by the owning core (with interrupts masked).
+    pub page_cache: core::cell::UnsafeCell<crate::mm::frame_allocator::PerCpuPageCache>,
+
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
@@ -524,6 +529,7 @@ pub fn init_bsp_per_core() {
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
+        page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
@@ -635,6 +641,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         current_addrspace: core::ptr::null(),
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
+        page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
