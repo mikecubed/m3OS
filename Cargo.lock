@@ -838,6 +838,7 @@ version = "0.52.0"
 dependencies = [
  "loom",
  "proptest",
+ "spin",
 ]
 
 [[package]]
