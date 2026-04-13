@@ -691,9 +691,21 @@ pub fn handle_cache_drain_ipi() {
     DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
 }
 
-/// Returns the number of frames currently free.
-pub fn free_count() -> usize {
+/// Returns the number of frames available for allocation, including reclaimable
+/// per-CPU cached pages.
+///
+/// This matches the Linux-like `MemAvailable` view. For buddy-managed frames
+/// immediately allocatable without draining per-CPU caches, use
+/// `frame_stats().free_frames`.
+pub fn available_count() -> usize {
     FRAME_ALLOCATOR.0.lock().current_free_count() + per_cpu_cached_total()
+}
+
+/// Compatibility accessor for older callers that interpreted "free" as
+/// reclaimable/available rather than buddy-only `MemFree`.
+#[allow(dead_code)]
+pub fn free_count() -> usize {
+    available_count()
 }
 
 /// Returns the total number of usable frames discovered at boot.

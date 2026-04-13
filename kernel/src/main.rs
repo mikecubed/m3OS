@@ -844,7 +844,7 @@ mod tests {
         // as a frame leak.
         let mut frames = alloc::vec::Vec::with_capacity(16);
 
-        let before = frame_allocator::free_count();
+        let before = frame_allocator::available_count();
 
         // Allocate 16 frames.
         for _ in 0..16 {
@@ -852,7 +852,7 @@ mod tests {
             frames.push(frame.start_address().as_u64());
         }
 
-        let during = frame_allocator::free_count();
+        let during = frame_allocator::available_count();
         assert!(
             during <= before - 16,
             "free count should have dropped by at least 16: before={} during={}",
@@ -865,7 +865,7 @@ mod tests {
             frame_allocator::free_frame(phys);
         }
 
-        let after = frame_allocator::free_count();
+        let after = frame_allocator::available_count();
         assert_eq!(
             after, before,
             "frame leak: before={} after={}",
@@ -878,7 +878,7 @@ mod tests {
     fn contiguous_alloc_works() {
         use crate::mm::frame_allocator;
 
-        let before = frame_allocator::free_count();
+        let before = frame_allocator::available_count();
 
         // Allocate 4 contiguous pages (order 2).
         let frame = frame_allocator::allocate_contiguous(2).expect("contiguous alloc failed");
@@ -893,7 +893,7 @@ mod tests {
 
         // Free and verify no leak.
         frame_allocator::free_contiguous(base, 2);
-        let after = frame_allocator::free_count();
+        let after = frame_allocator::available_count();
         assert_eq!(
             after, before,
             "contiguous frame leak: before={} after={}",

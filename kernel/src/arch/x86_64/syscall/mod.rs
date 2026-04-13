@@ -488,7 +488,7 @@ fn make_statfs(
 }
 
 fn tmpfs_statfs() -> Statfs {
-    let free_blocks = crate::mm::frame_allocator::free_count() as u64;
+    let free_blocks = crate::mm::frame_allocator::available_count() as u64;
     make_statfs(
         TMPFS_MAGIC,
         TMPFS_TOTAL_BLOCKS,
