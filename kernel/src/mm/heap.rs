@@ -279,9 +279,10 @@ unsafe impl Sync for SizeClassAllocator {}
 /// Returns true if `layout` can be satisfied by the slab path.
 ///
 /// Criteria: size fits a size class AND the requested alignment is at most
-/// the size-class bucket size (slab objects are naturally aligned to their
-/// bucket size, which is always a power-of-two-aligned for power-of-two
-/// classes and at least 32-byte aligned for all classes).
+/// the largest power-of-two factor of the class size (`class_size &
+/// -class_size`).  Power-of-two classes (32, 64, …, 4096) are aligned to
+/// their own size; non-power-of-two classes have a smaller guarantee
+/// (e.g. 48 → 16, 96 → 32).
 #[inline]
 fn is_slab_eligible(layout: &Layout) -> bool {
     let size = layout.size();
@@ -289,17 +290,12 @@ fn is_slab_eligible(layout: &Layout) -> bool {
     if size == 0 || size > SIZE_CLASSES[NUM_SIZE_CLASSES - 1] {
         return false;
     }
-    // Every size class ≥ 32 and the class size is always ≥ size, so the
-    // minimum natural alignment from the slab is 32.  For classes that are
-    // exact powers of two (32, 64, 128, 256, 512, 1024, 2048, 4096) the
-    // alignment guarantee equals the class size.  For non-power-of-two
-    // classes (48, 96, 192, 384, 768) the alignment guarantee is the
-    // largest power of two that divides the class size (e.g. 48 → 16,
-    // 96 → 32, 192 → 64, 384 → 128, 768 → 256).
-    //
-    // Conservative: we guarantee alignment up to the largest power-of-two
-    // factor of the class size.  For the common case (align ≤ 16 or align
-    // = size) this is always satisfied.
+    // Alignment guarantee per class = class_size & -class_size (largest
+    // power-of-two divisor).  Power-of-two classes (32, 64, …, 4096)
+    // are self-aligned; non-power-of-two classes guarantee less
+    // (e.g. 48 → 16, 96 → 32, 192 → 64, 384 → 128, 768 → 256).
+    // For the common case (align ≤ 16 or align = size) this is always
+    // satisfied.
     if let Some(idx) = size_to_class(size) {
         let class_size = SIZE_CLASSES[idx];
         // Alignment guarantee: largest power-of-two divisor of class_size.
