@@ -146,7 +146,11 @@ mod tests {
     /// Allocate a 64-byte aligned block as a fake slab object.
     fn fake_obj() -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(64, 8).unwrap();
-        unsafe { std::alloc::alloc(layout) }
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        ptr
     }
 
     unsafe fn free_obj(ptr: *mut u8) {
