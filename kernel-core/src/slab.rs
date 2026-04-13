@@ -1,5 +1,90 @@
-use alloc::vec;
 use alloc::vec::Vec;
+use core::mem;
+
+// ── Constants ───────────────────────────────────────────────────────────
+
+/// Sentinel value marking the end of a slab freelist chain.
+const FREELIST_END: usize = 0;
+
+/// [`SpanMeta::partial_idx`] value when the span is **not** in the partial
+/// list (i.e. the slab is full).
+const NOT_IN_PARTIAL: usize = usize::MAX;
+
+// ── D.5 — Encoded freelist pointer hardening ────────────────────────────
+
+/// Encode a raw freelist next-pointer for in-object storage.
+///
+/// The encoding XORs `raw_next` with both a per-cache `secret` and the
+/// `slot_addr` where the result will be written.  This makes each stored
+/// value position-dependent and secret-dependent:
+///
+/// - Overwriting the stored word with arbitrary bytes is detected on
+///   decode (the decoded result won't be a valid in-slab pointer).
+/// - Swapping two encoded words between slots decodes to garbage.
+/// - The secret prevents cross-cache pointer forgery.
+#[inline]
+fn encode_next(raw_next: usize, secret: usize, slot_addr: usize) -> usize {
+    raw_next ^ secret ^ slot_addr
+}
+
+/// Decode an encoded freelist pointer back to the raw next-address.
+#[inline]
+fn decode_next(encoded: usize, secret: usize, slot_addr: usize) -> usize {
+    encoded ^ secret ^ slot_addr
+}
+
+/// Write an encoded freelist next-pointer into a free object.
+///
+/// # Safety
+///
+/// `slot_addr` must be a valid, writable, `usize`-aligned address with at
+/// least `size_of::<usize>()` bytes available.
+#[inline]
+unsafe fn write_encoded_ptr(slot_addr: usize, raw_next: usize, secret: usize) {
+    let encoded = encode_next(raw_next, secret, slot_addr);
+    unsafe { (slot_addr as *mut usize).write(encoded) };
+}
+
+/// Read and decode the freelist next-pointer from a free object.
+///
+/// # Safety
+///
+/// `slot_addr` must be a valid, readable, `usize`-aligned address with at
+/// least `size_of::<usize>()` bytes, holding a previously-encoded pointer.
+#[inline]
+unsafe fn read_decoded_ptr(slot_addr: usize, secret: usize) -> usize {
+    let encoded = unsafe { (slot_addr as *const usize).read() };
+    decode_next(encoded, secret, slot_addr)
+}
+
+/// Validate that a decoded freelist pointer is either [`FREELIST_END`] or
+/// an aligned address inside the owning slab page.
+///
+/// # Panics
+///
+/// Panics with a `D.5 corruption` message if validation fails — this
+/// indicates detectable heap corruption.
+fn validate_freelist_ptr(decoded: usize, slab_base: usize, page_size: usize, object_size: usize) {
+    if decoded == FREELIST_END {
+        return;
+    }
+    assert!(
+        decoded >= slab_base && decoded < slab_base + page_size,
+        "D.5 corruption: decoded freelist ptr {:#x} outside slab [{:#x}..{:#x})",
+        decoded,
+        slab_base,
+        slab_base + page_size,
+    );
+    assert!(
+        (decoded - slab_base).is_multiple_of(object_size),
+        "D.5 corruption: decoded freelist ptr {:#x} misaligned (base={:#x}, obj_size={})",
+        decoded,
+        slab_base,
+        object_size,
+    );
+}
+
+// ── Public types ────────────────────────────────────────────────────────
 
 /// Statistics for a slab cache.
 pub struct SlabStats {
@@ -8,116 +93,123 @@ pub struct SlabStats {
     pub free_slots: usize,
 }
 
-/// A single slab: one page divided into fixed-size slots.
-struct Slab {
-    /// Base address of this slab's page.
+// ── Out-of-line span metadata ───────────────────────────────────────────
+
+/// Metadata for one slab page, stored **outside** the page itself.
+///
+/// Keeping metadata out-of-line means the entire page is available for
+/// client objects — critical for the 4 096-byte size class on 4 096-byte
+/// pages.
+struct SpanMeta {
+    /// Base address of this slab's backing page.
     base: usize,
-    /// Bitmap of free slots (1 = free, 0 = allocated).
-    free_bitmap: Vec<u64>,
-    /// Number of free slots.
-    free_count: usize,
-    /// Total number of slots in this slab.
-    total_slots: usize,
+    /// Raw address of the first free object, or [`FREELIST_END`] if the
+    /// slab is completely full.
+    freelist_head: usize,
+    /// Number of currently allocated (in-use) objects.
+    inuse_count: usize,
+    /// Total object capacity of this slab.
+    total_objects: usize,
+    /// Owning CPU ID (reserved for future per-CPU slab affinity).
+    #[allow(dead_code)]
+    owning_cpu: usize,
+    /// Size class (== `object_size`) this span belongs to.
+    #[allow(dead_code)]
+    size_class: usize,
+    /// Position in the parent cache's [`SlabCache::partial_list`], or
+    /// [`NOT_IN_PARTIAL`] when this slab is full and not in the list.
+    partial_idx: usize,
 }
 
-impl Slab {
-    /// Create a new slab at the given base address.
-    fn new(base: usize, total_slots: usize) -> Self {
-        let bitmap_words = total_slots.div_ceil(64);
-        let mut free_bitmap = vec![!0u64; bitmap_words];
-
-        // Clear unused bits in the last word.
-        let remainder = total_slots % 64;
-        if remainder != 0 {
-            free_bitmap[bitmap_words - 1] = (1u64 << remainder) - 1;
-        }
-
-        Slab {
-            base,
-            free_bitmap,
-            free_count: total_slots,
-            total_slots,
-        }
+impl SpanMeta {
+    fn is_full(&self) -> bool {
+        self.inuse_count == self.total_objects
     }
 
-    /// Allocate a slot, returning its index. Returns None if full.
-    fn allocate(&mut self) -> Option<usize> {
-        if self.free_count == 0 {
-            return None;
-        }
-        for (word_idx, word) in self.free_bitmap.iter_mut().enumerate() {
-            if *word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                *word &= !(1u64 << bit);
-                self.free_count -= 1;
-                return Some(word_idx * 64 + bit);
-            }
-        }
-        None
+    fn is_empty(&self) -> bool {
+        self.inuse_count == 0
     }
 
-    /// Free a slot by index. Returns true if the slab is now completely empty.
-    fn free(&mut self, slot_index: usize) -> bool {
-        if slot_index >= self.total_slots {
-            debug_assert!(
-                false,
-                "Slab::free: slot_index {} out of bounds (total_slots = {})",
-                slot_index, self.total_slots,
-            );
-            return false;
-        }
-        let word_idx = slot_index / 64;
-        let bit = slot_index % 64;
-        let mask = 1u64 << bit;
-
-        // Double-free guard: bit already set means the slot is free.
-        if (self.free_bitmap[word_idx] & mask) != 0 {
-            debug_assert!(
-                false,
-                "Slab::free: double-free of slot_index {}",
-                slot_index,
-            );
-            return self.free_count == self.total_slots;
-        }
-
-        self.free_bitmap[word_idx] |= mask;
-        self.free_count += 1;
-        self.free_count == self.total_slots
-    }
-
-    /// Returns true if this slab has free slots.
-    fn has_free(&self) -> bool {
-        self.free_count > 0
+    fn in_partial_list(&self) -> bool {
+        self.partial_idx != NOT_IN_PARTIAL
     }
 }
 
-/// A slab cache manages objects of a single fixed size.
+// ── SlabCache ───────────────────────────────────────────────────────────
+
+/// A slab cache with embedded-freelist allocation and D.5 pointer
+/// hardening.
+///
+/// Free objects contain an XOR-encoded next-pointer at their start.  The
+/// encoding mixes the raw pointer with a per-cache secret and the
+/// object's own address — corruption or cross-slot forgery is detected
+/// on every allocation.
+///
+/// Slab metadata is stored out-of-line in [`SpanMeta`] structures so the
+/// full backing page is available for client objects (including
+/// `object_size == page_size`).
 pub struct SlabCache {
-    /// Size of each object in bytes.
+    /// Size of each object in bytes (≥ `size_of::<usize>()`).
     object_size: usize,
-    /// Page size used for slab allocation.
+    /// Size of each backing slab page (typically 4096).
     page_size: usize,
-    /// Number of slots per slab.
-    slots_per_slab: usize,
-    /// All slabs managed by this cache.
-    slabs: Vec<Slab>,
+    /// Objects that fit in a single slab page.
+    objects_per_slab: usize,
+    /// Per-cache XOR secret for D.5 freelist pointer hardening.
+    secret: usize,
+    /// Out-of-line span metadata, indexed by span ID.
+    spans: Vec<SpanMeta>,
+    /// Span indices that have ≥ 1 free slot (the *partial list*).
+    /// Full slabs leave this list and re-enter when an object is freed.
+    partial_list: Vec<usize>,
 }
 
 impl SlabCache {
     /// Create a new slab cache for objects of `object_size` bytes.
     ///
     /// `page_size` is the size of each backing page (typically 4096).
+    ///
+    /// A deterministic hardening secret is derived from the size
+    /// parameters.  For production use, prefer
+    /// [`with_secret`](Self::with_secret) with a random secret.
     pub fn new(object_size: usize, page_size: usize) -> Self {
+        let secret = object_size
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(page_size.wrapping_mul(0x6c62_272e_07bb_0142));
+        Self::with_secret(object_size, page_size, secret)
+    }
+
+    /// Create a new slab cache with an explicit D.5 hardening secret.
+    pub fn with_secret(object_size: usize, page_size: usize, secret: usize) -> Self {
         assert!(object_size > 0, "object_size must be > 0");
         assert!(page_size > 0, "page_size must be > 0");
-        let slots_per_slab = page_size / object_size;
-        assert!(slots_per_slab > 0, "object_size must be <= page_size");
+        assert!(
+            object_size >= mem::size_of::<usize>(),
+            "object_size ({}) must be >= {} for embedded freelist pointers",
+            object_size,
+            mem::size_of::<usize>(),
+        );
+        assert!(
+            object_size.is_multiple_of(mem::align_of::<usize>()),
+            "object_size ({}) must be a multiple of {} for pointer alignment",
+            object_size,
+            mem::align_of::<usize>(),
+        );
+        let objects_per_slab = page_size / object_size;
+        assert!(
+            objects_per_slab > 0,
+            "object_size ({}) must be <= page_size ({})",
+            object_size,
+            page_size,
+        );
 
         SlabCache {
             object_size,
             page_size,
-            slots_per_slab,
-            slabs: Vec::new(),
+            objects_per_slab,
+            secret,
+            spans: Vec::new(),
+            partial_list: Vec::new(),
         }
     }
 
@@ -126,83 +218,217 @@ impl SlabCache {
     /// `page_alloc` is called to obtain a new page when all existing slabs are
     /// full. It should return the base address of a fresh page, or `None` if
     /// out of memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a D.5 freelist validation check fails (heap corruption).
     pub fn allocate(&mut self, page_alloc: &mut dyn FnMut() -> Option<usize>) -> Option<usize> {
-        // Search partial slabs first (have free slots but are not empty).
-        for slab in &mut self.slabs {
-            if slab.has_free() {
-                let slot = slab.allocate()?;
-                return Some(slab.base + slot * self.object_size);
-            }
+        if let Some(&span_idx) = self.partial_list.last() {
+            return self.allocate_from_span(span_idx);
         }
 
-        // All slabs are full: allocate a new page.
+        // All slabs are full (or none exist): request a new page.
         let base = page_alloc()?;
-        let mut slab = Slab::new(base, self.slots_per_slab);
-        let slot = slab.allocate()?;
-        let addr = slab.base + slot * self.object_size;
-        self.slabs.push(slab);
-        Some(addr)
+        let span_idx = self.create_span(base);
+        self.allocate_from_span(span_idx)
     }
 
     /// Free an object at the given address.
     ///
     /// Returns `true` if the containing slab became completely empty (the page
     /// could be returned to the system).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `addr` does not belong to any slab in this cache.
     pub fn free(&mut self, addr: usize) -> bool {
-        for slab in &mut self.slabs {
-            if addr >= slab.base && addr < slab.base + self.page_size {
-                let offset = addr - slab.base;
-                debug_assert!(
-                    offset.is_multiple_of(self.object_size),
-                    "SlabCache::free: addr {:#x} not aligned to object_size {}",
-                    addr,
-                    self.object_size,
-                );
-                let slot_index = offset / self.object_size;
-                return slab.free(slot_index);
-            }
+        let span_idx = self
+            .find_span_index(addr)
+            .expect("SlabCache::free: address not found in any slab");
+
+        let was_full = self.spans[span_idx].is_full();
+
+        // Prepend the freed object to this slab's freelist — O(1).
+        let old_head = self.spans[span_idx].freelist_head;
+        let secret = self.secret;
+        // Safety: `addr` is within a valid slab page and object_size ≥
+        // size_of::<usize>() is enforced by the constructor.
+        unsafe {
+            write_encoded_ptr(addr, old_head, secret);
         }
-        // Address not found in any slab.
-        false
+        self.spans[span_idx].freelist_head = addr;
+        self.spans[span_idx].inuse_count -= 1;
+
+        // A formerly-full slab re-enters the partial list.
+        if was_full {
+            self.add_to_partial_list(span_idx);
+        }
+
+        self.spans[span_idx].is_empty()
     }
 
     /// Return statistics about this cache.
     pub fn stats(&self) -> SlabStats {
-        let total_slabs = self.slabs.len();
-        let mut free_slots = 0usize;
-        let mut total_slots = 0usize;
-        for slab in &self.slabs {
-            free_slots += slab.free_count;
-            total_slots += slab.total_slots;
+        let total_slabs = self.spans.len();
+        let mut active = 0usize;
+        let mut free = 0usize;
+        for span in &self.spans {
+            active += span.inuse_count;
+            free += span.total_objects - span.inuse_count;
         }
         SlabStats {
             total_slabs,
-            active_objects: total_slots - free_slots,
-            free_slots,
+            active_objects: active,
+            free_slots: free,
         }
     }
+
+    // ── Internal helpers ────────────────────────────────────────────────
+
+    /// Create a span for a freshly-allocated page, initialise its embedded
+    /// freelist, and add it to the partial list.
+    fn create_span(&mut self, base: usize) -> usize {
+        let span_idx = self.spans.len();
+        let total = self.objects_per_slab;
+        let secret = self.secret;
+
+        // Thread the freelist from last slot back to first so that
+        // allocations walk forward through memory (cache-friendly).
+        let mut next_addr = FREELIST_END;
+        for i in (0..total).rev() {
+            let slot_addr = base + i * self.object_size;
+            // Safety: slot_addr is within the freshly-allocated page.
+            unsafe { write_encoded_ptr(slot_addr, next_addr, secret) };
+            next_addr = slot_addr;
+        }
+
+        self.spans.push(SpanMeta {
+            base,
+            freelist_head: next_addr, // == base (first slot)
+            inuse_count: 0,
+            total_objects: total,
+            owning_cpu: 0,
+            size_class: self.object_size,
+            partial_idx: NOT_IN_PARTIAL,
+        });
+
+        self.add_to_partial_list(span_idx);
+        span_idx
+    }
+
+    /// Pop one object from a partial span's freelist — O(1).
+    fn allocate_from_span(&mut self, span_idx: usize) -> Option<usize> {
+        let head = self.spans[span_idx].freelist_head;
+        if head == FREELIST_END {
+            return None;
+        }
+
+        // Read and decode the next pointer from the head object.
+        let secret = self.secret;
+        // Safety: head is a freelist address within a valid slab page.
+        let next = unsafe { read_decoded_ptr(head, secret) };
+
+        // D.5 validation: the decoded pointer must be in-bounds or sentinel.
+        validate_freelist_ptr(
+            next,
+            self.spans[span_idx].base,
+            self.page_size,
+            self.object_size,
+        );
+
+        self.spans[span_idx].freelist_head = next;
+        self.spans[span_idx].inuse_count += 1;
+
+        // If the slab just became full, remove it from the partial list.
+        if self.spans[span_idx].is_full() {
+            self.remove_from_partial_list(span_idx);
+        }
+
+        Some(head)
+    }
+
+    /// Find which span contains `addr`.
+    fn find_span_index(&self, addr: usize) -> Option<usize> {
+        for (i, span) in self.spans.iter().enumerate() {
+            if addr >= span.base && addr < span.base + self.page_size {
+                debug_assert!(
+                    (addr - span.base).is_multiple_of(self.object_size),
+                    "SlabCache: addr {:#x} not aligned to object_size {}",
+                    addr,
+                    self.object_size,
+                );
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Add `span_idx` to the partial list.
+    fn add_to_partial_list(&mut self, span_idx: usize) {
+        debug_assert!(!self.spans[span_idx].in_partial_list());
+        let pos = self.partial_list.len();
+        self.partial_list.push(span_idx);
+        self.spans[span_idx].partial_idx = pos;
+    }
+
+    /// Remove `span_idx` from the partial list — O(1) via swap-remove.
+    fn remove_from_partial_list(&mut self, span_idx: usize) {
+        let pos = self.spans[span_idx].partial_idx;
+        debug_assert!(pos < self.partial_list.len());
+
+        let last = self.partial_list.len() - 1;
+        if pos != last {
+            let swapped = self.partial_list[last];
+            self.partial_list[pos] = swapped;
+            self.spans[swapped].partial_idx = pos;
+        }
+        self.partial_list.pop();
+        self.spans[span_idx].partial_idx = NOT_IN_PARTIAL;
+    }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper: creates a page allocator that hands out pages starting at a
-    /// given base address, incrementing by page_size each call.
-    fn make_page_alloc(page_size: usize) -> impl FnMut() -> Option<usize> {
-        let mut next = page_size; // start at page_size to avoid address 0
-        move || {
-            let addr = next;
-            next += page_size;
-            Some(addr)
+    // ── Test page pool ──────────────────────────────────────────────────
+    //
+    // The embedded freelist writes encoded pointers into slab pages, so
+    // test pages must be real, writable memory.  `PagePool` heap-allocates
+    // `Vec<u8>` buffers and keeps them alive for the test's lifetime.
+
+    struct PagePool {
+        pages: Vec<Vec<u8>>,
+        page_size: usize,
+    }
+
+    impl PagePool {
+        fn new(page_size: usize) -> Self {
+            Self {
+                pages: Vec::new(),
+                page_size,
+            }
+        }
+
+        fn allocator(&mut self) -> impl FnMut() -> Option<usize> + '_ {
+            move || {
+                let page = vec![0u8; self.page_size];
+                let addr = page.as_ptr() as usize;
+                self.pages.push(page);
+                Some(addr)
+            }
         }
     }
 
+    // ── Basic allocation ────────────────────────────────────────────────
+
     #[test]
     fn allocate_single_object() {
+        let mut pool = PagePool::new(4096);
         let mut cache = SlabCache::new(64, 4096);
-        let mut alloc = make_page_alloc(4096);
-        let addr = cache.allocate(&mut alloc);
+        let addr = cache.allocate(&mut pool.allocator());
         assert!(addr.is_some());
         let stats = cache.stats();
         assert_eq!(stats.total_slabs, 1);
@@ -211,65 +437,61 @@ mod tests {
 
     #[test]
     fn allocate_until_slab_full_creates_new_slab() {
+        let mut pool = PagePool::new(4096);
         let mut cache = SlabCache::new(64, 4096);
-        let mut alloc = make_page_alloc(4096);
         let slots_per_slab = 4096 / 64;
 
-        // Fill the first slab completely.
         for _ in 0..slots_per_slab {
-            assert!(cache.allocate(&mut alloc).is_some());
+            assert!(cache.allocate(&mut pool.allocator()).is_some());
         }
         assert_eq!(cache.stats().total_slabs, 1);
         assert_eq!(cache.stats().free_slots, 0);
 
-        // Next allocation should create a second slab.
-        assert!(cache.allocate(&mut alloc).is_some());
+        // Next allocation triggers a second slab.
+        assert!(cache.allocate(&mut pool.allocator()).is_some());
         assert_eq!(cache.stats().total_slabs, 2);
     }
 
     #[test]
     fn free_all_objects_slab_becomes_empty() {
+        let mut pool = PagePool::new(4096);
         let mut cache = SlabCache::new(128, 4096);
-        let mut alloc = make_page_alloc(4096);
         let slots = 4096 / 128;
 
         let mut addrs = Vec::new();
         for _ in 0..slots {
-            addrs.push(cache.allocate(&mut alloc).unwrap());
+            addrs.push(cache.allocate(&mut pool.allocator()).unwrap());
         }
 
-        // Free all but the last: slab should not be empty yet.
         for addr in &addrs[..addrs.len() - 1] {
             assert!(!cache.free(*addr));
         }
 
         // Freeing the last object should mark the slab empty.
         assert!(cache.free(addrs[addrs.len() - 1]));
-
         let stats = cache.stats();
         assert_eq!(stats.active_objects, 0);
         assert_eq!(stats.free_slots, slots);
     }
 
     #[test]
-    fn mixed_alloc_free_patterns() {
+    fn mixed_alloc_free_reuses_slot() {
+        let mut pool = PagePool::new(4096);
         let mut cache = SlabCache::new(256, 4096);
-        let mut alloc = make_page_alloc(4096);
 
-        let a = cache.allocate(&mut alloc).unwrap();
-        let b = cache.allocate(&mut alloc).unwrap();
-        let c = cache.allocate(&mut alloc).unwrap();
+        let a = cache.allocate(&mut pool.allocator()).unwrap();
+        let b = cache.allocate(&mut pool.allocator()).unwrap();
+        let c = cache.allocate(&mut pool.allocator()).unwrap();
 
-        // Free middle object, then re-allocate: should reuse the slot.
+        // Freeing b prepends it to the freelist head, so the next
+        // allocation returns b's address.
         cache.free(b);
-        let d = cache.allocate(&mut alloc).unwrap();
-        // d should be the same address as b (reused slot).
-        assert_eq!(d, b);
+        let d = cache.allocate(&mut pool.allocator()).unwrap();
+        assert_eq!(d, b, "freed slot should be reused");
 
-        let stats = cache.stats();
-        assert_eq!(stats.active_objects, 3);
+        assert_eq!(cache.stats().active_objects, 3);
 
-        // Free all.
+        // Free everything.
         cache.free(a);
         cache.free(c);
         cache.free(d);
@@ -277,14 +499,67 @@ mod tests {
     }
 
     #[test]
+    fn full_page_object_size_allocatable() {
+        // 4096-byte objects on 4096-byte pages → 1 object per slab.
+        // This only works because metadata is out-of-line.
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(4096, 4096);
+
+        let addr = cache.allocate(&mut pool.allocator()).unwrap();
+        assert_eq!(cache.stats().total_slabs, 1);
+        assert_eq!(cache.stats().active_objects, 1);
+        assert_eq!(cache.stats().free_slots, 0);
+
+        assert!(cache.free(addr), "single-object slab should be empty");
+        assert_eq!(cache.stats().active_objects, 0);
+        assert_eq!(cache.stats().free_slots, 1);
+    }
+
+    // ── Partial list management ─────────────────────────────────────────
+
+    #[test]
+    fn partial_list_full_slab_leaves_and_reenters() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(512, 4096);
+        let slots = 4096 / 512; // 8
+
+        // Fill every slot → slab becomes full → leaves partial list.
+        let mut addrs = Vec::new();
+        for _ in 0..slots {
+            addrs.push(cache.allocate(&mut pool.allocator()).unwrap());
+        }
+        assert_eq!(cache.stats().free_slots, 0);
+        assert!(
+            cache.partial_list.is_empty(),
+            "full slab must not be in partial list"
+        );
+
+        // Free one object → slab re-enters partial list.
+        cache.free(addrs.pop().unwrap());
+        assert_eq!(
+            cache.partial_list.len(),
+            1,
+            "slab should re-enter partial list"
+        );
+
+        // Allocating again should reuse the same slab (no new page).
+        let _ = cache.allocate(&mut pool.allocator()).unwrap();
+        assert_eq!(
+            cache.stats().total_slabs,
+            1,
+            "should reuse partial slab, not create a new one"
+        );
+    }
+
+    #[test]
     fn different_object_sizes() {
-        for size in &[64, 128, 256, 512] {
-            let mut cache = SlabCache::new(*size, 4096);
-            let mut alloc = make_page_alloc(4096);
+        for &size in &[8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+            let mut pool = PagePool::new(4096);
+            let mut cache = SlabCache::new(size, 4096);
             let expected_slots = 4096 / size;
 
             for _ in 0..expected_slots {
-                assert!(cache.allocate(&mut alloc).is_some());
+                assert!(cache.allocate(&mut pool.allocator()).is_some());
             }
             let stats = cache.stats();
             assert_eq!(stats.total_slabs, 1);
@@ -293,27 +568,66 @@ mod tests {
         }
     }
 
+    // ── D.5 hardening ───────────────────────────────────────────────────
+
     #[test]
-    fn free_returns_true_when_slab_empty() {
-        let mut cache = SlabCache::new(512, 4096);
-        let mut alloc = make_page_alloc(4096);
-        let slots = 4096 / 512; // 8 slots
+    fn d5_encode_decode_roundtrip() {
+        let secret = 0xDEAD_BEEF_CAFE_BABE_u64 as usize;
+        let slot_addr = 0x1000_usize;
 
-        let mut addrs = Vec::new();
-        for _ in 0..slots {
-            addrs.push(cache.allocate(&mut alloc).unwrap());
+        for &raw_next in &[0_usize, 0x1040, 0x1080, 0x2000, usize::MAX] {
+            let encoded = encode_next(raw_next, secret, slot_addr);
+            let decoded = decode_next(encoded, secret, slot_addr);
+            assert_eq!(
+                decoded, raw_next,
+                "round-trip failed for raw_next={:#x}",
+                raw_next
+            );
         }
+    }
 
-        // Free all but the last: none should return true.
-        for addr in &addrs[..slots - 1] {
-            assert!(!cache.free(*addr), "slab should not be empty yet");
-        }
+    #[test]
+    fn d5_encoding_is_position_dependent() {
+        let secret = 0x1234_5678_9ABC_DEF0_u64 as usize;
+        let raw_next = 0x3000_usize;
 
-        // Last free makes the slab empty.
-        assert!(
-            cache.free(addrs[slots - 1]),
-            "slab should be empty after freeing all objects"
+        let enc_a = encode_next(raw_next, secret, 0x1000);
+        let enc_b = encode_next(raw_next, secret, 0x2000);
+        assert_ne!(
+            enc_a, enc_b,
+            "same raw_next at different slots must encode differently"
         );
+    }
+
+    #[test]
+    fn d5_encoding_is_secret_dependent() {
+        let slot_addr = 0x1000_usize;
+        let raw_next = 0x2000_usize;
+
+        let enc_a = encode_next(raw_next, 0xAAAA, slot_addr);
+        let enc_b = encode_next(raw_next, 0xBBBB, slot_addr);
+        assert_ne!(
+            enc_a, enc_b,
+            "same raw_next with different secrets must encode differently"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "D.5 corruption")]
+    fn d5_corruption_detected_on_allocate() {
+        let mut pool = PagePool::new(4096);
+        let secret = 0xAAAA_BBBB_CCCC_DDDD_u64 as usize;
+        let mut cache = SlabCache::with_secret(64, 4096, secret);
+
+        // First allocate: creates slab, pops slot 0 from the freelist.
+        let first = cache.allocate(&mut pool.allocator()).unwrap();
+
+        // Slot 1 is now the freelist head.  Corrupt its encoded pointer.
+        let slot1 = first + 64;
+        unsafe { (slot1 as *mut usize).write(0xBAD_BAD_BAD) };
+
+        // Next allocate pops slot 1, reads the corrupted pointer → panic.
+        let _ = cache.allocate(&mut pool.allocator());
     }
 
     #[test]
