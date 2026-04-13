@@ -151,9 +151,13 @@ flowchart TD
     P52a --> P52b["Phase 52b<br/>Kernel Structural Hardening"]
     P52b --> P52c["Phase 52c<br/>Kernel Architecture Evolution"]
     P52c --> P52d["Phase 52d<br/>Kernel Completion & Alignment"]
+    P52d --> P53a["Phase 53a<br/>Kernel Memory Modernization"]
+    P33 --> P53a
+    P35 --> P53a
+    P36 --> P53a
     P48 --> P53["Phase 53<br/>Headless Hardening"]
     P51 --> P53
-    P52d --> P53
+    P53a --> P53
     P52d --> P54["Phase 54<br/>Deep Serverization"]
     P53 --> P54
 
@@ -228,13 +232,13 @@ flowchart TD
 | 31 | Compiler Bootstrap | TCC compiles C programs and itself inside the OS | Complete | `phase-31` | [Phase 31](./31-compiler-bootstrap.md) | [Tasks](./tasks/31-compiler-bootstrap-tasks.md) |
 | 32 | Build Tools | make, ar, shell scripting for multi-file projects | Complete | `phase-32` | [Phase 32](./32-build-tools.md) | [Tasks](./tasks/32-build-tools-tasks.md) |
 
-### Kernel Infrastructure Phases (phases 33-39 complete, 40 planned)
+### Kernel Infrastructure Phases (phases 33-40 complete)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 33 | Kernel Memory | Slab allocator, OOM retry, working munmap | Complete | `phase-33` | [Phase 33](./33-kernel-memory-improvements.md) | [Tasks](./tasks/33-kernel-memory-tasks.md) |
+| 33 | Kernel Memory | Buddy allocator, OOM retry, slab-cache groundwork, working munmap | Complete | `phase-33` | [Phase 33](./33-kernel-memory-improvements.md) | [Tasks](./tasks/33-kernel-memory-tasks.md) |
 | 34 | Real-Time Clock | CMOS RTC, wall-clock time, CLOCK_REALTIME | Complete | `phase-34` | [Phase 34](./34-real-time-clock.md) | [Tasks](./tasks/34-real-time-clock-tasks.md) |
-| 35 | True SMP | Per-core syscall stacks, multi-core dispatch, priorities | Complete | `phase-35` | [Phase 35](./35-true-smp-multitasking.md) | [Tasks](./tasks/35-true-smp-multitasking-tasks.md) |
+| 35 | True SMP | Per-core syscall stacks, multi-core dispatch, per-core run queues with global scheduler coordination | Complete | `phase-35` | [Phase 35](./35-true-smp-multitasking.md) | [Tasks](./tasks/35-true-smp-multitasking-tasks.md) |
 | 36 | Expanded Memory | Demand paging, mprotect, large mmap, disk/RAM expansion | Complete | `phase-36` | [Phase 36](./36-expanded-memory.md) | [Tasks](./tasks/36-expanded-memory-tasks.md) |
 | 37 | I/O Multiplexing | select, epoll, non-blocking I/O | Complete | `phase-37` | [Phase 37](./37-io-multiplexing.md) | [Tasks](./tasks/37-io-multiplexing-tasks.md) |
 | 38 | Filesystem Enhancements | Symlinks, hard links, /proc, permissions, device nodes | Complete | `phase-38` | [Phase 38](./38-filesystem-enhancements.md) | [Tasks](./tasks/38-filesystem-enhancements-tasks.md) |
@@ -261,7 +265,7 @@ flowchart TD
 |---|---|---|---|---|---|---|
 | 47 | DOOM | A real full-screen graphical program runs and proves the graphics substrate under load | Complete | `phase-47` | [Phase 47](./47-doom.md) | [Tasks](./tasks/47-doom-tasks.md) |
 
-### Convergence and Release-Critical Phases (planned)
+### Convergence and Release-Critical Phases (48-50 complete, 51-52 active, 53a+ planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
@@ -274,6 +278,7 @@ flowchart TD
 | 52b | Kernel Structural Hardening | AddressSpace object, typed UserBuffers, batch TLB, frame zeroing, and partial task-owned return-state groundwork | **Complete** | `phase-52b` | [Phase 52b](./52b-kernel-structural-hardening.md) | [Tasks](./tasks/52b-kernel-structural-hardening-tasks.md) |
 | 52c | Kernel Architecture Evolution | VMA tree, growable endpoint/capability tables, unified line-discipline infrastructure, ISR wakeup, and deferred scheduler/keyboard/notification closure | **Complete** | `phase-52c` | [Phase 52c](./52c-kernel-architecture-evolution.md) | [Tasks](./tasks/52c-kernel-architecture-evolution-tasks.md) |
 | 52d | Kernel Completion and Roadmap Alignment | Audit-backed closure of the unfinished or overstated 52a/52b/52c work, integrated boot blockers, and release-gate drift before later hardening phases | Complete | `phase-52d` | [Phase 52d](./52d-kernel-completion-and-roadmap-alignment.md) | [Tasks](./tasks/52d-kernel-completion-and-roadmap-alignment-tasks.md) |
+| 53a | Kernel Memory Modernization | Per-CPU page cache, magazine-based slab allocator, size-class GlobalAlloc, SMP-scalable allocation | Planned | `phase-53a` | [Phase 53a](./53a-kernel-memory-modernization.md) | [Tasks](./tasks/53a-kernel-memory-modernization-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Planned | `phase-53` | [Phase 53](./53-headless-hardening.md) | Deferred until implementation planning |
 | 54 | Deep Serverization | Move storage, namespace, and networking policy further out of ring 0 | Planned | `phase-54` | [Phase 54](./54-deep-serverization.md) | Deferred until implementation planning |
 
@@ -348,7 +353,7 @@ gantt
     Compiler Bootstrap   :done, p31, after p26, 1
     Build Tools          :done, p32, after p31, 1
 
-    section Kernel Infrastructure (phases 33-39 complete)
+    section Kernel Infrastructure (complete)
     Kernel Memory        :done, p33, after p25, 1
     Real-Time Clock      :done, p34, after p15, 1
     True SMP             :done, p35, after p33, 1
@@ -356,26 +361,33 @@ gantt
     I/O Multiplexing     :done, p37, after p35, 1
     Filesystem Enhance   :done, p38, after p28, 1
     Unix Domain Sockets  :done, p39, after p38, 1
-    Threading            :p40, after p35, 1
+    Threading            :done, p40, after p35, 1
 
-    section Applications (planned)
-    Expanded Coreutils   :p41, after p38, 1
-    Crypto and TLS       :p42, after p31, 1
-    SSH                  :p43, after p42, 1
-    Rust Cross-Compile   :p44, after p24, 1
-    Ports System         :p45, after p41, 1
-    System Services      :p46, after p39, 1
+    section Applications and Developer Platform (complete)
+    Expanded Coreutils   :done, p41, after p38, 1
+    Crypto Primitives    :done, p42, after p31, 1
+    SSH                  :done, p43, after p42, 1
+    Crash Diagnostics    :done, p43a, after p43, 1
+    Kernel Trace Ring    :done, p43b, after p43a, 1
+    Regression + Stress  :done, p43c, after p43b, 1
+    Rust Cross-Compile   :done, p44, after p24, 1
+    Ports System         :done, p45, after p41, 1
+    System Services      :done, p46, after p39, 1
+    DOOM                 :done, p47, after p24, 1
 
-    section Showcase (planned)
-    DOOM                 :p47, after p24, 1
-    Mouse Input          :p48, after p47, 1
-    Audio                :p49, after p47, 1
-
-    section Cross-Compiled Runtimes (planned)
-    Toolchains           :p50, after p36, 1
-    Networking + GitHub  :p51, after p50, 1
-    Node.js              :p52, after p51, 1
-    Claude Code          :p53, after p52, 1
+    section Convergence and Release (active/planned)
+    Security Foundation  :done, p48, after p47, 1
+    Architectural Decl.  :done, p49, after p48, 1
+    IPC Completion       :done, p50, after p49, 1
+    Service Model Mature :active, p51, after p50, 1
+    Service Extractions  :active, p52, after p51, 1
+    Reliability Fixes    :done, p52a, after p52, 1
+    Structural Hardening :done, p52b, after p52a, 1
+    Architecture Evol.   :done, p52c, after p52b, 1
+    Completion + Align   :done, p52d, after p52c, 1
+    Memory Modernization :p53a, after p52d, 1
+    Headless Hardening   :p53, after p53a, 1
+    Deep Serverization   :p54, after p53, 1
 ```
 
 ## Required Documentation for Every Phase

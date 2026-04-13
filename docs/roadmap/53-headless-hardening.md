@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-53
-**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52b (Kernel Structural Hardening)
+**Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity), Phase 52d (Kernel Completion) ✅, Phase 53a (Kernel Memory Modernization)
 **Builds on:** Turns the now-shipped Rust std, ports, services, and first extracted-service work into a trustworthy headless/reference-system baseline with explicit validation and support boundaries
 **Primary Components:** xtask/src/main.rs, kernel-core, userspace/init, userspace/coreutils-rs, ports, docs/43c-regression-stress-ci.md, docs/45-ports-system.md
 
@@ -59,6 +59,11 @@ Write down what the headless/reference system promises and what it still does no
 | Tooling baseline | Phase 44 and 45 flows are reproducible enough for the release story | Pull missing packaging or runtime cleanup into this phase |
 | Validation story | Regression, stress, and smoke tests cover the workflows being claimed | Add the missing release-gate coverage instead of hand-waving it |
 
+**Planning note:** This phase defines the release gates that allocator work in
+Phase 53a must eventually satisfy. The dependency on Phase 53a is about closing
+the final headless/reference claim, not about drafting the gates; write the
+gates early enough that 53a has a concrete validation target.
+
 ## Important Components and How They Work
 
 ### Validation pipeline and release gates
@@ -78,6 +83,7 @@ Release quality is partly about saying no. The phase should clearly define what 
 - Builds on Phase 43c by turning validation infrastructure into explicit release gates.
 - Builds on Phases 44 and 45 by treating Rust std support and ports as part of the real supported environment.
 - Builds on Phases 46, 50, and 51 by turning the service model and extracted-service story into an operator-facing system.
+- Uses Phase 53a as allocator-sensitive infrastructure that must satisfy the same published headless gates before the release claim closes.
 - Depends on Phase 48 so headless readiness is not built on an unsafe trust floor.
 
 ## Implementation Outline
