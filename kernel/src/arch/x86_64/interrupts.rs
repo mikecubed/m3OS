@@ -920,10 +920,12 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
     super::apic::lapic_eoi();
 }
 
-/// Per-CPU page-cache drain IPI handler (vector 0xFC).
+/// Allocator-local cache drain IPI handler (vector 0xFC).
 ///
-/// Flushes this core's per-CPU page cache back to the buddy allocator.
-/// The handler runs on the owning core, so mutating the cache is safe.
+/// Flushes this core's per-CPU page cache when a page-cache drain round is
+/// active and also services slab-local reclaim handshakes when requested. The
+/// handler always runs on the owning core, so mutating CPU-local cache state is
+/// safe.
 extern "x86-interrupt" fn cache_drain_ipi_handler(_stack_frame: InterruptStackFrame) {
     crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();

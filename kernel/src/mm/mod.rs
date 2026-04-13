@@ -177,6 +177,8 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // allocations route through magazine_alloc; large allocations use
     // page-backed buddy frames.  Bootstrap-era allocations continue to be
     // recognized by address range and handled by the bootstrap allocator.
+    // The compile-time `legacy-bootstrap-allocator` feature leaves this cutover
+    // disabled as a bring-up kill switch.
     heap::activate_size_class_allocator();
 
     log::info!("[mm] Memory subsystem initialized");

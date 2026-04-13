@@ -155,6 +155,29 @@ impl MagazineDepot {
         }
     }
 
+    /// Drain every full magazine through `f`, returning each emptied magazine to
+    /// the depot's empty stack for reuse.
+    ///
+    /// The callback must consume every object from the magazine so the returned
+    /// magazine is truly empty before it is parked for future exchanges.
+    pub fn drain_full(&self, mut f: impl FnMut(&mut Magazine)) -> usize {
+        let mut drained = 0usize;
+        loop {
+            let mut mag = {
+                let mut fulls = self.full.lock();
+                match fulls.pop() {
+                    Some(mag) => mag,
+                    None => break,
+                }
+            };
+            f(&mut mag);
+            debug_assert!(mag.is_empty(), "drain_full callback must empty magazine");
+            self.empty.lock().push(mag);
+            drained += 1;
+        }
+        drained
+    }
+
     /// Number of full magazines currently in the depot.
     pub fn full_count(&self) -> usize {
         self.full.lock().len()
@@ -320,5 +343,24 @@ mod tests {
         assert!(e.is_empty());
         assert_eq!(depot.full_count(), 2);
         assert_eq!(depot.empty_count(), 3);
+    }
+
+    #[test]
+    fn depot_drain_full_magazines_returns_empties() {
+        let depot = MagazineDepot::new();
+        depot.full.lock().push(make_full_magazine());
+        depot.full.lock().push(make_full_magazine());
+
+        let mut drained_objects = 0usize;
+        let drained = depot.drain_full(|mag| {
+            while mag.pop().is_some() {
+                drained_objects += 1;
+            }
+        });
+
+        assert_eq!(drained, 2);
+        assert_eq!(drained_objects, 2 * MAGAZINE_CAPACITY);
+        assert_eq!(depot.full_count(), 0);
+        assert_eq!(depot.empty_count(), 2);
     }
 }

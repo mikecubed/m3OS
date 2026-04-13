@@ -4,7 +4,7 @@
 //! do not lose messages or wakeups under all possible thread interleavings.
 //!
 //! Gated behind `#[cfg(loom)]` — run with:
-//!   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --test ipc_loom
+//!   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test ipc_loom
 
 #[cfg(loom)]
 mod loom_tests {
@@ -179,6 +179,7 @@ mod tests {
     #[test]
     fn loom_tests_require_cfg_loom() {
         // Loom tests are gated behind #[cfg(loom)].
-        // Run with: RUSTFLAGS="--cfg loom" cargo test -p kernel-core --test ipc_loom
+        // Run with:
+        // RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test ipc_loom
     }
 }

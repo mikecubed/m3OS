@@ -57,7 +57,7 @@ When a CPU frees an object allocated on a different CPU's slab, it pushes to the
 
 ### Integration, reclaim, and validation (Track F)
 
-Make the allocator safe to land incrementally. Define the minimal allocation-context contract for page-fault/IRQ-sensitive callers, add allocator-local reclaim before high-order/OOM failure, preserve stats and `/proc/meminfo` / `sys_meminfo` semantics across the cutover, and add a kill switch plus concurrency validation (including loom for new Acquire/Release queues).
+Make the allocator safe to land incrementally. Define the minimal allocation-context contract for page-fault/IRQ-sensitive callers, add allocator-local reclaim before high-order/OOM failure, preserve stats and `/proc/meminfo` / `sys_meminfo` semantics across the cutover, and add a kill switch plus concurrency validation (including loom for new Acquire/Release queues). The staged rollout keeps a compile-time `legacy-bootstrap-allocator` escape hatch so bring-up can stay on the bootstrap allocator while `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` and the opt-in loom models burn in the new paths.
 
 ### Minimal allocation-context contract (Track F.1)
 

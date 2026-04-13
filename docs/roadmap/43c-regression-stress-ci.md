@@ -96,7 +96,7 @@ VecDeque matching the kernel's queue.
 ### Loom Integration (`kernel-core/tests/ipc_loom.rs`)
 
 Loom tests are gated behind `#[cfg(loom)]`. Run with:
-`RUSTFLAGS="--cfg loom" cargo test -p kernel-core --test ipc_loom`
+`RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test ipc_loom`
 
 ## How This Builds on Earlier Phases
 

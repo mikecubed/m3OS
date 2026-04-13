@@ -627,7 +627,9 @@ pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
 ///
 /// On failure, drains per-CPU page caches (A.4) and retries once, since
 /// hoarded single-page frames may be coalesced by the buddy into the
-/// requested high-order block.
+/// requested high-order block. The retry path escalates to the full
+/// allocator-local reclaim sequence so slab magazines / depots can also return
+/// hidden pages before the allocation gives up.
 #[allow(dead_code)]
 pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
     if let Some(frame) = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order) {
@@ -637,8 +639,8 @@ pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
         return Some(frame);
     }
 
-    // Retry after draining per-CPU caches so the buddy can coalesce.
-    drain_per_cpu_caches();
+    // Retry after allocator-local reclaim so order-0 hoarding can coalesce.
+    super::heap::reclaim_allocator_local_caches("high-order frame allocation");
 
     let frame = FRAME_ALLOCATOR.0.lock().allocate_contiguous(order)?;
     if REFCOUNT_INIT.load(Ordering::Acquire) {
@@ -690,18 +692,8 @@ pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
 /// enforced on the allocation side via [`allocate_frame_zeroed`]. Panics on
 /// double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
-    // Use refcounting when available.
-    if REFCOUNT_INIT.load(Ordering::Acquire) {
-        let current = refcount_get(phys);
-        if current == 0 {
-            // Frame was allocated before refcounting was enabled — free directly.
-        } else {
-            let new_count = refcount_dec(phys);
-            if new_count > 0 {
-                // Frame is still shared — do not reclaim.
-                return;
-            }
-        }
+    if !release_last_reference(phys) {
+        return;
     }
 
     if crate::smp::is_per_core_ready() {
@@ -741,22 +733,26 @@ pub fn free_frame(phys: u64) {
     FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
 
+/// Return a frame directly to the buddy/free-list pool, bypassing the per-CPU
+/// page cache while still honoring the refcount contract.
+///
+/// Used by allocator-local reclaim when a hidden slab page has already been
+/// selected for immediate surfacing back to the global pool.
+pub(crate) fn free_frame_direct(phys: u64) {
+    if !release_last_reference(phys) {
+        return;
+    }
+    FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
+}
+
 /// Free a contiguous block of `1 << order` pages.
 ///
 /// Decrements refcount for the base frame. Frees the entire block when the
 /// count reaches zero.  Does **not** zero — see [`allocate_contiguous_zeroed`].
 #[allow(dead_code)]
 pub fn free_contiguous(phys: u64, order: usize) {
-    if REFCOUNT_INIT.load(Ordering::Acquire) {
-        let current = refcount_get(phys);
-        if current == 0 {
-            // Pre-refcount frame — free directly.
-        } else {
-            let new_count = refcount_dec(phys);
-            if new_count > 0 {
-                return;
-            }
-        }
+    if !release_last_reference(phys) {
+        return;
     }
     FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
 }
@@ -769,6 +765,30 @@ pub fn free_contiguous(phys: u64, order: usize) {
 /// remote drains to complete.  Each remote core decrements this after
 /// flushing its local cache.
 static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
+/// Serializes initiators so concurrent memory-pressure drains cannot stomp the
+/// shared pending counter or IPI handshake.
+static CACHE_DRAIN_LOCK: Mutex<()> = Mutex::new(());
+/// Whether the current `IPI_CACHE_DRAIN` round should also service page-cache
+/// drains on the remote cores.
+static CACHE_DRAIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn drain_local_page_cache_to_pool() -> usize {
+    if !crate::smp::is_per_core_ready() {
+        return 0;
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
+        let n = cache.len() as usize;
+        if n > 0 {
+            let mut alloc = FRAME_ALLOCATOR.0.lock();
+            cache.drain_to(n, |frame_phys| {
+                alloc.free_to_pool(frame_phys);
+            });
+        }
+        n
+    })
+}
 
 /// Drain per-CPU page caches across all cores and return frames to the buddy.
 ///
@@ -785,28 +805,24 @@ static DRAIN_PENDING: AtomicU8 = AtomicU8::new(0);
 ///
 /// # Ordering
 ///
-/// 1. Set `DRAIN_PENDING` to the number of remote online cores.
+/// 1. Serialize initiators with `CACHE_DRAIN_LOCK`.
 /// 2. Drain the local core's cache under `without_interrupts`.
-/// 3. Send `IPI_CACHE_DRAIN` to all other cores.
-/// 4. Spin-wait until `DRAIN_PENDING` reaches 0.
+/// 3. Publish the remote-core count in `DRAIN_PENDING`, set
+///    `CACHE_DRAIN_ACTIVE = true`, then send `IPI_CACHE_DRAIN`.
+/// 4. Each remote core self-drains inside the handler and decrements
+///    `DRAIN_PENDING`.
+/// 5. Spin-wait until `DRAIN_PENDING` reaches 0, then clear
+///    `CACHE_DRAIN_ACTIVE`.
 pub fn drain_per_cpu_caches() {
     if !crate::smp::is_per_core_ready() {
         return;
     }
 
+    let _drain_guard = CACHE_DRAIN_LOCK.lock();
     let core_count = crate::smp::core_count();
 
     // Drain local cache.
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
-        let n = cache.len() as usize;
-        if n > 0 {
-            let mut alloc = FRAME_ALLOCATOR.0.lock();
-            cache.drain_to(n, |frame_phys| {
-                alloc.free_to_pool(frame_phys);
-            });
-        }
-    });
+    let _ = drain_local_page_cache_to_pool();
 
     if core_count <= 1 {
         return;
@@ -831,12 +847,14 @@ pub fn drain_per_cpu_caches() {
     }
 
     DRAIN_PENDING.store(remote_count, Ordering::Release);
+    CACHE_DRAIN_ACTIVE.store(true, Ordering::Release);
     crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
 
     // Spin-wait for all remote cores to complete their drain.
     while DRAIN_PENDING.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
+    CACHE_DRAIN_ACTIVE.store(false, Ordering::Release);
 
     log::debug!(
         "[mm] drained per-CPU page caches on {} remote core(s)",
@@ -848,17 +866,15 @@ pub fn drain_per_cpu_caches() {
 ///
 /// Called from the IDT handler for `IPI_CACHE_DRAIN`.  Drains the local
 /// per-CPU page cache into the buddy allocator, then decrements
-/// `DRAIN_PENDING` to signal completion to the initiator.
+/// `DRAIN_PENDING` to signal completion to the initiator. The same vector is
+/// also reused by slab reclaim, so page-cache work is gated by
+/// `CACHE_DRAIN_ACTIVE`.
 pub fn handle_cache_drain_ipi() {
-    let cache = unsafe { &mut *crate::smp::per_core().page_cache.get() };
-    let n = cache.len() as usize;
-    if n > 0 {
-        let mut alloc = FRAME_ALLOCATOR.0.lock();
-        cache.drain_to(n, |frame_phys| {
-            alloc.free_to_pool(frame_phys);
-        });
+    if CACHE_DRAIN_ACTIVE.load(Ordering::Acquire) {
+        let _ = drain_local_page_cache_to_pool();
+        DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
     }
-    DRAIN_PENDING.fetch_sub(1, Ordering::AcqRel);
+    crate::mm::slab::handle_reclaim_ipi();
 }
 
 /// Returns the number of frames available for allocation, including reclaimable
@@ -1036,6 +1052,18 @@ pub fn refcount_get(phys: u64) -> u16 {
 }
 
 #[inline]
+fn release_last_reference(phys: u64) -> bool {
+    if !REFCOUNT_INIT.load(Ordering::Acquire) {
+        return true;
+    }
+    let current = refcount_get(phys);
+    if current == 0 {
+        return true;
+    }
+    refcount_dec(phys) == 0
+}
+
+#[inline]
 fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
@@ -1099,5 +1127,49 @@ mod tests {
             "reentrant free during free_frame cache push leaked frames"
         );
         drain_per_cpu_caches();
+    }
+
+    #[test_case]
+    fn contiguous_alloc_recovers_order0_hoarding() {
+        ensure_test_per_core();
+
+        // Pre-allocate the bookkeeping Vec so any slab pages it needs are
+        // accounted for before we snapshot frame availability.
+        let mut held = alloc::vec::Vec::with_capacity(available_count());
+        let before = available_count();
+
+        let hoarded = allocate_contiguous(2).expect("seed contiguous block");
+        let base = hoarded.start_address().as_u64();
+
+        while let Some(frame) = allocate_frame() {
+            held.push(frame.start_address().as_u64());
+        }
+
+        // Return the seed block one page at a time so it sits in the local
+        // per-CPU cache as order-0 pages instead of buddy-visible order-2 state.
+        for page in 0..(1u64 << 2) {
+            free_frame(base + page * PAGE_SIZE);
+        }
+
+        let recovered =
+            allocate_contiguous(2).expect("allocator-local reclaim should recover hoarded pages");
+        assert_eq!(
+            recovered.start_address().as_u64(),
+            base,
+            "high-order retry should recover the hoarded block after draining caches"
+        );
+
+        free_contiguous(recovered.start_address().as_u64(), 2);
+        for &phys in &held {
+            free_frame(phys);
+        }
+        drain_per_cpu_caches();
+        let after = available_count();
+        assert_eq!(
+            after, before,
+            "contiguous reclaim test leaked frames: before={} after={}",
+            before, after
+        );
+        drop(held);
     }
 }

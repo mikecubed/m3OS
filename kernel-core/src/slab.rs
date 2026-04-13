@@ -293,6 +293,41 @@ impl SlabCache {
         }
     }
 
+    /// Reclaim every completely-empty slab page.
+    ///
+    /// Empty slabs are removed from the span table in-place without allocating
+    /// scratch vectors, then passed to `reclaim_page` so the embedding allocator
+    /// can return the backing page to its frame pool.
+    pub fn reclaim_empty(&mut self, mut reclaim_page: impl FnMut(usize)) -> usize {
+        let mut reclaimed = 0usize;
+        let mut span_idx = 0usize;
+        while span_idx < self.spans.len() {
+            if !self.spans[span_idx].is_empty() {
+                span_idx += 1;
+                continue;
+            }
+
+            if self.spans[span_idx].in_partial_list() {
+                self.remove_from_partial_list(span_idx);
+            }
+
+            let base = self.spans[span_idx].base;
+            let last_idx = self.spans.len() - 1;
+            if span_idx != last_idx {
+                let moved_partial_idx = self.spans[last_idx].partial_idx;
+                self.spans.swap(span_idx, last_idx);
+                if moved_partial_idx != NOT_IN_PARTIAL {
+                    self.partial_list[moved_partial_idx] = span_idx;
+                    self.spans[span_idx].partial_idx = moved_partial_idx;
+                }
+            }
+            self.spans.pop();
+            reclaim_page(base);
+            reclaimed += 1;
+        }
+        reclaimed
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────
 
     /// Create a span for a freshly-allocated page, initialise its embedded
@@ -770,5 +805,49 @@ mod tests {
         let mut cache = SlabCache::new(64, 4096);
         let mut fail_alloc = || None;
         assert!(cache.allocate(&mut fail_alloc).is_none());
+    }
+
+    #[test]
+    fn reclaim_empty_returns_pages_and_updates_stats() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(256, 4096);
+
+        let a = cache.allocate(&mut pool.allocator()).unwrap();
+        let b = cache.allocate(&mut pool.allocator()).unwrap();
+        cache.free(a);
+        cache.free(b);
+
+        let mut reclaimed = Vec::new();
+        let count = cache.reclaim_empty(|base| reclaimed.push(base));
+        assert_eq!(count, 1);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(cache.stats().total_slabs, 0);
+        assert!(cache.partial_list.is_empty());
+    }
+
+    #[test]
+    fn reclaim_empty_keeps_partial_indices_consistent() {
+        let mut pool = PagePool::new(4096);
+        let mut cache = SlabCache::new(512, 4096);
+        let slots = 4096 / 512;
+
+        let mut first_slab = Vec::new();
+        for _ in 0..slots {
+            first_slab.push(cache.allocate(&mut pool.allocator()).unwrap());
+        }
+        let survivor = cache.allocate(&mut pool.allocator()).unwrap();
+        for addr in first_slab {
+            cache.free(addr);
+        }
+
+        let reclaimed = cache.reclaim_empty(|_| {});
+        assert_eq!(reclaimed, 1);
+        assert_eq!(cache.stats().total_slabs, 1);
+        assert_eq!(cache.partial_list.len(), 1);
+
+        cache.free(survivor);
+        assert_eq!(cache.reclaim_empty(|_| {}), 1);
+        assert_eq!(cache.stats().total_slabs, 0);
+        assert!(cache.partial_list.is_empty());
     }
 }

@@ -7,10 +7,16 @@
 //!    init, refcount-table setup, slab metadata bootstrap, and per-core
 //!    bring-up allocations.  Lives at `HEAP_START..HEAP_START+HEAP_MAX_SIZE`.
 //!
-//! 2. **Size-class** (`SizeClassAllocator`): active after `activate_size_class_allocator()`.
-//!    Small allocations (size ≤ 4096 with natural alignment ≤ size-class
-//!    guarantee) route through `magazine_alloc`.  Large or high-alignment
-//!    allocations get page-backed buddy frames in the physmap region.
+//! 2. **Size-class** (`SizeClassAllocator`): active after
+//!    `activate_size_class_allocator()`. Small allocations (size ≤ 4096 with
+//!    natural alignment ≤ size-class guarantee) route through `magazine_alloc`.
+//!    Large or high-alignment allocations get page-backed buddy frames in the
+//!    physmap region.
+//!
+//!    Build with `--features legacy-bootstrap-allocator` to leave the cutover
+//!    disabled during bring-up. In that mode the bootstrap allocator stays
+//!    active for the whole boot, trading reclamation quality for a simple
+//!    compile-time kill switch.
 //!
 //! ## Allocation metadata (dense side table)
 //!
@@ -113,6 +119,11 @@ static PAGE_META_TABLE: spin::Once<Vec<PageMeta>> = spin::Once::new();
 
 /// Whether the size-class allocator is active (post-cutover).
 static SIZE_CLASS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+const fn size_class_rollout_enabled() -> bool {
+    !cfg!(feature = "legacy-bootstrap-allocator")
+}
 
 // ---------------------------------------------------------------------------
 // Per-core recursion guard (prevents deadlock from slab-internal Vec growth)
@@ -348,6 +359,33 @@ pub(crate) fn register_slab_page(phys: u64, class_idx: usize, owning_cpu: u8) {
     }
 }
 
+pub(crate) fn unregister_slab_page(phys: u64, expected_class_idx: usize) {
+    let pfn = (phys / 4096) as usize;
+    let Some(entry) = page_meta_entry(pfn) else {
+        return;
+    };
+    let raw = entry.0.swap(PAGE_META_NONE, Ordering::AcqRel);
+    match decode_page_meta(raw) {
+        Some(PageMetaKind::Slab { class_idx, .. }) if class_idx == expected_class_idx => {}
+        Some(PageMetaKind::Slab {
+            class_idx,
+            owning_cpu,
+        }) => {
+            panic!(
+                "heap: reclaim cleared slab page pfn {} with class {} / owner {} but expected class {}",
+                pfn, class_idx, owning_cpu, expected_class_idx
+            );
+        }
+        Some(PageMetaKind::Large { order }) => {
+            panic!(
+                "heap: reclaim cleared large-allocation metadata for pfn {} (order {})",
+                pfn, order
+            );
+        }
+        None => panic!("heap: reclaim found no slab metadata for pfn {}", pfn),
+    }
+}
+
 fn register_large_page(phys: u64, order: usize) {
     let pfn = (phys / 4096) as usize;
     if let Some(entry) = page_meta_entry(pfn) {
@@ -370,25 +408,16 @@ fn register_large_page(phys: u64, order: usize) {
 fn large_alloc(layout: &Layout) -> *mut u8 {
     let (_page_count, order) = pages_for_layout(layout);
     let frame = if order == 0 {
-        super::frame_allocator::allocate_frame_zeroed()
+        super::frame_allocator::allocate_frame_zeroed().or_else(|| {
+            reclaim_allocator_local_caches("large page-backed allocation");
+            super::frame_allocator::allocate_frame_zeroed()
+        })
     } else {
         super::frame_allocator::allocate_contiguous_zeroed(order)
     };
     let frame = match frame {
         Some(f) => f,
-        None => {
-            // Drain per-CPU caches and retry once.
-            super::frame_allocator::drain_per_cpu_caches();
-            let retry = if order == 0 {
-                super::frame_allocator::allocate_frame_zeroed()
-            } else {
-                super::frame_allocator::allocate_contiguous_zeroed(order)
-            };
-            match retry {
-                Some(f) => f,
-                None => return core::ptr::null_mut(),
-            }
-        }
+        None => return core::ptr::null_mut(),
     };
 
     let phys = frame.start_address().as_u64();
@@ -407,6 +436,61 @@ fn large_alloc(layout: &Layout) -> *mut u8 {
     );
 
     virt as *mut u8
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AllocatorLocalReclaimStats {
+    pub remote_free_objects: usize,
+    pub magazine_objects: usize,
+    pub depot_objects: usize,
+    pub reclaimed_slab_pages: usize,
+}
+
+impl AllocatorLocalReclaimStats {
+    fn touched_allocator_state(self) -> bool {
+        self.remote_free_objects != 0
+            || self.magazine_objects != 0
+            || self.depot_objects != 0
+            || self.reclaimed_slab_pages != 0
+    }
+}
+
+/// Serializes allocator-local reclaim so the shared remote-drain handshakes in
+/// the frame and slab layers cannot race with each other.
+static ALLOCATOR_RECLAIM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Recover allocator-local memory before declaring OOM / high-order failure.
+///
+/// Reclaim order intentionally avoids hidden references:
+///
+/// 1. Drain per-CPU page caches back to the buddy so order-0 hoarding becomes
+///    globally visible.
+/// 2. Owner CPUs collect pending cross-CPU frees and drain local/depot
+///    magazines back into the backing slab caches.
+/// 3. Once free objects are visible in the slab metadata, reclaim completely
+///    empty slab pages straight to the buddy/free-list pool.
+///
+/// Callers must not hold the frame allocator lock, slab locks, or local
+/// magazine/page-cache guards while entering this helper.
+pub(crate) fn reclaim_allocator_local_caches(reason: &'static str) -> AllocatorLocalReclaimStats {
+    let _reclaim_guard = ALLOCATOR_RECLAIM_LOCK.lock();
+
+    super::frame_allocator::drain_per_cpu_caches();
+    let mut stats = super::slab::collect_remote_frees();
+    stats.reclaimed_slab_pages = super::slab::reclaim_empty_slabs();
+
+    if stats.touched_allocator_state() {
+        log::debug!(
+            "[mm] allocator-local reclaim for {}: remote={} magazines={} depot={} slab_pages={}",
+            reason,
+            stats.remote_free_objects,
+            stats.magazine_objects,
+            stats.depot_objects,
+            stats.reclaimed_slab_pages,
+        );
+    }
+
+    stats
 }
 
 /// Free a page-backed large allocation.
@@ -507,7 +591,10 @@ unsafe impl GlobalAlloc for SizeClassAllocator {
         enter_slab();
         let ptr = if is_slab_eligible(&layout) {
             let idx = size_to_class(layout.size()).unwrap();
-            super::slab::magazine_alloc(idx).unwrap_or_default()
+            super::slab::magazine_alloc(idx).unwrap_or_else(|| {
+                reclaim_allocator_local_caches("slab allocation");
+                super::slab::magazine_alloc(idx).unwrap_or_default()
+            })
         } else {
             large_alloc(&layout)
         };
@@ -635,6 +722,12 @@ pub fn activate_size_class_allocator() {
         !SIZE_CLASS_ACTIVE.load(Ordering::Acquire),
         "heap::activate_size_class_allocator called more than once"
     );
+    if !size_class_rollout_enabled() {
+        log::warn!(
+            "[mm] size-class allocator disabled by feature `legacy-bootstrap-allocator`; staying on bootstrap allocator"
+        );
+        return;
+    }
     let table_size = super::frame_allocator::max_frame_number() + 1;
 
     PAGE_META_TABLE.call_once(|| {
@@ -744,7 +837,7 @@ fn try_grow_on_oom_for_layout(layout: Layout) -> bool {
         }
     }
 
-    super::frame_allocator::drain_per_cpu_caches();
+    reclaim_allocator_local_caches("bootstrap heap growth");
     grow_heap(requested).is_ok()
 }
 

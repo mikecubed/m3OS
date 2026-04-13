@@ -726,8 +726,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    // The RetryAllocator already attempted heap growth and retry before this
-    // handler is reached. If we get here, all growth attempts failed.
+    // The bootstrap/size-class allocator already attempted allocator-local
+    // reclaim and any eligible heap-growth retry before this handler is
+    // reached. If we get here, the allocation really is out of options.
     panic!(
         "kernel OOM: failed to allocate {:?} after heap growth retry",
         layout

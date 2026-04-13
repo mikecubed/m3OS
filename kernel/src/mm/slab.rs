@@ -33,8 +33,25 @@
 //!
 //! Cold paths still use spin locks only, so "sleepable" here means "allowed to
 //! take the contended cold path", not that the allocator literally sleeps.
+//!
+//! ## Allocator-local reclaim ordering (Track F.2)
+//!
+//! Memory-pressure reclaim must not mutate another CPU's magazines or
+//! cross-CPU free list in place. The reclaim sequence is therefore:
+//!
+//! 1. [`crate::mm::frame_allocator::drain_per_cpu_caches`] returns order-0 page
+//!    hoards to the buddy via owner-CPU self-drain.
+//! 2. [`collect_remote_frees`] asks each CPU (local critical section or IPI
+//!    self-drain) to flush its cross-CPU free lists and local magazines back to
+//!    the backing slab caches, then drains depot magazines on the initiator.
+//! 3. [`reclaim_empty_slabs`] runs only after step 2 so `inuse_count == 0`
+//!    really means "no object is still hidden in a magazine/depot/remote queue".
+//!
+//! The cold reclaim path may hold interrupts disabled while it walks the local
+//! magazines and takes the per-size-class slab lock, but it never holds a slab
+//! lock while requesting another CPU to mutate its local caches.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use kernel_core::cross_cpu_free::CrossCpuFreeList;
 use kernel_core::magazine::{Magazine, MagazineDepot};
 #[allow(unused_imports)]
@@ -231,6 +248,11 @@ fn sc_state() -> &'static [SizeClassState; NUM_SIZE_CLASSES] {
         .expect("slab size-class state not initialized")
 }
 
+#[inline]
+fn size_class_state_ready() -> bool {
+    SIZE_CLASS_STATE.get().is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Named slab caches (compatibility layer)
 // ---------------------------------------------------------------------------
@@ -312,6 +334,157 @@ pub fn init() {
 #[allow(dead_code)]
 pub fn caches() -> &'static KernelSlabCaches {
     SLAB_CACHES.get().expect("slab caches not initialized")
+}
+
+// ---------------------------------------------------------------------------
+// Allocator-local reclaim (F.2)
+// ---------------------------------------------------------------------------
+
+/// Remote-drain completion counter for `collect_remote_frees`.
+static SLAB_RECLAIM_PENDING: AtomicU8 = AtomicU8::new(0);
+/// Whether the current `IPI_CACHE_DRAIN` round should also flush slab-local
+/// magazines / cross-CPU free lists on the receiving cores.
+static SLAB_RECLAIM_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Serializes initiators so the reclaim IPI handshake cannot race.
+static SLAB_RECLAIM_LOCK: Mutex<()> = Mutex::new(());
+
+fn drain_local_reclaimable_objects() -> super::heap::AllocatorLocalReclaimStats {
+    let mut stats = super::heap::AllocatorLocalReclaimStats::default();
+    if !crate::smp::is_per_core_ready() || !size_class_state_ready() {
+        return stats;
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(_guard) = LocalMagazineGuard::try_enter() else {
+            log::warn!("[mm] slab reclaim skipped local drain due to held magazine guard");
+            return;
+        };
+        let core = crate::smp::per_core();
+        let mags = unsafe { &mut *core.slab_magazines.get() };
+
+        for class_idx in 0..NUM_SIZE_CLASSES {
+            let state = &sc_state()[class_idx];
+            let pair = &mut mags.pairs[class_idx];
+            let mut slab = state.slab.lock();
+
+            let mut node = core.cross_cpu_free.lists[class_idx].take_all();
+            while !node.is_null() {
+                let next = unsafe { (node as *const *mut u8).read() };
+                slab.free(node as usize);
+                stats.remote_free_objects += 1;
+                node = next;
+            }
+
+            while let Some(obj) = pair.loaded.pop() {
+                slab.free(obj as usize);
+                stats.magazine_objects += 1;
+            }
+            while let Some(obj) = pair.previous.pop() {
+                slab.free(obj as usize);
+                stats.magazine_objects += 1;
+            }
+        }
+    });
+
+    stats
+}
+
+fn drain_depot_magazines(stats: &mut super::heap::AllocatorLocalReclaimStats) {
+    if !size_class_state_ready() {
+        return;
+    }
+
+    for class_idx in 0..NUM_SIZE_CLASSES {
+        let state = &sc_state()[class_idx];
+        state.depot.drain_full(|mag| {
+            let mut slab = state.slab.lock();
+            while let Some(obj) = mag.pop() {
+                slab.free(obj as usize);
+                stats.depot_objects += 1;
+            }
+        });
+    }
+}
+
+/// Flush pending remote frees and hidden magazine objects back into the slab
+/// metadata so empty pages become reclaimable.
+///
+/// The initiator drains its own CPU-local state directly, requests the same
+/// owner-CPU self-drain from remotes via `IPI_CACHE_DRAIN`, waits for those
+/// remotes to acknowledge, then drains depot-held full magazines.
+pub fn collect_remote_frees() -> super::heap::AllocatorLocalReclaimStats {
+    if !size_class_state_ready() {
+        return super::heap::AllocatorLocalReclaimStats::default();
+    }
+
+    let _reclaim_guard = SLAB_RECLAIM_LOCK.lock();
+    let mut stats = drain_local_reclaimable_objects();
+
+    if crate::smp::is_per_core_ready() {
+        let my_core = crate::smp::per_core().core_id;
+        let mut remote_count: u8 = 0;
+        for cid in 0..crate::smp::core_count() {
+            if cid == my_core {
+                continue;
+            }
+            if let Some(data) = crate::smp::get_core_data(cid)
+                && data.is_online.load(Ordering::Acquire)
+            {
+                remote_count += 1;
+            }
+        }
+
+        if remote_count != 0 {
+            SLAB_RECLAIM_PENDING.store(remote_count, Ordering::Release);
+            SLAB_RECLAIM_ACTIVE.store(true, Ordering::Release);
+            crate::smp::ipi::send_ipi_all_excluding_self(crate::smp::ipi::IPI_CACHE_DRAIN);
+            while SLAB_RECLAIM_PENDING.load(Ordering::Acquire) != 0 {
+                core::hint::spin_loop();
+            }
+            SLAB_RECLAIM_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+
+    drain_depot_magazines(&mut stats);
+    stats
+}
+
+/// IPI-side companion to [`collect_remote_frees`].
+///
+/// Runs only on the owner CPU. If reclaim is active, flushes that CPU's
+/// cross-CPU free lists and magazines back into the slab caches, then signals
+/// the initiator via `SLAB_RECLAIM_PENDING`.
+pub fn handle_reclaim_ipi() {
+    if SLAB_RECLAIM_ACTIVE.load(Ordering::Acquire) {
+        let _ = drain_local_reclaimable_objects();
+        SLAB_RECLAIM_PENDING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Reclaim every completely-empty size-class slab page.
+///
+/// Callers should run [`collect_remote_frees`] first; otherwise hidden frees in
+/// magazines / depots will keep `inuse_count` non-zero and the slab will remain
+/// intentionally unreclaimable.
+pub fn reclaim_empty_slabs() -> usize {
+    if !size_class_state_ready() {
+        return 0;
+    }
+
+    let phys_offset = crate::mm::phys_offset();
+    let mut reclaimed = 0usize;
+    for class_idx in 0..NUM_SIZE_CLASSES {
+        let state = &sc_state()[class_idx];
+        let mut slab = state.slab.lock();
+        reclaimed += slab.reclaim_empty(|base| {
+            let phys = (base as u64)
+                .checked_sub(phys_offset)
+                .expect("slab reclaim page not in physmap");
+            super::heap::unregister_slab_page(phys, class_idx);
+            super::frame_allocator::free_frame_direct(phys);
+        });
+    }
+    reclaimed
 }
 
 // ---------------------------------------------------------------------------
