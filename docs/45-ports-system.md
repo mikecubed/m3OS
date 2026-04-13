@@ -108,12 +108,25 @@ Two flat-file databases at `/var/db/ports/`:
 
 ### xtask Integration
 
+The ports tree is assembled from two predictable host-side locations:
+
+- `ports/` in the repository for Portfiles, Makefiles, patches, and bundled
+  sources
+- `target/ports-src/` for host-fetched Lua/zlib source caches
+
 Three functions in `xtask/src/main.rs` handle ports:
 
 **`fetch_lua_source` / `fetch_zlib_source`** — Download Lua 5.4.7 and zlib 1.3.1
 source tarballs at build time via `curl`, extract them to
 `target/ports-src/<category>/<name>/src/`, and cache the result. Other ports
-(bc, sbase, mandoc, minizip) ship self-contained source in-repo.
+(bc, sbase, mandoc, and minizip's own source tree) ship self-contained source
+in-repo.
+
+For a fully populated ports bundle, the host needs `curl`, `tar`, and
+`sha256sum` (for zlib verification), plus network access the first time Lua/zlib
+are fetched. If those prerequisites are missing, xtask warns and the image still
+ships the in-repo ports baseline plus whatever is already cached under
+`target/ports-src/`.
 
 **`populate_ports_tree`** — Called from `create_data_disk()` after
 `populate_demo_project()`. Mirrors the host `ports/` directory into `/usr/ports/`
@@ -134,9 +147,39 @@ on the ext2 partition via `debugfs`, overlaying downloaded source from
 | mandoc | doc | Man page formatter | none |
 | minizip | util | Compression test tool | zlib |
 
-Lua and zlib are real third-party code fetched at build time. bc, sbase,
-mandoc, and minizip are self-contained C implementations bundled in the
-repository under `ports/<category>/<name>/src/`.
+Lua and zlib are real third-party code fetched on the **host** at image-build
+time and cached under `target/ports-src/`. bc, sbase, mandoc, and minizip's own
+source tree are bundled in the repository under `ports/<category>/<name>/src/`.
+Because `minizip` depends on `zlib`, its install path is only part of the
+baseline when the zlib cache is present.
+
+### Phase 53 Supported Path
+
+The Phase 53 headless/reference baseline treats the ports tree as a shipped,
+manual operator workflow rather than a mandatory smoke/regression gate.
+
+The predictable manual validation path is:
+
+1. Build an image with `cargo xtask image` (or boot with `cargo xtask run --fresh`)
+2. In the guest, run `port list`
+3. Install and remove an always-bundled port such as `bc`:
+   ```sh
+   port install bc
+   port remove bc
+   ```
+
+Supported expectations for this baseline:
+
+- `/usr/bin/port` and the in-repo ports tree are always shipped
+- `bc`, `sbase`, and `mandoc` do not depend on host-side source downloads
+- `lua` and `zlib` require host-side fetch/cached source under `target/ports-src/`
+  plus the refresh tools (`curl`, `tar`, and `sha256sum`) when that cache is cold
+- `minizip` is bundled in-repo but its install path still depends on `zlib`
+
+When the host cannot refresh Lua or zlib sources, xtask emits explicit warnings
+and continues with the bundled ports baseline. If the cache under
+`target/ports-src/` is already primed, xtask reuses it instead of refetching.
+This is a reduced-but-explicit path, not a silent success path.
 
 ## Key Files
 
@@ -158,8 +201,9 @@ repository under `ports/<category>/<name>/src/`.
 
 - This phase provides source-based package management only. Binary package
   distribution (precompiled packages) is deferred.
-- All port sources are bundled in the disk image. Network fetching is deferred
-  until an HTTP client is ported (Phase 45 stretch goal or later).
+- Guest-side network fetching is deferred until an HTTP client is ported
+  (Phase 45 stretch goal or later). Host-side image creation may still fetch
+  Lua and zlib into `target/ports-src/` unless that cache is already primed.
 - Dependency resolution is simple (linear scan, no version constraints). Version
   conflict resolution and upgrade handling are deferred.
 - No package signing or integrity verification.

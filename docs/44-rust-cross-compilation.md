@@ -44,26 +44,43 @@ This produces `ET_EXEC` (non-PIE) static binaries, which avoids conflicts with
 musl's self-relocating CRT startup and matches what the kernel's ELF loader
 expects.
 
+Host prerequisites for the full Phase 44 path are explicit:
+
+- `rustup target add x86_64-unknown-linux-musl`
+- `strip` is optional; xtask falls back to a plain copy if it is unavailable
+
 ### xtask Build Integration (`build_musl_rust_bins`)
 
 The `build_musl_rust_bins()` function in `xtask/src/main.rs` automates the
 cross-compilation pipeline:
 
-1. Checks that `x86_64-unknown-linux-musl` is installed via `rustup`.
-2. Creates placeholder files in `kernel/initrd/` for each crate so the kernel's
-   `include_bytes!` always resolves, even if the musl target is unavailable.
-3. Iterates over the five demo crates, building each with:
+1. Defines the supported demo crate set: `hello-rust`, `sysinfo-rust`,
+   `httpd-rust`, `calc-rust`, and `todo-rust`.
+2. Creates placeholder files in `target/generated-initrd/` for each crate so the
+   kernel's `include_bytes!` always resolves, even if the musl target is unavailable.
+3. Checks that `x86_64-unknown-linux-musl` is installed via `rustup`.
+4. Iterates over the five demo crates, building each with:
    ```
-   cargo build --manifest-path userspace/<name>/Cargo.toml \
-     --target x86_64-unknown-linux-musl --release
+    cargo build --manifest-path userspace/<name>/Cargo.toml \
+      --target x86_64-unknown-linux-musl --release
    ```
-4. Strips debug symbols from the resulting binary (falls back to plain copy).
-5. Copies the stripped binary to `kernel/initrd/<name>` for inclusion in the
+5. Strips debug symbols from the resulting binary (falls back to plain copy).
+6. Copies the stripped binary to `target/generated-initrd/<name>` for inclusion in the
    initial ramdisk.
 
 Each demo crate is a standalone project (not a workspace member) with its own
-`Cargo.toml` and `target/` directory. This avoids polluting the kernel workspace
-with `std`-dependent crates.
+`Cargo.toml` and `userspace/<name>/target/` directory. This avoids polluting the
+kernel workspace with `std`-dependent crates.
+
+If the musl target is missing, xtask emits a warning, leaves placeholder files
+in `target/generated-initrd/`, and still allows the image build to continue.
+That produces a reduced image rather than a hard failure: the Rust std demos are
+present as staged names, but they are not runnable until the host has
+`x86_64-unknown-linux-musl` installed.
+
+If an individual crate directory is missing or a specific build fails, xtask
+warns and leaves that placeholder in place while still packaging the rest of the
+image.
 
 ### Custom x86_64-m3os Target Spec
 
@@ -95,6 +112,34 @@ Five programs validate different `std` library subsystems:
 Each program exercises a different syscall path through musl to the kernel:
 `write` (hello), `open`/`read` (sysinfo), `socket`/`bind`/`accept` (httpd),
 `read` from stdin (calc), `open`/`write`/`close` (todo).
+
+### Phase 53 Supported Path
+
+The Phase 53 headless/reference baseline treats these five crates as the
+supported Rust std demos:
+
+- `hello-rust`
+- `sysinfo-rust`
+- `httpd-rust`
+- `calc-rust`
+- `todo-rust`
+
+Host prerequisites for this path are explicit:
+
+1. `rustup target add x86_64-unknown-linux-musl`
+2. A normal host Rust toolchain capable of running `cargo xtask image` or
+   `cargo xtask run --fresh`
+
+This Rust std path is **manual validation**, not part of the mandatory smoke or
+regression bundle. The supported reference check is:
+
+1. Build an image with `cargo xtask image` (or boot with `cargo xtask run --fresh`)
+2. Boot the guest
+3. Run one or more shipped demos such as `/bin/hello-rust`, `/bin/sysinfo-rust`,
+   or `/bin/todo-rust`
+
+That keeps the baseline explicit without implying broader post-1.0 Rust
+ecosystem support inside m3OS.
 
 ## Key Files
 

@@ -97,6 +97,22 @@ This is the main reason the current system reads as "microkernel-aimed" rather t
 | Graphics/UI | Framebuffer text console plus a shipped single-app graphics proof; still no multi-client display/input architecture | `docs/09-framebuffer-and-shell.md`, `docs/47-doom.md`, `kernel/src/fb/mod.rs`, `docs/roadmap/47-doom.md`, `docs/roadmap/56-display-and-input-architecture.md` |
 | Hardware breadth | Still QEMU-centric | `kernel/src/blk/`, `kernel/src/net/virtio_net.rs`, `docs/roadmap/55-hardware-substrate.md`, `docs/roadmap/57-audio-and-local-session.md` |
 
+## Supported operator path
+
+The primary supported workflow is the headless/reference QEMU path:
+
+- `cargo xtask run` boots `target/x86_64-unknown-none/release/boot-uefi-m3os.img`
+  with the companion ext2 data disk
+  `target/x86_64-unknown-none/release/disk.img`
+- `cargo xtask image` produces the same raw UEFI image plus
+  `target/x86_64-unknown-none/release/boot-uefi-m3os.vhdx` without launching QEMU
+- `cargo xtask run-gui` exists for framebuffer debugging, but it is not the
+  reference support target
+
+Host extras such as `curl`/`tar`/`sha256sum`, `musl-gcc`, and the Rust
+`x86_64-unknown-linux-musl` target widen the bundled demos and ports, but they
+are optional for the baseline headless image path.
+
 ## Why m3OS is already more than "just a toy"
 
 The right mental model is not "small kernel experiment." The right mental model is:
@@ -128,7 +144,10 @@ Two details from the failed regression matter:
 1. the failure happened at the common **boot-to-login** path defined in `xtask/src/main.rs`, before the actual fork workload began
 2. the saved regression serial log was empty, which looks more like a pre-serial boot/harness failure than a deterministic fork bug
 
-Also noted during that run: the ports fetch path emitted a `zlib` source-download 404 and skipped the port, which suggests some ecosystem/package inputs are still brittle.
+Also noted during that run: the ports path is now less about a broken upstream
+URL and more about host-side prerequisites. Lua and zlib are fetched into
+`target/ports-src/` during image creation, so builds without the required host
+tools or cached sources still produce a reduced ports baseline.
 
 ## So how usable is m3OS right now?
 

@@ -392,9 +392,11 @@ fn build_musl_bins() {
 /// Phase 44: Cross-compile musl-linked Rust userspace programs and stage them
 /// under target/generated-initrd/.
 ///
-/// Each crate is built individually via `--manifest-path` (they are NOT workspace members).
-/// Uses `x86_64-unknown-linux-musl` target with prebuilt std (no `-Zbuild-std`).
-/// Gracefully skips crates that don't exist yet and handles missing musl target.
+/// Each crate is built individually via `--manifest-path` (they are NOT workspace
+/// members). Zero-length placeholders are created first so the ramdisk
+/// `include_bytes!` path always resolves. Uses `x86_64-unknown-linux-musl`
+/// target with prebuilt std (no `-Zbuild-std`) and warns instead of failing when
+/// the target or an individual crate is unavailable.
 fn build_musl_rust_bins() {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
@@ -432,7 +434,9 @@ fn build_musl_rust_bins() {
     if !musl_target_available {
         eprintln!(
             "warning: x86_64-unknown-linux-musl target not installed — \
-             skipping all musl Rust builds. Run: rustup target add x86_64-unknown-linux-musl"
+             leaving Rust std demo placeholders in target/generated-initrd/ for: {}.\n\
+             Run: rustup target add x86_64-unknown-linux-musl",
+            crates.join(", ")
         );
         return;
     }
@@ -440,7 +444,9 @@ fn build_musl_rust_bins() {
     for name in crates {
         let manifest = root.join(format!("userspace/{name}/Cargo.toml"));
         if !manifest.exists() {
-            eprintln!("warning: userspace/{name}/Cargo.toml not found — skipping");
+            eprintln!(
+                "warning: userspace/{name}/Cargo.toml not found — leaving target/generated-initrd/{name} as a placeholder"
+            );
             continue;
         }
 
@@ -471,7 +477,9 @@ fn build_musl_rust_bins() {
         };
 
         if !status.success() {
-            eprintln!("warning: musl Rust build failed for {name} — skipping");
+            eprintln!(
+                "warning: musl Rust build failed for {name} — leaving target/generated-initrd/{name} unavailable in this image"
+            );
             continue;
         }
 
@@ -4751,7 +4759,7 @@ fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
 fn fetch_lua_source(ports_src: &Path) {
     let lua_dir = ports_src.join("lang/lua/src");
     if lua_dir.join("lua.c").exists() {
-        println!("ports: Lua source already cached");
+        println!("ports: Lua source already cached at {}", lua_dir.display());
         return;
     }
 
@@ -4768,7 +4776,10 @@ fn fetch_lua_source(ports_src: &Path) {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            eprintln!("warning: failed to download Lua source — skipping Lua port");
+            eprintln!(
+                "warning: failed to download Lua source for host cache {}",
+                lua_dir.display()
+            );
             return;
         }
     }
@@ -4787,7 +4798,10 @@ fn fetch_lua_source(ports_src: &Path) {
         .status()
         .expect("failed to run tar");
     if !status.success() {
-        eprintln!("warning: failed to extract Lua source");
+        eprintln!(
+            "warning: failed to extract Lua source into host cache {}",
+            lua_dir.display()
+        );
         return;
     }
 
@@ -4813,7 +4827,10 @@ fn fetch_zlib_source(ports_src: &Path) {
 
     let zlib_dir = ports_src.join("lib/zlib/src");
     if zlib_dir.join("zlib.h").exists() {
-        println!("ports: zlib source already cached");
+        println!(
+            "ports: zlib source already cached at {}",
+            zlib_dir.display()
+        );
         return;
     }
 
@@ -4830,7 +4847,10 @@ fn fetch_zlib_source(ports_src: &Path) {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            eprintln!("warning: failed to download zlib source — skipping zlib port");
+            eprintln!(
+                "warning: failed to download zlib source for host cache {}",
+                zlib_dir.display()
+            );
             return;
         }
     }
@@ -4838,8 +4858,10 @@ fn fetch_zlib_source(ports_src: &Path) {
     // Verify SHA-256 checksum before extracting.
     if !verify_sha256(&zlib_tar, ZLIB_SHA256) {
         eprintln!(
-            "warning: zlib tarball verification failed (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
-             Expected SHA-256: {ZLIB_SHA256}"
+            "warning: zlib tarball verification failed for host cache {} \
+             (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
+             Expected SHA-256: {ZLIB_SHA256}",
+            zlib_dir.display()
         );
         let _ = fs::remove_file(&zlib_tar);
         return;
@@ -4858,7 +4880,10 @@ fn fetch_zlib_source(ports_src: &Path) {
         .status()
         .expect("failed to run tar");
     if !status.success() {
-        eprintln!("warning: failed to extract zlib source");
+        eprintln!(
+            "warning: failed to extract zlib source into host cache {}",
+            zlib_dir.display()
+        );
         return;
     }
 
@@ -4886,21 +4911,36 @@ fn fetch_port_sources() -> PathBuf {
     let root = workspace_root();
     let ports_src = root.join("target/ports-src");
     fs::create_dir_all(&ports_src).unwrap();
+    println!("ports: using host cache {}", ports_src.display());
     fetch_lua_source(&ports_src);
     fetch_zlib_source(&ports_src);
+    let lua_ready = ports_src.join("lang/lua/src/lua.c").exists();
+    let zlib_ready = ports_src.join("lib/zlib/src/zlib.h").exists();
+    println!(
+        "ports: source readiness -> bundled ports: bc, sbase, mandoc; fetched sources: lua={}, zlib={} (minizip depends on zlib)",
+        if lua_ready { "ready" } else { "missing" },
+        if zlib_ready { "ready" } else { "missing" }
+    );
     ports_src
 }
 
 /// Phase 45: Populate the ports tree into `/usr/ports/` on the ext2 partition.
 ///
-/// Mirrors the host-side `ports/` directory (Portfiles, Makefiles, patches) and
-/// downloaded source files into the ext2 image. Also installs the `port` command
-/// at `/usr/bin/port` and creates `/usr/local/` and `/var/db/ports/` directories.
+/// Mirrors the host-side `ports/` directory (Portfiles, Makefiles, patches, and
+/// bundled sources) plus any host-cached files from `target/ports-src/` into the
+/// ext2 image. Also installs the `port` command at `/usr/bin/port` and creates
+/// `/usr/local/` and `/var/db/ports/` directories.
 fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path) {
     let ports_dir = workspace_root.join("ports");
     if !ports_dir.is_dir() {
         return;
     }
+
+    println!(
+        "ports: mirroring {} plus cached sources from {} into /usr/ports",
+        ports_dir.display(),
+        ports_src.display()
+    );
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
