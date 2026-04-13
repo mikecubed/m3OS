@@ -280,7 +280,6 @@ Parse memory regions, framebuffer, RSDP during `kernel_main` init and store in t
 | `x86_64` | `PageTable`, `IDT`, `GDT`, `PhysAddr`/`VirtAddr`, port I/O |
 | `uart_16550` | Serial port driver — primary debug output |
 | `pic8259` | 8259 PIC init and EOI |
-| `linked_list_allocator` | `#[global_allocator]` for kernel heap |
 | `spin` | `Mutex`/`RwLock` for `no_std` |
 | `log` | Logging facade; backend writes to serial |
 | `kernel-core` | Shared pure-logic library, host-testable |

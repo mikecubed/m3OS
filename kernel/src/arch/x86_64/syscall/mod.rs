@@ -7715,14 +7715,25 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     let heap = crate::mm::heap::heap_stats();
     let frames = crate::mm::frame_allocator::frame_stats();
     let slabs = crate::mm::slab::all_slab_stats();
+    let sc_stats = crate::mm::slab::size_class_slab_stats();
 
-    // Format into a stack buffer
-    let mut tmp = [0u8; 2048];
+    // Format into a stack buffer — 4 KiB to accommodate new size-class rows.
+    let mut tmp = [0u8; 4096];
     let mut writer = BufWriter::new(&mut tmp);
 
     let _ = writeln!(writer, "=== Kernel Memory Info ===");
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "Heap:");
+    let _ = writeln!(
+        writer,
+        "Allocator: {}",
+        if heap.size_class_active {
+            "size-class (slab + page-backed)"
+        } else {
+            "bootstrap (monotonic)"
+        }
+    );
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Bootstrap Heap:");
     let _ = writeln!(
         writer,
         "  total: {} KiB  used: {} KiB  free: {} KiB",
@@ -7735,6 +7746,13 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
         "  allocs: {}  deallocs: {}",
         heap.alloc_count, heap.dealloc_count
     );
+    if heap.size_class_active {
+        let _ = writeln!(
+            writer,
+            "  slab pages: {}  large pages: {}",
+            heap.slab_pages, heap.page_backed_pages
+        );
+    }
     let _ = writeln!(writer);
     let _ = writeln!(writer, "Frames (4 KiB pages):");
     let _ = writeln!(
@@ -7759,7 +7777,7 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
         let _ = writeln!(writer, "  per-cpu cached: {}", frames.per_cpu_cached);
     }
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "Slab Caches:");
+    let _ = writeln!(writer, "Slab Caches (named):");
     fn fmt_slab(w: &mut BufWriter<'_>, name: &str, s: &kernel_core::slab::SlabStats) {
         let _ = writeln!(
             w,
@@ -7772,6 +7790,20 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
     fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
     fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
+    if heap.size_class_active {
+        let _ = writeln!(writer);
+        let _ = writeln!(writer, "Size Classes (slab backing):");
+        let classes = kernel_core::size_class::SIZE_CLASSES;
+        for (i, stats) in sc_stats.iter().enumerate() {
+            if stats.total_slabs > 0 || stats.active_objects > 0 {
+                let _ = writeln!(
+                    writer,
+                    "  {}B: slabs={} active={} free={}",
+                    classes[i], stats.total_slabs, stats.active_objects, stats.free_slots
+                );
+            }
+        }
+    }
 
     let written = writer.pos;
 

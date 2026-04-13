@@ -7,7 +7,7 @@ use syscall_lib::{STDOUT_FILENO, meminfo, write};
 syscall_lib::entry_point!(main);
 
 fn main(_args: &[&str]) -> i32 {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 4096];
     let n = meminfo(&mut buf);
     if n > 0 {
         let _ = write(STDOUT_FILENO, &buf[..n]);
