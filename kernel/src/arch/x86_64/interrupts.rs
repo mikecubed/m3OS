@@ -257,7 +257,6 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
     const PROT_WRITE: u64 = 0x2;
     const PROT_EXEC: u64 = 0x4;
 
-    let phys_off = crate::mm::phys_offset();
     let page_vaddr = VirtAddr::new(vaddr & !0xFFF);
 
     {
@@ -267,15 +266,11 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
         }
     }
 
-    // Allocate a fresh zeroed frame for the data page.
-    let frame = match crate::mm::frame_allocator::allocate_frame() {
+    // Zero-before-exposure (D.4): user-visible demand-paged frame.
+    let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
         Some(f) => f,
         None => return false,
     };
-    let frame_phys = frame.start_address().as_u64();
-    unsafe {
-        core::ptr::write_bytes((phys_off + frame_phys) as *mut u8, 0, 4096);
-    }
 
     // Build PTE flags from the POSIX prot bits.
     let mut data_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -289,7 +284,7 @@ fn demand_map_user_page_locked(vaddr: u64, prot: u64) -> bool {
     if unsafe { crate::mm::paging::map_current_user_page_locked(page_vaddr, frame, data_flags) }
         .is_err()
     {
-        crate::mm::frame_allocator::free_frame(frame_phys);
+        crate::mm::frame_allocator::free_frame(frame.start_address().as_u64());
         return false;
     }
     true

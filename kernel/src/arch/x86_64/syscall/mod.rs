@@ -7247,7 +7247,8 @@ fn sys_mmap_file_backed(
         let mut page_buf = alloc::vec![0u8; 4096];
 
         for i in 0..pages {
-            let frame = match crate::mm::frame_allocator::allocate_frame() {
+            // Zero-before-exposure (D.4): user-visible mmap frame.
+            let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
                 Some(f) => f,
                 None => {
                     log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
@@ -7267,9 +7268,8 @@ fn sys_mmap_file_backed(
                 }
             };
 
-            // Zero the frame then fill from file.
+            // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
             let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
 
             let read_offset = file_offset + (i as usize) * 4096;
             match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
@@ -8339,12 +8339,12 @@ pub(super) fn sys_linux_brk(addr: u64) -> u64 {
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
                     | PageTableFlags::NO_EXECUTE;
-                let phys_off = crate::mm::phys_offset();
                 let mut committed_brk = current_brk;
 
                 for i in 0..pages_needed {
                     let vaddr = VirtAddr::new(current_brk + i * 4096);
-                    let frame = match crate::mm::frame_allocator::allocate_frame() {
+                    // Zero-before-exposure (D.4): user-visible brk frame.
+                    let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
                         Some(f) => f,
                         None => {
                             log::warn!("[brk] out of frames at page {}/{}", i, pages_needed);
@@ -8352,10 +8352,6 @@ pub(super) fn sys_linux_brk(addr: u64) -> u64 {
                             break;
                         }
                     };
-                    unsafe {
-                        let ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-                        core::ptr::write_bytes(ptr, 0, 4096);
-                    }
                     if unsafe {
                         crate::mm::paging::map_current_user_page_locked(vaddr, frame, flags)
                     }

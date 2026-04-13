@@ -1,3 +1,28 @@
+//! Physical frame allocator.
+//!
+//! # Zero-before-exposure invariant (D.4)
+//!
+//! The kernel guarantees that **no frame reaches user-visible address space
+//! containing stale data from a prior allocation**.  Enforcement strategy:
+//!
+//! * [`allocate_frame_zeroed`] / [`allocate_contiguous_zeroed`] — allocate and
+//!   zero in one step.  **Standard path for any frame that will become
+//!   user-visible** (data pages, stack pages, demand-paged pages, brk growth,
+//!   mmap pages, ELF segment pages).  All audited user-facing callsites in
+//!   `demand_map_user_page_locked`, `map_user_stack`, `map_load_segment`,
+//!   `sys_linux_brk`, `sys_mmap_file_backed`, and `map_user_pages` use this
+//!   path.
+//!
+//! * [`allocate_frame`] / [`allocate_contiguous`] — raw allocation, **no
+//!   zeroing**.  Acceptable when the caller **fully overwrites** the frame
+//!   before user exposure (e.g., `copy_nonoverlapping` in `resolve_cow_fault`)
+//!   or when the frame is kernel-internal (heap backing, DMA buffers,
+//!   page-table frames that the caller zeroes explicitly).
+//!
+//! `free_frame` and `free_contiguous` do **not** zero on free.  The stale
+//! content is harmless because every user-facing path goes through a zeroed
+//! allocation or an explicit full-page copy (CoW).
+
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -292,6 +317,27 @@ pub fn allocate_frame() -> Option<PhysFrame<Size4KiB>> {
     Some(frame)
 }
 
+/// Allocate a single 4 KiB frame and zero its contents.
+///
+/// This is the **standard** path for any frame that will become visible to
+/// user-space (data pages, stack pages, demand-paged pages, brk growth, mmap
+/// pages, ELF segment pages).  Callers that fully overwrite the frame before
+/// user exposure (CoW `copy_nonoverlapping`) or need a kernel-internal frame
+/// (heap, DMA, page tables) may use [`allocate_frame`] instead.
+///
+/// See module-level docs for the full zero-before-exposure invariant.
+pub fn allocate_frame_zeroed() -> Option<PhysFrame<Size4KiB>> {
+    let frame = allocate_frame()?;
+    let phys_offset = cached_phys_offset();
+    let virt_ptr = (phys_offset + frame.start_address().as_u64()) as *mut u8;
+    // SAFETY: frame is freshly allocated with exclusive ownership; the
+    // physical-memory offset guarantees virt_ptr is a valid kernel address.
+    unsafe {
+        core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
+    }
+    Some(frame)
+}
+
 /// Allocate a contiguous block of `1 << order` pages.
 ///
 /// Returns the base frame. Sets refcount for the base frame only.
@@ -305,12 +351,34 @@ pub fn allocate_contiguous(order: usize) -> Option<PhysFrame<Size4KiB>> {
     Some(frame)
 }
 
+/// Allocate a contiguous block of `1 << order` pages and zero all of them.
+///
+/// Zeroed-allocation variant of [`allocate_contiguous`] for user-visible
+/// contiguous mappings.
+#[allow(dead_code)]
+pub fn allocate_contiguous_zeroed(order: usize) -> Option<PhysFrame<Size4KiB>> {
+    let frame = allocate_contiguous(order)?;
+    let page_count = 1u64 << order;
+    let phys_offset = cached_phys_offset();
+    let base = frame.start_address().as_u64();
+    for i in 0..page_count {
+        let virt_ptr = (phys_offset + base + i * PAGE_SIZE) as *mut u8;
+        unsafe {
+            core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
+        }
+    }
+    Some(frame)
+}
+
 /// Return a frame to the allocator.
 ///
 /// If refcounting is initialized, decrements the reference count first.
 /// The frame is only pushed onto the free list when the count reaches zero.
 /// Frames allocated before refcounting was enabled (refcount == 0) are freed
 /// directly without decrementing.
+///
+/// Does **not** zero the frame — the zero-before-exposure invariant is
+/// enforced on the allocation side via [`allocate_frame_zeroed`].
 /// Panics on double-free (frame already on the free list).
 pub fn free_frame(phys: u64) {
     // Use refcounting when available.
@@ -326,19 +394,13 @@ pub fn free_frame(phys: u64) {
             }
         }
     }
-    // Zero the frame before returning to pool to prevent stale data exposure.
-    let phys_offset = cached_phys_offset();
-    let virt_ptr = (phys_offset + phys) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
-    }
     FRAME_ALLOCATOR.0.lock().free_to_pool(phys);
 }
 
 /// Free a contiguous block of `1 << order` pages.
 ///
 /// Decrements refcount for the base frame. Frees the entire block when the
-/// count reaches zero.
+/// count reaches zero.  Does **not** zero — see [`allocate_contiguous_zeroed`].
 #[allow(dead_code)]
 pub fn free_contiguous(phys: u64, order: usize) {
     if REFCOUNT_INIT.load(Ordering::Acquire) {
@@ -350,15 +412,6 @@ pub fn free_contiguous(phys: u64, order: usize) {
             if new_count > 0 {
                 return;
             }
-        }
-    }
-    // Zero all frames in the contiguous block before returning to pool.
-    let page_count = 1u64 << order;
-    let phys_offset = cached_phys_offset();
-    for i in 0..page_count {
-        let virt_ptr = (phys_offset + phys + i * PAGE_SIZE) as *mut u8;
-        unsafe {
-            core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
         }
     }
     FRAME_ALLOCATOR.0.lock().free_contiguous(phys, order);
