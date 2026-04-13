@@ -47,6 +47,10 @@ pub const HEAP_MAX_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tracks total deallocations (for Track F diagnostics).
 static DEALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Tracks slab-backed pages currently owned by the cutover allocator.
+static SLAB_PAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Tracks page-backed large-allocation pages currently owned by the cutover allocator.
+static PAGE_BACKED_PAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Page-backed allocation metadata (dense side table, C.1)
@@ -348,17 +352,17 @@ fn page_meta_for_ptr(ptr: *mut u8) -> Option<PageMetaKind> {
 
 pub(crate) fn register_slab_page(phys: u64, class_idx: usize, owning_cpu: u8) {
     let pfn = (phys / 4096) as usize;
-    if let Some(entry) = page_meta_entry(pfn) {
-        entry
-            .0
-            .compare_exchange(
-                PAGE_META_NONE,
-                encode_slab_meta(class_idx, owning_cpu),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .expect("heap: slab page metadata already populated");
-    }
+    let entry = page_meta_entry(pfn).expect("heap: slab page metadata entry missing");
+    entry
+        .0
+        .compare_exchange(
+            PAGE_META_NONE,
+            encode_slab_meta(class_idx, owning_cpu),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("heap: slab page metadata already populated");
+    SLAB_PAGE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn unregister_slab_page(phys: u64, expected_class_idx: usize) {
@@ -368,7 +372,9 @@ pub(crate) fn unregister_slab_page(phys: u64, expected_class_idx: usize) {
     };
     let raw = entry.0.swap(PAGE_META_NONE, Ordering::AcqRel);
     match decode_page_meta(raw) {
-        Some(PageMetaKind::Slab { class_idx, .. }) if class_idx == expected_class_idx => {}
+        Some(PageMetaKind::Slab { class_idx, .. }) if class_idx == expected_class_idx => {
+            SLAB_PAGE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
         Some(PageMetaKind::Slab {
             class_idx,
             owning_cpu,
@@ -390,17 +396,17 @@ pub(crate) fn unregister_slab_page(phys: u64, expected_class_idx: usize) {
 
 fn register_large_page(phys: u64, order: usize) {
     let pfn = (phys / 4096) as usize;
-    if let Some(entry) = page_meta_entry(pfn) {
-        entry
-            .0
-            .compare_exchange(
-                PAGE_META_NONE,
-                encode_large_meta(order),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .expect("heap: large allocation metadata already populated");
-    }
+    let entry = page_meta_entry(pfn).expect("heap: large allocation metadata entry missing");
+    entry
+        .0
+        .compare_exchange(
+            PAGE_META_NONE,
+            encode_large_meta(order),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("heap: large allocation metadata already populated");
+    PAGE_BACKED_PAGE_COUNT.fetch_add(1usize << order, Ordering::Relaxed);
 }
 
 /// Allocate via the page-backed large-allocation path.
@@ -508,13 +514,22 @@ fn large_dealloc(ptr: *mut u8) {
         }
     };
     let pfn = (phys / 4096) as usize;
-    let raw = match page_meta_entry(pfn) {
-        Some(entry) => entry.0.swap(PAGE_META_NONE, Ordering::AcqRel),
-        None => PAGE_META_NONE,
+    let entry = match page_meta_entry(pfn) {
+        Some(entry) => entry,
+        None => {
+            log::error!(
+                "[heap] large_dealloc: no metadata entry for pfn {} (ptr {:#x})",
+                pfn,
+                ptr as usize
+            );
+            return;
+        }
     };
+    let raw = entry.0.swap(PAGE_META_NONE, Ordering::AcqRel);
     let order = match decode_page_meta(raw) {
         Some(PageMetaKind::Large { order }) => order,
         Some(PageMetaKind::Slab { class_idx, .. }) => {
+            entry.0.store(raw, Ordering::Release);
             log::error!(
                 "[heap] large_dealloc: slab metadata for class {} found at ptr {:#x}",
                 class_idx,
@@ -531,6 +546,7 @@ fn large_dealloc(ptr: *mut u8) {
             return;
         }
     };
+    PAGE_BACKED_PAGE_COUNT.fetch_sub(1usize << order, Ordering::Relaxed);
 
     if order == 0 {
         super::frame_allocator::free_frame(phys);
@@ -883,20 +899,6 @@ pub struct HeapStats {
 /// Returns a snapshot of kernel heap statistics.
 pub fn heap_stats() -> HeapStats {
     let bootstrap = ALLOCATOR.bootstrap.stats();
-    let (slab_pages, page_backed_pages) = if let Some(table) = PAGE_META_TABLE.get() {
-        let mut slab_pages = 0usize;
-        let mut page_backed_pages = 0usize;
-        for entry in table {
-            match decode_page_meta(entry.0.load(Ordering::Acquire)) {
-                Some(PageMetaKind::Slab { .. }) => slab_pages += 1,
-                Some(PageMetaKind::Large { order }) => page_backed_pages += 1usize << order,
-                None => {}
-            }
-        }
-        (slab_pages, page_backed_pages)
-    } else {
-        (0, 0)
-    };
     HeapStats {
         total_size: bootstrap.mapped_bytes,
         used_bytes: bootstrap.used_bytes,
@@ -904,8 +906,8 @@ pub fn heap_stats() -> HeapStats {
         alloc_count: ALLOC_COUNT.load(Ordering::Relaxed),
         dealloc_count: DEALLOC_COUNT.load(Ordering::Relaxed),
         size_class_active: SIZE_CLASS_ACTIVE.load(Ordering::Relaxed),
-        slab_pages,
-        page_backed_pages,
+        slab_pages: SLAB_PAGE_COUNT.load(Ordering::Relaxed),
+        page_backed_pages: PAGE_BACKED_PAGE_COUNT.load(Ordering::Relaxed),
     }
 }
 

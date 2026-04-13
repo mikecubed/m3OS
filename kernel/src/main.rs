@@ -830,6 +830,11 @@ mod tests {
             frames_after.allocated_frames,
             frames_final.allocated_frames
         );
+        assert_eq!(
+            final_stats.page_backed_pages, before.page_backed_pages,
+            "dropping blocks did not restore the page-backed allocation count: before={} final={}",
+            before.page_backed_pages, final_stats.page_backed_pages
+        );
         assert!(final_stats.free_bytes > 0);
     }
 
