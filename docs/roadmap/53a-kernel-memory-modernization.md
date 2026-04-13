@@ -1,6 +1,6 @@
 # Phase 53a - Kernel Memory Modernization
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-53a
 **Depends on:** Phase 33 (Kernel Memory) ✅, Phase 35 (True SMP) ✅, Phase 36 (Expanded Memory) ✅, Phase 52c (Kernel Architecture Evolution) ✅, Phase 52d (Kernel Completion) ✅
 **Builds on:** Replaces the Phase 33 linked-list heap and unintegrated slab-cache scaffolding with an SMP-scalable allocator stack informed by `docs/research/m3os-allocator-analysis.md`, `docs/research/allocator-theory.md`, and `docs/research/memory-allocator-survey.md`
@@ -41,7 +41,7 @@ Replace the unused `SlabCache` with an embedded-freelist slab allocator and per-
 
 ### Size-class-based GlobalAlloc (Track C)
 
-Replace `linked_list_allocator::LockedHeap` with a custom `GlobalAlloc` that routes allocations to the appropriate size-class slab cache. 13 geometric size classes (32B to 4KiB, 4 steps per doubling, <20% max internal waste) cover the small-object path. Larger or stronger-aligned layouts use a page-backed mapped allocation path with explicit metadata for deallocation; the buddy allocator remains the physical backend.
+Replace `linked_list_allocator::LockedHeap` with a custom `GlobalAlloc` that routes allocations to the appropriate size-class slab cache. A fixed 13-class table (32B to 4 KiB) covers the small-object path; the 32..=1024 region stays below ~34% internal waste and the 2048→4096 jump stays below 50% worst-case waste. Larger or stronger-aligned layouts use a page-backed mapped allocation path with explicit metadata for deallocation; the buddy allocator remains the physical backend.
 
 ### Foundation fixes (Track D)
 
