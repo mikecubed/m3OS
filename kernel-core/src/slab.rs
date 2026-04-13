@@ -71,17 +71,11 @@ fn validate_freelist_ptr(decoded: usize, slab_base: usize, page_size: usize, obj
     }
     assert!(
         decoded >= slab_base && decoded < slab_base + page_size,
-        "D.5 corruption: decoded freelist ptr {:#x} outside slab [{:#x}..{:#x})",
-        decoded,
-        slab_base,
-        slab_base + page_size,
+        "D.5 corruption: decoded freelist ptr outside slab bounds",
     );
     assert!(
         (decoded - slab_base).is_multiple_of(object_size),
-        "D.5 corruption: decoded freelist ptr {:#x} misaligned (base={:#x}, obj_size={})",
-        decoded,
-        slab_base,
-        object_size,
+        "D.5 corruption: decoded freelist ptr not aligned to object size",
     );
 }
 
@@ -251,8 +245,7 @@ impl SlabCache {
         let slot_index = self.slot_index_for_addr(span_idx, addr);
         assert!(
             self.slot_is_allocated(span_idx, slot_index),
-            "SlabCache::free: double-free of address {:#x}",
-            addr,
+            "SlabCache::free: double-free detected",
         );
 
         let was_full = self.spans[span_idx].is_full();
@@ -413,9 +406,7 @@ impl SlabCache {
             if addr >= span.base && addr < span.base + self.page_size {
                 assert!(
                     (addr - span.base).is_multiple_of(self.object_size),
-                    "SlabCache: addr {:#x} not aligned to object_size {}",
-                    addr,
-                    self.object_size,
+                    "SlabCache: addr not aligned to object_size",
                 );
                 return Some(i);
             }
@@ -428,16 +419,12 @@ impl SlabCache {
         let offset = addr - span.base;
         assert!(
             offset.is_multiple_of(self.object_size),
-            "SlabCache: addr {:#x} not aligned to object_size {}",
-            addr,
-            self.object_size,
+            "SlabCache: addr not aligned to object_size",
         );
         let slot_index = offset / self.object_size;
         assert!(
             slot_index < span.total_objects,
-            "SlabCache: addr {:#x} lies outside object slots for object_size {}",
-            addr,
-            self.object_size,
+            "SlabCache: addr lies outside object slots",
         );
         slot_index
     }
@@ -463,9 +450,7 @@ impl SlabCache {
         let slot_index = self.slot_index_for_addr(span_idx, addr);
         assert!(
             !self.slot_is_allocated(span_idx, slot_index),
-            "D.5 corruption: {} {:#x} points to allocated slot",
-            label,
-            addr,
+            "D.5 corruption: {label} points to allocated slot",
         );
     }
 
