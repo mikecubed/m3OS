@@ -15,23 +15,23 @@ const NOT_IN_PARTIAL: usize = usize::MAX;
 
 /// Encode a raw freelist next-pointer for in-object storage.
 ///
-/// The encoding XORs `raw_next` with both a per-cache `secret` and the
+/// The encoding XORs `raw_next` with both a per-cache `freelist_key` and the
 /// `slot_addr` where the result will be written.  This makes each stored
-/// value position-dependent and secret-dependent:
+/// value position-dependent and key-dependent:
 ///
 /// - Overwriting the stored word with arbitrary bytes is detected on
 ///   decode (the decoded result won't be a valid in-slab pointer).
 /// - Swapping two encoded words between slots decodes to garbage.
-/// - The secret prevents cross-cache pointer forgery.
+/// - The key prevents cross-cache pointer forgery.
 #[inline]
-fn encode_next(raw_next: usize, secret: usize, slot_addr: usize) -> usize {
-    raw_next ^ secret ^ slot_addr
+fn encode_next(raw_next: usize, freelist_key: usize, slot_addr: usize) -> usize {
+    raw_next ^ freelist_key ^ slot_addr
 }
 
 /// Decode an encoded freelist pointer back to the raw next-address.
 #[inline]
-fn decode_next(encoded: usize, secret: usize, slot_addr: usize) -> usize {
-    encoded ^ secret ^ slot_addr
+fn decode_next(encoded: usize, freelist_key: usize, slot_addr: usize) -> usize {
+    encoded ^ freelist_key ^ slot_addr
 }
 
 /// Write an encoded freelist next-pointer into a free object.
@@ -41,8 +41,8 @@ fn decode_next(encoded: usize, secret: usize, slot_addr: usize) -> usize {
 /// `slot_addr` must be a valid, writable, `usize`-aligned address with at
 /// least `size_of::<usize>()` bytes available.
 #[inline]
-unsafe fn write_encoded_ptr(slot_addr: usize, raw_next: usize, secret: usize) {
-    let encoded = encode_next(raw_next, secret, slot_addr);
+unsafe fn write_encoded_ptr(slot_addr: usize, raw_next: usize, freelist_key: usize) {
+    let encoded = encode_next(raw_next, freelist_key, slot_addr);
     unsafe { (slot_addr as *mut usize).write(encoded) };
 }
 
@@ -53,9 +53,9 @@ unsafe fn write_encoded_ptr(slot_addr: usize, raw_next: usize, secret: usize) {
 /// `slot_addr` must be a valid, readable, `usize`-aligned address with at
 /// least `size_of::<usize>()` bytes, holding a previously-encoded pointer.
 #[inline]
-unsafe fn read_decoded_ptr(slot_addr: usize, secret: usize) -> usize {
+unsafe fn read_decoded_ptr(slot_addr: usize, freelist_key: usize) -> usize {
     let encoded = unsafe { (slot_addr as *const usize).read() };
-    decode_next(encoded, secret, slot_addr)
+    decode_next(encoded, freelist_key, slot_addr)
 }
 
 /// Validate that a decoded freelist pointer is either [`FREELIST_END`] or
@@ -138,7 +138,7 @@ impl SpanMeta {
 /// hardening.
 ///
 /// Free objects contain an XOR-encoded next-pointer at their start.  The
-/// encoding mixes the raw pointer with a per-cache secret and the
+/// encoding mixes the raw pointer with a per-cache key and the
 /// object's own address — corruption or cross-slot forgery is detected
 /// on every allocation.
 ///
@@ -152,8 +152,8 @@ pub struct SlabCache {
     page_size: usize,
     /// Objects that fit in a single slab page.
     objects_per_slab: usize,
-    /// Per-cache XOR secret for D.5 freelist pointer hardening.
-    secret: usize,
+    /// Per-cache XOR key for D.5 freelist pointer hardening.
+    freelist_key: usize,
     /// Out-of-line span metadata, kept sorted by base address so owning-span
     /// lookup stays O(log n) without extra side metadata.
     spans: Vec<SpanMeta>,
@@ -167,18 +167,18 @@ impl SlabCache {
     ///
     /// `page_size` is the size of each backing page (typically 4096).
     ///
-    /// A deterministic hardening secret is derived from the size
+    /// A deterministic hardening key is derived from the size
     /// parameters.  For production use, prefer
-    /// [`with_secret`](Self::with_secret) with a random secret.
+    /// [`with_freelist_key`](Self::with_freelist_key) with a random key.
     pub fn new(object_size: usize, page_size: usize) -> Self {
-        let secret = object_size
+        let freelist_key = object_size
             .wrapping_mul(0x517c_c1b7_2722_0a95)
             .wrapping_add(page_size.wrapping_mul(0x6c62_272e_07bb_0142));
-        Self::with_secret(object_size, page_size, secret)
+        Self::with_freelist_key(object_size, page_size, freelist_key)
     }
 
-    /// Create a new slab cache with an explicit D.5 hardening secret.
-    pub fn with_secret(object_size: usize, page_size: usize, secret: usize) -> Self {
+    /// Create a new slab cache with an explicit D.5 hardening key.
+    pub fn with_freelist_key(object_size: usize, page_size: usize, freelist_key: usize) -> Self {
         assert!(object_size > 0, "object_size must be > 0");
         assert!(page_size > 0, "page_size must be > 0");
         assert!(
@@ -205,7 +205,7 @@ impl SlabCache {
             object_size,
             page_size,
             objects_per_slab,
-            secret,
+            freelist_key,
             spans: Vec::new(),
             partial_list: Vec::new(),
         }
@@ -253,11 +253,11 @@ impl SlabCache {
 
         // Prepend the freed object to this slab's freelist — O(1).
         let old_head = self.spans[span_idx].freelist_head;
-        let secret = self.secret;
+        let freelist_key = self.freelist_key;
         // Safety: `addr` is within a valid slab page and object_size ≥
         // size_of::<usize>() is enforced by the constructor.
         unsafe {
-            write_encoded_ptr(addr, old_head, secret);
+            write_encoded_ptr(addr, old_head, freelist_key);
         }
         self.spans[span_idx].freelist_head = addr;
         self.set_slot_allocated(span_idx, slot_index, false);
@@ -320,7 +320,7 @@ impl SlabCache {
     fn create_span(&mut self, base: usize) -> usize {
         let span_idx = self.spans.partition_point(|span| span.base < base);
         let total = self.objects_per_slab;
-        let secret = self.secret;
+        let freelist_key = self.freelist_key;
         let bitmap_words = total.div_ceil(64);
 
         // Thread the freelist from last slot back to first so that
@@ -329,7 +329,7 @@ impl SlabCache {
         for i in (0..total).rev() {
             let slot_addr = base + i * self.object_size;
             // Safety: slot_addr is within the freshly-allocated page.
-            unsafe { write_encoded_ptr(slot_addr, next_addr, secret) };
+            unsafe { write_encoded_ptr(slot_addr, next_addr, freelist_key) };
             next_addr = slot_addr;
         }
 
@@ -367,9 +367,9 @@ impl SlabCache {
         self.assert_slot_is_free(span_idx, head, "freelist_head");
 
         // Read and decode the next pointer from the head object.
-        let secret = self.secret;
+        let freelist_key = self.freelist_key;
         // Safety: head is a freelist address within a valid slab page.
-        let next = unsafe { read_decoded_ptr(head, secret) };
+        let next = unsafe { read_decoded_ptr(head, freelist_key) };
 
         // D.5 validation: the decoded pointer must be in-bounds or sentinel.
         validate_freelist_ptr(
@@ -682,12 +682,12 @@ mod tests {
 
     #[test]
     fn d5_encode_decode_roundtrip() {
-        let secret = 0xDEAD_BEEF_CAFE_BABE_u64 as usize;
+        let freelist_key = 0xDEAD_BEEF_CAFE_BABE_u64 as usize;
         let slot_addr = 0x1000_usize;
 
         for &raw_next in &[0_usize, 0x1040, 0x1080, 0x2000, usize::MAX] {
-            let encoded = encode_next(raw_next, secret, slot_addr);
-            let decoded = decode_next(encoded, secret, slot_addr);
+            let encoded = encode_next(raw_next, freelist_key, slot_addr);
+            let decoded = decode_next(encoded, freelist_key, slot_addr);
             assert_eq!(
                 decoded, raw_next,
                 "round-trip failed for raw_next={:#x}",
@@ -698,11 +698,11 @@ mod tests {
 
     #[test]
     fn d5_encoding_is_position_dependent() {
-        let secret = 0x1234_5678_9ABC_DEF0_u64 as usize;
+        let freelist_key = 0x1234_5678_9ABC_DEF0_u64 as usize;
         let raw_next = 0x3000_usize;
 
-        let enc_a = encode_next(raw_next, secret, 0x1000);
-        let enc_b = encode_next(raw_next, secret, 0x2000);
+        let enc_a = encode_next(raw_next, freelist_key, 0x1000);
+        let enc_b = encode_next(raw_next, freelist_key, 0x2000);
         assert_ne!(
             enc_a, enc_b,
             "same raw_next at different slots must encode differently"
@@ -710,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn d5_encoding_is_secret_dependent() {
+    fn d5_encoding_is_key_dependent() {
         let slot_addr = 0x1000_usize;
         let raw_next = 0x2000_usize;
 
@@ -718,7 +718,7 @@ mod tests {
         let enc_b = encode_next(raw_next, 0xBBBB, slot_addr);
         assert_ne!(
             enc_a, enc_b,
-            "same raw_next with different secrets must encode differently"
+            "same raw_next with different keys must encode differently"
         );
     }
 
@@ -726,8 +726,8 @@ mod tests {
     #[should_panic(expected = "D.5 corruption")]
     fn d5_corruption_detected_on_allocate() {
         let mut pool = PagePool::new(4096);
-        let secret = 0xAAAA_BBBB_CCCC_DDDD_u64 as usize;
-        let mut cache = SlabCache::with_secret(64, 4096, secret);
+        let freelist_key = 0xAAAA_BBBB_CCCC_DDDD_u64 as usize;
+        let mut cache = SlabCache::with_freelist_key(64, 4096, freelist_key);
 
         // First allocate: creates slab, pops slot 0 from the freelist.
         let first = cache.allocate(&mut pool.allocator()).unwrap();
@@ -777,8 +777,8 @@ mod tests {
     #[should_panic(expected = "D.5 corruption")]
     fn d5_corruption_detected_on_invalid_head() {
         let mut pool = PagePool::new(4096);
-        let secret = 0xFEED_FACE_1234_5678_u64 as usize;
-        let mut cache = SlabCache::with_secret(64, 4096, secret);
+        let freelist_key = 0xFEED_FACE_1234_5678_u64 as usize;
+        let mut cache = SlabCache::with_freelist_key(64, 4096, freelist_key);
         let addr = cache.allocate(&mut pool.allocator()).unwrap();
 
         cache.free(addr);
@@ -792,8 +792,8 @@ mod tests {
     #[should_panic(expected = "allocated slot")]
     fn d5_corruption_detected_when_head_points_to_allocated_slot() {
         let mut pool = PagePool::new(4096);
-        let secret = 0x1357_9BDF_2468_ACED_u64 as usize;
-        let mut cache = SlabCache::with_secret(64, 4096, secret);
+        let freelist_key = 0x1357_9BDF_2468_ACED_u64 as usize;
+        let mut cache = SlabCache::with_freelist_key(64, 4096, freelist_key);
         let first = cache.allocate(&mut pool.allocator()).unwrap();
         let second = cache.allocate(&mut pool.allocator()).unwrap();
 
