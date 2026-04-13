@@ -35,6 +35,60 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 const PAGE_SIZE: u64 = 4096;
 
+// ---------------------------------------------------------------------------
+// Per-CPU page cache (A.1)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of cached frames per CPU.
+pub const PER_CPU_PAGE_CACHE_CAP: usize = 64;
+
+/// Per-CPU cache of recently freed physical frames.
+///
+/// Each core maintains a small stack of physical page addresses so that the
+/// hot-path `allocate_frame` / `free_frame` can operate without acquiring
+/// the global buddy-allocator lock.  The cache is only ever accessed by its
+/// owning core (with interrupts masked or from a non-reentrant context), so
+/// no internal locking is required.
+///
+/// Aligned to 64 bytes (one cache line) to prevent false sharing when
+/// per-core data structs are adjacent in memory.
+#[repr(C, align(64))]
+pub struct PerCpuPageCache {
+    /// Stack of cached physical addresses.  Only entries `[0..count)` are valid.
+    frames: [u64; PER_CPU_PAGE_CACHE_CAP],
+    /// Number of valid entries in `frames`.
+    count: u32,
+}
+
+#[allow(dead_code)]
+impl PerCpuPageCache {
+    /// Create an empty cache.
+    pub const fn new() -> Self {
+        Self {
+            frames: [0; PER_CPU_PAGE_CACHE_CAP],
+            count: 0,
+        }
+    }
+
+    /// Number of frames currently cached.
+    #[inline]
+    pub fn len(&self) -> u32 {
+        self.count
+    }
+
+    /// Returns `true` if the cache contains no frames.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Returns `true` if the cache is at capacity.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.count as usize >= PER_CPU_PAGE_CACHE_CAP
+    }
+}
+
 /// Frames below 1 MiB are skipped even when the region is marked Usable.
 /// Some UEFI/QEMU memory maps mark conventional low memory as Usable, but
 /// those frames may hold BIOS data area remnants or be used by UEFI firmware
