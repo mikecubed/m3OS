@@ -132,9 +132,10 @@ or "regression" are not sufficient; the bundle names the exact commands.
 |---|---|---|
 | Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests pass |
 | Unit + property tests | `cargo test -p kernel-core` | Host-side pure-logic invariants hold |
-| QEMU boot smoke test | `cargo xtask smoke-test` | Boot → login → shell → TCC compile round-trip |
-| Regression suite | `cargo xtask regression` | SMP-sensitive paths (fork, IPC, PTY, signal, exit-group, kbd-echo) pass |
-| Stress suite (CI nightly) | `cargo xtask stress --test fork-overlap --iterations 50` | No timing-dependent failures across repeated runs |
+| Loom concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Lock-free allocator paths are linearizable |
+| QEMU boot smoke test | `cargo xtask smoke-test --timeout 300` | Boot → login → UID check → service list → ext2 write/verify/delete → log pipeline → TCC compile |
+| Regression suite | `cargo xtask regression --timeout 90` | 10 registered SMP-sensitive and headless-operator scenarios pass |
+| Stress suite (nightly only) | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | No timing-dependent failures across repeated runs |
 
 ### Manual checks (performed once per release-candidate image)
 
@@ -147,12 +148,48 @@ or "regression" are not sufficient; the bundle names the exact commands.
 | Shutdown/reboot | `shutdown` from shell | QEMU exits cleanly, no panic in serial log |
 | Reboot | `reboot` from shell | System returns to login prompt |
 | Failure recovery | `service stop sshd && service start sshd` | Service stops and restarts without side effects |
+| su/passwd auth (security floor) | `su user` with correct password; `passwd` to change password | `su` authenticates via shadow hash; `passwd` writes a fresh salted hash |
 
 ### Gate status
 
-The automated gates exist today (Phase 43c). The manual checks are documented
-here as a repeatable operator checklist. Track B turns additional manual checks
-into automation where practical.
+**Smoke test** (`cargo xtask smoke-test --timeout 300`) now covers headless
+workflow steps 1–5: boot/login with security-floor verification (`id` shows
+uid 0), service inspection (`service list` header + core daemon entry),
+storage verification (ext2 touch/ls/rm), log inspection (`logger` +
+`grep /var/log/messages`), and package/build basics (TCC compile). Step
+labels use `guest/` prefixes to distinguish guest-side failures from harness
+failures in CI output.
+
+**Regression suite** (`cargo xtask regression`) covers 10 scenarios:
+
+| Category | Tests |
+|---|---|
+| SMP-sensitive paths | fork-overlap, ipc-wake, pty-overlap, signal-reset, exit-group-teardown, kbd-echo |
+| Headless operator workflows | service-lifecycle, storage-roundtrip, log-pipeline, security-floor |
+
+The `security-floor` regression explicitly verifies: (a) `id` confirms
+uid=0 after login (kernel-enforced setuid/setgid), (b) `/etc/shadow`
+contains a SHA-256-family shadow hash (`$sha256$` on the pre-seeded image,
+`$sha256i$10000$` after first-boot password setup or `passwd`), and (c)
+`whoami` resolves the authenticated uid.
+
+The Phase 48 security floor also includes `getrandom()`-backed salt generation,
+`su` authentication, `passwd` hash rewriting, and non-root privilege
+enforcement. Those remain explicit manual checks because the current automated
+guest flows do not exercise the first-boot or interactive password-change
+paths on every run.
+
+**Shutdown/reboot** (headless workflow §7) is verified by the manual
+release checklist. Automated shutdown verification requires QEMU-exit
+coordination that is fragile under CI load.
+
+**Gate artifact locations** are documented in a single table in
+`docs/43c-regression-stress-ci.md` § Gate Artifact Locations.
+
+**CI alignment:** PR and main-branch workflows run the same gate bundle
+(`check` + loom + `smoke-test --timeout 300` + `regression --timeout 90`).
+Nightly stress (`stress --test ssh-overlap --iterations 50`) is sustaining
+evidence, not a merge gate.
 
 ---
 

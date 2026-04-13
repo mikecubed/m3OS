@@ -2572,8 +2572,121 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "prompt after hello",
     });
 
-    // Keep smoke-test scoped to boot/login plus a minimal userspace/TCC proof.
-    // Deeper interactive coverage belongs in targeted regression tests.
+    // -----------------------------------------------------------------------
+    // 4. Security floor verification (Phase 48 — headless workflow §1)
+    // -----------------------------------------------------------------------
+    // Verify kernel-enforced setuid/setgid transition by checking effective
+    // uid via the `id` command. The login binary's shadow-file auth path
+    // already succeeded (we reached a shell prompt), and on first-boot the
+    // getrandom()-backed password hash was stored. This step makes the
+    // credential state observable in serial output.
+    steps.push(SmokeStep::Send {
+        input: "/bin/id\n",
+        label: "guest/auth: verify uid after login",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=0",
+        timeout_secs: 10,
+        label: "guest/auth: id shows uid=0 (root)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after id",
+    });
+
+    // -----------------------------------------------------------------------
+    // 5. Service inspection (headless workflow §2)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/service list\n",
+        label: "guest/service: enumerate managed services",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NAME",
+        timeout_secs: 15,
+        label: "guest/service: list header visible",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "syslogd",
+        timeout_secs: 10,
+        label: "guest/service: list includes syslogd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after service list",
+    });
+
+    // -----------------------------------------------------------------------
+    // 6. Storage verification (headless workflow §3)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/touch /root/smoke_test_file\n",
+        label: "guest/storage: create file on ext2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after touch",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ls /root/smoke_test_file\n",
+        label: "guest/storage: verify file exists",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "smoke_test_file",
+        timeout_secs: 10,
+        label: "guest/storage: ls shows created file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/storage: prompt after ls",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/rm /root/smoke_test_file\n",
+        label: "guest/storage: remove test file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after rm",
+    });
+
+    // -----------------------------------------------------------------------
+    // 7. Log inspection (headless workflow §4)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/logger \"SMOKE_LOG_MARKER\"\n",
+        label: "guest/log: inject smoke marker via /dev/log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after logger",
+    });
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep SMOKE_LOG_MARKER /var/log/messages\n",
+        label: "guest/log: verify smoke marker in system log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE_LOG_MARKER",
+        timeout_secs: 15,
+        label: "guest/log: smoke marker found in system log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after log inspection",
+    });
+
+    // Shutdown/reboot (headless workflow §7) is verified by the manual
+    // release checklist. Automated shutdown verification requires precise
+    // QEMU-exit coordination that is fragile under CI load; the regression
+    // suite covers the operator workflows leading up to shutdown.
+
     return steps;
 
     // -----------------------------------------------------------------------
@@ -5641,6 +5754,30 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
         },
+        RegressionTest {
+            name: "service-lifecycle",
+            description: "Service list/status in the headless operator workflow",
+            guest_steps: service_lifecycle_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "storage-roundtrip",
+            description: "Ext2 write/read/delete round-trip on persistent storage",
+            guest_steps: storage_roundtrip_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "log-pipeline",
+            description: "Logger injection via /dev/log and /var/log/messages verification",
+            guest_steps: log_pipeline_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "security-floor",
+            description: "Phase 48 security floor: shadow auth, credential transition, hash format",
+            guest_steps: security_floor_steps,
+            timeout_secs: 90,
+        },
     ]
 }
 
@@ -5781,6 +5918,188 @@ fn kbd_echo_steps() -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "second echo received",
     });
+    steps
+}
+
+/// Guest steps for the service-lifecycle regression: boot, login, run
+/// `service list` and `service status sshd` to verify the init daemon's
+/// service management is responsive in the headless workflow.
+fn service_lifecycle_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service list\n",
+        label: "guest/service: enumerate services",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NAME",
+        timeout_secs: 15,
+        label: "guest/service: list header visible",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "sshd",
+        timeout_secs: 10,
+        label: "guest/service: list includes sshd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after list",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status sshd\n",
+        label: "guest/service: query sshd status",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Name:",
+        timeout_secs: 15,
+        label: "guest/service: status shows service name",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "State:",
+        timeout_secs: 10,
+        label: "guest/service: status shows service state",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after status sshd",
+    });
+    steps
+}
+
+/// Guest steps for the storage-roundtrip regression: write, read-back, and
+/// delete a file on the ext2 root filesystem to verify persistent storage.
+fn storage_roundtrip_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo STORAGE_OK > /root/regtest_file\n",
+        label: "guest/storage: write file on ext2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after write",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /root/regtest_file\n",
+        label: "guest/storage: read file back",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "STORAGE_OK",
+        timeout_secs: 10,
+        label: "guest/storage: verify file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/storage: prompt after read",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/rm /root/regtest_file\n",
+        label: "guest/storage: delete file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after delete",
+    });
+    steps
+}
+
+/// Guest steps for the log-pipeline regression: inject a tagged message via
+/// `logger` and verify it appears in `/var/log/messages` through the syslogd
+/// /dev/log → file pipeline.
+fn log_pipeline_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/logger \"REGTEST_LOG_MARKER\"\n",
+        label: "guest/log: inject log message via /dev/log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after logger",
+    });
+    // Small delay for syslogd to flush to disk.
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep REGTEST_LOG_MARKER /var/log/messages\n",
+        label: "guest/log: verify message in syslog",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "REGTEST_LOG_MARKER",
+        timeout_secs: 15,
+        label: "guest/log: marker found in /var/log/messages",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/log: prompt after grep",
+    });
+    steps
+}
+
+/// Guest steps for the Phase 48 security-floor regression: verify that
+/// the headless login path exercises kernel-enforced credential transitions,
+/// getrandom()-backed salted SHA-256 hashes, and shadow-file authentication.
+fn security_floor_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+
+    // 1. Verify kernel credential state: setuid/setgid transition occurred.
+    steps.push(SmokeStep::Send {
+        input: "/bin/id\n",
+        label: "guest/auth: verify kernel credential state",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=0",
+        timeout_secs: 10,
+        label: "guest/auth: uid=0 confirms setuid transition",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after id",
+    });
+
+    // 2. Verify shadow file contains a salted SHA-256-family password hash
+    //    (not plaintext, not locked). Pre-seeded images use $sha256$ while
+    //    first-boot or passwd updates produce $sha256i$ hashes with a fresh
+    //    getrandom()-backed salt.
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep root /etc/shadow\n",
+        label: "guest/auth: inspect shadow hash format",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$sha256",
+        timeout_secs: 10,
+        label: "guest/auth: shadow contains SHA-256-family hash",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after shadow check",
+    });
+
+    // 3. Verify whoami resolves the authenticated uid to "root".
+    steps.push(SmokeStep::Send {
+        input: "/bin/whoami\n",
+        label: "guest/auth: verify whoami resolution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root",
+        timeout_secs: 10,
+        label: "guest/auth: whoami confirms root",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after whoami",
+    });
+
     steps
 }
 

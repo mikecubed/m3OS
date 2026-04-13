@@ -36,7 +36,7 @@ Regression tests (QEMU, ~30s each):
   cargo xtask regression --test fork-overlap
 
 Smoke test (QEMU, full boot validation):
-  cargo xtask smoke-test              # boot + login + compile + coreutils
+  cargo xtask smoke-test              # boot + login + auth + service + storage + log + TCC compile
 
 Stress tests (QEMU, repeated iterations):
   cargo xtask stress --test ssh-overlap --iterations 50
@@ -53,6 +53,13 @@ kernel panics/faults in serial output as immediate failures.
 | `fork-overlap` | `/bin/fork-test` | Concurrent fork() from multiple parents |
 | `ipc-wake` | `/bin/unix-socket-test` | Overlapping IPC send/recv/reply |
 | `pty-overlap` | `/bin/pty-test` | PTY allocation + shell spawning |
+| `signal-reset` | `/bin/signal-test` | Exec-time signal disposition reset |
+| `exit-group-teardown` | `/bin/thread-test` | exit_group() reaps live spinning sibling |
+| `kbd-echo` | shell echo | Keyboard input via serial→TTY→stdin |
+| `service-lifecycle` | `/bin/service` | Service list/status in headless workflow |
+| `storage-roundtrip` | shell commands | Ext2 write/read/delete round-trip |
+| `log-pipeline` | `/bin/logger`, `/bin/grep` | Logger → syslogd → /var/log/messages |
+| `security-floor` | `/bin/id`, `/bin/whoami`, `/bin/grep` | Phase 48 shadow auth, credential transition, hash format |
 
 ### Stress Tests
 
@@ -124,9 +131,23 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 
 | Tier | Trigger | Tests | Time |
 |---|---|---|---|
-| PR | Every pull request | `check` + `smoke-test` + `regression` | ~3-4 min |
-| Build | Push to main | Same as PR | ~3-4 min |
-| Nightly | 3 AM UTC daily | `stress --test ssh-overlap --iterations 50` | ~60 min |
+| PR | Every pull request | `cargo xtask check` + loom + `smoke-test` + `regression` | ~5-8 min |
+| Build | Push to main | Same as PR | ~5-8 min |
+| Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50` | ~60 min |
+
+### Gate Artifact Locations
+
+All automated gate artifacts are produced under `target/` and uploaded as CI
+artifacts on failure. This is the single reference for artifact paths:
+
+| Artifact | Path | When produced |
+|---|---|---|
+| Regression serial logs | `target/regression/<test-name>/serial.log` | Every regression run |
+| Regression trace dumps | `target/regression/<test-name>/trace.log` | On kernel crash |
+| Stress serial logs | `target/stress/<test-name>/<iter>/serial.log` | Every stress iteration |
+| Stress trace dumps | `target/stress/<test-name>/<iter>/trace.log` | On kernel crash |
+| CI regression bundle | `regression-artifacts` (GitHub Actions) | On PR/build failure |
+| CI stress bundle | `stress-artifacts` (GitHub Actions) | On nightly failure |
 
 ## Adding a New Regression Test
 

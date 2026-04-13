@@ -127,6 +127,10 @@ pub extern "C" fn _start() -> ! {
     close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");
+    write_str(
+        STDOUT_FILENO,
+        "[security] getrandom salt + iterated SHA-256 hash written\n",
+    );
     exit(0);
 }
 

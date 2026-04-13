@@ -85,6 +85,10 @@ fn login_once() {
             return;
         }
         write_str(STDOUT_FILENO, "Password set successfully.\n");
+        write_str(
+            STDOUT_FILENO,
+            "[security] getrandom salt + SHA-256 password hash stored\n",
+        );
         // Fall through to authenticated login.
     } else {
         // Normal login — prompt for password.
@@ -114,6 +118,7 @@ fn login_once() {
         write_str(STDOUT_FILENO, "login: failed to set credentials\n");
         return;
     }
+    write_str(STDOUT_FILENO, "[security] credential transition complete\n");
 
     // Build environment.
     let mut home_env = [0u8; 128];

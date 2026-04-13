@@ -158,6 +158,16 @@ static THREAD_TEST_ELF: &[u8] = generated_initrd_asset!("thread-test");
 static CRYPTO_TEST_ELF: &[u8] = generated_initrd_asset!("crypto-test");
 static SHA256SUM_ELF: &[u8] = generated_initrd_asset!("sha256sum");
 static GENKEY_ELF: &[u8] = generated_initrd_asset!("genkey");
+// Phase 46: system service/operator commands
+static SERVICE_ELF: &[u8] = generated_initrd_asset!("service");
+static LOGGER_ELF: &[u8] = generated_initrd_asset!("logger");
+static SHUTDOWN_ELF: &[u8] = generated_initrd_asset!("shutdown");
+static REBOOT_ELF: &[u8] = generated_initrd_asset!("reboot");
+static HOSTNAME_ELF: &[u8] = generated_initrd_asset!("hostname");
+static WHO_ELF: &[u8] = generated_initrd_asset!("who");
+static W_ELF: &[u8] = generated_initrd_asset!("w");
+static LAST_ELF: &[u8] = generated_initrd_asset!("last");
+static CRONTAB_ELF: &[u8] = generated_initrd_asset!("crontab");
 // Phase 44: musl-linked Rust std programs
 static HELLO_RUST_ELF: &[u8] = generated_initrd_asset!("hello-rust");
 static SYSINFO_RUST_ELF: &[u8] = generated_initrd_asset!("sysinfo-rust");
@@ -411,6 +421,46 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "genkey",
         RamdiskNode::File {
             content: GENKEY_ELF,
+        },
+    ),
+    // Phase 46: system service/operator commands
+    (
+        "service",
+        RamdiskNode::File {
+            content: SERVICE_ELF,
+        },
+    ),
+    (
+        "logger",
+        RamdiskNode::File {
+            content: LOGGER_ELF,
+        },
+    ),
+    (
+        "shutdown",
+        RamdiskNode::File {
+            content: SHUTDOWN_ELF,
+        },
+    ),
+    (
+        "reboot",
+        RamdiskNode::File {
+            content: REBOOT_ELF,
+        },
+    ),
+    (
+        "hostname",
+        RamdiskNode::File {
+            content: HOSTNAME_ELF,
+        },
+    ),
+    ("who", RamdiskNode::File { content: WHO_ELF }),
+    ("w", RamdiskNode::File { content: W_ELF }),
+    ("last", RamdiskNode::File { content: LAST_ELF }),
+    (
+        "crontab",
+        RamdiskNode::File {
+            content: CRONTAB_ELF,
         },
     ),
     // Phase 44: musl-linked Rust std programs

@@ -64,6 +64,10 @@ fn su_main(args: &[&str]) -> i32 {
         write_str(STDOUT_FILENO, "su: failed to set credentials\n");
         exit(1);
     }
+    write_str(
+        STDOUT_FILENO,
+        "[security] su credential transition complete\n",
+    );
 
     // Exec the target user's shell.
     let env_path: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";

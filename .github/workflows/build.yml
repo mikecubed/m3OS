@@ -51,13 +51,13 @@ jobs:
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom --quiet
 
-      - name: Smoke test (boot + login + TCC compile)
+      - name: Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.
           rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 180
+          cargo xtask smoke-test --timeout 300
 
-      - name: Regression tests (fork-overlap, ipc-wake, pty-overlap, signal-reset, kbd-echo)
+      - name: Regression suite (SMP races + headless operator workflows)
         run: cargo xtask regression --timeout 90
 
       - name: Upload regression artifacts on failure
