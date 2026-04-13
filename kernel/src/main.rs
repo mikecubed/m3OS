@@ -1238,16 +1238,27 @@ mod tests {
         let stats = crate::mm::frame_allocator::frame_stats();
 
         assert!(stats.total_frames > 0, "no frames reported");
+
+        // Linux-like accounting: total = available + allocated,
+        // where available = free (buddy) + per_cpu_cached.
         assert_eq!(
             stats.total_frames,
-            stats.free_frames + stats.allocated_frames,
-            "frame count mismatch: total={} free={} alloc={}",
+            stats.available_frames + stats.allocated_frames,
+            "frame count mismatch: total={} available={} alloc={}",
             stats.total_frames,
-            stats.free_frames,
+            stats.available_frames,
             stats.allocated_frames
         );
+        assert_eq!(
+            stats.available_frames,
+            stats.free_frames + stats.per_cpu_cached,
+            "available mismatch: available={} free={} cached={}",
+            stats.available_frames,
+            stats.free_frames,
+            stats.per_cpu_cached
+        );
 
-        // Per-order free counts should sum to the total free count.
+        // Per-order free counts should sum to free_frames (buddy-only, no per-CPU).
         let order_sum: usize = stats
             .free_by_order
             .iter()
@@ -1255,17 +1266,15 @@ mod tests {
             .map(|(order, &count)| count * (1 << order))
             .sum();
         assert_eq!(
-            order_sum + stats.per_cpu_cached,
-            stats.free_frames,
-            "buddy order sum ({}) + per_cpu_cached ({}) != free_frames ({})",
-            order_sum,
-            stats.per_cpu_cached,
-            stats.free_frames
+            order_sum, stats.free_frames,
+            "buddy order sum ({}) != free_frames ({})",
+            order_sum, stats.free_frames
         );
         serial_println!(
-            "frame stats: total={} free={} allocated={} per_cpu_cached={}",
+            "frame stats: total={} free={} available={} allocated={} per_cpu_cached={}",
             stats.total_frames,
             stats.free_frames,
+            stats.available_frames,
             stats.allocated_frames,
             stats.per_cpu_cached
         );

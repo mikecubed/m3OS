@@ -7757,14 +7757,15 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     let _ = writeln!(writer, "Frames (4 KiB pages):");
     let _ = writeln!(
         writer,
-        "  total: {}  free: {}  allocated: {}",
-        frames.total_frames, frames.free_frames, frames.allocated_frames
+        "  total: {}  free: {}  available: {}  allocated: {}",
+        frames.total_frames, frames.free_frames, frames.available_frames, frames.allocated_frames
     );
     let _ = writeln!(
         writer,
-        "  memory: {} MiB total, {} MiB free",
+        "  memory: {} MiB total, {} MiB free, {} MiB available",
         frames.total_frames * 4 / 1024,
-        frames.free_frames * 4 / 1024
+        frames.free_frames * 4 / 1024,
+        frames.available_frames * 4 / 1024
     );
     let _ = write!(writer, "  buddy orders:");
     for (order, &count) in frames.free_by_order.iter().enumerate() {
@@ -7774,7 +7775,11 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     }
     let _ = writeln!(writer);
     if frames.per_cpu_cached > 0 {
-        let _ = writeln!(writer, "  per-cpu cached: {}", frames.per_cpu_cached);
+        let _ = writeln!(
+            writer,
+            "  per-cpu cached: {} (reclaimable, not in MemFree)",
+            frames.per_cpu_cached
+        );
     }
     let _ = writeln!(writer);
     let _ = writeln!(writer, "Slab Caches (named):");

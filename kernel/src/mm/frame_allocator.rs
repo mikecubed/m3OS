@@ -726,16 +726,35 @@ fn per_cpu_cached_total() -> usize {
 }
 
 /// Frame allocator statistics snapshot.
+///
+/// # Accounting policy (Linux-like)
+///
+/// * **`free_frames`** — buddy-managed frames immediately allocatable without
+///   draining any per-CPU cache.  Corresponds to Linux `MemFree`.
+/// * **`available_frames`** — `free_frames` plus reclaimable per-CPU cached
+///   pages.  Corresponds to Linux `MemAvailable`.
+/// * **`allocated_frames`** — `total_frames − available_frames`.  Frames
+///   actively backing kernel or user mappings.
+/// * **`per_cpu_cached`** — frames held in per-CPU page caches.  Excluded from
+///   `free_frames`, included in `available_frames`.
 pub struct FrameStats {
     pub total_frames: usize,
+    /// Buddy-managed free frames (immediately allocatable, excludes per-CPU caches).
     pub free_frames: usize,
+    /// Frames available for allocation (free + reclaimable per-CPU caches).
+    pub available_frames: usize,
+    /// Frames in use by kernel/userspace (`total − available`).
     pub allocated_frames: usize,
     pub free_by_order: [usize; kernel_core::buddy::MAX_ORDER + 1],
-    /// Frames currently held in per-CPU page caches (already counted in `free_frames`).
+    /// Frames held in per-CPU page caches (reclaimable, not in buddy free lists).
     pub per_cpu_cached: usize,
 }
 
 /// Returns a snapshot of frame allocator statistics.
+///
+/// Uses Linux-like accounting: `free_frames` reflects only buddy-managed pages
+/// (immediately allocatable).  Per-CPU cached pages are excluded from free but
+/// included in `available_frames` because they are reclaimable.
 pub fn frame_stats() -> FrameStats {
     let alloc = FRAME_ALLOCATOR.0.lock();
     let total = alloc.total_frames;
@@ -745,11 +764,12 @@ pub fn frame_stats() -> FrameStats {
         (alloc.free_count, [0; kernel_core::buddy::MAX_ORDER + 1])
     };
     let cached = per_cpu_cached_total();
-    let free = buddy_free + cached;
+    let available = buddy_free + cached;
     FrameStats {
         total_frames: total,
-        free_frames: free,
-        allocated_frames: total.saturating_sub(free),
+        free_frames: buddy_free,
+        available_frames: available,
+        allocated_frames: total.saturating_sub(available),
         free_by_order: by_order,
         per_cpu_cached: cached,
     }

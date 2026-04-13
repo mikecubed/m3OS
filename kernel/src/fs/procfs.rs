@@ -285,17 +285,20 @@ fn render_meminfo() -> String {
     let frames = frame_allocator::frame_stats();
     let heap = crate::mm::heap::heap_stats();
     let total_kib = frames.total_frames * 4;
+    // MemFree: buddy-managed only (excludes per-CPU caches).
     let free_kib = frames.free_frames * 4;
-    let available_kib = free_kib;
+    // MemAvailable: buddy free + reclaimable per-CPU caches.
+    let available_kib = frames.available_frames * 4;
     let per_cpu_cached_kib = frames.per_cpu_cached * 4;
     let slab_pages_kib = heap.slab_pages * 4;
     let large_pages_kib = heap.page_backed_pages * 4;
     alloc::format!(
         concat!(
-            "MemTotal: {:>8} kB\n",
-            "MemFree:  {:>8} kB\n",
-            "MemAvailable: {:>5} kB\n",
-            "PerCpuCached: {:>4} kB\n",
+            "MemTotal:     {:>8} kB\n",
+            "MemFree:      {:>8} kB\n",
+            "MemAvailable: {:>8} kB\n",
+            "PerCpuCached: {:>8} kB\n",
+            "Allocated:    {:>8} kB\n",
             "KernelAllocator: {}\n",
             "KernelSlabPages: {:>4} kB\n",
             "KernelLargePages: {:>3} kB\n"
@@ -304,6 +307,7 @@ fn render_meminfo() -> String {
         free_kib,
         available_kib,
         per_cpu_cached_kib,
+        frames.allocated_frames * 4,
         if heap.size_class_active {
             "size-class"
         } else {

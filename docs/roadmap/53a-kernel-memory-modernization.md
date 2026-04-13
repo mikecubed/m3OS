@@ -85,6 +85,22 @@ Replace `Vec::position()`-based free-block removal with an O(1)-removable per-or
 
 `frame_stats()`, `heap_stats()`, `/proc/meminfo`, and `sys_meminfo` currently assume a single global frame pool and a fixed heap/slab shape. Phase 53a must define how per-CPU cached pages, size-class slabs, remote free queues, and page-backed large allocations appear in those stats so debugging and tests stay meaningful during the cutover.
 
+### Memory accounting policy (Track F.3 — Linux-like semantics)
+
+The project adopts Linux-like memory accounting:
+
+| Metric | Definition | `/proc/meminfo` field |
+|---|---|---|
+| **MemFree** | Buddy-managed frames immediately allocatable without draining any per-CPU cache | `MemFree` |
+| **MemAvailable** | `MemFree` + reclaimable per-CPU cached pages | `MemAvailable` |
+| **Allocated** | `MemTotal − MemAvailable`.  Frames actively backing kernel or user mappings | `Allocated` |
+| **PerCpuCached** | Frames held in per-CPU page caches; excluded from MemFree, included in MemAvailable | `PerCpuCached` |
+
+Key invariants enforced by `frame_stats_consistent()`:
+- `total_frames == available_frames + allocated_frames`
+- `available_frames == free_frames + per_cpu_cached`
+- `sum(order_count × 2^order) == free_frames` (buddy orders sum to buddy-only free count)
+
 ## How This Builds on Earlier Phases
 
 - Replaces Phase 33's `LockedHeap` + unused `SlabCache` with a production-grade allocator stack
