@@ -756,15 +756,23 @@ mod tests {
     // Phase 33 — Memory subsystem tests
     // -----------------------------------------------------------------------
 
-    /// A.4: Verify the kernel heap grows automatically via the RetryAllocator
-    /// when the initial heap is exhausted.
+    /// C.1/C.2: Verify the post-cutover allocator can satisfy large runtime
+    /// allocations without disturbing the bootstrap heap accounting.
     #[test_case]
     fn heap_grows_on_oom() {
-        use crate::mm::heap::{HEAP_INITIAL_SIZE, heap_stats};
+        use crate::mm::{
+            frame_allocator::frame_stats,
+            heap::{HEAP_INITIAL_SIZE, heap_stats},
+        };
         use alloc::vec::Vec;
 
         let before = heap_stats();
+        let frames_before = frame_stats();
         assert!(before.total_size >= HEAP_INITIAL_SIZE);
+        assert!(
+            before.size_class_active,
+            "size-class allocator was not activated before runtime tests",
+        );
 
         // Allocate a series of 256 KiB blocks to push past initial heap.
         let block_size = 256 * 1024;
@@ -783,23 +791,44 @@ mod tests {
         }
 
         let after = heap_stats();
-        // Heap must have grown beyond initial size.
+        let frames_after = frame_stats();
+        // Runtime allocations should increase allocator activity and consume
+        // backing pages without requiring the bootstrap heap itself to grow.
         assert!(
-            after.total_size > HEAP_INITIAL_SIZE,
-            "heap did not grow: total_size={} initial={}",
-            after.total_size,
-            HEAP_INITIAL_SIZE
+            after.alloc_count > before.alloc_count,
+            "allocator did not record new allocations: before={} after={}",
+            before.alloc_count,
+            after.alloc_count
+        );
+        assert!(
+            after.page_backed_pages > before.page_backed_pages,
+            "page-backed allocation count did not increase: before={} after={}",
+            before.page_backed_pages,
+            after.page_backed_pages
+        );
+        assert!(
+            frames_after.allocated_frames > frames_before.allocated_frames,
+            "frame usage did not increase: before={} after={}",
+            frames_before.allocated_frames,
+            frames_after.allocated_frames
         );
         serial_println!(
-            "heap grew: {} KiB → {} KiB ({} allocs)",
-            before.total_size / 1024,
+            "allocator grew via page-backed path: bootstrap={} KiB large_pages={} alloc_delta={}",
             after.total_size / 1024,
+            after.page_backed_pages,
             after.alloc_count - before.alloc_count
         );
 
-        // Drop all blocks — heap should have free space again.
+        // Drop all blocks — backing pages should return to the frame allocator.
         drop(blocks);
         let final_stats = heap_stats();
+        let frames_final = frame_stats();
+        assert!(
+            frames_final.allocated_frames < frames_after.allocated_frames,
+            "dropping blocks did not release backing pages: after={} final={}",
+            frames_after.allocated_frames,
+            frames_final.allocated_frames
+        );
         assert!(final_stats.free_bytes > 0);
     }
 
@@ -809,10 +838,15 @@ mod tests {
     fn buddy_alloc_free_no_leak() {
         use crate::mm::frame_allocator;
 
+        // Pre-allocate the storage Vec so that its slab page consumption
+        // happens before we snapshot the free count.  Without this, the
+        // size-class allocator's first slab page allocation would appear
+        // as a frame leak.
+        let mut frames = alloc::vec::Vec::with_capacity(16);
+
         let before = frame_allocator::free_count();
 
         // Allocate 16 frames.
-        let mut frames = alloc::vec::Vec::new();
         for _ in 0..16 {
             let frame = frame_allocator::allocate_frame().expect("frame alloc failed");
             frames.push(frame.start_address().as_u64());

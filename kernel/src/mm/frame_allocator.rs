@@ -701,6 +701,13 @@ pub fn total_frames() -> usize {
     FRAME_ALLOCATOR.0.lock().total_frames
 }
 
+/// Returns the highest physical frame number from the memory map.
+///
+/// Used by the heap allocator to size the dense page-metadata side table.
+pub fn max_frame_number() -> usize {
+    FRAME_ALLOCATOR.0.lock().max_frame_number as usize
+}
+
 /// Sum of frames currently held in all per-CPU page caches.
 fn per_cpu_cached_total() -> usize {
     if !crate::smp::is_per_core_ready() {

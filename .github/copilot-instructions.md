@@ -192,7 +192,6 @@ every call site.
 | `x86_64` | `PageTable`, `IDT`, `GDT`, `PhysAddr`/`VirtAddr`, port I/O |
 | `uart_16550` | Serial port driver — primary debug output |
 | `pic8259` | 8259 PIC init and EOI — hardware interrupts |
-| `linked_list_allocator` | `#[global_allocator]` for the kernel heap |
 | `spin` | `Mutex`/`RwLock` for `no_std` |
 | `log` | Logging facade; backend writes to serial |
 

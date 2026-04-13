@@ -128,6 +128,18 @@ fn slab_page_alloc() -> Option<usize> {
     Some((crate::mm::phys_offset() + frame.start_address().as_u64()) as usize)
 }
 
+/// Page allocator callback for size-class slab caches.
+///
+/// Unlike the generic named-cache helper above, this tags the backing page in
+/// the heap allocator's dense metadata table so `GlobalAlloc::dealloc` can
+/// recover the owning size class from the object address.
+fn size_class_page_alloc(class_idx: usize) -> Option<usize> {
+    let frame = crate::mm::frame_allocator::allocate_frame()?;
+    let phys = frame.start_address().as_u64();
+    crate::mm::heap::register_slab_page(phys, class_idx);
+    Some((crate::mm::phys_offset() + phys) as usize)
+}
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -225,7 +237,7 @@ pub fn magazine_alloc(class_idx: usize) -> Option<*mut u8> {
         let mut slab = state.slab.lock();
         // Fill the loaded magazine from the slab.
         while !pair.loaded.is_full() {
-            if let Some(addr) = slab.allocate(&mut slab_page_alloc) {
+            if let Some(addr) = slab.allocate(&mut || size_class_page_alloc(class_idx)) {
                 let _ = pair.loaded.push(addr as *mut u8);
             } else {
                 break;
@@ -311,7 +323,8 @@ pub fn magazine_free(class_idx: usize, ptr: *mut u8) {
 fn slab_alloc_fallback(class_idx: usize) -> Option<*mut u8> {
     let state = &sc_state()[class_idx];
     let mut slab = state.slab.lock();
-    slab.allocate(&mut slab_page_alloc).map(|a| a as *mut u8)
+    slab.allocate(&mut || size_class_page_alloc(class_idx))
+        .map(|a| a as *mut u8)
 }
 
 /// Direct slab free (pre-SMP fallback).
