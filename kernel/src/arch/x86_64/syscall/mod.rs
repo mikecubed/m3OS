@@ -7755,6 +7755,9 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
         }
     }
     let _ = writeln!(writer);
+    if frames.per_cpu_cached > 0 {
+        let _ = writeln!(writer, "  per-cpu cached: {}", frames.per_cpu_cached);
+    }
     let _ = writeln!(writer);
     let _ = writeln!(writer, "Slab Caches:");
     fn fmt_slab(w: &mut BufWriter<'_>, name: &str, s: &kernel_core::slab::SlabStats) {

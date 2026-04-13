@@ -239,7 +239,11 @@ fn try_grow_on_oom_for_layout(layout: Layout) -> bool {
             return true;
         }
     }
-    false
+
+    // Last resort: drain per-CPU page caches to recover hoarded frames (A.4),
+    // then retry the smallest growth that satisfies the layout.
+    super::frame_allocator::drain_per_cpu_caches();
+    grow_heap(requested).is_ok()
 }
 
 /// Attempt to grow the heap on OOM (simple 1 MiB attempt).
