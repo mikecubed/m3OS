@@ -3,9 +3,10 @@
 ## Milestone Goal
 
 All CPU cores dispatch and run user tasks. The BSP-only restriction is removed by
-making syscall infrastructure per-core. The scheduler uses per-CPU run queues with
-load balancing, and tasks have priority levels. This is the single highest-impact
-performance improvement — the OS goes from effectively single-core to true multi-core.
+making syscall infrastructure per-core. The scheduler introduces per-CPU run queues
+with load balancing and task priorities, substantially improving dispatch locality
+and multi-core throughput even though the global scheduler lock remains on the
+dispatch hot path for task-state coordination.
 
 ## Learning Goals
 
@@ -56,8 +57,13 @@ PerCoreData {
 - `yield_now()` re-enqueues to the local queue.
 - `wake()` enqueues to the target core's queue (or the waker's queue).
 
+**Shipped state (audited Phase 52d):** Per-core run queues, work-stealing,
+load-balancing with migration cooldown, and dead-slot recycling all landed.
+However, the global `SCHEDULER` lock is still acquired on every dispatch iteration
+for task-state reads, transitions, and post-switch bookkeeping.
+
 **Benefits:**
-- No global lock contention on the scheduler.
+- Ready-queue contention is reduced compared to a single global queue.
 - Cache-warm tasks stay on the same core.
 
 ### Load Balancing
@@ -145,7 +151,7 @@ Expose via `times()` syscall and future `/proc/stat`.
 2. Verify: two cores can handle syscalls simultaneously without corruption.
 3. Remove BSP-only guard in `pick_next()`.
 4. Verify: tasks run on multiple cores (log which core runs which task).
-5. Implement per-CPU run queues, replacing the global scheduler lock.
+5. Implement per-CPU run queues and move ready-queue contention off the single global queue while keeping the global scheduler lock for task-state coordination.
 6. Implement load balancing (periodic migration).
 7. Add priority field to `Task`; update `pick_next()` to respect priorities.
 8. Implement `sched_setaffinity` / `sched_getaffinity` syscalls.
@@ -157,7 +163,7 @@ Expose via `times()` syscall and future `/proc/stat`.
 
 - Tasks run on all available cores (verified via per-core logging).
 - Two processes making syscalls simultaneously on different cores do not corrupt state.
-- Per-CPU run queues eliminate global scheduler lock contention.
+- Per-CPU run queues reduce ready-queue contention, but the global scheduler lock remains on the dispatch hot path until later work.
 - Load balancing distributes tasks across cores (no core is idle while another has >1 ready task).
 - Priority 0 (real-time) tasks always preempt priority 20 (normal) tasks.
 - `sched_setaffinity` pins a task to a specific core.

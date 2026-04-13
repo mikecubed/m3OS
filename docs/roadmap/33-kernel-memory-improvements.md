@@ -3,15 +3,16 @@
 **Status:** Complete
 **Source Ref:** phase-33
 **Depends on:** Phase 17 (Memory Reclamation) ✅, Phase 25 (SMP) ✅
-**Builds on:** Replaces the bump frame allocator from Phase 17 with a buddy allocator; adds a slab allocator layer for kernel objects; fixes the stub munmap from Phase 17; adds SMP-aware TLB shootdown from Phase 25 to munmap
+**Builds on:** Replaces the bump frame allocator from Phase 17 with a buddy allocator; adds slab-cache infrastructure for kernel objects; fixes the stub munmap from Phase 17; adds SMP-aware TLB shootdown from Phase 25 to munmap
 **Primary Components:** kernel-core/src/buddy.rs, kernel-core/src/slab.rs, kernel/src/mm/, userspace/coreutils-rs/ (meminfo)
 
 ## Milestone Goal
 
 The kernel heap allocator is robust, efficient, and recoverable. Out-of-memory conditions
 no longer panic the kernel — the allocator grows on demand and retries failed allocations.
-A slab allocator handles fixed-size kernel objects with O(1) performance. Userspace
-`munmap()` actually reclaims memory, and the userspace heap coalesces free blocks.
+Buddy allocation, working `munmap()`, userspace-heap coalescing, and slab-cache
+infrastructure all land. Broad migration of hot kernel object families onto slab caches
+remains later work.
 
 ## Why This Phase Exists
 
@@ -19,9 +20,10 @@ The kernel's original memory allocator was a simple bump allocator that could ne
 reclaim freed frames, and the heap's OOM handler panicked unconditionally. As the OS
 grew to support multiple processes, networking, and a compiler, memory pressure became
 a real problem. This phase replaces the allocator stack with production-quality
-components: a buddy allocator for efficient frame management, a slab allocator for
-fast fixed-size kernel object allocation, working `munmap()` for virtual memory
-reclamation, and an OOM retry path so the kernel does not crash under load.
+components: a buddy allocator for efficient frame management, slab-cache
+infrastructure for fixed-size kernel objects, working `munmap()` for virtual
+memory reclamation, and an OOM retry path so the kernel does not crash under
+load.
 
 ## Learning Goals
 
@@ -62,6 +64,10 @@ Each slab cache:
 - Maintains a free-list of available slots (O(1) alloc and free).
 - Grows by allocating additional pages when the free-list is empty.
 - Optionally returns empty pages to the frame allocator.
+
+**Shipped state (audited in Phase 53a):** The slab-cache infrastructure and direct
+cache tests landed, but the main hot kernel object families were not broadly migrated
+to use it. Most kernel allocations still flow through the global linked-list heap.
 
 ### Buddy Allocator for Page-Granularity Allocations
 
@@ -112,10 +118,10 @@ allocator is host-testable via `kernel-core`.
 
 ### Slab Allocator (`kernel-core/src/slab.rs`)
 
-Provides O(1) allocation for fixed-size kernel objects. Each slab cache manages pages
-divided into equal-sized slots with a free-list. When the free-list is exhausted, a new
-page is requested from the buddy allocator. Empty pages can be returned to reduce
-memory pressure.
+Provides O(1) allocation for fixed-size kernel objects in direct cache tests. Each
+slab cache manages pages divided into equal-sized slots with a free-list. When the
+free-list is exhausted, a new page is requested from the buddy allocator. Empty
+pages can be returned to reduce memory pressure.
 
 ### munmap Implementation
 
@@ -140,7 +146,7 @@ Linux.
 1. Implement OOM retry wrapper around the global allocator.
 2. Verify: allocation-heavy workloads no longer panic (heap grows and retries).
 3. Implement buddy allocator for page-granularity allocations.
-4. Implement slab allocator caches for Task, FD, endpoint, pipe, socket objects.
+4. Implement slab allocator caches for Task, FD, endpoint, pipe, and socket-sized objects, and validate them in direct cache tests.
 5. Implement working `munmap()` with frame reclamation and TLB invalidation.
 6. Add free-block coalescing to userspace `BrkAllocator`.
 7. Add `heap_stats()` and verify with a stress-test program.
@@ -150,7 +156,7 @@ Linux.
 
 - Allocation-heavy workloads (many fork/exec cycles) no longer panic with OOM.
 - The kernel heap grows on demand and the retry path works.
-- Slab-allocated objects (Task, FD) allocate and free in O(1).
+- Slab-cache infrastructure for hot kernel object sizes allocates and frees in O(1) in direct cache tests; broad object-family migration is deferred.
 - `munmap()` returns physical frames; a program that maps and unmaps in a loop
   does not exhaust memory.
 - Userspace programs that allocate and free many small objects do not fragment
@@ -184,3 +190,4 @@ advanced features (compaction, THP, OOM killer, NUMA awareness).
 - Kernel memory accounting and cgroups
 - vmalloc for large virtually-contiguous allocations
 - Memory pressure notifications
+- Broad migration of hot kernel object families onto slab caches
