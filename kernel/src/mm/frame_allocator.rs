@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use kernel_core::buddy::BuddyAllocator;
 use spin::Mutex;
 use x86_64::PhysAddr;
@@ -228,11 +228,22 @@ static FRAME_ALLOCATOR: LockedFrameAllocator =
 
 static FRAME_ALLOC_INIT: AtomicBool = AtomicBool::new(false);
 
+/// Cached physical-memory offset — constant after `init()`, read without the
+/// frame allocator lock to avoid double-lock in `free_frame` / `free_contiguous`.
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Read the cached physical-memory offset (set once during `init`).
+#[inline]
+fn cached_phys_offset() -> u64 {
+    PHYS_OFFSET.load(Ordering::Acquire)
+}
+
 pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     assert!(
         !FRAME_ALLOC_INIT.swap(true, Ordering::AcqRel),
         "frame_allocator::init called more than once"
     );
+    PHYS_OFFSET.store(phys_offset, Ordering::Release);
     FRAME_ALLOCATOR.0.lock().init(regions, phys_offset);
 }
 
@@ -316,7 +327,7 @@ pub fn free_frame(phys: u64) {
         }
     }
     // Zero the frame before returning to pool to prevent stale data exposure.
-    let phys_offset = FRAME_ALLOCATOR.0.lock().phys_offset;
+    let phys_offset = cached_phys_offset();
     let virt_ptr = (phys_offset + phys) as *mut u8;
     unsafe {
         core::ptr::write_bytes(virt_ptr, 0, PAGE_SIZE as usize);
@@ -343,7 +354,7 @@ pub fn free_contiguous(phys: u64, order: usize) {
     }
     // Zero all frames in the contiguous block before returning to pool.
     let page_count = 1u64 << order;
-    let phys_offset = FRAME_ALLOCATOR.0.lock().phys_offset;
+    let phys_offset = cached_phys_offset();
     for i in 0..page_count {
         let virt_ptr = (phys_offset + phys + i * PAGE_SIZE) as *mut u8;
         unsafe {
@@ -433,7 +444,7 @@ pub fn refcount_inc(phys: u64) {
         .get()
         .expect("refcount table not initialized");
     assert!(idx < table.len(), "refcount_inc: frame index out of range");
-    let prev = table[idx].fetch_add(1, Ordering::SeqCst);
+    let prev = table[idx].fetch_add(1, Ordering::Relaxed);
     assert!(
         prev < u16::MAX,
         "refcount_inc: overflow for frame {:#x}",
@@ -450,7 +461,7 @@ pub fn refcount_dec(phys: u64) -> u16 {
         .get()
         .expect("refcount table not initialized");
     assert!(idx < table.len(), "refcount_dec: frame index out of range");
-    let prev = table[idx].fetch_sub(1, Ordering::SeqCst);
+    let prev = table[idx].fetch_sub(1, Ordering::AcqRel);
     assert!(prev > 0, "refcount_dec: underflow for frame {:#x}", phys);
     prev - 1
 }
@@ -463,7 +474,7 @@ pub fn refcount_get(phys: u64) -> u16 {
         .get()
         .expect("refcount table not initialized");
     assert!(idx < table.len(), "refcount_get: frame index out of range");
-    table[idx].load(Ordering::SeqCst)
+    table[idx].load(Ordering::Acquire)
 }
 
 #[inline]
