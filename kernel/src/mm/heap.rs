@@ -743,7 +743,7 @@ pub fn activate_size_class_allocator() {
     log::info!(
         "[mm] size-class allocator active (side table: {} entries, {} KiB)",
         table_size,
-        table_size / 1024,
+        table_size * core::mem::size_of::<PageMeta>() / 1024,
     );
 }
 
