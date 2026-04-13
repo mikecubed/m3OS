@@ -544,6 +544,15 @@ static HEAP_INIT: AtomicBool = AtomicBool::new(false);
 /// Tracks the current number of bytes mapped into the bootstrap heap region.
 static HEAP_MAPPED: AtomicUsize = AtomicUsize::new(0);
 
+/// Serializes bootstrap heap growth.
+///
+/// The bootstrap allocator can still be used post-cutover as the recursion
+/// fallback when slab-internal metadata needs temporary space. Serializing
+/// `grow_heap` avoids leaving unmapped holes in the bootstrap heap range if two
+/// cores hit the fallback concurrently and one growth attempt only partially
+/// succeeds.
+static GROW_HEAP_LOCK: Mutex<()> = Mutex::new(());
+
 /// Map the kernel heap region and initialise the bootstrap allocator.
 ///
 /// This sets up the monotonic bootstrap allocator at `HEAP_START` which serves
@@ -634,35 +643,22 @@ pub fn activate_size_class_allocator() {
 /// slab or page-backed paths instead of growing this region.
 pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     use super::paging::{GlobalFrameAlloc, get_mapper};
+    let _growth_guard = GROW_HEAP_LOCK.lock();
 
     // Round up to page boundary.
     let page_size: usize = 4096;
     let additional_bytes = (additional_bytes + page_size - 1) & !(page_size - 1);
 
-    // Atomically reserve the heap range to prevent SMP races.
-    let current_mapped = loop {
-        let current = HEAP_MAPPED.load(Ordering::Acquire);
-        let new_mapped = current.checked_add(additional_bytes).ok_or(())?;
-
-        if new_mapped > HEAP_MAX_SIZE {
-            log::error!(
-                "[mm] heap growth refused: requested total {}KiB exceeds max {}MiB",
-                new_mapped / 1024,
-                HEAP_MAX_SIZE / (1024 * 1024),
-            );
-            return Err(());
-        }
-
-        match HEAP_MAPPED.compare_exchange_weak(
-            current,
-            new_mapped,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => break current,
-            Err(_) => continue,
-        }
-    };
+    let current_mapped = HEAP_MAPPED.load(Ordering::Acquire);
+    let new_mapped = current_mapped.checked_add(additional_bytes).ok_or(())?;
+    if new_mapped > HEAP_MAX_SIZE {
+        log::error!(
+            "[mm] heap growth refused: requested total {}KiB exceeds max {}MiB",
+            new_mapped / 1024,
+            HEAP_MAX_SIZE / (1024 * 1024),
+        );
+        return Err(());
+    }
     let new_mapped = current_mapped + additional_bytes;
 
     let mut mapper = unsafe { get_mapper() };
@@ -705,24 +701,14 @@ pub fn grow_heap(additional_bytes: usize) -> Result<(), ()> {
     }
 
     let bytes_mapped = pages_mapped * 4096;
+    let mapped_end = current_mapped + bytes_mapped;
     ALLOCATOR.bootstrap.extend(bytes_mapped);
-
-    let wasted = additional_bytes - bytes_mapped;
-    if wasted > 0 {
-        let reserved_end = current_mapped + additional_bytes;
-        let mapped_end = current_mapped + bytes_mapped;
-        let _ = HEAP_MAPPED.compare_exchange(
-            reserved_end,
-            mapped_end,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
-    }
+    HEAP_MAPPED.store(mapped_end, Ordering::Release);
 
     log::info!(
         "[mm] bootstrap heap grown by {}KiB → total {}KiB",
         bytes_mapped / 1024,
-        (current_mapped + bytes_mapped) / 1024,
+        mapped_end / 1024,
     );
 
     Ok(())
