@@ -235,6 +235,11 @@ pub struct PerCoreData {
     /// Only accessed by the owning core (with interrupts masked).
     pub page_cache: core::cell::UnsafeCell<crate::mm::frame_allocator::PerCpuPageCache>,
 
+    // ----- Phase 53a: per-CPU slab magazines (B.3) -----
+    /// Per-CPU magazine pairs for each of the 13 slab size classes.
+    /// Only accessed by the owning core (with interrupts masked).
+    pub slab_magazines: core::cell::UnsafeCell<crate::mm::slab::PerCpuMagazines>,
+
     // ----- Phase 43b: per-core trace ring -----
     /// Lockless ring buffer of recent kernel trace events (scheduler, fork, IPC).
     /// Written only by the owning core; read by panic/fault dump and `sys_ktrace`.
@@ -530,6 +535,7 @@ pub fn init_bsp_per_core() {
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
+        slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
@@ -642,6 +648,7 @@ pub fn init_ap_per_core(core_id: u8, apic_id: u8) -> *mut PerCoreData {
         fork_entry_ctx: crate::arch::x86_64::ForkEntryCtx::ZERO,
         isr_wake_queue: IsrWakeQueue::new(),
         page_cache: core::cell::UnsafeCell::new(crate::mm::frame_allocator::PerCpuPageCache::new()),
+        slab_magazines: core::cell::UnsafeCell::new(crate::mm::slab::PerCpuMagazines::new()),
         #[cfg(feature = "trace")]
         trace_ring: core::cell::UnsafeCell::new(kernel_core::trace_ring::TraceRing::new()),
     }));
