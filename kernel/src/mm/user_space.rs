@@ -55,8 +55,9 @@ pub unsafe fn map_user_pages(
         for i in 0..n {
             let vaddr = VirtAddr::new(virt_base + i * 4096);
             let page: Page<Size4KiB> = Page::containing_address(vaddr);
-            let frame = frame_allocator::allocate_frame().ok_or("out of physical frames")?;
-            // Safety: frame is freshly allocated, vaddr is within user range.
+            // Zero-before-exposure: user-visible frame must be zeroed.
+            let frame = frame_allocator::allocate_frame_zeroed().ok_or("out of physical frames")?;
+            // Safety: frame is freshly allocated and zeroed, vaddr is within user range.
             mapper
                 .map_to(page, frame, flags, &mut alloc)
                 .map_err(|_| "map_to failed")?

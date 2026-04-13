@@ -726,8 +726,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
-    // The RetryAllocator already attempted heap growth and retry before this
-    // handler is reached. If we get here, all growth attempts failed.
+    // The bootstrap/size-class allocator already attempted allocator-local
+    // reclaim and any eligible heap-growth retry before this handler is
+    // reached. If we get here, the allocation really is out of options.
     panic!(
         "kernel OOM: failed to allocate {:?} after heap growth retry",
         layout
@@ -756,15 +757,23 @@ mod tests {
     // Phase 33 — Memory subsystem tests
     // -----------------------------------------------------------------------
 
-    /// A.4: Verify the kernel heap grows automatically via the RetryAllocator
-    /// when the initial heap is exhausted.
+    /// C.1/C.2: Verify the post-cutover allocator can satisfy large runtime
+    /// allocations without disturbing the bootstrap heap accounting.
     #[test_case]
     fn heap_grows_on_oom() {
-        use crate::mm::heap::{HEAP_INITIAL_SIZE, heap_stats};
+        use crate::mm::{
+            frame_allocator::frame_stats,
+            heap::{HEAP_INITIAL_SIZE, heap_stats},
+        };
         use alloc::vec::Vec;
 
         let before = heap_stats();
+        let frames_before = frame_stats();
         assert!(before.total_size >= HEAP_INITIAL_SIZE);
+        assert!(
+            before.size_class_active,
+            "size-class allocator was not activated before runtime tests",
+        );
 
         // Allocate a series of 256 KiB blocks to push past initial heap.
         let block_size = 256 * 1024;
@@ -783,23 +792,49 @@ mod tests {
         }
 
         let after = heap_stats();
-        // Heap must have grown beyond initial size.
+        let frames_after = frame_stats();
+        // Runtime allocations should increase allocator activity and consume
+        // backing pages without requiring the bootstrap heap itself to grow.
         assert!(
-            after.total_size > HEAP_INITIAL_SIZE,
-            "heap did not grow: total_size={} initial={}",
-            after.total_size,
-            HEAP_INITIAL_SIZE
+            after.alloc_count > before.alloc_count,
+            "allocator did not record new allocations: before={} after={}",
+            before.alloc_count,
+            after.alloc_count
+        );
+        assert!(
+            after.page_backed_pages > before.page_backed_pages,
+            "page-backed allocation count did not increase: before={} after={}",
+            before.page_backed_pages,
+            after.page_backed_pages
+        );
+        assert!(
+            frames_after.allocated_frames > frames_before.allocated_frames,
+            "frame usage did not increase: before={} after={}",
+            frames_before.allocated_frames,
+            frames_after.allocated_frames
         );
         serial_println!(
-            "heap grew: {} KiB → {} KiB ({} allocs)",
-            before.total_size / 1024,
+            "allocator grew via page-backed path: bootstrap={} KiB large_pages={} alloc_delta={}",
             after.total_size / 1024,
+            after.page_backed_pages,
             after.alloc_count - before.alloc_count
         );
 
-        // Drop all blocks — heap should have free space again.
+        // Drop all blocks — backing pages should return to the frame allocator.
         drop(blocks);
         let final_stats = heap_stats();
+        let frames_final = frame_stats();
+        assert!(
+            frames_final.allocated_frames < frames_after.allocated_frames,
+            "dropping blocks did not release backing pages: after={} final={}",
+            frames_after.allocated_frames,
+            frames_final.allocated_frames
+        );
+        assert_eq!(
+            final_stats.page_backed_pages, before.page_backed_pages,
+            "dropping blocks did not restore the page-backed allocation count: before={} final={}",
+            before.page_backed_pages, final_stats.page_backed_pages
+        );
         assert!(final_stats.free_bytes > 0);
     }
 
@@ -809,16 +844,21 @@ mod tests {
     fn buddy_alloc_free_no_leak() {
         use crate::mm::frame_allocator;
 
-        let before = frame_allocator::free_count();
+        // Pre-allocate the storage Vec so that its slab page consumption
+        // happens before we snapshot the free count.  Without this, the
+        // size-class allocator's first slab page allocation would appear
+        // as a frame leak.
+        let mut frames = alloc::vec::Vec::with_capacity(16);
+
+        let before = frame_allocator::available_count();
 
         // Allocate 16 frames.
-        let mut frames = alloc::vec::Vec::new();
         for _ in 0..16 {
             let frame = frame_allocator::allocate_frame().expect("frame alloc failed");
             frames.push(frame.start_address().as_u64());
         }
 
-        let during = frame_allocator::free_count();
+        let during = frame_allocator::available_count();
         assert!(
             during <= before - 16,
             "free count should have dropped by at least 16: before={} during={}",
@@ -831,7 +871,7 @@ mod tests {
             frame_allocator::free_frame(phys);
         }
 
-        let after = frame_allocator::free_count();
+        let after = frame_allocator::available_count();
         assert_eq!(
             after, before,
             "frame leak: before={} after={}",
@@ -844,7 +884,7 @@ mod tests {
     fn contiguous_alloc_works() {
         use crate::mm::frame_allocator;
 
-        let before = frame_allocator::free_count();
+        let before = frame_allocator::available_count();
 
         // Allocate 4 contiguous pages (order 2).
         let frame = frame_allocator::allocate_contiguous(2).expect("contiguous alloc failed");
@@ -859,12 +899,300 @@ mod tests {
 
         // Free and verify no leak.
         frame_allocator::free_contiguous(base, 2);
-        let after = frame_allocator::free_count();
+        let after = frame_allocator::available_count();
         assert_eq!(
             after, before,
             "contiguous frame leak: before={} after={}",
             before, after
         );
+    }
+
+    /// D.4: Verify allocate_frame_zeroed returns a fully zeroed frame.
+    #[test_case]
+    fn allocate_frame_zeroed_returns_zeros() {
+        use crate::mm::frame_allocator;
+
+        // First, allocate a raw frame, write a non-zero pattern, and free it
+        // so the buddy pool contains a "dirty" frame.
+        let dirty = frame_allocator::allocate_frame().expect("alloc dirty frame");
+        let phys = dirty.start_address().as_u64();
+        let phys_off = crate::mm::phys_offset();
+        let ptr = (phys_off + phys) as *mut u8;
+        unsafe { core::ptr::write_bytes(ptr, 0xAB, 4096) };
+        frame_allocator::free_frame(phys);
+
+        // Now allocate via the zeroed path.
+        let zeroed = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed frame");
+        let z_phys = zeroed.start_address().as_u64();
+        let z_ptr = (phys_off + z_phys) as *const u8;
+        let data = unsafe { core::slice::from_raw_parts(z_ptr, 4096) };
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "allocate_frame_zeroed returned non-zero content at frame {:#x}",
+            z_phys
+        );
+        frame_allocator::free_frame(z_phys);
+    }
+
+    /// D.4: Stale-mapping reuse — dirty frames recycled through multiple
+    /// alloc/free cycles must still be zeroed by allocate_frame_zeroed.
+    /// Catches regressions where a new allocator path skips zeroing.
+    #[test_case]
+    fn zero_exposure_stale_reuse_cycles() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        // Run 4 rounds with different poison patterns to defeat coincidence.
+        let patterns: [u8; 4] = [0xDE, 0x55, 0xFF, 0x01];
+        for (round, &pattern) in patterns.iter().enumerate() {
+            let dirty = frame_allocator::allocate_frame().expect("alloc dirty");
+            let phys = dirty.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes((phys_off + phys) as *mut u8, pattern, 4096);
+            }
+            frame_allocator::free_frame(phys);
+
+            let zeroed = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed");
+            let z_phys = zeroed.start_address().as_u64();
+            let data =
+                unsafe { core::slice::from_raw_parts((phys_off + z_phys) as *const u8, 4096) };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "round {}: stale reuse leak at frame {:#x} (pattern {:#x})",
+                round,
+                z_phys,
+                pattern
+            );
+            frame_allocator::free_frame(z_phys);
+        }
+    }
+
+    /// D.4: map_user_pages end-to-end — exercises the real `map_user_pages`
+    /// function (which calls `allocate_frame_zeroed` internally).  Poisons
+    /// frames first so that any failure to zero would leave stale data.
+    /// Verifies the mapped physical frames are clean via the physical offset.
+    #[test_case]
+    fn zero_exposure_map_user_pages_e2e() {
+        use crate::mm::frame_allocator;
+        use x86_64::structures::paging::{Mapper, PageTableFlags, Translate};
+        let phys_off = crate::mm::phys_offset();
+
+        // Poison 4 frames and return them to the pool.
+        for pattern in [0xCC_u8, 0xDD, 0xEE, 0xFF] {
+            let f = frame_allocator::allocate_frame().expect("alloc poison");
+            let phys = f.start_address().as_u64();
+            unsafe { core::ptr::write_bytes((phys_off + phys) as *mut u8, pattern, 4096) };
+            frame_allocator::free_frame(phys);
+        }
+
+        // Call the real map_user_pages which allocates via allocate_frame_zeroed.
+        const TEST_VBASE: u64 = 0x0000_7FFE_0000_0000;
+        const N_PAGES: u64 = 4;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+        unsafe {
+            crate::mm::user_space::map_user_pages(&mut mapper, TEST_VBASE, N_PAGES, flags)
+                .expect("map_user_pages failed");
+        }
+
+        // Read back each mapped frame via physical offset and verify zero.
+        let mut frame_addrs = [0u64; N_PAGES as usize];
+        for i in 0..N_PAGES {
+            let vaddr = x86_64::VirtAddr::new(TEST_VBASE + i * 4096);
+            let paddr = mapper
+                .translate_addr(vaddr)
+                .expect("page not mapped after map_user_pages");
+            frame_addrs[i as usize] = paddr.as_u64() & !0xFFF;
+            let data = unsafe {
+                core::slice::from_raw_parts((phys_off + frame_addrs[i as usize]) as *const u8, 4096)
+            };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "map_user_pages: stale data in page {} (frame {:#x})",
+                i,
+                frame_addrs[i as usize]
+            );
+        }
+
+        // Cleanup: unmap and free.
+        for i in 0..N_PAGES {
+            let vaddr = x86_64::VirtAddr::new(TEST_VBASE + i * 4096);
+            let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size4KiB>::containing_address(vaddr);
+            if let Ok((_frame, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+            frame_allocator::free_frame(frame_addrs[i as usize]);
+        }
+    }
+
+    /// D.4: resolve_cow_fault end-to-end — sets up a real CoW-marked page in
+    /// the current address space, calls the real `resolve_cow_fault`, and
+    /// verifies that the new frame contains the parent's data with no stale
+    /// content leakage.
+    #[test_case]
+    fn zero_exposure_resolve_cow_e2e() {
+        use crate::mm::frame_allocator;
+        use x86_64::structures::paging::{Mapper, PageTableFlags, Translate};
+        let phys_off = crate::mm::phys_offset();
+
+        // Poison a frame and return it so the pool has stale data for the CoW
+        // destination.
+        let stale = frame_allocator::allocate_frame().expect("alloc stale");
+        let stale_phys = stale.start_address().as_u64();
+        unsafe { core::ptr::write_bytes((phys_off + stale_phys) as *mut u8, 0xBE, 4096) };
+        frame_allocator::free_frame(stale_phys);
+
+        // Allocate the "parent" frame and fill with a distinguishable pattern.
+        let parent = frame_allocator::allocate_frame().expect("alloc parent");
+        let parent_phys = parent.start_address().as_u64();
+        let parent_ptr = (phys_off + parent_phys) as *mut u8;
+        for i in 0u16..4096 {
+            unsafe { parent_ptr.add(i as usize).write((i & 0xFF) as u8) };
+        }
+
+        // Bump refcount to 2 so resolve_cow_fault takes the copy path.
+        frame_allocator::refcount_inc(parent_phys);
+
+        // Map the parent frame at a test user-space address with CoW flags:
+        // PRESENT | USER_ACCESSIBLE | BIT_9 (CoW marker) | !WRITABLE.
+        const COW_TEST_VADDR: u64 = 0x0000_7FFD_0000_0000;
+        let cow_flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::BIT_9;
+        let vaddr = x86_64::VirtAddr::new(COW_TEST_VADDR);
+        unsafe {
+            crate::mm::paging::map_current_user_page_locked(vaddr, parent, cow_flags)
+                .expect("map CoW page failed");
+        }
+
+        // Call the real resolve_cow_fault — this allocates a new frame, copies
+        // parent data, and remaps the PTE as writable.
+        let resolved = crate::arch::x86_64::interrupts::resolve_cow_fault(COW_TEST_VADDR);
+        assert!(resolved, "resolve_cow_fault returned false");
+
+        // Find the new physical frame via translation.
+        let mapper = unsafe { crate::mm::paging::get_mapper() };
+        let new_paddr = mapper
+            .translate_addr(vaddr)
+            .expect("page not mapped after resolve_cow_fault");
+        let new_phys = new_paddr.as_u64() & !0xFFF;
+
+        // The new frame must differ from the parent (a copy was made).
+        assert_ne!(
+            new_phys, parent_phys,
+            "resolve_cow_fault should have allocated a new frame"
+        );
+
+        // Verify every byte in the new frame matches the parent's pattern.
+        let new_data =
+            unsafe { core::slice::from_raw_parts((phys_off + new_phys) as *const u8, 4096) };
+        for (i, &byte) in new_data.iter().enumerate() {
+            let expected = (i & 0xFF) as u8;
+            assert_eq!(
+                byte, expected,
+                "CoW copy mismatch at offset {}: got {:#x}, expected {:#x} (new frame {:#x})",
+                i, byte, expected, new_phys
+            );
+        }
+
+        // Cleanup: unmap the page and free both frames.
+        let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size4KiB>::containing_address(vaddr);
+        drop(mapper);
+        let mut mapper = unsafe { crate::mm::paging::get_mapper() };
+        if let Ok((_f, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+        frame_allocator::free_frame(new_phys);
+        // Parent frame had refcount bumped to 2; resolve_cow_fault decremented
+        // to 1 via free_frame.  Decrement once more to actually free.
+        frame_allocator::free_frame(parent_phys);
+    }
+
+    /// D.4: munmap + reuse — after freeing a batch of dirty frames
+    /// (simulating munmap), every subsequent zeroed allocation must be clean.
+    #[test_case]
+    fn zero_exposure_munmap_reuse_batch() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+
+        const BATCH: usize = 8;
+        let mut freed_addrs = [0u64; BATCH];
+
+        // Allocate BATCH frames, poison each with a distinct pattern, free all.
+        for (i, slot) in freed_addrs.iter_mut().enumerate() {
+            let f = frame_allocator::allocate_frame().expect("alloc batch");
+            let phys = f.start_address().as_u64();
+            unsafe {
+                core::ptr::write_bytes((phys_off + phys) as *mut u8, (0xA0 + i as u8), 4096);
+            }
+            *slot = phys;
+        }
+        for &phys in &freed_addrs {
+            frame_allocator::free_frame(phys);
+        }
+
+        // Re-allocate BATCH frames via the zeroed path and verify each.
+        for i in 0..BATCH {
+            let z = frame_allocator::allocate_frame_zeroed().expect("alloc zeroed batch");
+            let z_phys = z.start_address().as_u64();
+            let data =
+                unsafe { core::slice::from_raw_parts((phys_off + z_phys) as *const u8, 4096) };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "munmap reuse batch[{}]: stale data at frame {:#x}",
+                i,
+                z_phys
+            );
+            frame_allocator::free_frame(z_phys);
+        }
+    }
+
+    /// D.4: Contiguous-block zeroed allocation — multi-page allocations
+    /// via allocate_contiguous_zeroed must zero every page in the block,
+    /// even when backing frames previously held data.
+    #[test_case]
+    fn zero_exposure_contiguous_zeroed() {
+        use crate::mm::frame_allocator;
+        let phys_off = crate::mm::phys_offset();
+        let page_size = 4096u64;
+
+        // Allocate and poison a 4-page contiguous block (order 2), then free it.
+        let dirty = frame_allocator::allocate_contiguous(2).expect("alloc dirty contig");
+        let base = dirty.start_address().as_u64();
+        for i in 0..4u64 {
+            unsafe {
+                core::ptr::write_bytes(
+                    (phys_off + base + i * page_size) as *mut u8,
+                    0xFE,
+                    page_size as usize,
+                );
+            }
+        }
+        frame_allocator::free_contiguous(base, 2);
+
+        // Re-allocate via the zeroed path.
+        let zeroed = frame_allocator::allocate_contiguous_zeroed(2).expect("alloc zeroed contig");
+        let z_base = zeroed.start_address().as_u64();
+        for i in 0..4u64 {
+            let data = unsafe {
+                core::slice::from_raw_parts(
+                    (phys_off + z_base + i * page_size) as *const u8,
+                    page_size as usize,
+                )
+            };
+            assert!(
+                data.iter().all(|&b| b == 0),
+                "contiguous zeroed: stale data in page {} of block at {:#x}",
+                i,
+                z_base
+            );
+        }
+        frame_allocator::free_contiguous(z_base, 2);
     }
 
     /// C: Verify slab cache allocation and deallocation.
@@ -916,16 +1244,27 @@ mod tests {
         let stats = crate::mm::frame_allocator::frame_stats();
 
         assert!(stats.total_frames > 0, "no frames reported");
+
+        // Linux-like accounting: total = available + allocated,
+        // where available = free (buddy) + per_cpu_cached.
         assert_eq!(
             stats.total_frames,
-            stats.free_frames + stats.allocated_frames,
-            "frame count mismatch: total={} free={} alloc={}",
+            stats.available_frames + stats.allocated_frames,
+            "frame count mismatch: total={} available={} alloc={}",
             stats.total_frames,
-            stats.free_frames,
+            stats.available_frames,
             stats.allocated_frames
         );
+        assert_eq!(
+            stats.available_frames,
+            stats.free_frames + stats.per_cpu_cached,
+            "available mismatch: available={} free={} cached={}",
+            stats.available_frames,
+            stats.free_frames,
+            stats.per_cpu_cached
+        );
 
-        // Per-order free counts should sum to the total free count.
+        // Per-order free counts should sum to free_frames (buddy-only, no per-CPU).
         let order_sum: usize = stats
             .free_by_order
             .iter()
@@ -938,10 +1277,12 @@ mod tests {
             order_sum, stats.free_frames
         );
         serial_println!(
-            "frame stats: total={} free={} allocated={}",
+            "frame stats: total={} free={} available={} allocated={} per_cpu_cached={}",
             stats.total_frames,
             stats.free_frames,
-            stats.allocated_frames
+            stats.available_frames,
+            stats.allocated_frames,
+            stats.per_cpu_cached
         );
     }
 

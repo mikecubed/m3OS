@@ -488,7 +488,7 @@ fn make_statfs(
 }
 
 fn tmpfs_statfs() -> Statfs {
-    let free_blocks = crate::mm::frame_allocator::free_count() as u64;
+    let free_blocks = crate::mm::frame_allocator::available_count() as u64;
     make_statfs(
         TMPFS_MAGIC,
         TMPFS_TOTAL_BLOCKS,
@@ -5354,8 +5354,9 @@ fn is_directory(path: &str) -> bool {
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
 fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
-    /// Maximum executable size we are willing to load (16 MB).
-    const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
+    /// Maximum executable size we can safely materialize in one reclaimable
+    /// kernel heap allocation with the current page-backed large-allocation path.
+    const MAX_EXEC_SIZE: usize = crate::mm::heap::max_page_backed_allocation_bytes();
 
     // Try ext2 root filesystem first (most likely location for compiled binaries).
     // Skip /data/ paths — those are routed to FAT32 by other syscalls.
@@ -5392,10 +5393,21 @@ fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
         && !rel.is_empty()
     {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(data) = tmpfs.read_file(rel, 0, usize::MAX)
-            && !data.is_empty()
-        {
-            return Ok(data.to_vec());
+        if let Ok(stat) = tmpfs.stat(rel) {
+            if stat.size > MAX_EXEC_SIZE {
+                log::warn!(
+                    "[exec] file too large ({} bytes > {} limit): {}",
+                    stat.size,
+                    MAX_EXEC_SIZE,
+                    path
+                );
+                return Err(NEG_E2BIG);
+            }
+            if let Ok(data) = tmpfs.read_file(rel, 0, stat.size)
+                && !data.is_empty()
+            {
+                return Ok(data.to_vec());
+            }
         }
     }
 
@@ -7247,7 +7259,8 @@ fn sys_mmap_file_backed(
         let mut page_buf = alloc::vec![0u8; 4096];
 
         for i in 0..pages {
-            let frame = match crate::mm::frame_allocator::allocate_frame() {
+            // Zero-before-exposure (D.4): user-visible mmap frame.
+            let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
                 Some(f) => f,
                 None => {
                     log::warn!("[mmap_file] OOM at page {}/{}", i, pages);
@@ -7267,9 +7280,8 @@ fn sys_mmap_file_backed(
                 }
             };
 
-            // Zero the frame then fill from file.
+            // Frame is pre-zeroed by allocate_frame_zeroed (D.4); fill from file.
             let frame_ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096) };
 
             let read_offset = file_offset + (i as usize) * 4096;
             match kernel_read_fd_at(pid, fd, read_offset, &mut page_buf) {
@@ -7715,14 +7727,25 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     let heap = crate::mm::heap::heap_stats();
     let frames = crate::mm::frame_allocator::frame_stats();
     let slabs = crate::mm::slab::all_slab_stats();
+    let sc_stats = crate::mm::slab::size_class_slab_stats();
 
-    // Format into a stack buffer
-    let mut tmp = [0u8; 2048];
+    // Format into a stack buffer — 4 KiB to accommodate new size-class rows.
+    let mut tmp = [0u8; 4096];
     let mut writer = BufWriter::new(&mut tmp);
 
     let _ = writeln!(writer, "=== Kernel Memory Info ===");
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "Heap:");
+    let _ = writeln!(
+        writer,
+        "Allocator: {}",
+        if heap.size_class_active {
+            "size-class (slab + page-backed)"
+        } else {
+            "bootstrap (monotonic)"
+        }
+    );
+    let _ = writeln!(writer);
+    let _ = writeln!(writer, "Bootstrap Heap:");
     let _ = writeln!(
         writer,
         "  total: {} KiB  used: {} KiB  free: {} KiB",
@@ -7735,18 +7758,26 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
         "  allocs: {}  deallocs: {}",
         heap.alloc_count, heap.dealloc_count
     );
+    if heap.size_class_active {
+        let _ = writeln!(
+            writer,
+            "  slab pages: {}  large pages: {}",
+            heap.slab_pages, heap.page_backed_pages
+        );
+    }
     let _ = writeln!(writer);
     let _ = writeln!(writer, "Frames (4 KiB pages):");
     let _ = writeln!(
         writer,
-        "  total: {}  free: {}  allocated: {}",
-        frames.total_frames, frames.free_frames, frames.allocated_frames
+        "  total: {}  free: {}  available: {}  allocated: {}",
+        frames.total_frames, frames.free_frames, frames.available_frames, frames.allocated_frames
     );
     let _ = writeln!(
         writer,
-        "  memory: {} MiB total, {} MiB free",
+        "  memory: {} MiB total, {} MiB free, {} MiB available",
         frames.total_frames * 4 / 1024,
-        frames.free_frames * 4 / 1024
+        frames.free_frames * 4 / 1024,
+        frames.available_frames * 4 / 1024
     );
     let _ = write!(writer, "  buddy orders:");
     for (order, &count) in frames.free_by_order.iter().enumerate() {
@@ -7755,8 +7786,15 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
         }
     }
     let _ = writeln!(writer);
+    if frames.per_cpu_cached > 0 {
+        let _ = writeln!(
+            writer,
+            "  per-cpu cached: {} (reclaimable, not in MemFree)",
+            frames.per_cpu_cached
+        );
+    }
     let _ = writeln!(writer);
-    let _ = writeln!(writer, "Slab Caches:");
+    let _ = writeln!(writer, "Slab Caches (named):");
     fn fmt_slab(w: &mut BufWriter<'_>, name: &str, s: &kernel_core::slab::SlabStats) {
         let _ = writeln!(
             w,
@@ -7769,6 +7807,20 @@ pub(super) fn sys_meminfo(buf_addr: u64, buf_len: u64) -> u64 {
     fmt_slab(&mut writer, "endpt(128B)", &slabs.endpoint);
     fmt_slab(&mut writer, "pipe(4KiB)", &slabs.pipe);
     fmt_slab(&mut writer, "sock(256B)", &slabs.socket);
+    if heap.size_class_active {
+        let _ = writeln!(writer);
+        let _ = writeln!(writer, "Size Classes (slab backing):");
+        let classes = kernel_core::size_class::SIZE_CLASSES;
+        for (i, stats) in sc_stats.iter().enumerate() {
+            if stats.total_slabs > 0 || stats.active_objects > 0 {
+                let _ = writeln!(
+                    writer,
+                    "  {}B: slabs={} active={} free={}",
+                    classes[i], stats.total_slabs, stats.active_objects, stats.free_slots
+                );
+            }
+        }
+    }
 
     let written = writer.pos;
 
@@ -8339,12 +8391,12 @@ pub(super) fn sys_linux_brk(addr: u64) -> u64 {
                     | PageTableFlags::WRITABLE
                     | PageTableFlags::USER_ACCESSIBLE
                     | PageTableFlags::NO_EXECUTE;
-                let phys_off = crate::mm::phys_offset();
                 let mut committed_brk = current_brk;
 
                 for i in 0..pages_needed {
                     let vaddr = VirtAddr::new(current_brk + i * 4096);
-                    let frame = match crate::mm::frame_allocator::allocate_frame() {
+                    // Zero-before-exposure (D.4): user-visible brk frame.
+                    let frame = match crate::mm::frame_allocator::allocate_frame_zeroed() {
                         Some(f) => f,
                         None => {
                             log::warn!("[brk] out of frames at page {}/{}", i, pages_needed);
@@ -8352,10 +8404,6 @@ pub(super) fn sys_linux_brk(addr: u64) -> u64 {
                             break;
                         }
                     };
-                    unsafe {
-                        let ptr = (phys_off + frame.start_address().as_u64()) as *mut u8;
-                        core::ptr::write_bytes(ptr, 0, 4096);
-                    }
                     if unsafe {
                         crate::mm::paging::map_current_user_page_locked(vaddr, frame, flags)
                     }

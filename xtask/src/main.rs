@@ -12,6 +12,7 @@ use tempfile::NamedTempFile;
 const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
+const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -1553,7 +1554,10 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    // Clippy + tests for kernel-core (host target).
+    // Host-side allocator/property coverage uses:
+    //   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
+    // Loom coverage remains opt-in via:
+    //   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test <...>
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -1561,7 +1565,7 @@ fn cmd_check() {
             "--package",
             "kernel-core",
             "--target",
-            "x86_64-unknown-linux-gnu",
+            KERNEL_CORE_HOST_TARGET,
             "--",
             "-D",
             "warnings",
@@ -1581,13 +1585,15 @@ fn cmd_check() {
             "--package",
             "kernel-core",
             "--target",
-            "x86_64-unknown-linux-gnu",
+            KERNEL_CORE_HOST_TARGET,
         ])
         .status()
         .expect("failed to run kernel-core tests");
 
     if !status.success() {
-        eprintln!("kernel-core host tests failed");
+        eprintln!(
+            "kernel-core host tests failed — rerun `cargo test -p kernel-core --target {KERNEL_CORE_HOST_TARGET}`"
+        );
         std::process::exit(1);
     }
 

@@ -13,6 +13,11 @@ pub const IPI_RESCHEDULE: u8 = 0xFE;
 /// TLB shootdown IPI vector — requests remote cores to invalidate a page.
 pub const IPI_TLB_SHOOTDOWN: u8 = 0xFD;
 
+/// Allocator-local cache drain IPI vector — requests remote cores to self-drain
+/// their page cache and, when a reclaim round is active, their slab-local
+/// magazines / cross-CPU free lists.
+pub const IPI_CACHE_DRAIN: u8 = 0xFC;
+
 // ---------------------------------------------------------------------------
 // LAPIC ICR helpers
 // ---------------------------------------------------------------------------

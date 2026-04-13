@@ -172,6 +172,15 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // P33: initialize slab caches for fixed-size kernel objects.
     slab::init();
 
+    // Phase 53a C.2: activate the size-class allocator now that slab caches
+    // and the buddy allocator are ready.  All subsequent eligible small
+    // allocations route through magazine_alloc; large allocations use
+    // page-backed buddy frames.  Bootstrap-era allocations continue to be
+    // recognized by address range and handled by the bootstrap allocator.
+    // The compile-time `legacy-bootstrap-allocator` feature leaves this cutover
+    // disabled as a bring-up kill switch.
+    heap::activate_size_class_allocator();
+
     log::info!("[mm] Memory subsystem initialized");
 }
 

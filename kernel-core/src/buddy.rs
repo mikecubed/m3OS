@@ -1,36 +1,161 @@
 //! Buddy frame allocator for managing physical page frames.
 //!
 //! Manages page-frame numbers (PFNs) using the classic buddy algorithm with
-//! 10 order levels (0..=9).  Order 0 = 4 KiB, order 9 = 2 MiB.
+//! 10 order levels (0..=9). Order 0 = 4 KiB, order 9 = 2 MiB.
 //!
 //! Design: pure data structure with no unsafe, no hardware access, fully
 //! testable on the host via `cargo test -p kernel-core`.
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::array;
 
-/// Maximum allocation order.  Order 0 = 1 page (4 KiB), order 9 = 512 pages (2 MiB).
+/// Maximum allocation order. Order 0 = 1 page (4 KiB), order 9 = 512 pages (2 MiB).
 pub const MAX_ORDER: usize = 9;
 
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Hierarchical bitmap used to track free blocks at a single order.
+///
+/// Level 0 stores one bit per block. Higher levels summarize the lower level:
+/// bit `i` at level `n + 1` is set when word `i` at level `n` is non-zero. This
+/// keeps removal allocation-free while still letting us find a free block
+/// without scanning every leaf word.
+#[derive(Default)]
+struct SummaryBitmap {
+    levels: Vec<Vec<u64>>,
+    bits: usize,
+}
+
+impl SummaryBitmap {
+    fn new(bits: usize) -> Self {
+        if bits == 0 {
+            return Self {
+                levels: vec![Vec::new()],
+                bits,
+            };
+        }
+
+        let mut levels = Vec::new();
+        let mut level_bits = bits;
+        loop {
+            let words = level_bits.div_ceil(64);
+            levels.push(vec![0u64; words]);
+            if words <= 1 {
+                break;
+            }
+            level_bits = words;
+        }
+
+        Self { levels, bits }
+    }
+
+    fn contains(&self, bit_index: usize) -> bool {
+        if bit_index >= self.bits || self.levels[0].is_empty() {
+            return false;
+        }
+
+        let word = bit_index / 64;
+        let bit = bit_index % 64;
+        self.levels[0][word] & (1u64 << bit) != 0
+    }
+
+    fn set(&mut self, bit_index: usize) {
+        if bit_index >= self.bits || self.levels[0].is_empty() {
+            return;
+        }
+
+        let mut entry = bit_index;
+        for level in 0..self.levels.len() {
+            let word_index = entry / 64;
+            let bit = entry % 64;
+            let word = &mut self.levels[level][word_index];
+            let was_zero = *word == 0;
+            *word |= 1u64 << bit;
+            if !was_zero {
+                break;
+            }
+            entry = word_index;
+        }
+    }
+
+    fn clear(&mut self, bit_index: usize) {
+        if bit_index >= self.bits || self.levels[0].is_empty() {
+            return;
+        }
+
+        let mut entry = bit_index;
+        for level in 0..self.levels.len() {
+            let word_index = entry / 64;
+            let bit = entry % 64;
+            let word = &mut self.levels[level][word_index];
+            let before = *word;
+            *word &= !(1u64 << bit);
+            if before == *word || *word != 0 {
+                break;
+            }
+            entry = word_index;
+        }
+    }
+
+    fn first_set(&self) -> Option<usize> {
+        if self.bits == 0 || self.levels[0].is_empty() {
+            return None;
+        }
+
+        let top = self.levels.last()?.first().copied()?;
+        if top == 0 {
+            return None;
+        }
+
+        let mut word_index = 0usize;
+        for level in (1..self.levels.len()).rev() {
+            let word = self.levels[level][word_index];
+            debug_assert_ne!(
+                word, 0,
+                "SummaryBitmap::first_set: summary level {} is out of sync",
+                level
+            );
+            let bit = word.trailing_zeros() as usize;
+            word_index = word_index * 64 + bit;
+        }
+
+        let leaf = self.levels[0][word_index];
+        debug_assert_ne!(
+            leaf, 0,
+            "SummaryBitmap::first_set: leaf summary is out of sync"
+        );
+        let bit = leaf.trailing_zeros() as usize;
+        let bit_index = word_index * 64 + bit;
+        debug_assert!(
+            bit_index < self.bits,
+            "SummaryBitmap::first_set returned out-of-range bit {} (bits={})",
+            bit_index,
+            self.bits
+        );
+        (bit_index < self.bits).then_some(bit_index)
+    }
+}
+
 /// Buddy frame allocator.
 ///
 /// Each order level maintains:
-/// - A bitmap where bit *i* is set when block *i* at that order is free.
-/// - A free list (Vec used as a stack) of free block start PFNs.
+/// - A leaf bitmap where bit *i* is set when block *i* at that order is free.
+/// - Compact summary bitmaps that make "find any free block" fast without a
+///   max-PFN-sized position vector.
 ///
-/// Free list push/pop within a single order is O(1). Overall allocation and
-/// free may traverse/split/merge across orders up to MAX_ORDER, giving
-/// O(log n) behavior bounded by MAX_ORDER + 1 levels. The bitmap enables
-/// O(1) buddy-merge checks without scanning the free list.
+/// Free-list removal is therefore O(1): clearing a buddy block touches only the
+/// leaf bit and, at most, one word per summary level. Overall allocation and
+/// free may traverse/split/merge across orders up to MAX_ORDER, giving O(log n)
+/// behavior bounded by MAX_ORDER + 1 levels.
+///
+/// **Heap/bootstrap note:** All bitmap storage is allocated once in `new()` and
+/// never grows afterwards, so `free()` and buddy coalescing do not allocate.
 pub struct BuddyAllocator {
-    /// Per-order free lists: each entry is a PFN of a free block at that order.
-    free_lists: [Vec<usize>; MAX_ORDER + 1],
-    /// Per-order bitmaps: bit at `block_index(pfn, order)` is set iff that block
-    /// is free.  Stored as Vec<u64> for efficient bit manipulation.
-    bitmaps: [Vec<u64>; MAX_ORDER + 1],
+    /// Per-order hierarchical bitmaps. Leaf bit at `block_index(pfn, order)` is
+    /// set iff that block is free.
+    free_maps: [SummaryBitmap; MAX_ORDER + 1],
     /// Per-order free block counts.
     free_counts: [usize; MAX_ORDER + 1],
     /// Total number of page frames managed.
@@ -40,21 +165,13 @@ pub struct BuddyAllocator {
 impl BuddyAllocator {
     /// Create a new buddy allocator sized for `total_pages` page frames.
     ///
-    /// All pages start as *allocated* (not free).  Call [`add_region`] or [`free`]
+    /// All pages start as *allocated* (not free). Call [`add_region`] or [`free`]
     /// to populate the free pool.
     pub fn new(total_pages: usize) -> Self {
-        // For each order, we need ceil(total_pages / (1 << order)) bits,
-        // stored in ceil(bits / 64) u64 words.
-        let mut bitmaps: [Vec<u64>; MAX_ORDER + 1] = Default::default();
-        for (order, bitmap) in bitmaps.iter_mut().enumerate() {
-            let blocks = blocks_at_order(total_pages, order);
-            let words = blocks.div_ceil(64);
-            *bitmap = vec![0u64; words];
-        }
-
+        let free_maps =
+            array::from_fn(|order| SummaryBitmap::new(blocks_at_order(total_pages, order)));
         Self {
-            free_lists: Default::default(),
-            bitmaps,
+            free_maps,
             free_counts: [0; MAX_ORDER + 1],
             total_pages,
         }
@@ -64,7 +181,7 @@ impl BuddyAllocator {
     /// possible buddy blocks.
     ///
     /// `start_pfn` and `page_count` describe a range of page frames that should
-    /// be added to the free pool.  Pages outside `0..total_pages` are silently
+    /// be added to the free pool. Pages outside `0..total_pages` are silently
     /// skipped.
     pub fn add_region(&mut self, start_pfn: usize, page_count: usize) {
         let end_pfn = start_pfn.saturating_add(page_count).min(self.total_pages);
@@ -83,22 +200,17 @@ impl BuddyAllocator {
             return None;
         }
 
-        // Find the smallest order >= requested that has free blocks.
-        let mut found_order = None;
+        let mut source_order = None;
         for o in order..=MAX_ORDER {
             if self.free_counts[o] > 0 {
-                found_order = Some(o);
+                source_order = Some(o);
                 break;
             }
         }
-        let source_order = found_order?;
+        let source_order = source_order?;
 
-        // Pop a block from the source order's free list.
         let pfn = self.pop_free(source_order)?;
-
-        // Split down from source_order to the requested order.
         for o in (order..source_order).rev() {
-            // The upper buddy at order `o` becomes free.
             let buddy = pfn ^ (1 << o);
             self.push_free(o, buddy);
         }
@@ -114,7 +226,7 @@ impl BuddyAllocator {
         if order > MAX_ORDER {
             return;
         }
-        // Alignment check: PFN must be aligned to block size.
+
         debug_assert!(
             pfn.is_multiple_of(1 << order),
             "BuddyAllocator::free: pfn {} not aligned to order {} (expected alignment {})",
@@ -122,7 +234,7 @@ impl BuddyAllocator {
             order,
             1usize << order,
         );
-        // Double-free guard: if already marked free at this order, bail out.
+
         if self.is_free(order, pfn) {
             debug_assert!(
                 false,
@@ -131,10 +243,9 @@ impl BuddyAllocator {
             );
             return;
         }
-        // Bounds check: the block must fit within managed pages.
+
         let block_pages = 1usize << order;
         if pfn.saturating_add(block_pages) > self.total_pages {
-            // Cannot merge further; just insert at current order if the PFN is valid.
             if pfn < self.total_pages {
                 self.push_free(order, pfn);
             }
@@ -143,9 +254,7 @@ impl BuddyAllocator {
 
         if order < MAX_ORDER {
             let buddy = pfn ^ (1 << order);
-            // Check buddy is within bounds and free at this order.
             if buddy.saturating_add(block_pages) <= self.total_pages && self.is_free(order, buddy) {
-                // Remove buddy from free list and merge.
                 self.remove_free(order, buddy);
                 let parent = pfn & !(1 << order);
                 self.free(parent, order + 1);
@@ -179,66 +288,46 @@ impl BuddyAllocator {
 
     /// Test whether the block at `(pfn, order)` is marked free in the bitmap.
     fn is_free(&self, order: usize, pfn: usize) -> bool {
-        let idx = Self::block_index(pfn, order);
-        let word = idx / 64;
-        let bit = idx % 64;
-        if word >= self.bitmaps[order].len() {
-            return false;
-        }
-        self.bitmaps[order][word] & (1u64 << bit) != 0
+        self.free_maps[order].contains(Self::block_index(pfn, order))
     }
 
     /// Set the free bit for `(pfn, order)`.
     fn set_free(&mut self, order: usize, pfn: usize) {
-        let idx = Self::block_index(pfn, order);
-        let word = idx / 64;
-        let bit = idx % 64;
-        if word < self.bitmaps[order].len() {
-            self.bitmaps[order][word] |= 1u64 << bit;
-        }
+        self.free_maps[order].set(Self::block_index(pfn, order));
     }
 
     /// Clear the free bit for `(pfn, order)`.
     fn clear_free(&mut self, order: usize, pfn: usize) {
-        let idx = Self::block_index(pfn, order);
-        let word = idx / 64;
-        let bit = idx % 64;
-        if word < self.bitmaps[order].len() {
-            self.bitmaps[order][word] &= !(1u64 << bit);
-        }
+        self.free_maps[order].clear(Self::block_index(pfn, order));
     }
 
-    /// Push a PFN onto the free list at `order` and set its bitmap bit.
+    /// Mark a block free at `order`.
     fn push_free(&mut self, order: usize, pfn: usize) {
         self.set_free(order, pfn);
-        self.free_lists[order].push(pfn);
         self.free_counts[order] += 1;
     }
 
-    /// Pop a PFN from the free list at `order` and clear its bitmap bit.
+    /// Remove and return any free block from `order`.
     fn pop_free(&mut self, order: usize) -> Option<usize> {
-        let pfn = self.free_lists[order].pop()?;
-        self.clear_free(order, pfn);
+        let block_index = self.free_maps[order].first_set()?;
+        self.free_maps[order].clear(block_index);
         self.free_counts[order] -= 1;
-        Some(pfn)
+        Some(block_index << order)
     }
 
-    /// Remove a specific PFN from the free list at `order` and clear its bitmap bit.
-    ///
-    /// This is O(n) in the free list length, but buddy merges are infrequent
-    /// relative to the list size.
+    /// Remove a specific PFN from the free pool at `order` in O(1) by clearing
+    /// its leaf bit plus the affected summary words.
     fn remove_free(&mut self, order: usize, pfn: usize) {
-        if let Some(pos) = self.free_lists[order].iter().position(|&p| p == pfn) {
-            self.clear_free(order, pfn);
-            self.free_lists[order].swap_remove(pos);
-            self.free_counts[order] -= 1;
-        } else {
+        if !self.is_free(order, pfn) {
             debug_assert!(
                 false,
-                "BuddyAllocator::remove_free: pfn {} not found in free list for order {}",
+                "BuddyAllocator::remove_free: pfn {} not found in free map for order {}",
                 pfn, order,
             );
+            return;
         }
+        self.clear_free(order, pfn);
+        self.free_counts[order] -= 1;
     }
 }
 
@@ -278,11 +367,9 @@ mod tests {
     fn allocate_all_pages_exhaustion() {
         let mut buddy = BuddyAllocator::new(8);
         buddy.add_region(0, 8);
-        // Allocate all 8 pages.
         for _ in 0..8 {
             assert!(buddy.allocate(0).is_some());
         }
-        // Should be exhausted.
         assert!(buddy.allocate(0).is_none());
         assert_eq!(buddy.free_count(), 0);
     }
@@ -303,11 +390,8 @@ mod tests {
 
     #[test]
     fn buddy_merging() {
-        // Allocate 2 adjacent order-0 blocks from a 2-page region.
-        // Freeing both should merge into one order-1 block.
         let mut buddy = BuddyAllocator::new(2);
         buddy.add_region(0, 2);
-        // After add_region, 2 pages should merge into 1 order-1 block.
         let counts = buddy.free_count_by_order();
         assert_eq!(
             counts[1], 1,
@@ -315,12 +399,10 @@ mod tests {
         );
         assert_eq!(counts[0], 0);
 
-        // Allocate order-0: should split the order-1 block.
         let p0 = buddy.allocate(0).unwrap();
         let p1 = buddy.allocate(0).unwrap();
         assert!(buddy.allocate(0).is_none());
 
-        // Free both: should merge back to order-1.
         buddy.free(p0, 0);
         buddy.free(p1, 0);
         let counts = buddy.free_count_by_order();
@@ -330,7 +412,6 @@ mod tests {
 
     #[test]
     fn splitting_higher_order() {
-        // 4-page region: should coalesce to one order-2 block.
         let mut buddy = BuddyAllocator::new(4);
         buddy.add_region(0, 4);
         let counts = buddy.free_count_by_order();
@@ -338,8 +419,6 @@ mod tests {
         assert_eq!(counts[1], 0);
         assert_eq!(counts[0], 0);
 
-        // Allocate order-0: splits order-2 -> order-1 + order-0,
-        // then order-0 is returned.
         let pfn = buddy.allocate(0).unwrap();
         assert!(pfn < 4);
         assert_eq!(buddy.free_count(), 3);
@@ -352,7 +431,6 @@ mod tests {
         let initial = buddy.free_count();
         assert_eq!(initial, 16);
 
-        // Alternating pattern: alloc 4, free 2, alloc 4, free 2, ...
         let mut allocated = Vec::new();
         for round in 0..4 {
             for _ in 0..4 {
@@ -360,7 +438,6 @@ mod tests {
                     allocated.push(pfn);
                 }
             }
-            // Free the first 2 from this round.
             let start = round * 4;
             for i in start..start + 2 {
                 if i < allocated.len() {
@@ -368,7 +445,6 @@ mod tests {
                 }
             }
         }
-        // We allocated 16, freed 8, so 8 should be free.
         assert_eq!(buddy.free_count(), 8);
     }
 
@@ -387,11 +463,9 @@ mod tests {
 
     #[test]
     fn non_power_of_two_region() {
-        // 5 pages: should get partial blocks without panicking.
         let mut buddy = BuddyAllocator::new(5);
         buddy.add_region(0, 5);
         assert_eq!(buddy.free_count(), 5);
-        // Should be: 1 order-2 block (4 pages) + 1 order-0 block (1 page).
         let counts = buddy.free_count_by_order();
         assert_eq!(counts[2], 1);
         assert_eq!(counts[0], 1);
@@ -399,23 +473,19 @@ mod tests {
 
     #[test]
     fn multi_order_allocation() {
-        // 16 pages: order-4 block.
         let mut buddy = BuddyAllocator::new(16);
         buddy.add_region(0, 16);
 
-        // Allocate order-2 (4 pages).
         let pfn = buddy.allocate(2).unwrap();
-        assert_eq!(pfn % 4, 0); // Must be aligned to 4-page boundary.
+        assert_eq!(pfn % 4, 0);
         assert_eq!(buddy.free_count(), 12);
 
-        // Free it back.
         buddy.free(pfn, 2);
         assert_eq!(buddy.free_count(), 16);
     }
 
     #[test]
     fn add_region_with_offset() {
-        // Add a region starting at PFN 256 (simulating physical memory above 1 MiB).
         let mut buddy = BuddyAllocator::new(512);
         buddy.add_region(256, 128);
         assert_eq!(buddy.free_count(), 128);
@@ -437,5 +507,141 @@ mod tests {
         let mut buddy = BuddyAllocator::new(16);
         buddy.add_region(0, 16);
         assert!(buddy.allocate(MAX_ORDER + 1).is_none());
+    }
+
+    // ----- D.2 tests: O(1) removal representation -----
+
+    /// Freeing buddies in reverse allocation order forces `remove_free` on every
+    /// merge. After all frees the region must fully coalesce.
+    #[test]
+    fn coalesce_chain_via_reverse_free() {
+        let mut buddy = BuddyAllocator::new(8);
+        buddy.add_region(0, 8);
+        assert_eq!(buddy.free_count_by_order()[3], 1);
+
+        let mut pages: Vec<usize> = (0..8).map(|_| buddy.allocate(0).unwrap()).collect();
+        assert_eq!(buddy.free_count(), 0);
+
+        pages.reverse();
+        for pfn in &pages {
+            buddy.free(*pfn, 0);
+        }
+        assert_eq!(buddy.free_count(), 8);
+        assert_eq!(buddy.free_count_by_order()[3], 1);
+    }
+
+    /// Interleaved alloc/free across multiple orders must keep the free-state
+    /// metadata consistent while `remove_free` clears merged buddies directly.
+    #[test]
+    fn interleaved_multi_order_remove_consistency() {
+        let mut buddy = BuddyAllocator::new(32);
+        buddy.add_region(0, 32);
+        assert_eq!(buddy.free_count(), 32);
+
+        let a0 = buddy.allocate(0).unwrap();
+        let a1 = buddy.allocate(1).unwrap();
+        let a2 = buddy.allocate(2).unwrap();
+        let a3 = buddy.allocate(3).unwrap();
+        assert_eq!(buddy.free_count(), 32 - 1 - 2 - 4 - 8);
+
+        buddy.free(a2, 2);
+        buddy.free(a0, 0);
+        buddy.free(a3, 3);
+        buddy.free(a1, 1);
+
+        assert_eq!(buddy.free_count(), 32);
+        assert_eq!(buddy.free_count_by_order()[5], 1);
+    }
+
+    /// Stress: 256 pages, allocate all order-0, free in butterfly (even then
+    /// odd) order to maximise coalesce remove_free calls. Free count must stay
+    /// consistent throughout.
+    #[test]
+    fn stress_butterfly_free_pattern() {
+        let n = 256;
+        let mut buddy = BuddyAllocator::new(n);
+        buddy.add_region(0, n);
+
+        let mut pages: Vec<usize> = (0..n).map(|_| buddy.allocate(0).unwrap()).collect();
+        assert_eq!(buddy.free_count(), 0);
+
+        pages.sort();
+
+        let mut freed = 0usize;
+        for pfn in pages.iter().filter(|p| **p % 2 == 0) {
+            buddy.free(*pfn, 0);
+            freed += 1;
+            assert_eq!(buddy.free_count(), freed);
+        }
+        for pfn in pages.iter().filter(|p| **p % 2 == 1) {
+            buddy.free(*pfn, 0);
+            freed += 1;
+            assert_eq!(buddy.free_count(), freed);
+        }
+        assert_eq!(buddy.free_count(), n);
+    }
+
+    /// Targeted: allocate two buddy pairs, free only one of each pair, verify
+    /// no spurious merges, then free the remaining halves and verify merge.
+    #[test]
+    fn partial_buddy_pair_no_spurious_merge() {
+        let mut buddy = BuddyAllocator::new(4);
+        buddy.add_region(0, 4);
+
+        let p0 = buddy.allocate(0).unwrap();
+        let p1 = buddy.allocate(0).unwrap();
+        let p2 = buddy.allocate(0).unwrap();
+        let p3 = buddy.allocate(0).unwrap();
+        assert_eq!(buddy.free_count(), 0);
+
+        let mut pfns = [p0, p1, p2, p3];
+        pfns.sort();
+
+        buddy.free(pfns[0], 0);
+        assert_eq!(buddy.free_count(), 1);
+        assert_eq!(buddy.free_count_by_order()[0], 1);
+
+        buddy.free(pfns[2], 0);
+        assert_eq!(buddy.free_count(), 2);
+        assert_eq!(buddy.free_count_by_order()[0], 2);
+
+        buddy.free(pfns[1], 0);
+        assert_eq!(buddy.free_count(), 3);
+        assert_eq!(buddy.free_count_by_order()[1], 1);
+        assert_eq!(buddy.free_count_by_order()[0], 1);
+
+        buddy.free(pfns[3], 0);
+        assert_eq!(buddy.free_count(), 4);
+        assert_eq!(buddy.free_count_by_order()[2], 1);
+    }
+
+    /// Repeated split/merge churn must keep the allocator stable without any
+    /// auxiliary free-list metadata growing across cycles.
+    #[test]
+    fn repeated_split_merge_cycles_round_trip() {
+        let mut buddy = BuddyAllocator::new(2);
+        buddy.add_region(0, 2);
+
+        for _ in 0..1024 {
+            let a = buddy.allocate(0).unwrap();
+            let b = buddy.allocate(0).unwrap();
+            assert!(buddy.allocate(0).is_none());
+
+            buddy.free(a, 0);
+            buddy.free(b, 0);
+
+            assert_eq!(buddy.free_count(), 2);
+            assert_eq!(buddy.free_count_by_order()[1], 1);
+        }
+    }
+
+    #[test]
+    fn sparse_high_pfn_region_round_trips() {
+        let mut buddy = BuddyAllocator::new(1 << 24);
+        let high_pfn = (1 << 24) - 1;
+
+        buddy.free(high_pfn, 0);
+        assert!(buddy.is_free(0, high_pfn));
+        assert_eq!(buddy.allocate(0), Some(high_pfn));
     }
 }

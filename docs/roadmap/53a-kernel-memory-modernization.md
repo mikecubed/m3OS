@@ -1,6 +1,6 @@
 # Phase 53a - Kernel Memory Modernization
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-53a
 **Depends on:** Phase 33 (Kernel Memory) ✅, Phase 35 (True SMP) ✅, Phase 36 (Expanded Memory) ✅, Phase 52c (Kernel Architecture Evolution) ✅, Phase 52d (Kernel Completion) ✅
 **Builds on:** Replaces the Phase 33 linked-list heap and unintegrated slab-cache scaffolding with an SMP-scalable allocator stack informed by `docs/research/m3os-allocator-analysis.md`, `docs/research/allocator-theory.md`, and `docs/research/memory-allocator-survey.md`
@@ -41,7 +41,7 @@ Replace the unused `SlabCache` with an embedded-freelist slab allocator and per-
 
 ### Size-class-based GlobalAlloc (Track C)
 
-Replace `linked_list_allocator::LockedHeap` with a custom `GlobalAlloc` that routes allocations to the appropriate size-class slab cache. 13 geometric size classes (32B to 4KiB, 4 steps per doubling, <20% max internal waste) cover the small-object path. Larger or stronger-aligned layouts use a page-backed mapped allocation path with explicit metadata for deallocation; the buddy allocator remains the physical backend.
+Replace `linked_list_allocator::LockedHeap` with a custom `GlobalAlloc` that routes allocations to the appropriate size-class slab cache. A fixed 13-class table (32B to 4 KiB) covers the small-object path; the 32..=1024 region stays below ~34% internal waste and the 2048→4096 jump stays below 50% worst-case waste. Larger or stronger-aligned layouts use a page-backed mapped allocation path with explicit metadata for deallocation; the buddy allocator remains the physical backend.
 
 ### Foundation fixes (Track D)
 
@@ -57,7 +57,18 @@ When a CPU frees an object allocated on a different CPU's slab, it pushes to the
 
 ### Integration, reclaim, and validation (Track F)
 
-Make the allocator safe to land incrementally. Define the minimal allocation-context contract for page-fault/IRQ-sensitive callers, add allocator-local reclaim before high-order/OOM failure, preserve stats and `/proc/meminfo` / `sys_meminfo` semantics across the cutover, and add a kill switch plus concurrency validation (including loom for new Acquire/Release queues).
+Make the allocator safe to land incrementally. Define the minimal allocation-context contract for page-fault/IRQ-sensitive callers, add allocator-local reclaim before high-order/OOM failure, preserve stats and `/proc/meminfo` / `sys_meminfo` semantics across the cutover, and add a kill switch plus concurrency validation (including loom for new Acquire/Release queues). The staged rollout keeps a compile-time `legacy-bootstrap-allocator` escape hatch so bring-up can stay on the bootstrap allocator while `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` and the opt-in loom models burn in the new paths.
+
+### Minimal allocation-context contract (Track F.1)
+
+Phase 53a adopts a deliberately small contract before full GFP-style flags exist:
+
+| Context | Contract |
+|---|---|
+| **IRQ-sensitive / page-fault-adjacent** | Local per-CPU page-cache and magazine mutations run with interrupts masked plus a same-core non-reentrancy guard. Re-entrant allocs bypass CPU-local caches/magazines and use a best-effort cold path (or fail with `None`); re-entrant slab frees route to the owner CPU's lock-free queue rather than touching magazine state twice. |
+| **Sleepable** | Callers may tolerate the contended cold path, trigger reclaim, or retry after `None`. Future reclaim that might sleep is restricted to this context. |
+
+Cold paths still use spin locks only today, so "sleepable" means "allowed to take the contended path / retry" rather than "allocator literally sleeps already."
 
 ## Important Components and How They Work
 
@@ -84,6 +95,22 @@ Replace `Vec::position()`-based free-block removal with an O(1)-removable per-or
 ### Compatibility and observability surfaces (`kernel/src/mm/*`, `kernel/src/fs/procfs.rs`, `kernel/src/arch/x86_64/syscall/mod.rs`)
 
 `frame_stats()`, `heap_stats()`, `/proc/meminfo`, and `sys_meminfo` currently assume a single global frame pool and a fixed heap/slab shape. Phase 53a must define how per-CPU cached pages, size-class slabs, remote free queues, and page-backed large allocations appear in those stats so debugging and tests stay meaningful during the cutover.
+
+### Memory accounting policy (Track F.3 — Linux-like semantics)
+
+The project adopts Linux-like memory accounting:
+
+| Metric | Definition | `/proc/meminfo` field |
+|---|---|---|
+| **MemFree** | Buddy-managed frames immediately allocatable without draining any per-CPU cache | `MemFree` |
+| **MemAvailable** | `MemFree` + reclaimable per-CPU cached pages | `MemAvailable` |
+| **Allocated** | `MemTotal − MemAvailable`.  Frames actively backing kernel or user mappings | `Allocated` |
+| **PerCpuCached** | Frames held in per-CPU page caches; excluded from MemFree, included in MemAvailable | `PerCpuCached` |
+
+Key invariants enforced by `frame_stats_consistent()`:
+- `total_frames == available_frames + allocated_frames`
+- `available_frames == free_frames + per_cpu_cached`
+- `sum(order_count × 2^order) == free_frames` (buddy orders sum to buddy-only free count)
 
 ## How This Builds on Earlier Phases
 

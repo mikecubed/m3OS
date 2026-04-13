@@ -1,9 +1,10 @@
 [package]
 name = "kernel-core"
-version = "0.52.0"
+version = "0.53.0"
 edition = "2024"
 
 [dependencies]
+spin = "0.9.8"
 
 [dev-dependencies]
 proptest = "1"
@@ -12,6 +13,9 @@ loom = "0.7"
 [features]
 default = ["std"]
 std = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 # When used from the kernel (no_std), disable the default "std" feature:
 # kernel-core = { path = "../kernel-core", default-features = false }

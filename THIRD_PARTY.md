@@ -51,7 +51,6 @@ are licensed under MIT, Apache-2.0, or both.
 | `x86_64` | 0.15.4 | MIT/Apache-2.0 | Page tables, IDT, GDT, port I/O |
 | `uart_16550` | 0.4.0 | MIT | Serial port driver |
 | `pic8259` | 0.11.0 | Apache-2.0/MIT | 8259 PIC initialization |
-| `linked_list_allocator` | 0.10.5 | Apache-2.0/MIT | Kernel heap allocator |
 | `log` | 0.4.29 | MIT OR Apache-2.0 | Logging facade |
 | `spin` | 0.9.8 | MIT | no_std Mutex/RwLock |
 | `fatfs` | 0.3.6 | MIT | FAT32 filesystem (xtask) |

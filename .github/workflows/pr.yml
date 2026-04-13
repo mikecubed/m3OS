@@ -47,6 +47,9 @@ jobs:
       - name: Lint (clippy + fmt)
         run: cargo xtask check
 
+      - name: Allocator loom concurrency tests
+        run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom --quiet
+
       - name: Smoke test (boot + login + TCC compile)
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.
