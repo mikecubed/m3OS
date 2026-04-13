@@ -1,14 +1,17 @@
 //! Size-class table for the slab allocator.
 //!
 //! Maps arbitrary allocation sizes (1..=4096) to a fixed set of 13 slab
-//! size classes using a geometric 4-steps-per-doubling progression.
-//! Internal waste is bounded at <20 % for every size in range.
+//! size classes. The table follows roughly 2 steps per doubling up to 1024,
+//! then uses full doublings for the large buckets.
 
 /// The 13 size classes (bytes), in ascending order.
 ///
-/// Geometric progression: 4 steps per doubling ≈ ×1.19 per step.
-/// This bounds internal fragmentation to at most ~19 % for any request
-/// size in 1..=4096.
+/// This exact table is the Phase 53a contract:
+/// 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096.
+///
+/// With these exact buckets the geometric region (32..=1024) stays below
+/// ~34 % internal waste, while the 2048→4096 jump reaches ~50 % worst-case
+/// waste for requests just above 2048.
 pub const SIZE_CLASSES: [usize; 13] = [
     32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096,
 ];
