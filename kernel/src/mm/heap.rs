@@ -320,6 +320,12 @@ fn pages_for_layout(layout: &Layout) -> (usize, usize) {
     (1 << order, order)
 }
 
+/// Maximum reclaimable allocation size that the current page-backed large path
+/// can satisfy in one request.
+pub const fn max_page_backed_allocation_bytes() -> usize {
+    (1usize << kernel_core::buddy::MAX_ORDER) * kernel_core::buddy::PAGE_SIZE
+}
+
 #[inline]
 fn page_meta_entry(pfn: usize) -> Option<&'static PageMeta> {
     PAGE_META_TABLE.get().and_then(|table| table.get(pfn))
@@ -900,5 +906,21 @@ pub fn heap_stats() -> HeapStats {
         size_class_active: SIZE_CLASS_ACTIVE.load(Ordering::Relaxed),
         slab_pages,
         page_backed_pages,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn page_backed_allocation_limit_matches_buddy_ceiling() {
+        let max_bytes = max_page_backed_allocation_bytes();
+        let (_, max_order) = pages_for_layout(&Layout::from_size_align(max_bytes, 1).unwrap());
+        let (_, overflow_order) =
+            pages_for_layout(&Layout::from_size_align(max_bytes + 1, 1).unwrap());
+
+        assert_eq!(max_order, kernel_core::buddy::MAX_ORDER);
+        assert!(overflow_order > kernel_core::buddy::MAX_ORDER);
     }
 }

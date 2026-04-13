@@ -5354,8 +5354,9 @@ fn is_directory(path: &str) -> bool {
 const NEG_E2BIG: u64 = (-7_i64) as u64;
 
 fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
-    /// Maximum executable size we are willing to load (16 MB).
-    const MAX_EXEC_SIZE: usize = 16 * 1024 * 1024;
+    /// Maximum executable size we can safely materialize in one reclaimable
+    /// kernel heap allocation with the current page-backed large-allocation path.
+    const MAX_EXEC_SIZE: usize = crate::mm::heap::max_page_backed_allocation_bytes();
 
     // Try ext2 root filesystem first (most likely location for compiled binaries).
     // Skip /data/ paths — those are routed to FAT32 by other syscalls.
@@ -5392,10 +5393,21 @@ fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
         && !rel.is_empty()
     {
         let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if let Ok(data) = tmpfs.read_file(rel, 0, usize::MAX)
-            && !data.is_empty()
-        {
-            return Ok(data.to_vec());
+        if let Ok(stat) = tmpfs.stat(rel) {
+            if stat.size > MAX_EXEC_SIZE {
+                log::warn!(
+                    "[exec] file too large ({} bytes > {} limit): {}",
+                    stat.size,
+                    MAX_EXEC_SIZE,
+                    path
+                );
+                return Err(NEG_E2BIG);
+            }
+            if let Ok(data) = tmpfs.read_file(rel, 0, stat.size)
+                && !data.is_empty()
+            {
+                return Ok(data.to_vec());
+            }
         }
     }
 
