@@ -10,6 +10,7 @@ pub mod fs;
 pub mod input;
 pub mod ipc;
 pub mod log_ring;
+pub mod magazine;
 pub mod mm;
 pub mod net;
 pub mod pipe;
