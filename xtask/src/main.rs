@@ -1030,7 +1030,7 @@ fn build_tcc() -> Option<PathBuf> {
         .args([
             "./configure",
             "--prefix=/usr",
-            &format!("--cc={cc}"),
+            &format!("--cc={cc} -static"),
             "--extra-cflags=-static",
             "--extra-ldflags=-static -no-pie",
             "--cpu=x86_64",
