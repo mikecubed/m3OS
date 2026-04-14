@@ -44,13 +44,13 @@ jobs:
           key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
           restore-keys: ${{ runner.os }}-tcc-
 
-      - name: Gate bundle: cargo xtask check (clippy + fmt + host tests)
+      - name: "Gate bundle: cargo xtask check (clippy + fmt + host tests)"
         run: cargo xtask check
 
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
-      - name: Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)
+      - name: "Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)"
         run: |
           # Delete cached disk.img so it is regenerated with TCC files.
           rm -f target/x86_64-unknown-none/release/disk.img
