@@ -1,6 +1,6 @@
 current-task: Resolve the remaining PR #105 review and readiness findings on feature branch feat/53-headless-hardening
-current-phase: fix-batch-3-complete
-next-action: publish the remaining account-parser hardening follow-up, rerun final readiness on the new head, and close the loop
+current-phase: final-ready
+next-action: branch published at 50542a6 with green hosted checks; PR is ready for human review
 workspace: PR #105 / feat/53-headless-hardening
 last-updated: 2026-04-14T06:44:27+00:00
 
@@ -19,6 +19,8 @@ last-updated: 2026-04-14T06:44:27+00:00
 - Fix batch 3 hardened `login`, `id`, `whoami`, and `adduser` to reject malformed or overflowed UID/GID fields via checked arithmetic, and made `adduser` fail cleanly when `max_uid.checked_add(1)` overflows instead of wrapping a new account to UID 0.
 - Post-fix validation for batch 3 passed: `cargo xtask check` and the existing passwd host regression remained green.
 - Independent review on the final five-file parser batch reported no substantive remaining issues after the `adduser` overflow follow-up fix.
+- Branch update published as `50542a6` (`fix: harden remaining account uid parsers`).
+- Latest hosted checks on PR #105 head `50542a6` all reached terminal success: CodeQL (`actions`, `c-cpp`, `rust`) and DevSkim passed; no pending or failing checks remained.
 
 ## Files Touched
 
