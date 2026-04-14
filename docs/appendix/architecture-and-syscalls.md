@@ -99,15 +99,15 @@ In addition to the target components above, the kernel currently also contains:
 
 | In-Kernel Component | Intended Location | Status |
 |---|---|---|
-| VFS layer (`fs/vfs.rs`) | Ring 3 server | Transition — runs as kernel task |
-| FAT32 driver (`fs/fat32.rs`) | Ring 3 server | Transition — kernel task |
-| ext2 driver (`fs/ext2.rs`) | Ring 3 server | Transition — kernel task |
+| VFS layer (`fs/vfs.rs`) | Ring 3 server | Transition — kernel keeps fd/object facade; pathname and mount policy now route through `vfs_server` for the migrated rootfs slice |
+| FAT32 driver (`fs/fat32.rs`) | Ring 3 server | Transition — supervised `fat_server` exists, but FAT32 file I/O is still mostly ring-0 |
+| ext2 driver (`fs/ext2.rs`) | Ring 3 server | Transition — read-only `/etc/...` path and metadata flow through `vfs_server`; kernel still owns bootstrap/ext2 mechanism |
 | ramdisk (`fs/ramdisk.rs`) | Ring 3 server | Transition — kernel task |
 | tmpfs (`fs/tmpfs.rs`) | Ring 3 server | Transition — kernel task |
 | procfs (`fs/procfs.rs`) | Ring 3 server | Transition — kernel task |
-| TCP/UDP/ICMP stack (`net/`) | Ring 3 server | Transition — kernel code |
+| TCP/UDP/ICMP stack (`net/`) | Ring 3 server | Transition — UDP policy has a userspace `net_server` facade; packet transport and TCP stay in kernel |
 | ARP (`net/arp.rs`) | Ring 3 server | Transition — kernel code |
-| Socket table (`net/mod.rs`) | Ring 3 server | Transition — kernel code |
+| Socket table (`net/mod.rs`) | Ring 3 server | Transition — kernel fd/socket handles stay in ring 0 while userspace owns the migrated UDP policy slice |
 | Unix sockets (`net/unix.rs`) | Ring 3 server | Transition — kernel code |
 | VirtIO-net driver (`net/virtio_net.rs`) | Ring 3 driver | Transition — kernel driver |
 | VirtIO-blk driver (`blk/`) | Ring 3 driver | Transition — kernel driver |
@@ -117,15 +117,18 @@ In addition to the target components above, the kernel currently also contains:
 | Framebuffer console (`fb/`) | Ring 3 server | Transition — kernel driver |
 | console_server_task | Ring 3 server | Runs as kernel task in `main.rs` |
 | kbd_server_task | Ring 3 server | Runs as kernel task in `main.rs` |
-| fat_server_task | Ring 3 server | Runs as kernel task in `main.rs` |
-| vfs_server_task | Ring 3 server | Runs as kernel task in `main.rs` |
-| net_task | Ring 3 server | Runs as kernel task in `main.rs` |
+| fat_server_task | Ring 3 server | Replaced by supervised `/bin/fat_server` userspace service |
+| vfs_server_task | Ring 3 server | Replaced by supervised `/bin/vfs_server` userspace service |
+| net_task | Ring 3 server | Replaced for the migrated UDP policy slice by supervised `/bin/net_server` |
 
 ## What Lives in Userspace
 
 | Server | Responsibility |
 |---|---|
 | `init` | First process (PID 1); service manager, spawns servers, reaps orphans |
+| `fat_server` | Supervised storage helper; currently a first-class placeholder for later FAT extraction |
+| `vfs_server` | Rootfs pathname, metadata, directory listing, and read-only file-handle policy for the migrated ext2 slice |
+| `net_server` | UDP socket policy service (`net_udp`): bind/connect/send/recv validation and teardown coordination |
 | `shell` | Interactive command interpreter (sh0) |
 | `login` | Authentication and session management |
 | `telnetd` | Telnet server daemon |
@@ -282,24 +285,38 @@ infrastructure**. All subsystems run in ring 0:
 - **IPC** (ipc/): seL4-style synchronous rendezvous endpoints, async notifications,
   capability tables — ring 0 (correctly placed).
 - **Process management** (process/): fork, exec, exit, wait, threads, futex — ring 0.
-- **Filesystem** (fs/): VFS routing, FAT32, ext2, ramdisk, tmpfs, procfs — all run as
-  kernel tasks via `fat_server_task` / `vfs_server_task` in `main.rs`.
-- **Network** (net/): full IPv4/TCP/UDP/ICMP/ARP stack, Unix domain sockets, socket
-  table — all ring 0 kernel code, driven by `net_task` in `main.rs`.
+- **Filesystem** (fs/): kernel still owns low-level ext2/FAT/tmpfs/procfs mechanism and fd
+  tracking, but the migrated rootfs pathname + metadata policy now crosses the supervised
+  `vfs_server` boundary, with `fat_server` retained as the storage-service anchor.
+- **Network** (net/): packet ingress/egress, TCP, datagram queues, and socket handles stay in
+  ring 0, but the migrated UDP bind/connect/send/recv policy flows through supervised
+  `net_server` (`net_udp`) service calls.
 - **Drivers**: VirtIO-blk, VirtIO-net, framebuffer, serial, keyboard, RTC — all ring 0.
 - **TTY/PTY** (tty.rs, pty.rs): terminal subsystem — ring 0.
 - **Signals** (signal.rs): POSIX signal delivery — ring 0.
 - **SMP** (smp/): AP boot, IPI, TLB shootdown — ring 0 (correctly placed).
 
-The kernel-resident service tasks (`console_server_task`, `kbd_server_task`,
-`fat_server_task`, `vfs_server_task`, `net_task`) use the IPC endpoint infrastructure
-but run entirely in kernel address space with ring-0 privileges. The `stdin_feeder_task`
-and `serial_stdin_feeder_task` are transitional glue that bridge hardware interrupts to
-the IPC-based server model.
+The remaining kernel-resident service tasks are transitional console/input helpers
+(`console_server_task`, `kbd_server_task`, `stdin_feeder_task`, and
+`serial_stdin_feeder_task`). Phase 54 moves storage and the first UDP policy slice to
+supervised userspace binaries instead of leaving them as kernel-resident loops.
 
-True userspace processes (init, shell, login, telnetd, sshd, coreutils) communicate with
-the kernel via the Linux-compatible syscall ABI (~90 syscalls), bypassing the IPC
-endpoints entirely for filesystem and network operations.
+True userspace processes (init, storage/network services, shell, login, telnetd, sshd,
+coreutils) still enter through the Linux-compatible syscall ABI, but the migrated
+filesystem and UDP paths now dispatch through IPC-backed service facades rather than
+keeping all policy in ring 0.
+
+### Phase 54 restart and degradation rules
+
+- `fat_server` remains restartable because it does not yet own long-lived file handles.
+- `vfs_server` runs with `restart=never`: once the kernel has handed out `FdBackend::VfsService`
+  handles, an automatic restart could recycle service-local handle IDs. If `vfs_server`
+  exits, new rootfs pathname operations fall back to kernel ext2 bootstrap logic, while
+  existing VFS-backed file descriptors fail with explicit `EIO`/`EBADF`-style errors.
+- `net_server` (`net_udp`) also runs with `restart=never`: live UDP sockets keep the
+  kernel-owned bind/address state needed to continue send/recv, and new UDP syscalls
+  fall back to the kernel policy path when the service is absent, but the userspace
+  policy table is not automatically rebuilt over existing handles.
 
 ---
 
