@@ -463,6 +463,15 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
     // Phase 54: route read-only /etc/... file opens through the userspace VFS
     // service when it is registered, instead of the kernel-inline ext2 path.
     if vfs_service_should_route(&resolved, flags) {
+        // Enforce the same DAC permission check the kernel path uses so that
+        // protected files (e.g. /etc/shadow) are not exposed through the VFS
+        // service path.
+        if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+            let (_, _, euid, egid) = current_process_ids();
+            if !check_permission(fu, fg, fm, euid, egid, 4) {
+                return NEG_EACCES;
+            }
+        }
         // Release mount lock before IPC to avoid blocking other openers.
         drop(_mount_guard);
         return vfs_service_open(&resolved, flags);
@@ -5563,7 +5572,8 @@ fn ext2_root_path(path: &str) -> Option<&str> {
 /// 1. Path is under `/etc/` (a config-file read class).
 /// 2. Open flags are read-only (`O_RDONLY`, no create/trunc/append).
 /// 3. The "vfs" service is currently registered.
-/// 4. The path is a regular ext2 file (not a directory).
+/// 4. The path has no ramdisk overlay (ramdisk takes precedence).
+/// 5. The path is a regular ext2 file on the mounted volume.
 fn vfs_service_should_route(path: &str, flags: u64) -> bool {
     // Only /etc/ prefix — this is the Phase 54 first-slice boundary.
     if !(path.starts_with("/etc/") && path.len() > 5) {
@@ -5576,6 +5586,20 @@ fn vfs_service_should_route(path: &str, flags: u64) -> bool {
     }
     if flags & (0x40 | 0x200 | 0x400) != 0 {
         return false; // O_CREAT | O_TRUNC | O_APPEND
+    }
+    // Ramdisk overlays stay on the kernel path (e.g. /etc/hello.txt).
+    if crate::fs::ramdisk::ramdisk_lookup(path).is_some() {
+        return false;
+    }
+    // Must be a regular file on the ext2 root volume (not a directory or
+    // symlink).  `ext2_root_path` converts the absolute path to a volume-
+    // relative path; `is_ext2_regular_file` confirms the inode type.
+    if let Some(rel) = ext2_root_path(path) {
+        if !crate::fs::ext2::is_ext2_regular_file(rel) {
+            return false;
+        }
+    } else {
+        return false;
     }
     // Service must be registered.
     crate::ipc::registry::is_registered("vfs")
@@ -8558,6 +8582,9 @@ fn serial_echo_bytes(bytes: &[u8]) {
 // Phase 54: sys_block_read — raw sector reads for ring-3 storage servers
 // ---------------------------------------------------------------------------
 
+/// Allowed caller binaries for raw block reads.
+const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
 /// Read raw disk sectors into a userspace buffer.
 ///
 /// Args:
@@ -8568,7 +8595,22 @@ fn serial_echo_bytes(bytes: &[u8]) {
 ///
 /// Returns 0 on success, or a negative errno on error.
 /// Capped at 128 sectors (64 KiB) per call for safety.
+///
+/// Only processes whose `exec_path` is in [`BLOCK_READ_ALLOWED`] may call
+/// this syscall; all others receive `-EPERM`.
 fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    // Restrict to supervised storage services.
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table
+            .find(pid)
+            .is_some_and(|p| BLOCK_READ_ALLOWED.iter().any(|a| p.exec_path == *a));
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+
     const MAX_SECTORS: usize = 128; // 64 KiB
 
     let count = count as usize;
