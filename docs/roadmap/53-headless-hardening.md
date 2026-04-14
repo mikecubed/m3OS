@@ -130,10 +130,10 @@ or "regression" are not sufficient; the bundle names the exact commands.
 
 | Gate | Command | What it proves |
 |---|---|---|
-| Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests pass |
+| Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests + passwd host regression pass |
 | Unit + property tests | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` | Host-side pure-logic invariants hold |
 | Loom concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Lock-free allocator paths are linearizable |
-| QEMU boot smoke test | `cargo xtask smoke-test --timeout 300` | Boot → login → UID check → service list → ext2 write/verify/delete → log pipeline → TCC compile |
+| QEMU boot smoke test | `cargo xtask smoke-test --timeout 300` | Boot → login → TCC compile → UID check → service list → ext2 write/verify/delete → log pipeline |
 | Regression suite | `cargo xtask regression --timeout 90` | 10 registered SMP-sensitive and headless-operator scenarios pass |
 | Stress suite (nightly only) | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | No timing-dependent failures across repeated runs |
 
@@ -152,13 +152,12 @@ or "regression" are not sufficient; the bundle names the exact commands.
 
 ### Gate status
 
-**Smoke test** (`cargo xtask smoke-test --timeout 300`) now covers headless
-workflow steps 1–5: boot/login with security-floor verification (`id` shows
-uid 0), service inspection (`service list` header + core daemon entry),
-storage verification (ext2 touch/ls/rm), log inspection (`logger` +
-`grep /var/log/messages`), and package/build basics (TCC compile). Step
-labels use `guest/` prefixes to distinguish guest-side failures from harness
-failures in CI output.
+**Smoke test** (`cargo xtask smoke-test --timeout 300`) now covers boot/login,
+package/build basics (TCC compile), security-floor verification (`id` shows uid
+0), service inspection (`service list` header + core daemon entry), storage
+verification (ext2 touch/ls/rm), and log inspection (`logger` +
+`grep /var/log/messages`). Step labels use `guest/` prefixes to distinguish
+guest-side failures from harness failures in CI output.
 
 **Regression suite** (`cargo xtask regression`) covers 10 scenarios:
 
@@ -190,7 +189,9 @@ coordination that is fragile under CI load.
 
 **CI alignment:** PR and main-branch workflows run the same gate bundle:
 `cargo xtask check` (which already runs the host-side
-`cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier),
+`cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier and
+`cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features
+--features host-tests --test passwd_host`),
 `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target
 x86_64-unknown-linux-gnu --test allocator_loom`,
 `cargo xtask smoke-test --timeout 300`, and
@@ -203,7 +204,7 @@ sustaining evidence, not a merge gate.
 Phase 53 closes only after the allocator-sensitive post-53a image passes the
 same final-close bundle that the docs publish:
 
-1. `cargo xtask check` (this includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier)
+1. `cargo xtask check` (this includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier plus `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host`)
 2. `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom`
 3. `cargo xtask smoke-test --timeout 300`
 4. `cargo xtask regression --timeout 90`

@@ -1,26 +1,21 @@
-current-task: Resolve PR #105 review feedback for the Phase 53 host-test command documentation on feature branch feat/53-headless-hardening
+current-task: Resolve the open PR #105 smoke-test ordering review comment on feature branch feat/53-headless-hardening
 current-phase: fix-batch-1-complete
-next-action: run final readiness gate
-workspace: feat/53-headless-hardening
-last-updated: 2026-04-14T03:07:33+00:00
+next-action: run post-fix validation and publish the branch update
+workspace: PR #105 / feat/53-headless-hardening
+last-updated: 2026-04-14T04:48:34+00:00
 
 ## Decisions
 
-- discussion_r3076848155 fixed in `docs/evaluation/usability-roadmap.md`.
-- discussion_r3076848177 fixed in `docs/roadmap/53-headless-hardening.md`.
-- discussion_r3076848191 fixed in `docs/53-headless-hardening.md`.
-- discussion_r3076848202 fixed in `docs/43c-regression-stress-ci.md`.
-- Consistency follow-ups within the active PR surface were also fixed in `docs/43c-regression-stress-ci.md` and `docs/evaluation/current-state.md`.
-- No review items remain pending in this fix batch.
+- discussion_r3077159872 fixed in `docs/roadmap/53-headless-hardening.md` by updating the published smoke-test sequence to match the actual `xtask` smoke-test order.
+- Related Phase 53 gate docs in `docs/43c-regression-stress-ci.md` were updated so the published `cargo xtask check` contract matches the current CI entrypoint, including the `passwd_host` host-test regression.
+- `xtask/src/main.rs` now runs `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host` inside `cargo xtask check`.
 
 ## Files Touched
 
 - .agent/SESSION.md
-- docs/53-headless-hardening.md
 - docs/43c-regression-stress-ci.md
-- docs/evaluation/current-state.md
-- docs/evaluation/usability-roadmap.md
 - docs/roadmap/53-headless-hardening.md
+- xtask/src/main.rs
 
 ## Open Questions
 

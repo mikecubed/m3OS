@@ -14,8 +14,10 @@ validation, and looped stress tests for timing-dependent failures.
 
 Phase 53 later turns the automated half of this stack into the published
 headless/reference gate bundle: `cargo xtask check` (which already runs the
-host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu`
-tier in CI), `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target
+host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier
+plus `cargo test -p passwd --target x86_64-unknown-linux-gnu
+--no-default-features --features host-tests --test passwd_host` in CI),
+`RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target
 x86_64-unknown-linux-gnu --test allocator_loom`, `cargo xtask smoke-test
 --timeout 300`, and
 `cargo xtask regression --timeout 90`. Nightly
@@ -42,6 +44,7 @@ Static analysis gate:
 
 Host tests (fast, no QEMU):
   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
+  cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host
   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
 Regression tests (QEMU, ~30s each):
@@ -144,7 +147,7 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 
 | Tier | Trigger | Tests | Time |
 |---|---|---|---|
-| PR | Every pull request | `cargo xtask check` (includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier) + `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
+| PR | Every pull request | `cargo xtask check` (includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier plus `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host`) + `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
 | Build | Push to main | Same as PR | ~5-8 min |
 | Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | ~60 min |
 
@@ -155,7 +158,7 @@ but it does not replace the full Phase 53 contract.
 
 | Published Phase 53 gate | How this doc fits |
 |---|---|
-| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds; also the command that invokes the host-side kernel-core tier in CI |
+| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds; also the command that invokes the host-side kernel-core tier plus the `passwd_host` regression in CI |
 | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` | Direct rerun command for the host-side unit/property tier when debugging locally or collecting release evidence outside `xtask check` |
 | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Host-side concurrency tier |
 | `cargo xtask smoke-test --timeout 300` | Full-boot headless workflow smoke tier |

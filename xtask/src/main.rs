@@ -1583,6 +1583,8 @@ fn cmd_check() {
 
     // Host-side allocator/property coverage uses:
     //   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
+    // Password-shadow rewrite regression coverage uses:
+    //   cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host
     // Loom coverage remains opt-in via:
     //   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test <...>
     let status = Command::new(env!("CARGO"))
@@ -1624,6 +1626,30 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "passwd",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+            "--no-default-features",
+            "--features",
+            "host-tests",
+            "--test",
+            "passwd_host",
+        ])
+        .status()
+        .expect("failed to run passwd host tests");
+
+    if !status.success() {
+        eprintln!(
+            "passwd host tests failed — rerun `cargo test -p passwd --target {KERNEL_CORE_HOST_TARGET} --no-default-features --features host-tests --test passwd_host`"
+        );
+        std::process::exit(1);
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1636,7 +1662,9 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    println!("check passed: clippy clean, formatting correct, host tests pass");
+    println!(
+        "check passed: clippy clean, formatting correct, kernel-core and passwd host tests pass"
+    );
 }
 
 #[derive(Debug, Clone)]
