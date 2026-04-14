@@ -6552,17 +6552,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-            FdBackend::Socket { handle } => {
-                // Phase 54 Track C: notify net_udp service on UDP socket close.
-                let is_udp = crate::net::with_socket(*handle, |s| {
-                    s.protocol == crate::net::SocketProtocol::Udp
-                })
-                .unwrap_or(false);
-                if is_udp && net_udp_service_available() {
-                    net_udp_service_close(*handle);
-                }
-                crate::net::free_socket(*handle);
-            }
+            FdBackend::Socket { handle } => release_socket_handle(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
@@ -12691,7 +12681,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     if proto == SocketProtocol::Udp && net_udp_service_available() {
         let err = net_udp_service_create(handle);
         if err != 0 {
-            crate::net::free_socket(handle);
+            release_socket_handle(handle);
             return err;
         }
     }
@@ -12706,7 +12696,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
         None => {
-            crate::net::free_socket(handle);
+            release_socket_handle(handle);
             NEG_EMFILE
         }
     }
@@ -13001,7 +12991,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
@@ -13009,15 +12999,15 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_to_kernel(&mut len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                     if u32::from_ne_bytes(len_buf) < 16 {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return e;
                     }
                 }
@@ -13028,7 +13018,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                 }
@@ -13045,7 +13035,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
                     None => {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EMFILE;
                     }
                 }
@@ -15101,4 +15091,17 @@ fn net_udp_service_close(kernel_handle: u32) -> u16 {
     msg.data[0] = kernel_handle as u64;
     let reply = endpoint::call_msg(task, ep, msg);
     reply.data[0] as u16
+}
+
+fn release_socket_handle(handle: u32) {
+    let hold_udp_last_ref = net_udp_service_available();
+    let result = crate::net::free_socket_with_result(handle, hold_udp_last_ref);
+    if result.needs_finalization {
+        net_udp_service_close(handle);
+        crate::net::finalize_socket_close(handle);
+    }
+}
+
+pub fn release_socket_pub(handle: u32) {
+    release_socket_handle(handle);
 }

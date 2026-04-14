@@ -4441,7 +4441,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=fat\nuser=200\n";
 
     // Phase 54 Track C: UDP network service.
-    let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
+    let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
 
     let hostname_content = "m3os\n";
 

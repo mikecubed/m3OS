@@ -307,7 +307,7 @@ pub fn close_cloexec_fds(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::net::free_socket(h);
+        crate::arch::x86_64::syscall::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
@@ -372,7 +372,7 @@ pub fn close_all_fds_for(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::net::free_socket(h);
+        crate::arch::x86_64::syscall::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
