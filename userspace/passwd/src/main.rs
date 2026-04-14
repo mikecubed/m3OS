@@ -1,10 +1,13 @@
 //! m3OS passwd — change user password (Phase 27).
 //!
 //! Only root can change passwords (non-root support requires setuid-bit, deferred).
-#![cfg_attr(not(test), no_std)]
-#![cfg_attr(not(test), no_main)]
-#![cfg_attr(test, allow(dead_code))]
+#![no_std]
+#![no_main]
 
+use passwd::{
+    ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
+    rewrite_shadow_file, user_exists,
+};
 use syscall_lib::{
     O_RDONLY, STDOUT_FILENO, close, fsync, geteuid, getrandom, getuid, open, read, write, write_str,
 };
@@ -12,7 +15,6 @@ use syscall_lib::{
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 
-#[cfg(not(test))]
 syscall_lib::entry_point!(passwd_main);
 
 fn passwd_main(args: &[&str]) -> i32 {
@@ -156,150 +158,6 @@ fn passwd_main(args: &[&str]) -> i32 {
     0
 }
 
-fn requested_username<'a>(args: &'a [&'a str]) -> Option<&'a [u8]> {
-    args.get(1).map(|name| name.as_bytes())
-}
-
-fn user_exists(passwd: &[u8], username: &[u8]) -> bool {
-    find_username(passwd, username).is_some()
-}
-
-fn find_username<'a>(passwd: &'a [u8], username: &[u8]) -> Option<&'a [u8]> {
-    for line in passwd.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            continue;
-        };
-        if &line[..colon] == username {
-            return Some(&line[..colon]);
-        }
-    }
-    None
-}
-
-fn build_hash_field(salt_hex: &[u8], hash_hex: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut pos = 0usize;
-    append_bytes(out, &mut pos, b"$sha256i$10000$").ok()?;
-    append_bytes(out, &mut pos, salt_hex).ok()?;
-    append_bytes(out, &mut pos, b"$").ok()?;
-    append_bytes(out, &mut pos, hash_hex).ok()?;
-    Some(pos)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShadowRewriteError {
-    UserNotFound,
-    OutputTooLarge,
-}
-
-fn rewrite_shadow_file(
-    shadow: &[u8],
-    username: &[u8],
-    hash_field: &[u8],
-    out: &mut [u8],
-) -> Result<usize, ShadowRewriteError> {
-    let mut out_pos = 0usize;
-    let mut updated = false;
-
-    for line in shadow.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if rewrite_shadow_line(line, username, hash_field, out, &mut out_pos)? {
-            updated = true;
-        } else {
-            append_bytes(out, &mut out_pos, line)?;
-            append_bytes(out, &mut out_pos, b"\n")?;
-        }
-    }
-
-    if updated {
-        Ok(out_pos)
-    } else {
-        Err(ShadowRewriteError::UserNotFound)
-    }
-}
-
-fn rewrite_shadow_line(
-    line: &[u8],
-    username: &[u8],
-    hash_field: &[u8],
-    out: &mut [u8],
-    out_pos: &mut usize,
-) -> Result<bool, ShadowRewriteError> {
-    let Some(name_end) = line.iter().position(|&b| b == b':') else {
-        return Ok(false);
-    };
-    if &line[..name_end] != username {
-        return Ok(false);
-    }
-
-    append_bytes(out, out_pos, username)?;
-    append_bytes(out, out_pos, b":")?;
-    append_bytes(out, out_pos, hash_field)?;
-
-    let rest = &line[name_end + 1..];
-    if let Some(hash_end) = rest.iter().position(|&b| b == b':') {
-        append_bytes(out, out_pos, &rest[hash_end..])?;
-    }
-    append_bytes(out, out_pos, b"\n")?;
-    Ok(true)
-}
-
-fn append_bytes(
-    out: &mut [u8],
-    out_pos: &mut usize,
-    bytes: &[u8],
-) -> Result<(), ShadowRewriteError> {
-    let end = out_pos
-        .checked_add(bytes.len())
-        .ok_or(ShadowRewriteError::OutputTooLarge)?;
-    if end > out.len() {
-        return Err(ShadowRewriteError::OutputTooLarge);
-    }
-    out[*out_pos..end].copy_from_slice(bytes);
-    *out_pos = end;
-    Ok(())
-}
-
-fn find_username_by_uid(passwd: &[u8], target_uid: u32) -> Option<&[u8]> {
-    for line in passwd.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = [&[] as &[u8]; 7];
-        let mut start = 0;
-        let mut field = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b':' && field < 7 {
-                fields[field] = &line[start..i];
-                field += 1;
-                start = i + 1;
-            }
-        }
-        if field == 6 {
-            fields[6] = &line[start..];
-            let uid = parse_u32(fields[2]);
-            if uid == target_uid {
-                return Some(fields[0]);
-            }
-        }
-    }
-    None
-}
-
-fn parse_u32(s: &[u8]) -> u32 {
-    let mut n: u32 = 0;
-    for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-        }
-    }
-    n
-}
-
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     let fd = open(path, O_RDONLY, 0);
     if fd < 0 {
@@ -353,57 +211,8 @@ fn restore_echo(saved: Option<syscall_lib::Termios>) {
     }
 }
 
-#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     write_str(STDOUT_FILENO, "passwd: PANIC\n");
     syscall_lib::exit(101)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn requested_username_uses_cli_target_when_present() {
-        assert_eq!(
-            requested_username(&["passwd", "user"]),
-            Some("user".as_bytes())
-        );
-        assert_eq!(requested_username(&["passwd"]), None);
-    }
-
-    #[test]
-    fn rewrite_shadow_file_updates_only_requested_user() {
-        let shadow = b"root:$sha256i$10000$oldsalt$oldroot::::::\nuser:$sha256i$10000$oldsalt$olduser:17000:0:99999:7:::\n";
-        let mut updated = [0u8; 256];
-        let len = rewrite_shadow_file(
-            shadow,
-            b"user",
-            b"$sha256i$10000$newsalt$newhash",
-            &mut updated,
-        )
-        .unwrap();
-
-        let updated = &updated[..len];
-        assert_eq!(
-            updated,
-            b"root:$sha256i$10000$oldsalt$oldroot::::::\nuser:$sha256i$10000$newsalt$newhash:17000:0:99999:7:::\n"
-        );
-    }
-
-    #[test]
-    fn rewrite_shadow_file_errors_for_missing_user() {
-        let shadow = b"root:$sha256i$10000$oldsalt$oldroot::::::\n";
-        let mut updated = [0u8; 128];
-        assert_eq!(
-            rewrite_shadow_file(
-                shadow,
-                b"user",
-                b"$sha256i$10000$newsalt$newhash",
-                &mut updated,
-            ),
-            Err(ShadowRewriteError::UserNotFound)
-        );
-    }
 }

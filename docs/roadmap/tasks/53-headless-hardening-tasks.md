@@ -402,7 +402,7 @@ Close the phase only when the published headless gates and docs all line up.
 **Validation run:**
 - `cargo xtask check`
 - `cargo +nightly test -p xtask --target x86_64-unknown-linux-gnu`
-- `cargo test -p passwd --target x86_64-unknown-linux-gnu`
+- `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host`
 - `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom`
 - `cargo xtask smoke-test --timeout 300`
 - `cargo xtask regression --timeout 90`
