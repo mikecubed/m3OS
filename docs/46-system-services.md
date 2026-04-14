@@ -14,9 +14,9 @@
 
 Phase 46 transforms m3OS from a system that hardcodes which daemons to run into
 one that reads service definitions from configuration files, starts them in
-dependency order, restarts them on failure, logs their output centrally, schedules
-recurring tasks, and shuts down cleanly. This is what separates a hobby kernel
-from an administrable server.
+dependency order, restarts them on failure, logs their output centrally,
+schedules recurring tasks, and shuts down cleanly. This is the layer that gives
+the later headless/reference release story a real operator-facing control plane.
 
 ## What This Doc Covers
 
@@ -99,14 +99,21 @@ a broken binary from consuming all system resources in a crash loop.
 service list            # enumerate managed services
 service status sshd     # inspect one service in detail
 service restart crond   # bounce a daemon after fixing config
-service disable telnetd # create a .disabled marker for next boot
-service enable telnetd  # remove the marker so it can start again
+service disable crond   # create a .disabled marker for next boot
+service enable crond    # remove the marker so it can start again
 ```
 
 `service list` now includes disabled services as `disabled` entries so operators
 can distinguish "configured but suppressed" from "not installed". `service status
 <name>` shows the same state vocabulary and, for `disabled` or
 `permanently-stopped`, prints the next recovery step inline.
+
+Phase 53 treats this command surface as the supported headless/reference
+operator model: boot to login, inspect services, check logs and storage, recover
+with `service restart`, and halt or reboot cleanly. SSH is the supported
+remote-admin path. telnetd remains a service the framework can supervise, but
+it is only part of explicitly opt-in images and is not part of the default
+headless claim.
 
 Only `service list` and `service status` are read-only. `start`, `stop`,
 `restart`, `enable`, and `disable` require UID 0 and fail with
@@ -260,6 +267,8 @@ If shutdown is partial or slow, the evidence trail remains operator-visible:
 
 - [Phase 46 roadmap doc](./roadmap/46-system-services.md)
 - [Phase 46 task doc](./roadmap/tasks/46-system-services-tasks.md)
+- [Phase 53 learning doc](./53-headless-hardening.md)
+- [Phase 53 roadmap doc](./roadmap/53-headless-hardening.md)
 
 ## Deferred or Later-Phase Topics
 

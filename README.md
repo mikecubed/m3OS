@@ -67,6 +67,7 @@ Full documentation lives in [`docs/`](docs/README.md):
 - [Interrupts & Exceptions](docs/03-interrupts.md) — IDT, PIC, hardware IRQs
 - [Tasking & Scheduling](docs/04-tasking.md) — Task model and context switching
 - [IPC](docs/06-ipc.md) — The core microkernel primitive
+- [Headless Hardening](docs/53-headless-hardening.md) — Learner-facing overview of the headless/reference workflow, gates, and support boundary
 - [Roadmap Guide](docs/roadmap/README.md) — Phased implementation plan
 - [Architecture & Syscalls](docs/appendix/architecture-and-syscalls.md) — Microkernel design, privilege model, syscall ABI
 
@@ -84,7 +85,7 @@ configuration: `cargo +nightly xtask run` boots
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img` together with
 `target/x86_64-unknown-none/release/disk.img` in QEMU, and `cargo +nightly xtask image`
 builds the same artifacts without launching QEMU. The supported workflow is to boot,
-log in, manage services, build software, diagnose failures, and shut down cleanly over
+log in, inspect services, verify storage and logging, compile bounded software, diagnose failures, and shut down cleanly over
 the serial/headless path. SSH is the default remote-admin path; telnet is available
 only with an explicit opt-in build flag.
 
@@ -95,6 +96,8 @@ mandatory smoke bundle. The ports baseline always ships `/usr/bin/port` and the
 in-repo ports tree; ports that depend on host-fetched Lua/zlib sources require
 that cache to be present when the image is built.
 
-See [`docs/roadmap/53-headless-hardening.md`](docs/roadmap/53-headless-hardening.md)
-for the supported workflow, validation gate bundle, and support boundary.
+See [`docs/53-headless-hardening.md`](docs/53-headless-hardening.md) for the
+learner-facing overview, and
+[`docs/roadmap/53-headless-hardening.md`](docs/roadmap/53-headless-hardening.md)
+for the exact supported workflow, validation gate bundle, and support boundary.
 GUI, broad hardware certification, and large runtime ecosystems are later work.

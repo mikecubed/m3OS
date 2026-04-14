@@ -10,8 +10,14 @@
 Phase 43c adds a layered test infrastructure for catching SMP race conditions.
 The system has four tiers: host-side property/concurrency tests (proptest, loom),
 QEMU regression tests for specific SMP-sensitive paths, smoke tests for full-boot
-validation, and looped stress tests for timing-dependent failures. CI runs
-regressions on every PR and stress tests nightly.
+validation, and looped stress tests for timing-dependent failures.
+
+Phase 53 later turns the automated half of this stack into the published
+headless/reference gate bundle: `cargo xtask check`, `cargo test -p kernel-core`,
+loom, `cargo xtask smoke-test --timeout 300`, and
+`cargo xtask regression --timeout 90`. Nightly
+`cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is
+sustaining evidence rather than a per-PR merge gate.
 
 ## What This Doc Covers
 
@@ -20,6 +26,7 @@ regressions on every PR and stress tests nightly.
 - How to reproduce a stress failure using seed replay
 - How the property and concurrency tests work
 - How CI tiers are mapped
+- How this infrastructure feeds the Phase 53 headless/reference gate bundle
 - How to read failure artifacts
 
 ## Core Implementation
@@ -27,19 +34,22 @@ regressions on every PR and stress tests nightly.
 ### Test Tier Architecture
 
 ```
+Static analysis gate:
+  cargo xtask check
+
 Host tests (fast, no QEMU):
-  cargo test -p kernel-core           # 200+ unit + property tests
-  RUSTFLAGS="--cfg loom" cargo test   # loom concurrency tests
+  cargo test -p kernel-core
+  RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
 Regression tests (QEMU, ~30s each):
-  cargo xtask regression              # all registered regressions
-  cargo xtask regression --test fork-overlap
+  cargo xtask regression --timeout 90
+  cargo xtask regression --test fork-overlap --timeout 90
 
 Smoke test (QEMU, full boot validation):
-  cargo xtask smoke-test              # boot + login + auth + service + storage + log + TCC compile
+  cargo xtask smoke-test --timeout 300
 
-Stress tests (QEMU, repeated iterations):
-  cargo xtask stress --test ssh-overlap --iterations 50
+Stress tests (QEMU, repeated iterations; nightly evidence):
+  cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90
 ```
 
 ### Regression Tests
@@ -83,7 +93,7 @@ stress: test=ssh-overlap iterations=50 seed=1712345678 timeout=90s
 To reproduce a failure:
 
 ```
-cargo xtask stress --test ssh-overlap --seed 1712345678 --iterations 1
+cargo xtask stress --test ssh-overlap --seed 1712345678 --iterations 1 --timeout 90
 ```
 
 ### Artifact Capture
@@ -131,9 +141,24 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 
 | Tier | Trigger | Tests | Time |
 |---|---|---|---|
-| PR | Every pull request | `cargo xtask check` + loom + `smoke-test` + `regression` | ~5-8 min |
+| PR | Every pull request | `cargo xtask check` + `cargo test -p kernel-core` + loom + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
 | Build | Push to main | Same as PR | ~5-8 min |
-| Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50` | ~60 min |
+| Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | ~60 min |
+
+### Phase 53 Gate Mapping
+
+Phase 43c supplies the automated evidence behind the headless/reference claim,
+but it does not replace the full Phase 53 contract.
+
+| Published Phase 53 gate | How this doc fits |
+|---|---|
+| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds |
+| `cargo test -p kernel-core` | Host-side unit/property tier |
+| Loom allocator test | Host-side concurrency tier |
+| `cargo xtask smoke-test --timeout 300` | Full-boot headless workflow smoke tier |
+| `cargo xtask regression --timeout 90` | Registered SMP and operator-workflow regressions |
+| `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | Nightly sustaining evidence, not the per-PR gate |
+| Manual service/log/storage/SSH/shutdown checks | Still defined in Phase 53 rather than duplicated here |
 
 ### Gate Artifact Locations
 
@@ -186,6 +211,8 @@ artifacts on failure. This is the single reference for artifact paths:
 - [Phase 43c task doc](./roadmap/tasks/43c-regression-stress-ci-tasks.md)
 - [Phase 43a learning doc](./43a-crash-diagnostics.md)
 - [Phase 43b learning doc](./43b-kernel-trace-ring.md)
+- [Phase 53 learning doc](./53-headless-hardening.md)
+- [Phase 53 roadmap doc](./roadmap/53-headless-hardening.md)
 
 ## Known Limitations
 

@@ -60,6 +60,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Kernel Architecture Evolution](./52c-kernel-architecture-evolution.md) | 52c | VMA tree, growable IPC tables, kernel line-discipline infrastructure, ISR wakeups |
 | [Kernel Completion and Roadmap Alignment](./52d-kernel-completion-and-roadmap-alignment.md) | 52d | Return-state closure, keyboard convergence, bootfixes, and release-gate/initrd cleanup |
 | [Kernel Memory Modernization](./53a-kernel-memory-modernization.md) | 53a | Per-CPU page cache, magazine slabs, size-class allocator cutover, cross-CPU frees, and allocator-local reclaim |
+| [Headless Hardening](./53-headless-hardening.md) | 53 | Supported headless/reference workflow, validation gates, operator model, and non-goals |
 
 ### Roadmap
 

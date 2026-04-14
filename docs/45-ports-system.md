@@ -6,12 +6,19 @@
 
 ## Overview
 
-Phase 45 adds a BSD-style ports system for building and installing third-party
-software from source inside m3OS. Each port is a directory containing a Portfile
-(metadata), a Makefile (build rules), bundled source code, and optional patches.
-The `port` shell command automates the full lifecycle: dependency resolution,
-source extraction, compilation with TCC, installation to `/usr/local/`, and
-package tracking with file manifests for clean removal.
+Phase 45 adds a BSD-style ports system for building and installing a bounded set
+of third-party software from source inside m3OS. Each port is a directory
+containing a Portfile (metadata), a Makefile (build rules), bundled source
+code, and optional patches. The `port` shell command automates the full
+lifecycle: dependency resolution, source extraction, compilation with TCC,
+installation to `/usr/local/`, and package tracking with file manifests for
+clean removal.
+
+Phase 53 keeps this capability in the headless/reference story as a documented
+manual validation surface rather than a mandatory smoke/regression gate. The
+important convergence work is therefore predictability: the in-repo baseline
+must always ship, and the host-cached Lua/zlib expansion path must be explicit
+instead of silently assumed.
 
 ## What This Doc Covers
 
@@ -181,6 +188,10 @@ and continues with the bundled ports baseline. If the cache under
 `target/ports-src/` is already primed, xtask reuses it instead of refetching.
 This is a reduced-but-explicit path, not a silent success path.
 
+That is the whole Phase 53 packaging claim: a bounded ports baseline plus an
+explicit host-cache contract. Package feeds, guest-side network fetching, and a
+broader ecosystem remain later work.
+
 ## Key Files
 
 | File | Purpose |
@@ -212,6 +223,8 @@ This is a reduced-but-explicit path, not a silent success path.
 
 - [Phase 45 roadmap doc](./roadmap/45-ports-system.md)
 - [Phase 45 task doc](./roadmap/tasks/45-ports-system-tasks.md)
+- [Phase 53 learning doc](./53-headless-hardening.md)
+- [Phase 53 roadmap doc](./roadmap/53-headless-hardening.md)
 
 ## Deferred or Later-Phase Topics
 

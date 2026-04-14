@@ -59,10 +59,10 @@ flowchart TD
 | Area | Current state | Required in this phase | Later extension |
 |---|---|---|---|
 | P1 hardening | Good crypto and diagnostics work exists, but security polish is incomplete | SSH, auth-file handling, and default hygiene are materially stronger | More advanced sandboxing and policy controls |
-| Rust userspace | Rust std path is in the current base, but it still needs to become the boring/default workflow | Rust std becomes the normal guest development path | Bigger toolchains and richer ecosystem support |
-| Packaging | Ports exist in the current base, but reliability and failure modes still matter | Ports and images are predictable enough for routine use | Package feeds, larger repos, dependency breadth |
+| Rust userspace | Rust std demos are in the current base, but they need to stay a clear, documented manual validation surface rather than a vague ecosystem promise | Rust std becomes a boring, bounded guest-development path | Bigger toolchains and richer ecosystem support |
+| Packaging | Ports exist in the current base, but the real promise is a predictable in-repo baseline plus explicit host-cache rules for the expanded set | Ports and images are predictable enough for routine use | Package feeds, larger repos, dependency breadth |
 | Remote/outbound boundary | Basic networking exists, but 1.0 release scope is not the same thing as broad client-network tooling | Make the supported remote/admin workflows explicit and keep non-essential outbound tooling out of the release gate | Full HTTPS-heavy tooling and larger online ecosystem |
-| Validation | Diagnostics are already strong | Smoke/regression/stress become trusted release gates | Wider hardware CI and richer telemetry |
+| Validation | The Phase 53 automated bundle is now defined (`check`, `kernel-core`, loom, `smoke-test --timeout 300`, `regression --timeout 90`) and nightly `ssh-overlap` stress is sustaining evidence | Publish passing post-53a evidence plus the manual RC checklist | Wider hardware CI and richer telemetry |
 
 ## Detailed workstreams
 
@@ -109,13 +109,14 @@ outbound HTTPS/DNS tooling, and large runtime ecosystems remain post-1.0 work.
 
 - The supported headless/reference workflow from [Phase 53](../../roadmap/53-headless-hardening.md#supported-headlessreference-workflow) is exercised end-to-end
 - The full gate bundle (automated + manual checks) from [Phase 53 § Gate Bundle](../../roadmap/53-headless-hardening.md#gate-bundle) passes on a post-Phase 53a image
-- Rust std-based guest programs are part of the normal documented workflow
+- Rust std demos and the ports baseline are documented as supported manual validation surfaces, while TCC remains the automated build-basics gate
 - Ports and image-building behavior are deterministic enough for repeated use
 - The release docs explicitly describe which remote/outbound workflows are
   supported at 1.0 (SSH-first; telnet opt-in only) and which are deferred
   (HTTPS clients, DNS, git, GitHub tooling)
 - Security documentation and operator documentation match the shipped behavior
 - Phase 53 is not marked complete until the gate bundle passes on the allocator-sensitive baseline after Phase 53a
+- GUI/local-session work, broad hardware, and large runtime ecosystems remain explicit later-scope work rather than hidden Phase 53 blockers
 
 ## Key Cross-Links
 
