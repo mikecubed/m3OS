@@ -202,6 +202,14 @@ pub enum FdBackend {
     UnixSocket { handle: usize },
     /// epoll instance — Phase 37. Monitors other FDs for readiness events.
     Epoll { instance_id: usize },
+    /// Phase 54: fd backed by the userspace VFS service.
+    /// The kernel dispatches open/read/close to the ring-3 `vfs_server` via IPC.
+    VfsService {
+        /// Opaque handle returned by the vfs_server on open.
+        service_handle: u64,
+        /// Cached file size (for stat / EOF).
+        file_size: u32,
+    },
 }
 
 /// A single open-file entry in the per-process FD table.

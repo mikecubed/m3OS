@@ -181,6 +181,8 @@ static CROND_ELF: &[u8] = generated_initrd_asset!("crond");
 static CONSOLE_SERVER_ELF: &[u8] = generated_initrd_asset!("console_server");
 static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
 static STDIN_FEEDER_ELF: &[u8] = generated_initrd_asset!("stdin_feeder");
+static FAT_SERVER_ELF: &[u8] = generated_initrd_asset!("fat_server");
+static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 
@@ -299,6 +301,18 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "stdin_feeder",
         RamdiskNode::File {
             content: STDIN_FEEDER_ELF,
+        },
+    ),
+    (
+        "fat_server",
+        RamdiskNode::File {
+            content: FAT_SERVER_ELF,
+        },
+    ),
+    (
+        "vfs_server",
+        RamdiskNode::File {
+            content: VFS_SERVER_ELF,
         },
     ),
     // Phase 32: build tools and utilities

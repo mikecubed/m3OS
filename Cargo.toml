@@ -48,9 +48,8 @@ members = [
     "userspace/console_server",
     "userspace/kbd_server",
     "userspace/stdin_feeder",
-    # Future userspace servers:
-    # "userspace/vfs_server",
-    # "userspace/fat_server",
+    "userspace/vfs_server",
+    "userspace/fat_server",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

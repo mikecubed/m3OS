@@ -51,6 +51,8 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
     b"/etc/services.d/kbd.conf\0",
     b"/etc/services.d/stdin_feeder.conf\0",
+    b"/etc/services.d/fat_server.conf\0",
+    b"/etc/services.d/vfs_server.conf\0",
     b"/etc/services.d/sshd.conf\0",
     b"/etc/services.d/telnetd.conf\0",
     b"/etc/services.d/syslogd.conf\0",

@@ -78,6 +78,7 @@ pub use registry::RegistryError;
 /// | 14 | 0x110D | `ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` → label |
 /// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label |
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
+/// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -116,7 +117,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, and 12 do not use arg0 as a cap handle — handle them
+    // Syscalls 10, 11, 12, and 17 do not use arg0 as a cap handle — handle them
     // before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
@@ -126,6 +127,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 12 {
         return ipc_create_endpoint(task_id);
+    }
+    if number == 17 {
+        return ipc_store_reply_bulk(task_id, arg0, arg1);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -199,7 +203,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                     // Consume the one-shot reply cap before replying.
                     let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
                     let reply = message::Message::with2(arg1, arg2, 0);
-                    endpoint::reply(caller_id, reply);
+                    endpoint::reply(task_id, caller_id, reply);
                     0
                 }
                 _ => u64::MAX,
@@ -301,7 +305,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             };
             let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
             let reply = message::Message::new(arg1);
-            endpoint::reply(caller_id, reply);
+            endpoint::reply(task_id, caller_id, reply);
             // Read buf_len from the 6th syscall register (r9), capped at
             // MAX_BULK_LEN to match ipc_recv_msg's bounds.
             let buf_len = crate::smp::per_core().syscall_user_r9;
@@ -565,4 +569,36 @@ fn ipc_recv_msg(
     }
 
     msg.label
+}
+
+// ---------------------------------------------------------------------------
+// Reply bulk data helper (Phase 54)
+// ---------------------------------------------------------------------------
+
+/// Syscall 17 (0x1110): store bulk data to be sent with the next IPC reply.
+///
+/// Copies `buf_len` bytes from the caller's userspace address `buf_ptr` into
+/// the caller's `pending_bulk` slot.  The data is transferred to the reply
+/// target when [`endpoint::reply`] is called (which now does `transfer_bulk`
+/// from server → caller).
+///
+/// Returns `0` on success, or `u64::MAX` on error.
+fn ipc_store_reply_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64) -> u64 {
+    use crate::task::scheduler;
+
+    let len = buf_len as usize;
+    if len == 0 || len > MAX_BULK_LEN {
+        return u64::MAX;
+    }
+
+    let mut bulk = alloc::vec![0u8; len];
+    if UserSliceRo::new(buf_ptr, bulk.len())
+        .and_then(|s| s.copy_to_kernel(&mut bulk))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+
+    scheduler::deliver_bulk(task_id, bulk);
+    0
 }
