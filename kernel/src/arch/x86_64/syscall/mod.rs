@@ -3479,6 +3479,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
     let name: &str = &resolved_name;
+    let privileged_exec_override = privileged_exec_credentials(name);
     let pid = crate::process::current_pid();
     log::info!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
@@ -3602,6 +3603,10 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                     .map(alloc::string::String::from)
                     .collect()
             };
+            if let Some((euid, egid)) = privileged_exec_override {
+                proc.euid = euid;
+                proc.egid = egid;
+            }
 
             // Phase 52a: Reset caught signal dispositions to Default on exec
             // (POSIX semantics). Ignore and Default dispositions are preserved.
@@ -6161,6 +6166,16 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         cleanup_ext2_inode_if_unused(inode_num);
     }
     0
+}
+
+fn privileged_exec_credentials(path: &str) -> Option<(u32, u32)> {
+    match path {
+        // Until generic setuid-on-exec exists, /bin/su runs with a root
+        // effective identity so it can verify passwords via /etc/shadow and
+        // then perform the authenticated credential transition.
+        "/bin/su" => Some((0, 0)),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

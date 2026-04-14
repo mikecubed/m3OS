@@ -13,6 +13,7 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
+const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04";
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -1442,7 +1443,7 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
 
 fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
     let ovmf = find_ovmf();
-    let args = qemu_args(uefi_image, &ovmf, display_mode);
+    let args = qemu_run_args(uefi_image, &ovmf, display_mode);
 
     if display_mode == QemuDisplayMode::Gui {
         println!(
@@ -1455,7 +1456,25 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
         .status()
         .expect("failed to launch QEMU");
 
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(normalize_run_qemu_exit(status.code()));
+}
+
+fn qemu_run_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
+    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    args.retain(|arg| arg != "-no-reboot");
+    args.extend([
+        "-device".to_string(),
+        QEMU_ISA_DEBUG_EXIT_DEVICE.to_string(),
+    ]);
+    args
+}
+
+fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
+    match code {
+        Some(0) | Some(QEMU_EXIT_SUCCESS) => 0,
+        Some(other) => other,
+        None => 1,
+    }
 }
 
 fn cmd_check() {
@@ -1768,7 +1787,7 @@ fn qemu_test_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> 
     // Add ISA debug exit device so the test kernel can signal pass/fail.
     args.extend([
         "-device".to_string(),
-        "isa-debug-exit,iobase=0xf4,iosize=0x04".to_string(),
+        QEMU_ISA_DEBUG_EXIT_DEVICE.to_string(),
     ]);
     args
 }
@@ -6124,7 +6143,51 @@ fn security_floor_steps() -> Vec<SmokeStep> {
         label: "guest/auth: prompt after shadow check",
     });
 
-    // 3. Verify whoami resolves the authenticated uid to "root".
+    // 3. Verify /bin/su can authenticate via /etc/shadow and restore a
+    //    privileged shell.
+    steps.push(SmokeStep::Send {
+        input: "/bin/su user\n",
+        label: "guest/auth: drop into user shell via su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$ ",
+        timeout_secs: 10,
+        label: "guest/auth: user shell prompt after su user",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/whoami\n",
+        label: "guest/auth: verify whoami in user shell",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user",
+        timeout_secs: 10,
+        label: "guest/auth: whoami confirms user",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$ ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after user whoami",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/su root\n",
+        label: "guest/auth: authenticate back to root via su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Password:",
+        timeout_secs: 10,
+        label: "guest/auth: su root password prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "guest/auth: enter root password for su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/auth: root shell prompt after su root",
+    });
+
+    // 4. Verify whoami resolves the authenticated uid to "root".
     steps.push(SmokeStep::Send {
         input: "/bin/whoami\n",
         label: "guest/auth: verify whoami resolution",
@@ -6936,6 +6999,42 @@ mod tests {
             args.windows(2)
                 .any(|window| window == ["-machine", "pcspk-audiodev=noaudio"])
         );
+    }
+
+    #[test]
+    fn qemu_run_args_include_debug_exit_device() {
+        let args = qemu_run_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", QEMU_ISA_DEBUG_EXIT_DEVICE])
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_allow_guest_reboot() {
+        let args = qemu_run_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "-no-reboot"));
+    }
+
+    #[test]
+    fn normalize_run_qemu_exit_maps_debug_success_to_zero() {
+        assert_eq!(normalize_run_qemu_exit(Some(0)), 0);
+        assert_eq!(normalize_run_qemu_exit(Some(QEMU_EXIT_SUCCESS)), 0);
+        assert_eq!(
+            normalize_run_qemu_exit(Some(QEMU_EXIT_FAILURE)),
+            QEMU_EXIT_FAILURE
+        );
+        assert_eq!(normalize_run_qemu_exit(None), 1);
     }
 
     #[test]

@@ -13,11 +13,12 @@ QEMU regression tests for specific SMP-sensitive paths, smoke tests for full-boo
 validation, and looped stress tests for timing-dependent failures.
 
 Phase 53 later turns the automated half of this stack into the published
-headless/reference gate bundle: `cargo xtask check`, `cargo test -p kernel-core`,
-loom, `cargo xtask smoke-test --timeout 300`, and
+headless/reference gate bundle: `cargo xtask check` (which already runs the
+host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu`
+tier in CI), loom, `cargo xtask smoke-test --timeout 300`, and
 `cargo xtask regression --timeout 90`. Nightly
 `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is
-sustaining evidence rather than a per-PR merge gate.
+sustaining evidence rather than a per-PR or final-close rerun.
 
 ## What This Doc Covers
 
@@ -69,7 +70,7 @@ kernel panics/faults in serial output as immediate failures.
 | `service-lifecycle` | `/bin/service` | Service list/status in headless workflow |
 | `storage-roundtrip` | shell commands | Ext2 write/read/delete round-trip |
 | `log-pipeline` | `/bin/logger`, `/bin/grep` | Logger → syslogd → /var/log/messages |
-| `security-floor` | `/bin/id`, `/bin/whoami`, `/bin/grep` | Phase 48 shadow auth, credential transition, hash format |
+| `security-floor` | `/bin/id`, `/bin/su`, `/bin/whoami`, `/bin/grep` | Phase 48 shadow auth, credential transition, hash format |
 
 ### Stress Tests
 
@@ -141,7 +142,7 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 
 | Tier | Trigger | Tests | Time |
 |---|---|---|---|
-| PR | Every pull request | `cargo xtask check` + `cargo test -p kernel-core` + loom + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
+| PR | Every pull request | `cargo xtask check` (includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier) + loom + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
 | Build | Push to main | Same as PR | ~5-8 min |
 | Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | ~60 min |
 
@@ -152,21 +153,23 @@ but it does not replace the full Phase 53 contract.
 
 | Published Phase 53 gate | How this doc fits |
 |---|---|
-| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds |
-| `cargo test -p kernel-core` | Host-side unit/property tier |
+| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds; also the command that invokes the host-side kernel-core tier in CI |
+| `cargo test -p kernel-core` | Direct rerun command for the host-side unit/property tier when debugging locally or collecting release evidence outside `xtask check` |
 | Loom allocator test | Host-side concurrency tier |
 | `cargo xtask smoke-test --timeout 300` | Full-boot headless workflow smoke tier |
 | `cargo xtask regression --timeout 90` | Registered SMP and operator-workflow regressions |
-| `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | Nightly sustaining evidence, not the per-PR gate |
+| `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | Nightly sustaining evidence, not the per-PR or final-close rerun |
 | Manual service/log/storage/SSH/shutdown checks | Still defined in Phase 53 rather than duplicated here |
 
 ### Gate Artifact Locations
 
-All automated gate artifacts are produced under `target/` and uploaded as CI
-artifacts on failure. This is the single reference for artifact paths:
+Regression and stress artifacts are produced under `target/` and uploaded as CI
+artifacts on failure. Smoke-test evidence currently remains in terminal/CI job
+output. This is the single reference for Phase 53 artifact locations:
 
 | Artifact | Path | When produced |
 |---|---|---|
+| Smoke-test transcript | Terminal / CI job log only | Every smoke-test run |
 | Regression serial logs | `target/regression/<test-name>/serial.log` | Every regression run |
 | Regression trace dumps | `target/regression/<test-name>/trace.log` | On kernel crash |
 | Stress serial logs | `target/stress/<test-name>/<iter>/serial.log` | Every stress iteration |

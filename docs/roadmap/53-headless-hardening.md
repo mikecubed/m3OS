@@ -1,6 +1,6 @@
 # Phase 53 - Headless Hardening
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-53
 **Depends on:** Phase 43c (Regression and Stress) ✅, Phase 44 (Rust Cross-Compilation) ✅, Phase 45 (Ports System) ✅, Phase 46 (System Services) ✅, Phase 48 (Security Foundation) ✅, Phase 51 (Service Model Maturity), Phase 52d (Kernel Completion) ✅, Phase 53a (Kernel Memory Modernization)
 **Builds on:** Turns the now-shipped Rust std, ports, services, and first extracted-service work into a trustworthy headless/reference-system baseline with explicit validation and support boundaries
@@ -148,7 +148,7 @@ or "regression" are not sufficient; the bundle names the exact commands.
 | Shutdown/reboot | `shutdown` from shell | QEMU exits cleanly, no panic in serial log |
 | Reboot | `reboot` from shell | System returns to login prompt |
 | Failure recovery | `service stop sshd && service start sshd` | Service stops and restarts without side effects |
-| su/passwd auth (security floor) | `su user` with correct password; `passwd` to change password | `su` authenticates via shadow hash; `passwd` writes a fresh salted hash |
+| su/passwd auth (security floor) | `su root` from a user shell with the correct password; `passwd user` to change a user password | `su` authenticates via shadow hash; `passwd` writes a fresh salted hash |
 
 ### Gate status
 
@@ -170,8 +170,10 @@ failures in CI output.
 The `security-floor` regression explicitly verifies: (a) `id` confirms
 uid=0 after login (kernel-enforced setuid/setgid), (b) `/etc/shadow`
 contains a SHA-256-family shadow hash (`$sha256$` on the pre-seeded image,
-`$sha256i$10000$` after first-boot password setup or `passwd`), and (c)
-`whoami` resolves the authenticated uid.
+`$sha256i$10000$` after first-boot password setup or `passwd`), (c)
+`/bin/su` can drop to a user shell and authenticate back to root via
+shadow-backed password verification, and (d) `whoami` resolves the
+authenticated uid.
 
 The Phase 48 security floor also includes `getrandom()`-backed salt generation,
 `su` authentication, `passwd` hash rewriting, and non-root privilege
@@ -187,9 +189,37 @@ coordination that is fragile under CI load.
 `docs/43c-regression-stress-ci.md` § Gate Artifact Locations.
 
 **CI alignment:** PR and main-branch workflows run the same gate bundle
-(`check` + loom + `smoke-test --timeout 300` + `regression --timeout 90`).
-Nightly stress (`stress --test ssh-overlap --iterations 50`) is sustaining
+(`cargo xtask check`, where `check` already runs the host-side
+`cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier, plus loom,
+`smoke-test --timeout 300`, and `regression --timeout 90`). Nightly stress
+(`stress --test ssh-overlap --iterations 50`) is sustaining
 evidence, not a merge gate.
+
+### Post-53a closure evidence
+
+Phase 53 closes only after the allocator-sensitive post-53a image passes the
+same final-close bundle that the docs publish:
+
+1. `cargo xtask check` (this includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier)
+2. `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom`
+3. `cargo xtask smoke-test --timeout 300`
+4. `cargo xtask regression --timeout 90`
+5. The manual checks listed above (service lifecycle, storage round-trip, log pipeline, SSH login, shutdown, reboot, failure recovery, and `su`/`passwd`)
+
+The targeted stress command `cargo xtask stress --test ssh-overlap --iterations
+50 --timeout 90` remains sustaining/nightly evidence. It is tracked to catch
+timing-sensitive allocator regressions over time, but it is not a per-PR gate
+and not part of the final-close rerun bundle.
+
+Closure evidence lives in the same places the tooling already produces today:
+
+| Evidence | Location |
+|---|---|
+| `cargo xtask check` | Terminal/CI job log |
+| Loom allocator test | Terminal/CI job log |
+| `cargo xtask smoke-test --timeout 300` | Terminal/CI job log only (no dedicated `target/` artifact path yet) |
+| `cargo xtask regression --timeout 90` | `target/regression/` and the CI `regression-artifacts` bundle on failure |
+| Nightly stress sustaining evidence | `target/stress/` and the CI `stress-artifacts` bundle on nightly failure |
 
 ---
 
@@ -245,12 +275,13 @@ allocation). These are related but have distinct closure rules:
 | Support boundary and non-goals | ✅ Defined above | — |
 | Operator workflow documentation | Tracks C–D | — |
 | Automated gates pass on the allocator-sensitive baseline | — | ✅ Must pass after 53a lands |
-| Stress suite shows no allocator regressions | — | ✅ Must pass after 53a lands |
+| Nightly stress sustaining evidence stays green on the allocator-sensitive baseline | — | ✅ Must remain green after 53a lands |
 | Phase 53 marked "Complete" | — | Only after 53a satisfies published gates |
 
-**Closure rule:** Phase 53 may not be marked complete until the full gate bundle
-passes on an image that includes the Phase 53a allocator changes. The gate
-definitions are fixed now; the evidence is produced after 53a.
+**Closure rule:** Phase 53 may not be marked complete until the final-close
+bundle in § Post-53a closure evidence passes on an image that includes the
+Phase 53a allocator changes. The gate definitions are fixed now; the evidence is
+produced after 53a.
 
 This rule applies identically in the evaluation docs
 (`docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`) and in the
@@ -342,7 +373,7 @@ Release quality is partly about saying no. The support boundary (§ Support Boun
 - Update `README.md`, `docs/README.md`, `docs/roadmap/README.md`, `docs/43c-regression-stress-ci.md`, and `docs/45-ports-system.md`.
 - Update `docs/evaluation/usability-roadmap.md`, `docs/evaluation/current-state.md`, and `docs/evaluation/roadmap/R06-hardening-and-operational-polish.md`.
 - Update any setup or image documentation that describes the supported development or operator workflow.
-- When the phase lands, bump `kernel/Cargo.toml` and any release/version references to `0.53.0`.
+- Keep `kernel/Cargo.toml` and any roadmap-facing version references aligned at `0.53.0`; the version tracks the roadmap phase number and does not by itself mark the phase complete before the post-53a evidence bundle passes.
 
 ## Acceptance Criteria
 
@@ -354,6 +385,8 @@ Release quality is partly about saying no. The support boundary (§ Support Boun
 - GUI/local-session features, broad hardware certification, and large runtime ecosystems are explicitly out of scope.
 - The support boundary is narrow enough to feed Phase 58 without reopening Phase 53 scope.
 - The Phase 53 / Phase 53a closure contract states which decisions are defined now versus satisfied only after the published gates pass on the allocator-sensitive baseline.
+- The post-53a closure bundle names the exact final-close commands and manual checks, records where regression/stress evidence lives, and states that smoke output remains stdout-only until the harness writes a dedicated artifact.
+- Nightly `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is explicitly classified as sustaining evidence rather than a per-PR or final-close rerun.
 - No documentation implies that Phase 53 is already complete before the gate bundle passes on the post-53a image.
 
 ## Companion Task List

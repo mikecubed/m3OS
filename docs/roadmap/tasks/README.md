@@ -251,7 +251,7 @@ flowchart TD
 | 52b | Kernel structural hardening | Complete | `phase-52b` | [Tasks](./52b-kernel-structural-hardening-tasks.md) |
 | 52c | Kernel architecture evolution | Complete | `phase-52c` | [Tasks](./52c-kernel-architecture-evolution-tasks.md) |
 | 52d | Kernel completion and roadmap alignment | Complete | `phase-52d` | [Tasks](./52d-kernel-completion-and-roadmap-alignment-tasks.md) |
-| 53 | Headless hardening | In Progress | `phase-53` | [Tasks](./53-headless-hardening-tasks.md) |
+| 53 | Headless hardening | Complete | `phase-53` | [Tasks](./53-headless-hardening-tasks.md) |
 
 ### Future Task Docs
 Task docs for Phases **54 and later** are intentionally deferred until closer to implementation time.

@@ -44,11 +44,11 @@ jobs:
           key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
           restore-keys: ${{ runner.os }}-tcc-
 
-      - name: Lint (clippy + fmt)
+      - name: Gate bundle: cargo xtask check (clippy + fmt + host tests)
         run: cargo xtask check
 
       - name: Allocator loom concurrency tests
-        run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom --quiet
+        run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
       - name: Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)
         run: |
