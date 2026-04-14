@@ -2,6 +2,7 @@
 #![no_std]
 #![no_main]
 
+use passwd::{build_hash_field, rewrite_shadow_file};
 use syscall_lib::{
     O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, execve, exit, fsync, getrandom, open, read,
     setgid, setuid, write, write_str, write_u64,
@@ -282,6 +283,15 @@ fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
+    let mut hash_field = [0u8; 128];
+    let hash_field_len = match build_hash_field(
+        &salt_hex[..salt_hex_len],
+        &hash_hex[..hash_hex_len],
+        &mut hash_field,
+    ) {
+        Some(len) => len,
+        None => return false,
+    };
 
     // Read current shadow file.
     let mut shadow_buf = [0u8; 2048];
@@ -290,54 +300,17 @@ fn set_initial_password(username: &[u8], password: &[u8]) -> bool {
         return false;
     }
 
-    // Build new shadow content, replacing the locked entry.
+    // Reuse the shared shadow rewrite helper so the existing metadata suffix is preserved.
     let mut new_shadow = [0u8; 2048];
-    let mut out_pos = 0;
-
-    for line in shadow_buf[..shadow_len].split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(colon) = line.iter().position(|&b| b == b':')
-            && &line[..colon] == username
-        {
-            // Replace this line with the new hash.
-            let n = username.len().min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&username[..n]);
-            out_pos += n;
-
-            let prefix = b":$sha256i$10000$";
-            let n = prefix.len().min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&prefix[..n]);
-            out_pos += n;
-
-            let n = salt_hex_len.min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&salt_hex[..n]);
-            out_pos += n;
-
-            let dollar = b"$";
-            let n = dollar.len().min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&dollar[..n]);
-            out_pos += n;
-
-            let n = hash_hex_len.min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&hash_hex[..n]);
-            out_pos += n;
-
-            let suffix = b"::::::\n";
-            let n = suffix.len().min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&suffix[..n]);
-            out_pos += n;
-        } else {
-            let n = line.len().min(new_shadow.len() - out_pos);
-            new_shadow[out_pos..out_pos + n].copy_from_slice(&line[..n]);
-            out_pos += n;
-            if out_pos < new_shadow.len() {
-                new_shadow[out_pos] = b'\n';
-                out_pos += 1;
-            }
-        }
-    }
+    let out_pos = match rewrite_shadow_file(
+        &shadow_buf[..shadow_len],
+        username,
+        &hash_field[..hash_field_len],
+        &mut new_shadow,
+    ) {
+        Ok(len) => len,
+        Err(_) => return false,
+    };
 
     // Write the new shadow file.
     let fd = open(SHADOW_PATH, O_WRONLY | O_TRUNC, 0);

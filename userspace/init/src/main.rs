@@ -26,6 +26,7 @@ use syscall_lib::{
 // ---------------------------------------------------------------------------
 
 const MAX_SERVICES: usize = 16;
+const MAX_DISCOVERED_DISABLED: usize = 16;
 const MAX_PIDS: usize = 64;
 const MAX_DEPS: usize = 4;
 const MAX_NAME: usize = 32;
@@ -658,6 +659,8 @@ fn parse_deps(val: &[u8], deps: &mut [FixedStr<MAX_NAME>; MAX_DEPS], count: &mut
 struct ServiceManager {
     services: [ServiceDef; MAX_SERVICES],
     count: usize,
+    discovered_disabled: [FixedStr<MAX_NAME>; MAX_DISCOVERED_DISABLED],
+    discovered_disabled_count: usize,
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
@@ -682,6 +685,8 @@ impl ServiceManager {
         Self {
             services: [ServiceDef::empty(); MAX_SERVICES],
             count: 0,
+            discovered_disabled: [FixedStr::new(); MAX_DISCOVERED_DISABLED],
+            discovered_disabled_count: 0,
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
@@ -774,16 +779,13 @@ impl ServiceManager {
     fn load_services_from_dir(&mut self, dir_fd: i32) {
         let mut dent_buf = [0u8; 1024];
         loop {
-            if self.count >= MAX_SERVICES {
-                break;
-            }
             let n = getdents64(dir_fd, &mut dent_buf);
             if n <= 0 {
                 break;
             }
             let n = n as usize;
             let mut pos = 0;
-            while pos < n && self.count < MAX_SERVICES {
+            while pos < n {
                 // Each dirent64: u64 ino, u64 off, u16 reclen, u8 type, name[]
                 if pos + 19 > n {
                     break;
@@ -856,7 +858,17 @@ impl ServiceManager {
                     Some(svc) => {
                         // Check if this service is disabled.
                         if Self::is_disabled(svc.name.as_bytes()) {
+                            self.remember_disabled_service(svc.name.as_bytes());
                             write_str(STDOUT_FILENO, "init: skipping disabled service '");
+                            write(STDOUT_FILENO, svc.name.as_bytes());
+                            write_str(STDOUT_FILENO, "'\n");
+                            return;
+                        }
+                        if self.count >= MAX_SERVICES {
+                            write_str(
+                                STDOUT_FILENO,
+                                "init: warning: service table full, skipping '",
+                            );
                             write(STDOUT_FILENO, svc.name.as_bytes());
                             write_str(STDOUT_FILENO, "'\n");
                             return;
@@ -1473,16 +1485,7 @@ impl ServiceManager {
             }
             let name = &path[prefix.len()..path.len() - suffix.len()];
 
-            let mut already_loaded = false;
-            let mut i = 0;
-            while i < self.count {
-                if self.services[i].active && self.services[i].name.eq_bytes(name) {
-                    already_loaded = true;
-                    break;
-                }
-                i += 1;
-            }
-            if already_loaded || !Self::is_disabled(name) {
+            if self.has_loaded_service(name) || !Self::is_disabled(name) {
                 continue;
             }
 
@@ -1494,6 +1497,21 @@ impl ServiceManager {
 
             write(fd, name);
             write_str(fd, " disabled pid=0 restarts=0 changed=0\n");
+        }
+
+        let mut i = 0;
+        while i < self.discovered_disabled_count {
+            let name = self.discovered_disabled[i].as_bytes();
+            if self.has_loaded_service(name)
+                || self.is_known_config_name(name)
+                || !Self::is_disabled(name)
+            {
+                i += 1;
+                continue;
+            }
+            write(fd, name);
+            write_str(fd, " disabled pid=0 restarts=0 changed=0\n");
+            i += 1;
         }
     }
 
@@ -1654,6 +1672,46 @@ impl ServiceManager {
             i += 1;
         }
         None
+    }
+
+    fn remember_disabled_service(&mut self, name: &[u8]) {
+        let mut i = 0;
+        while i < self.discovered_disabled_count {
+            if self.discovered_disabled[i].eq_bytes(name) {
+                return;
+            }
+            i += 1;
+        }
+        if self.discovered_disabled_count >= MAX_DISCOVERED_DISABLED {
+            return;
+        }
+        self.discovered_disabled[self.discovered_disabled_count] = FixedStr::from_bytes(name);
+        self.discovered_disabled_count += 1;
+    }
+
+    fn has_loaded_service(&self, name: &[u8]) -> bool {
+        let mut i = 0;
+        while i < self.count {
+            if self.services[i].active && self.services[i].name.eq_bytes(name) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn is_known_config_name(&self, name: &[u8]) -> bool {
+        let prefix = b"/etc/services.d/";
+        let suffix = b".conf\0";
+        for path in KNOWN_CONFIGS {
+            if path.len() <= prefix.len() + suffix.len() {
+                continue;
+            }
+            if &path[prefix.len()..path.len() - suffix.len()] == name {
+                return true;
+            }
+        }
+        false
     }
 }
 

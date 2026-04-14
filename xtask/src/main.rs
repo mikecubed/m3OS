@@ -2722,8 +2722,9 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/log: prompt after logger",
     });
     steps.push(SmokeStep::Sleep { millis: 1000 });
+    // Read file contents directly so the awaited marker cannot come from the echoed command line.
     steps.push(SmokeStep::Send {
-        input: "/bin/grep SMOKE_LOG_MARKER /var/log/messages\n",
+        input: "/bin/cat /var/log/messages\n",
         label: "guest/log: verify smoke marker in system log",
     });
     steps.push(SmokeStep::Wait {
@@ -6112,8 +6113,9 @@ fn log_pipeline_steps() -> Vec<SmokeStep> {
     });
     // Small delay for syslogd to flush to disk.
     steps.push(SmokeStep::Sleep { millis: 1000 });
+    // Read file contents directly so the awaited marker cannot come from the echoed command line.
     steps.push(SmokeStep::Send {
-        input: "/bin/grep REGTEST_LOG_MARKER /var/log/messages\n",
+        input: "/bin/cat /var/log/messages\n",
         label: "guest/log: verify message in syslog",
     });
     steps.push(SmokeStep::Wait {
@@ -6124,7 +6126,7 @@ fn log_pipeline_steps() -> Vec<SmokeStep> {
     steps.push(SmokeStep::Wait {
         pattern: "# ",
         timeout_secs: 5,
-        label: "guest/log: prompt after grep",
+        label: "guest/log: prompt after log read",
     });
     steps
 }
@@ -7217,6 +7219,24 @@ mod tests {
             hello_compile,
             Some("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n")
         );
+    }
+
+    #[test]
+    fn smoke_test_log_verification_reads_log_file_contents() {
+        let log_check = send_input_for_label(
+            &smoke_test_script(false),
+            "guest/log: verify smoke marker in system log",
+        );
+
+        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
+    }
+
+    #[test]
+    fn log_pipeline_regression_reads_log_file_contents() {
+        let log_check =
+            send_input_for_label(&log_pipeline_steps(), "guest/log: verify message in syslog");
+
+        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
     }
 
     #[test]

@@ -1,20 +1,23 @@
-current-task: Resolve the open PR #105 smoke-test ordering review comment on feature branch feat/53-headless-hardening
-current-phase: fix-batch-1-complete
-next-action: run post-fix validation and publish the branch update
+current-task: Resolve the final PR #105 readiness findings on feature branch feat/53-headless-hardening
+current-phase: fix-batch-2-validated
+next-action: collect final integrated review results, then publish the branch update
 workspace: PR #105 / feat/53-headless-hardening
-last-updated: 2026-04-14T04:48:34+00:00
+last-updated: 2026-04-14T06:10:00+00:00
 
 ## Decisions
 
-- discussion_r3077159872 fixed in `docs/roadmap/53-headless-hardening.md` by updating the published smoke-test sequence to match the actual `xtask` smoke-test order.
-- Related Phase 53 gate docs in `docs/43c-regression-stress-ci.md` were updated so the published `cargo xtask check` contract matches the current CI entrypoint, including the `passwd_host` host-test regression.
-- `xtask/src/main.rs` now runs `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host` inside `cargo xtask check`.
+- `userspace/login/src/main.rs` now reuses the shared `passwd` shadow rewrite helper so first-boot password setup preserves any existing shadow suffix metadata instead of hardcoding `::::::`.
+- `xtask/src/main.rs` now reads `/var/log/messages` directly for smoke/regression log-pipeline checks so the awaited marker cannot be satisfied by echoed `grep` command text.
+- `userspace/init/src/main.rs` now records disabled services discovered from dynamic `/etc/services.d/*.conf` scans and appends them to `/var/run/services.status`, not just `KNOWN_CONFIGS`.
+- Local validation for this batch passed: `cargo xtask check`, `cargo xtask smoke-test --timeout 300`, and `cargo xtask regression --timeout 90`.
 
 ## Files Touched
 
 - .agent/SESSION.md
-- docs/43c-regression-stress-ci.md
-- docs/roadmap/53-headless-hardening.md
+- Cargo.lock
+- userspace/init/src/main.rs
+- userspace/login/Cargo.toml
+- userspace/login/src/main.rs
 - xtask/src/main.rs
 
 ## Open Questions
