@@ -29,7 +29,9 @@ pub extern "C" fn _start() -> ! {
             }
         }
         if field > 2 {
-            let uid = parse_u32(fields[2]);
+            let Some(uid) = parse_u32(fields[2]) else {
+                continue;
+            };
             if uid == euid {
                 let _ = write(STDOUT_FILENO, fields[0]);
                 write_str(STDOUT_FILENO, "\n");
@@ -44,14 +46,17 @@ pub extern "C" fn _start() -> ! {
     exit(0);
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
     let mut n: u32 = 0;
+    let mut saw_digit = false;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        saw_digit = true;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    n
+    if saw_digit { Some(n) } else { None }
 }
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {

@@ -60,7 +60,9 @@ pub extern "C" fn _start() -> ! {
         for (i, &b) in line.iter().enumerate() {
             if b == b':' {
                 if field == 2 {
-                    let uid = parse_u32(&line[start..i]);
+                    let Some(uid) = parse_u32(&line[start..i]) else {
+                        break;
+                    };
                     if uid > max_uid {
                         max_uid = uid;
                     }
@@ -70,7 +72,10 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
-    let new_uid = max_uid + 1;
+    let Some(new_uid) = max_uid.checked_add(1) else {
+        write_str(STDOUT_FILENO, "adduser: no available uid\n");
+        exit(1);
+    };
     let new_gid = new_uid; // GID = UID
 
     // Hash the password with random salt and iterated SHA-256.
@@ -245,14 +250,17 @@ fn u32_to_buf(dst: &mut [u8], n: u32) -> usize {
     n
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
     let mut n: u32 = 0;
+    let mut saw_digit = false;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        saw_digit = true;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    n
+    if saw_digit { Some(n) } else { None }
 }
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
