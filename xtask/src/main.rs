@@ -1383,10 +1383,12 @@ fn find_ovmf() -> PathBuf {
         "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         "/usr/share/qemu/OVMF.fd",
-        // Arch Linux (edk2-ovmf package) uses .4m suffix and x64/ subdirectory
-        "/usr/share/ovmf/x64/OVMF_CODE.4m.fd",
-        "/usr/share/OVMF/x64/OVMF_CODE.4m.fd",
-        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        // Arch Linux (edk2-ovmf package) uses .4m suffix and x64/ subdirectory.
+        // Prefer the combined OVMF.4m.fd since it works with -bios; the split
+        // OVMF_CODE.4m.fd requires pflash setup with a separate VARS file.
+        "/usr/share/ovmf/x64/OVMF.4m.fd",
+        "/usr/share/OVMF/x64/OVMF.4m.fd",
+        "/usr/share/edk2/x64/OVMF.4m.fd",
     ];
 
     for path in &candidates {
