@@ -1,7 +1,9 @@
-//! Userspace VFS service for m3OS (Phase 54, first slice).
+//! Userspace VFS service for m3OS (Phase 54).
 //!
-//! Owns read-only ext2 file I/O for the `/etc/` path class.  The kernel
-//! intercepts `open("/etc/...", O_RDONLY)` and routes it here via IPC.
+//! Owns the migrated ext2 pathname authority for the Phase 54 storage slice.
+//! The kernel keeps per-process fd bookkeeping and virtual-filesystem carveouts,
+//! while this service answers ext2-backed pathname, metadata, directory, and
+//! mount-policy requests via IPC.
 //!
 //! # Architecture
 //!
@@ -24,6 +26,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
@@ -32,19 +35,26 @@ use kernel_core::fs::ext2::{
     inode_index_in_group,
 };
 use kernel_core::fs::mbr;
-use kernel_core::fs::vfs_protocol::{VFS_CLOSE, VFS_MAX_READ, VFS_OPEN, VFS_READ};
+use kernel_core::fs::vfs_protocol::{
+    VFS_ACCESS_PATH, VFS_CLOSE, VFS_LIST_DIR, VFS_MAX_READ, VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_POLICY,
+    VFS_MOUNT_VFAT_DATA, VFS_NODE_DIR, VFS_NODE_FILE, VFS_NODE_SYMLINK, VFS_OPEN, VFS_READ,
+    VFS_STAT_PATH, VFS_STAT_REPLY_SIZE, VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_POLICY,
+    VFS_UMOUNT_VFAT_DATA,
+};
 use syscall_lib::STDOUT_FILENO;
 use syscall_lib::heap::BrkAllocator;
 
 #[global_allocator]
 static ALLOCATOR: BrkAllocator = BrkAllocator::new();
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: alloc error\n");
     syscall_lib::exit(99)
 }
 
+#[cfg(not(test))]
 syscall_lib::entry_point!(program_main);
 
 // ---------------------------------------------------------------------------
@@ -251,6 +261,51 @@ impl Ext2State {
         }
 
         Ok(result)
+    }
+
+    fn read_symlink_target(&self, inode: &Ext2Inode) -> Result<Vec<u8>, ()> {
+        if !inode.is_symlink() {
+            return Err(());
+        }
+        let target_len = inode.size as usize;
+        if inode.blocks == 0 && target_len <= 60 {
+            let mut raw = [0u8; 60];
+            for (i, &slot) in inode.block.iter().enumerate() {
+                let start = i * 4;
+                raw[start..start + 4].copy_from_slice(&slot.to_le_bytes());
+            }
+            Ok(raw[..target_len].to_vec())
+        } else {
+            self.read_file_data(inode, 0, target_len)
+        }
+    }
+
+    fn read_dir_entries(&self, inode: &Ext2Inode) -> Result<Vec<(u32, String, u8)>, u64> {
+        let mut entries = Vec::new();
+        let mut file_block = 0u32;
+        let blocks_count = inode.size / self.block_size;
+        while file_block <= blocks_count {
+            let block_num = self.resolve_block(inode, file_block).map_err(|_| NEG_EIO)?;
+            if block_num == 0 {
+                file_block += 1;
+                continue;
+            }
+            let block_data = self.read_block(block_num).map_err(|_| NEG_EIO)?;
+            let block_entries = Ext2DirEntry::parse_block(&block_data).map_err(|_| NEG_EIO)?;
+            for entry in block_entries {
+                if entry.inode == 0 {
+                    continue;
+                }
+                let entry_inode = self.read_inode(entry.inode).map_err(|_| NEG_EIO)?;
+                entries.push((
+                    entry.inode,
+                    entry.name,
+                    inode_kind_to_dirent_type(&entry_inode),
+                ));
+            }
+            file_block += 1;
+        }
+        Ok(entries)
     }
 }
 
@@ -462,7 +517,86 @@ fn handle_request(
         VFS_OPEN => handle_open(ext2, handles, msg, recv_buf),
         VFS_READ => handle_read(ext2, handles, msg),
         VFS_CLOSE => handle_close(handles, msg),
+        VFS_STAT_PATH => handle_stat_path(ext2, msg, recv_buf),
+        VFS_LIST_DIR => handle_list_dir(ext2, msg, recv_buf),
+        VFS_ACCESS_PATH => handle_access_path(ext2, msg, recv_buf),
+        VFS_MOUNT_POLICY => handle_mount_policy(msg, recv_buf),
+        VFS_UMOUNT_POLICY => handle_umount_policy(msg, recv_buf),
         _ => (NEG_EINVAL, 0),
+    }
+}
+
+fn decode_path<'a>(recv_buf: &'a [u8], path_len: usize) -> Result<&'a str, u64> {
+    if path_len == 0 || path_len > recv_buf.len() {
+        return Err(NEG_EINVAL);
+    }
+    core::str::from_utf8(&recv_buf[..path_len]).map_err(|_| NEG_EINVAL)
+}
+
+fn inode_kind(inode: &Ext2Inode) -> Result<u64, u64> {
+    if inode.is_regular() {
+        Ok(VFS_NODE_FILE)
+    } else if inode.is_dir() {
+        Ok(VFS_NODE_DIR)
+    } else if inode.is_symlink() {
+        Ok(VFS_NODE_SYMLINK)
+    } else {
+        Err(NEG_EINVAL)
+    }
+}
+
+fn inode_kind_to_dirent_type(inode: &Ext2Inode) -> u8 {
+    if inode.is_dir() {
+        4
+    } else if inode.is_regular() {
+        8
+    } else if inode.is_symlink() {
+        10
+    } else {
+        0
+    }
+}
+
+fn encode_stat_header(
+    ext2: &Ext2State,
+    inode_num: u32,
+    inode: &Ext2Inode,
+) -> Result<[u8; VFS_STAT_REPLY_SIZE], u64> {
+    let kind = inode_kind(inode)?;
+    let words = [
+        kind,
+        inode.mode as u64,
+        inode.uid as u64,
+        inode.gid as u64,
+        inode_num as u64,
+        inode.size as u64,
+        inode.links_count as u64,
+        ext2.block_size as u64,
+        inode.atime as u64,
+        inode.mtime as u64,
+        inode.ctime as u64,
+    ];
+    let mut out = [0u8; VFS_STAT_REPLY_SIZE];
+    for (idx, word) in words.iter().enumerate() {
+        let start = idx * 8;
+        out[start..start + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn mount_policy_action(target: &str, fstype: &str) -> Result<u64, u64> {
+    match (target, fstype) {
+        ("/", "ext2") => Ok(VFS_MOUNT_EXT2_ROOT),
+        ("/data", "vfat") => Ok(VFS_MOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
+    }
+}
+
+fn umount_policy_action(target: &str) -> Result<u64, u64> {
+    match target {
+        "/" => Ok(VFS_UMOUNT_EXT2_ROOT),
+        "/data" => Ok(VFS_UMOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
     }
 }
 
@@ -476,14 +610,9 @@ fn handle_open(
     msg: &syscall_lib::IpcMessage,
     recv_buf: &[u8],
 ) -> (u64, u64) {
-    let path_len = msg.data[1] as usize;
-    if path_len == 0 || path_len > recv_buf.len() {
-        return (NEG_EINVAL, 0);
-    }
-
-    let path = match core::str::from_utf8(&recv_buf[..path_len]) {
-        Ok(s) => s,
-        Err(_) => return (NEG_EINVAL, 0),
+    let path = match decode_path(recv_buf, msg.data[1] as usize) {
+        Ok(path) => path,
+        Err(errno) => return (errno, 0),
     };
 
     // Resolve path to inode.
@@ -577,6 +706,141 @@ fn handle_close(handles: &mut HandleTable, msg: &syscall_lib::IpcMessage) -> (u6
     (0, 0)
 }
 
+fn handle_stat_path(
+    ext2: &Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let path = match decode_path(recv_buf, msg.data[0] as usize) {
+        Ok(path) => path,
+        Err(errno) => return (errno, 0),
+    };
+    let inode_num = match ext2.resolve_path(path) {
+        Ok(n) => n,
+        Err(errno) => return (errno, 0),
+    };
+    let inode = match ext2.read_inode(inode_num) {
+        Ok(inode) => inode,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    let mut stat = match encode_stat_header(ext2, inode_num, &inode) {
+        Ok(stat) => stat.to_vec(),
+        Err(errno) => return (errno, 0),
+    };
+    if inode.is_symlink() {
+        let target = match ext2.read_symlink_target(&inode) {
+            Ok(target) => target,
+            Err(_) => return (NEG_EIO, 0),
+        };
+        stat.extend_from_slice(&target);
+    }
+    syscall_lib::ipc_store_reply_bulk(&stat);
+    (0, 0)
+}
+
+fn handle_list_dir(ext2: &Ext2State, msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
+    let path = match decode_path(recv_buf, msg.data[0] as usize) {
+        Ok(path) => path,
+        Err(errno) => return (errno, 0),
+    };
+    let offset = msg.data[1] as usize;
+    let max_bytes = (msg.data[2] as usize).min(MAX_BULK_BUF);
+
+    let inode_num = match ext2.resolve_path(path) {
+        Ok(n) => n,
+        Err(errno) => return (errno, 0),
+    };
+    let inode = match ext2.read_inode(inode_num) {
+        Ok(inode) => inode,
+        Err(_) => return (NEG_EIO, 0),
+    };
+    if !inode.is_dir() {
+        return (NEG_ENOTDIR, 0);
+    }
+
+    let entries = match ext2.read_dir_entries(&inode) {
+        Ok(entries) => entries,
+        Err(errno) => return (errno, 0),
+    };
+
+    let mut out = Vec::new();
+    let mut idx = offset;
+    while idx < entries.len() {
+        let (inode_num, name, d_type) = &entries[idx];
+        let name_bytes = name.as_bytes();
+        let reclen = (19 + name_bytes.len() + 1 + 7) & !7;
+        if out.len() + reclen > max_bytes {
+            if out.is_empty() {
+                return (NEG_EINVAL, 0);
+            }
+            break;
+        }
+        let start = out.len();
+        out.resize(start + reclen, 0);
+        let d_ino = *inode_num as u64;
+        let d_off = (idx + 1) as i64;
+        out[start..start + 8].copy_from_slice(&d_ino.to_ne_bytes());
+        out[start + 8..start + 16].copy_from_slice(&d_off.to_ne_bytes());
+        out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        out[start + 18] = *d_type;
+        out[start + 19..start + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+        idx += 1;
+    }
+
+    if !out.is_empty() {
+        syscall_lib::ipc_store_reply_bulk(&out);
+    }
+    let packed = (out.len() as u64) | ((idx as u64) << 32);
+    (0, packed)
+}
+
+fn handle_access_path(
+    ext2: &Ext2State,
+    msg: &syscall_lib::IpcMessage,
+    recv_buf: &[u8],
+) -> (u64, u64) {
+    let path = match decode_path(recv_buf, msg.data[0] as usize) {
+        Ok(path) => path,
+        Err(errno) => return (errno, 0),
+    };
+    match ext2.resolve_path(path) {
+        Ok(_) => (0, 0),
+        Err(errno) => (errno, 0),
+    }
+}
+
+fn handle_mount_policy(msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
+    let target_len = msg.data[0] as usize;
+    let fstype_len = msg.data[1] as usize;
+    if target_len == 0 || fstype_len == 0 || target_len + fstype_len > recv_buf.len() {
+        return (NEG_EINVAL, 0);
+    }
+    let target = match core::str::from_utf8(&recv_buf[..target_len]) {
+        Ok(target) => target,
+        Err(_) => return (NEG_EINVAL, 0),
+    };
+    let fstype = match core::str::from_utf8(&recv_buf[target_len..target_len + fstype_len]) {
+        Ok(fstype) => fstype,
+        Err(_) => return (NEG_EINVAL, 0),
+    };
+    match mount_policy_action(target, fstype) {
+        Ok(action) => (0, action),
+        Err(errno) => (errno, 0),
+    }
+}
+
+fn handle_umount_policy(msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) -> (u64, u64) {
+    let target = match decode_path(recv_buf, msg.data[0] as usize) {
+        Ok(path) => path,
+        Err(errno) => return (errno, 0),
+    };
+    match umount_policy_action(target) {
+        Ok(action) => (0, action),
+        Err(errno) => (errno, 0),
+    }
+}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::write_str(STDOUT_FILENO, "vfs_server: PANIC\n");
