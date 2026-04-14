@@ -3479,7 +3479,6 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         }
     };
     let name: &str = &resolved_name;
-    let privileged_exec_override = privileged_exec_credentials(name);
     let pid = crate::process::current_pid();
     log::info!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
@@ -3514,6 +3513,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         (None, Some(data)) => data,
         _ => return NEG_EIO,
     };
+    let privileged_exec_override = privileged_exec_credentials(name, exec_static.is_some());
 
     // Allocate a fresh page table for the new image.
     const NEG_ENOMEM: u64 = (-12_i64) as u64;
@@ -6168,12 +6168,12 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     0
 }
 
-fn privileged_exec_credentials(path: &str) -> Option<(u32, u32)> {
-    match path {
+fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Option<(u32, u32)> {
+    match (path, exec_is_static_ramdisk) {
         // Until generic setuid-on-exec exists, /bin/su runs with a root
         // effective identity so it can verify passwords via /etc/shadow and
         // then perform the authenticated credential transition.
-        "/bin/su" => Some((0, 0)),
+        ("/bin/su", true) => Some((0, 0)),
         _ => None,
     }
 }
