@@ -170,6 +170,15 @@ fn current_umask() -> u16 {
     table.find(pid).map(|proc| proc.umask).unwrap_or(0o022)
 }
 
+fn current_exec_path() -> alloc::string::String {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table
+        .find(pid)
+        .map(|proc| proc.exec_path.clone())
+        .unwrap_or_default()
+}
+
 enum PathNodeKind {
     File,
     Dir,
@@ -284,6 +293,19 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        if vfs_service_can_handle_path(abs_path) {
+            return match vfs_service_stat_path(abs_path) {
+                Ok(stat) if stat.kind == kernel_core::fs::vfs_protocol::VFS_NODE_SYMLINK => stat
+                    .symlink_target
+                    .map(PathNodeKind::Symlink)
+                    .ok_or(NEG_EIO),
+                Ok(stat) if stat.kind == kernel_core::fs::vfs_protocol::VFS_NODE_DIR => {
+                    Ok(PathNodeKind::Dir)
+                }
+                Ok(_) => Ok(PathNodeKind::File),
+                Err(err) => Err(err),
+            };
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             return match vol.resolve_path(rel) {
@@ -5567,49 +5589,100 @@ fn ext2_root_path(path: &str) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if `path` (already fully resolved) should be routed through
-/// the userspace VFS service.  Conditions:
-///
-/// 1. Path is under `/etc/` (a config-file read class).
-/// 2. Open flags are read-only (`O_RDONLY`, no create/trunc/append).
-/// 3. The "vfs" service is currently registered.
-/// 4. The path has no ramdisk overlay (ramdisk takes precedence).
-/// 5. The path is a regular ext2 file on the mounted volume.
-fn vfs_service_should_route(path: &str, flags: u64) -> bool {
-    // Only /etc/ prefix — this is the Phase 54 first-slice boundary.
-    if !(path.starts_with("/etc/") && path.len() > 5) {
-        return false;
-    }
-    // Read-only, no create/trunc/append.
-    let accmode = flags & 0o3;
-    if accmode != 0 {
-        return false; // O_WRONLY or O_RDWR
-    }
-    if flags & (0x40 | 0x200 | 0x400) != 0 {
-        return false; // O_CREAT | O_TRUNC | O_APPEND
-    }
-    // Ramdisk overlays stay on the kernel path (e.g. /etc/hello.txt).
-    if crate::fs::ramdisk::ramdisk_lookup(path).is_some() {
-        return false;
-    }
-    // Must be a regular file on the ext2 root volume (not a directory or
-    // symlink).  `ext2_root_path` converts the absolute path to a volume-
-    // relative path; `is_ext2_regular_file` confirms the inode type.
-    if let Some(rel) = ext2_root_path(path) {
-        if !crate::fs::ext2::is_ext2_regular_file(rel) {
-            return false;
-        }
-    } else {
-        return false;
-    }
-    // Service must be registered.
-    crate::ipc::registry::is_registered("vfs")
+struct VfsPathStat {
+    kind: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    ino: u64,
+    size: u64,
+    nlink: u64,
+    blksize: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    symlink_target: Option<alloc::string::String>,
 }
 
-/// Open a file through the userspace VFS service via IPC.
-///
-/// Sends a [`VFS_OPEN`] message with the path as bulk data and waits for
-/// a reply containing an opaque service handle.  Creates a
-/// [`FdBackend::VfsService`] entry in the current process's fd table.
+fn vfs_service_can_handle_path(path: &str) -> bool {
+    if current_exec_path() == "/bin/vfs_server" {
+        return false;
+    }
+    if path == "/proc" || path.starts_with("/proc/") || path == "/dev" || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    if path == "/data" || path.starts_with("/data/") {
+        return false;
+    }
+    crate::ipc::registry::is_registered("vfs")
+        && crate::fs::ramdisk::ramdisk_lookup(path).is_none()
+        && ext2_root_path(path).is_some()
+}
+
+fn vfs_service_can_list_dir(path: &str) -> bool {
+    path != "/"
+        && vfs_service_can_handle_path(path)
+        && crate::fs::ramdisk::ramdisk_list_dir(path).is_none()
+}
+
+fn vfs_bootstrap_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_VFAT_DATA};
+
+    match (target, fstype) {
+        ("/", "ext2") => Ok(VFS_MOUNT_EXT2_ROOT),
+        ("/data", "vfat") => Ok(VFS_MOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
+    }
+}
+
+fn vfs_bootstrap_umount_action(target: &str) -> Result<u64, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_VFAT_DATA};
+
+    match target {
+        "/" => Ok(VFS_UMOUNT_EXT2_ROOT),
+        "/data" => Ok(VFS_UMOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
+    }
+}
+
+fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_NODE_SYMLINK, VFS_STAT_REPLY_SIZE};
+
+    if bulk.len() < VFS_STAT_REPLY_SIZE {
+        return Err(NEG_EIO);
+    }
+    let read_word = |index: usize| -> u64 {
+        let start = index * 8;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bulk[start..start + 8]);
+        u64::from_le_bytes(word)
+    };
+    let kind = read_word(0);
+    let symlink_target = if kind == VFS_NODE_SYMLINK {
+        Some(
+            alloc::string::String::from_utf8(bulk[VFS_STAT_REPLY_SIZE..].to_vec())
+                .map_err(|_| NEG_EIO)?,
+        )
+    } else {
+        None
+    };
+    Ok(VfsPathStat {
+        kind,
+        mode: read_word(1) as u32,
+        uid: read_word(2) as u32,
+        gid: read_word(3) as u32,
+        ino: read_word(4),
+        size: read_word(5),
+        nlink: read_word(6),
+        blksize: read_word(7),
+        atime: read_word(8) as i64,
+        mtime: read_word(9) as i64,
+        ctime: read_word(10) as i64,
+        symlink_target,
+    })
+}
+
 fn vfs_service_open(path: &str, _flags: u64) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
@@ -5619,34 +5692,24 @@ fn vfs_service_open(path: &str, _flags: u64) -> u64 {
         Some(ep) => ep,
         None => return NEG_ENOENT,
     };
-
     let task_id = match scheduler::current_task_id() {
         Some(id) => id,
         None => return NEG_EINVAL,
     };
 
-    // Construct IPC message: label=VFS_OPEN, data[0]=flags, data[1]=path_len.
     let mut msg = Message::new(VFS_OPEN);
-    msg.data[0] = 0; // O_RDONLY
+    msg.data[0] = 0;
     msg.data[1] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
 
-    // Store path as bulk data on the current task.
-    let path_vec = alloc::vec::Vec::from(path.as_bytes());
-    scheduler::deliver_bulk(task_id, path_vec);
-
-    // RPC to vfs_server — blocks until reply.
     let reply = endpoint::call_msg(task_id, vfs_ep, msg);
-
     if reply.label != 0 {
-        return reply.label; // error from vfs_server (negative errno)
+        return reply.label;
     }
 
-    // vfs_server packs handle (low 32 bits) and file_size (high 32 bits) into data[0].
     let packed = reply.data[0];
     let handle = packed & 0xFFFF_FFFF;
     let file_size = (packed >> 32) as u32;
-
-    // Allocate a process fd with VfsService backend.
     let entry = FdEntry {
         backend: FdBackend::VfsService {
             service_handle: handle,
@@ -5664,10 +5727,151 @@ fn vfs_service_open(path: &str, _flags: u64) -> u64 {
     }
 }
 
-/// Read from a VFS-service-backed fd via IPC.
-///
-/// Sends a [`VFS_READ`] message and retrieves the reply bulk data containing
-/// file content.
+fn vfs_service_stat_path(path: &str) -> Result<VfsPathStat, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_STAT_PATH;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_STAT_PATH);
+    msg.data[0] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+    vfs_service_parse_stat_reply(&bulk)
+}
+
+fn vfs_service_access_path(path: &str) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_ACCESS_PATH;
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return NEG_ENOENT,
+    };
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+    let mut msg = Message::new(VFS_ACCESS_PATH);
+    msg.data[0] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    reply.label
+}
+
+fn vfs_service_list_dir(
+    path: &str,
+    offset: usize,
+    user_buf_ptr: u64,
+    count: usize,
+) -> Result<(usize, usize), u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_LIST_DIR;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_LIST_DIR);
+    msg.data[0] = path.len() as u64;
+    msg.data[1] = offset as u64;
+    msg.data[2] = count as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+
+    let packed = reply.data[0];
+    let bytes = (packed & 0xFFFF_FFFF) as usize;
+    let next_offset = (packed >> 32) as usize;
+    if bytes == 0 {
+        return Ok((0, next_offset));
+    }
+    if bytes > count {
+        return Err(NEG_EIO);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+    if bulk.len() < bytes {
+        return Err(NEG_EIO);
+    }
+    if UserSliceWo::new(user_buf_ptr, bytes)
+        .and_then(|s| s.copy_from_kernel(&bulk[..bytes]))
+        .is_err()
+    {
+        return Err(NEG_EFAULT);
+    }
+    Ok((bytes, next_offset))
+}
+
+fn vfs_service_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_MOUNT_POLICY;
+
+    if current_exec_path() == "/bin/vfs_server" || !crate::ipc::registry::is_registered("vfs") {
+        return vfs_bootstrap_mount_action(target, fstype);
+    }
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut bulk = alloc::vec::Vec::from(target.as_bytes());
+    bulk.extend_from_slice(fstype.as_bytes());
+    let mut msg = Message::new(VFS_MOUNT_POLICY);
+    msg.data[0] = target.len() as u64;
+    msg.data[1] = fstype.len() as u64;
+    scheduler::deliver_bulk(task_id, bulk);
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    Ok(reply.data[0])
+}
+
+fn vfs_service_umount_action(target: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_UMOUNT_POLICY;
+
+    if current_exec_path() == "/bin/vfs_server" || !crate::ipc::registry::is_registered("vfs") {
+        return vfs_bootstrap_umount_action(target);
+    }
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_UMOUNT_POLICY);
+    msg.data[0] = target.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(target.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    Ok(reply.data[0])
+}
+
+fn vfs_service_should_route(path: &str, flags: u64) -> bool {
+    let accmode = flags & 0o3;
+    if accmode != 0 {
+        return false;
+    }
+    if flags & (0x40 | 0x200 | 0x400) != 0 {
+        return false;
+    }
+    if !vfs_service_can_handle_path(path) {
+        return false;
+    }
+    if let Some(rel) = ext2_root_path(path) {
+        crate::fs::ext2::is_ext2_regular_file(rel)
+    } else {
+        false
+    }
+}
+
 fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
@@ -5677,52 +5881,43 @@ fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize)
         Some(ep) => ep,
         None => return NEG_EIO,
     };
-
     let task_id = match scheduler::current_task_id() {
         Some(id) => id,
         None => return NEG_EINVAL,
     };
-
     let capped = count.min(VFS_MAX_READ);
 
     let mut msg = Message::new(VFS_READ);
     msg.data[0] = handle;
     msg.data[1] = offset as u64;
     msg.data[2] = capped as u64;
-
     let reply = endpoint::call_msg(task_id, vfs_ep, msg);
-
     if reply.label != 0 {
         return reply.label;
     }
-
     let bytes_read = reply.data[0] as usize;
     if bytes_read == 0 {
         return 0;
     }
-
-    // Extract reply bulk data from our pending_bulk.
+    if bytes_read > capped {
+        return NEG_EIO;
+    }
     let bulk = match scheduler::take_bulk_data(task_id) {
         Some(b) => b,
         None => return NEG_EIO,
     };
-
-    let copy_len = bytes_read.min(bulk.len()).min(capped);
-    if copy_len == 0 {
-        return 0;
+    if bulk.len() < bytes_read {
+        return NEG_EIO;
     }
-
-    if UserSliceWo::new(user_buf_ptr, copy_len)
-        .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+    if UserSliceWo::new(user_buf_ptr, bytes_read)
+        .and_then(|s| s.copy_from_kernel(&bulk[..bytes_read]))
         .is_err()
     {
         return NEG_EFAULT;
     }
-
-    copy_len as u64
+    bytes_read as u64
 }
 
-/// Close a VFS-service-backed handle via IPC.
 fn vfs_service_close(handle: u64) {
     use crate::ipc::{endpoint, message::Message, registry};
     use crate::task::scheduler;
@@ -5732,17 +5927,12 @@ fn vfs_service_close(handle: u64) {
         Some(ep) => ep,
         None => return,
     };
-
     let task_id = match scheduler::current_task_id() {
         Some(id) => id,
         None => return,
     };
-
     let mut msg = Message::new(VFS_CLOSE);
     msg.data[0] = handle;
-
-    // Fire-and-forget: we don't care about the reply, but we still need to
-    // wait for it to avoid leaving the server with a dangling reply cap.
     let _ = endpoint::call_msg(task_id, vfs_ep, msg);
 }
 
@@ -6932,6 +7122,11 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
     if let Some(rel) = ext2_root_path(abs_path)
         && crate::fs::ext2::is_mounted()
     {
+        if vfs_service_can_handle_path(abs_path)
+            && let Ok(stat) = vfs_service_stat_path(abs_path)
+        {
+            return Some((stat.uid, stat.gid, (stat.mode & 0o7777) as u16));
+        }
         return data_file_metadata(rel);
     }
     // Legacy: /data paths for FAT32 fallback.
@@ -9419,6 +9614,28 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             if crate::fs::ext2::is_mounted()
                 && let Some(rel) = ext2_root_path(name)
             {
+                if vfs_service_can_handle_path(name)
+                    && let Ok(vfs_stat) = vfs_service_stat_path(name)
+                {
+                    let mut stat = [0u8; 144];
+                    stat[8..16].copy_from_slice(&vfs_stat.ino.to_ne_bytes());
+                    stat[16..24].copy_from_slice(&vfs_stat.nlink.to_ne_bytes());
+                    stat[24..28].copy_from_slice(&vfs_stat.mode.to_ne_bytes());
+                    stat[28..32].copy_from_slice(&vfs_stat.uid.to_ne_bytes());
+                    stat[32..36].copy_from_slice(&vfs_stat.gid.to_ne_bytes());
+                    stat[48..56].copy_from_slice(&vfs_stat.size.to_ne_bytes());
+                    stat[56..64].copy_from_slice(&vfs_stat.blksize.to_ne_bytes());
+                    stat[72..80].copy_from_slice(&vfs_stat.atime.to_ne_bytes());
+                    stat[88..96].copy_from_slice(&vfs_stat.mtime.to_ne_bytes());
+                    stat[104..112].copy_from_slice(&vfs_stat.ctime.to_ne_bytes());
+                    if UserSliceWo::new(stat_ptr, stat.len())
+                        .and_then(|s| s.copy_from_kernel(&stat))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    return 0;
+                }
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref()
                     && let Ok(ino) = vol.resolve_path(rel)
@@ -10269,6 +10486,10 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 
 pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
     let _mount_guard = MOUNT_OP_LOCK.lock();
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
     let mut buf_target = [0u8; 512];
     let target = match read_user_cstr(target_ptr, &mut buf_target) {
         Some(s) => s,
@@ -10282,35 +10503,29 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
     };
 
     let cwd = current_cwd();
-    let resolved_target = resolve_path(&cwd, target);
-
-    if fstype != "vfat" && fstype != "ext2" {
-        log::warn!("[mount] unsupported fstype: {}", fstype);
-        return NEG_EINVAL;
+    let lexical_target = resolve_path(&cwd, target);
+    let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
+        return NEG_ENOTDIR;
     }
 
-    // Support mounting at / (ext2 root) or /data (legacy).
-    if resolved_target != "/" && resolved_target != "/data" {
-        log::warn!(
-            "[mount] unsupported mountpoint {}; only / and /data are supported",
-            resolved_target
-        );
-        return NEG_EINVAL;
-    }
+    let action = match vfs_service_mount_action(&resolved_target, fstype) {
+        Ok(action) => action,
+        Err(err) => {
+            log::warn!(
+                "[mount] rejected mount target={} fstype={}: {}",
+                resolved_target,
+                fstype,
+                err as i64
+            );
+            return err;
+        }
+    };
 
-    // vfat can only mount at /data, not /.
-    if fstype == "vfat" && resolved_target == "/" {
-        log::warn!("[mount] vfat cannot be mounted at /; only /data is supported for vfat");
-        return NEG_EINVAL;
-    }
-
-    // ext2 can only mount at /, not /data.
-    if fstype == "ext2" && resolved_target == "/data" {
-        log::warn!("[mount] ext2 cannot be mounted at /data; only / is supported for ext2");
-        return NEG_EINVAL;
-    }
-
-    if fstype == "ext2" {
+    if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_EXT2_ROOT {
         let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
             Some(p) => p,
             None => {
@@ -10329,8 +10544,7 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
                 NEG_EIO
             }
         }
-    } else {
-        // fstype == "vfat"
+    } else if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_VFAT_DATA {
         let (base_lba, _sector_count) = match crate::blk::mbr::probe() {
             Some(p) => p,
             None => {
@@ -10353,6 +10567,8 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
                 NEG_EIO
             }
         }
+    } else {
+        NEG_EINVAL
     }
 }
 
@@ -10374,16 +10590,24 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
     };
 
     let cwd = current_cwd();
-    let resolved_target = resolve_path(&cwd, target);
-    if resolved_target != "/" && resolved_target != "/data" {
-        return NEG_EINVAL;
+    let lexical_target = resolve_path(&cwd, target);
+    let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
+        return NEG_ENOTDIR;
     }
+    let action = match vfs_service_umount_action(&resolved_target) {
+        Ok(action) => action,
+        Err(err) => return err,
+    };
 
     let table = crate::process::PROCESS_TABLE.lock();
     let busy = table.iter().any(|proc| {
         mount_contains_path(&resolved_target, &proc.cwd)
             || proc
-                .fd_table
+                .fd_table_snapshot()
                 .iter()
                 .flatten()
                 .any(|entry| mount_holds_fd(&resolved_target, &entry.backend))
@@ -10393,14 +10617,14 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
         return NEG_EBUSY;
     }
 
-    match resolved_target.as_str() {
-        "/" => {
+    match action {
+        kernel_core::fs::vfs_protocol::VFS_UMOUNT_EXT2_ROOT => {
             if !crate::fs::ext2::is_mounted() {
                 return NEG_EINVAL;
             }
             crate::fs::ext2::unmount_ext2();
         }
-        "/data" => {
+        kernel_core::fs::vfs_protocol::VFS_UMOUNT_VFAT_DATA => {
             if !crate::fs::fat32::is_mounted() {
                 return NEG_EINVAL;
             }
@@ -10434,7 +10658,9 @@ fn mount_contains_path(target: &str, path: &str) -> bool {
 
 fn mount_holds_fd(target: &str, backend: &FdBackend) -> bool {
     match (target, backend) {
-        ("/", FdBackend::Ext2Disk { .. }) | ("/data", FdBackend::Fat32Disk { .. }) => true,
+        ("/", FdBackend::Ext2Disk { .. })
+        | ("/", FdBackend::VfsService { .. })
+        | ("/data", FdBackend::Fat32Disk { .. }) => true,
         (_, FdBackend::Dir { path }) => mount_contains_path(target, path),
         _ => false,
     }
@@ -10672,6 +10898,22 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).
         if let Some(rel) = ext2_root_path(&dir_path) {
+            if vfs_service_can_list_dir(&dir_path) {
+                match vfs_service_list_dir(&dir_path, offset, buf_ptr, max_bytes) {
+                    Ok((bytes, next_offset)) => {
+                        if bytes == 0 {
+                            return 0;
+                        }
+                        with_current_fd_mut(fd_idx, |slot| {
+                            if let Some(e) = slot {
+                                e.offset = next_offset;
+                            }
+                        });
+                        return bytes as u64;
+                    }
+                    Err(err) => return err,
+                }
+            }
             // Merge entries from both ramdisk and ext2 for overlaid dirs.
             let mut seen = alloc::collections::BTreeSet::new();
             if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
@@ -10866,67 +11108,26 @@ pub(super) fn sys_access(path_ptr: u64) -> u64 {
     };
 
     let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
-
-    // Phase 21: /dev/null always exists.
-    // Phase 22: /dev/ptmx and /dev/pts/* always exist.
-    if resolved == "/dev/null"
-        || resolved == "/dev/zero"
-        || resolved == "/dev/urandom"
-        || resolved == "/dev/random"
-        || resolved == "/dev/full"
-        || resolved == "/dev/ptmx"
-        || resolved.starts_with("/dev/pts/")
-    {
-        return 0;
-    }
-
-    // Check ramdisk.
-    if crate::fs::ramdisk::ramdisk_lookup(&resolved).is_some() {
-        return 0;
-    }
-    // Check tmpfs.
-    if let Some(rel) = tmpfs_relative_path(&resolved) {
-        if rel.is_empty() {
-            return 0; // /tmp itself
-        }
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if tmpfs.stat(rel).is_ok() {
-            return 0;
-        }
-    }
-
-    // Phase 31: check ext2 root filesystem.
-    if crate::fs::ext2::is_mounted() {
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_ref() {
-            let rel = resolved.trim_start_matches('/');
-            if vol.resolve_path(rel).is_ok() {
-                return 0;
+    let lexical = resolve_path(&cwd, name);
+    let resolved = match resolve_existing_fs_path(&lexical, true) {
+        Ok(path) => path,
+        Err(err) => {
+            if lexical.starts_with("/usr/") {
+                let rel = lexical.trim_start_matches('/');
+                let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                if let Some(vol) = vol.as_ref()
+                    && vol.lookup(rel).is_ok()
+                {
+                    return 0;
+                }
             }
+            return err;
         }
+    };
+    if vfs_service_can_handle_path(&resolved) {
+        return vfs_service_access_path(&resolved);
     }
-
-    // Phase 31: check FAT32 (/data mount and /usr paths mapped onto it).
-    {
-        let fat_rel = if let Some(stripped) = resolved.strip_prefix("/data/") {
-            Some(stripped)
-        } else if resolved.starts_with("/usr/") {
-            Some(resolved.trim_start_matches('/'))
-        } else {
-            None
-        };
-        if let Some(rel) = fat_rel {
-            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-            if let Some(vol) = vol.as_ref()
-                && vol.lookup(rel).is_ok()
-            {
-                return 0;
-            }
-        }
-    }
-
-    NEG_ENOENT
+    0
 }
 
 // ---------------------------------------------------------------------------
