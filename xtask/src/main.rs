@@ -179,6 +179,7 @@ fn build_userspace_bins() {
         ("stdin_feeder", "stdin_feeder", false),    // Phase 52: ring-3 stdin
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
+        ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -4439,6 +4440,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\nuser=200\n";
     let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=fat\nuser=200\n";
 
+    // Phase 54 Track C: UDP network service.
+    let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
+
     let hostname_content = "m3os\n";
 
     // Create temp host files for debugfs `write` command.
@@ -4453,6 +4457,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let stdin_feeder_conf_tmp = output_dir.join("_tmp_stdin_feeder_conf");
     let fat_server_conf_tmp = output_dir.join("_tmp_fat_server_conf");
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
+    let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
@@ -4465,6 +4470,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     fs::write(&stdin_feeder_conf_tmp, stdin_feeder_conf).expect("write temp stdin_feeder.conf");
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
+    fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
 
     // Phase 48: telnetd service config is only written when --enable-telnet is passed.
@@ -4589,6 +4595,10 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
          sif etc/services.d/vfs_server.conf mode 0x81A4\n\
          sif etc/services.d/vfs_server.conf uid 0\n\
          sif etc/services.d/vfs_server.conf gid 0\n\
+         write \"{net_server_conf}\" etc/services.d/net_server.conf\n\
+         sif etc/services.d/net_server.conf mode 0x81A4\n\
+         sif etc/services.d/net_server.conf uid 0\n\
+         sif etc/services.d/net_server.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -4606,6 +4616,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
         stdin_feeder_conf = stdin_feeder_conf_tmp.display(),
         fat_server_conf = fat_server_conf_tmp.display(),
         vfs_server_conf = vfs_server_conf_tmp.display(),
+        net_server_conf = net_server_conf_tmp.display(),
         hostname = hostname_tmp.display(),
     );
 

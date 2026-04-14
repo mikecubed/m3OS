@@ -6552,7 +6552,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-            FdBackend::Socket { handle } => crate::net::free_socket(*handle),
+            FdBackend::Socket { handle } => release_socket_handle(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
@@ -12677,6 +12677,14 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
         Some(h) => h,
         None => return NEG_ENFILE,
     };
+    // Phase 54 Track C: notify net_udp service about new UDP socket.
+    if proto == SocketProtocol::Udp && net_udp_service_available() {
+        let err = net_udp_service_create(handle);
+        if err != 0 {
+            release_socket_handle(handle);
+            return err;
+        }
+    }
     let entry = FdEntry {
         backend: FdBackend::Socket { handle },
         offset: 0,
@@ -12688,7 +12696,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
         None => {
-            crate::net::free_socket(handle);
+            release_socket_handle(handle);
             NEG_EMFILE
         }
     }
@@ -12719,8 +12727,21 @@ pub(super) fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match proto {
         crate::net::SocketProtocol::Udp => {
-            if !crate::net::udp::bind(port) {
-                return NEG_EADDRINUSE;
+            // Phase 54 Track C: delegate binding policy to net_udp service.
+            if net_udp_service_available() {
+                let err = net_udp_service_bind(handle, port, local_ip);
+                if err != 0 {
+                    return err;
+                }
+                // Service approved — register in kernel mechanism layer too
+                // so ingress datagrams are queued for this port.  Ignore the
+                // return value: the service is the policy authority.
+                let _ = crate::net::udp::bind(port);
+            } else {
+                // Fallback: no service, kernel owns policy directly.
+                if !crate::net::udp::bind(port) {
+                    return NEG_EADDRINUSE;
+                }
             }
             crate::net::with_socket_mut(handle, |s| {
                 s.local_addr = local_ip;
@@ -12830,16 +12851,34 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             }
         }
         crate::net::SocketProtocol::Udp => {
-            // Auto-bind an ephemeral port if not already bound
-            let needs_bind = crate::net::with_socket(handle, |s| !s.udp_bound).unwrap_or(true);
-            if needs_bind {
-                let ephemeral = crate::arch::x86_64::interrupts::tick_count() as u16 | 0xC000;
-                if crate::net::udp::bind(ephemeral) {
+            // Phase 54 Track C: delegate connect policy to net_udp service.
+            if net_udp_service_available() {
+                let (err, ephemeral_port) = net_udp_service_connect(handle, ip, port);
+                if err != 0 {
+                    return err;
+                }
+                // If the service auto-bound an ephemeral port, register in
+                // kernel mechanism layer and update socket state.
+                if ephemeral_port != 0 {
+                    let _ = crate::net::udp::bind(ephemeral_port);
                     crate::net::with_socket_mut(handle, |s| {
-                        s.local_port = ephemeral;
+                        s.local_port = ephemeral_port;
                         s.local_addr = crate::net::config::our_ip();
                         s.udp_bound = true;
                     });
+                }
+            } else {
+                // Fallback: kernel owns policy directly.
+                let needs_bind = crate::net::with_socket(handle, |s| !s.udp_bound).unwrap_or(true);
+                if needs_bind {
+                    let ephemeral = crate::arch::x86_64::interrupts::tick_count() as u16 | 0xC000;
+                    if crate::net::udp::bind(ephemeral) {
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.local_port = ephemeral;
+                            s.local_addr = crate::net::config::our_ip();
+                            s.udp_bound = true;
+                        });
+                    }
                 }
             }
             crate::net::with_socket_mut(handle, |s| {
@@ -12952,7 +12991,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
@@ -12960,15 +12999,15 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_to_kernel(&mut len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                     if u32::from_ne_bytes(len_buf) < 16 {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return e;
                     }
                 }
@@ -12979,7 +13018,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                 }
@@ -12996,7 +13035,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
                     None => {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EMFILE;
                     }
                 }
@@ -13115,7 +13154,18 @@ pub(super) fn sys_sendto(
                     if dst_port == 0 {
                         return NEG_ENOTCONN;
                     }
-                    crate::net::udp::send(dst_ip, dst_port, local_port, &tmp[..capped]);
+                    // Phase 54 Track C: service validates, then kernel transmits.
+                    let src_port = if net_udp_service_available() {
+                        let (err, sp) =
+                            net_udp_service_sendto_params(handle, dst_ip, dst_port, capped);
+                        if err != 0 {
+                            return err;
+                        }
+                        sp
+                    } else {
+                        local_port
+                    };
+                    crate::net::udp::send(dst_ip, dst_port, src_port, &tmp[..capped]);
                     capped as u64
                 }
                 crate::net::SocketProtocol::Icmp => {
@@ -13297,40 +13347,53 @@ pub(super) fn sys_recvfrom_socket(
                         crate::task::yield_now();
                     }
                 }
-                crate::net::SocketProtocol::Udp => loop {
-                    if let Some(dgram) = crate::net::udp::recv(local_port) {
-                        let n = dgram.data.len().min(capped);
-                        if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
-                            .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
-                            .is_err()
-                        {
-                            return NEG_EFAULT;
+                crate::net::SocketProtocol::Udp => {
+                    // Phase 54 Track C: service validates which port to recv from.
+                    let recv_port = if net_udp_service_available() {
+                        let (err, port) = net_udp_service_recvfrom_port(handle);
+                        if err != 0 {
+                            return err;
                         }
-                        if addr_ptr != 0 {
-                            if let Err(e) = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
+                        port
+                    } else {
+                        local_port
+                    };
+                    loop {
+                        if let Some(dgram) = crate::net::udp::recv(recv_port) {
+                            let n = dgram.data.len().min(capped);
+                            if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
+                                .is_err()
                             {
-                                return e;
+                                return NEG_EFAULT;
                             }
-                            if addr_len_ptr != 0 {
-                                let len_buf = 16u32.to_ne_bytes();
-                                if UserSliceWo::new(addr_len_ptr, len_buf.len())
-                                    .and_then(|s| s.copy_from_kernel(&len_buf))
-                                    .is_err()
+                            if addr_ptr != 0 {
+                                if let Err(e) =
+                                    sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
                                 {
-                                    return NEG_EFAULT;
+                                    return e;
+                                }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 16u32.to_ne_bytes();
+                                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                        .and_then(|s| s.copy_from_kernel(&len_buf))
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
                                 }
                             }
+                            return n as u64;
                         }
-                        return n as u64;
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
                     }
-                    if nonblock {
-                        return NEG_EAGAIN;
-                    }
-                    if has_pending_signal() {
-                        return NEG_EINTR;
-                    }
-                    crate::task::yield_now();
-                },
+                }
                 crate::net::SocketProtocol::Icmp => {
                     // Wait for ICMP echo reply
                     use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
@@ -14879,4 +14942,166 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     }
 
     write_count as u64
+}
+
+// ===========================================================================
+// Phase 54 Track C: UDP network service facade
+// ===========================================================================
+
+/// Returns `true` when the ring-3 `net_udp` service is registered and the
+/// current caller is *not* the service itself (prevents recursion).
+fn net_udp_service_available() -> bool {
+    current_exec_path() != "/bin/net_server" && crate::ipc::registry::is_registered("net_udp")
+}
+
+/// Tell the service about a newly-allocated kernel socket handle.
+fn net_udp_service_create(kernel_handle: u32) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_CREATE;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let mut msg = Message::new(NET_UDP_CREATE);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.label // 0 on success
+}
+
+/// Forward bind to the service (port binding policy decision).
+fn net_udp_service_bind(kernel_handle: u32, port: u16, ip: [u8; 4]) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_BIND;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let ip_u32 =
+        ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16) | ((ip[2] as u64) << 8) | (ip[3] as u64);
+
+    let mut msg = Message::new(NET_UDP_BIND);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = port as u64;
+    msg.data[2] = ip_u32;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.label
+}
+
+/// Forward connect to the service. Returns (errno, ephemeral_port).
+fn net_udp_service_connect(kernel_handle: u32, ip: [u8; 4], port: u16) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::{NET_UDP_CONNECT, pack_ip_port};
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_CONNECT);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = pack_ip_port(ip, port);
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Validate a sendto — returns (errno, src_port) from the service.
+fn net_udp_service_sendto_params(
+    kernel_handle: u32,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    len: usize,
+) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::{NET_UDP_SENDTO, pack_ip_port};
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_SENDTO);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = pack_ip_port(dst_ip, dst_port);
+    msg.data[2] = len as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Validate a recvfrom — returns (errno, local_port) from the service.
+fn net_udp_service_recvfrom_port(kernel_handle: u32) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_RECVFROM;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_RECVFROM);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Tell the service a socket was closed. Returns the port that was unbound.
+fn net_udp_service_close(kernel_handle: u32) -> u16 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_CLOSE;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return 0,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return 0,
+    };
+
+    let mut msg = Message::new(NET_UDP_CLOSE);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.data[0] as u16
+}
+
+fn release_socket_handle(handle: u32) {
+    let hold_udp_last_ref = net_udp_service_available();
+    let result = crate::net::free_socket_with_result(handle, hold_udp_last_ref);
+    if result.needs_finalization {
+        net_udp_service_close(handle);
+        crate::net::finalize_socket_close(handle);
+    }
+}
+
+pub fn release_socket_pub(handle: u32) {
+    release_socket_handle(handle);
 }

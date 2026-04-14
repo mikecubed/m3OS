@@ -50,6 +50,7 @@ members = [
     "userspace/stdin_feeder",
     "userspace/vfs_server",
     "userspace/fat_server",
+    "userspace/net_server",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

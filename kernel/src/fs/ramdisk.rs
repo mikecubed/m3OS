@@ -183,6 +183,7 @@ static KBD_SERVER_ELF: &[u8] = generated_initrd_asset!("kbd_server");
 static STDIN_FEEDER_ELF: &[u8] = generated_initrd_asset!("stdin_feeder");
 static FAT_SERVER_ELF: &[u8] = generated_initrd_asset!("fat_server");
 static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
+static NET_SERVER_ELF: &[u8] = generated_initrd_asset!("net_server");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 
@@ -313,6 +314,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "vfs_server",
         RamdiskNode::File {
             content: VFS_SERVER_ELF,
+        },
+    ),
+    // Phase 54 Track C: ring-3 UDP network service
+    (
+        "net_server",
+        RamdiskNode::File {
+            content: NET_SERVER_ELF,
         },
     ),
     // Phase 32: build tools and utilities

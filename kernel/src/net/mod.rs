@@ -99,6 +99,9 @@ pub struct SocketEntry {
     /// Reference count — number of FDs (across all processes) pointing to this socket.
     /// Only freed when this drops to zero.
     pub refcount: u32,
+    /// True once the last ref has started close-time teardown and the handle
+    /// must not be reused or resurrected.
+    pub closing: bool,
 }
 
 struct SocketTable {
@@ -150,6 +153,7 @@ pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<Socket
                 shut_rd: false,
                 shut_wr: false,
                 refcount: 1,
+                closing: false,
             });
             return Some(i as SocketHandle);
         }
@@ -157,40 +161,89 @@ pub fn alloc_socket(kind: SocketKind, protocol: SocketProtocol) -> Option<Socket
     None
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketFreeResult {
+    pub protocol: Option<SocketProtocol>,
+    pub released_last_ref: bool,
+    pub needs_finalization: bool,
+}
+
 /// Decrement socket refcount; free the entry only when it reaches zero.
-pub fn free_socket(handle: SocketHandle) {
+pub fn free_socket_with_result(handle: SocketHandle, hold_udp_last_ref: bool) -> SocketFreeResult {
+    let mut result = SocketFreeResult::default();
     let mut table = SOCKET_TABLE.lock();
     let should_free = if let Some(entry) = table
         .entries
         .get_mut(handle as usize)
         .and_then(|s| s.as_mut())
     {
+        result.protocol = Some(entry.protocol);
         entry.refcount = entry.refcount.saturating_sub(1);
         entry.refcount == 0
     } else {
-        return;
+        return result;
     };
     if should_free {
-        // Clean up TCP/UDP resources.
-        if let Some(entry) = table
-            .entries
-            .get_mut(handle as usize)
-            .and_then(|s| s.as_mut())
+        result.released_last_ref = true;
+        if hold_udp_last_ref
+            && result.protocol == Some(SocketProtocol::Udp)
+            && let Some(entry) = table
+                .entries
+                .get_mut(handle as usize)
+                .and_then(|s| s.as_mut())
         {
-            if let Some(tcp_idx) = entry.tcp_slot {
-                tcp::close(tcp_idx);
-                tcp::destroy(tcp_idx);
+            entry.closing = true;
+            result.needs_finalization = true;
+        } else {
+            // Clean up TCP/UDP resources.
+            if let Some(entry) = table
+                .entries
+                .get_mut(handle as usize)
+                .and_then(|s| s.as_mut())
+            {
+                if let Some(tcp_idx) = entry.tcp_slot {
+                    tcp::close(tcp_idx);
+                    tcp::destroy(tcp_idx);
+                }
+                if entry.udp_bound {
+                    udp::unbind(entry.local_port);
+                }
             }
-            if entry.udp_bound {
-                udp::unbind(entry.local_port);
+            if let Some(slot) = table.entries.get_mut(handle as usize) {
+                *slot = None;
             }
-        }
-        if let Some(slot) = table.entries.get_mut(handle as usize) {
-            *slot = None;
         }
     }
     drop(table);
     // Wake any pollers on this socket (HUP / close notification).
+    wake_socket(handle);
+    result
+}
+
+pub fn finalize_socket_close(handle: SocketHandle) {
+    let mut table = SOCKET_TABLE.lock();
+    if let Some(entry) = table
+        .entries
+        .get_mut(handle as usize)
+        .and_then(|s| s.as_mut())
+    {
+        if entry.refcount != 0 || !entry.closing {
+            return;
+        }
+        if let Some(tcp_idx) = entry.tcp_slot {
+            tcp::close(tcp_idx);
+            tcp::destroy(tcp_idx);
+        }
+        if entry.udp_bound {
+            udp::unbind(entry.local_port);
+        }
+    } else {
+        return;
+    }
+    if let Some(slot) = table.entries.get_mut(handle as usize) {
+        *slot = None;
+    }
+    drop(table);
     wake_socket(handle);
 }
 
@@ -201,6 +254,7 @@ pub fn add_socket_ref(handle: SocketHandle) {
         .entries
         .get_mut(handle as usize)
         .and_then(|s| s.as_mut())
+        && !entry.closing
     {
         entry.refcount += 1;
     }
