@@ -1152,6 +1152,7 @@ impl ServiceManager {
 
                 // Check restart policy if not shutting down.
                 if !self.shutdown_requested {
+                    self.note_extracted_service_degradation(idx);
                     self.maybe_restart(idx, exit_code, signaled);
                 }
             }
@@ -1227,6 +1228,33 @@ impl ServiceManager {
         }
 
         self.start_service(idx);
+    }
+
+    fn note_extracted_service_degradation(&self, idx: usize) {
+        let svc = &self.services[idx];
+        if svc.restart_policy != RestartPolicy::Never {
+            return;
+        }
+
+        if svc.name.eq_bytes(b"vfs") {
+            write_str(
+                STDOUT_FILENO,
+                "init: vfs unavailable; new rootfs opens fall back to kernel ext2, but existing vfs-backed fds may fail with EIO until manual restart\n",
+            );
+            self.send_syslog(
+                SEV_WARNING,
+                b"vfs unavailable; new rootfs opens fall back to kernel ext2 and existing vfs-backed fds may fail with EIO until manual restart",
+            );
+        } else if svc.name.eq_bytes(b"net_udp") {
+            write_str(
+                STDOUT_FILENO,
+                "init: net_udp unavailable; UDP syscalls fall back to kernel policy and existing UDP sockets keep kernel-owned state until manual restart\n",
+            );
+            self.send_syslog(
+                SEV_WARNING,
+                b"net_udp unavailable; UDP syscalls fall back to kernel policy and existing UDP sockets keep kernel-owned state until manual restart",
+            );
+        }
     }
 
     /// Orderly shutdown of all services in reverse dependency order.

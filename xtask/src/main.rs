@@ -4438,7 +4438,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
 
     // Phase 54: storage service definitions.
     let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\nuser=200\n";
-    let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=fat\nuser=200\n";
+    let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=fat\nuser=200\n";
 
     // Phase 54 Track C: UDP network service.
     let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
