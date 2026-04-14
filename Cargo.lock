@@ -961,6 +961,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "net_server"
+version = "0.54.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
