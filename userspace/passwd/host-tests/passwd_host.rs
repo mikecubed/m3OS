@@ -1,4 +1,4 @@
-use passwd::{ShadowRewriteError, requested_username, rewrite_shadow_file};
+use passwd::{ShadowRewriteError, find_username_by_uid, requested_username, rewrite_shadow_file};
 
 #[test]
 fn requested_username_uses_cli_target_when_present() {
@@ -41,4 +41,11 @@ fn rewrite_shadow_file_errors_for_missing_user() {
         ),
         Err(ShadowRewriteError::UserNotFound)
     );
+}
+
+#[test]
+fn find_username_by_uid_skips_overflowed_uid_fields() {
+    let passwd = b"evil:x:4294967296:0:evil:/root:/bin/sh\nroot:x:0:0:root:/root:/bin/sh\n";
+
+    assert_eq!(find_username_by_uid(passwd, 0), Some("root".as_bytes()));
 }

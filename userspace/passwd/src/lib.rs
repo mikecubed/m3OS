@@ -126,7 +126,9 @@ pub fn find_username_by_uid(passwd: &[u8], target_uid: u32) -> Option<&[u8]> {
         }
         if field == 6 {
             fields[6] = &line[start..];
-            let uid = parse_u32(fields[2]);
+            let Some(uid) = parse_u32(fields[2]) else {
+                continue;
+            };
             if uid == target_uid {
                 return Some(fields[0]);
             }
@@ -135,12 +137,15 @@ pub fn find_username_by_uid(passwd: &[u8], target_uid: u32) -> Option<&[u8]> {
     None
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
     let mut n: u32 = 0;
+    let mut saw_digit = false;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        saw_digit = true;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    n
+    if saw_digit { Some(n) } else { None }
 }

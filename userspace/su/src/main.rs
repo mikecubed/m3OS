@@ -139,8 +139,12 @@ fn find_user<'a>(passwd: &'a [u8], username: &[u8]) -> Option<(u32, u32, &'a [u8
         if field == 6 {
             fields[6] = &line[start..];
             if fields[0] == username {
-                let uid = parse_u32(fields[2]);
-                let gid = parse_u32(fields[3]);
+                let Some(uid) = parse_u32(fields[2]) else {
+                    continue;
+                };
+                let Some(gid) = parse_u32(fields[3]) else {
+                    continue;
+                };
                 return Some((uid, gid, fields[5], fields[6]));
             }
         }
@@ -148,14 +152,17 @@ fn find_user<'a>(passwd: &'a [u8], username: &[u8]) -> Option<(u32, u32, &'a [u8
     None
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
     let mut n: u32 = 0;
+    let mut saw_digit = false;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        saw_digit = true;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    n
+    if saw_digit { Some(n) } else { None }
 }
 
 fn verify_shadow(shadow: &[u8], username: &[u8], password: &[u8]) -> bool {
