@@ -1,23 +1,20 @@
-current-task: Resolve the final PR #105 readiness findings on feature branch feat/53-headless-hardening
-current-phase: fix-batch-2-validated
-next-action: collect final integrated review results, then publish the branch update
+current-task: Resolve the live PR #105 musl placeholder review thread on feature branch feat/53-headless-hardening
+current-phase: fix-batch-1-complete
+next-action: run post-fix validation and close the GitHub thread
 workspace: PR #105 / feat/53-headless-hardening
-last-updated: 2026-04-14T06:10:00+00:00
+last-updated: 2026-04-14T06:28:00+00:00
 
 ## Decisions
 
-- `userspace/login/src/main.rs` now reuses the shared `passwd` shadow rewrite helper so first-boot password setup preserves any existing shadow suffix metadata instead of hardcoding `::::::`.
-- `xtask/src/main.rs` now reads `/var/log/messages` directly for smoke/regression log-pipeline checks so the awaited marker cannot be satisfied by echoed `grep` command text.
-- `userspace/init/src/main.rs` now records disabled services discovered from dynamic `/etc/services.d/*.conf` scans and appends them to `/var/run/services.status`, not just `KNOWN_CONFIGS`.
-- Local validation for this batch passed: `cargo xtask check`, `cargo xtask smoke-test --timeout 300`, and `cargo xtask regression --timeout 90`.
+- `discussion_r3077430924` | evidence verdict: valid | concern: correctness + contract mismatch | action: fix. Current `build_musl_rust_bins()` only creates zero-length placeholders when the staged file does not already exist, so a missing musl target can leave stale cached binaries in `target/generated-initrd/` while logging that placeholders are being left in place.
+- Discovery brief skipped because the live review batch is already narrow and fully scoped: one open thread on one file (`xtask/src/main.rs`) with no scope ambiguity.
+- Fix batch 1 implemented by resetting musl Rust staged initrd files to zero-length placeholders before availability checks/build attempts, plus xtask unit coverage for both create and truncate paths.
+- Post-fix validation passed: `cargo test -p xtask --target x86_64-unknown-linux-gnu --quiet` and `cargo xtask check`.
+- Independent fix review reported no substantive remaining issues after the warning text was aligned with the new placeholder behavior.
 
 ## Files Touched
 
 - .agent/SESSION.md
-- Cargo.lock
-- userspace/init/src/main.rs
-- userspace/login/Cargo.toml
-- userspace/login/src/main.rs
 - xtask/src/main.rs
 
 ## Open Questions

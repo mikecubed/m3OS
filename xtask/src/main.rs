@@ -398,6 +398,10 @@ fn build_musl_bins() {
 /// `include_bytes!` path always resolves. Uses `x86_64-unknown-linux-musl`
 /// target with prebuilt std (no `-Zbuild-std`) and warns instead of failing when
 /// the target or an individual crate is unavailable.
+fn reset_placeholder_file(path: &Path) -> io::Result<()> {
+    File::create(path).map(|_| ())
+}
+
 fn build_musl_rust_bins() {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
@@ -410,17 +414,12 @@ fn build_musl_rust_bins() {
         "todo-rust",
     ];
 
-    // Ensure placeholder files exist for every crate so that the kernel's
-    // include_bytes! in ramdisk.rs always finds them, even if the musl target
-    // is not installed or individual crates are missing.
+    // Reset every staged file to a zero-length placeholder first so stale
+    // cached binaries cannot survive missing-target or build-failure paths.
     for name in crates {
         let dst = initrd.join(name);
-        if !dst.exists() {
-            if let Err(e) = File::create(&dst) {
-                eprintln!(
-                    "warning: failed to create placeholder target/generated-initrd/{name}: {e}"
-                );
-            }
+        if let Err(e) = reset_placeholder_file(&dst) {
+            eprintln!("warning: failed to create placeholder target/generated-initrd/{name}: {e}");
         }
     }
 
@@ -479,7 +478,7 @@ fn build_musl_rust_bins() {
 
         if !status.success() {
             eprintln!(
-                "warning: musl Rust build failed for {name} — leaving target/generated-initrd/{name} unavailable in this image"
+                "warning: musl Rust build failed for {name} — leaving target/generated-initrd/{name} as a placeholder"
             );
             continue;
         }
@@ -7189,6 +7188,28 @@ mod tests {
         let mut kernel_bytes = Vec::new();
         kernel.read_to_end(&mut kernel_bytes).unwrap();
         assert_eq!(kernel_bytes, b"kernel-bytes");
+    }
+
+    #[test]
+    fn reset_placeholder_file_creates_missing_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("placeholder");
+
+        reset_placeholder_file(&path).unwrap();
+
+        assert!(path.exists());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reset_placeholder_file_truncates_stale_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("placeholder");
+        fs::write(&path, b"stale-binary").unwrap();
+
+        reset_placeholder_file(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"");
     }
 
     #[test]
