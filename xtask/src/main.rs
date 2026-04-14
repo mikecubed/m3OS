@@ -1021,6 +1021,15 @@ fn build_tcc() -> Option<PathBuf> {
         }
     }
 
+    // Clean stale artifacts before reconfiguring (a cached c2str.exe from a
+    // previous build with different flags may be dynamically linked and fail).
+    let _ = Command::new("make")
+        .current_dir(&tcc_src)
+        .args(["clean"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
     // Configure TCC.
     // Use --extra-ldflags=-static to produce a fully static, non-PIE binary.
     // The --extra-cflags=-static alone doesn't prevent PIE on newer toolchains.
