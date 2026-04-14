@@ -4320,14 +4320,24 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     }
 
     // Format with mkfs.ext2 (4K blocks, ext2 rev 0, no optional features).
+    // Newer e2fsprogs (>=1.47.4, Arch) removed -r; try -E revision=0 first
+    // (rev 0 implies no features, so -O none is not needed), then fall back
+    // to -r 0 -O none for older versions (Ubuntu 22.04/24.04).
     let mkfs_status = Command::new("mkfs.ext2")
-        .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
+        .args(["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"])
         .arg(&part_tmp)
         .status()
         .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
     if !mkfs_status.success() {
-        eprintln!("Error: mkfs.ext2 failed (exit {})", mkfs_status);
-        std::process::exit(1);
+        let fallback = Command::new("mkfs.ext2")
+            .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
+            .arg(&part_tmp)
+            .status()
+            .expect("failed to run mkfs.ext2");
+        if !fallback.success() {
+            eprintln!("Error: mkfs.ext2 failed (exit {})", fallback);
+            std::process::exit(1);
+        }
     }
 
     // Populate files using debugfs.
