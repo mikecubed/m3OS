@@ -51,3 +51,14 @@ pub fn with_lookup<R>(name: &str, f: impl FnOnce(EndpointId) -> R) -> Option<R> 
     let reg = REGISTRY.lock();
     reg.lookup(name).map(f)
 }
+
+/// Phase 54: check if a named service is currently registered.
+pub fn is_registered(name: &str) -> bool {
+    REGISTRY.lock().lookup(name).is_some()
+}
+
+/// Phase 54: look up a named service and return its endpoint ID directly.
+/// Convenience alias for [`lookup`] used by the kernel VFS routing layer.
+pub fn lookup_endpoint_id(name: &str) -> Option<EndpointId> {
+    lookup(name)
+}

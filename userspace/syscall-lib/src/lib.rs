@@ -320,6 +320,12 @@ pub const SYS_IPC_RECV_MSG: u64 = 0x110E;
 /// Reply then receive with full data words and optional bulk payload.
 pub const SYS_IPC_REPLY_RECV_MSG: u64 = 0x110F;
 
+/// Store bulk data to be sent with the next IPC reply (Phase 54).
+pub const SYS_IPC_STORE_REPLY_BULK: u64 = 0x1110;
+
+/// Read raw disk sectors from userspace (Phase 54).
+pub const SYS_BLOCK_READ: u64 = 0x1011;
+
 // ===========================================================================
 // IPC wrappers (Phase 52)
 // ===========================================================================
@@ -528,6 +534,44 @@ pub fn ipc_reply_recv_msg(
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
+    }
+}
+
+/// Store bulk data to be attached to the next IPC reply (Phase 54).
+///
+/// The kernel copies `buf` from this process's address space into the
+/// task's `pending_bulk` slot.  When the server next calls [`ipc_reply`]
+/// or [`ipc_reply_recv_msg`], the pending bulk is transferred to the
+/// caller alongside the reply message.
+///
+/// Returns 0 on success, `u64::MAX` on error.
+pub fn ipc_store_reply_bulk(buf: &[u8]) -> u64 {
+    unsafe {
+        syscall2(
+            SYS_IPC_STORE_REPLY_BULK,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
+/// Read raw disk sectors into a userspace buffer (Phase 54).
+///
+/// Reads `count` 512-byte sectors starting at `start_sector` (absolute LBA)
+/// into `buf`.  `buf` must be at least `count * 512` bytes.
+///
+/// Returns 0 on success, negative errno on error.
+pub fn block_read(start_sector: u64, count: usize, buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall6(
+            SYS_BLOCK_READ,
+            start_sector,
+            count as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ) as i64
     }
 }
 

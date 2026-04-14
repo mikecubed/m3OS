@@ -460,6 +460,23 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
         return NEG_ELOOP;
     }
 
+    // Phase 54: route read-only /etc/... file opens through the userspace VFS
+    // service when it is registered, instead of the kernel-inline ext2 path.
+    if vfs_service_should_route(&resolved, flags) {
+        // Enforce the same DAC permission check the kernel path uses so that
+        // protected files (e.g. /etc/shadow) are not exposed through the VFS
+        // service path.
+        if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+            let (_, _, euid, egid) = current_process_ids();
+            if !check_permission(fu, fg, fm, euid, egid, 4) {
+                return NEG_EACCES;
+            }
+        }
+        // Release mount lock before IPC to avoid blocking other openers.
+        drop(_mount_guard);
+        return vfs_service_open(&resolved, flags);
+    }
+
     open_resolved_path(&resolved, flags, mode_arg)
 }
 
@@ -1121,10 +1138,12 @@ mod syscall_nr {
     pub const GET_TERMIOS_OFLAG: u64 = 0x100F;
     /// Phase 52c: push raw input byte through kernel line discipline.
     pub const PUSH_RAW_INPUT: u64 = 0x1010;
+    /// Phase 54: read raw disk sectors from userspace (for ring-3 storage servers).
+    pub const BLOCK_READ: u64 = 0x1011;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x110F;
+    pub const IPC_LAST: u64 = 0x1110;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1479,7 @@ pub extern "C" fn syscall_handler(
         GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().ldisc.termios.c_iflag as u64,
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
+        BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -4698,6 +4718,21 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::Epoll { .. } => NEG_EBADF,
+        // Phase 54: read from userspace VFS-service-backed fd.
+        FdBackend::VfsService { service_handle, .. } => {
+            let handle = *service_handle;
+            let offset = entry.offset;
+            let result = vfs_service_read(handle, offset, buf_ptr, count as usize);
+            if result > 0 && result < 0x8000_0000_0000_0000 {
+                let bytes = result as usize;
+                with_current_fd_mut(fd, |slot| {
+                    if let Some(e) = slot {
+                        e.offset += bytes;
+                    }
+                });
+            }
+            result
+        }
     }
 }
 
@@ -5254,6 +5289,7 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::Epoll { .. } => NEG_EBADF,
+        FdBackend::VfsService { .. } => NEG_EBADF, // read-only; writes rejected
     }
 }
 
@@ -5524,6 +5560,190 @@ fn ext2_root_path(path: &str) -> Option<&str> {
     }
 
     Some(rest)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 54: userspace VFS service routing
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `path` (already fully resolved) should be routed through
+/// the userspace VFS service.  Conditions:
+///
+/// 1. Path is under `/etc/` (a config-file read class).
+/// 2. Open flags are read-only (`O_RDONLY`, no create/trunc/append).
+/// 3. The "vfs" service is currently registered.
+/// 4. The path has no ramdisk overlay (ramdisk takes precedence).
+/// 5. The path is a regular ext2 file on the mounted volume.
+fn vfs_service_should_route(path: &str, flags: u64) -> bool {
+    // Only /etc/ prefix — this is the Phase 54 first-slice boundary.
+    if !(path.starts_with("/etc/") && path.len() > 5) {
+        return false;
+    }
+    // Read-only, no create/trunc/append.
+    let accmode = flags & 0o3;
+    if accmode != 0 {
+        return false; // O_WRONLY or O_RDWR
+    }
+    if flags & (0x40 | 0x200 | 0x400) != 0 {
+        return false; // O_CREAT | O_TRUNC | O_APPEND
+    }
+    // Ramdisk overlays stay on the kernel path (e.g. /etc/hello.txt).
+    if crate::fs::ramdisk::ramdisk_lookup(path).is_some() {
+        return false;
+    }
+    // Must be a regular file on the ext2 root volume (not a directory or
+    // symlink).  `ext2_root_path` converts the absolute path to a volume-
+    // relative path; `is_ext2_regular_file` confirms the inode type.
+    if let Some(rel) = ext2_root_path(path) {
+        if !crate::fs::ext2::is_ext2_regular_file(rel) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    // Service must be registered.
+    crate::ipc::registry::is_registered("vfs")
+}
+
+/// Open a file through the userspace VFS service via IPC.
+///
+/// Sends a [`VFS_OPEN`] message with the path as bulk data and waits for
+/// a reply containing an opaque service handle.  Creates a
+/// [`FdBackend::VfsService`] entry in the current process's fd table.
+fn vfs_service_open(path: &str, _flags: u64) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_OPEN;
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return NEG_ENOENT,
+    };
+
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    // Construct IPC message: label=VFS_OPEN, data[0]=flags, data[1]=path_len.
+    let mut msg = Message::new(VFS_OPEN);
+    msg.data[0] = 0; // O_RDONLY
+    msg.data[1] = path.len() as u64;
+
+    // Store path as bulk data on the current task.
+    let path_vec = alloc::vec::Vec::from(path.as_bytes());
+    scheduler::deliver_bulk(task_id, path_vec);
+
+    // RPC to vfs_server — blocks until reply.
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+
+    if reply.label != 0 {
+        return reply.label; // error from vfs_server (negative errno)
+    }
+
+    // vfs_server packs handle (low 32 bits) and file_size (high 32 bits) into data[0].
+    let packed = reply.data[0];
+    let handle = packed & 0xFFFF_FFFF;
+    let file_size = (packed >> 32) as u32;
+
+    // Allocate a process fd with VfsService backend.
+    let entry = FdEntry {
+        backend: FdBackend::VfsService {
+            service_handle: handle,
+            file_size,
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+        cloexec: false,
+        nonblock: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
+    }
+}
+
+/// Read from a VFS-service-backed fd via IPC.
+///
+/// Sends a [`VFS_READ`] message and retrieves the reply bulk data containing
+/// file content.
+fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_READ, VFS_READ};
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let capped = count.min(VFS_MAX_READ);
+
+    let mut msg = Message::new(VFS_READ);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+
+    if reply.label != 0 {
+        return reply.label;
+    }
+
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read == 0 {
+        return 0;
+    }
+
+    // Extract reply bulk data from our pending_bulk.
+    let bulk = match scheduler::take_bulk_data(task_id) {
+        Some(b) => b,
+        None => return NEG_EIO,
+    };
+
+    let copy_len = bytes_read.min(bulk.len()).min(capped);
+    if copy_len == 0 {
+        return 0;
+    }
+
+    if UserSliceWo::new(user_buf_ptr, copy_len)
+        .and_then(|s| s.copy_from_kernel(&bulk[..copy_len]))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+
+    copy_len as u64
+}
+
+/// Close a VFS-service-backed handle via IPC.
+fn vfs_service_close(handle: u64) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_CLOSE;
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return,
+    };
+
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return,
+    };
+
+    let mut msg = Message::new(VFS_CLOSE);
+    msg.data[0] = handle;
+
+    // Fire-and-forget: we don't care about the reply, but we still need to
+    // wait for it to avoid leaving the server with a dangling reply cap.
+    let _ = endpoint::call_msg(task_id, vfs_ep, msg);
 }
 
 fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
@@ -6136,6 +6356,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         return NEG_EBADF;
     }
     let mut ext2_inode = None;
+    let mut vfs_handle = None;
     // Close-time cleanup for resource-backed FDs.
     if let Some(entry) = current_fd_entry(fd) {
         match &entry.backend {
@@ -6147,6 +6368,7 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
             FdBackend::Ext2Disk { inode_num, .. } => ext2_inode = Some(*inode_num),
+            FdBackend::VfsService { service_handle, .. } => vfs_handle = Some(*service_handle),
             _ => {}
         }
     }
@@ -6164,6 +6386,10 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     }
     if let Some(inode_num) = ext2_inode {
         cleanup_ext2_inode_if_unused(inode_num);
+    }
+    // Phase 54: notify userspace VFS server that handle is closed.
+    if let Some(handle) = vfs_handle {
+        vfs_service_close(handle);
     }
     0
 }
@@ -6558,6 +6784,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
         FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
+        FdBackend::VfsService { file_size, .. } => (0x8000 | 0o444, 0, 0, *file_size as u64, 0),
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -6625,6 +6852,7 @@ pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
+        FdBackend::VfsService { .. } => ext2_statfs(),
     };
     write_statfs_to_user(buf_ptr, &stat)
 }
@@ -6975,6 +7203,7 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Fat32Disk { file_size, .. } | FdBackend::Ext2Disk { file_size, .. } => {
             *file_size as usize
         }
+        FdBackend::VfsService { file_size, .. } => *file_size as usize,
     };
 
     let offset = offset as i64;
@@ -8346,6 +8575,69 @@ fn serial_echo_bytes(bytes: &[u8]) {
             while x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20 == 0 {}
             x86_64::instructions::port::Port::new(0x3F8).write(b);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 54: sys_block_read — raw sector reads for ring-3 storage servers
+// ---------------------------------------------------------------------------
+
+/// Allowed caller binaries for raw block reads.
+const STORAGE_SERVICE_UID: u32 = 200;
+const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
+/// Read raw disk sectors into a userspace buffer.
+///
+/// Args:
+///   - `start_sector`: absolute LBA of the first sector
+///   - `count`: number of 512-byte sectors to read
+///   - `buf_ptr`: userspace destination address
+///   - `buf_len`: size of the destination buffer in bytes
+///
+/// Returns 0 on success, or a negative errno on error.
+/// Capped at 128 sectors (64 KiB) per call for safety.
+///
+/// Only supervised storage services may call this syscall. The kernel requires
+/// both a dedicated service euid and an expected service binary path so
+/// ordinary users cannot gain raw-disk access by directly exec'ing a public
+/// `/bin/*_server` binary.
+fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    // Restrict to supervised storage services.
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_READ_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+
+    const MAX_SECTORS: usize = 128; // 64 KiB
+
+    let count = count as usize;
+    if count == 0 || count > MAX_SECTORS {
+        return NEG_EINVAL;
+    }
+
+    let needed = count * 512;
+    if needed > buf_len as usize {
+        return NEG_EINVAL;
+    }
+
+    let mut kernel_buf = alloc::vec![0u8; needed];
+    match crate::blk::read_sectors(start_sector, count, &mut kernel_buf) {
+        Ok(()) => {
+            if UserSliceWo::new(buf_ptr, needed)
+                .and_then(|s| s.copy_from_kernel(&kernel_buf))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        Err(_) => NEG_EIO,
     }
 }
 
@@ -10243,6 +10535,7 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
             // FAT32/ext2 truncate not yet implemented.
             NEG_EINVAL
         }
+        FdBackend::VfsService { .. } => NEG_EROFS, // read-only
     }
 }
 
@@ -13422,6 +13715,7 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             }
         }
         FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
+        FdBackend::VfsService { .. } => POLLIN, // always readable
     }
 }
 
