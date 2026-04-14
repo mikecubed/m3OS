@@ -131,7 +131,7 @@ or "regression" are not sufficient; the bundle names the exact commands.
 | Gate | Command | What it proves |
 |---|---|---|
 | Static analysis | `cargo xtask check` | clippy + rustfmt + kernel-core host tests pass |
-| Unit + property tests | `cargo test -p kernel-core` | Host-side pure-logic invariants hold |
+| Unit + property tests | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` | Host-side pure-logic invariants hold |
 | Loom concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Lock-free allocator paths are linearizable |
 | QEMU boot smoke test | `cargo xtask smoke-test --timeout 300` | Boot → login → UID check → service list → ext2 write/verify/delete → log pipeline → TCC compile |
 | Regression suite | `cargo xtask regression --timeout 90` | 10 registered SMP-sensitive and headless-operator scenarios pass |
@@ -188,12 +188,15 @@ coordination that is fragile under CI load.
 **Gate artifact locations** are documented in a single table in
 `docs/43c-regression-stress-ci.md` § Gate Artifact Locations.
 
-**CI alignment:** PR and main-branch workflows run the same gate bundle
-(`cargo xtask check`, where `check` already runs the host-side
-`cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier, plus loom,
-`smoke-test --timeout 300`, and `regression --timeout 90`). Nightly stress
-(`stress --test ssh-overlap --iterations 50`) is sustaining
-evidence, not a merge gate.
+**CI alignment:** PR and main-branch workflows run the same gate bundle:
+`cargo xtask check` (which already runs the host-side
+`cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier),
+`RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target
+x86_64-unknown-linux-gnu --test allocator_loom`,
+`cargo xtask smoke-test --timeout 300`, and
+`cargo xtask regression --timeout 90`. Nightly stress
+(`cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90`) is
+sustaining evidence, not a merge gate.
 
 ### Post-53a closure evidence
 

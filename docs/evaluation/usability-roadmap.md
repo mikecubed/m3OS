@@ -118,7 +118,7 @@ Stage 1 readiness is proven by the gate bundle in
 | Tier | Gate | Command or procedure |
 |---|---|---|
 | Automated | Static analysis | `cargo xtask check` |
-| Automated | Unit + property tests | `cargo test -p kernel-core` |
+| Automated | Unit + property tests | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` |
 | Automated | Loom concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` |
 | Automated | Boot smoke test | `cargo xtask smoke-test --timeout 300` |
 | Automated | Regression suite | `cargo xtask regression --timeout 90` |

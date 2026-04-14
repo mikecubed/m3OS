@@ -62,7 +62,7 @@ Phase 53 publishes exact commands instead of vague references to "smoke" or
 | Tier | Command | Why it is in the bundle |
 |---|---|---|
 | Static analysis | `cargo xtask check` | Keeps formatting, clippy, and host-test drift out of the baseline |
-| Host logic tests | `cargo test -p kernel-core` | Verifies pure logic outside QEMU |
+| Host logic tests | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` | Verifies pure logic outside QEMU |
 | Concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Proves allocator-sensitive ordering on the host |
 | Boot smoke | `cargo xtask smoke-test --timeout 300` | Exercises boot/login, service list, storage, logs, and TCC compile |
 | Regression suite | `cargo xtask regression --timeout 90` | Covers SMP-sensitive paths plus the headless operator regressions |

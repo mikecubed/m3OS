@@ -157,7 +157,7 @@ sensitive Phase 53a baseline.
 
 | Surface | Current posture | Why it matters |
 |---|---|---|
-| Automated gates | `cargo xtask check`, `cargo test -p kernel-core`, loom, `cargo xtask smoke-test --timeout 300`, and `cargo xtask regression --timeout 90` are the published bundle | The headless/reference claim now maps to exact commands |
+| Automated gates | `cargo xtask check`, `cargo test -p kernel-core --target x86_64-unknown-linux-gnu`, `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom`, `cargo xtask smoke-test --timeout 300`, and `cargo xtask regression --timeout 90` are the published bundle | The headless/reference claim now maps to exact commands |
 | Sustaining evidence | Nightly `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is published as ongoing evidence, not a per-PR merge gate | Stress stays valuable without silently expanding the merge contract |
 | Manual release checks | Service lifecycle, storage round-trip, log pipeline, SSH login, shutdown/reboot, failure recovery, and `su`/`passwd` remain release-candidate checks | Some operator flows are still best validated interactively |
 | Remaining gap | Phase 53 is not complete until the full bundle passes on an image that includes Phase 53a and the manual checklist is satisfied | The 53/53a closure contract prevents premature "complete" claims |
