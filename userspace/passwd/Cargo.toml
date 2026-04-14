@@ -3,9 +3,26 @@ name = "passwd"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["guest-bin"]
+guest-bin = []
+host-tests = []
+
+[lib]
+name = "passwd"
+path = "src/lib.rs"
+test = false
+
 [[bin]]
 name = "passwd"
 path = "src/main.rs"
+required-features = ["guest-bin"]
+test = false
+
+[[test]]
+name = "passwd_host"
+path = "host-tests/passwd_host.rs"
+required-features = ["host-tests"]
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib" }

@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 syscall-lib = { path = "../syscall-lib" }
+passwd = { path = "../passwd", default-features = false }

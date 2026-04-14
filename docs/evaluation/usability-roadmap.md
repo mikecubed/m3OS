@@ -4,7 +4,7 @@ This document separates four different claims that are often blurred together:
 
 1. **interesting OS project**
 2. **usable QEMU development environment**
-3. **safer headless/server-ish system**
+3. **bounded headless/reference system**
 4. **usable local desktop system**
 
 m3OS already satisfies the first two in a meaningful way. The work ahead is about making the latter two explicit and staged.
@@ -17,7 +17,7 @@ Phase 47 changes the Stage 2 starting point more modestly but still materially: 
 
 ```mermaid
 flowchart TD
-    S0["Stage 0<br/>Current QEMU-first system"] --> S1["Stage 1<br/>Safer headless/server-ish state"]
+    S0["Stage 0<br/>Current QEMU-first system"] --> S1["Stage 1<br/>Bounded headless/reference system"]
     S1 --> S2["Stage 2<br/>Local interactive desktop substrate"]
     S2 --> S3["Stage 3<br/>Broader developer platform"]
 
@@ -52,13 +52,13 @@ The detailed version of that path is in [microkernel-path.md](./microkernel-path
 
 ### Reasonable current claim
 
-**m3OS is a strong, smoke-tested, QEMU-first operating system suitable for OS development, demos, and serious subsystem work.**
+**m3OS is a strong, QEMU-first operating system with a published headless/reference target and enough shipped subsystems to evaluate it seriously.**
 
 Evidence for that claim:
 
 - the build/test workflow is mature and explicit in `README.md`, `CLAUDE.md`, and `xtask/src/main.rs`
 - the feature surface already includes login, shell, editor, coreutils, networking, SSH, PTYs, ext2, Unix sockets, threads, futexes, and ports (`docs/roadmap/README.md`, `userspace/`)
-- the evaluation-session `cargo xtask smoke-test` passed end-to-end
+- Phase 53 now publishes the supported workflow, gate bundle, and support boundary for the bounded headless/reference claim
 
 ### Limits of the current claim
 
@@ -66,19 +66,90 @@ Evidence for that claim:
 - it is not yet comfortable enough to call a server distribution
 - it is not yet graphical enough to call a desktop system
 
-## Stage 1: safer headless / server-ish state
+## Stage 1: bounded headless/reference system
 
 ### Must-have outcomes
 
 | Work item | Why it matters | Evidence |
 |---|---|---|
-| Fix the P0 security issues | Without this, remote access and user isolation are not trustworthy | [security-review.md](./security-review.md) |
+| Keep the Phase 48 security floor validated in the normal operator path | The headless claim only works if login, `su`, and `passwd` continue to exercise the repaired credential model | [security-review.md](./security-review.md), `docs/roadmap/48-security-foundation.md`, `docs/roadmap/53-headless-hardening.md` |
 | Harden and validate the shipped service supervision, logging, shutdown/reboot layer | Real systems need PID 1 to manage daemons, logs, and lifecycle; Phase 51 matures the Phase 46 baseline with restart backoff, crash classification, per-service shutdown timeouts, init-to-syslog routing, and admin hardening | `docs/roadmap/46-system-services.md`, `docs/roadmap/51-service-model-maturity.md`, `userspace/init/src/main.rs`, `userspace/syslogd/src/main.rs`, `userspace/crond/src/main.rs` |
 | Stabilize the shipped Rust std path | This is the easiest path to writing more serious userspace in Rust, and it is already part of the base | `docs/roadmap/44-rust-cross-compilation.md` |
-| Improve packaging/ports reliability | Tooling that silently skips sources or drifts is not a stable user story, even when the ports system already exists | `docs/45-ports-system.md`, validation-session zlib fetch issue |
+| Improve packaging/ports reliability | The supported story needs a predictable in-repo ports baseline plus explicit host prerequisites for the cached extras and Rust std demos | `docs/45-ports-system.md`, `docs/44-rust-cross-compilation.md`, `docs/53-headless-hardening.md` |
 | Make the remote/outbound support boundary explicit | A defensible 1.0 can stay headless/reference-focused, but it cannot be vague about what outbound workflows are in or out | `docs/16-network.md`, `docs/roadmap/53-headless-hardening.md`, `docs/roadmap/58-release-1-0-gate.md` |
 
-Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly security and maturity gaps in shipped systems, not the absence of the service layer itself.
+Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly
+evidence and maturity gaps in shipped systems, not the absence of the service
+layer itself.
+
+### Supported headless/reference workflow (Stage 1 definition)
+
+Stage 1 is anchored by the single normal operator path documented in
+[Phase 53 § Supported Headless/Reference Workflow](../roadmap/53-headless-hardening.md#supported-headlessreference-workflow).
+That path covers:
+
+1. **Boot and login** — unattended boot to `login:` prompt, login with
+   pre-seeded password (Phase 48 security floor: kernel-enforced identity
+   transitions, `getrandom()`-backed salted hashes, shadow-file-based
+   authentication).
+2. **Service inspection and control** — `service list/status/start/stop/restart`
+   via init PID 1 supervision (Phase 46/51 baseline).
+3. **Storage verification** — ext2 root filesystem write/read/delete round-trip.
+4. **Log inspection** — `logger` + `/var/log/messages` via syslogd.
+5. **Package and build basics** — TCC compilation is part of the automated
+   workflow; ports install/remove and Rust std demos remain documented manual
+   validation surfaces.
+6. **Failure recovery** — crash diagnostics, trace rings, `service restart`.
+7. **Clean shutdown and reboot** — `shutdown` / `reboot` with orderly service
+   stop and orphan reaping.
+
+### Remote administration posture
+
+- **SSH** is the default and supported remote-admin path.
+- **Telnet** is available only with an explicit opt-in build flag
+  (`cargo xtask image --enable-telnet`) and is not part of the headless release
+  claim.
+
+### Gate bundle (Stage 1 validation)
+
+Stage 1 readiness is proven by the gate bundle in
+[Phase 53 § Gate Bundle](../roadmap/53-headless-hardening.md#gate-bundle):
+
+| Tier | Gate | Command or procedure |
+|---|---|---|
+| Automated | Static analysis | `cargo xtask check` |
+| Automated | Unit + property tests | `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` |
+| Automated | Loom concurrency tests | `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` |
+| Automated | Boot smoke test | `cargo xtask smoke-test --timeout 300` |
+| Automated | Regression suite | `cargo xtask regression --timeout 90` |
+| Automated | Nightly sustaining evidence | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` |
+| Manual | Service lifecycle, SSH login, storage, logs, shutdown/reboot, failure recovery, `su`/`passwd` | See Phase 53 manual-check table |
+
+Nightly stress matters, but it is published as sustaining evidence rather than a
+per-PR merge gate.
+
+### Support boundary
+
+Stage 1 supports exactly the headless/reference scope listed in
+[Phase 53 § Support Boundary](../roadmap/53-headless-hardening.md#support-boundary).
+The following are **explicitly out of scope** for Stage 1:
+
+- GUI / display compositor / graphical session
+- Broad hardware certification (bare-metal, non-QEMU)
+- Large runtime ecosystems (Python, Node.js, JVM)
+- Outbound HTTPS/TLS client tooling, DNS, git, GitHub integration
+- Dynamic linking, package feeds, full POSIX compliance
+
+Stage 1 is deliberately smaller than "server distribution" language might
+suggest. It is a bounded QEMU reference system with a narrow, documented support
+boundary.
+
+### Phase 53 / 53a closure rule
+
+Stage 1 is not satisfied until the gate bundle passes on an image that includes
+the Phase 53a allocator changes. The gates are defined now; the passing evidence
+is produced after Phase 53a lands. This closure rule is shared with Phase 53 and
+Phase 58.
 
 ### Detailed Stage 1 work breakdown
 
@@ -86,7 +157,7 @@ Phase 46 moves Stage 1 meaningfully closer. The missing pieces are now mostly se
 |---|---|---|
 | Security | root boundary actually means something | No amount of service polish matters if any process can become root |
 | Operations | turn the shipped Phase 46 supervisor/logging stack into something safe to rely on unattended | This is the difference between a shell session and a real system |
-| Packaging/tooling | reproducible ports and Rust std path | This is the difference between a demo image and an extensible environment |
+| Packaging/tooling | reproducible ports baseline and explicit Rust std demo path | This is the difference between a demo image and an extensible environment |
 | Networking boundary | decide which outbound/network-client workflows are true 1.0 needs and which belong after the release gate | This keeps 1.0 honest instead of quietly absorbing every remote-tooling wish |
 | Architecture | ring-3-safe IPC and service boundaries | If proper microkernel design remains a real goal, this work cannot stay deferred forever |
 
@@ -98,8 +169,9 @@ Call Stage 1 achieved only when all of these are true:
 2. SSH is the default remote-admin path and telnet is not exposed by default
 3. service restart, shutdown, and reboot are first-class operations
 4. logs survive long enough to diagnose failures and are accessible sanely
-5. Rust std-based guest programs are part of the normal workflow
-6. smoke/regression runs are reliable enough to trust as release gates
+5. the build/tooling floor is explicit: TCC is on the gate path, while ports and Rust std demos are documented manual validation surfaces
+6. the full gate bundle (automated + manual) passes on a post-Phase 53a image
+7. the support boundary is documented and narrow enough to feed Phase 58
 
 ## Stage 2: local desktop substrate
 
@@ -169,6 +241,6 @@ That phase likely forces design choices that can be postponed today:
 
 The key judgment here is simple:
 
-**m3OS does not need a GUI first. It needs to become a safer and better-operated headless system first.**
+**m3OS does not need a GUI first. It needs to become a safer, bounded headless/reference system first.**
 
 If that work is done cleanly, the GUI effort will build on a healthier base instead of papering over missing system fundamentals.

@@ -57,21 +57,30 @@ fn lookup_name(data: &[u8], target_id: u32, id_field: usize) -> Option<&[u8]> {
         if field > 0 {
             fields[field.min(6)] = &line[start..];
         }
-        if field > id_field && parse_u32(fields[id_field]) == target_id {
+        let Some(id) = (field > id_field)
+            .then(|| parse_u32(fields[id_field]))
+            .flatten()
+        else {
+            continue;
+        };
+        if id == target_id {
             return Some(fields[0]);
         }
     }
     None
 }
 
-fn parse_u32(s: &[u8]) -> u32 {
+fn parse_u32(s: &[u8]) -> Option<u32> {
     let mut n: u32 = 0;
+    let mut saw_digit = false;
     for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+        if !b.is_ascii_digit() {
+            return None;
         }
+        saw_digit = true;
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
     }
-    n
+    if saw_digit { Some(n) } else { None }
 }
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {

@@ -32,8 +32,9 @@ pub egid: u32,  // Effective group ID
 
 All process constructors initialize these to 0 (root). On `fork()`,
 the kernel copies all four fields from parent to child after the new
-process entry is created. On `execve()`, credentials are preserved
-(no setuid-bit support).
+process entry is created. On `execve()`, credentials are preserved for
+normal binaries; `/bin/su` is the one temporary privileged helper that
+execs with a root effective identity until generic setuid-on-exec exists.
 
 ### Identity Syscalls
 
@@ -240,15 +241,17 @@ shell exec.
 Rust no_std binary. `su <username>` (defaults to root). Any user can
 run `su`; non-root callers are prompted for the target user's password.
 Root skips the password prompt. Verifies against shadow, then switches
-to the target identity and execs their shell. (The kernel's `setuid`/
-`setgid` syscalls are unconditional until setuid-bit support is added.)
+to the target identity and execs their shell. The kernel currently
+launches `/bin/su` as a temporary privileged helper so it can read
+`/etc/shadow` and perform the authenticated transition before generic
+setuid-on-exec support exists.
 
 ### passwd (`userspace/passwd/`)
 
-Rust no_std binary. Root-only. Reads the current username from
-`/etc/passwd` by UID lookup, prompts for a new password twice,
-hashes with SHA-256, and rewrites `/etc/shadow` with the updated
-entry.
+Rust no_std binary. Root-only. Defaults to the current username via
+`/etc/passwd` UID lookup, but root may also run `passwd <username>` to
+update another account. It prompts for a new password twice, hashes
+with SHA-256, and rewrites `/etc/shadow` with the updated entry.
 
 ### adduser (`userspace/adduser/`)
 
@@ -283,9 +286,11 @@ C libc stubs were added to the coreutils libc for `getuid`, `getgid`,
 
 ## Known Limitations
 
-- **No setuid-bit on executables** — setuid-on-exec is deferred.
-  Phase 48 added kernel enforcement for `setuid`/`setgid` syscalls
-  (root-only escalation), replacing the previous unconditional behavior.
+- **No generic setuid-bit on executables** — setuid-on-exec is still
+  deferred. `/bin/su` is the current narrow exception so password-based
+  user switching can authenticate against `/etc/shadow`. Phase 48 added
+  kernel enforcement for `setuid`/`setgid` syscalls (root-only
+  escalation), replacing the previous unconditional behavior.
 - **No sticky bit enforcement** — `/tmp` is mode `0o1777` but
   `check_permission` does not prevent users from deleting each other's
   files in sticky directories.

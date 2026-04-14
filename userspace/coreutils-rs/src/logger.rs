@@ -124,7 +124,10 @@ fn main(args: &[&str]) -> i32 {
     syscall_lib::close(fd as i32);
 
     if ret < 0 {
-        write_str(STDERR_FILENO, "logger: failed to send to /dev/log\n");
+        write_str(
+            STDERR_FILENO,
+            "logger: failed to send to /dev/log (is syslogd running?)\n",
+        );
         return 1;
     }
 

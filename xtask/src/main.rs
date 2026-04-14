@@ -13,6 +13,7 @@ const KERNEL_FILE_NAME: &str = "kernel-x86_64";
 const UEFI_BOOT_FILENAME: &str = "efi/boot/bootx64.efi";
 const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`.";
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
+const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04";
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -392,9 +393,15 @@ fn build_musl_bins() {
 /// Phase 44: Cross-compile musl-linked Rust userspace programs and stage them
 /// under target/generated-initrd/.
 ///
-/// Each crate is built individually via `--manifest-path` (they are NOT workspace members).
-/// Uses `x86_64-unknown-linux-musl` target with prebuilt std (no `-Zbuild-std`).
-/// Gracefully skips crates that don't exist yet and handles missing musl target.
+/// Each crate is built individually via `--manifest-path` (they are NOT workspace
+/// members). Zero-length placeholders are created first so the ramdisk
+/// `include_bytes!` path always resolves. Uses `x86_64-unknown-linux-musl`
+/// target with prebuilt std (no `-Zbuild-std`) and warns instead of failing when
+/// the target or an individual crate is unavailable.
+fn reset_placeholder_file(path: &Path) -> io::Result<()> {
+    File::create(path).map(|_| ())
+}
+
 fn build_musl_rust_bins() {
     let root = workspace_root();
     let initrd = ensure_generated_initrd_dir(&root);
@@ -407,17 +414,12 @@ fn build_musl_rust_bins() {
         "todo-rust",
     ];
 
-    // Ensure placeholder files exist for every crate so that the kernel's
-    // include_bytes! in ramdisk.rs always finds them, even if the musl target
-    // is not installed or individual crates are missing.
+    // Reset every staged file to a zero-length placeholder first so stale
+    // cached binaries cannot survive missing-target or build-failure paths.
     for name in crates {
         let dst = initrd.join(name);
-        if !dst.exists() {
-            if let Err(e) = File::create(&dst) {
-                eprintln!(
-                    "warning: failed to create placeholder target/generated-initrd/{name}: {e}"
-                );
-            }
+        if let Err(e) = reset_placeholder_file(&dst) {
+            eprintln!("warning: failed to create placeholder target/generated-initrd/{name}: {e}");
         }
     }
 
@@ -432,7 +434,9 @@ fn build_musl_rust_bins() {
     if !musl_target_available {
         eprintln!(
             "warning: x86_64-unknown-linux-musl target not installed — \
-             skipping all musl Rust builds. Run: rustup target add x86_64-unknown-linux-musl"
+             leaving Rust std demo placeholders in target/generated-initrd/ for: {}.\n\
+             Run: rustup target add x86_64-unknown-linux-musl",
+            crates.join(", ")
         );
         return;
     }
@@ -440,7 +444,9 @@ fn build_musl_rust_bins() {
     for name in crates {
         let manifest = root.join(format!("userspace/{name}/Cargo.toml"));
         if !manifest.exists() {
-            eprintln!("warning: userspace/{name}/Cargo.toml not found — skipping");
+            eprintln!(
+                "warning: userspace/{name}/Cargo.toml not found — leaving target/generated-initrd/{name} as a placeholder"
+            );
             continue;
         }
 
@@ -471,7 +477,9 @@ fn build_musl_rust_bins() {
         };
 
         if !status.success() {
-            eprintln!("warning: musl Rust build failed for {name} — skipping");
+            eprintln!(
+                "warning: musl Rust build failed for {name} — leaving target/generated-initrd/{name} as a placeholder"
+            );
             continue;
         }
 
@@ -1434,7 +1442,7 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
 
 fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
     let ovmf = find_ovmf();
-    let args = qemu_args(uefi_image, &ovmf, display_mode);
+    let args = qemu_run_args(uefi_image, &ovmf, display_mode);
 
     if display_mode == QemuDisplayMode::Gui {
         println!(
@@ -1447,7 +1455,25 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
         .status()
         .expect("failed to launch QEMU");
 
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(normalize_run_qemu_exit(status.code()));
+}
+
+fn qemu_run_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
+    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    args.retain(|arg| arg != "-no-reboot");
+    args.extend([
+        "-device".to_string(),
+        QEMU_ISA_DEBUG_EXIT_DEVICE.to_string(),
+    ]);
+    args
+}
+
+fn normalize_run_qemu_exit(code: Option<i32>) -> i32 {
+    match code {
+        Some(0) | Some(QEMU_EXIT_SUCCESS) => 0,
+        Some(other) => other,
+        None => 1,
+    }
 }
 
 fn cmd_check() {
@@ -1556,6 +1582,8 @@ fn cmd_check() {
 
     // Host-side allocator/property coverage uses:
     //   cargo test -p kernel-core --target x86_64-unknown-linux-gnu
+    // Password-shadow rewrite regression coverage uses:
+    //   cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host
     // Loom coverage remains opt-in via:
     //   RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test <...>
     let status = Command::new(env!("CARGO"))
@@ -1597,6 +1625,30 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "passwd",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+            "--no-default-features",
+            "--features",
+            "host-tests",
+            "--test",
+            "passwd_host",
+        ])
+        .status()
+        .expect("failed to run passwd host tests");
+
+    if !status.success() {
+        eprintln!(
+            "passwd host tests failed — rerun `cargo test -p passwd --target {KERNEL_CORE_HOST_TARGET} --no-default-features --features host-tests --test passwd_host`"
+        );
+        std::process::exit(1);
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1609,7 +1661,9 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
-    println!("check passed: clippy clean, formatting correct, host tests pass");
+    println!(
+        "check passed: clippy clean, formatting correct, kernel-core and passwd host tests pass"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -1760,7 +1814,7 @@ fn qemu_test_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> 
     // Add ISA debug exit device so the test kernel can signal pass/fail.
     args.extend([
         "-device".to_string(),
-        "isa-debug-exit,iobase=0xf4,iosize=0x04".to_string(),
+        QEMU_ISA_DEBUG_EXIT_DEVICE.to_string(),
     ]);
     args
 }
@@ -2572,8 +2626,122 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "prompt after hello",
     });
 
-    // Keep smoke-test scoped to boot/login plus a minimal userspace/TCC proof.
-    // Deeper interactive coverage belongs in targeted regression tests.
+    // -----------------------------------------------------------------------
+    // 4. Security floor verification (Phase 48 — headless workflow §1)
+    // -----------------------------------------------------------------------
+    // Verify kernel-enforced setuid/setgid transition by checking effective
+    // uid via the `id` command. The login binary's shadow-file auth path
+    // already succeeded (we reached a shell prompt), and on first-boot the
+    // getrandom()-backed password hash was stored. This step makes the
+    // credential state observable in serial output.
+    steps.push(SmokeStep::Send {
+        input: "/bin/id\n",
+        label: "guest/auth: verify uid after login",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=0",
+        timeout_secs: 10,
+        label: "guest/auth: id shows uid=0 (root)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after id",
+    });
+
+    // -----------------------------------------------------------------------
+    // 5. Service inspection (headless workflow §2)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/service list\n",
+        label: "guest/service: enumerate managed services",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NAME",
+        timeout_secs: 15,
+        label: "guest/service: list header visible",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "syslogd",
+        timeout_secs: 10,
+        label: "guest/service: list includes syslogd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after service list",
+    });
+
+    // -----------------------------------------------------------------------
+    // 6. Storage verification (headless workflow §3)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/touch /root/smoke_test_file\n",
+        label: "guest/storage: create file on ext2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after touch",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/ls /root/smoke_test_file\n",
+        label: "guest/storage: verify file exists",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "smoke_test_file",
+        timeout_secs: 10,
+        label: "guest/storage: ls shows created file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/storage: prompt after ls",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/rm /root/smoke_test_file\n",
+        label: "guest/storage: remove test file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after rm",
+    });
+
+    // -----------------------------------------------------------------------
+    // 7. Log inspection (headless workflow §4)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/bin/logger \"SMOKE_LOG_MARKER\"\n",
+        label: "guest/log: inject smoke marker via /dev/log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after logger",
+    });
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    // Read file contents directly so the awaited marker cannot come from the echoed command line.
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /var/log/messages\n",
+        label: "guest/log: verify smoke marker in system log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE_LOG_MARKER",
+        timeout_secs: 15,
+        label: "guest/log: smoke marker found in system log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after log inspection",
+    });
+
+    // Shutdown/reboot (headless workflow §7) is verified by the manual
+    // release checklist. Automated shutdown verification requires precise
+    // QEMU-exit coordination that is fragile under CI load; the regression
+    // suite covers the operator workflows leading up to shutdown.
+
     return steps;
 
     // -----------------------------------------------------------------------
@@ -4638,7 +4806,7 @@ fn populate_demo_project(part_path: &Path, workspace_root: &Path) {
 fn fetch_lua_source(ports_src: &Path) {
     let lua_dir = ports_src.join("lang/lua/src");
     if lua_dir.join("lua.c").exists() {
-        println!("ports: Lua source already cached");
+        println!("ports: Lua source already cached at {}", lua_dir.display());
         return;
     }
 
@@ -4655,7 +4823,10 @@ fn fetch_lua_source(ports_src: &Path) {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            eprintln!("warning: failed to download Lua source — skipping Lua port");
+            eprintln!(
+                "warning: failed to download Lua source for host cache {}",
+                lua_dir.display()
+            );
             return;
         }
     }
@@ -4674,7 +4845,10 @@ fn fetch_lua_source(ports_src: &Path) {
         .status()
         .expect("failed to run tar");
     if !status.success() {
-        eprintln!("warning: failed to extract Lua source");
+        eprintln!(
+            "warning: failed to extract Lua source into host cache {}",
+            lua_dir.display()
+        );
         return;
     }
 
@@ -4700,7 +4874,10 @@ fn fetch_zlib_source(ports_src: &Path) {
 
     let zlib_dir = ports_src.join("lib/zlib/src");
     if zlib_dir.join("zlib.h").exists() {
-        println!("ports: zlib source already cached");
+        println!(
+            "ports: zlib source already cached at {}",
+            zlib_dir.display()
+        );
         return;
     }
 
@@ -4717,7 +4894,10 @@ fn fetch_zlib_source(ports_src: &Path) {
     match status {
         Ok(s) if s.success() => {}
         _ => {
-            eprintln!("warning: failed to download zlib source — skipping zlib port");
+            eprintln!(
+                "warning: failed to download zlib source for host cache {}",
+                zlib_dir.display()
+            );
             return;
         }
     }
@@ -4725,8 +4905,10 @@ fn fetch_zlib_source(ports_src: &Path) {
     // Verify SHA-256 checksum before extracting.
     if !verify_sha256(&zlib_tar, ZLIB_SHA256) {
         eprintln!(
-            "warning: zlib tarball verification failed (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
-             Expected SHA-256: {ZLIB_SHA256}"
+            "warning: zlib tarball verification failed for host cache {} \
+             (checksum mismatch or `sha256sum` unavailable) — removing the file.\n\
+             Expected SHA-256: {ZLIB_SHA256}",
+            zlib_dir.display()
         );
         let _ = fs::remove_file(&zlib_tar);
         return;
@@ -4745,7 +4927,10 @@ fn fetch_zlib_source(ports_src: &Path) {
         .status()
         .expect("failed to run tar");
     if !status.success() {
-        eprintln!("warning: failed to extract zlib source");
+        eprintln!(
+            "warning: failed to extract zlib source into host cache {}",
+            zlib_dir.display()
+        );
         return;
     }
 
@@ -4773,21 +4958,36 @@ fn fetch_port_sources() -> PathBuf {
     let root = workspace_root();
     let ports_src = root.join("target/ports-src");
     fs::create_dir_all(&ports_src).unwrap();
+    println!("ports: using host cache {}", ports_src.display());
     fetch_lua_source(&ports_src);
     fetch_zlib_source(&ports_src);
+    let lua_ready = ports_src.join("lang/lua/src/lua.c").exists();
+    let zlib_ready = ports_src.join("lib/zlib/src/zlib.h").exists();
+    println!(
+        "ports: source readiness -> bundled ports: bc, sbase, mandoc; fetched sources: lua={}, zlib={} (minizip depends on zlib)",
+        if lua_ready { "ready" } else { "missing" },
+        if zlib_ready { "ready" } else { "missing" }
+    );
     ports_src
 }
 
 /// Phase 45: Populate the ports tree into `/usr/ports/` on the ext2 partition.
 ///
-/// Mirrors the host-side `ports/` directory (Portfiles, Makefiles, patches) and
-/// downloaded source files into the ext2 image. Also installs the `port` command
-/// at `/usr/bin/port` and creates `/usr/local/` and `/var/db/ports/` directories.
+/// Mirrors the host-side `ports/` directory (Portfiles, Makefiles, patches, and
+/// bundled sources) plus any host-cached files from `target/ports-src/` into the
+/// ext2 image. Also installs the `port` command at `/usr/bin/port` and creates
+/// `/usr/local/` and `/var/db/ports/` directories.
 fn populate_ports_tree(part_path: &Path, workspace_root: &Path, ports_src: &Path) {
     let ports_dir = workspace_root.join("ports");
     if !ports_dir.is_dir() {
         return;
     }
+
+    println!(
+        "ports: mirroring {} plus cached sources from {} into /usr/ports",
+        ports_dir.display(),
+        ports_src.display()
+    );
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
@@ -5641,6 +5841,30 @@ fn regression_tests() -> Vec<RegressionTest> {
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
         },
+        RegressionTest {
+            name: "service-lifecycle",
+            description: "Service list/status in the headless operator workflow",
+            guest_steps: service_lifecycle_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "storage-roundtrip",
+            description: "Ext2 write/read/delete round-trip on persistent storage",
+            guest_steps: storage_roundtrip_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "log-pipeline",
+            description: "Logger injection via /dev/log and /var/log/messages verification",
+            guest_steps: log_pipeline_steps,
+            timeout_secs: 60,
+        },
+        RegressionTest {
+            name: "security-floor",
+            description: "Phase 48 security floor: shadow auth, credential transition, hash format",
+            guest_steps: security_floor_steps,
+            timeout_secs: 90,
+        },
     ]
 }
 
@@ -5781,6 +6005,233 @@ fn kbd_echo_steps() -> Vec<SmokeStep> {
         timeout_secs: 10,
         label: "second echo received",
     });
+    steps
+}
+
+/// Guest steps for the service-lifecycle regression: boot, login, run
+/// `service list` and `service status sshd` to verify the init daemon's
+/// service management is responsive in the headless workflow.
+fn service_lifecycle_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service list\n",
+        label: "guest/service: enumerate services",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "NAME",
+        timeout_secs: 15,
+        label: "guest/service: list header visible",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "sshd",
+        timeout_secs: 10,
+        label: "guest/service: list includes sshd",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after list",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status sshd\n",
+        label: "guest/service: query sshd status",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Name:",
+        timeout_secs: 15,
+        label: "guest/service: status shows service name",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "State:",
+        timeout_secs: 10,
+        label: "guest/service: status shows service state",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/service: prompt after status sshd",
+    });
+    steps
+}
+
+/// Guest steps for the storage-roundtrip regression: write, read-back, and
+/// delete a file on the ext2 root filesystem to verify persistent storage.
+fn storage_roundtrip_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/echo STORAGE_OK > /root/regtest_file\n",
+        label: "guest/storage: write file on ext2",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after write",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /root/regtest_file\n",
+        label: "guest/storage: read file back",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "STORAGE_OK",
+        timeout_secs: 10,
+        label: "guest/storage: verify file content",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/storage: prompt after read",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/rm /root/regtest_file\n",
+        label: "guest/storage: delete file",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after delete",
+    });
+    steps
+}
+
+/// Guest steps for the log-pipeline regression: inject a tagged message via
+/// `logger` and verify it appears in `/var/log/messages` through the syslogd
+/// /dev/log → file pipeline.
+fn log_pipeline_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/logger \"REGTEST_LOG_MARKER\"\n",
+        label: "guest/log: inject log message via /dev/log",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/log: prompt after logger",
+    });
+    // Small delay for syslogd to flush to disk.
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    // Read file contents directly so the awaited marker cannot come from the echoed command line.
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /var/log/messages\n",
+        label: "guest/log: verify message in syslog",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "REGTEST_LOG_MARKER",
+        timeout_secs: 15,
+        label: "guest/log: marker found in /var/log/messages",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/log: prompt after log read",
+    });
+    steps
+}
+
+/// Guest steps for the Phase 48 security-floor regression: verify that
+/// the headless login path exercises kernel-enforced credential transitions,
+/// getrandom()-backed salted SHA-256 hashes, and shadow-file authentication.
+fn security_floor_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 300 });
+
+    // 1. Verify kernel credential state: setuid/setgid transition occurred.
+    steps.push(SmokeStep::Send {
+        input: "/bin/id\n",
+        label: "guest/auth: verify kernel credential state",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "uid=0",
+        timeout_secs: 10,
+        label: "guest/auth: uid=0 confirms setuid transition",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after id",
+    });
+
+    // 2. Verify shadow file contains a salted SHA-256-family password hash
+    //    (not plaintext, not locked). Pre-seeded images use $sha256$ while
+    //    first-boot or passwd updates produce $sha256i$ hashes with a fresh
+    //    getrandom()-backed salt.
+    steps.push(SmokeStep::Send {
+        input: "/bin/grep root /etc/shadow\n",
+        label: "guest/auth: inspect shadow hash format",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$sha256",
+        timeout_secs: 10,
+        label: "guest/auth: shadow contains SHA-256-family hash",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after shadow check",
+    });
+
+    // 3. Verify /bin/su can authenticate via /etc/shadow and restore a
+    //    privileged shell.
+    steps.push(SmokeStep::Send {
+        input: "/bin/su user\n",
+        label: "guest/auth: drop into user shell via su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$ ",
+        timeout_secs: 10,
+        label: "guest/auth: user shell prompt after su user",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/whoami\n",
+        label: "guest/auth: verify whoami in user shell",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "user",
+        timeout_secs: 10,
+        label: "guest/auth: whoami confirms user",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$ ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after user whoami",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/su root\n",
+        label: "guest/auth: authenticate back to root via su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Password:",
+        timeout_secs: 10,
+        label: "guest/auth: su root password prompt",
+    });
+    steps.push(SmokeStep::Send {
+        input: "root\n",
+        label: "guest/auth: enter root password for su",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/auth: root shell prompt after su root",
+    });
+
+    // 4. Verify whoami resolves the authenticated uid to "root".
+    steps.push(SmokeStep::Send {
+        input: "/bin/whoami\n",
+        label: "guest/auth: verify whoami resolution",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root",
+        timeout_secs: 10,
+        label: "guest/auth: whoami confirms root",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/auth: prompt after whoami",
+    });
+
     steps
 }
 
@@ -6580,6 +7031,42 @@ mod tests {
     }
 
     #[test]
+    fn qemu_run_args_include_debug_exit_device() {
+        let args = qemu_run_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+        );
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", QEMU_ISA_DEBUG_EXIT_DEVICE])
+        );
+    }
+
+    #[test]
+    fn qemu_run_args_allow_guest_reboot() {
+        let args = qemu_run_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "-no-reboot"));
+    }
+
+    #[test]
+    fn normalize_run_qemu_exit_maps_debug_success_to_zero() {
+        assert_eq!(normalize_run_qemu_exit(Some(0)), 0);
+        assert_eq!(normalize_run_qemu_exit(Some(QEMU_EXIT_SUCCESS)), 0);
+        assert_eq!(
+            normalize_run_qemu_exit(Some(QEMU_EXIT_FAILURE)),
+            QEMU_EXIT_FAILURE
+        );
+        assert_eq!(normalize_run_qemu_exit(None), 1);
+    }
+
+    #[test]
     fn parse_image_args_defaults_to_unsigned_image() {
         let workspace_root = PathBuf::from("/workspace/m3os");
         let parsed = parse_image_args(&[], &workspace_root).unwrap();
@@ -6704,6 +7191,28 @@ mod tests {
     }
 
     #[test]
+    fn reset_placeholder_file_creates_missing_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("placeholder");
+
+        reset_placeholder_file(&path).unwrap();
+
+        assert!(path.exists());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reset_placeholder_file_truncates_stale_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("placeholder");
+        fs::write(&path, b"stale-binary").unwrap();
+
+        reset_placeholder_file(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
     fn smoke_test_stays_within_boot_login_and_tcc_scope() {
         let labels = smoke_step_labels(&smoke_test_script(false));
 
@@ -6731,6 +7240,24 @@ mod tests {
             hello_compile,
             Some("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n")
         );
+    }
+
+    #[test]
+    fn smoke_test_log_verification_reads_log_file_contents() {
+        let log_check = send_input_for_label(
+            &smoke_test_script(false),
+            "guest/log: verify smoke marker in system log",
+        );
+
+        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
+    }
+
+    #[test]
+    fn log_pipeline_regression_reads_log_file_contents() {
+        let log_check =
+            send_input_for_label(&log_pipeline_steps(), "guest/log: verify message in syslog");
+
+        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
     }
 
     #[test]

@@ -4,38 +4,52 @@
 #![no_std]
 #![no_main]
 
+use passwd::{
+    ShadowRewriteError, build_hash_field, find_username_by_uid, requested_username,
+    rewrite_shadow_file, user_exists,
+};
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, close, exit, fsync, geteuid, getrandom, getuid, open, read, write,
-    write_str,
+    O_RDONLY, STDOUT_FILENO, close, fsync, geteuid, getrandom, getuid, open, read, write, write_str,
 };
 
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 
-#[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+syscall_lib::entry_point!(passwd_main);
+
+fn passwd_main(args: &[&str]) -> i32 {
     let euid = geteuid();
     if euid != 0 {
         write_str(
             STDOUT_FILENO,
             "passwd: must be root (non-root password change not yet supported)\n",
         );
-        exit(1);
+        return 1;
     }
     let uid = getuid();
     let mut passwd_buf = [0u8; 2048];
     let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
         write_str(STDOUT_FILENO, "passwd: cannot read /etc/passwd\n");
-        exit(1);
+        return 1;
     }
 
-    let username = match find_username_by_uid(&passwd_buf[..passwd_len], uid) {
+    let current_username = match find_username_by_uid(&passwd_buf[..passwd_len], uid) {
         Some(u) => u,
         None => {
             write_str(STDOUT_FILENO, "passwd: cannot find current user\n");
-            exit(1);
+            return 1;
         }
+    };
+    let username = match requested_username(args) {
+        Some(target) => {
+            if !user_exists(&passwd_buf[..passwd_len], target) {
+                write_str(STDOUT_FILENO, "passwd: unknown user\n");
+                return 1;
+            }
+            target
+        }
+        None => current_username,
     };
 
     write_str(STDOUT_FILENO, "Changing password for ");
@@ -59,64 +73,74 @@ pub extern "C" fn _start() -> ! {
 
     if new_len != confirm_len || new_input[..new_len] != confirm[..confirm_len] {
         write_str(STDOUT_FILENO, "passwd: passwords don't match\n");
-        exit(1);
+        return 1;
     }
 
     // Generate new hash with random salt and iterated SHA-256.
     let mut salt = [0u8; 16];
     if getrandom(&mut salt) != 16 {
         write_str(STDOUT_FILENO, "passwd: failed to generate random salt\n");
-        exit(1);
+        return 1;
     }
     let hash = syscall_lib::sha256::hash_password_iterated(&new_input[..new_len], &salt, 10000);
     let mut salt_hex = [0u8; 64];
     let salt_hex_len = syscall_lib::sha256::to_hex(&salt, &mut salt_hex);
     let mut hash_hex = [0u8; 64];
     let hash_hex_len = syscall_lib::sha256::to_hex(&hash, &mut hash_hex);
+    let mut hash_field = [0u8; 128];
+    let hash_field_len = match build_hash_field(
+        &salt_hex[..salt_hex_len],
+        &hash_hex[..hash_hex_len],
+        &mut hash_field,
+    ) {
+        Some(len) => len,
+        None => {
+            write_str(STDOUT_FILENO, "passwd: updated hash is too large\n");
+            return 1;
+        }
+    };
 
     // Read current shadow file, replace the user's entry, and write it back.
     let mut shadow_buf = [0u8; 2048];
     let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
         write_str(STDOUT_FILENO, "passwd: cannot read shadow file\n");
-        exit(1);
+        return 1;
     }
 
     // Build new shadow file content.
     let mut new_shadow = [0u8; 2048];
-    let mut out_pos = 0;
-
-    for line in shadow_buf[..shadow_len].split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+    let out_pos = match rewrite_shadow_file(
+        &shadow_buf[..shadow_len],
+        username,
+        &hash_field[..hash_field_len],
+        &mut new_shadow,
+    ) {
+        Ok(len) => len,
+        Err(ShadowRewriteError::UserNotFound) => {
+            write_str(STDOUT_FILENO, "passwd: user is missing from /etc/shadow\n");
+            return 1;
         }
-        if let Some(colon) = line.iter().position(|&b| b == b':')
-            && &line[..colon] == username
-        {
-            // Replace this line with new hash.
-            out_pos += copy_to(&mut new_shadow[out_pos..], username);
-            out_pos += copy_to(&mut new_shadow[out_pos..], b":$sha256i$10000$");
-            out_pos += copy_to(&mut new_shadow[out_pos..], &salt_hex[..salt_hex_len]);
-            out_pos += copy_to(&mut new_shadow[out_pos..], b"$");
-            out_pos += copy_to(&mut new_shadow[out_pos..], &hash_hex[..hash_hex_len]);
-            out_pos += copy_to(&mut new_shadow[out_pos..], b"::::::\n");
-            continue;
+        Err(ShadowRewriteError::OutputTooLarge) => {
+            write_str(
+                STDOUT_FILENO,
+                "passwd: shadow file update exceeded buffer\n",
+            );
+            return 1;
         }
-        out_pos += copy_to(&mut new_shadow[out_pos..], line);
-        out_pos += copy_to(&mut new_shadow[out_pos..], b"\n");
-    }
+    };
 
     // Write new shadow file.
     let fd = open(SHADOW_PATH, syscall_lib::O_WRONLY | syscall_lib::O_TRUNC, 0);
     if fd < 0 {
         write_str(STDOUT_FILENO, "passwd: cannot write shadow file\n");
-        exit(1);
+        return 1;
     }
     let written = write(fd as i32, &new_shadow[..out_pos]);
     if written < 0 || written as usize != out_pos {
         write_str(STDOUT_FILENO, "passwd: failed to fully write shadow file\n");
         close(fd as i32);
-        exit(1);
+        return 1;
     }
     if fsync(fd as i32) < 0 {
         write_str(
@@ -127,49 +151,11 @@ pub extern "C" fn _start() -> ! {
     close(fd as i32);
 
     write_str(STDOUT_FILENO, "passwd: password updated successfully\n");
-    exit(0);
-}
-
-fn copy_to(dst: &mut [u8], src: &[u8]) -> usize {
-    let n = src.len().min(dst.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    n
-}
-
-fn find_username_by_uid(passwd: &[u8], target_uid: u32) -> Option<&[u8]> {
-    for line in passwd.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = [&[] as &[u8]; 7];
-        let mut start = 0;
-        let mut field = 0;
-        for (i, &b) in line.iter().enumerate() {
-            if b == b':' && field < 7 {
-                fields[field] = &line[start..i];
-                field += 1;
-                start = i + 1;
-            }
-        }
-        if field == 6 {
-            fields[6] = &line[start..];
-            let uid = parse_u32(fields[2]);
-            if uid == target_uid {
-                return Some(fields[0]);
-            }
-        }
-    }
-    None
-}
-
-fn parse_u32(s: &[u8]) -> u32 {
-    let mut n: u32 = 0;
-    for &b in s {
-        if b.is_ascii_digit() {
-            n = n.wrapping_mul(10).wrapping_add((b - b'0') as u32);
-        }
-    }
-    n
+    write_str(
+        STDOUT_FILENO,
+        "[security] getrandom salt + iterated SHA-256 hash written\n",
+    );
+    0
 }
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
@@ -228,5 +214,5 @@ fn restore_echo(saved: Option<syscall_lib::Termios>) {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     write_str(STDOUT_FILENO, "passwd: PANIC\n");
-    exit(101)
+    syscall_lib::exit(101)
 }

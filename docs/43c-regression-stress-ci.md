@@ -10,8 +10,19 @@
 Phase 43c adds a layered test infrastructure for catching SMP race conditions.
 The system has four tiers: host-side property/concurrency tests (proptest, loom),
 QEMU regression tests for specific SMP-sensitive paths, smoke tests for full-boot
-validation, and looped stress tests for timing-dependent failures. CI runs
-regressions on every PR and stress tests nightly.
+validation, and looped stress tests for timing-dependent failures.
+
+Phase 53 later turns the automated half of this stack into the published
+headless/reference gate bundle: `cargo xtask check` (which already runs the
+host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier
+plus `cargo test -p passwd --target x86_64-unknown-linux-gnu
+--no-default-features --features host-tests --test passwd_host` in CI),
+`RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target
+x86_64-unknown-linux-gnu --test allocator_loom`, `cargo xtask smoke-test
+--timeout 300`, and
+`cargo xtask regression --timeout 90`. Nightly
+`cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` is
+sustaining evidence rather than a per-PR or final-close rerun.
 
 ## What This Doc Covers
 
@@ -20,6 +31,7 @@ regressions on every PR and stress tests nightly.
 - How to reproduce a stress failure using seed replay
 - How the property and concurrency tests work
 - How CI tiers are mapped
+- How this infrastructure feeds the Phase 53 headless/reference gate bundle
 - How to read failure artifacts
 
 ## Core Implementation
@@ -27,19 +39,23 @@ regressions on every PR and stress tests nightly.
 ### Test Tier Architecture
 
 ```
+Static analysis gate:
+  cargo xtask check
+
 Host tests (fast, no QEMU):
-  cargo test -p kernel-core           # 200+ unit + property tests
-  RUSTFLAGS="--cfg loom" cargo test   # loom concurrency tests
+  cargo test -p kernel-core --target x86_64-unknown-linux-gnu
+  cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host
+  RUSTFLAGS="--cfg loom" cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
 
 Regression tests (QEMU, ~30s each):
-  cargo xtask regression              # all registered regressions
-  cargo xtask regression --test fork-overlap
+  cargo xtask regression --timeout 90
+  cargo xtask regression --test fork-overlap --timeout 90
 
 Smoke test (QEMU, full boot validation):
-  cargo xtask smoke-test              # boot + login + compile + coreutils
+  cargo xtask smoke-test --timeout 300
 
-Stress tests (QEMU, repeated iterations):
-  cargo xtask stress --test ssh-overlap --iterations 50
+Stress tests (QEMU, repeated iterations; nightly evidence):
+  cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90
 ```
 
 ### Regression Tests
@@ -53,6 +69,13 @@ kernel panics/faults in serial output as immediate failures.
 | `fork-overlap` | `/bin/fork-test` | Concurrent fork() from multiple parents |
 | `ipc-wake` | `/bin/unix-socket-test` | Overlapping IPC send/recv/reply |
 | `pty-overlap` | `/bin/pty-test` | PTY allocation + shell spawning |
+| `signal-reset` | `/bin/signal-test` | Exec-time signal disposition reset |
+| `exit-group-teardown` | `/bin/thread-test` | exit_group() reaps live spinning sibling |
+| `kbd-echo` | shell echo | Keyboard input via serial→TTY→stdin |
+| `service-lifecycle` | `/bin/service` | Service list/status in headless workflow |
+| `storage-roundtrip` | shell commands | Ext2 write/read/delete round-trip |
+| `log-pipeline` | `/bin/logger`, `/bin/grep` | Logger → syslogd → /var/log/messages |
+| `security-floor` | `/bin/id`, `/bin/su`, `/bin/whoami`, `/bin/grep` | Phase 48 shadow auth, credential transition, hash format |
 
 ### Stress Tests
 
@@ -76,7 +99,7 @@ stress: test=ssh-overlap iterations=50 seed=1712345678 timeout=90s
 To reproduce a failure:
 
 ```
-cargo xtask stress --test ssh-overlap --seed 1712345678 --iterations 1
+cargo xtask stress --test ssh-overlap --seed 1712345678 --iterations 1 --timeout 90
 ```
 
 ### Artifact Capture
@@ -124,9 +147,40 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 
 | Tier | Trigger | Tests | Time |
 |---|---|---|---|
-| PR | Every pull request | `check` + `smoke-test` + `regression` | ~3-4 min |
-| Build | Push to main | Same as PR | ~3-4 min |
-| Nightly | 3 AM UTC daily | `stress --test ssh-overlap --iterations 50` | ~60 min |
+| PR | Every pull request | `cargo xtask check` (includes the host-side `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` tier plus `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host`) + `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` + `cargo xtask smoke-test --timeout 300` + `cargo xtask regression --timeout 90` | ~5-8 min |
+| Build | Push to main | Same as PR | ~5-8 min |
+| Nightly | 3 AM UTC daily | `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | ~60 min |
+
+### Phase 53 Gate Mapping
+
+Phase 43c supplies the automated evidence behind the headless/reference claim,
+but it does not replace the full Phase 53 contract.
+
+| Published Phase 53 gate | How this doc fits |
+|---|---|
+| `cargo xtask check` | Static-analysis gate run on PRs and main-branch builds; also the command that invokes the host-side kernel-core tier plus the `passwd_host` regression in CI |
+| `cargo test -p kernel-core --target x86_64-unknown-linux-gnu` | Direct rerun command for the host-side unit/property tier when debugging locally or collecting release evidence outside `xtask check` |
+| `RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom` | Host-side concurrency tier |
+| `cargo xtask smoke-test --timeout 300` | Full-boot headless workflow smoke tier |
+| `cargo xtask regression --timeout 90` | Registered SMP and operator-workflow regressions |
+| `cargo xtask stress --test ssh-overlap --iterations 50 --timeout 90` | Nightly sustaining evidence, not the per-PR or final-close rerun |
+| Manual service/log/storage/SSH/shutdown checks | Still defined in Phase 53 rather than duplicated here |
+
+### Gate Artifact Locations
+
+Regression and stress artifacts are produced under `target/` and uploaded as CI
+artifacts on failure. Smoke-test evidence currently remains in terminal/CI job
+output. This is the single reference for Phase 53 artifact locations:
+
+| Artifact | Path | When produced |
+|---|---|---|
+| Smoke-test transcript | Terminal / CI job log only | Every smoke-test run |
+| Regression serial logs | `target/regression/<test-name>/serial.log` | Every regression run |
+| Regression trace dumps | `target/regression/<test-name>/trace.log` | On kernel crash |
+| Stress serial logs | `target/stress/<test-name>/<iter>/serial.log` | Every stress iteration |
+| Stress trace dumps | `target/stress/<test-name>/<iter>/trace.log` | On kernel crash |
+| CI regression bundle | `regression-artifacts` (GitHub Actions) | On PR/build failure |
+| CI stress bundle | `stress-artifacts` (GitHub Actions) | On nightly failure |
 
 ## Adding a New Regression Test
 
@@ -165,6 +219,8 @@ IPC model tests in `kernel-core/tests/ipc_loom.rs` (run with `--cfg loom`):
 - [Phase 43c task doc](./roadmap/tasks/43c-regression-stress-ci-tasks.md)
 - [Phase 43a learning doc](./43a-crash-diagnostics.md)
 - [Phase 43b learning doc](./43b-kernel-trace-ring.md)
+- [Phase 53 learning doc](./53-headless-hardening.md)
+- [Phase 53 roadmap doc](./roadmap/53-headless-hardening.md)
 
 ## Known Limitations
 

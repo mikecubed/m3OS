@@ -54,20 +54,30 @@ Align the top-level docs, roadmap, learning-doc index, support notes, and versio
 
 | Check | Required state before closing the phase | If missing, add it to this phase |
 |---|---|---|
-| Headless baseline | Phase 53 and Phase 55 are complete enough for a defensible headless/reference release | Pull missing validation or support-boundary work into this phase |
+| Headless baseline | Phase 53 headless/reference gates (see [Phase 53 § Gate Bundle](./53-headless-hardening.md#gate-bundle)) pass on a post-Phase 53a image, and Phase 55 hardware work is complete | Pull missing validation or support-boundary work into this phase |
 | Optional GUI baseline | If 1.0 is meant to include a local-system milestone, Phase 47 and Phases 56-57 are complete enough to justify it | Otherwise explicitly defer the local-system branch to 1.x |
-| Release-evidence baseline | The project can name the exact tests, targets, and docs that prove the claim | Add the missing release-gate automation or manual checklist items |
+| Release-evidence baseline | The project can name the exact tests, targets, and docs that prove the claim — these are the Phase 53 gate bundle plus any Phase 55 hardware-specific gates | Add the missing release-gate automation or manual checklist items |
 | Versioning baseline | The project agrees that the kernel crate version tracks the roadmap phase number even if the public release language says "1.0" | Add the missing versioning documentation and cross-reference updates |
 
 ## Important Components and How They Work
 
 ### Support matrix and release contract
 
-The support matrix is the central artifact of the phase. It ties together hardware scope, validated workflows, release non-goals, and the public story the project can defend.
+The support matrix is the central artifact of the phase. It starts from the
+bounded [Phase 53 support boundary](./53-headless-hardening.md#support-boundary)
+— QEMU x86_64 with OVMF, SSH-first remote admin, shipped ports and Rust std
+path — and extends it only where Phase 55 hardware work adds new supported
+targets. The matrix ties together hardware scope, validated workflows, release
+non-goals, and the public story the project can defend.
 
 ### Validation gate bundle
 
-The validation gate bundle defines which commands and manual checks are required for the selected release promise. It is the operational proof behind the release contract.
+The validation gate bundle starts from the
+[Phase 53 gate bundle](./53-headless-hardening.md#gate-bundle) (exact `cargo
+xtask` commands and manual operator checks) and adds any Phase 55
+hardware-specific gates. It defines which commands and manual checks are
+required for the selected release promise and serves as the operational proof
+behind the release contract.
 
 ### Documentation and version alignment
 
@@ -75,9 +85,11 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## How This Builds on Earlier Phases
 
-- Builds on Phase 53's headless hardening and Phase 55's hardware promise as the minimum 1.0 foundation.
+- Builds on Phase 53's bounded headless/reference baseline — the support boundary, gate bundle, and closure contract are fixed inputs, not re-opened scope.
+- Builds on Phase 55's hardware promise as additional supported targets beyond the Phase 53 QEMU reference.
 - Optionally includes the local-system milestones from Phase 47 and Phases 56-57 if the project chooses the broader release target.
 - Creates the stable boundary after which later ecosystem work can clearly be called 1.x growth instead of hidden release debt.
+- Inherits the Phase 53/53a closure rule: Phase 53 gates must have already passed on the post-53a allocator baseline before Phase 58 can close.
 
 ## Implementation Outline
 
@@ -103,11 +115,12 @@ This phase succeeds only if top-level docs, subsystem docs, roadmap docs, and ve
 
 ## Acceptance Criteria
 
-- A written 1.0 support matrix exists with explicit supported workflows, hardware scope, and non-goals.
-- The project has a documented validation bundle for the chosen release claim.
+- A written 1.0 support matrix exists that starts from the Phase 53 bounded headless/reference baseline, with explicit supported workflows, hardware scope, and non-goals.
+- The project has a documented validation bundle that extends the Phase 53 gate bundle with any Phase 55 hardware-specific gates.
 - The docs explicitly state whether 1.0 is headless/reference-only or also includes the local-system branch.
 - Top-level docs, roadmap docs, and version references all reflect the same release promise.
 - Later work such as toolchains, GitHub integration, Node.js, and Claude Code is explicitly framed as 1.x growth if not part of the chosen release.
+- Phase 53 gates have already passed on the post-53a allocator baseline (the Phase 53/53a closure rule is a prerequisite, not re-evaluated here).
 
 ## Companion Task List
 

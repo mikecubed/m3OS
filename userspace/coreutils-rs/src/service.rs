@@ -189,6 +189,11 @@ fn cmd_status(name: &str) -> i32 {
 
             write_str(STDOUT_FILENO, "State:          ");
             write_str(STDOUT_FILENO, state_str);
+            if state_str == "permanently-stopped" {
+                write_str(STDOUT_FILENO, " (fix the failure, then restart)");
+            } else if state_str == "disabled" {
+                write_str(STDOUT_FILENO, " (use 'service enable' before starting it)");
+            }
             write_str(STDOUT_FILENO, "\n");
 
             write_str(STDOUT_FILENO, "PID:            ");
