@@ -4436,8 +4436,8 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let stdin_feeder_conf = "name=stdin_feeder\ncommand=/bin/stdin_feeder\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=console,kbd\n";
 
     // Phase 54: storage service definitions.
-    let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\n";
-    let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=fat\n";
+    let fat_server_conf = "name=fat\ncommand=/bin/fat_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=\nuser=200\n";
+    let vfs_server_conf = "name=vfs\ncommand=/bin/vfs_server\ntype=daemon\nrestart=always\nmax_restart=10\ndepends=fat\nuser=200\n";
 
     let hostname_content = "m3os\n";
 

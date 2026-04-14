@@ -8583,6 +8583,7 @@ fn serial_echo_bytes(bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// Allowed caller binaries for raw block reads.
+const STORAGE_SERVICE_UID: u32 = 200;
 const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
 
 /// Read raw disk sectors into a userspace buffer.
@@ -8596,16 +8597,18 @@ const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
 /// Returns 0 on success, or a negative errno on error.
 /// Capped at 128 sectors (64 KiB) per call for safety.
 ///
-/// Only processes whose `exec_path` is in [`BLOCK_READ_ALLOWED`] may call
-/// this syscall; all others receive `-EPERM`.
+/// Only supervised storage services may call this syscall. The kernel requires
+/// both a dedicated service euid and an expected service binary path so
+/// ordinary users cannot gain raw-disk access by directly exec'ing a public
+/// `/bin/*_server` binary.
 fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     // Restrict to supervised storage services.
     {
         let pid = crate::process::current_pid();
         let table = crate::process::PROCESS_TABLE.lock();
-        let allowed = table
-            .find(pid)
-            .is_some_and(|p| BLOCK_READ_ALLOWED.iter().any(|a| p.exec_path == *a));
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_READ_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
         if !allowed {
             return NEG_EPERM;
         }
