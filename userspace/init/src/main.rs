@@ -989,11 +989,6 @@ impl ServiceManager {
                 let deps_ready = self.check_deps_ready(&graph, idx);
                 if deps_ready {
                     self.start_service(idx);
-                    // For daemons, give a brief moment to start.
-                    if self.services[idx].service_type == ServiceType::Daemon {
-                        // Small yield to let the child exec.
-                        nanosleep(0);
-                    }
                 } else {
                     write_str(STDOUT_FILENO, "init: skipping '");
                     write(STDOUT_FILENO, self.services[idx].name.as_bytes());

@@ -303,7 +303,29 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
                     Ok(PathNodeKind::Dir)
                 }
                 Ok(_) => Ok(PathNodeKind::File),
-                Err(err) => Err(err),
+                // Fall back to the kernel ext2 path if the userspace VFS slice
+                // is unavailable during boot or degraded mode.
+                Err(_) => {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    if let Some(vol) = vol.as_ref() {
+                        match vol.resolve_path(rel) {
+                            Ok(ino) => match vol.read_inode(ino) {
+                                Ok(inode) if inode.is_symlink() => vol
+                                    .read_symlink(ino)
+                                    .map(PathNodeKind::Symlink)
+                                    .map_err(|_| NEG_EIO),
+                                Ok(inode) if inode.is_dir() => Ok(PathNodeKind::Dir),
+                                Ok(_) => Ok(PathNodeKind::File),
+                                Err(_) => Err(NEG_EIO),
+                            },
+                            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => Err(NEG_ENOENT),
+                            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => Err(NEG_ENOTDIR),
+                            Err(_) => Err(NEG_EIO),
+                        }
+                    } else {
+                        Err(NEG_ENOENT)
+                    }
+                }
             };
         }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
@@ -496,7 +518,11 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
         }
         // Release mount lock before IPC to avoid blocking other openers.
         drop(_mount_guard);
-        return vfs_service_open(&resolved, flags);
+        let routed = vfs_service_open(&resolved, flags);
+        if routed != NEG_ENOENT && routed != NEG_EIO {
+            return routed;
+        }
+        return open_resolved_path(&resolved, flags, mode_arg);
     }
 
     open_resolved_path(&resolved, flags, mode_arg)

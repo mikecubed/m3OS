@@ -16,7 +16,9 @@ service manager, logging daemon, cron daemon, and admin commands. Phase 47 adds
 a real userspace graphical proof by running DOOM end to end through the
 framebuffer path. Phase 53 then converges the headless side of that work into an
 explicit promise: supported workflow, exact gates, narrow support boundary, and
-an equally explicit "later-scope" list.
+an equally explicit "later-scope" list. Phase 54 then narrows one of the biggest
+remaining architecture gaps by moving meaningful rootfs/VFS and UDP policy
+through supervised ring-3 services with explicit degraded-mode contracts.
 
 A useful framing change after `v0.47.0` is that phases 1-47 are the shipped
 base. If something expected from that scope still feels rough, it is best
@@ -33,8 +35,8 @@ flowchart TB
     end
 
     subgraph Actual["Current implementation"]
-        AK["Kernel:<br/>MM + scheduler + IPC + VFS + filesystems + net + tty/pty + procfs + block + large syscall layer"]
-        AU["Userspace:<br/>init + shell + login + coreutils + edit + sshd + telnetd + tests"]
+        AK["Kernel:<br/>MM + scheduler + IPC + broad fs/net/tty policy + large syscall facade"]
+        AU["Userspace:<br/>init + shell + login + coreutils + vfs/fat/net services + sshd + telnetd + tests"]
     end
 
     IK --> IU
@@ -85,11 +87,11 @@ The microkernel gap is visible in specific repo seams, not just in high-level rh
 
 | Deficiency | Concrete evidence | Architectural effect |
 |---|---|---|
-| Core services still live in the kernel | `kernel/src/main.rs` spawns `console_server_task`, `kbd_server_task`, `fat_server_task`, and `vfs_server_task` | The system keeps service logic inside the trusted kernel address space |
+| Core-service extraction is still partial | `userspace/fat_server`, `userspace/vfs_server`, and `userspace/net_server` are now real supervised services, but `kernel/src/main.rs` still keeps transitional kernel console/input tasks and the kernel still owns broad fs/net mechanism | The system is materially narrower than the Phase 53 baseline, but the kernel blast radius is still larger than an ideal microkernel |
 | Service IPC still depends on shared-address-space shortcuts | `kernel/src/ipc/mod.rs` documents kernel-task IPC assumptions for service registration; `kernel/src/main.rs` passes kernel pointers in console IPC | A true ring-3 server conversion cannot be finished until these assumptions are removed |
 | Bulk data path is unfinished | `docs/06-ipc.md` still defers page-capability grants and bulk transfers | Filesystems, graphics, and networking still lack a clean microkernel-grade data path |
 | Filesystem and network policy remain ring-0 code | `kernel/src/fs/`, `kernel/src/net/`, `kernel/src/tty.rs`, `kernel/src/pty.rs` | The kernel blast radius remains much larger than the docs imply |
-| Future server crates are still not active workspace members | `Cargo.toml` comments out `userspace/console_server`, `userspace/vfs_server`, `userspace/fat_server`, and `userspace/kbd_server` | The intended service topology is still only partially realized |
+| The extracted boundaries are still selective rather than end-to-end | Phase 54 ships ring-3 `fat_server`, `vfs_server`, and `net_server` slices, but TCP, tmpfs/procfs, TTY/PTY, and most driver policy remain ring 0 | The architecture is now partially enforced instead of purely aspirational, but it is not yet a fully serverized OS |
 
 This is the main reason the current system reads as "microkernel-aimed" rather than "properly enforced microkernel." The detailed migration plan is in [microkernel-path.md](./microkernel-path.md).
 

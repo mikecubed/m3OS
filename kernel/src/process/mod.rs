@@ -1220,10 +1220,22 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
         }
         // Clear any pending SIGSTOP/SIGTSTP.
         proc.pending_signals &= !(1u64 << SIGSTOP) & !(1u64 << SIGTSTP);
+        drop(table);
+        for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
+            crate::ipc::endpoint::cancel_task_wait(task_id);
+            crate::task::scheduler::deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
+            let _ = crate::task::scheduler::wake_task(task_id);
+        }
         return true;
     }
 
     proc.pending_signals |= 1u64 << sig;
+    drop(table);
+    for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
+        crate::ipc::endpoint::cancel_task_wait(task_id);
+        crate::task::scheduler::deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
+        let _ = crate::task::scheduler::wake_task(task_id);
+    }
     true
 }
 

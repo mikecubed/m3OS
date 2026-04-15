@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -1831,6 +1831,13 @@ dependencies = [
  "bitflags 2.11.0",
  "rustversion",
  "x86",
+]
+
+[[package]]
+name = "udp-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]

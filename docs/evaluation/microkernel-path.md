@@ -20,7 +20,13 @@ That gap is not cosmetic. It is the difference between:
 - "the kernel could eventually host userspace services"
 - and "the kernel is already small because it has no choice"
 
-Phase 46 narrows one operational gap: m3OS now has a real userspace service manager, logging daemon, restart behavior, and admin surface for ordinary daemons. That improves the system story, but it does **not** yet convert the kernel-resident console/input/storage/network services into restartable ring-3 servers.
+Phase 46 narrows one operational gap: m3OS now has a real userspace service
+manager, logging daemon, restart behavior, and admin surface for ordinary
+daemons. Phase 54 narrows a larger architectural gap by moving meaningful
+rootfs/VFS and UDP policy into supervised ring-3 services. That still does **not**
+fully convert the kernel-resident storage/network/TTY world into restartable
+userspace servers, but it means the serverized design is now shipped reality for
+important slices rather than only future tense.
 
 ```mermaid
 flowchart LR
@@ -77,12 +83,12 @@ These are the concrete ways the current repo still falls short of a properly enf
 
 | Deficiency | Evidence | Why it matters |
 |---|---|---|
-| Core servers are still kernel tasks | `kernel/src/main.rs` spawns `fat_server_task` and `vfs_server_task` as kernel tasks; Phase 52 added ring-3 `console_server` and `kbd_server` binaries but the kernel still runs its own `console_server_task` and `kbd_server_task` in parallel during the transition | Fault isolation is partial: ring-3 service binaries exist and are supervised, but the kernel-resident versions have not yet been removed; storage servers also remain in ring 0 |
+| Core-service extraction is still partial | Phase 54 ships supervised ring-3 `fat_server`, `vfs_server`, and `net_server` services, but `kernel/src/main.rs` still keeps transitional kernel console/input tasks and the kernel still owns broad fs/net mechanism | Fault isolation is materially better than before Phase 54, but the trusted kernel still carries more service logic than a proper microkernel target |
 | IPC still assumes a shared kernel address space in places | `kernel/src/ipc/mod.rs` says service-registry syscalls still assume kernel-task callers; `kernel/src/main.rs` passes kernel pointers in console IPC; `docs/07-core-servers.md` and `docs/08-storage-and-vfs.md` explain this limitation | The system cannot fully serverize while message payloads still depend on shared in-kernel pointers |
 | Capability grant and bulk shared-data path are unfinished | `docs/06-ipc.md` defers page-capability grants and bulk data transfers | Serious userspace servers need a safe, zero-copy or bounded-copy way to exchange file blocks, framebuffer regions, packets, and strings |
 | Filesystem, networking, TTY, PTY, procfs, and related policy still live in ring 0 | `kernel/src/fs/`, `kernel/src/net/`, `kernel/src/tty.rs`, `kernel/src/pty.rs`, `kernel/src/signal.rs` | The kernel TCB is much larger than the documented architecture suggests |
 | POSIX/Linux ABI policy is concentrated in the kernel | `kernel/src/arch/x86_64/syscall.rs` is still the giant compatibility/policy surface | This makes the kernel the place where policy keeps accumulating |
-| Future userspace service crates are still commented out | `Cargo.toml` lists `userspace/console_server`, `userspace/vfs_server`, `userspace/fat_server`, and `userspace/kbd_server` as future work | The workspace structure itself reflects that the serverized design is still aspirational |
+| Serverization is real but still selective | `Cargo.toml` now includes active `userspace/vfs_server`, `userspace/fat_server`, and `userspace/net_server` members, while TCP, tmpfs/procfs, TTY/PTY, and most drivers remain kernel-resident | The architecture is no longer purely aspirational, but the remaining ring-0 policy is still substantial |
 | Core-service lifecycle and restartability are still incomplete | Phase 46 provides supervision for ordinary userspace daemons, but the kernel-resident services that matter most for the microkernel claim are not yet extracted into that model | A real microkernel needs restartable userspace services, not one-shot kernel tasks |
 | The native IPC model is not yet the dominant application-facing path | most real userland behavior currently routes through Linux-style syscalls instead of service IPC | The more POSIX policy stays in the kernel, the harder it becomes to fully enforce userspace services later |
 

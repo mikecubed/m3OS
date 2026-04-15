@@ -1312,6 +1312,24 @@ pub fn reply_waiters(id: TaskId) -> alloc::vec::Vec<TaskId> {
     sched.reply_waiters(id)
 }
 
+/// Return blocked task ids that belong to `pid` and are currently sleeping in
+/// IPC wait states.
+pub fn blocked_ipc_task_ids_for_pid(pid: u32) -> alloc::vec::Vec<TaskId> {
+    let sched = SCHEDULER.lock();
+    sched
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.pid == pid
+                && matches!(
+                    task.state,
+                    TaskState::BlockedOnRecv | TaskState::BlockedOnSend | TaskState::BlockedOnReply
+                )
+        })
+        .map(|task| task.id)
+        .collect()
+}
+
 /// The main scheduler loop. Called once per core. Never returns.
 ///
 /// Each core runs its own instance. The per-core reschedule flag gates

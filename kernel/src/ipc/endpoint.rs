@@ -518,6 +518,21 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     call_msg(caller, ep_id, msg).label
 }
 
+/// Remove a task from any endpoint sender/receiver wait queues.
+///
+/// Used when signal delivery needs to interrupt a task blocked inside IPC so it
+/// can return to userspace and observe the pending signal.
+pub fn cancel_task_wait(task_id: TaskId) {
+    let mut reg = ENDPOINTS.lock();
+    let slot_count = reg.slot_count();
+    for i in 0..slot_count {
+        if let Some(ep) = reg.get_mut(EndpointId(i as u8)) {
+            ep.receivers.retain(|&receiver| receiver != task_id);
+            ep.senders.retain(|pending| pending.task != task_id);
+        }
+    }
+}
+
 /// Reply to a blocked caller.
 ///
 /// Wakes the caller task and delivers `reply_msg` to it.  If the `server`

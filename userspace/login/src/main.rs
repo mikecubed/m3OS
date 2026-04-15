@@ -4,12 +4,13 @@
 
 use passwd::{build_hash_field, rewrite_shadow_file};
 use syscall_lib::{
-    O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, execve, exit, fsync, getrandom, open, read,
-    setgid, setuid, write, write_str, write_u64,
+    O_RDONLY, O_TRUNC, O_WRONLY, STDOUT_FILENO, close, execve, exit, fsync, getrandom, nanosleep,
+    open, read, setgid, setuid, write, write_str, write_u64,
 };
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const SHADOW_PATH: &[u8] = b"/etc/shadow\0";
+const LOGIN_FILE_READ_RETRIES: usize = 5;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -30,7 +31,7 @@ fn login_once() {
 
     // Look up user in /etc/passwd before prompting for password.
     let mut passwd_buf = [0u8; 2048];
-    let passwd_len = read_file(PASSWD_PATH, &mut passwd_buf);
+    let passwd_len = read_file_with_retry(PASSWD_PATH, &mut passwd_buf);
     if passwd_len == 0 {
         write_str(STDOUT_FILENO, "login: cannot read /etc/passwd\n");
         return;
@@ -46,7 +47,7 @@ fn login_once() {
 
     // Read /etc/shadow to determine if account is locked or has a password.
     let mut shadow_buf = [0u8; 2048];
-    let shadow_len = read_file(SHADOW_PATH, &mut shadow_buf);
+    let shadow_len = read_file_with_retry(SHADOW_PATH, &mut shadow_buf);
     if shadow_len == 0 {
         write_str(STDOUT_FILENO, "login: cannot read /etc/shadow\n");
         return;
@@ -196,6 +197,21 @@ fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     }
     close(fd as i32);
     total
+}
+
+fn read_file_with_retry(path: &[u8], buf: &mut [u8]) -> usize {
+    let mut attempts = 0;
+    while attempts < LOGIN_FILE_READ_RETRIES {
+        let len = read_file(path, buf);
+        if len > 0 {
+            return len;
+        }
+        attempts += 1;
+        if attempts < LOGIN_FILE_READ_RETRIES {
+            nanosleep(1);
+        }
+    }
+    0
 }
 
 /// Parse /etc/passwd to find a user entry.

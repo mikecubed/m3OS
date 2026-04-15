@@ -158,6 +158,7 @@ fn build_userspace_bins() {
         ("fork-test", "fork-test", false),
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
+        ("udp-smoke", "udp-smoke", false),
         ("init", "init", false),
         ("shell", "sh0", false),
         ("edit", "edit", true),
@@ -2548,11 +2549,22 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
             label: "wait for shell prompt",
         },
     ];
+    const BOOT_MARKER_SETTLE: &[SmokeStep] = &[
+        SmokeStep::Sleep { millis: 2000 },
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 20,
+            label: "wait for m3OS login prompt after final boot marker",
+        },
+    ];
 
-    steps.push(SmokeStep::Wait {
-        pattern: "login:",
+    steps.push(SmokeStep::WaitEither {
+        pattern_a: "m3OS login:",
+        pattern_b: "init: started 'net_udp' pid=10",
         timeout_secs: 60,
-        label: "wait for login prompt",
+        label: "wait for m3OS login prompt or final boot marker",
+        extra_steps_a: &[],
+        extra_steps_b: BOOT_MARKER_SETTLE,
     });
     steps.push(SmokeStep::Sleep { millis: 200 });
     steps.push(SmokeStep::Send {
@@ -2712,7 +2724,25 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
 
     // -----------------------------------------------------------------------
-    // 7. Log inspection (headless workflow §4)
+    // 7. Migrated UDP policy flow (Phase 54)
+    // -----------------------------------------------------------------------
+    steps.push(SmokeStep::Send {
+        input: "/root/udp-smoke\n",
+        label: "guest/net: exercise migrated UDP policy path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "udp-smoke: PASS",
+        timeout_secs: 15,
+        label: "guest/net: udp-smoke completed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 5,
+        label: "guest/net: prompt after udp-smoke",
+    });
+
+    // -----------------------------------------------------------------------
+    // 8. Log inspection (headless workflow §4)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
         input: "/bin/logger \"SMOKE_LOG_MARKER\"\n",
@@ -2723,7 +2753,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/log: prompt after logger",
     });
-    steps.push(SmokeStep::Sleep { millis: 1000 });
+    steps.push(SmokeStep::Sleep { millis: 3000 });
     // Read file contents directly so the awaited marker cannot come from the echoed command line.
     steps.push(SmokeStep::Send {
         input: "/bin/cat /var/log/messages\n",
@@ -4444,6 +4474,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
 
     let hostname_content = "m3os\n";
+    let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
 
     // Create temp host files for debugfs `write` command.
     let passwd_tmp = output_dir.join("_tmp_passwd");
@@ -4515,10 +4546,14 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
          sif etc mode 0x41ED\n\
          sif etc uid 0\n\
          sif etc gid 0\n\
-         sif root mode 0x41C0\n\
-         sif root uid 0\n\
-         sif root gid 0\n\
-         sif home mode 0x41ED\n\
+          sif root mode 0x41C0\n\
+          sif root uid 0\n\
+          sif root gid 0\n\
+          write \"{udp_smoke_bin}\" root/udp-smoke\n\
+          sif root/udp-smoke mode 0x81ED\n\
+          sif root/udp-smoke uid 0\n\
+          sif root/udp-smoke gid 0\n\
+          sif home mode 0x41ED\n\
          sif home uid 0\n\
          sif home gid 0\n\
          sif home/user mode 0x41ED\n\
@@ -4618,6 +4653,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
         vfs_server_conf = vfs_server_conf_tmp.display(),
         net_server_conf = net_server_conf_tmp.display(),
         hostname = hostname_tmp.display(),
+        udp_smoke_bin = udp_smoke_bin.display(),
     );
 
     let mut debugfs = Command::new("debugfs")
@@ -5885,6 +5921,12 @@ fn regression_tests() -> Vec<RegressionTest> {
             timeout_secs: 60,
         },
         RegressionTest {
+            name: "serverization-fallback",
+            description: "Phase 54 degraded-mode behavior after stopping vfs and net_udp",
+            guest_steps: serverization_fallback_steps,
+            timeout_secs: 90,
+        },
+        RegressionTest {
             name: "log-pipeline",
             description: "Logger injection via /dev/log and /var/log/messages verification",
             guest_steps: log_pipeline_steps,
@@ -6126,6 +6168,72 @@ fn storage_roundtrip_steps() -> Vec<SmokeStep> {
     steps
 }
 
+/// Guest steps for the Phase 54 degraded-mode regression: stop the extracted
+/// storage and UDP policy services, then verify the documented fallback paths.
+fn serverization_fallback_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    steps.push(SmokeStep::Send {
+        input: "/bin/service stop vfs\n",
+        label: "guest/serverization: request stop for vfs",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "service: stop vfs completed",
+        timeout_secs: 30,
+        label: "guest/serverization: vfs stop completed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/serverization: prompt after vfs stop",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/bin/cat /etc/passwd\n",
+        label: "guest/serverization: open rootfs file after vfs stop",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "root:x:0:0:root:/root:/bin/ion",
+        timeout_secs: 10,
+        label: "guest/serverization: rootfs fallback still readable",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/serverization: prompt after passwd read",
+    });
+
+    steps.push(SmokeStep::Send {
+        input: "/bin/service stop net_udp\n",
+        label: "guest/serverization: request stop for net_udp",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "service: stop net_udp completed",
+        timeout_secs: 30,
+        label: "guest/serverization: net_udp stop completed",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/serverization: prompt after net_udp stop",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/root/udp-smoke\n",
+        label: "guest/serverization: verify UDP fallback path",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "udp-smoke: PASS",
+        timeout_secs: 15,
+        label: "guest/serverization: udp-smoke passed after service stop",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/serverization: prompt after udp fallback probe",
+    });
+    steps
+}
+
 /// Guest steps for the log-pipeline regression: inject a tagged message via
 /// `logger` and verify it appears in `/var/log/messages` through the syslogd
 /// /dev/log → file pipeline.
@@ -6268,60 +6376,59 @@ fn security_floor_steps() -> Vec<SmokeStep> {
 
 /// Common boot + login steps shared by all regression tests.
 fn boot_and_login_steps() -> Vec<SmokeStep> {
-    // First-boot: account is locked (hash "!"), login prompts to set password.
-    // Normal boot (or after first-boot persists): account has a password.
-    // Both paths use "root" as the password. Regression runs use -snapshot,
-    // so they always hit the first-boot path on a fresh locked image.
-    const FIRST_BOOT_LOGIN: &[SmokeStep] = &[
+    // Regression runs use the shipped image in snapshot mode. The image already
+    // contains active password hashes, so the normal login path should apply.
+    // If login races the extracted rootfs path once and reports that it cannot
+    // read /etc/passwd, wait for the next prompt and retry the username.
+    const RETRY_AFTER_PASSWD_MISS: &[SmokeStep] = &[
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 20,
+            label: "wait for retry login prompt",
+        },
+        SmokeStep::Sleep { millis: 25000 },
         SmokeStep::Send {
             input: "root\n",
-            label: "set initial password",
+            label: "retry username after passwd miss",
         },
         SmokeStep::Wait {
-            pattern: "Retype password:",
-            timeout_secs: 10,
-            label: "wait for password confirmation prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "confirm initial password",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for shell prompt after first-boot setup",
+            pattern: "Password:",
+            timeout_secs: 20,
+            label: "wait for password prompt after retry",
         },
     ];
-    const NORMAL_LOGIN: &[SmokeStep] = &[
-        SmokeStep::Send {
-            input: "root\n",
-            label: "enter password",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for shell prompt",
-        },
-    ];
-
     vec![
         SmokeStep::Wait {
-            pattern: "login:",
+            pattern: "init: started 'net_udp' pid=10",
             timeout_secs: 60,
-            label: "boot to login prompt",
+            label: "wait for final boot marker",
         },
-        SmokeStep::Sleep { millis: 200 },
+        SmokeStep::Sleep { millis: 25000 },
+        SmokeStep::Wait {
+            pattern: "m3OS login:",
+            timeout_secs: 20,
+            label: "wait for login prompt after boot settle",
+        },
         SmokeStep::Send {
             input: "root\n",
             label: "username",
         },
         SmokeStep::WaitEither {
-            pattern_a: "Set password for",
-            pattern_b: "Password:",
+            pattern_a: "Password:",
+            pattern_b: "login: cannot read /etc/passwd",
             timeout_secs: 10,
-            label: "detect first-boot or normal login",
-            extra_steps_a: FIRST_BOOT_LOGIN,
-            extra_steps_b: NORMAL_LOGIN,
+            label: "wait for password prompt or retryable passwd miss",
+            extra_steps_a: &[],
+            extra_steps_b: RETRY_AFTER_PASSWD_MISS,
+        },
+        SmokeStep::Send {
+            input: "root\n",
+            label: "password",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 30,
+            label: "wait for shell prompt",
         },
     ]
 }
@@ -6354,6 +6461,7 @@ fn cmd_regression(args: &RegressionArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     let ovmf = find_ovmf();
+    create_data_disk(uefi_image.parent().unwrap(), false);
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -7247,7 +7355,7 @@ mod tests {
     fn smoke_test_stays_within_boot_login_and_tcc_scope() {
         let labels = smoke_step_labels(&smoke_test_script(false));
 
-        assert!(labels.contains(&"wait for login prompt"));
+        assert!(labels.contains(&"wait for m3OS login prompt or final boot marker"));
         assert!(labels.contains(&"tcc --version"));
         assert!(labels.contains(&"compile hello.c with TCC"));
         assert!(!labels.contains(&"run PTY regression (quick - skips ion timing tests)"));

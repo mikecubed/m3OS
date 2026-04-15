@@ -11,7 +11,7 @@
 #![no_std]
 #![no_main]
 
-use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, write_str};
+use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, nanosleep, write_str};
 
 syscall_lib::entry_point!(main);
 
@@ -221,6 +221,52 @@ fn cmd_status(name: &str) -> i32 {
     1
 }
 
+fn read_status_text(buf: &mut [u8]) -> Result<&str, i32> {
+    let n = read_file(STATUS_PATH, buf);
+    if n <= 0 {
+        return Err(n as i32);
+    }
+    core::str::from_utf8(&buf[..n as usize]).map_err(|_| -1)
+}
+
+fn service_status<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    for line in text.split('\n') {
+        if let Some(rest) = line.strip_prefix(name)
+            && (rest.starts_with(' ') || rest.starts_with('\t'))
+        {
+            let mut fields = line.split(' ');
+            let _svc_name = fields.next();
+            return Some(fields.next().unwrap_or("unknown"));
+        }
+    }
+    None
+}
+
+fn wait_for_stopped(name: &str, timeout_secs: u64) -> i32 {
+    let mut buf = [0u8; 4096];
+    let mut waited = 0;
+    while waited < timeout_secs {
+        if let Ok(text) = read_status_text(&mut buf)
+            && let Some(status) = service_status(text, name)
+            && (status.starts_with("stopped:")
+                || status == "permanently-stopped"
+                || status == "disabled")
+        {
+            write_str(STDOUT_FILENO, "service: stop ");
+            write_str(STDOUT_FILENO, name);
+            write_str(STDOUT_FILENO, " completed\n");
+            return 0;
+        }
+        nanosleep(1);
+        waited += 1;
+    }
+
+    write_str(STDERR_FILENO, "service: timed out waiting for '");
+    write_str(STDERR_FILENO, name);
+    write_str(STDERR_FILENO, "' to stop\n");
+    1
+}
+
 fn send_command(cmd: &str, name: &str) -> i32 {
     let mut buf = [0u8; 128];
     let cmd_bytes = cmd.as_bytes();
@@ -287,7 +333,11 @@ fn main(args: &[&str]) -> i32 {
             if !require_root("stop") {
                 return 1;
             }
-            send_command("stop", args[2])
+            let ret = send_command("stop", args[2]);
+            if ret != 0 {
+                return ret;
+            }
+            wait_for_stopped(args[2], 30)
         }
         "restart" => {
             if args.len() < 3 {
