@@ -374,8 +374,18 @@ fn dispatch(table: &mut HandleTable, msg: &syscall_lib::IpcMessage) -> (u64, u64
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "net_server: starting (UDP service)\n");
 
-    let ep_handle = syscall_lib::create_endpoint() as u32;
-    syscall_lib::ipc_register_service(ep_handle, "net_udp");
+    let ep_handle = syscall_lib::create_endpoint();
+    if ep_handle == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "net_server: create_endpoint failed\n");
+        return 1;
+    }
+    let ep_handle = ep_handle as u32;
+
+    let ret = syscall_lib::ipc_register_service(ep_handle, "net_udp");
+    if ret == u64::MAX {
+        syscall_lib::write_str(STDOUT_FILENO, "net_server: register_service failed\n");
+        return 1;
+    }
 
     syscall_lib::write_str(STDOUT_FILENO, "net_server: registered as net_udp\n");
 

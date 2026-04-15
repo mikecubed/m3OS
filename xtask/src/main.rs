@@ -2167,15 +2167,11 @@ fn find_serial_match(
     pattern: &str,
 ) -> Option<(SerialMatchMode, usize)> {
     if matches!(pattern, "# " | "$ ") {
-        for prompt in ["# ", "$ "] {
-            if let Some(end) = prompt_suffix_end(stripped, prompt) {
-                return Some((SerialMatchMode::Stripped, end));
-            }
+        if let Some(end) = prompt_suffix_end(stripped, pattern) {
+            return Some((SerialMatchMode::Stripped, end));
         }
-        for prompt in ["# ", "$ "] {
-            if let Some(end) = prompt_suffix_end(cleaned, prompt) {
-                return Some((SerialMatchMode::Cleaned, end));
-            }
+        if let Some(end) = prompt_suffix_end(cleaned, pattern) {
+            return Some((SerialMatchMode::Cleaned, end));
         }
         return None;
     }
@@ -2602,16 +2598,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         extra_steps_a: FIRST_BOOT_LOGIN,
         extra_steps_b: NORMAL_LOGIN,
     });
-    steps.push(SmokeStep::Send {
-        input: "/bin/sh0\n",
-        label: "switch to sh0 for smoke commands",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "$ ",
-        timeout_secs: 10,
-        label: "wait for sh0 prompt",
-    });
-
     // -----------------------------------------------------------------------
     // 2. Basic shell sanity
     // -----------------------------------------------------------------------
@@ -7403,13 +7389,13 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_switches_to_sh0_before_running_commands() {
+    fn smoke_test_stays_on_root_shell_for_commands() {
         let switch = send_input_for_label(
             &smoke_test_script(false),
             "switch to sh0 for smoke commands",
         );
 
-        assert_eq!(switch, Some("/bin/sh0\n"));
+        assert_eq!(switch, None);
     }
 
     #[test]

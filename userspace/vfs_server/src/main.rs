@@ -192,8 +192,8 @@ impl Ext2State {
             // Scan directory entries.
             let mut found = false;
             let mut file_block = 0u32;
-            let blocks_count = inode.size / self.block_size;
-            while file_block <= blocks_count {
+            let blocks_count = inode.size.div_ceil(self.block_size);
+            while file_block < blocks_count {
                 let block_num = self
                     .resolve_block(&inode, file_block)
                     .map_err(|_| NEG_EIO)?;
@@ -283,8 +283,8 @@ impl Ext2State {
     fn read_dir_entries(&self, inode: &Ext2Inode) -> Result<Vec<(u32, String, u8)>, u64> {
         let mut entries = Vec::new();
         let mut file_block = 0u32;
-        let blocks_count = inode.size / self.block_size;
-        while file_block <= blocks_count {
+        let blocks_count = inode.size.div_ceil(self.block_size);
+        while file_block < blocks_count {
             let block_num = self.resolve_block(inode, file_block).map_err(|_| NEG_EIO)?;
             if block_num == 0 {
                 file_block += 1;
