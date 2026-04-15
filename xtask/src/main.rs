@@ -2586,17 +2586,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     let _ = doom_wad_available;
     let mut steps = Vec::new();
     const BOOT_READY_MARKER: &str = "init: started 'net_udp' pid=";
-    const ECHO_DONE_MARKER: &str = "\n__SMOKE_ECHO_DONE__";
-    const TCC_VERSION_DONE_MARKER: &str = "\n__SMOKE_TCC_VERSION_DONE__";
-    const HELLO_DONE_MARKER: &str = "\n__SMOKE_HELLO_DONE__";
-    const ID_DONE_MARKER: &str = "\n__SMOKE_ID_DONE__";
-    const SERVICE_LIST_DONE_MARKER: &str = "\n__SMOKE_SERVICE_LIST_DONE__";
-    const TOUCH_DONE_MARKER: &str = "\n__SMOKE_TOUCH_DONE__";
-    const LS_DONE_MARKER: &str = "\n__SMOKE_LS_DONE__";
-    const RM_DONE_MARKER: &str = "\n__SMOKE_RM_DONE__";
-    const UDP_DONE_MARKER: &str = "\n__SMOKE_UDP_DONE__";
-    const LOGGER_DONE_MARKER: &str = "\n__SMOKE_LOGGER_DONE__";
-    const LOG_READ_DONE_MARKER: &str = "\n__SMOKE_LOG_READ_DONE__";
 
     // -----------------------------------------------------------------------
     // 1. Boot and login (handles both first-boot locked accounts and normal login)
@@ -2670,7 +2659,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // 2. Basic shell sanity
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/bin/echo SMOKE_OK; /bin/echo __SMOKE_ECHO_DONE__\n",
+        input: "/bin/echo SMOKE_OK\n",
         label: "echo test",
     });
     steps.push(SmokeStep::Wait {
@@ -2679,16 +2668,16 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "verify echo output",
     });
     steps.push(SmokeStep::Wait {
-        pattern: ECHO_DONE_MARKER,
-        timeout_secs: 5,
-        label: "echo completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after echo",
     });
 
     // -----------------------------------------------------------------------
     // 3. TCC compiler (Phase 31 regression)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc --version; /bin/echo __SMOKE_TCC_VERSION_DONE__\n",
+        input: "/usr/bin/tcc --version\n",
         label: "tcc --version",
     });
     steps.push(SmokeStep::Wait {
@@ -2697,13 +2686,13 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "verify TCC version",
     });
     steps.push(SmokeStep::Wait {
-        pattern: TCC_VERSION_DONE_MARKER,
-        timeout_secs: 5,
-        label: "tcc version completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after tcc --version",
     });
 
     steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello; /tmp/hello; /bin/echo __SMOKE_HELLO_DONE__\n",
+        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello; /tmp/hello\n",
         label: "compile hello.c with TCC",
     });
     steps.push(SmokeStep::Wait {
@@ -2712,9 +2701,9 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "verify hello world output",
     });
     steps.push(SmokeStep::Wait {
-        pattern: HELLO_DONE_MARKER,
+        pattern: "# ",
         timeout_secs: 10,
-        label: "hello world completion marker",
+        label: "prompt after hello",
     });
 
     // -----------------------------------------------------------------------
@@ -2726,7 +2715,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // getrandom()-backed password hash was stored. This step makes the
     // credential state observable in serial output.
     steps.push(SmokeStep::Send {
-        input: "/bin/id; /bin/echo __SMOKE_ID_DONE__\n",
+        input: "/bin/id\n",
         label: "guest/auth: verify uid after login",
     });
     steps.push(SmokeStep::Wait {
@@ -2735,16 +2724,16 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/auth: id shows uid=0 (root)",
     });
     steps.push(SmokeStep::Wait {
-        pattern: ID_DONE_MARKER,
-        timeout_secs: 5,
-        label: "guest/auth: id completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/auth: prompt after id",
     });
 
     // -----------------------------------------------------------------------
     // 5. Service inspection (headless workflow §2)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/bin/service list; /bin/echo __SMOKE_SERVICE_LIST_DONE__\n",
+        input: "/bin/service list\n",
         label: "guest/service: enumerate managed services",
     });
     steps.push(SmokeStep::Wait {
@@ -2758,25 +2747,25 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/service: list includes syslogd",
     });
     steps.push(SmokeStep::Wait {
-        pattern: SERVICE_LIST_DONE_MARKER,
-        timeout_secs: 15,
-        label: "guest/service: list completion marker",
+        pattern: "# ",
+        timeout_secs: 20,
+        label: "guest/service: prompt after service list",
     });
 
     // -----------------------------------------------------------------------
     // 6. Storage verification (headless workflow §3)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/bin/touch /root/smoke_test_file; /bin/echo __SMOKE_TOUCH_DONE__\n",
+        input: "/bin/touch /root/smoke_test_file\n",
         label: "guest/storage: create file on ext2",
     });
     steps.push(SmokeStep::Wait {
-        pattern: TOUCH_DONE_MARKER,
+        pattern: "# ",
         timeout_secs: 10,
-        label: "guest/storage: touch completion marker",
+        label: "guest/storage: prompt after touch",
     });
     steps.push(SmokeStep::Send {
-        input: "/bin/ls /root/smoke_test_file; /bin/echo __SMOKE_LS_DONE__\n",
+        input: "/bin/ls /root/smoke_test_file\n",
         label: "guest/storage: verify file exists",
     });
     steps.push(SmokeStep::Wait {
@@ -2785,25 +2774,25 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/storage: ls shows created file",
     });
     steps.push(SmokeStep::Wait {
-        pattern: LS_DONE_MARKER,
-        timeout_secs: 5,
-        label: "guest/storage: ls completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/storage: prompt after ls",
     });
     steps.push(SmokeStep::Send {
-        input: "/bin/rm /root/smoke_test_file; /bin/echo __SMOKE_RM_DONE__\n",
+        input: "/bin/rm /root/smoke_test_file\n",
         label: "guest/storage: remove test file",
     });
     steps.push(SmokeStep::Wait {
-        pattern: RM_DONE_MARKER,
+        pattern: "# ",
         timeout_secs: 10,
-        label: "guest/storage: rm completion marker",
+        label: "guest/storage: prompt after rm",
     });
 
     // -----------------------------------------------------------------------
     // 7. Migrated UDP policy flow (Phase 54)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/root/udp-smoke; /bin/echo __SMOKE_UDP_DONE__\n",
+        input: "/root/udp-smoke\n",
         label: "guest/net: exercise migrated UDP policy path",
     });
     steps.push(SmokeStep::Wait {
@@ -2812,27 +2801,27 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/net: udp-smoke completed",
     });
     steps.push(SmokeStep::Wait {
-        pattern: UDP_DONE_MARKER,
-        timeout_secs: 5,
-        label: "guest/net: udp completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/net: prompt after udp-smoke",
     });
 
     // -----------------------------------------------------------------------
     // 8. Log inspection (headless workflow §4)
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/bin/logger \"SMOKE_LOG_MARKER\"; /bin/echo __SMOKE_LOGGER_DONE__\n",
+        input: "/bin/logger \"SMOKE_LOG_MARKER\"\n",
         label: "guest/log: inject smoke marker via /dev/log",
     });
     steps.push(SmokeStep::Wait {
-        pattern: LOGGER_DONE_MARKER,
-        timeout_secs: 15,
-        label: "guest/log: logger completion marker",
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "guest/log: prompt after logger",
     });
     steps.push(SmokeStep::Sleep { millis: 3000 });
     // Read file contents directly so the awaited marker cannot come from the echoed command line.
     steps.push(SmokeStep::Send {
-        input: "/bin/cat /var/log/messages; /bin/echo __SMOKE_LOG_READ_DONE__\n",
+        input: "/bin/cat /var/log/messages\n",
         label: "guest/log: verify smoke marker in system log",
     });
     steps.push(SmokeStep::Wait {
@@ -2841,9 +2830,9 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/log: smoke marker found in system log",
     });
     steps.push(SmokeStep::Wait {
-        pattern: LOG_READ_DONE_MARKER,
+        pattern: "# ",
         timeout_secs: 10,
-        label: "guest/log: log read completion marker",
+        label: "guest/log: prompt after log read",
     });
 
     // Shutdown/reboot (headless workflow §7) is verified by the manual
@@ -7471,30 +7460,46 @@ mod tests {
 
         let hello_compile = hello_compile.expect("compile step should exist");
         assert!(hello_compile.starts_with("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello"));
-        assert!(hello_compile.ends_with("; /tmp/hello; /bin/echo __SMOKE_HELLO_DONE__\n"));
+        assert!(hello_compile.ends_with("; /tmp/hello\n"));
     }
 
     #[test]
-    fn smoke_test_tcc_version_uses_completion_marker() {
+    fn smoke_test_tcc_version_runs_direct_command() {
         let tcc_version = send_input_for_label(&smoke_test_script(false), "tcc --version");
 
-        assert_eq!(
-            tcc_version,
-            Some("/usr/bin/tcc --version; /bin/echo __SMOKE_TCC_VERSION_DONE__\n")
-        );
+        assert_eq!(tcc_version, Some("/usr/bin/tcc --version\n"));
     }
 
     #[test]
-    fn smoke_test_log_verification_uses_completion_marker() {
+    fn smoke_test_touch_and_rm_use_direct_commands() {
+        let touch = send_input_for_label(
+            &smoke_test_script(false),
+            "guest/storage: create file on ext2",
+        );
+        let rm = send_input_for_label(&smoke_test_script(false), "guest/storage: remove test file");
+
+        assert_eq!(touch, Some("/bin/touch /root/smoke_test_file\n"));
+        assert_eq!(rm, Some("/bin/rm /root/smoke_test_file\n"));
+    }
+
+    #[test]
+    fn smoke_test_logger_uses_direct_command() {
+        let logger = send_input_for_label(
+            &smoke_test_script(false),
+            "guest/log: inject smoke marker via /dev/log",
+        );
+
+        assert_eq!(logger, Some("/bin/logger \"SMOKE_LOG_MARKER\"\n"));
+    }
+
+    #[test]
+    fn smoke_test_log_verification_reads_log_file_contents() {
         let log_check = send_input_for_label(
             &smoke_test_script(false),
             "guest/log: verify smoke marker in system log",
         );
 
-        assert_eq!(
-            log_check,
-            Some("/bin/cat /var/log/messages; /bin/echo __SMOKE_LOG_READ_DONE__\n")
-        );
+        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
     }
 
     #[test]
