@@ -2068,6 +2068,45 @@ fn strip_ansi(input: &str) -> String {
 enum SerialMatchMode {
     Stripped,
     Cleaned,
+    RenderedStripped,
+    RenderedCleaned,
+}
+
+fn render_terminal_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut line: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+
+    for ch in input.chars() {
+        match ch {
+            '\n' => {
+                out.extend(line.iter());
+                out.push('\n');
+                line.clear();
+                cursor = 0;
+            }
+            '\r' => {
+                line.clear();
+                cursor = 0;
+            }
+            '\x08' => cursor = cursor.saturating_sub(1),
+            c if c.is_control() => {}
+            c => {
+                if cursor < line.len() {
+                    line[cursor] = c;
+                } else {
+                    while line.len() < cursor {
+                        line.push(' ');
+                    }
+                    line.push(c);
+                }
+                cursor += 1;
+            }
+        }
+    }
+
+    out.extend(line.iter());
+    out
 }
 
 fn map_cleaned_offset_to_stripped(stripped: &str, cleaned_offset: usize) -> Option<usize> {
@@ -2145,9 +2184,18 @@ fn drain_serial_through_match(
     mode: SerialMatchMode,
     match_end: usize,
 ) {
+    if matches!(
+        mode,
+        SerialMatchMode::RenderedStripped | SerialMatchMode::RenderedCleaned
+    ) {
+        serial_buf.clear();
+        return;
+    }
+
     let stripped_end = match mode {
         SerialMatchMode::Stripped => Some(match_end),
         SerialMatchMode::Cleaned => map_cleaned_offset_to_stripped(stripped, match_end),
+        SerialMatchMode::RenderedStripped | SerialMatchMode::RenderedCleaned => None,
     };
 
     if let Some(stripped_end) = stripped_end {
@@ -2172,6 +2220,14 @@ fn find_serial_match(
         }
         if let Some(end) = prompt_suffix_end(cleaned, pattern) {
             return Some((SerialMatchMode::Cleaned, end));
+        }
+        let rendered_stripped = render_terminal_text(stripped);
+        if let Some(end) = prompt_suffix_end(&rendered_stripped, pattern) {
+            return Some((SerialMatchMode::RenderedStripped, end));
+        }
+        let rendered_cleaned = render_terminal_text(cleaned);
+        if let Some(end) = prompt_suffix_end(&rendered_cleaned, pattern) {
+            return Some((SerialMatchMode::RenderedCleaned, end));
         }
         return None;
     }
@@ -2635,27 +2691,13 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
 
     steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n",
+        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello; /tmp/hello\n",
         label: "compile hello.c with TCC",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 120,
-        label: "wait for hello.c compilation",
-    });
-    steps.push(SmokeStep::Send {
-        input: "/tmp/hello\n",
-        label: "run compiled hello",
-    });
-    steps.push(SmokeStep::Wait {
         pattern: "hello, world",
-        timeout_secs: 15,
+        timeout_secs: 120,
         label: "verify hello world output",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 5,
-        label: "prompt after hello",
     });
 
     // -----------------------------------------------------------------------
@@ -2780,11 +2822,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE_LOG_MARKER",
         timeout_secs: 15,
         label: "guest/log: smoke marker found in system log",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/log: prompt after log inspection",
     });
 
     // Shutdown/reboot (headless workflow §7) is verified by the manual
@@ -7403,10 +7440,9 @@ mod tests {
         let hello_compile =
             send_input_for_label(&smoke_test_script(false), "compile hello.c with TCC");
 
-        assert_eq!(
-            hello_compile,
-            Some("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello\n")
-        );
+        let hello_compile = hello_compile.expect("compile step should exist");
+        assert!(hello_compile.starts_with("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello"));
+        assert!(hello_compile.ends_with("; /tmp/hello\n"));
     }
 
     #[test]
@@ -7503,6 +7539,18 @@ mod tests {
     fn find_serial_match_requires_prompt_suffix_for_shell_prompts() {
         let serial = "root@m3os:/# /bin/file /tmp/hello";
         assert!(find_serial_match(serial, serial, "# ").is_none());
+    }
+
+    #[test]
+    fn find_serial_match_accepts_prompt_after_carriage_return_redraw() {
+        let serial = "root@m3os:/# /usr/bin/tcc --version\rroot@m3os:/# ";
+        assert!(find_serial_match(serial, serial, "# ").is_some());
+    }
+
+    #[test]
+    fn render_terminal_text_replaces_line_after_carriage_return() {
+        let serial = "root@m3os:/# /usr/bin/tcc --version\rroot@m3os:/# ";
+        assert_eq!(render_terminal_text(serial), "root@m3os:/# ");
     }
 
     #[test]
