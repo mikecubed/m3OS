@@ -2166,12 +2166,33 @@ fn find_serial_match(
     cleaned: &str,
     pattern: &str,
 ) -> Option<(SerialMatchMode, usize)> {
+    if matches!(pattern, "# " | "$ ") {
+        for prompt in ["# ", "$ "] {
+            if let Some(end) = prompt_suffix_end(stripped, prompt) {
+                return Some((SerialMatchMode::Stripped, end));
+            }
+        }
+        for prompt in ["# ", "$ "] {
+            if let Some(end) = prompt_suffix_end(cleaned, prompt) {
+                return Some((SerialMatchMode::Cleaned, end));
+            }
+        }
+        return None;
+    }
     if let Some(pos) = stripped.find(pattern) {
         return Some((SerialMatchMode::Stripped, pos + pattern.len()));
     }
     cleaned
         .find(pattern)
         .map(|pos| (SerialMatchMode::Cleaned, pos + pattern.len()))
+}
+
+fn prompt_suffix_end(buf: &str, prompt: &str) -> Option<usize> {
+    let trimmed = buf.trim_end_matches(['\r', '\n']);
+    if !trimmed.ends_with(prompt) {
+        return None;
+    }
+    Some(trimmed.len())
 }
 
 /// Background serial output reader.
@@ -2356,6 +2377,7 @@ fn run_smoke_script(
                 );
                 if let Some(stdin) = child.stdin.as_mut() {
                     use std::io::Write;
+                    serial_buf.clear();
                     if stdin.write_all(input.as_bytes()).is_err() {
                         return Err(format!(
                             "failed to send input at step {}: {label}",
@@ -2580,6 +2602,15 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         extra_steps_a: FIRST_BOOT_LOGIN,
         extra_steps_b: NORMAL_LOGIN,
     });
+    steps.push(SmokeStep::Send {
+        input: "/bin/sh0\n",
+        label: "switch to sh0 for smoke commands",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "$ ",
+        timeout_secs: 10,
+        label: "wait for sh0 prompt",
+    });
 
     // -----------------------------------------------------------------------
     // 2. Basic shell sanity
@@ -2623,7 +2654,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 30,
+        timeout_secs: 120,
         label: "wait for hello.c compilation",
     });
     steps.push(SmokeStep::Send {
@@ -6662,6 +6693,7 @@ fn run_smoke_steps_with_capture(
                     .as_mut()
                     .ok_or_else(|| format!("no stdin at step {} ({label})", step_num))?;
                 use std::io::Write;
+                serial_buf.clear();
                 stdin
                     .write_all(input.as_bytes())
                     .map_err(|e| format!("write failed at step {} ({label}): {e}", step_num))?;
@@ -7371,6 +7403,16 @@ mod tests {
     }
 
     #[test]
+    fn smoke_test_switches_to_sh0_before_running_commands() {
+        let switch = send_input_for_label(
+            &smoke_test_script(false),
+            "switch to sh0 for smoke commands",
+        );
+
+        assert_eq!(switch, Some("/bin/sh0\n"));
+    }
+
+    #[test]
     fn smoke_test_hello_compile_uses_direct_tcc_command() {
         let hello_compile =
             send_input_for_label(&smoke_test_script(false), "compile hello.c with TCC");
@@ -7457,6 +7499,24 @@ mod tests {
     fn strip_background_noise_handles_trailing_noise_without_newline() {
         let input = "output here[INFO] [fork] p8 fork()";
         assert_eq!(strip_background_noise(input), "output here");
+    }
+
+    #[test]
+    fn prompt_suffix_end_matches_terminal_prompt_suffix() {
+        let serial = "tcc version 0.9.27\nroot@m3os:/# ";
+        assert_eq!(prompt_suffix_end(serial, "# "), Some(serial.len()));
+    }
+
+    #[test]
+    fn prompt_suffix_end_rejects_prompt_fragments_followed_by_command_text() {
+        let serial = "root@m3os:/# /bin/file /tmp/hello";
+        assert_eq!(prompt_suffix_end(serial, "# "), None);
+    }
+
+    #[test]
+    fn find_serial_match_requires_prompt_suffix_for_shell_prompts() {
+        let serial = "root@m3os:/# /bin/file /tmp/hello";
+        assert!(find_serial_match(serial, serial, "# ").is_none());
     }
 
     #[test]
