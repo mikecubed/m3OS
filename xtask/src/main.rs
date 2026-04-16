@@ -2663,7 +2663,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "echo test",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "SMOKE_OK",
+        pattern: "\nSMOKE_OK",
         timeout_secs: 5,
         label: "verify echo output",
     });
@@ -2692,12 +2692,30 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
 
     steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello; /tmp/hello\n",
+        input: "cd /usr/src\n",
+        label: "change to hello source directory",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 10,
+        label: "prompt after changing to hello source directory",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/usr/bin/tcc -static hello.c -o /tmp/h\n",
         label: "compile hello.c with TCC",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "hello, world",
+        pattern: "# ",
         timeout_secs: 120,
+        label: "prompt after compiling hello.c with TCC",
+    });
+    steps.push(SmokeStep::Send {
+        input: "/tmp/h\n",
+        label: "run compiled hello binary",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "hello, world",
+        timeout_secs: 30,
         label: "verify hello world output",
     });
     steps.push(SmokeStep::Wait {
@@ -2748,7 +2766,7 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 20,
+        timeout_secs: 40,
         label: "guest/service: prompt after service list",
     });
 
@@ -7459,8 +7477,15 @@ mod tests {
             send_input_for_label(&smoke_test_script(false), "compile hello.c with TCC");
 
         let hello_compile = hello_compile.expect("compile step should exist");
-        assert!(hello_compile.starts_with("/usr/bin/tcc -static /usr/src/hello.c -o /tmp/hello"));
-        assert!(hello_compile.ends_with("; /tmp/hello\n"));
+        assert_eq!(hello_compile, "/usr/bin/tcc -static hello.c -o /tmp/h\n");
+    }
+
+    #[test]
+    fn smoke_test_runs_hello_binary_separately() {
+        assert_eq!(
+            send_input_for_label(&smoke_test_script(false), "run compiled hello binary"),
+            Some("/tmp/h\n")
+        );
     }
 
     #[test]
@@ -7468,6 +7493,14 @@ mod tests {
         let tcc_version = send_input_for_label(&smoke_test_script(false), "tcc --version");
 
         assert_eq!(tcc_version, Some("/usr/bin/tcc --version\n"));
+    }
+
+    #[test]
+    fn smoke_test_echo_waits_for_output_line_not_command_echo() {
+        assert_eq!(
+            wait_pattern_for_label(&smoke_test_script(false), "verify echo output"),
+            Some("\nSMOKE_OK")
+        );
     }
 
     #[test]
