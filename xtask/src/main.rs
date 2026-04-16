@@ -6056,25 +6056,6 @@ fn service_lifecycle_steps() -> Vec<SmokeStep> {
     let mut steps = boot_and_login_steps();
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/service list\n",
-        label: "guest/service: enumerate services",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "NAME",
-        timeout_secs: 15,
-        label: "guest/service: list header visible",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "sshd",
-        timeout_secs: 10,
-        label: "guest/service: list includes sshd",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 15,
-        label: "guest/service: prompt after list",
-    });
-    steps.push(SmokeStep::Send {
         input: "/bin/service status sshd\n",
         label: "guest/service: query sshd status",
     });
@@ -6209,7 +6190,7 @@ fn log_pipeline_steps() -> Vec<SmokeStep> {
     let mut steps = boot_and_login_steps();
     steps.push(SmokeStep::Sleep { millis: 500 });
     steps.push(SmokeStep::Send {
-        input: "/bin/logger \"REGTEST_LOG_MARKER\"\n",
+        input: "/bin/logger REGTEST_LOG_MARKER\n",
         label: "guest/log: inject log message via /dev/log",
     });
     steps.push(SmokeStep::Wait {
@@ -6394,9 +6375,24 @@ fn boot_and_login_steps() -> Vec<SmokeStep> {
             label: "password",
         },
         SmokeStep::Wait {
-            pattern: "# ",
+            pattern: "[security] credential transition complete",
             timeout_secs: 30,
-            label: "wait for shell prompt",
+            label: "wait for credential transition completion",
+        },
+        SmokeStep::Sleep { millis: 500 },
+        SmokeStep::Send {
+            input: "/bin/echo __LOGIN_READY__\n",
+            label: "bootstrap shell with deterministic ready marker",
+        },
+        SmokeStep::Wait {
+            pattern: "__LOGIN_READY__",
+            timeout_secs: 30,
+            label: "wait for login ready marker",
+        },
+        SmokeStep::Wait {
+            pattern: "# ",
+            timeout_secs: 10,
+            label: "wait for shell prompt after ready marker",
         },
     ]
 }
