@@ -1008,31 +1008,8 @@ fn terminal_size() -> (usize, usize) {
     }
 }
 
-// Signal restorer trampoline — must live in executable .text segment.
-// Performs rt_sigreturn (syscall 15) so the kernel can restore context.
-core::arch::global_asm!(
-    ".global __sigrestorer",
-    "__sigrestorer:",
-    "mov rax, 15",
-    "syscall",
-);
-
-unsafe extern "C" {
-    fn __sigrestorer();
-}
-
 fn register_sigwinch_handler() {
-    let sa = syscall_lib::SigAction {
-        sa_handler: sigwinch_handler as *const () as u64,
-        sa_flags: syscall_lib::SA_RESTORER,
-        sa_restorer: __sigrestorer as *const () as u64,
-        sa_mask: 0,
-    };
-    syscall_lib::rt_sigaction(
-        syscall_lib::SIGWINCH as usize,
-        &sa as *const syscall_lib::SigAction,
-        core::ptr::null_mut(),
-    );
+    let _ = syscall_lib::rt_sigaction_simple(syscall_lib::SIGWINCH as usize, sigwinch_handler);
 }
 
 extern "C" fn sigwinch_handler(_sig: i32) {

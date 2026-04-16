@@ -8,8 +8,8 @@
 #![no_main]
 
 use syscall_lib::{
-    AF_UNIX, CLOCK_REALTIME, SOCK_DGRAM, STDERR_FILENO, STDOUT_FILENO, SigAction, SockaddrUn,
-    WNOHANG, clock_gettime, close, execve, exit, fork, gmtime, nanosleep, open, read, rt_sigaction,
+    AF_UNIX, CLOCK_REALTIME, SOCK_DGRAM, STDERR_FILENO, STDOUT_FILENO, SockaddrUn, WNOHANG,
+    clock_gettime, close, execve, exit, fork, gmtime, nanosleep, open, read, rt_sigaction_simple,
     sendto_unix, socket, waitpid, write, write_str,
 };
 
@@ -562,18 +562,10 @@ fn entry_matches(
 fn main(_args: &[&str]) -> i32 {
     write_str(STDOUT_FILENO, "crond: starting\n");
 
-    // Install SIGHUP handler for crontab reload
-    let sa = SigAction {
-        sa_handler: sighup_handler as *const () as u64,
-        sa_flags: 0,
-        sa_restorer: 0,
-        sa_mask: 0,
-    };
-    let _ = rt_sigaction(
-        syscall_lib::SIGHUP as usize,
-        &sa as *const SigAction,
-        core::ptr::null_mut(),
-    );
+    // Install SIGHUP handler for crontab reload. rt_sigaction_simple provides
+    // the default __syscall_lib_sigrestorer trampoline; without SA_RESTORER
+    // the handler would fault on return the moment a reload signal arrived.
+    let _ = rt_sigaction_simple(syscall_lib::SIGHUP as usize, sighup_handler);
 
     // Open syslog socket
     let log_fd = open_syslog();

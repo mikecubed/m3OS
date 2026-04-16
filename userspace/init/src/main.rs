@@ -15,10 +15,10 @@
 #![no_main]
 
 use syscall_lib::{
-    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
-    SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
-    nanosleep, open, read, rt_sigaction, sendto_unix, set_nonblocking, setuid, socket, waitpid,
-    write, write_str, write_u64,
+    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SockaddrUn, WNOHANG,
+    clock_gettime, close, execve, exit, fork, getdents64, kill, mount, nanosleep, open, read,
+    rt_sigaction_simple, sendto_unix, set_nonblocking, setuid, socket, waitpid, write, write_str,
+    write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -1909,14 +1909,10 @@ pub extern "C" fn _start() -> ! {
     // Make /tmp world-writable.
     syscall_lib::chmod(b"/tmp\0", 0o1777);
 
-    // Install SIGTERM handler for orderly shutdown.
-    let act = SigAction {
-        sa_handler: sigterm_handler as *const () as u64,
-        sa_flags: 0,
-        sa_restorer: 0,
-        sa_mask: 0,
-    };
-    rt_sigaction(SIGTERM as usize, &act, core::ptr::null_mut());
+    // Install SIGTERM handler for orderly shutdown. rt_sigaction_simple wires
+    // up the default __syscall_lib_sigrestorer trampoline so the handler can
+    // return without faulting (missing SA_RESTORER would leave restorer=0).
+    rt_sigaction_simple(SIGTERM as usize, sigterm_handler);
 
     // Initialize service manager.
     let mut mgr = ServiceManager::new();
