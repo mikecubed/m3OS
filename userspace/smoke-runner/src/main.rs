@@ -34,6 +34,9 @@ const FILE_SCAN_BUF_LEN: usize = 1152;
 syscall_lib::entry_point!(program_main);
 
 fn program_main(_args: &[&str]) -> i32 {
+    write_str(STDOUT_FILENO, "SMOKE:BEGIN\n");
+
+    begin("auth");
     if geteuid() != 0 {
         return fail("auth", "expected root shell session", 1);
     }
@@ -41,6 +44,7 @@ fn program_main(_args: &[&str]) -> i32 {
 
     let mut command_output = [0u8; READ_BUF_LEN];
 
+    begin("tcc-version");
     let tcc_version_argv = [TCC_ARGV0.as_ptr(), TCC_VERSION_ARG.as_ptr(), ptr::null()];
     if let Err(code) = run_command_expect_output(
         "tcc-version",
@@ -53,6 +57,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     pass("tcc-version");
 
+    begin("tcc-compile");
     let tcc_compile_argv = [
         TCC_ARGV0.as_ptr(),
         TCC_STATIC_ARG.as_ptr(),
@@ -69,7 +74,9 @@ fn program_main(_args: &[&str]) -> i32 {
     ) {
         return code;
     }
+    pass("tcc-compile");
 
+    begin("hello");
     let hello_argv = [HELLO_BIN_PATH.as_ptr(), ptr::null()];
     if let Err(code) = run_command_expect_output(
         "hello",
@@ -83,6 +90,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let _ = unlink(HELLO_BIN_PATH);
     pass("hello");
 
+    begin("service");
     if !wait_for_file_contains(SERVICE_STATUS_PATH, SERVICE_STATUS_NEEDLE, 30) {
         return fail(
             "service",
@@ -92,11 +100,13 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     pass("service");
 
+    begin("storage");
     if let Err(code) = create_and_verify_smoke_file() {
         return code;
     }
     pass("storage");
 
+    begin("net");
     let udp_smoke_argv = [UDP_SMOKE_PATH.as_ptr(), ptr::null()];
     if let Err(code) = run_command_expect_output(
         "net",
@@ -109,6 +119,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
     pass("net");
 
+    begin("log");
     if let Err(code) = inject_and_verify_log_marker(&mut command_output) {
         return code;
     }
@@ -387,6 +398,12 @@ fn pass(stage: &str) {
     write_str(STDOUT_FILENO, ":PASS\n");
 }
 
+fn begin(stage: &str) {
+    write_str(STDOUT_FILENO, "SMOKE:");
+    write_str(STDOUT_FILENO, stage);
+    write_str(STDOUT_FILENO, ":BEGIN\n");
+}
+
 fn fail(stage: &str, msg: &str, code: i32) -> i32 {
     write_str(STDOUT_FILENO, "SMOKE:");
     write_str(STDOUT_FILENO, stage);
@@ -410,5 +427,6 @@ fn fail_with_output(stage: &str, msg: &str, code: i32, output: &[u8]) -> i32 {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    write_str(STDOUT_FILENO, "SMOKE:panic:FAIL\n");
     exit(101)
 }

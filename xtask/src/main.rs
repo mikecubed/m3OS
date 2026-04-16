@@ -2276,6 +2276,7 @@ fn spawn_serial_reader(stdout: std::process::ChildStdout) -> std::sync::mpsc::Re
 fn drain_serial_until_idle(
     rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     serial_buf: &mut String,
+    serial_history: &mut String,
     idle_threshold: std::time::Duration,
     idle_cap: std::time::Duration,
 ) {
@@ -2285,8 +2286,7 @@ fn drain_serial_until_idle(
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(chunk) => {
-                let text = String::from_utf8_lossy(&chunk);
-                serial_buf.push_str(&text);
+                append_serial_chunk(serial_buf, serial_history, &chunk);
                 last_data = std::time::Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -2316,6 +2316,7 @@ fn run_smoke_script(
     let rx = spawn_serial_reader(stdout);
 
     let mut serial_buf = String::new();
+    let mut serial_history = String::new();
     let global_start = std::time::Instant::now();
     // Use a queue so WaitEither can inject extra steps at the front.
     let mut queue: VecDeque<&SmokeStep> = steps.iter().collect();
@@ -2349,8 +2350,7 @@ fn run_smoke_script(
                 loop {
                     // Drain any available output.
                     while let Ok(chunk) = rx.try_recv() {
-                        let text = String::from_utf8_lossy(&chunk);
-                        serial_buf.push_str(&text);
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
                     }
 
                     // Check for pattern in stripped output.  Also try with
@@ -2368,7 +2368,7 @@ fn run_smoke_script(
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
                         return Err(format!(
                             "step {} timed out: {label}\n\
                              expected pattern: \"{pattern}\"\n\
@@ -2380,8 +2380,7 @@ fn run_smoke_script(
                     // Wait a bit before polling again.
                     match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(chunk) => {
-                            let text = String::from_utf8_lossy(&chunk);
-                            serial_buf.push_str(&text);
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2395,7 +2394,7 @@ fn run_smoke_script(
                                 serial_buf.clear();
                                 break;
                             }
-                            let tail = tail_lines(&stripped, 50);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
                             return Err(format!(
                                 "QEMU exited while waiting for step {}: {label}\n\
                                  expected pattern: \"{pattern}\"\n\
@@ -2403,16 +2402,6 @@ fn run_smoke_script(
                                 step_num
                             ));
                         }
-                    }
-
-                    // Trim buffer to prevent unbounded growth (keep last 64 KB).
-                    if serial_buf.len() > 64 * 1024 {
-                        let mut cut = serial_buf.len() - 48 * 1024;
-                        // Advance to next char boundary to avoid splitting a multi-byte UTF-8 sequence.
-                        while cut < serial_buf.len() && !serial_buf.is_char_boundary(cut) {
-                            cut += 1;
-                        }
-                        serial_buf.drain(..cut);
                     }
                 }
             }
@@ -2425,6 +2414,7 @@ fn run_smoke_script(
                 drain_serial_until_idle(
                     &rx,
                     &mut serial_buf,
+                    &mut serial_history,
                     std::time::Duration::from_millis(150),
                     std::time::Duration::from_secs(2),
                 );
@@ -2468,8 +2458,7 @@ fn run_smoke_script(
                 let matched_a;
                 loop {
                     while let Ok(chunk) = rx.try_recv() {
-                        let text = String::from_utf8_lossy(&chunk);
-                        serial_buf.push_str(&text);
+                        append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
                     }
                     let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
@@ -2490,7 +2479,7 @@ fn run_smoke_script(
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                        let tail = tail_lines(&strip_ansi(&serial_history), 80);
                         return Err(format!(
                             "step {} timed out: {label}\n\
                              expected pattern_a: \"{pattern_a}\"\n\
@@ -2501,26 +2490,18 @@ fn run_smoke_script(
                     }
                     match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(chunk) => {
-                            let text = String::from_utf8_lossy(&chunk);
-                            serial_buf.push_str(&text);
+                            append_serial_chunk(&mut serial_buf, &mut serial_history, &chunk);
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             let _ = child.wait();
-                            let tail = tail_lines(&strip_ansi(&serial_buf), 50);
+                            let tail = tail_lines(&strip_ansi(&serial_history), 80);
                             return Err(format!(
                                 "QEMU exited while waiting for step {}: {label}\n\
                                  last serial output:\n{tail}",
                                 step_num
                             ));
                         }
-                    }
-                    if serial_buf.len() > 64 * 1024 {
-                        let mut cut = serial_buf.len() - 48 * 1024;
-                        while cut < serial_buf.len() && !serial_buf.is_char_boundary(cut) {
-                            cut += 1;
-                        }
-                        serial_buf.drain(..cut);
                     }
                 }
                 let inject = if matched_a {
@@ -2547,6 +2528,26 @@ fn run_smoke_script(
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+fn append_serial_chunk(serial_buf: &mut String, serial_history: &mut String, chunk: &[u8]) {
+    let text = String::from_utf8_lossy(chunk);
+    serial_buf.push_str(&text);
+    serial_history.push_str(&text);
+    trim_serial_buffer(serial_buf, 64 * 1024, 48 * 1024);
+    trim_serial_buffer(serial_history, 256 * 1024, 192 * 1024);
+}
+
+fn trim_serial_buffer(buf: &mut String, max_len: usize, keep_len: usize) {
+    if buf.len() <= max_len {
+        return;
+    }
+
+    let mut cut = buf.len().saturating_sub(keep_len);
+    while cut < buf.len() && !buf.is_char_boundary(cut) {
+        cut += 1;
+    }
+    buf.drain(..cut);
 }
 
 /// Return the last `n` lines of a string.
@@ -2688,9 +2689,14 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/tcc: smoke runner verified tcc version",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "SMOKE:hello:PASS",
+        pattern: "SMOKE:tcc-compile:PASS",
         timeout_secs: 180,
-        label: "guest/tcc: smoke runner compiled and ran hello world",
+        label: "guest/tcc: smoke runner compiled hello world",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:hello:PASS",
+        timeout_secs: 20,
+        label: "guest/hello: smoke runner ran compiled hello world",
     });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:service:PASS",
@@ -6509,9 +6515,11 @@ fn run_smoke_steps_with_capture(
     steps: &[SmokeStep],
     global_timeout: std::time::Duration,
     rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-    mut serial_buf: &mut String,
+    serial_buf: &mut String,
     global_start: std::time::Instant,
 ) -> Result<(), String> {
+    let serial_history = &mut *serial_buf;
+    let mut serial_buf = String::new();
     // Use a queue so WaitEither can inject extra steps at the front.
     let mut queue: std::collections::VecDeque<&SmokeStep> = steps.iter().collect();
     let mut step_num = 0usize;
@@ -6540,11 +6548,10 @@ fn run_smoke_steps_with_capture(
 
                 loop {
                     while let Ok(chunk) = rx.try_recv() {
-                        let text = String::from_utf8_lossy(&chunk);
-                        serial_buf.push_str(&text);
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
                     }
 
-                    let stripped = strip_ansi(serial_buf);
+                    let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
 
                     // Check for kernel-level crash indicators in serial output.
@@ -6566,8 +6573,7 @@ fn run_smoke_steps_with_capture(
 
                     if child.try_wait().ok().flatten().is_some() {
                         while let Ok(chunk) = rx.try_recv() {
-                            let text = String::from_utf8_lossy(&chunk);
-                            serial_buf.push_str(&text);
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
                         }
                         return Err(format!(
                             "QEMU exited unexpectedly at step {} ({label})",
@@ -6576,15 +6582,7 @@ fn run_smoke_steps_with_capture(
                     }
 
                     if std::time::Instant::now() >= deadline {
-                        let last_lines: String = serial_buf
-                            .lines()
-                            .rev()
-                            .take(30)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
                         return Err(format!(
                             "timeout waiting for '{pattern}' at step {} ({label})\nLast serial output:\n{last_lines}",
                             step_num
@@ -6593,20 +6591,12 @@ fn run_smoke_steps_with_capture(
 
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-
-                // Trim buffer to avoid unbounded growth.
-                if serial_buf.len() > 64 * 1024 {
-                    let keep_from = serial_buf.len() - 48 * 1024;
-                    let boundary = (keep_from..serial_buf.len())
-                        .find(|&i| serial_buf.is_char_boundary(i))
-                        .unwrap_or(serial_buf.len());
-                    serial_buf.drain(..boundary);
-                }
             }
             SmokeStep::Send { input, label } => {
                 drain_serial_until_idle(
                     rx,
                     &mut serial_buf,
+                    serial_history,
                     std::time::Duration::from_millis(150),
                     std::time::Duration::from_secs(2),
                 );
@@ -6642,10 +6632,9 @@ fn run_smoke_steps_with_capture(
                 let matched_a;
                 loop {
                     while let Ok(chunk) = rx.try_recv() {
-                        let text = String::from_utf8_lossy(&chunk);
-                        serial_buf.push_str(&text);
+                        append_serial_chunk(&mut serial_buf, serial_history, &chunk);
                     }
-                    let stripped = strip_ansi(serial_buf);
+                    let stripped = strip_ansi(&serial_buf);
                     let cleaned = strip_background_noise(&stripped);
 
                     if let Some((mode, match_end)) =
@@ -6665,8 +6654,7 @@ fn run_smoke_steps_with_capture(
 
                     if child.try_wait().ok().flatten().is_some() {
                         while let Ok(chunk) = rx.try_recv() {
-                            let text = String::from_utf8_lossy(&chunk);
-                            serial_buf.push_str(&text);
+                            append_serial_chunk(&mut serial_buf, serial_history, &chunk);
                         }
                         return Err(format!(
                             "QEMU exited unexpectedly at step {} ({label})",
@@ -6675,15 +6663,7 @@ fn run_smoke_steps_with_capture(
                     }
 
                     if std::time::Instant::now() >= deadline {
-                        let last_lines: String = serial_buf
-                            .lines()
-                            .rev()
-                            .take(30)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let last_lines = tail_lines(&strip_ansi(serial_history), 80);
                         return Err(format!(
                             "timeout at step {} ({label}), expected '{pattern_a}' or '{pattern_b}'\nLast serial output:\n{last_lines}",
                             step_num
@@ -7383,9 +7363,16 @@ mod tests {
         assert_eq!(
             wait_timeout_for_label(
                 &smoke_test_script(false),
-                "guest/tcc: smoke runner compiled and ran hello world"
+                "guest/tcc: smoke runner compiled hello world"
             ),
             Some(180)
+        );
+        assert_eq!(
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "guest/hello: smoke runner ran compiled hello world"
+            ),
+            Some("SMOKE:hello:PASS")
         );
         assert_eq!(
             wait_pattern_for_label(
@@ -7559,13 +7546,16 @@ mod tests {
         });
 
         let mut serial = String::new();
+        let mut history = String::new();
         drain_serial_until_idle(
             &rx,
             &mut serial,
+            &mut history,
             std::time::Duration::from_millis(20),
             std::time::Duration::from_millis(200),
         );
 
         assert_eq!(serial, "login: Password:");
+        assert_eq!(history, "login: Password:");
     }
 }
