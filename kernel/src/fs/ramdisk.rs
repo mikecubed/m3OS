@@ -145,6 +145,7 @@ static PATCH_ELF: &[u8] = generated_initrd_asset!("patch");
 static LESS_ELF: &[u8] = generated_initrd_asset!("less");
 // Phase 23: ping
 static PING_ELF: &[u8] = generated_initrd_asset!("ping");
+static SMOKE_RUNNER_ELF: &[u8] = generated_initrd_asset!("smoke-runner");
 // Phase 29: PTY test
 static PTY_TEST_ELF: &[u8] = generated_initrd_asset!("pty-test");
 // Phase 34: timekeeping utilities
@@ -206,6 +207,12 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         },
     ),
     ("hello", RamdiskNode::File { content: HELLO_ELF }),
+    (
+        "smoke-runner",
+        RamdiskNode::File {
+            content: SMOKE_RUNNER_ELF,
+        },
+    ),
     (
         "tmpfs-test",
         RamdiskNode::File {

@@ -1577,11 +1577,11 @@ fn check_pending_signals(syscall_result: u64) {
                 use crate::process::SignalDisposition;
                 match disposition {
                     SignalDisposition::Terminate => {
-                        log::info!("[p{}] killed by signal {}", pid, signum);
+                        log::debug!("[p{}] killed by signal {}", pid, signum);
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
-                        log::info!("[p{}] stopped by signal {}", pid, signum);
+                        log::debug!("[p{}] stopped by signal {}", pid, signum);
                         {
                             let mut table = crate::process::PROCESS_TABLE.lock();
                             if let Some(proc) = table.find_mut(pid) {
@@ -1958,7 +1958,7 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
 ///     remove Process entry, mark scheduler task as Dead.
 pub(super) fn sys_exit(code: i32) -> ! {
     let pid = crate::process::current_pid();
-    log::info!("[p{}] exit({})", pid, code);
+    log::debug!("[p{}] exit({})", pid, code);
 
     if pid != 0 {
         // Phase 40: clear_child_tid futex wake.
@@ -2020,7 +2020,7 @@ pub(super) fn sys_exit(code: i32) -> ! {
 /// process cleanup once it is the last thread standing.
 pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
-    log::info!("[p{}] exit_group({})", pid, code);
+    log::debug!("[p{}] exit_group({})", pid, code);
 
     if pid != 0 {
         // Check if we are in a thread group.
@@ -2036,7 +2036,7 @@ pub(super) fn sys_exit_group(code: i32) -> ! {
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
             ) {
-                log::info!(
+                log::debug!(
                     "[p{}] exit_group: owner {} already tearing down thread group",
                     pid,
                     owner_pid
@@ -2057,7 +2057,7 @@ pub(super) fn sys_exit_group(code: i32) -> ! {
                     continue;
                 }
                 if !crate::task::scheduler::request_group_exit_by_pid(sibling_tid) {
-                    log::info!(
+                    log::debug!(
                         "[p{}] exit_group: waiting for sibling {} scheduler task publication",
                         pid,
                         sibling_tid
@@ -2765,7 +2765,7 @@ pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         return NEG_EFAULT;
     }
 
-    log::info!(
+    log::debug!(
         "[pipe] created pipe_id={} → fd[{}(r), {}(w)]",
         pipe_id,
         read_fd,
@@ -3265,7 +3265,7 @@ pub(super) fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
 /// Returns the child PID to the parent.
 pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     let parent_pid = crate::process::current_pid();
-    log::info!("[p{}] fork()", parent_pid);
+    log::debug!("[p{}] fork()", parent_pid);
 
     // Allocate a new page table for the child, copying kernel entries.
     let child_cr3 = match crate::mm::new_process_page_table() {
@@ -3423,7 +3423,7 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         "fork-child",
     );
 
-    log::info!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
     child_pid as u64
 }
 
@@ -3548,7 +3548,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     let name: &str = &resolved_name;
     let pid = crate::process::current_pid();
-    log::info!("[p{}] execve({})", pid, name);
+    log::debug!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
     // it from the canonical single-threaded TGID owner. Otherwise shared-mm
     // metadata would remain anchored on a different Process entry.
@@ -3848,7 +3848,7 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 let _ = UserSliceWo::new(status_ptr, bytes.len())
                     .and_then(|s| s.copy_from_kernel(&bytes));
             }
-            log::info!(
+            log::debug!(
                 "[waitpid] pid {} {}",
                 child_pid,
                 if stopped { "stopped" } else { "exited" }
@@ -7988,7 +7988,7 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
 
     if freed_count > 0 {
-        log::info!(
+        log::debug!(
             "[munmap] freed {} pages @ {:#x} (len={:#x})",
             freed_count,
             addr,
@@ -11524,7 +11524,7 @@ fn sys_clone_thread(
         "clone-thread",
     );
 
-    log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
+    log::debug!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64
 }
 

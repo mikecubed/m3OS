@@ -15,6 +15,7 @@ members = [
     "userspace/ping",
     # Phase 54 validation probe
     "userspace/udp-smoke",
+    "userspace/smoke-runner",
     # Phase 26 text editor
     "userspace/edit",
     # Phase 27 user accounts

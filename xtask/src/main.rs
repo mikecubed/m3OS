@@ -159,6 +159,7 @@ fn build_userspace_bins() {
         ("echo-args", "echo-args", false),
         ("ping", "ping", false),
         ("udp-smoke", "udp-smoke", false),
+        ("smoke-runner", "smoke-runner", false),
         ("init", "init", false),
         ("shell", "sh0", false),
         ("edit", "edit", true),
@@ -2659,198 +2660,67 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     // 2. Basic shell sanity
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/bin/echo SMOKE_OK\n",
+        input: "echo SMOKE_OK\n",
         label: "echo test",
     });
     steps.push(SmokeStep::Wait {
         pattern: "\nSMOKE_OK",
-        timeout_secs: 5,
+        timeout_secs: 10,
         label: "verify echo output",
     });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "prompt after echo",
-    });
+    steps.push(SmokeStep::Sleep { millis: 1000 });
 
     // -----------------------------------------------------------------------
-    // 3. TCC compiler (Phase 31 regression)
+    // 3. Guest-side smoke runner
     // -----------------------------------------------------------------------
     steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc --version\n",
-        label: "tcc --version",
+        input: "smoke-runner\n",
+        label: "run guest smoke runner",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "tcc version",
+        pattern: "SMOKE:auth:PASS",
+        timeout_secs: 10,
+        label: "guest/auth: smoke runner confirmed root session",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:tcc-version:PASS",
         timeout_secs: 30,
-        label: "verify TCC version",
+        label: "guest/tcc: smoke runner verified tcc version",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "prompt after tcc --version",
-    });
-
-    steps.push(SmokeStep::Send {
-        input: "cd /usr/src\n",
-        label: "change to hello source directory",
+        pattern: "SMOKE:hello:PASS",
+        timeout_secs: 180,
+        label: "guest/tcc: smoke runner compiled and ran hello world",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "prompt after changing to hello source directory",
-    });
-    steps.push(SmokeStep::Send {
-        input: "/usr/bin/tcc -static hello.c -o /tmp/h\n",
-        label: "compile hello.c with TCC",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 120,
-        label: "prompt after compiling hello.c with TCC",
-    });
-    steps.push(SmokeStep::Send {
-        input: "/tmp/h\n",
-        label: "run compiled hello binary",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "hello, world",
+        pattern: "SMOKE:service:PASS",
         timeout_secs: 30,
-        label: "verify hello world output",
+        label: "guest/service: smoke runner observed syslogd running",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:storage:PASS",
+        timeout_secs: 20,
+        label: "guest/storage: smoke runner verified ext2 file lifecycle",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:net:PASS",
+        timeout_secs: 45,
+        label: "guest/net: smoke runner completed udp smoke",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:log:PASS",
+        timeout_secs: 20,
+        label: "guest/log: smoke runner verified syslog marker",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SMOKE:PASS",
+        timeout_secs: 5,
+        label: "guest smoke runner completed all checks",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
-        label: "prompt after hello",
-    });
-
-    // -----------------------------------------------------------------------
-    // 4. Security floor verification (Phase 48 — headless workflow §1)
-    // -----------------------------------------------------------------------
-    // Verify kernel-enforced setuid/setgid transition by checking effective
-    // uid via the `id` command. The login binary's shadow-file auth path
-    // already succeeded (we reached a shell prompt), and on first-boot the
-    // getrandom()-backed password hash was stored. This step makes the
-    // credential state observable in serial output.
-    steps.push(SmokeStep::Send {
-        input: "/bin/id\n",
-        label: "guest/auth: verify uid after login",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "uid=0",
-        timeout_secs: 10,
-        label: "guest/auth: id shows uid=0 (root)",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/auth: prompt after id",
-    });
-
-    // -----------------------------------------------------------------------
-    // 5. Service inspection (headless workflow §2)
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "/bin/service list\n",
-        label: "guest/service: enumerate managed services",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "NAME",
-        timeout_secs: 15,
-        label: "guest/service: list header visible",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "syslogd",
-        timeout_secs: 10,
-        label: "guest/service: list includes syslogd",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 40,
-        label: "guest/service: prompt after service list",
-    });
-
-    // -----------------------------------------------------------------------
-    // 6. Storage verification (headless workflow §3)
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "/bin/touch /root/smoke_test_file\n",
-        label: "guest/storage: create file on ext2",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/storage: prompt after touch",
-    });
-    steps.push(SmokeStep::Send {
-        input: "/bin/ls /root/smoke_test_file\n",
-        label: "guest/storage: verify file exists",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "smoke_test_file",
-        timeout_secs: 10,
-        label: "guest/storage: ls shows created file",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/storage: prompt after ls",
-    });
-    steps.push(SmokeStep::Send {
-        input: "/bin/rm /root/smoke_test_file\n",
-        label: "guest/storage: remove test file",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/storage: prompt after rm",
-    });
-
-    // -----------------------------------------------------------------------
-    // 7. Migrated UDP policy flow (Phase 54)
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "/root/udp-smoke\n",
-        label: "guest/net: exercise migrated UDP policy path",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "udp-smoke: PASS",
-        timeout_secs: 15,
-        label: "guest/net: udp-smoke completed",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/net: prompt after udp-smoke",
-    });
-
-    // -----------------------------------------------------------------------
-    // 8. Log inspection (headless workflow §4)
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "/bin/logger \"SMOKE_LOG_MARKER\"\n",
-        label: "guest/log: inject smoke marker via /dev/log",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/log: prompt after logger",
-    });
-    steps.push(SmokeStep::Sleep { millis: 3000 });
-    // Read file contents directly so the awaited marker cannot come from the echoed command line.
-    steps.push(SmokeStep::Send {
-        input: "/bin/cat /var/log/messages\n",
-        label: "guest/log: verify smoke marker in system log",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "SMOKE_LOG_MARKER",
-        timeout_secs: 15,
-        label: "guest/log: smoke marker found in system log",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 10,
-        label: "guest/log: prompt after log read",
+        timeout_secs: 20,
+        label: "wait for shell prompt after guest smoke runner",
     });
 
     // Shutdown/reboot (headless workflow §7) is verified by the manual
@@ -7219,6 +7089,17 @@ mod tests {
         })
     }
 
+    fn wait_timeout_for_label(steps: &[SmokeStep], target_label: &str) -> Option<u64> {
+        steps.iter().find_map(|step| match step {
+            SmokeStep::Wait {
+                timeout_secs,
+                label,
+                ..
+            } if *label == target_label => Some(*timeout_secs),
+            _ => None,
+        })
+    }
+
     #[test]
     fn signed_path_appends_signed_suffix() {
         let unsigned = PathBuf::from("target/bootx64.efi");
@@ -7443,12 +7324,12 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_stays_within_boot_login_and_tcc_scope() {
+    fn smoke_test_stays_within_boot_login_and_guest_runner_scope() {
         let labels = smoke_step_labels(&smoke_test_script(false));
 
         assert!(labels.contains(&"wait for m3OS login prompt or final boot marker"));
-        assert!(labels.contains(&"tcc --version"));
-        assert!(labels.contains(&"compile hello.c with TCC"));
+        assert!(labels.contains(&"run guest smoke runner"));
+        assert!(labels.contains(&"guest smoke runner completed all checks"));
         assert!(!labels.contains(&"run PTY regression (quick - skips ion timing tests)"));
         assert!(!labels.contains(&"doom: launch with iwad"));
         assert!(!labels.contains(&"uniq: count adjacent duplicates"));
@@ -7472,27 +7353,10 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_hello_compile_uses_direct_tcc_command() {
-        let hello_compile =
-            send_input_for_label(&smoke_test_script(false), "compile hello.c with TCC");
+    fn smoke_test_runs_guest_smoke_runner_with_single_command() {
+        let runner = send_input_for_label(&smoke_test_script(false), "run guest smoke runner");
 
-        let hello_compile = hello_compile.expect("compile step should exist");
-        assert_eq!(hello_compile, "/usr/bin/tcc -static hello.c -o /tmp/h\n");
-    }
-
-    #[test]
-    fn smoke_test_runs_hello_binary_separately() {
-        assert_eq!(
-            send_input_for_label(&smoke_test_script(false), "run compiled hello binary"),
-            Some("/tmp/h\n")
-        );
-    }
-
-    #[test]
-    fn smoke_test_tcc_version_runs_direct_command() {
-        let tcc_version = send_input_for_label(&smoke_test_script(false), "tcc --version");
-
-        assert_eq!(tcc_version, Some("/usr/bin/tcc --version\n"));
+        assert_eq!(runner, Some("smoke-runner\n"));
     }
 
     #[test]
@@ -7501,38 +7365,42 @@ mod tests {
             wait_pattern_for_label(&smoke_test_script(false), "verify echo output"),
             Some("\nSMOKE_OK")
         );
+        assert_eq!(
+            wait_timeout_for_label(&smoke_test_script(false), "verify echo output"),
+            Some(10)
+        );
     }
 
     #[test]
-    fn smoke_test_touch_and_rm_use_direct_commands() {
-        let touch = send_input_for_label(
-            &smoke_test_script(false),
-            "guest/storage: create file on ext2",
+    fn smoke_test_waits_for_guest_smoke_runner_markers() {
+        assert_eq!(
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "guest/auth: smoke runner confirmed root session"
+            ),
+            Some("SMOKE:auth:PASS")
         );
-        let rm = send_input_for_label(&smoke_test_script(false), "guest/storage: remove test file");
-
-        assert_eq!(touch, Some("/bin/touch /root/smoke_test_file\n"));
-        assert_eq!(rm, Some("/bin/rm /root/smoke_test_file\n"));
-    }
-
-    #[test]
-    fn smoke_test_logger_uses_direct_command() {
-        let logger = send_input_for_label(
-            &smoke_test_script(false),
-            "guest/log: inject smoke marker via /dev/log",
+        assert_eq!(
+            wait_timeout_for_label(
+                &smoke_test_script(false),
+                "guest/tcc: smoke runner compiled and ran hello world"
+            ),
+            Some(180)
         );
-
-        assert_eq!(logger, Some("/bin/logger \"SMOKE_LOG_MARKER\"\n"));
-    }
-
-    #[test]
-    fn smoke_test_log_verification_reads_log_file_contents() {
-        let log_check = send_input_for_label(
-            &smoke_test_script(false),
-            "guest/log: verify smoke marker in system log",
+        assert_eq!(
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "guest/log: smoke runner verified syslog marker"
+            ),
+            Some("SMOKE:log:PASS")
         );
-
-        assert_eq!(log_check, Some("/bin/cat /var/log/messages\n"));
+        assert_eq!(
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "guest smoke runner completed all checks"
+            ),
+            Some("SMOKE:PASS")
+        );
     }
 
     #[test]
