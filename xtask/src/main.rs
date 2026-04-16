@@ -6310,13 +6310,19 @@ fn security_floor_steps() -> Vec<SmokeStep> {
 
     // 3. Verify /bin/su can authenticate via /etc/shadow and restore a
     //    privileged shell.
+    //
+    //    Post-Phase-54: after "[security] su credential transition complete",
+    //    the target shell (ion) reads its per-user config + history from ext2
+    //    via multi-hop IPC (syscall -> vfs_server -> fat_server -> block I/O).
+    //    Under -smp 2 TCG in CI this reliably exceeds 10s; aligned to 30s to
+    //    match the login bootstrap budget in boot_and_login_steps.
     steps.push(SmokeStep::Send {
         input: "/bin/su user\n",
         label: "guest/auth: drop into user shell via su",
     });
     steps.push(SmokeStep::Wait {
         pattern: "$ ",
-        timeout_secs: 10,
+        timeout_secs: 30,
         label: "guest/auth: user shell prompt after su user",
     });
     steps.push(SmokeStep::Send {
@@ -6325,12 +6331,12 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "user",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "guest/auth: whoami confirms user",
     });
     steps.push(SmokeStep::Wait {
         pattern: "$ ",
-        timeout_secs: 5,
+        timeout_secs: 15,
         label: "guest/auth: prompt after user whoami",
     });
     steps.push(SmokeStep::Send {
@@ -6339,7 +6345,7 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "Password:",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "guest/auth: su root password prompt",
     });
     steps.push(SmokeStep::Send {
@@ -6348,7 +6354,7 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
+        timeout_secs: 30,
         label: "guest/auth: root shell prompt after su root",
     });
 
