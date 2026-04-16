@@ -258,23 +258,39 @@ fn run_command_expect_success(
     stage: &str,
     path: &[u8],
     argv: &[*const u8],
-    output: &mut [u8],
+    _output: &mut [u8],
 ) -> Result<(), i32> {
-    let (status, len) = match run_command_capture(path, argv, output) {
-        Ok(result) => result,
+    let status = match run_command_wait(path, argv) {
+        Ok(status) => status,
         Err(msg) => return Err(fail(stage, msg, 10)),
     };
 
     if exit_code(status) != Some(0) {
-        return Err(fail_with_output(
-            stage,
-            "command exited non-zero",
-            11,
-            &output[..len],
-        ));
+        return Err(fail(stage, "command exited non-zero", 11));
     }
 
     Ok(())
+}
+
+fn run_command_wait(path: &[u8], argv: &[*const u8]) -> Result<i32, &'static str> {
+    let pid = fork();
+    if pid < 0 {
+        return Err("fork() failed");
+    }
+
+    if pid == 0 {
+        let envp = [ptr::null()];
+        let _ = execve(path, argv, &envp);
+        write_str(STDOUT_FILENO, "execve() failed\n");
+        exit(127);
+    }
+
+    let mut status = 0i32;
+    if waitpid(pid as i32, &mut status, 0) != pid as isize {
+        return Err("waitpid() failed");
+    }
+
+    Ok(status)
 }
 
 fn run_command_expect_output(
@@ -368,7 +384,7 @@ fn run_command_capture(
     let _ = close(fds[0]);
 
     let mut status = 0i32;
-    if waitpid(pid as i32, &mut status, 0) != pid {
+    if waitpid(pid as i32, &mut status, 0) != pid as isize {
         return Err("waitpid() failed");
     }
 
