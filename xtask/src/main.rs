@@ -2313,6 +2313,28 @@ fn drain_serial_until_idle(
     }
 }
 
+/// Uniform timing multiplier for every Wait/WaitEither/Sleep in the smoke and
+/// regression step executors. Set `M3OS_CI_TIMING_MULT=3` (or any positive
+/// float) in CI to give serialized-VFS IPC round-trips enough headroom under
+/// `-smp 2` TCG; local dev leaves it unset for strict fail-fast budgets.
+fn ci_timing_multiplier() -> f32 {
+    std::env::var("M3OS_CI_TIMING_MULT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .unwrap_or(1.0)
+}
+
+fn scaled_secs(secs: u64) -> std::time::Duration {
+    let scaled = ((secs as f32) * ci_timing_multiplier()).ceil() as u64;
+    std::time::Duration::from_secs(scaled.max(secs))
+}
+
+fn scaled_millis(millis: u64) -> std::time::Duration {
+    let scaled = ((millis as f32) * ci_timing_multiplier()).ceil() as u64;
+    std::time::Duration::from_millis(scaled.max(millis))
+}
+
 /// Run an expect-style smoke test script against a running QEMU instance.
 ///
 /// Returns `Ok(())` on success or `Err(message)` on failure.
@@ -2352,8 +2374,7 @@ fn run_smoke_script(
                 label,
             } => {
                 println!("[step {}] wait: {label} ({}s)", step_num, timeout_secs);
-                let step_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
                 let global_deadline = global_start + global_timeout;
                 let deadline = step_deadline.min(global_deadline);
 
@@ -2445,7 +2466,7 @@ fn run_smoke_script(
 
             SmokeStep::Sleep { millis } => {
                 println!("[step {}] sleep {}ms", step_num, millis);
-                std::thread::sleep(std::time::Duration::from_millis(*millis));
+                std::thread::sleep(scaled_millis(*millis));
             }
 
             SmokeStep::WaitEither {
@@ -2460,8 +2481,7 @@ fn run_smoke_script(
                     "[step {}] wait-either: {label} ({}s)",
                     step_num, timeout_secs
                 );
-                let step_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
                 let global_deadline = global_start + global_timeout;
                 let deadline = step_deadline.min(global_deadline);
 
@@ -6602,8 +6622,7 @@ fn run_smoke_steps_with_capture(
                 timeout_secs,
                 label,
             } => {
-                let step_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
                 let global_deadline = global_start + global_timeout;
                 let deadline = step_deadline.min(global_deadline);
 
@@ -6675,7 +6694,7 @@ fn run_smoke_steps_with_capture(
                     .map_err(|e| format!("flush failed at step {} ({label}): {e}", step_num))?;
             }
             SmokeStep::Sleep { millis } => {
-                std::thread::sleep(std::time::Duration::from_millis(*millis));
+                std::thread::sleep(scaled_millis(*millis));
             }
             SmokeStep::WaitEither {
                 pattern_a,
@@ -6685,8 +6704,7 @@ fn run_smoke_steps_with_capture(
                 extra_steps_a,
                 extra_steps_b,
             } => {
-                let step_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+                let step_deadline = std::time::Instant::now() + scaled_secs(*timeout_secs);
                 let global_deadline = global_start + global_timeout;
                 let deadline = step_deadline.min(global_deadline);
 

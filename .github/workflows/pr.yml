@@ -21,6 +21,11 @@ jobs:
       # for tcc-compile + hello. Local/nightly runs still exercise the full
       # compile path.
       M3OS_SMOKE_SKIP_TCC_COMPILE: "1"
+      # 3x every per-step Wait/WaitEither/Sleep in the smoke+regression step
+      # executors. Local dev leaves unset (1.0) for strict fail-fast budgets;
+      # CI TCG under serialized VFS needs the slack uniformly so we stop
+      # chasing individual too-tight timeouts.
+      M3OS_CI_TIMING_MULT: "3"
     steps:
       - uses: actions/checkout@v5
 
@@ -68,9 +73,10 @@ jobs:
           cargo xtask smoke-test --timeout 300
 
       - name: Regression suite (SMP races + headless operator workflows)
-        # Pure TCG under -smp 2: boots run ~15-20s, so each test needs
-        # generous headroom beyond its per-step waits.
-        run: cargo xtask regression --timeout 180
+        # Per-step waits are 3x-scaled in CI (M3OS_CI_TIMING_MULT), so the
+        # per-test global timeout needs matching headroom. 90s baseline x3
+        # plus a safety margin.
+        run: cargo xtask regression --timeout 360
 
       - name: Upload regression artifacts on failure
         if: failure()
