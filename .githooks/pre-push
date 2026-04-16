@@ -1,6 +1,14 @@
 #!/bin/sh
 # Pre-push hook: run full quality gates before pushing to remote.
+#
+# The PR CI gate only runs static checks (clippy/fmt/host tests/loom) because
+# GitHub's 2-vCPU shared runners can't execute TCG-emulated QEMU workloads
+# reliably under Phase 54's IPC-heavy VFS. Full-system tests run here on
+# developer hardware instead (and in the nightly workflow for scheduled
+# coverage).
+#
 # To bypass in an emergency: git push --no-verify
+# To skip just the QEMU tests: M3OS_SKIP_QEMU_TESTS=1 git push
 
 set -e
 
@@ -16,3 +24,21 @@ fi
 
 echo "pre-push: running cargo xtask check..."
 cargo xtask check
+
+if [ "${M3OS_SKIP_QEMU_TESTS:-0}" = "1" ]; then
+    echo "pre-push: M3OS_SKIP_QEMU_TESTS=1 — skipping smoke + regression"
+    exit 0
+fi
+
+if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+    echo "pre-push: qemu-system-x86_64 not found — skipping smoke + regression"
+    echo "          install QEMU and OVMF to exercise the full-system gate locally,"
+    echo "          or set M3OS_SKIP_QEMU_TESTS=1 to silence this notice."
+    exit 0
+fi
+
+echo "pre-push: running cargo xtask smoke-test..."
+cargo xtask smoke-test --timeout 300
+
+echo "pre-push: running cargo xtask regression..."
+cargo xtask regression --timeout 90

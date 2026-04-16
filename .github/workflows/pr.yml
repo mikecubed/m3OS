@@ -10,22 +10,6 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    env:
-      # GitHub hosted runners have 2 vCPUs. Match -smp to avoid oversubscribing
-      # the emulated scheduler, which destabilizes login/IPC timing. Local dev
-      # still gets -smp 4 via the default in xtask::qemu_smp_count().
-      M3OS_SMP: "2"
-      # Pure-TCG CI can't compile hello.c with TCC through the Phase 54
-      # extracted-VFS IPC path within any reasonable per-step budget. The
-      # guest smoke-runner treats this marker as "emit SKIP instead of PASS"
-      # for tcc-compile + hello. Local/nightly runs still exercise the full
-      # compile path.
-      M3OS_SMOKE_SKIP_TCC_COMPILE: "1"
-      # 3x every per-step Wait/WaitEither/Sleep in the smoke+regression step
-      # executors. Local dev leaves unset (1.0) for strict fail-fast budgets;
-      # CI TCG under serialized VFS needs the slack uniformly so we stop
-      # chasing individual too-tight timeouts.
-      M3OS_CI_TIMING_MULT: "3"
     steps:
       - uses: actions/checkout@v5
 
@@ -37,9 +21,13 @@ jobs:
           components: rustfmt, clippy, rust-src
 
       - name: Install system dependencies
+        # musl-tools + qemu-utils + e2fsprogs are needed by `cargo xtask check`
+        # (cross-compile + disk-image build paths). QEMU itself is not needed
+        # on the PR gate — smoke and regression run on developer hardware via
+        # the pre-push hook and in the nightly workflow.
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+          sudo apt-get install -y musl-tools qemu-utils e2fsprogs
 
       - name: Cargo cache
         uses: actions/cache@v5
@@ -65,23 +53,3 @@ jobs:
 
       - name: Allocator loom concurrency tests
         run: RUSTFLAGS='--cfg loom' cargo test -p kernel-core --target x86_64-unknown-linux-gnu --test allocator_loom
-
-      - name: "Smoke test (headless workflow: boot + login + auth + service + storage + log + TCC)"
-        run: |
-          # Delete cached disk.img so it is regenerated with TCC files.
-          rm -f target/x86_64-unknown-none/release/disk.img
-          cargo xtask smoke-test --timeout 300
-
-      - name: Regression suite (SMP races + headless operator workflows)
-        # Per-step waits are 3x-scaled in CI (M3OS_CI_TIMING_MULT), so the
-        # per-test global timeout needs matching headroom. 90s baseline x3
-        # plus a safety margin.
-        run: cargo xtask regression --timeout 360
-
-      - name: Upload regression artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: regression-artifacts
-          path: target/regression/
-          retention-days: 14

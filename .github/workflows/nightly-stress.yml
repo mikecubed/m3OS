@@ -55,16 +55,34 @@ jobs:
           key: ${{ runner.os }}-tcc-${{ hashFiles('xtask/src/main.rs') }}
           restore-keys: ${{ runner.os }}-tcc-
 
+      - name: "Smoke test (full-system: boot + login + auth + service + storage + log + TCC)"
+        # Per-step waits scale 3x under CI TCG to absorb shared-runner jitter;
+        # Sleep durations are not scaled (they're deliberate settle delays).
+        env:
+          M3OS_SMP: "2"
+          M3OS_CI_TIMING_MULT: "3"
+        run: |
+          rm -f target/x86_64-unknown-none/release/disk.img
+          cargo xtask smoke-test --timeout 900
+
+      - name: "Regression suite (SMP races + headless operator workflows)"
+        env:
+          M3OS_SMP: "2"
+          M3OS_CI_TIMING_MULT: "3"
+        run: cargo xtask regression --timeout 360
+
       - name: Run stress test
         run: |
           TEST="${{ github.event.inputs.test || 'ssh-overlap' }}"
           ITERS="${{ github.event.inputs.iterations || '50' }}"
           cargo xtask stress --test "$TEST" --iterations "$ITERS" --timeout 90 --continue-on-failure
 
-      - name: Upload stress artifacts on failure
+      - name: Upload test artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: stress-artifacts
-          path: target/stress/
+          name: nightly-artifacts
+          path: |
+            target/stress/
+            target/regression/
           retention-days: 14
