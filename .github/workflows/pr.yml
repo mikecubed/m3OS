@@ -10,6 +10,11 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # GitHub hosted runners have 2 vCPUs. Match -smp to avoid oversubscribing
+      # the emulated scheduler, which destabilizes login/IPC timing. Local dev
+      # still gets -smp 4 via the default in xtask::qemu_smp_count().
+      M3OS_SMP: "2"
     steps:
       - uses: actions/checkout@v5
 
@@ -24,6 +29,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
+
+      - name: Enable KVM access
+        # GitHub hosted runners expose /dev/kvm but with restrictive permissions.
+        # Relaxing them lets QEMU use -accel kvm, giving ~5-20x speedup over TCG.
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
 
       - name: Cargo cache
         uses: actions/cache@v5

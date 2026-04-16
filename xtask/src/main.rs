@@ -1390,6 +1390,28 @@ fn find_ovmf() -> PathBuf {
     std::process::exit(1);
 }
 
+/// Returns true when `/dev/kvm` is present and usable by the current user.
+/// KVM acceleration gives a 5–20x speedup over TCG emulation and is the
+/// difference between passing and failing under CI timing budgets.
+fn qemu_kvm_available() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok()
+}
+
+/// Number of guest CPUs to configure. Defaults to 4 for SMP-race coverage on
+/// dev machines; CI (2-vCPU runners) overrides via `M3OS_SMP=2` to avoid
+/// oversubscribing the host and starving the guest scheduler.
+fn qemu_smp_count() -> u32 {
+    std::env::var("M3OS_SMP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4)
+}
+
 fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
     let mut args = vec![
         "-bios".to_string(),
@@ -1401,10 +1423,18 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         // Phase 36: increase RAM to 1 GB for larger disk image and extended storage workloads.
         "-m".to_string(),
         "1024".to_string(),
-        // Phase 25: SMP — boot with 4 CPU cores.
         "-smp".to_string(),
-        "4".to_string(),
+        qemu_smp_count().to_string(),
     ];
+
+    if qemu_kvm_available() {
+        args.extend([
+            "-accel".to_string(),
+            "kvm".to_string(),
+            "-cpu".to_string(),
+            "host".to_string(),
+        ]);
+    }
 
     match display_mode {
         QemuDisplayMode::Headless => {
