@@ -1428,12 +1428,11 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
     ];
 
     if qemu_kvm_available() {
-        args.extend([
-            "-accel".to_string(),
-            "kvm".to_string(),
-            "-cpu".to_string(),
-            "host".to_string(),
-        ]);
+        // Use KVM but stay on the default qemu64 CPU model. `-cpu host` would
+        // advertise SSE/AVX/etc., and the kernel's `switch_context()` only
+        // saves GPRs (see `-mmx,-sse` target-spec note in CLAUDE.md). Exposing
+        // SIMD silently corrupts task state and hangs boot during `fat` init.
+        args.extend(["-accel".to_string(), "kvm".to_string()]);
     }
 
     match display_mode {
