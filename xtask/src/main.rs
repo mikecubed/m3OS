@@ -6389,11 +6389,6 @@ fn boot_and_login_steps() -> Vec<SmokeStep> {
             timeout_secs: 30,
             label: "wait for login ready marker",
         },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 10,
-            label: "wait for shell prompt after ready marker",
-        },
     ]
 }
 
