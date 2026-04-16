@@ -38,6 +38,9 @@ const SIGKILL: i32 = syscall_lib::SIGKILL;
 
 const LOGIN_PATH: &[u8] = b"/bin/login\0";
 const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
+const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
+const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
+const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -667,6 +670,7 @@ struct ServiceManager {
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
+    respawn_login: bool,
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
 }
@@ -693,6 +697,7 @@ impl ServiceManager {
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
+            respawn_login: true,
             syslog_fd: -1,
         }
     }
@@ -1154,11 +1159,16 @@ impl ServiceManager {
             None => {
                 // Not a managed service — could be a login shell or other child.
                 if pid == self.login_pid {
-                    write_str(
-                        STDOUT_FILENO,
-                        "\ninit: session ended, respawning login...\n",
-                    );
-                    self.login_pid = spawn_login();
+                    if self.respawn_login {
+                        write_str(
+                            STDOUT_FILENO,
+                            "\ninit: session ended, respawning login...\n",
+                        );
+                        self.login_pid = spawn_login();
+                    } else {
+                        write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
+                        self.login_pid = -1;
+                    }
                 }
             }
         }
@@ -1821,6 +1831,41 @@ fn spawn_login() -> i32 {
     pid as i32
 }
 
+fn spawn_smoke_runner() -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        let envp: [*const u8; 5] = [
+            ENV_PATH.as_ptr(),
+            ENV_HOME.as_ptr(),
+            ENV_TERM.as_ptr(),
+            ENV_EDITOR.as_ptr(),
+            core::ptr::null(),
+        ];
+
+        let argv: [*const u8; 2] = [SMOKE_RUNNER_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SMOKE_RUNNER_PATH, &argv, &envp);
+
+        write_str(STDOUT_FILENO, "init: smoke-runner execve failed (");
+        write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+        exit(1);
+    }
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: failed to fork smoke-runner\n");
+        return -1;
+    }
+    pid as i32
+}
+
+fn smoke_test_mode_enabled() -> bool {
+    let fd = open(SMOKE_MODE_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SIGTERM handler — sets a flag checked in the main loop.
 //
@@ -1880,11 +1925,24 @@ pub extern "C" fn _start() -> ! {
     // Open syslog socket now that syslogd should be running.
     mgr.open_syslog();
 
-    // Spawn initial login session (not a managed service).
-    mgr.login_pid = spawn_login();
-    if mgr.login_pid < 0 {
-        write_str(STDOUT_FILENO, "init: failed to spawn login\n");
-        // Not fatal — services may still be running.
+    // Spawn the initial interactive session unless the smoke-test marker asks
+    // PID 1 to run the guest smoke runner directly.
+    if smoke_test_mode_enabled() {
+        write_str(
+            STDOUT_FILENO,
+            "init: smoke-test mode enabled, launching /bin/smoke-runner\n",
+        );
+        mgr.respawn_login = false;
+        mgr.login_pid = spawn_smoke_runner();
+        if mgr.login_pid < 0 {
+            write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
+        }
+    } else {
+        mgr.login_pid = spawn_login();
+        if mgr.login_pid < 0 {
+            write_str(STDOUT_FILENO, "init: failed to spawn login\n");
+            // Not fatal — services may still be running.
+        }
     }
 
     // Create control command file with root-only permissions (mode 0600).

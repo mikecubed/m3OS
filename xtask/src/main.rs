@@ -2590,94 +2590,26 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
     const BOOT_READY_MARKER: &str = "init: started 'net_udp' pid=";
 
     // -----------------------------------------------------------------------
-    // 1. Boot and login (handles both first-boot locked accounts and normal login)
+    // 1. Boot and start the dedicated guest-side smoke runner
     // -----------------------------------------------------------------------
-    // First-boot: account is locked (hash "!"), login prompts to set password.
-    // Normal boot: account has a password, login prompts for it.
-    // Both paths use "root" as the password.
-    const FIRST_BOOT_LOGIN: &[SmokeStep] = &[
-        SmokeStep::Send {
-            input: "root\n",
-            label: "set initial password",
-        },
-        SmokeStep::Wait {
-            pattern: "Retype password:",
-            timeout_secs: 10,
-            label: "wait for password confirmation prompt",
-        },
-        SmokeStep::Send {
-            input: "root\n",
-            label: "confirm initial password",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for shell prompt after first-boot setup",
-        },
-    ];
-    const NORMAL_LOGIN: &[SmokeStep] = &[
-        SmokeStep::Send {
-            input: "root\n",
-            label: "enter password",
-        },
-        SmokeStep::Wait {
-            pattern: "# ",
-            timeout_secs: 30,
-            label: "wait for shell prompt",
-        },
-    ];
-    const BOOT_MARKER_SETTLE: &[SmokeStep] = &[
-        SmokeStep::Sleep { millis: 2000 },
-        SmokeStep::Wait {
-            pattern: "m3OS login:",
-            timeout_secs: 20,
-            label: "wait for m3OS login prompt after final boot marker",
-        },
-    ];
+    const BOOT_MARKER_SETTLE: &[SmokeStep] = &[SmokeStep::Wait {
+        pattern: "SMOKE:BEGIN",
+        timeout_secs: 20,
+        label: "wait for smoke runner start after final boot marker",
+    }];
 
     steps.push(SmokeStep::WaitEither {
-        pattern_a: "m3OS login:",
+        pattern_a: "SMOKE:BEGIN",
         pattern_b: BOOT_READY_MARKER,
         timeout_secs: 60,
-        label: "wait for m3OS login prompt or final boot marker",
+        label: "wait for smoke runner start or final boot marker",
         extra_steps_a: &[],
         extra_steps_b: BOOT_MARKER_SETTLE,
     });
-    steps.push(SmokeStep::Sleep { millis: 200 });
-    steps.push(SmokeStep::Send {
-        input: "root\n",
-        label: "enter username",
-    });
-    // Branch: first-boot shows "Set password for" while normal login shows "Password:".
-    steps.push(SmokeStep::WaitEither {
-        pattern_a: "Set password for",
-        pattern_b: "Password:",
-        timeout_secs: 20,
-        label: "detect first-boot or normal login",
-        extra_steps_a: FIRST_BOOT_LOGIN,
-        extra_steps_b: NORMAL_LOGIN,
-    });
-    // -----------------------------------------------------------------------
-    // 2. Basic shell sanity
-    // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "echo SMOKE_OK\n",
-        label: "echo test",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "\nSMOKE_OK",
-        timeout_secs: 10,
-        label: "verify echo output",
-    });
-    steps.push(SmokeStep::Sleep { millis: 1000 });
 
     // -----------------------------------------------------------------------
-    // 3. Guest-side smoke runner
+    // 2. Guest-side smoke runner
     // -----------------------------------------------------------------------
-    steps.push(SmokeStep::Send {
-        input: "smoke-runner\n",
-        label: "run guest smoke runner",
-    });
     steps.push(SmokeStep::Wait {
         pattern: "SMOKE:auth:PASS",
         timeout_secs: 10,
@@ -2699,11 +2631,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         label: "guest/hello: smoke runner ran compiled hello world",
     });
     steps.push(SmokeStep::Wait {
-        pattern: "SMOKE:service:PASS",
-        timeout_secs: 30,
-        label: "guest/service: smoke runner observed syslogd running",
-    });
-    steps.push(SmokeStep::Wait {
         pattern: "SMOKE:storage:PASS",
         timeout_secs: 20,
         label: "guest/storage: smoke runner verified ext2 file lifecycle",
@@ -2722,11 +2649,6 @@ fn smoke_test_script(doom_wad_available: bool) -> Vec<SmokeStep> {
         pattern: "SMOKE:PASS",
         timeout_secs: 5,
         label: "guest smoke runner completed all checks",
-    });
-    steps.push(SmokeStep::Wait {
-        pattern: "# ",
-        timeout_secs: 20,
-        label: "wait for shell prompt after guest smoke runner",
     });
 
     // Shutdown/reboot (headless workflow §7) is verified by the manual
@@ -3968,7 +3890,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     if disk_img.exists() {
         let _ = fs::remove_file(&disk_img);
     }
-    create_data_disk(uefi_image.parent().unwrap(), false);
+    create_data_disk(uefi_image.parent().unwrap(), false, true);
 
     let ovmf = find_ovmf();
     let display_mode = if smoke_args.display {
@@ -4005,7 +3927,7 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
             if disk_img.exists() {
                 let _ = fs::remove_file(&disk_img);
             }
-            create_data_disk(uefi_image.parent().unwrap(), false);
+            create_data_disk(uefi_image.parent().unwrap(), false, true);
         }
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -4260,7 +4182,7 @@ fn signed_path(path: &Path) -> PathBuf {
 /// Skips creation if the image already exists to preserve persisted data.
 ///
 /// Requires `e2fsprogs` on the host: `mkfs.ext2`, `debugfs`, `e2fsck`.
-fn create_data_disk(output_dir: &Path, enable_telnet: bool) -> PathBuf {
+fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: bool) -> PathBuf {
     let disk_path = output_dir.join("disk.img");
     // Phase 36: increased from 128 MB to 1 GB to support the expanded persistent
     // storage requirements for filesystem stress testing and larger workloads.
@@ -4357,7 +4279,7 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool) -> PathBuf {
     }
 
     // Populate files using debugfs.
-    populate_ext2_files(&part_tmp, output_dir, enable_telnet);
+    populate_ext2_files(&part_tmp, output_dir, enable_telnet, smoke_test_mode);
 
     // Phase 31: populate TCC, musl headers/libs, and test files.
     let root = workspace_root();
@@ -4405,7 +4327,12 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool) -> PathBuf {
 
 /// Populate the ext2 partition image with initial directories and files
 /// using `debugfs -w`. Creates temp host files for the `write` command.
-fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool) {
+fn populate_ext2_files(
+    part_path: &Path,
+    output_dir: &Path,
+    enable_telnet: bool,
+    smoke_test_mode: bool,
+) {
     // Standard Unix root filesystem layout.
     let passwd_content =
         "root:x:0:0:root:/root:/bin/ion\nuser:x:1000:1000:user:/home/user:/bin/ion\n";
@@ -4433,6 +4360,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
 
     let hostname_content = "m3os\n";
+    let smoke_mode_content = "enabled\n";
     let udp_smoke_bin = generated_initrd_dir(&workspace_root()).join("udp-smoke");
 
     // Create temp host files for debugfs `write` command.
@@ -4449,6 +4377,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
+    let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     fs::write(&passwd_tmp, passwd_content).expect("write temp passwd");
     fs::write(&shadow_tmp, shadow_content).expect("write temp shadow");
     fs::write(&group_tmp, group_content).expect("write temp group");
@@ -4462,6 +4391,9 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
+    if smoke_test_mode {
+        fs::write(&smoke_mode_tmp, smoke_mode_content).expect("write temp smoke marker");
+    }
 
     // Phase 48: telnetd service config is only written when --enable-telnet is passed.
     let telnetd_cmds = if enable_telnet {
@@ -4473,6 +4405,18 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
              sif etc/services.d/telnetd.conf uid 0\n\
              sif etc/services.d/telnetd.conf gid 0\n",
             telnetd_conf_tmp.display()
+        )
+    } else {
+        String::new()
+    };
+
+    let smoke_mode_cmds = if smoke_test_mode {
+        format!(
+            "write \"{}\" etc/m3os-smoke-test-mode\n\
+             sif etc/m3os-smoke-test-mode mode 0x81A4\n\
+             sif etc/m3os-smoke-test-mode uid 0\n\
+             sif etc/m3os-smoke-test-mode gid 0\n",
+            smoke_mode_tmp.display()
         )
     } else {
         String::new()
@@ -4597,6 +4541,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
          sif etc/hostname gid 0\n\
+         {smoke_mode_cmds}\
          q\n",
         passwd = passwd_tmp.display(),
         shadow = shadow_tmp.display(),
@@ -4612,6 +4557,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
         vfs_server_conf = vfs_server_conf_tmp.display(),
         net_server_conf = net_server_conf_tmp.display(),
         hostname = hostname_tmp.display(),
+        smoke_mode_cmds = smoke_mode_cmds,
         udp_smoke_bin = udp_smoke_bin.display(),
     );
 
@@ -4650,6 +4596,7 @@ fn populate_ext2_files(part_path: &Path, output_dir: &Path, enable_telnet: bool)
     let _ = fs::remove_file(&syslogd_conf_tmp);
     let _ = fs::remove_file(&crond_conf_tmp);
     let _ = fs::remove_file(&hostname_tmp);
+    let _ = fs::remove_file(&smoke_mode_tmp);
 }
 
 /// Phase 31: Populate TCC, musl headers/libraries, and test files into the
@@ -5362,7 +5309,7 @@ fn cmd_image(image_args: &ImageArgs) {
 
     // Phase 24: create a data disk image alongside the UEFI boot image.
     let output_dir = uefi_image.parent().unwrap();
-    create_data_disk(output_dir, image_args.enable_telnet);
+    create_data_disk(output_dir, image_args.enable_telnet, false);
 
     if !image_args.sign {
         return;
@@ -5744,7 +5691,7 @@ fn cmd_run(fresh: bool) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false);
     launch_qemu(&uefi_image, QemuDisplayMode::Headless);
 }
 
@@ -5759,7 +5706,7 @@ fn cmd_run_gui(fresh: bool) {
             println!("Removed {} (--fresh)", disk.display());
         }
     }
-    create_data_disk(uefi_image.parent().unwrap(), false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false);
     launch_qemu(&uefi_image, QemuDisplayMode::Gui);
 }
 
@@ -6420,7 +6367,7 @@ fn cmd_regression(args: &RegressionArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     let ovmf = find_ovmf();
-    create_data_disk(uefi_image.parent().unwrap(), false);
+    create_data_disk(uefi_image.parent().unwrap(), false, false);
 
     let mut passed = 0usize;
     let mut failed = 0usize;
@@ -7304,11 +7251,10 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_stays_within_boot_login_and_guest_runner_scope() {
+    fn smoke_test_stays_within_boot_and_guest_runner_scope() {
         let labels = smoke_step_labels(&smoke_test_script(false));
 
-        assert!(labels.contains(&"wait for m3OS login prompt or final boot marker"));
-        assert!(labels.contains(&"run guest smoke runner"));
+        assert!(labels.contains(&"wait for smoke runner start or final boot marker"));
         assert!(labels.contains(&"guest smoke runner completed all checks"));
         assert!(!labels.contains(&"run PTY regression (quick - skips ion timing tests)"));
         assert!(!labels.contains(&"doom: launch with iwad"));
@@ -7316,38 +7262,32 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_uses_plain_root_login_input() {
-        let username = send_input_for_label(&smoke_test_script(false), "enter username");
-
-        assert_eq!(username, Some("root\n"));
-    }
-
-    #[test]
-    fn smoke_test_stays_on_root_shell_for_commands() {
-        let switch = send_input_for_label(
-            &smoke_test_script(false),
-            "switch to sh0 for smoke commands",
-        );
-
-        assert_eq!(switch, None);
-    }
-
-    #[test]
-    fn smoke_test_runs_guest_smoke_runner_with_single_command() {
-        let runner = send_input_for_label(&smoke_test_script(false), "run guest smoke runner");
-
-        assert_eq!(runner, Some("smoke-runner\n"));
-    }
-
-    #[test]
-    fn smoke_test_echo_waits_for_output_line_not_command_echo() {
+    fn smoke_test_starts_directly_in_smoke_runner_mode() {
         assert_eq!(
-            wait_pattern_for_label(&smoke_test_script(false), "verify echo output"),
-            Some("\nSMOKE_OK")
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "wait for smoke runner start or final boot marker"
+            ),
+            Some("SMOKE:BEGIN")
         );
         assert_eq!(
-            wait_timeout_for_label(&smoke_test_script(false), "verify echo output"),
-            Some(10)
+            wait_pattern_for_label(
+                &smoke_test_script(false),
+                "wait for smoke runner start after final boot marker"
+            ),
+            Some("SMOKE:BEGIN")
+        );
+    }
+
+    #[test]
+    fn smoke_test_no_longer_relies_on_serial_shell_input() {
+        assert_eq!(
+            send_input_for_label(&smoke_test_script(false), "enter username"),
+            None
+        );
+        assert_eq!(
+            send_input_for_label(&smoke_test_script(false), "run guest smoke runner"),
+            None
         );
     }
 

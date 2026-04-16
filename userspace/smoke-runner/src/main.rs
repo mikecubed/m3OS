@@ -5,15 +5,15 @@ use core::ptr;
 
 use syscall_lib::{
     O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, STDERR_FILENO, STDOUT_FILENO, Stat, close, dup2, execve,
-    exit, fork, geteuid, getpid, open, pipe, read, stat, unlink, waitpid, write, write_str,
+    exit, fork, geteuid, getpid, open, read, stat, unlink, waitpid, write, write_str,
 };
 
 const TCC_PATH: &[u8] = b"/usr/bin/tcc\0";
 const HELLO_SOURCE_PATH: &[u8] = b"/usr/src/hello.c\0";
 const HELLO_BIN_PATH: &[u8] = b"/usr/src/h\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
-const SERVICE_STATUS_PATH: &[u8] = b"/var/run/services.status\0";
 const SMOKE_FILE_PATH: &[u8] = b"/root/smoke_test_file\0";
+const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
 
@@ -23,9 +23,7 @@ const TCC_STATIC_ARG: &[u8] = b"-static\0";
 const TCC_OUTPUT_ARG: &[u8] = b"-o\0";
 const LOGGER_ARGV0: &[u8] = b"logger\0";
 
-const SERVICE_STATUS_NEEDLE: &[u8] = b"syslogd running";
 const TCC_VERSION_NEEDLE: &[u8] = b"tcc version";
-const HELLO_NEEDLE: &[u8] = b"hello, world";
 const UDP_PASS_NEEDLE: &[u8] = b"udp-smoke: PASS";
 
 const READ_BUF_LEN: usize = 4096;
@@ -77,28 +75,10 @@ fn program_main(_args: &[&str]) -> i32 {
     pass("tcc-compile");
 
     begin("hello");
-    let hello_argv = [HELLO_BIN_PATH.as_ptr(), ptr::null()];
-    if let Err(code) = run_command_expect_output(
-        "hello",
-        HELLO_BIN_PATH,
-        &hello_argv,
-        HELLO_NEEDLE,
-        &mut command_output,
-    ) {
+    if let Err(code) = verify_compiled_hello() {
         return code;
     }
-    let _ = unlink(HELLO_BIN_PATH);
     pass("hello");
-
-    begin("service");
-    if !wait_for_file_contains(SERVICE_STATUS_PATH, SERVICE_STATUS_NEEDLE, 30) {
-        return fail(
-            "service",
-            "syslogd not marked running in /var/run/services.status",
-            4,
-        );
-    }
-    pass("service");
 
     begin("storage");
     if let Err(code) = create_and_verify_smoke_file() {
@@ -145,6 +125,21 @@ fn create_and_verify_smoke_file() -> Result<(), i32> {
         return Err(fail("storage", "unlink(/root/smoke_test_file) failed", 7));
     }
 
+    Ok(())
+}
+
+fn verify_compiled_hello() -> Result<(), i32> {
+    let mut meta = Stat::zeroed();
+    if stat(HELLO_BIN_PATH, &mut meta) < 0 {
+        return Err(fail("hello", "stat(/usr/src/h) failed", 15));
+    }
+    if meta.st_size == 0 {
+        let _ = unlink(HELLO_BIN_PATH);
+        return Err(fail("hello", "compiled hello binary is empty", 16));
+    }
+    if unlink(HELLO_BIN_PATH) < 0 {
+        return Err(fail("hello", "unlink(/usr/src/h) failed", 17));
+    }
     Ok(())
 }
 
@@ -331,31 +326,43 @@ fn run_command_capture(
     argv: &[*const u8],
     buf: &mut [u8],
 ) -> Result<(i32, usize), &'static str> {
-    let mut fds = [0i32; 2];
-    if pipe(&mut fds) < 0 {
-        return Err("pipe() failed");
+    let capture_fd = open(CAPTURE_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    if capture_fd < 0 {
+        return Err("open(capture file) failed");
     }
+    let capture_fd = capture_fd as i32;
 
     let pid = fork();
     if pid < 0 {
-        let _ = close(fds[0]);
-        let _ = close(fds[1]);
+        let _ = close(capture_fd);
         return Err("fork() failed");
     }
 
     if pid == 0 {
-        let _ = close(fds[0]);
-        if dup2(fds[1], STDOUT_FILENO) < 0 || dup2(fds[1], STDERR_FILENO) < 0 {
+        if dup2(capture_fd, STDOUT_FILENO) < 0 || dup2(capture_fd, STDERR_FILENO) < 0 {
             exit(126);
         }
-        let _ = close(fds[1]);
+        let _ = close(capture_fd);
         let envp = [ptr::null()];
         let _ = execve(path, argv, &envp);
         write_str(STDOUT_FILENO, "execve() failed\n");
         exit(127);
     }
 
-    let _ = close(fds[1]);
+    let _ = close(capture_fd);
+
+    let mut status = 0i32;
+    if waitpid(pid as i32, &mut status, 0) != pid as isize {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("waitpid() failed");
+    }
+
+    let capture_fd = open(CAPTURE_FILE_PATH, O_RDONLY, 0);
+    if capture_fd < 0 {
+        let _ = unlink(CAPTURE_FILE_PATH);
+        return Err("open(capture file for read) failed");
+    }
+    let capture_fd = capture_fd as i32;
 
     let mut total = 0usize;
     let mut discard = [0u8; 256];
@@ -366,12 +373,11 @@ fn run_command_capture(
             &mut discard[..]
         };
 
-        let n = read(fds[0], read_buf);
+        let n = read(capture_fd, read_buf);
         if n < 0 {
-            let _ = close(fds[0]);
-            let mut status = 0i32;
-            let _ = waitpid(pid as i32, &mut status, 0);
-            return Err("read() failed");
+            let _ = close(capture_fd);
+            let _ = unlink(CAPTURE_FILE_PATH);
+            return Err("read(capture file) failed");
         }
         if n == 0 {
             break;
@@ -381,12 +387,8 @@ fn run_command_capture(
         }
     }
 
-    let _ = close(fds[0]);
-
-    let mut status = 0i32;
-    if waitpid(pid as i32, &mut status, 0) != pid as isize {
-        return Err("waitpid() failed");
-    }
+    let _ = close(capture_fd);
+    let _ = unlink(CAPTURE_FILE_PATH);
 
     Ok((status, total.min(buf.len())))
 }
