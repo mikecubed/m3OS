@@ -137,14 +137,14 @@ fn create_and_verify_smoke_file() -> Result<(), i32> {
 fn verify_compiled_hello() -> Result<(), i32> {
     let mut meta = Stat::zeroed();
     if stat(HELLO_BIN_PATH, &mut meta) < 0 {
-        return Err(fail("hello", "stat(/usr/src/h) failed", 15));
+        return Err(fail("hello", "stat(/tmp/h) failed", 15));
     }
     if meta.st_size == 0 {
         let _ = unlink(HELLO_BIN_PATH);
         return Err(fail("hello", "compiled hello binary is empty", 16));
     }
     if unlink(HELLO_BIN_PATH) < 0 {
-        return Err(fail("hello", "unlink(/usr/src/h) failed", 17));
+        return Err(fail("hello", "unlink(/tmp/h) failed", 17));
     }
     Ok(())
 }

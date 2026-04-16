@@ -357,11 +357,28 @@ fn ipc_register_service(
     }
 }
 
+/// Internal-only services that userspace is not allowed to look up by name.
+///
+/// These services act as a private kernel-side facade (e.g., `vfs_server` is
+/// only ever meant to be called via kernel syscall routing that already
+/// enforces DAC). Handing out endpoint capabilities to arbitrary userspace
+/// tasks would let unprivileged code bypass the kernel's access checks and
+/// drive the service directly.
+const PRIVATE_SERVICE_NAMES: &[&str] = &["vfs", "net_udp"];
+
+fn is_private_service_name(name: &str) -> bool {
+    PRIVATE_SERVICE_NAMES.contains(&name)
+}
+
 /// Syscall 10: look up a named endpoint and insert it into the caller's cap table.
 ///
 /// `name_ptr` is a userspace virtual address pointing to `name_len` bytes of
 /// UTF-8. The name is safely copied from the caller's address space via
 /// `copy_from_user`. Invalid or unmapped pointers return an error.
+///
+/// Private services (see `PRIVATE_SERVICE_NAMES`) are never exposed to
+/// userspace — lookups for those names fail as if the service were not
+/// registered.
 ///
 /// Returns the new [`CapHandle`] cast to `u64`, or `u64::MAX` on any error.
 fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64) -> u64 {
@@ -383,6 +400,9 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
+    if is_private_service_name(name) {
+        return u64::MAX;
+    }
     match registry::with_lookup(name, |ep_id| {
         crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id))
     }) {

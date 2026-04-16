@@ -170,13 +170,16 @@ fn current_umask() -> u16 {
     table.find(pid).map(|proc| proc.umask).unwrap_or(0o022)
 }
 
-fn current_exec_path() -> alloc::string::String {
+/// Non-allocating check that the current process's `exec_path` equals
+/// `expected`. Used on hot VFS/UDP syscall routing paths so we don't clone the
+/// path `String` out of the process table on every dispatch.
+fn is_current_exec_path(expected: &str) -> bool {
     let pid = crate::process::current_pid();
     let table = crate::process::PROCESS_TABLE.lock();
     table
         .find(pid)
-        .map(|proc| proc.exec_path.clone())
-        .unwrap_or_default()
+        .map(|proc| proc.exec_path.as_str() == expected)
+        .unwrap_or(false)
 }
 
 enum PathNodeKind {
@@ -5614,7 +5617,6 @@ fn ext2_root_path(path: &str) -> Option<&str> {
 // Phase 54: userspace VFS service routing
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if `path` (already fully resolved) should be routed through
 struct VfsPathStat {
     kind: u64,
     mode: u32,
@@ -5630,8 +5632,10 @@ struct VfsPathStat {
     symlink_target: Option<alloc::string::String>,
 }
 
+/// Returns `true` when `path` (already fully resolved) should be routed
+/// through the ring-3 `vfs` service rather than the in-kernel ext2 path.
 fn vfs_service_can_handle_path(path: &str) -> bool {
-    if current_exec_path() == "/bin/vfs_server" {
+    if is_current_exec_path("/bin/vfs_server") {
         return false;
     }
     if path == "/proc" || path.starts_with("/proc/") || path == "/dev" || path.starts_with("/dev/")
@@ -5771,26 +5775,6 @@ fn vfs_service_stat_path(path: &str) -> Result<VfsPathStat, u64> {
     vfs_service_parse_stat_reply(&bulk)
 }
 
-fn vfs_service_access_path(path: &str) -> u64 {
-    use crate::ipc::{endpoint, message::Message, registry};
-    use crate::task::scheduler;
-    use kernel_core::fs::vfs_protocol::VFS_ACCESS_PATH;
-
-    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
-        Some(ep) => ep,
-        None => return NEG_ENOENT,
-    };
-    let task_id = match scheduler::current_task_id() {
-        Some(id) => id,
-        None => return NEG_EINVAL,
-    };
-    let mut msg = Message::new(VFS_ACCESS_PATH);
-    msg.data[0] = path.len() as u64;
-    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
-    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
-    reply.label
-}
-
 fn vfs_service_list_dir(
     path: &str,
     offset: usize,
@@ -5840,7 +5824,7 @@ fn vfs_service_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
     use crate::task::scheduler;
     use kernel_core::fs::vfs_protocol::VFS_MOUNT_POLICY;
 
-    if current_exec_path() == "/bin/vfs_server" || !crate::ipc::registry::is_registered("vfs") {
+    if is_current_exec_path("/bin/vfs_server") || !crate::ipc::registry::is_registered("vfs") {
         return vfs_bootstrap_mount_action(target, fstype);
     }
 
@@ -5864,7 +5848,7 @@ fn vfs_service_umount_action(target: &str) -> Result<u64, u64> {
     use crate::task::scheduler;
     use kernel_core::fs::vfs_protocol::VFS_UMOUNT_POLICY;
 
-    if current_exec_path() == "/bin/vfs_server" || !crate::ipc::registry::is_registered("vfs") {
+    if is_current_exec_path("/bin/vfs_server") || !crate::ipc::registry::is_registered("vfs") {
         return vfs_bootstrap_umount_action(target);
     }
 
@@ -11135,8 +11119,8 @@ pub(super) fn sys_access(path_ptr: u64) -> u64 {
 
     let cwd = current_cwd();
     let lexical = resolve_path(&cwd, name);
-    let resolved = match resolve_existing_fs_path(&lexical, true) {
-        Ok(path) => path,
+    match resolve_existing_fs_path(&lexical, true) {
+        Ok(_) => 0,
         Err(err) => {
             if lexical.starts_with("/usr/") {
                 let rel = lexical.trim_start_matches('/');
@@ -11147,13 +11131,9 @@ pub(super) fn sys_access(path_ptr: u64) -> u64 {
                     return 0;
                 }
             }
-            return err;
+            err
         }
-    };
-    if vfs_service_can_handle_path(&resolved) {
-        return vfs_service_access_path(&resolved);
     }
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -14977,7 +14957,7 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 /// Returns `true` when the ring-3 `net_udp` service is registered and the
 /// current caller is *not* the service itself (prevents recursion).
 fn net_udp_service_available() -> bool {
-    current_exec_path() != "/bin/net_server" && crate::ipc::registry::is_registered("net_udp")
+    !is_current_exec_path("/bin/net_server") && crate::ipc::registry::is_registered("net_udp")
 }
 
 /// Tell the service about a newly-allocated kernel socket handle.

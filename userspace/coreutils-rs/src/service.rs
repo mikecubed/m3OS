@@ -234,7 +234,7 @@ fn service_status<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         if let Some(rest) = line.strip_prefix(name)
             && (rest.starts_with(' ') || rest.starts_with('\t'))
         {
-            let mut fields = line.split(' ');
+            let mut fields = line.split_whitespace();
             let _svc_name = fields.next();
             return Some(fields.next().unwrap_or("unknown"));
         }

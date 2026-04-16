@@ -688,9 +688,10 @@ fn handle_read(
 
     let bytes_read = data.len();
 
-    // Store read data as reply bulk.
-    if bytes_read > 0 {
-        syscall_lib::ipc_store_reply_bulk(&data);
+    // Store read data as reply bulk. Propagate store failure as EIO so the
+    // kernel doesn't see a "success + missing bulk" response.
+    if bytes_read > 0 && syscall_lib::ipc_store_reply_bulk(&data) != 0 {
+        return (NEG_EIO, 0);
     }
 
     (0, bytes_read as u64)
@@ -734,7 +735,9 @@ fn handle_stat_path(
         };
         stat.extend_from_slice(&target);
     }
-    syscall_lib::ipc_store_reply_bulk(&stat);
+    if syscall_lib::ipc_store_reply_bulk(&stat) != 0 {
+        return (NEG_EIO, 0);
+    }
     (0, 0)
 }
 
@@ -787,8 +790,8 @@ fn handle_list_dir(ext2: &Ext2State, msg: &syscall_lib::IpcMessage, recv_buf: &[
         idx += 1;
     }
 
-    if !out.is_empty() {
-        syscall_lib::ipc_store_reply_bulk(&out);
+    if !out.is_empty() && syscall_lib::ipc_store_reply_bulk(&out) != 0 {
+        return (NEG_EIO, 0);
     }
     let packed = (out.len() as u64) | ((idx as u64) << 32);
     (0, packed)

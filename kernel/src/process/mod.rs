@@ -1221,22 +1221,48 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
         // Clear any pending SIGSTOP/SIGTSTP.
         proc.pending_signals &= !(1u64 << SIGSTOP) & !(1u64 << SIGTSTP);
         drop(table);
-        for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
-            crate::ipc::endpoint::cancel_task_wait(task_id);
-            crate::task::scheduler::deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
-            let _ = crate::task::scheduler::wake_task(task_id);
-        }
+        interrupt_ipc_waits(pid);
         return true;
     }
 
     proc.pending_signals |= 1u64 << sig;
+    let should_interrupt = signal_interrupts_ipc_wait(proc, sig);
     drop(table);
+    if should_interrupt {
+        interrupt_ipc_waits(pid);
+    }
+    true
+}
+
+/// Decide whether `sig` should abort a task's IPC wait for `proc`.
+///
+/// IPC waits are only broken when the signal will actually do something:
+/// SIGKILL/SIGSTOP always interrupt; otherwise the signal must be unblocked
+/// *and* have an effective disposition that is not `Ignore`. This preserves
+/// EINTR-style semantics for handled / default-terminate / default-stop
+/// signals while leaving long-running IPC waiters alone for signals like
+/// SIGCHLD/SIGWINCH (default Ignore) or signals the process has explicitly
+/// blocked via `sigprocmask`.
+fn signal_interrupts_ipc_wait(proc: &Process, sig: u32) -> bool {
+    if sig == SIGKILL || sig == SIGSTOP {
+        return true;
+    }
+    if proc.blocked_signals & (1u64 << sig) != 0 {
+        return false;
+    }
+    match proc.sigaction_get(sig as usize) {
+        SignalAction::Handler { .. } => true,
+        SignalAction::Ignore => false,
+        SignalAction::Default => !matches!(default_signal_action(sig), SignalDisposition::Ignore),
+    }
+}
+
+fn interrupt_ipc_waits(pid: Pid) {
     for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
         crate::ipc::endpoint::cancel_task_wait(task_id);
         crate::task::scheduler::deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
         let _ = crate::task::scheduler::wake_task(task_id);
     }
-    true
 }
 
 /// Check and deliver pending signals for a process.

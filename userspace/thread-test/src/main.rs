@@ -382,6 +382,13 @@ fn now_micros() -> i128 {
     }
 }
 
+/// Returns true when `deadline_us` has elapsed or the clock is unavailable
+/// (so loops can't hang forever if `gettimeofday` keeps failing).
+fn deadline_reached(deadline_us: i128) -> bool {
+    let now = now_micros();
+    now < 0 || now >= deadline_us
+}
+
 fn arm_exit_group_spinner() -> bool {
     static CHILD_TID4: AtomicU32 = AtomicU32::new(0);
     CHILD_TID4.store(0, Ordering::Release);
@@ -397,14 +404,18 @@ fn arm_exit_group_spinner() -> bool {
         return false;
     }
 
-    let deadline_us = now_micros() + 5_000_000;
+    let start = now_micros();
+    if start < 0 {
+        return false;
+    }
+    let deadline_us = start + 5_000_000;
 
     loop {
         if EXIT_GROUP_SPINNER_STARTED.load(Ordering::Acquire) != 0 {
             return true;
         }
         let _ = unsafe { syscall0(SYS_GETTID) };
-        if now_micros() >= deadline_us {
+        if deadline_reached(deadline_us) {
             break;
         }
     }
@@ -430,7 +441,12 @@ fn test_exit_group_teardown() -> bool {
     }
 
     let child_pid = pid as i32;
-    let deadline_us = now_micros() + 5_000_000;
+    let start = now_micros();
+    if start < 0 {
+        serial_print("FAIL (gettimeofday failed)\n");
+        return false;
+    }
+    let deadline_us = start + 5_000_000;
     let mut status = 0i32;
 
     loop {
@@ -462,7 +478,7 @@ fn test_exit_group_teardown() -> bool {
             serial_print("FAIL (waitpid failed)\n");
             return false;
         }
-        if now_micros() >= deadline_us {
+        if deadline_reached(deadline_us) {
             serial_print("FAIL (waitpid timeout)\n");
             return false;
         }

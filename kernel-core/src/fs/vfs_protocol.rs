@@ -8,13 +8,13 @@
 //!
 //! | Label | Operation | Request | Reply |
 //! |---|---|---|---|
-//! | [`VFS_OPEN`] | Open file by path | bulk=path, data[0]=flags, data[1]=path_len | data[0]=handle |
+//! | [`VFS_OPEN`] | Open file by path | bulk=path, data[0]=flags, data[1]=path_len | data[0]=handle \| (file_size << 32) |
 //! | [`VFS_READ`] | Read from handle | data[0]=handle, data[1]=offset, data[2]=count | data[0]=bytes_read, reply_bulk=data |
 //! | [`VFS_CLOSE`] | Close handle | data[0]=handle | label=0 ack |
 //! | [`VFS_STAT_PATH`] | Stat resolved path | bulk=path, data[0]=path_len | reply_bulk=`VFS_STAT_REPLY_SIZE` bytes + optional symlink target |
-//! | [`VFS_LIST_DIR`] | List directory entries | bulk=path, data[0]=path_len, data[1]=offset, data[2]=count | data[0]=packed(next_offset, bytes), reply_bulk=dirent bytes |
+//! | [`VFS_LIST_DIR`] | List directory entries | bulk=path, data[0]=path_len, data[1]=offset, data[2]=count | data[0]=bytes_written \| (next_offset << 32), reply_bulk=dirent bytes |
 //! | [`VFS_ACCESS_PATH`] | Check resolved path existence | bulk=path, data[0]=path_len | label=0 on success |
-//! | [`VFS_MOUNT_POLICY`] | Resolve mount policy | bulk=target||fstype, data[0]=target_len, data[1]=fstype_len | data[0]=policy action |
+//! | [`VFS_MOUNT_POLICY`] | Resolve mount policy | bulk=target\|\|fstype, data[0]=target_len, data[1]=fstype_len | data[0]=policy action |
 //! | [`VFS_UMOUNT_POLICY`] | Resolve umount policy | bulk=target, data[0]=target_len | data[0]=policy action |
 //!
 //! # Reply bulk data
@@ -26,7 +26,10 @@
 /// Open a file by path (read-only for Phase 54 first slice).
 ///
 /// Request: bulk = UTF-8 path bytes, `data[0]` = open flags, `data[1]` = path length.
-/// Reply:   label = 0 on success (negative errno on error), `data[0]` = opaque service handle.
+/// Reply:   label = 0 on success (negative errno on error),
+///          `data[0]` packs the opaque service handle in the low 32 bits and
+///          the file size (clamped to `u32::MAX`) in the high 32 bits — the
+///          kernel unpacks both to seed the FdBackend::VfsService handle.
 pub const VFS_OPEN: u64 = 10;
 
 /// Read bytes from an open handle.
@@ -47,6 +50,13 @@ pub const VFS_CLOSE: u64 = 12;
 pub const VFS_STAT_PATH: u64 = 13;
 
 /// Serialize one `getdents64` batch for a resolved directory path.
+///
+/// Request: bulk = UTF-8 path bytes, `data[0]` = path length,
+///          `data[1]` = starting entry offset, `data[2]` = max reply bulk bytes.
+/// Reply:   label = 0 on success (negative errno on error),
+///          `data[0]` packs `bytes_written` in the low 32 bits and the next
+///          entry offset to resume from in the high 32 bits.
+///          Reply bulk holds the `getdents64` record bytes.
 pub const VFS_LIST_DIR: u64 = 14;
 
 /// Check whether a resolved path exists in the migrated namespace.
