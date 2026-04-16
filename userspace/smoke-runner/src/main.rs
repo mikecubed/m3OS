@@ -10,7 +10,7 @@ use syscall_lib::{
 
 const TCC_PATH: &[u8] = b"/usr/bin/tcc\0";
 const HELLO_SOURCE_PATH: &[u8] = b"/usr/src/hello.c\0";
-const HELLO_BIN_PATH: &[u8] = b"/usr/src/h\0";
+const HELLO_BIN_PATH: &[u8] = b"/tmp/h\0";
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
