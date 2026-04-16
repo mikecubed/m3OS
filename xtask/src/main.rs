@@ -2313,10 +2313,14 @@ fn drain_serial_until_idle(
     }
 }
 
-/// Uniform timing multiplier for every Wait/WaitEither/Sleep in the smoke and
-/// regression step executors. Set `M3OS_CI_TIMING_MULT=3` (or any positive
+/// Uniform timing multiplier for Wait/WaitEither timeout budgets in the smoke
+/// and regression step executors. Set `M3OS_CI_TIMING_MULT=3` (or any positive
 /// float) in CI to give serialized-VFS IPC round-trips enough headroom under
 /// `-smp 2` TCG; local dev leaves it unset for strict fail-fast budgets.
+///
+/// Applies only to *timeouts* (max-wait budgets). Explicit `Sleep { millis }`
+/// steps are deliberate fixed settle delays — scaling them turns the 25s
+/// boot-settle into 75s and runs the suite past its CI wall-clock.
 fn ci_timing_multiplier() -> f32 {
     std::env::var("M3OS_CI_TIMING_MULT")
         .ok()
@@ -2328,11 +2332,6 @@ fn ci_timing_multiplier() -> f32 {
 fn scaled_secs(secs: u64) -> std::time::Duration {
     let scaled = ((secs as f32) * ci_timing_multiplier()).ceil() as u64;
     std::time::Duration::from_secs(scaled.max(secs))
-}
-
-fn scaled_millis(millis: u64) -> std::time::Duration {
-    let scaled = ((millis as f32) * ci_timing_multiplier()).ceil() as u64;
-    std::time::Duration::from_millis(scaled.max(millis))
 }
 
 /// Run an expect-style smoke test script against a running QEMU instance.
@@ -2466,7 +2465,7 @@ fn run_smoke_script(
 
             SmokeStep::Sleep { millis } => {
                 println!("[step {}] sleep {}ms", step_num, millis);
-                std::thread::sleep(scaled_millis(*millis));
+                std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
 
             SmokeStep::WaitEither {
@@ -6694,7 +6693,7 @@ fn run_smoke_steps_with_capture(
                     .map_err(|e| format!("flush failed at step {} ({label}): {e}", step_num))?;
             }
             SmokeStep::Sleep { millis } => {
-                std::thread::sleep(scaled_millis(*millis));
+                std::thread::sleep(std::time::Duration::from_millis(*millis));
             }
             SmokeStep::WaitEither {
                 pattern_a,
