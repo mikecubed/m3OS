@@ -41,6 +41,7 @@ const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
 const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
 const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
+const SMOKE_MODE_SETTLE_SECS: u64 = 3;
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
@@ -1834,6 +1835,10 @@ fn spawn_login() -> i32 {
 fn spawn_smoke_runner() -> i32 {
     let pid = fork();
     if pid == 0 {
+        // Let boot-time services finish their initial ext2/syslog work before
+        // the smoke runner starts mutating the filesystem.
+        let _ = nanosleep(SMOKE_MODE_SETTLE_SECS);
+
         let envp: [*const u8; 5] = [
             ENV_PATH.as_ptr(),
             ENV_HOME.as_ptr(),
@@ -1930,7 +1935,7 @@ pub extern "C" fn _start() -> ! {
     if smoke_test_mode_enabled() {
         write_str(
             STDOUT_FILENO,
-            "init: smoke-test mode enabled, launching /bin/smoke-runner\n",
+            "init: smoke-test mode enabled, scheduling /bin/smoke-runner\n",
         );
         mgr.respawn_login = false;
         mgr.login_pid = spawn_smoke_runner();

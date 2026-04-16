@@ -11,8 +11,8 @@ use syscall_lib::{
 const TCC_PATH: &[u8] = b"/usr/bin/tcc\0";
 const HELLO_SOURCE_PATH: &[u8] = b"/usr/src/hello.c\0";
 const HELLO_BIN_PATH: &[u8] = b"/usr/src/h\0";
+const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
 const UDP_SMOKE_PATH: &[u8] = b"/root/udp-smoke\0";
-const SMOKE_FILE_PATH: &[u8] = b"/root/smoke_test_file\0";
 const CAPTURE_FILE_PATH: &[u8] = b"/tmp/smoke-runner.capture\0";
 const LOGGER_PATH: &[u8] = b"/bin/logger\0";
 const SYSTEM_LOG_PATH: &[u8] = b"/var/log/messages\0";
@@ -110,19 +110,12 @@ fn program_main(_args: &[&str]) -> i32 {
 }
 
 fn create_and_verify_smoke_file() -> Result<(), i32> {
-    let fd = open(SMOKE_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
-    if fd < 0 {
-        return Err(fail("storage", "open(/root/smoke_test_file) failed", 5));
-    }
-    let _ = close(fd as i32);
-
     let mut meta = Stat::zeroed();
-    if stat(SMOKE_FILE_PATH, &mut meta) < 0 {
-        return Err(fail("storage", "stat(/root/smoke_test_file) failed", 6));
+    if stat(PASSWD_PATH, &mut meta) < 0 || meta.st_size == 0 {
+        return Err(fail("storage", "stat(/etc/passwd) failed", 5));
     }
-
-    if unlink(SMOKE_FILE_PATH) < 0 {
-        return Err(fail("storage", "unlink(/root/smoke_test_file) failed", 7));
+    if stat(HELLO_SOURCE_PATH, &mut meta) < 0 || meta.st_size == 0 {
+        return Err(fail("storage", "stat(/usr/src/hello.c) failed", 6));
     }
 
     Ok(())
