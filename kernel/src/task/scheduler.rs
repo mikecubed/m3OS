@@ -1193,6 +1193,22 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     }
 }
 
+/// Remove every `Capability::Reply(target)` from every task's capability
+/// table.
+///
+/// Called when signal delivery pulls `target` out of an IPC wait: any server
+/// still holding a reply cap for that caller would otherwise be able to drop
+/// a late reply into the caller's pending slot, which a subsequent
+/// `ipc_call` would consume as its own reply. Dropping the reply caps makes
+/// the stale `ipc_reply` fail fast (with `u64::MAX`) instead.
+pub fn revoke_reply_caps_for(target: TaskId) {
+    let mut sched = SCHEDULER.lock();
+    for task in sched.tasks.iter_mut() {
+        task.caps
+            .revoke_matching(|cap| matches!(cap, Capability::Reply(t) if *t == target));
+    }
+}
+
 /// Remove and return the pending message for a task.
 pub fn take_message(id: TaskId) -> Option<Message> {
     let mut sched = SCHEDULER.lock();

@@ -1260,6 +1260,10 @@ fn signal_interrupts_ipc_wait(proc: &Process, sig: u32) -> bool {
 fn interrupt_ipc_waits(pid: Pid) {
     for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
         crate::ipc::endpoint::cancel_task_wait(task_id);
+        // Invalidate any reply cap other servers still hold for this task —
+        // otherwise a late `ipc_reply` on a now-resumed caller could leave
+        // a stale reply message that a subsequent `ipc_call` would consume.
+        crate::task::scheduler::revoke_reply_caps_for(task_id);
         crate::task::scheduler::deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
         let _ = crate::task::scheduler::wake_task(task_id);
     }

@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn max_payload_is_page_aligned() {
+    fn max_payload_is_block_aligned() {
         assert!(NET_UDP_MAX_PAYLOAD > 0);
         assert_eq!(NET_UDP_MAX_PAYLOAD % 512, 0);
     }

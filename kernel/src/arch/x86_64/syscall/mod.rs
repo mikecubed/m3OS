@@ -507,8 +507,12 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
         return NEG_ELOOP;
     }
 
-    // Phase 54: route read-only /etc/... file opens through the userspace VFS
-    // service when it is registered, instead of the kernel-inline ext2 path.
+    // Phase 54: route read-only regular-file opens on the ext2 root through
+    // the userspace VFS service when it is registered, instead of the
+    // kernel-inline ext2 path. The routing predicate (`vfs_service_should_route`)
+    // is not scoped to `/etc/` — any ext2-backed regular file the service
+    // claims it can handle is eligible when no write / create / exclusive
+    // flags are set.
     if vfs_service_should_route(&resolved, flags) {
         // Enforce the same DAC permission check the kernel path uses so that
         // protected files (e.g. /etc/shadow) are not exposed through the VFS
