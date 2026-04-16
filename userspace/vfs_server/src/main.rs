@@ -640,20 +640,10 @@ fn handle_open(
         None => return (NEG_ENFILE, 0),
     };
 
-    // Reply: label=0 (success), data[0]=handle, data[1]=file_size.
-    // (kernel picks up data[0] and data[1] from the reply Message)
-    // Since ipc_reply only supports label+data0, we pack file_size into
-    // a reply bulk payload (4 bytes, LE). The kernel extracts it.
-    //
-    // Actually, the kernel uses call_msg() which returns a full Message.
-    // But our reply via ipc_reply(cap, label, data0) only sets label and
-    // data[0]. The kernel reads reply.data[1] for file_size.
-    //
-    // Workaround: store file_size in the reply bulk (4 bytes).
-    // The kernel can read it from data[0] packed:
-    //   data[0] = handle | (file_size << 32)
-    //
-    // Simpler: pack handle in low 32 bits, file_size in high 32 bits of data0.
+    // Reply: label=0, data[0] packs the handle in the low 32 bits and the
+    // file size (clamped to u32::MAX) in the high 32 bits. The kernel
+    // unpacks both fields to seed its FdBackend::VfsService entry — see
+    // kernel_core::fs::vfs_protocol::VFS_OPEN for the canonical contract.
     let packed = handle | ((file_size as u64) << 32);
     (0, packed)
 }

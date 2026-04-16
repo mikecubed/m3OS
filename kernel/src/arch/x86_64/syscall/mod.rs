@@ -7129,14 +7129,15 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
         return Some((0, 0, 0o755));
     }
     // ext2 root filesystem — check for any path.
+    //
+    // DAC decisions must stay on kernel-verified metadata: a compromised or
+    // misbehaving ring-3 `vfs_server` could otherwise spoof uid/gid/mode via
+    // `VFS_STAT_PATH` and defeat the access checks in `open_user_path`. The
+    // service is only trusted for user-visible `stat` / `getdents` behavior
+    // (see `sys_fstat` / `sys_getdents`), not for enforcement paths.
     if let Some(rel) = ext2_root_path(abs_path)
         && crate::fs::ext2::is_mounted()
     {
-        if vfs_service_can_handle_path(abs_path)
-            && let Ok(stat) = vfs_service_stat_path(abs_path)
-        {
-            return Some((stat.uid, stat.gid, (stat.mode & 0o7777) as u16));
-        }
         return data_file_metadata(rel);
     }
     // Legacy: /data paths for FAT32 fallback.
