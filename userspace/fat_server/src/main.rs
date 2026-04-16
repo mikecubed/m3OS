@@ -29,6 +29,11 @@ syscall_lib::entry_point!(program_main);
 /// after each successful recv.
 const REPLY_CAP_HANDLE: u32 = 1;
 
+/// Negative `ENOSYS` as a reply label — signals "service exists but this
+/// operation is not implemented", distinct from `u64::MAX` which callers
+/// already use as a transport-level failure sentinel.
+const NEG_ENOSYS: u64 = (-38i64) as u64;
+
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "fat_server: starting\n");
 
@@ -59,13 +64,13 @@ fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
 
     loop {
-        // Reply with error label — no operations implemented in this slice.
-        let reply_label = u64::MAX;
-
+        // Reply with -ENOSYS — no operations implemented in this slice.
+        // Using a specific errno (not the u64::MAX transport sentinel) lets
+        // callers tell "service up, op not implemented" from "IPC failure".
         msg = syscall_lib::IpcMessage::new(0);
         syscall_lib::ipc_reply_recv_msg(
             REPLY_CAP_HANDLE,
-            reply_label,
+            NEG_ENOSYS,
             ep_handle,
             &mut msg,
             &mut buf,

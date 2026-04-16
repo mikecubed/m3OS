@@ -94,7 +94,7 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     begin("storage");
-    if let Err(code) = create_and_verify_smoke_file() {
+    if let Err(code) = verify_required_storage_files() {
         return code;
     }
     pass("storage");
@@ -122,7 +122,7 @@ fn program_main(_args: &[&str]) -> i32 {
     0
 }
 
-fn create_and_verify_smoke_file() -> Result<(), i32> {
+fn verify_required_storage_files() -> Result<(), i32> {
     let mut meta = Stat::zeroed();
     if stat(PASSWD_PATH, &mut meta) < 0 || meta.st_size == 0 {
         return Err(fail("storage", "stat(/etc/passwd) failed", 5));

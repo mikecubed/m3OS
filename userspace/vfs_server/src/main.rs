@@ -175,9 +175,10 @@ impl Ext2State {
 
     /// Resolve a path like "/etc/passwd" to its inode number.
     ///
-    /// `path` must start with "/". We walk from root inode (2).
+    /// `path` must start with "/" — relative paths are rejected with
+    /// `NEG_EINVAL`. Walks from root inode (2).
     fn resolve_path(&self, path: &str) -> Result<u32, u64> {
-        let path = path.strip_prefix('/').unwrap_or(path);
+        let path = path.strip_prefix('/').ok_or(NEG_EINVAL)?;
         let mut current_inode_num: u32 = 2; // root inode
 
         for component in path.split('/') {
