@@ -6132,7 +6132,7 @@ fn storage_roundtrip_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "guest/storage: prompt after write",
     });
     steps.push(SmokeStep::Send {
@@ -6141,21 +6141,25 @@ fn storage_roundtrip_steps() -> Vec<SmokeStep> {
     });
     steps.push(SmokeStep::Wait {
         pattern: "STORAGE_OK",
-        timeout_secs: 10,
+        timeout_secs: 15,
         label: "guest/storage: verify file content",
     });
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 5,
+        timeout_secs: 15,
         label: "guest/storage: prompt after read",
     });
     steps.push(SmokeStep::Send {
         input: "/bin/rm /root/regtest_file\n",
         label: "guest/storage: delete file",
     });
+    // rm does more IPC hops than echo/cat (stat + unlink + parent-dir close
+    // under Phase 54's extracted VFS). 10s was tight even before serverization;
+    // align with the other regression tests that use 15-20s for post-command
+    // prompts.
     steps.push(SmokeStep::Wait {
         pattern: "# ",
-        timeout_secs: 10,
+        timeout_secs: 20,
         label: "guest/storage: prompt after delete",
     });
     steps
