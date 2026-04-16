@@ -6367,6 +6367,13 @@ fn cmd_regression(args: &RegressionArgs) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     let ovmf = find_ovmf();
+    // CI runs smoke-test before regression in the same workspace. Recreate the
+    // data disk here so smoke-mode markers do not leak into login-based
+    // regression scenarios.
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
     create_data_disk(uefi_image.parent().unwrap(), false, false);
 
     let mut passed = 0usize;
