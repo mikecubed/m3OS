@@ -1390,20 +1390,9 @@ fn find_ovmf() -> PathBuf {
     std::process::exit(1);
 }
 
-/// Returns true when `/dev/kvm` is present and usable by the current user.
-/// KVM acceleration gives a 5–20x speedup over TCG emulation and is the
-/// difference between passing and failing under CI timing budgets.
-fn qemu_kvm_available() -> bool {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/kvm")
-        .is_ok()
-}
-
 /// Number of guest CPUs to configure. Defaults to 4 for SMP-race coverage on
 /// dev machines; CI (2-vCPU runners) overrides via `M3OS_SMP=2` to avoid
-/// oversubscribing the host and starving the guest scheduler.
+/// oversubscribing the host and starving the guest scheduler under TCG.
 fn qemu_smp_count() -> u32 {
     std::env::var("M3OS_SMP")
         .ok()
@@ -1426,14 +1415,6 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         "-smp".to_string(),
         qemu_smp_count().to_string(),
     ];
-
-    if qemu_kvm_available() {
-        // Use KVM but stay on the default qemu64 CPU model. `-cpu host` would
-        // advertise SSE/AVX/etc., and the kernel's `switch_context()` only
-        // saves GPRs (see `-mmx,-sse` target-spec note in CLAUDE.md). Exposing
-        // SIMD silently corrupts task state and hangs boot during `fat` init.
-        args.extend(["-accel".to_string(), "kvm".to_string()]);
-    }
 
     match display_mode {
         QemuDisplayMode::Headless => {

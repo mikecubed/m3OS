@@ -30,16 +30,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf musl-tools qemu-utils e2fsprogs
 
-      - name: Enable KVM access
-        # GitHub hosted runners expose /dev/kvm but with restrictive permissions.
-        # Relaxing them lets QEMU use -accel kvm, giving ~5-20x speedup over TCG.
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-
       - name: Cargo cache
         uses: actions/cache@v5
         with:
@@ -72,7 +62,9 @@ jobs:
           cargo xtask smoke-test --timeout 300
 
       - name: Regression suite (SMP races + headless operator workflows)
-        run: cargo xtask regression --timeout 90
+        # Pure TCG under -smp 2: boots run ~15-20s, so each test needs
+        # generous headroom beyond its per-step waits.
+        run: cargo xtask regression --timeout 180
 
       - name: Upload regression artifacts on failure
         if: failure()
