@@ -541,6 +541,24 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
             core: core_id,
         });
         data.reschedule.store(true, Ordering::Relaxed);
+        // Phase 54: when we enqueue onto a DIFFERENT core than the caller's,
+        // setting the reschedule flag alone won't wake a halted target core
+        // — `hlt` only wakes on an interrupt. Send a reschedule IPI so the
+        // target picks up the new task immediately instead of waiting for
+        // its next local timer tick (~10 ms on APs).
+        //
+        // Without this, the high-volume cross-core IPC introduced by the
+        // broadened VFS routing in commit 3944b9b causes deterministic
+        // login hangs on `/etc/services.d` STAT and intermittent hangs
+        // during subsequent interactive commands — wake_task returns true
+        // (state flips Blocked→Ready) but the idle target core never
+        // notices the new run-queue entry.
+        if crate::smp::is_per_core_ready() {
+            let current = crate::smp::per_core().core_id;
+            if current != core_id {
+                crate::smp::ipi::send_ipi_to_core(core_id, crate::smp::ipi::IPI_RESCHEDULE);
+            }
+        }
     }
 }
 
