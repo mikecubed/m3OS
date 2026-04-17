@@ -42,19 +42,20 @@
 - [ ] The matrix names at least one storage target (NVMe-class) and one network target (Intel e1000-class)
 - [ ] Each target entry records: device class, PCI vendor/device IDs, QEMU emulation flag, physical test hardware (if available), and validation status
 - [ ] The matrix distinguishes QEMU-emulated targets (validated in CI) from physical-hardware targets (validated manually)
+- [ ] Physical-hardware entries carry an explicit IOMMU caveat: "VT-d / AMD-Vi enabled systems may block driver DMA until IOMMU mappings exist; IOMMU support is deferred per Phase 55 design doc"
 - [ ] The matrix is referenced from both the Phase 55 design doc and the Phase 55 learning doc
 
 ### A.3 — Document QEMU validation configurations for reference targets
 
-**File:** `xtask/src/main.rs`
-**Symbol:** `build_qemu_args` (extend or document)
-**Why it matters:** Reproducible QEMU configurations for NVMe and e1000 are needed before driver bring-up starts, so development and CI can validate against emulated reference hardware.
+**File:** `docs/55-hardware-substrate.md` (learning doc) and/or `docs/roadmap/55-hardware-substrate.md`
+**Symbol:** `Reference QEMU configurations` (subsection)
+**Why it matters:** The QEMU command lines used to validate NVMe and e1000 bring-up must be recorded before driver development starts so development and CI target the same configuration. The xtask integration that exposes these as flags is handled separately in F.1 — A.3 is the documentation precursor so implementation and documentation cannot drift.
 
 **Acceptance:**
-- [ ] QEMU NVMe configuration documented: `-drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0`
-- [ ] QEMU e1000 configuration documented: `-device e1000,netdev=net0 -netdev user,id=net0`
-- [ ] Both configurations are reproducible from `xtask` or documented as manual invocations
-- [ ] Existing VirtIO configurations remain the default and are not broken
+- [ ] QEMU NVMe configuration recorded: `-drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0`
+- [ ] QEMU e1000 configuration recorded: `-device e1000,netdev=net0 -netdev user,id=net0`
+- [ ] The recorded configurations are explicitly cross-referenced from F.1's xtask `--device` flags
+- [ ] Existing VirtIO configurations remain the default and are not broken by the documented commands
 
 ### A.4 — Verify evaluation gate checks before closing Phase 55
 
@@ -135,7 +136,7 @@
 - [ ] `MmioRegion` provides `read_reg::<T>(offset)` and `write_reg::<T>(offset, value)` using volatile operations
 - [ ] PIO BARs provide equivalent typed port I/O wrappers
 - [ ] BAR size detection uses the standard write-ones/read-back PCI BAR sizing algorithm
-- [ ] At least 2 tests validate BAR type detection (MMIO vs PIO) and size calculation logic in `kernel-core`
+- [ ] At least 4 tests in `kernel-core` cover BAR decoding: (1) 32-bit MMIO BAR type + size, (2) PIO BAR type + size, (3) 64-bit MMIO BAR spanning two BAR slots with correct upper-half decoding, (4) prefetchable flag and zero-size BAR handling
 
 ### C.2 — DMA buffer allocation and management
 
@@ -232,6 +233,7 @@
 - [ ] BAR0 is mapped via the hardware-access layer (`map_bar`) as an MMIO region
 - [ ] NVMe controller registers are accessible: `CAP`, `VS`, `CC`, `CSTS`, `AQA`, `ASQ`, `ACQ`
 - [ ] Controller reset sequence executes: disable (`CC.EN=0`), wait for `CSTS.RDY=0`, configure, enable (`CC.EN=1`), wait for `CSTS.RDY=1`
+- [ ] Controller reset has a bounded timeout derived from `CAP.TO` (NVMe spec: `CAP.TO` is in 500 ms units); if `CSTS.RDY` does not reach the expected state within the timeout, `nvme_probe` returns a bring-up error instead of looping forever
 - [ ] Controller version and capabilities (queue entry sizes, doorbell stride, max queue entries) are parsed from `CAP` and `VS`
 
 ### D.2 — NVMe admin queue and identify command
@@ -246,10 +248,12 @@
 **Acceptance:**
 - [ ] Admin submission and completion queues are allocated as `DmaBuffer` with physically-contiguous pages
 - [ ] Queue doorbell registers are accessed at the correct stride offset from BAR0
-- [ ] `NvmeCommand` represents a 64-byte NVMe submission queue entry with opcode, namespace ID, PRP1/PRP2, and CDW10-15 fields
+- [ ] Submission queue entries are constructed using `kernel_core::nvme::NvmeCommand` (defined in D.0) — the kernel-side admin code does not redefine the 64-byte layout
+- [ ] Completion queue entries are typed as `kernel_core::nvme::NvmeCompletion` (defined in D.0)
 - [ ] Identify Controller command (`opcode 0x06`, CNS=1) returns model, serial, firmware revision, and queue limits
 - [ ] Identify Namespace command (`opcode 0x06`, CNS=0) returns namespace size, capacity, and LBA format
 - [ ] Completion queue entries are polled and the phase bit is used to detect new completions
+- [ ] Admin-queue helpers return a bounded error (rather than blocking forever) if a completion does not arrive within a configurable per-command timeout
 
 ### D.3 — NVMe I/O queue pairs and block read/write
 
@@ -322,8 +326,7 @@
 **Why it matters:** The e1000 uses hardware DMA descriptor rings for packet transmission and reception. Each descriptor points to a DMA buffer where the hardware reads (TX) or writes (RX) packet data. Correct ring setup is the foundation for all packet I/O.
 
 **Acceptance:**
-- [ ] `E1000RxDesc` is a 16-byte legacy receive descriptor with buffer address, length, status, and errors fields
-- [ ] `E1000TxDesc` is a 16-byte legacy transmit descriptor with buffer address, length, command, and status fields
+- [ ] Ring slots are typed as `kernel_core::e1000::E1000RxDesc` and `kernel_core::e1000::E1000TxDesc` (defined in E.0) — the kernel-side driver does not redefine the descriptor layout
 - [ ] `RxDescRing` allocates a `DmaBuffer` array of receive descriptors and pre-allocates per-descriptor packet buffers
 - [ ] `TxDescRing` allocates a `DmaBuffer` array of transmit descriptors
 - [ ] Ring base addresses and lengths are programmed into `RDBAL`/`RDBAH`/`RDLEN` and `TDBAL`/`TDBAH`/`TDLEN`
@@ -362,6 +365,7 @@
 - [ ] TX completion is checked via the DD status bit in transmitted descriptors; buffers are reclaimed
 - [ ] `init_e1000()` is called from `probe_all_drivers` and sets the network driver dispatch to use e1000 when the device is present
 - [ ] The existing `send_packet` path in `kernel/src/net/mod.rs` dispatches to e1000 or VirtIO-net based on which driver initialized
+- [ ] Link-status-change interrupts flip a driver-level link flag; while the flag is down, `e1000_transmit` returns an `ENETDOWN`-equivalent error instead of silently enqueuing onto a ring the hardware will not drain, and the TX ring is drained of in-flight descriptors before re-enabling transmit on link-up
 - [ ] ICMP ping through the e1000 driver works in QEMU (`-device e1000`)
 - [ ] TCP connections through the e1000 driver work (telnet/SSH to the OS via e1000)
 
@@ -412,6 +416,7 @@
 
 **Acceptance:**
 - [ ] `docs/roadmap/README.md` Phase 55 row updated from "Deferred until implementation planning" to the task doc link
+- [ ] `docs/roadmap/tasks/README.md` gains a Phase 55 row under `Convergence Phases` pointing at `./55-hardware-substrate-tasks.md`
 - [ ] `docs/README.md` references the Phase 55 learning doc
 - [ ] `docs/15-hardware-discovery.md` updated to mention PCIe MCFG and MSI/MSI-X
 - [ ] `docs/16-network.md` updated to document the e1000 driver alongside VirtIO-net
@@ -422,13 +427,23 @@
 
 ### F.4 — Version bump to 0.55.0
 
-**File:** `kernel/Cargo.toml`
-**Symbol:** `version` field
-**Why it matters:** The Phase 55 design doc requires the kernel version to be bumped to `0.55.0` when the phase lands.
+**Files:**
+- `kernel/Cargo.toml`
+- `AGENTS.md` (project-overview version string)
+- `README.md` (project overview / release notes)
+- `docs/roadmap/README.md` (Phase 55 status column)
+- `docs/roadmap/tasks/README.md` (Phase 55 status column, added in F.3)
+
+**Symbol:** `version` field (Cargo.toml) and prose version mentions (docs)
+**Why it matters:** The Phase 55 design doc requires the kernel version to be bumped to `0.55.0` when the phase lands. Phase 54 closure exposed that leaving "any other version references" open-ended permits drift between the crate version, the docs, and the roadmap status columns.
 
 **Acceptance:**
-- [ ] `kernel/Cargo.toml` version is `0.55.0`
-- [ ] Any other version references in the codebase or docs are updated to match
+- [ ] `kernel/Cargo.toml` `[package].version` is `0.55.0`
+- [ ] `AGENTS.md` project-overview paragraph reflects kernel `v0.55.0`
+- [ ] `README.md` project description reflects the new kernel version
+- [ ] `docs/roadmap/README.md` Phase 55 row status is `Complete`
+- [ ] `docs/roadmap/tasks/README.md` Phase 55 row status is `Complete`
+- [ ] A repo-wide search for the previous `0.54.x` version string returns no user-facing references that should have been bumped (generated lockfiles excepted)
 
 ---
 
@@ -438,8 +453,11 @@
 - Phase 24 introduced VirtIO-blk storage with legacy VirtIO 0.9.5 port I/O. Phase 55 adds NVMe as the first non-VirtIO storage path using the new hardware-access layer.
 - Phase 16 introduced VirtIO-net networking with legacy VirtIO 0.9.5 port I/O. Phase 55 adds Intel e1000 as the first non-VirtIO networking path.
 - Phase 53a modernized the memory allocator. Phase 55's DMA buffer abstraction builds on the buddy allocator's `alloc_contiguous_frames` for physically-contiguous allocation.
+- **Ring-0 placement is deliberate and bounded.** Phase 55 places the NVMe and e1000 drivers in ring 0 (`kernel/src/blk/nvme.rs`, `kernel/src/net/e1000.rs`) for bring-up simplicity, which is a conscious widening of the TCB relative to Phase 54's userspace-service direction. Extraction of these drivers into supervised ring-3 services (following the Phase 54 `vfs_server` / `net_server` pattern) is **deferred to a later phase**. To keep that door open, the hardware-access layer (BAR mapping, DMA, IRQ registration, device claim) is designed so its contracts are callable from a future userspace driver host rather than baked into kernel-only call sites.
+- **Failure modes covered by acceptance criteria.** The phase deliberately specifies non-happy paths so drivers do not hang ring 0 under hardware faults: NVMe controller-reset timeout (D.1), admin-command completion timeout (D.2), e1000 link-down with in-flight TX (E.4), MSI/MSI-X allocation failure falls back to polling on NVMe (D.4) and to legacy INTx on e1000 (E.3). DMA allocation failure surfaces as a driver-init error rather than a panic.
 - The donor strategy in `docs/evaluation/hardware-driver-strategy.md` was researched before Phase 55. Implementation should follow it: public specs first, Redox as device-logic reference, BSD as behavioral reference, Linux for quirks only.
 - The Redox porting analysis in `docs/evaluation/redox-driver-porting.md` identifies e1000 and NVMe as "high feasibility" extraction targets. The reusable part is device-register logic; the Redox scheme/daemon/event glue is not portable.
+- **Intel NIC scope.** Phase 55 targets the Intel 82540EM classic e1000 (`0x8086:0x100E`) only. The e1000e family (82574, 82576, etc.) is different silicon with separate register layouts and is **not** in scope; it is deferred to a later phase.
 - New pure-logic code (register definitions, command structures, descriptor formats) belongs in `kernel-core` for host testability where practical. Hardware-dependent wiring (MMIO access, DMA allocation, ISR registration) belongs in `kernel/src/`.
 - Host-side tests should use `cargo test -p kernel-core --target x86_64-unknown-linux-gnu`.
 - The existing VirtIO drivers should be migrated to use the new hardware-access layer (BAR mapping, device claim, IRQ registration) to validate the abstractions before NVMe and e1000 are built on them.
