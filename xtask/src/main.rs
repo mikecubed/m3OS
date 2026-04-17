@@ -4584,10 +4584,6 @@ fn populate_ext2_files(
          sif var/log mode 0x41ED\n\
          sif var/log uid 0\n\
          sif var/log gid 0\n\
-         mkdir var/run\n\
-         sif var/run mode 0x41ED\n\
-         sif var/run uid 0\n\
-         sif var/run gid 0\n\
          mkdir var/spool\n\
          sif var/spool mode 0x41ED\n\
          sif var/spool uid 0\n\
