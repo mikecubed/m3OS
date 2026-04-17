@@ -155,6 +155,22 @@ impl CapabilityTable {
             .collect()
     }
 
+    /// Clear every slot whose capability satisfies `pred`, returning the
+    /// number of revoked entries. Used to invalidate stale reply caps when
+    /// their target is pulled out of an IPC wait by signal delivery.
+    pub fn revoke_matching(&mut self, pred: impl Fn(&Capability) -> bool) -> usize {
+        let mut revoked = 0;
+        for slot in self.slots.iter_mut() {
+            if let Some(cap) = slot
+                && pred(cap)
+            {
+                *slot = None;
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
     /// Return the notification IDs currently held in the table.
     pub fn notification_ids(&self) -> Vec<NotifId> {
         self.slots

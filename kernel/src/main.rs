@@ -74,8 +74,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
+    // `tmpfs::init()` is deferred to after this block so its heap / frame
+    // usage doesn't perturb the frame-allocator baseline that some tests
+    // snapshot.
     #[cfg(test)]
     test_main();
+
+    // Phase 54: populate tmpfs with /tmp and /run top-level directories.
+    // Must run after heap init so tmpfs allocations succeed, before any
+    // task that opens files under those paths.
+    fs::tmpfs::init();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, info)) = fb_parts {
@@ -214,24 +222,13 @@ fn init_task() -> ! {
     // kbd_server service (kernel/initrd/etc/services.d/kbd.conf).  The kernel
     // no longer pre-registers or spawns a ring-0 kbd_server_task.
 
-    // Phase 8: fat_server endpoint — must be registered before vfs_server
-    // spawns because vfs_server calls lookup("fat") during its startup.
-    let fat_ep = ipc::endpoint::ENDPOINTS.lock().create();
-    ipc::registry::register("fat", fat_ep).expect("[init] failed to register fat service");
-    log::info!("[init] service registry: fat={:?}", fat_ep);
-
-    // Phase 8: vfs_server endpoint.
-    let vfs_ep = ipc::endpoint::ENDPOINTS.lock().create();
-    ipc::registry::register("vfs", vfs_ep).expect("[init] failed to register vfs service");
-    log::info!("[init] service registry: vfs={:?}", vfs_ep);
+    // Phase 54: fat_server and vfs_server are now userspace processes.
+    // Ring-0 endpoint pre-registration and task spawning removed —
+    // the userspace crates register themselves on startup via IPC.
 
     // Spawn Phase 7 service tasks.
     task::spawn(console_server_task, "console");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
-
-    // Spawn Phase 8 storage tasks.
-    task::spawn(fat_server_task, "fat");
-    task::spawn(vfs_server_task, "vfs");
 
     // Spawn Phase 16 network processing task.
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
@@ -430,96 +427,8 @@ const MAX_CONSOLE_WRITE_LEN: usize = 4096;
 // Phase 8 storage tasks
 // ---------------------------------------------------------------------------
 
-/// Ramdisk filesystem server: serves FILE_OPEN / FILE_READ / FILE_CLOSE
-/// requests by delegating to the static embedded ramdisk in `fs::ramdisk`.
-fn fat_server_task() -> ! {
-    let my_id = task::current_task_id().expect("[fat] no task id");
-
-    // Look up this server's endpoint via the service registry.
-    let ep_id = ipc::registry::lookup("fat").expect("[fat] endpoint not in registry");
-    task::set_server_endpoint(my_id, ep_id);
-
-    // Insert an endpoint capability at handle 0.
-    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("[fat] failed to insert endpoint cap");
-    assert_eq!(ep_handle, 0, "[fat] endpoint cap not at expected handle 0");
-
-    log::info!("[fat] ready");
-
-    let reply_cap_handle: ipc::CapHandle = 1;
-    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
-
-    loop {
-        // Delegate to the ramdisk handler (T003, T005: read-only, no mutations).
-        let reply_msg = crate::fs::ramdisk::handle(&msg);
-
-        // Consume the one-shot reply cap inserted by recv_msg.
-        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
-            Ok(ipc::Capability::Reply(id)) => id,
-            _ => {
-                log::warn!("[fat] no reply cap at handle 1; sender used send rather than call");
-                msg = ipc::endpoint::recv_msg(my_id, ep_id);
-                continue;
-            }
-        };
-        let _ = task::remove_task_cap(my_id, reply_cap_handle);
-
-        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
-    }
-}
-
-/// VFS routing server: accepts file requests from clients and forwards them
-/// to the fat_server backend via IPC.
-///
-/// In Phase 8 there is one backend (fat_server). Phase 9+ will consult a
-/// mount table to select the backend for each path prefix.
-fn vfs_server_task() -> ! {
-    let my_id = task::current_task_id().expect("[vfs] no task id");
-
-    // Look up this server's own endpoint.
-    let ep_id = ipc::registry::lookup("vfs").expect("[vfs] endpoint not in registry");
-    task::set_server_endpoint(my_id, ep_id);
-
-    let ep_handle = task::insert_cap(my_id, ipc::Capability::Endpoint(ep_id))
-        .expect("[vfs] failed to insert endpoint cap");
-    assert_eq!(ep_handle, 0, "[vfs] endpoint cap not at expected handle 0");
-
-    // Find the fat_server backend endpoint — it must already be registered
-    // (init_task registers "fat" before spawning vfs_server_task).
-    //
-    // NOTE: call_msg() takes EndpointId directly; no capability insert is
-    // needed here.  Inserting a cap would occupy handle 1, which this server
-    // reserves for incoming Reply caps from clients — causing a permanent
-    // block on the first client call.
-    let fat_ep_id = ipc::registry::lookup("fat").expect("[vfs] fat backend not in registry");
-
-    log::info!("[vfs] ready, backend={:?}", fat_ep_id);
-
-    let reply_cap_handle: ipc::CapHandle = 1;
-    let mut msg = ipc::endpoint::recv_msg(my_id, ep_id);
-
-    loop {
-        // Check for the Reply cap before forwarding to the backend.  A client
-        // using send() rather than call() inserts no Reply cap; forwarding via
-        // call_msg() in that case would block the VFS task waiting for a fat
-        // reply that will be discarded.  Skip the backend call entirely when
-        // no reply cap is present.
-        let caller_id = match task::task_cap(my_id, reply_cap_handle) {
-            Ok(ipc::Capability::Reply(id)) => id,
-            _ => {
-                log::warn!("[vfs] no reply cap at handle 1; sender used send rather than call");
-                msg = ipc::endpoint::recv_msg(my_id, ep_id);
-                continue;
-            }
-        };
-
-        // Forward the request to the fat_server backend and collect the full reply.
-        let reply_msg = ipc::endpoint::call_msg(my_id, fat_ep_id, msg);
-
-        let _ = task::remove_task_cap(my_id, reply_cap_handle);
-        msg = ipc::endpoint::reply_recv_msg(my_id, caller_id, ep_id, reply_msg);
-    }
-}
+// Phase 54: ring-0 fat_server_task and vfs_server_task removed.
+// These are now userspace processes (userspace/fat_server, userspace/vfs_server).
 
 /// Idle task: halts the CPU between timer ticks.
 fn idle_task() -> ! {

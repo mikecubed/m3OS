@@ -1522,3 +1522,17 @@ pub fn get_ext2_meta(path: &str) -> Option<(u32, u32, u16)> {
         None => None,
     }
 }
+
+/// Check if a root-relative ext2 path is a regular file (not directory/symlink).
+/// Returns `false` if the volume is not mounted or the path does not exist.
+pub fn is_ext2_regular_file(path: &str) -> bool {
+    use kernel_core::fs::ext2::{S_IFMT, S_IFREG};
+    let vol = EXT2_VOLUME.lock();
+    match vol.as_ref() {
+        Some(vol) => match vol.metadata(path) {
+            Ok((_, _, mode, _, _)) => mode & S_IFMT == S_IFREG,
+            Err(_) => false,
+        },
+        None => false,
+    }
+}

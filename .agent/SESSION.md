@@ -1,47 +1,46 @@
-current-task: Resolve the remaining PR #105 review and readiness findings on feature branch feat/53-headless-hardening
-current-phase: final-ready
-next-action: branch published at 50542a6 with green hosted checks; PR is ready for human review
-workspace: PR #105 / feat/53-headless-hardening
-last-updated: 2026-04-14T06:44:27+00:00
+---
+current-task: "Resolve PR #108 fifth-round ad-hoc review (3 verified items)"
+current-phase: "fix-batch-5-complete"
+next-action: "push, reply summary to developer"
+workspace: "PR #108 / feat/54-deep-serverization-closure"
+last-updated: "2026-04-17T00:05:00Z"
+---
 
 ## Decisions
 
-- `discussion_r3077430924` | evidence verdict: valid | concern: correctness + contract mismatch | action: fix. Current `build_musl_rust_bins()` only creates zero-length placeholders when the staged file does not already exist, so a missing musl target can leave stale cached binaries in `target/generated-initrd/` while logging that placeholders are being left in place.
-- Discovery brief skipped because the live review batch is already narrow and fully scoped: one open thread on one file (`xtask/src/main.rs`) with no scope ambiguity.
-- Fix batch 1 implemented by resetting musl Rust staged initrd files to zero-length placeholders before availability checks/build attempts, plus xtask unit coverage for both create and truncate paths.
-- Post-fix validation passed: `cargo test -p xtask --target x86_64-unknown-linux-gnu --quiet` and `cargo xtask check`.
-- Independent fix review reported no substantive remaining issues after the warning text was aligned with the new placeholder behavior.
-- Final readiness structured review surfaced a valid follow-up fix-now item: passwd/su account parsing used wrapping arithmetic for UID/GID fields, allowing malformed overflowed numeric values to alias low u32 IDs.
-- Fix batch 2 hardened numeric parsing in `userspace/passwd/src/lib.rs` and `userspace/su/src/main.rs` to reject malformed or overflowed UID/GID fields via checked arithmetic, and added a host regression test proving an overflowed UID cannot shadow root in `find_username_by_uid`.
-- Post-fix validation for batch 2 passed: `cargo test -p passwd --target x86_64-unknown-linux-gnu --no-default-features --features host-tests --test passwd_host --quiet` and `cargo xtask check`.
-- Independent fix review reported no substantive remaining issues in the UID/GID parser hardening diff.
-- The rerun structured review surfaced the same wrapping UID parser still present in `userspace/login/src/main.rs` and `userspace/id/src/main.rs`; local audit found matching `/etc/passwd` parsing in `userspace/whoami/src/main.rs` and `userspace/adduser/src/main.rs`, so the follow-up was widened to the full remaining account-parser family.
-- Fix batch 3 hardened `login`, `id`, `whoami`, and `adduser` to reject malformed or overflowed UID/GID fields via checked arithmetic, and made `adduser` fail cleanly when `max_uid.checked_add(1)` overflows instead of wrapping a new account to UID 0.
-- Post-fix validation for batch 3 passed: `cargo xtask check` and the existing passwd host regression remained green.
-- Independent review on the final five-file parser batch reported no substantive remaining issues after the `adduser` overflow follow-up fix.
-- Branch update published as `50542a6` (`fix: harden remaining account uid parsers`).
-- Latest hosted checks on PR #105 head `50542a6` all reached terminal success: CodeQL (`actions`, `c-cpp`, `rust`) and DevSkim passed; no pending or failing checks remained.
+Three ad-hoc review items verified against current code. All VALID.
+
+- P1 / `kernel/src/process/mod.rs:287-290` — VALID. `close_cloexec_fds` (and
+  also `close_all_fds_for`) lacked a `FdBackend::VfsService` arm; execve
+  with CLOEXEC and process exit silently dropped the service_handle without
+  sending `VFS_CLOSE`, leaking the server-side handle and eventually
+  exhausting the vfs_server's 32-slot table. Fix: added
+  `process::vfs_handle_open_count` and `syscall::cleanup_vfs_handle_if_unused`
+  helpers; wired them into `sys_linux_close`, `close_cloexec_fds`, and
+  `close_all_fds_for`. `VFS_CLOSE` now fires only when the last alias is
+  removed.
+- P1 / `kernel/src/process/mod.rs:205-211` — VALID. `add_fd_refs` (fork /
+  dup2 cloning path) did not refcount `FdBackend::VfsService`, so each
+  `sys_close` on a duplicate fired `VFS_CLOSE` and invalidated the
+  server-side handle even though sibling fds still referenced it. Fixed by
+  the same refcount-via-table-scan approach: close sites now count
+  remaining aliases and defer `VFS_CLOSE` to the last one.
+- P2 / `userspace/net_server/src/main.rs:54-55` — VALID. `MAX_BINDINGS = 16`
+  was a hard system-wide cap on simultaneously bound UDP ports, half the
+  kernel's historical `net::MAX_SOCKETS = 32`. Fix: bumped `MAX_BINDINGS`
+  to 32 and documented the pairing with kernel's MAX_SOCKETS.
 
 ## Files Touched
 
+- kernel/src/process/mod.rs
+- kernel/src/arch/x86_64/syscall/mod.rs
+- userspace/net_server/src/main.rs
 - .agent/SESSION.md
-- userspace/passwd/host-tests/passwd_host.rs
-- userspace/passwd/src/lib.rs
-- userspace/adduser/src/main.rs
-- userspace/id/src/main.rs
-- userspace/login/src/main.rs
-- userspace/su/src/main.rs
-- userspace/whoami/src/main.rs
-- xtask/src/main.rs
+
+Validation: `cargo xtask check` passes.
 
 ## Open Questions
 
-- none
-
 ## Blockers
 
-- none
-
 ## Failed Hypotheses
-
-- none

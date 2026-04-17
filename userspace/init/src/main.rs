@@ -8,17 +8,17 @@
 //! - Reap children, auto-restart per policy
 //! - Handle SIGTERM for orderly shutdown
 //! - Spawn login session separately (not a managed service)
-//! - Accept control commands via `/var/run/init.cmd`
-//! - Write service status to `/var/run/services.status`
+//! - Accept control commands via `/run/init.cmd`
+//! - Write service status to `/run/services.status`
 //! - Never exit (kernel panics if PID 1 dies)
 #![no_std]
 #![no_main]
 
 use syscall_lib::{
-    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SigAction,
-    SockaddrUn, WNOHANG, clock_gettime, close, execve, exit, fork, getdents64, kill, mount,
-    nanosleep, open, read, rt_sigaction, sendto_unix, set_nonblocking, setuid, socket, waitpid,
-    write, write_str, write_u64,
+    AF_UNIX, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, SOCK_DGRAM, STDOUT_FILENO, SockaddrUn, WNOHANG,
+    clock_gettime, close, execve, exit, fork, getdents64, kill, mount, nanosleep, open, read,
+    rt_sigaction_simple, sendto_unix, set_nonblocking, setuid, socket, waitpid, write, write_str,
+    write_u64,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,19 +38,32 @@ const SIGKILL: i32 = syscall_lib::SIGKILL;
 
 const LOGIN_PATH: &[u8] = b"/bin/login\0";
 const LOGIN_ARGV0: &[u8] = b"/bin/login\0";
+const SMOKE_RUNNER_PATH: &[u8] = b"/bin/smoke-runner\0";
+const SMOKE_RUNNER_ARGV0: &[u8] = b"/bin/smoke-runner\0";
+const SMOKE_MODE_PATH: &[u8] = b"/etc/m3os-smoke-test-mode\0";
+const SMOKE_MODE_SETTLE_SECS: u64 = 3;
 const ENV_PATH: &[u8] = b"PATH=/bin:/sbin:/usr/bin\0";
 const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 
-const STATUS_FILE: &[u8] = b"/var/run/services.status\0";
-const CMD_FILE: &[u8] = b"/var/run/init.cmd\0";
+// Runtime state files live on tmpfs under `/run` — matching the Linux
+// convention where runtime state is tmpfs-backed rather than persistent.
+// Putting them on ext2 caused init's periodic writes (every 10 s) to
+// synchronously spin-poll virtio_blk under EXT2_VOLUME, stalling core 0 for
+// ~900 ms and delaying every other task on that core's run queue (Phase 54
+// scheduler stall).
+const STATUS_FILE: &[u8] = b"/run/services.status\0";
+const CMD_FILE: &[u8] = b"/run/init.cmd\0";
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/console.conf\0",
     b"/etc/services.d/kbd.conf\0",
     b"/etc/services.d/stdin_feeder.conf\0",
+    b"/etc/services.d/fat_server.conf\0",
+    b"/etc/services.d/vfs_server.conf\0",
+    b"/etc/services.d/net_server.conf\0",
     b"/etc/services.d/sshd.conf\0",
     b"/etc/services.d/telnetd.conf\0",
     b"/etc/services.d/syslogd.conf\0",
@@ -664,6 +677,7 @@ struct ServiceManager {
     pid_table: PidTable,
     shutdown_requested: bool,
     login_pid: i32,
+    respawn_login: bool,
     /// File descriptor for the syslog socket (`/dev/log`), or -1 if unavailable.
     syslog_fd: i32,
 }
@@ -690,6 +704,7 @@ impl ServiceManager {
             pid_table: PidTable::new(),
             shutdown_requested: false,
             login_pid: -1,
+            respawn_login: true,
             syslog_fd: -1,
         }
     }
@@ -986,11 +1001,6 @@ impl ServiceManager {
                 let deps_ready = self.check_deps_ready(&graph, idx);
                 if deps_ready {
                     self.start_service(idx);
-                    // For daemons, give a brief moment to start.
-                    if self.services[idx].service_type == ServiceType::Daemon {
-                        // Small yield to let the child exec.
-                        nanosleep(0);
-                    }
                 } else {
                     write_str(STDOUT_FILENO, "init: skipping '");
                     write(STDOUT_FILENO, self.services[idx].name.as_bytes());
@@ -1149,17 +1159,23 @@ impl ServiceManager {
 
                 // Check restart policy if not shutting down.
                 if !self.shutdown_requested {
+                    self.note_extracted_service_degradation(idx);
                     self.maybe_restart(idx, exit_code, signaled);
                 }
             }
             None => {
                 // Not a managed service — could be a login shell or other child.
                 if pid == self.login_pid {
-                    write_str(
-                        STDOUT_FILENO,
-                        "\ninit: session ended, respawning login...\n",
-                    );
-                    self.login_pid = spawn_login();
+                    if self.respawn_login {
+                        write_str(
+                            STDOUT_FILENO,
+                            "\ninit: session ended, respawning login...\n",
+                        );
+                        self.login_pid = spawn_login();
+                    } else {
+                        write_str(STDOUT_FILENO, "\ninit: smoke session ended\n");
+                        self.login_pid = -1;
+                    }
                 }
             }
         }
@@ -1224,6 +1240,33 @@ impl ServiceManager {
         }
 
         self.start_service(idx);
+    }
+
+    fn note_extracted_service_degradation(&self, idx: usize) {
+        let svc = &self.services[idx];
+        if svc.restart_policy != RestartPolicy::Never {
+            return;
+        }
+
+        if svc.name.eq_bytes(b"vfs") {
+            write_str(
+                STDOUT_FILENO,
+                "init: vfs unavailable; new rootfs opens fall back to kernel ext2, but existing vfs-backed fds may fail with EIO until manual restart\n",
+            );
+            self.send_syslog(
+                SEV_WARNING,
+                b"vfs unavailable; new rootfs opens fall back to kernel ext2 and existing vfs-backed fds may fail with EIO until manual restart",
+            );
+        } else if svc.name.eq_bytes(b"net_udp") {
+            write_str(
+                STDOUT_FILENO,
+                "init: net_udp unavailable; UDP syscalls fall back to kernel policy and existing UDP sockets keep kernel-owned state until manual restart\n",
+            );
+            self.send_syslog(
+                SEV_WARNING,
+                b"net_udp unavailable; UDP syscalls fall back to kernel policy and existing UDP sockets keep kernel-owned state until manual restart",
+            );
+        }
     }
 
     /// Orderly shutdown of all services in reverse dependency order.
@@ -1423,7 +1466,7 @@ impl ServiceManager {
         false
     }
 
-    /// Write service status to `/var/run/services.status`.
+    /// Write service status to `/run/services.status`.
     fn write_status_file(&self) {
         let fd = open(STATUS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
         if fd < 0 {
@@ -1523,7 +1566,7 @@ impl ServiceManager {
         }
     }
 
-    /// Check for control commands in `/var/run/init.cmd`.
+    /// Check for control commands in `/run/init.cmd`.
     fn check_control_commands(&mut self) {
         let fd = open(CMD_FILE, O_RDONLY, 0);
         if fd < 0 {
@@ -1795,6 +1838,45 @@ fn spawn_login() -> i32 {
     pid as i32
 }
 
+fn spawn_smoke_runner() -> i32 {
+    let pid = fork();
+    if pid == 0 {
+        // Let boot-time services finish their initial ext2/syslog work before
+        // the smoke runner starts mutating the filesystem.
+        let _ = nanosleep(SMOKE_MODE_SETTLE_SECS);
+
+        let envp: [*const u8; 5] = [
+            ENV_PATH.as_ptr(),
+            ENV_HOME.as_ptr(),
+            ENV_TERM.as_ptr(),
+            ENV_EDITOR.as_ptr(),
+            core::ptr::null(),
+        ];
+
+        let argv: [*const u8; 2] = [SMOKE_RUNNER_ARGV0.as_ptr(), core::ptr::null()];
+        let ret = execve(SMOKE_RUNNER_PATH, &argv, &envp);
+
+        write_str(STDOUT_FILENO, "init: smoke-runner execve failed (");
+        write_u64(STDOUT_FILENO, (-ret) as u64);
+        write_str(STDOUT_FILENO, ")\n");
+        exit(1);
+    }
+    if pid < 0 {
+        write_str(STDOUT_FILENO, "init: failed to fork smoke-runner\n");
+        return -1;
+    }
+    pid as i32
+}
+
+fn smoke_test_mode_enabled() -> bool {
+    let fd = open(SMOKE_MODE_PATH, O_RDONLY, 0);
+    if fd < 0 {
+        return false;
+    }
+    close(fd as i32);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // SIGTERM handler — sets a flag checked in the main loop.
 //
@@ -1833,14 +1915,10 @@ pub extern "C" fn _start() -> ! {
     // Make /tmp world-writable.
     syscall_lib::chmod(b"/tmp\0", 0o1777);
 
-    // Install SIGTERM handler for orderly shutdown.
-    let act = SigAction {
-        sa_handler: sigterm_handler as *const () as u64,
-        sa_flags: 0,
-        sa_restorer: 0,
-        sa_mask: 0,
-    };
-    rt_sigaction(SIGTERM as usize, &act, core::ptr::null_mut());
+    // Install SIGTERM handler for orderly shutdown. rt_sigaction_simple wires
+    // up the default __syscall_lib_sigrestorer trampoline so the handler can
+    // return without faulting (missing SA_RESTORER would leave restorer=0).
+    rt_sigaction_simple(SIGTERM as usize, sigterm_handler);
 
     // Initialize service manager.
     let mut mgr = ServiceManager::new();
@@ -1854,11 +1932,24 @@ pub extern "C" fn _start() -> ! {
     // Open syslog socket now that syslogd should be running.
     mgr.open_syslog();
 
-    // Spawn initial login session (not a managed service).
-    mgr.login_pid = spawn_login();
-    if mgr.login_pid < 0 {
-        write_str(STDOUT_FILENO, "init: failed to spawn login\n");
-        // Not fatal — services may still be running.
+    // Spawn the initial interactive session unless the smoke-test marker asks
+    // PID 1 to run the guest smoke runner directly.
+    if smoke_test_mode_enabled() {
+        write_str(
+            STDOUT_FILENO,
+            "init: smoke-test mode enabled, scheduling /bin/smoke-runner\n",
+        );
+        mgr.respawn_login = false;
+        mgr.login_pid = spawn_smoke_runner();
+        if mgr.login_pid < 0 {
+            write_str(STDOUT_FILENO, "init: failed to spawn smoke-runner\n");
+        }
+    } else {
+        mgr.login_pid = spawn_login();
+        if mgr.login_pid < 0 {
+            write_str(STDOUT_FILENO, "init: failed to spawn login\n");
+            // Not fatal — services may still be running.
+        }
     }
 
     // Create control command file with root-only permissions (mode 0600).

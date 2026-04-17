@@ -202,6 +202,14 @@ pub enum FdBackend {
     UnixSocket { handle: usize },
     /// epoll instance — Phase 37. Monitors other FDs for readiness events.
     Epoll { instance_id: usize },
+    /// Phase 54: fd backed by the userspace VFS service.
+    /// The kernel dispatches open/read/close to the ring-3 `vfs_server` via IPC.
+    VfsService {
+        /// Opaque handle returned by the vfs_server on open.
+        service_handle: u64,
+        /// Cached file size (for stat / EOF).
+        file_size: u32,
+    },
 }
 
 /// A single open-file entry in the per-process FD table.
@@ -261,6 +269,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
+    let mut vfs_handles = alloc::vec::Vec::new();
+    let mut ext2_last_alias = alloc::vec::Vec::new();
+    let mut vfs_last_alias = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -280,11 +291,33 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
+                    FdBackend::VfsService { service_handle, .. } => {
+                        vfs_handles.push(*service_handle)
+                    }
                     _ => {}
                 }
                 *slot = None;
             }
         });
+        // Under the same lock that cleared the slots, decide which handles
+        // are the last alias so we can safely tear down the userspace side
+        // without racing another close of a sibling alias. Dedup first so a
+        // handle cleared from multiple fds in this process isn't counted
+        // once per appearance.
+        vfs_handles.sort_unstable();
+        vfs_handles.dedup();
+        ext2_inodes.sort_unstable();
+        ext2_inodes.dedup();
+        for &handle in &vfs_handles {
+            if vfs_handle_open_count_locked(&table, handle) == 0 {
+                vfs_last_alias.push(handle);
+            }
+        }
+        for &inode_num in &ext2_inodes {
+            if ext2_inode_open_count_locked(&table, inode_num) == 0 {
+                ext2_last_alias.push(inode_num);
+            }
+        }
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -299,7 +332,7 @@ pub fn close_cloexec_fds(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::net::free_socket(h);
+        crate::arch::x86_64::syscall::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
@@ -307,8 +340,11 @@ pub fn close_cloexec_fds(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
-    for inode_num in ext2_inodes {
-        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    for inode_num in ext2_last_alias {
+        crate::arch::x86_64::syscall::reap_unused_ext2_inode(inode_num);
+    }
+    for handle in vfs_last_alias {
+        crate::arch::x86_64::syscall::vfs_service_close_pub(handle);
     }
 }
 
@@ -329,6 +365,9 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
+    let mut vfs_handles = alloc::vec::Vec::new();
+    let mut ext2_last_alias = alloc::vec::Vec::new();
+    let mut vfs_last_alias = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -346,10 +385,31 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
+                    FdBackend::VfsService { service_handle, .. } => {
+                        vfs_handles.push(*service_handle)
+                    }
                     _ => {}
                 }
             }
         });
+        // Decide last-alias cleanups under the same lock acquisition that
+        // cleared the slots. See `close_cloexec_fds` for the rationale —
+        // two concurrent closes of aliased fds must not both observe
+        // count==0 after each drops its own lock.
+        vfs_handles.sort_unstable();
+        vfs_handles.dedup();
+        ext2_inodes.sort_unstable();
+        ext2_inodes.dedup();
+        for &handle in &vfs_handles {
+            if vfs_handle_open_count_locked(&table, handle) == 0 {
+                vfs_last_alias.push(handle);
+            }
+        }
+        for &inode_num in &ext2_inodes {
+            if ext2_inode_open_count_locked(&table, inode_num) == 0 {
+                ext2_last_alias.push(inode_num);
+            }
+        }
     }
     for id in readers {
         crate::pipe::pipe_close_reader(id);
@@ -364,7 +424,7 @@ pub fn close_all_fds_for(pid: Pid) {
         crate::pty::close_slave(id);
     }
     for h in sockets {
-        crate::net::free_socket(h);
+        crate::arch::x86_64::syscall::release_socket_pub(h);
     }
     for h in unix_sockets {
         crate::net::unix::free_unix_socket(h);
@@ -372,16 +432,33 @@ pub fn close_all_fds_for(pid: Pid) {
     for id in epolls {
         crate::arch::x86_64::syscall::epoll_free_pub(id);
     }
-    for inode_num in ext2_inodes {
-        crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
+    for inode_num in ext2_last_alias {
+        crate::arch::x86_64::syscall::reap_unused_ext2_inode(inode_num);
+    }
+    for handle in vfs_last_alias {
+        crate::arch::x86_64::syscall::vfs_service_close_pub(handle);
     }
 }
 
 /// Count open ext2-backed file descriptors referencing `inode_num`.
-/// Checks the shared fd table when present (thread groups), otherwise
-/// falls back to the per-process fd table.
+///
+/// Convenience wrapper that acquires `PROCESS_TABLE` for callers that do
+/// not already hold it (e.g., the ext2 `unlink` path). Close paths must use
+/// [`ext2_inode_open_count_locked`] under the same lock acquisition that
+/// cleared the fd slot — see that function's docs for why.
 pub fn ext2_inode_open_count(inode_num: u32) -> usize {
     let table = PROCESS_TABLE.lock();
+    ext2_inode_open_count_locked(&table, inode_num)
+}
+
+/// Count open ext2-backed file descriptors referencing `inode_num`, given an
+/// already-locked process table.
+///
+/// Callers that clear an fd slot must count under the same `PROCESS_TABLE`
+/// lock acquisition so two concurrent closes aliasing the same inode cannot
+/// both observe `count == 0` after each drops its own lock and both free the
+/// inode.
+pub fn ext2_inode_open_count_locked(table: &ProcessTable, inode_num: u32) -> usize {
     let mut count = 0usize;
     for proc in table.iter() {
         // Skip non-leader threads in a thread group — the leader's shared
@@ -400,6 +477,40 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
                     },
                     ..
                 } if *fd_inode == inode_num
+            ) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Count open VFS-service file descriptors referencing `service_handle`,
+/// given an already-locked process table.
+///
+/// Used so `close()` / `execve()`-CLOEXEC / `exit()` only send a single
+/// `VFS_CLOSE` to the ring-3 `vfs_server` when the *last* fd aliasing a
+/// given service handle goes away (Phase 54). Counting must happen under
+/// the SAME `PROCESS_TABLE` lock acquisition that cleared the fd slot —
+/// otherwise two cores concurrently closing two aliases of the same handle
+/// can both observe `count == 0` and double-send `VFS_CLOSE`, which
+/// force-closes an unrelated file after `vfs_server` recycles the handle.
+pub fn vfs_handle_open_count_locked(table: &ProcessTable, service_handle: u64) -> usize {
+    let mut count = 0usize;
+    for proc in table.iter() {
+        if proc.thread_group.is_some() && proc.tid != proc.tgid {
+            continue;
+        }
+        let snapshot = proc.fd_table_snapshot();
+        for entry in snapshot.iter().flatten() {
+            if matches!(
+                entry,
+                FdEntry {
+                    backend: FdBackend::VfsService {
+                        service_handle: h, ..
+                    },
+                    ..
+                } if *h == service_handle
             ) {
                 count += 1;
             }
@@ -1205,18 +1316,71 @@ pub fn send_signal(pid: Pid, sig: u32) -> bool {
     };
 
     if sig == SIGCONT {
-        // SIGCONT resumes a stopped process.
-        if proc.state == ProcessState::Stopped {
+        // SIGCONT resumes a stopped process. Only an actually-stopped target
+        // needs its IPC waits broken — a SIGCONT to a running process is a
+        // no-op beyond clearing pending SIGSTOP/SIGTSTP (POSIX), so breaking
+        // every in-flight IPC would silently cancel successful requests on
+        // any `kill(SIGCONT)` broadcast (shell pgroup, job control, etc.).
+        let was_stopped = proc.state == ProcessState::Stopped;
+        if was_stopped {
             proc.state = ProcessState::Ready;
             log::info!("[signal] SIGCONT → pid {} (resumed)", pid);
         }
         // Clear any pending SIGSTOP/SIGTSTP.
         proc.pending_signals &= !(1u64 << SIGSTOP) & !(1u64 << SIGTSTP);
+        drop(table);
+        if was_stopped {
+            interrupt_ipc_waits(pid);
+        }
         return true;
     }
 
     proc.pending_signals |= 1u64 << sig;
+    let should_interrupt = signal_interrupts_ipc_wait(proc, sig);
+    drop(table);
+    if should_interrupt {
+        interrupt_ipc_waits(pid);
+    }
     true
+}
+
+/// Decide whether `sig` should abort a task's IPC wait for `proc`.
+///
+/// IPC waits are only broken when the signal will actually do something:
+/// SIGKILL/SIGSTOP always interrupt; otherwise the signal must be unblocked
+/// *and* have an effective disposition that is not `Ignore`. This preserves
+/// EINTR-style semantics for handled / default-terminate / default-stop
+/// signals while leaving long-running IPC waiters alone for signals like
+/// SIGCHLD/SIGWINCH (default Ignore) or signals the process has explicitly
+/// blocked via `sigprocmask`.
+fn signal_interrupts_ipc_wait(proc: &Process, sig: u32) -> bool {
+    if sig == SIGKILL || sig == SIGSTOP {
+        return true;
+    }
+    if proc.blocked_signals & (1u64 << sig) != 0 {
+        return false;
+    }
+    match proc.sigaction_get(sig as usize) {
+        SignalAction::Handler { .. } => true,
+        SignalAction::Ignore => false,
+        SignalAction::Default => !matches!(default_signal_action(sig), SignalDisposition::Ignore),
+    }
+}
+
+fn interrupt_ipc_waits(pid: Pid) {
+    for task_id in crate::task::scheduler::blocked_ipc_task_ids_for_pid(pid) {
+        crate::ipc::endpoint::cancel_task_wait(task_id);
+        // Invalidate any reply cap other servers still hold for this task —
+        // otherwise a late `ipc_reply` on a now-resumed caller could leave
+        // a stale reply message that a subsequent `ipc_call` would consume.
+        crate::task::scheduler::revoke_reply_caps_for(task_id);
+        // Only install the EINTR sentinel if no real reply has already
+        // landed. Otherwise we clobber a successful cross-core reply and
+        // surface a spurious error; the signal stays pending and fires at
+        // the next syscall boundary.
+        crate::task::scheduler::try_deliver_message(task_id, crate::ipc::Message::new(u64::MAX));
+        let _ = crate::task::scheduler::wake_task(task_id);
+    }
 }
 
 /// Check and deliver pending signals for a process.

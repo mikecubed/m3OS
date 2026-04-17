@@ -198,6 +198,11 @@ pub struct Task {
     /// Used by the load balancer to enforce a cooldown period and prevent
     /// migration thrashing.
     pub last_migrated_tick: u64,
+    /// Tick at which this task most recently became `Ready` — set at spawn,
+    /// at every wake, and on post-switch re-enqueue. Compared against
+    /// `tick_count()` at dispatch time to measure ready-to-running latency
+    /// (Phase 54 diagnostic).
+    pub last_ready_tick: u64,
     /// True while the task is returning to the scheduler and its kernel stack
     /// pointer has not been safely published yet.
     pub switching_out: bool,
@@ -251,6 +256,7 @@ impl Task {
             system_ticks: 0,
             start_tick: 0,
             last_migrated_tick: 0,
+            last_ready_tick: 0,
             switching_out: false,
             wake_after_switch: false,
             ipc_cleaned: false,

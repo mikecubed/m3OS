@@ -4,6 +4,7 @@ pub mod icmp;
 pub mod ipv4;
 pub mod tcp;
 pub mod udp;
+pub mod udp_protocol;
 
 // ===========================================================================
 // Phase 23: SockaddrIn ABI layout tests

@@ -170,6 +170,18 @@ fn current_umask() -> u16 {
     table.find(pid).map(|proc| proc.umask).unwrap_or(0o022)
 }
 
+/// Non-allocating check that the current process's `exec_path` equals
+/// `expected`. Used on hot VFS/UDP syscall routing paths so we don't clone the
+/// path `String` out of the process table on every dispatch.
+fn is_current_exec_path(expected: &str) -> bool {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table
+        .find(pid)
+        .map(|proc| proc.exec_path.as_str() == expected)
+        .unwrap_or(false)
+}
+
 enum PathNodeKind {
     File,
     Dir,
@@ -188,7 +200,12 @@ fn basename(path: &str) -> &str {
 }
 
 fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
-    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" || abs_path == "/dev/pts" {
+    if abs_path == "/"
+        || abs_path == "/tmp"
+        || abs_path == "/run"
+        || abs_path == "/dev"
+        || abs_path == "/dev/pts"
+    {
         return Ok(PathNodeKind::Dir);
     }
     if let Some(node) = crate::fs::procfs::path_node(abs_path) {
@@ -284,6 +301,41 @@ fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
     if crate::fs::ext2::is_mounted()
         && let Some(rel) = ext2_root_path(abs_path)
     {
+        if vfs_service_can_handle_path(abs_path) {
+            return match vfs_service_stat_path(abs_path) {
+                Ok(stat) if stat.kind == kernel_core::fs::vfs_protocol::VFS_NODE_SYMLINK => stat
+                    .symlink_target
+                    .map(PathNodeKind::Symlink)
+                    .ok_or(NEG_EIO),
+                Ok(stat) if stat.kind == kernel_core::fs::vfs_protocol::VFS_NODE_DIR => {
+                    Ok(PathNodeKind::Dir)
+                }
+                Ok(_) => Ok(PathNodeKind::File),
+                // Fall back to the kernel ext2 path if the userspace VFS slice
+                // is unavailable during boot or degraded mode.
+                Err(_) => {
+                    let vol = crate::fs::ext2::EXT2_VOLUME.lock();
+                    if let Some(vol) = vol.as_ref() {
+                        match vol.resolve_path(rel) {
+                            Ok(ino) => match vol.read_inode(ino) {
+                                Ok(inode) if inode.is_symlink() => vol
+                                    .read_symlink(ino)
+                                    .map(PathNodeKind::Symlink)
+                                    .map_err(|_| NEG_EIO),
+                                Ok(inode) if inode.is_dir() => Ok(PathNodeKind::Dir),
+                                Ok(_) => Ok(PathNodeKind::File),
+                                Err(_) => Err(NEG_EIO),
+                            },
+                            Err(kernel_core::fs::ext2::Ext2Error::NotFound) => Err(NEG_ENOENT),
+                            Err(kernel_core::fs::ext2::Ext2Error::NotDirectory) => Err(NEG_ENOTDIR),
+                            Err(_) => Err(NEG_EIO),
+                        }
+                    } else {
+                        Err(NEG_ENOENT)
+                    }
+                }
+            };
+        }
         let vol = crate::fs::ext2::EXT2_VOLUME.lock();
         if let Some(vol) = vol.as_ref() {
             return match vol.resolve_path(rel) {
@@ -429,7 +481,13 @@ fn resolve_create_path(lexical: &str, follow_final: bool) -> Result<alloc::strin
 }
 
 fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
+    // MOUNT_OP_LOCK is intentionally NOT held here. Path resolution can issue
+    // blocking IPC via `path_node_nofollow` → `vfs_service_stat_path`; holding
+    // a spinlock across that call deadlocks any SMP peer that tries to acquire
+    // the same lock (Phase 54 SMP race). Mount/umount mutation is serialized
+    // by MOUNT_OP_LOCK in `sys_linux_mount` / `sys_linux_umount2`; read-only
+    // consumers rely on the per-volume locks (`EXT2_VOLUME`, `FAT32_VOLUME`,
+    // `ipc::registry`) for consistency.
     if raw_path.is_empty() {
         return NEG_ENOENT;
     }
@@ -458,6 +516,29 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
         && matches!(path_node_nofollow(&resolved), Ok(PathNodeKind::Symlink(_)))
     {
         return NEG_ELOOP;
+    }
+
+    // Phase 54: route read-only regular-file opens on the ext2 root through
+    // the userspace VFS service when it is registered, instead of the
+    // kernel-inline ext2 path. The routing predicate (`vfs_service_should_route`)
+    // is not scoped to `/etc/` — any ext2-backed regular file the service
+    // claims it can handle is eligible when no write / create / exclusive
+    // flags are set.
+    if vfs_service_should_route(&resolved, flags) {
+        // Enforce the same DAC permission check the kernel path uses so that
+        // protected files (e.g. /etc/shadow) are not exposed through the VFS
+        // service path.
+        if let Some((fu, fg, fm)) = path_metadata(&resolved) {
+            let (_, _, euid, egid) = current_process_ids();
+            if !check_permission(fu, fg, fm, euid, egid, 4) {
+                return NEG_EACCES;
+            }
+        }
+        let routed = vfs_service_open(&resolved, flags);
+        if routed != NEG_ENOENT && routed != NEG_EIO {
+            return routed;
+        }
+        return open_resolved_path(&resolved, flags, mode_arg);
     }
 
     open_resolved_path(&resolved, flags, mode_arg)
@@ -1121,10 +1202,12 @@ mod syscall_nr {
     pub const GET_TERMIOS_OFLAG: u64 = 0x100F;
     /// Phase 52c: push raw input byte through kernel line discipline.
     pub const PUSH_RAW_INPUT: u64 = 0x1010;
+    /// Phase 54: read raw disk sectors from userspace (for ring-3 storage servers).
+    pub const BLOCK_READ: u64 = 0x1011;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
-    pub const IPC_LAST: u64 = 0x110F;
+    pub const IPC_LAST: u64 = 0x1110;
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1543,7 @@ pub extern "C" fn syscall_handler(
         GET_TERMIOS_IFLAG => crate::tty::TTY0.lock().ldisc.termios.c_iflag as u64,
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
+        BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -1509,11 +1593,11 @@ fn check_pending_signals(syscall_result: u64) {
                 use crate::process::SignalDisposition;
                 match disposition {
                     SignalDisposition::Terminate => {
-                        log::info!("[p{}] killed by signal {}", pid, signum);
+                        log::debug!("[p{}] killed by signal {}", pid, signum);
                         sys_exit(-(signum as i32));
                     }
                     SignalDisposition::Stop => {
-                        log::info!("[p{}] stopped by signal {}", pid, signum);
+                        log::debug!("[p{}] stopped by signal {}", pid, signum);
                         {
                             let mut table = crate::process::PROCESS_TABLE.lock();
                             if let Some(proc) = table.find_mut(pid) {
@@ -1890,7 +1974,7 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
 ///     remove Process entry, mark scheduler task as Dead.
 pub(super) fn sys_exit(code: i32) -> ! {
     let pid = crate::process::current_pid();
-    log::info!("[p{}] exit({})", pid, code);
+    log::debug!("[p{}] exit({})", pid, code);
 
     if pid != 0 {
         // Phase 40: clear_child_tid futex wake.
@@ -1952,7 +2036,7 @@ pub(super) fn sys_exit(code: i32) -> ! {
 /// process cleanup once it is the last thread standing.
 pub(super) fn sys_exit_group(code: i32) -> ! {
     let pid = crate::process::current_pid();
-    log::info!("[p{}] exit_group({})", pid, code);
+    log::debug!("[p{}] exit_group({})", pid, code);
 
     if pid != 0 {
         // Check if we are in a thread group.
@@ -1968,7 +2052,7 @@ pub(super) fn sys_exit_group(code: i32) -> ! {
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
             ) {
-                log::info!(
+                log::debug!(
                     "[p{}] exit_group: owner {} already tearing down thread group",
                     pid,
                     owner_pid
@@ -1989,7 +2073,7 @@ pub(super) fn sys_exit_group(code: i32) -> ! {
                     continue;
                 }
                 if !crate::task::scheduler::request_group_exit_by_pid(sibling_tid) {
-                    log::info!(
+                    log::debug!(
                         "[p{}] exit_group: waiting for sibling {} scheduler task publication",
                         pid,
                         sibling_tid
@@ -2697,7 +2781,7 @@ pub(super) fn sys_pipe_with_flags(pipefd_ptr: u64, cloexec: bool) -> u64 {
         return NEG_EFAULT;
     }
 
-    log::info!(
+    log::debug!(
         "[pipe] created pipe_id={} → fd[{}(r), {}(w)]",
         pipe_id,
         read_fd,
@@ -3197,7 +3281,7 @@ pub(super) fn sys_linux_setregid(rgid_arg: u64, egid_arg: u64) -> u64 {
 /// Returns the child PID to the parent.
 pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
     let parent_pid = crate::process::current_pid();
-    log::info!("[p{}] fork()", parent_pid);
+    log::debug!("[p{}] fork()", parent_pid);
 
     // Allocate a new page table for the child, copying kernel entries.
     let child_cr3 = match crate::mm::new_process_page_table() {
@@ -3355,7 +3439,7 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         "fork-child",
     );
 
-    log::info!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
     child_pid as u64
 }
 
@@ -3444,7 +3528,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     let (resolved_name, exec_owned, exec_static) = {
-        let _mount_guard = MOUNT_OP_LOCK.lock();
+        // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
+        // can issue blocking IPC via the VFS service (Phase 54). Per-volume
+        // locks protect read consistency.
 
         // Follow the final symlink like Linux execve().
         let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
@@ -3480,7 +3566,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
     let name: &str = &resolved_name;
     let pid = crate::process::current_pid();
-    log::info!("[p{}] execve({})", pid, name);
+    log::debug!("[p{}] execve({})", pid, name);
     // Until exec() grows full "single surviving thread" semantics, only allow
     // it from the canonical single-threaded TGID owner. Otherwise shared-mm
     // metadata would remain anchored on a different Process entry.
@@ -3780,7 +3866,7 @@ pub(super) fn sys_waitpid(pid: u64, status_ptr: u64, options: u64) -> u64 {
                 let _ = UserSliceWo::new(status_ptr, bytes.len())
                     .and_then(|s| s.copy_from_kernel(&bytes));
             }
-            log::info!(
+            log::debug!(
                 "[waitpid] pid {} {}",
                 child_pid,
                 if stopped { "stopped" } else { "exited" }
@@ -4698,6 +4784,21 @@ pub(super) fn sys_linux_read(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::Epoll { .. } => NEG_EBADF,
+        // Phase 54: read from userspace VFS-service-backed fd.
+        FdBackend::VfsService { service_handle, .. } => {
+            let handle = *service_handle;
+            let offset = entry.offset;
+            let result = vfs_service_read(handle, offset, buf_ptr, count as usize);
+            if result > 0 && result < 0x8000_0000_0000_0000 {
+                let bytes = result as usize;
+                with_current_fd_mut(fd, |slot| {
+                    if let Some(e) = slot {
+                        e.offset += bytes;
+                    }
+                });
+            }
+            result
+        }
     }
 }
 
@@ -5254,6 +5355,7 @@ pub(super) fn sys_linux_write(fd: u64, buf_ptr: u64, count: u64) -> u64 {
             }
         }
         FdBackend::Epoll { .. } => NEG_EBADF,
+        FdBackend::VfsService { .. } => NEG_EBADF, // read-only; writes rejected
     }
 }
 
@@ -5460,20 +5562,29 @@ fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
 /// Rejects paths containing `.`, `..`, or empty segments to prevent
 /// traversal outside the `/tmp` mount boundary.
+/// Return the tmpfs-internal path for `path`, or `None` if `path` does not
+/// live on tmpfs.
+///
+/// The shared tmpfs instance mounts both `/tmp` and `/run` as top-level
+/// directories. The returned path preserves the mount-point prefix (`tmp/…`
+/// or `run/…`) so the tmpfs tree resolves to the correct sub-tree — callers
+/// simply pass the result to `TMPFS.stat`, `TMPFS.write_file`, etc.
+///
+/// - `/tmp` or `/run` → `Some("tmp")` / `Some("run")` (the mount-point dir).
+/// - `/tmp/foo/bar` → `Some("tmp/foo/bar")`.
+/// - Anything else, or a path with `.`, `..`, or empty segments → `None`.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
-    let rest = if trimmed == "tmp" {
-        ""
-    } else {
-        trimmed.strip_prefix("tmp/")?
+    let rest = match trimmed {
+        "tmp" | "run" => trimmed,
+        _ if trimmed.starts_with("tmp/") || trimmed.starts_with("run/") => trimmed,
+        _ => return None,
     };
 
-    // For non-empty relative paths, reject `.`, `..`, and empty segments.
-    if !rest.is_empty() {
-        for segment in rest.split('/') {
-            if segment.is_empty() || segment == "." || segment == ".." {
-                return None;
-            }
+    // Reject `.`, `..`, and empty segments anywhere in the path.
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
         }
     }
 
@@ -5507,8 +5618,8 @@ fn fat32_relative_path(path: &str) -> Option<&str> {
 /// Returns `None` only for paths claimed by tmpfs (`/tmp`) or that
 /// fail traversal validation.
 fn ext2_root_path(path: &str) -> Option<&str> {
-    // /tmp is always tmpfs, never ext2
-    if path == "/tmp" || path.starts_with("/tmp/") {
+    // /tmp and /run are always tmpfs, never ext2.
+    if path == "/tmp" || path.starts_with("/tmp/") || path == "/run" || path.starts_with("/run/") {
         return None;
     }
 
@@ -5524,6 +5635,339 @@ fn ext2_root_path(path: &str) -> Option<&str> {
     }
 
     Some(rest)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 54: userspace VFS service routing
+// ---------------------------------------------------------------------------
+
+struct VfsPathStat {
+    kind: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    ino: u64,
+    size: u64,
+    nlink: u64,
+    blksize: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    symlink_target: Option<alloc::string::String>,
+}
+
+/// Returns `true` when `path` (already fully resolved) should be routed
+/// through the ring-3 `vfs` service rather than the in-kernel ext2 path.
+fn vfs_service_can_handle_path(path: &str) -> bool {
+    if is_current_exec_path("/bin/vfs_server") {
+        return false;
+    }
+    if path == "/proc" || path.starts_with("/proc/") || path == "/dev" || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    if path == "/data" || path.starts_with("/data/") {
+        return false;
+    }
+    crate::ipc::registry::is_registered("vfs")
+        && crate::fs::ramdisk::ramdisk_lookup(path).is_none()
+        && ext2_root_path(path).is_some()
+}
+
+fn vfs_service_can_list_dir(path: &str) -> bool {
+    path != "/"
+        && vfs_service_can_handle_path(path)
+        && crate::fs::ramdisk::ramdisk_list_dir(path).is_none()
+}
+
+fn vfs_bootstrap_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_MOUNT_EXT2_ROOT, VFS_MOUNT_VFAT_DATA};
+
+    match (target, fstype) {
+        ("/", "ext2") => Ok(VFS_MOUNT_EXT2_ROOT),
+        ("/data", "vfat") => Ok(VFS_MOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
+    }
+}
+
+fn vfs_bootstrap_umount_action(target: &str) -> Result<u64, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_UMOUNT_EXT2_ROOT, VFS_UMOUNT_VFAT_DATA};
+
+    match target {
+        "/" => Ok(VFS_UMOUNT_EXT2_ROOT),
+        "/data" => Ok(VFS_UMOUNT_VFAT_DATA),
+        _ => Err(NEG_EINVAL),
+    }
+}
+
+fn vfs_service_parse_stat_reply(bulk: &[u8]) -> Result<VfsPathStat, u64> {
+    use kernel_core::fs::vfs_protocol::{VFS_NODE_SYMLINK, VFS_STAT_REPLY_SIZE};
+
+    if bulk.len() < VFS_STAT_REPLY_SIZE {
+        return Err(NEG_EIO);
+    }
+    let read_word = |index: usize| -> u64 {
+        let start = index * 8;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&bulk[start..start + 8]);
+        u64::from_le_bytes(word)
+    };
+    let kind = read_word(0);
+    let symlink_target = if kind == VFS_NODE_SYMLINK {
+        Some(
+            alloc::string::String::from_utf8(bulk[VFS_STAT_REPLY_SIZE..].to_vec())
+                .map_err(|_| NEG_EIO)?,
+        )
+    } else {
+        None
+    };
+    Ok(VfsPathStat {
+        kind,
+        mode: read_word(1) as u32,
+        uid: read_word(2) as u32,
+        gid: read_word(3) as u32,
+        ino: read_word(4),
+        size: read_word(5),
+        nlink: read_word(6),
+        blksize: read_word(7),
+        atime: read_word(8) as i64,
+        mtime: read_word(9) as i64,
+        ctime: read_word(10) as i64,
+        symlink_target,
+    })
+}
+
+fn vfs_service_open(path: &str, _flags: u64) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_OPEN;
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return NEG_ENOENT,
+    };
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let mut msg = Message::new(VFS_OPEN);
+    msg.data[0] = 0;
+    msg.data[1] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return reply.label;
+    }
+
+    let packed = reply.data[0];
+    let handle = packed & 0xFFFF_FFFF;
+    let file_size = (packed >> 32) as u32;
+    let entry = FdEntry {
+        backend: FdBackend::VfsService {
+            service_handle: handle,
+            file_size,
+        },
+        offset: 0,
+        readable: true,
+        writable: false,
+        cloexec: false,
+        nonblock: false,
+    };
+    match alloc_fd(3, entry) {
+        Some(i) => i as u64,
+        None => NEG_EMFILE,
+    }
+}
+
+fn vfs_service_stat_path(path: &str) -> Result<VfsPathStat, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_STAT_PATH;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_STAT_PATH);
+    msg.data[0] = path.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+    vfs_service_parse_stat_reply(&bulk)
+}
+
+fn vfs_service_list_dir(
+    path: &str,
+    offset: usize,
+    user_buf_ptr: u64,
+    count: usize,
+) -> Result<(usize, usize), u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_LIST_DIR;
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_LIST_DIR);
+    msg.data[0] = path.len() as u64;
+    msg.data[1] = offset as u64;
+    msg.data[2] = count as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(path.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+
+    let packed = reply.data[0];
+    let bytes = (packed & 0xFFFF_FFFF) as usize;
+    let next_offset = (packed >> 32) as usize;
+    if bytes == 0 {
+        return Ok((0, next_offset));
+    }
+    if bytes > count {
+        return Err(NEG_EIO);
+    }
+    let bulk = scheduler::take_bulk_data(task_id).ok_or(NEG_EIO)?;
+    if bulk.len() < bytes {
+        return Err(NEG_EIO);
+    }
+    if UserSliceWo::new(user_buf_ptr, bytes)
+        .and_then(|s| s.copy_from_kernel(&bulk[..bytes]))
+        .is_err()
+    {
+        return Err(NEG_EFAULT);
+    }
+    Ok((bytes, next_offset))
+}
+
+fn vfs_service_mount_action(target: &str, fstype: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_MOUNT_POLICY;
+
+    if is_current_exec_path("/bin/vfs_server") || !crate::ipc::registry::is_registered("vfs") {
+        return vfs_bootstrap_mount_action(target, fstype);
+    }
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut bulk = alloc::vec::Vec::from(target.as_bytes());
+    bulk.extend_from_slice(fstype.as_bytes());
+    let mut msg = Message::new(VFS_MOUNT_POLICY);
+    msg.data[0] = target.len() as u64;
+    msg.data[1] = fstype.len() as u64;
+    scheduler::deliver_bulk(task_id, bulk);
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    Ok(reply.data[0])
+}
+
+fn vfs_service_umount_action(target: &str) -> Result<u64, u64> {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_UMOUNT_POLICY;
+
+    if is_current_exec_path("/bin/vfs_server") || !crate::ipc::registry::is_registered("vfs") {
+        return vfs_bootstrap_umount_action(target);
+    }
+
+    let vfs_ep = registry::lookup_endpoint_id("vfs").ok_or(NEG_ENOENT)?;
+    let task_id = scheduler::current_task_id().ok_or(NEG_EINVAL)?;
+    let mut msg = Message::new(VFS_UMOUNT_POLICY);
+    msg.data[0] = target.len() as u64;
+    scheduler::deliver_bulk(task_id, alloc::vec::Vec::from(target.as_bytes()));
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return Err(reply.label);
+    }
+    Ok(reply.data[0])
+}
+
+fn vfs_service_should_route(path: &str, flags: u64) -> bool {
+    let accmode = flags & 0o3;
+    if accmode != 0 {
+        return false;
+    }
+    if flags & (0x40 | 0x200 | 0x400) != 0 {
+        return false;
+    }
+    if !vfs_service_can_handle_path(path) {
+        return false;
+    }
+    if let Some(rel) = ext2_root_path(path) {
+        crate::fs::ext2::is_ext2_regular_file(rel)
+    } else {
+        false
+    }
+}
+
+fn vfs_service_read(handle: u64, offset: usize, user_buf_ptr: u64, count: usize) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::{VFS_MAX_READ, VFS_READ};
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+    let capped = count.min(VFS_MAX_READ);
+
+    let mut msg = Message::new(VFS_READ);
+    msg.data[0] = handle;
+    msg.data[1] = offset as u64;
+    msg.data[2] = capped as u64;
+    let reply = endpoint::call_msg(task_id, vfs_ep, msg);
+    if reply.label != 0 {
+        return reply.label;
+    }
+    let bytes_read = reply.data[0] as usize;
+    if bytes_read == 0 {
+        return 0;
+    }
+    if bytes_read > capped {
+        return NEG_EIO;
+    }
+    let bulk = match scheduler::take_bulk_data(task_id) {
+        Some(b) => b,
+        None => return NEG_EIO,
+    };
+    if bulk.len() < bytes_read {
+        return NEG_EIO;
+    }
+    if UserSliceWo::new(user_buf_ptr, bytes_read)
+        .and_then(|s| s.copy_from_kernel(&bulk[..bytes_read]))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+    bytes_read as u64
+}
+
+fn vfs_service_close(handle: u64) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::fs::vfs_protocol::VFS_CLOSE;
+
+    let vfs_ep = match registry::lookup_endpoint_id("vfs") {
+        Some(ep) => ep,
+        None => return,
+    };
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return,
+    };
+    let mut msg = Message::new(VFS_CLOSE);
+    msg.data[0] = handle;
+    let _ = endpoint::call_msg(task_id, vfs_ep, msg);
 }
 
 fn open_resolved_path(name: &str, flags: u64, mode_arg: u64) -> u64 {
@@ -6104,7 +6548,12 @@ pub(super) fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
-pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
+/// Truncate and free the ext2 inode when its on-disk links_count has reached
+/// zero. The caller MUST have verified (under `PROCESS_TABLE`) that no open
+/// fd aliases this inode — this function intentionally skips a recount so
+/// two cores concurrently closing siblings of the same inode cannot both
+/// observe count==0 after each drops its own lock.
+pub(crate) fn reap_unused_ext2_inode(inode_num: u32) {
     let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
     let Some(vol) = vol.as_mut() else {
         return;
@@ -6115,11 +6564,15 @@ pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
     if inode.links_count != 0 {
         return;
     }
-    if crate::process::ext2_inode_open_count(inode_num) != 0 {
-        return;
-    }
     let _ = vol.truncate_file(inode_num, &mut inode);
     let _ = vol.free_inode(inode_num);
+}
+
+/// Public wrapper so `kernel/src/process` can issue `VFS_CLOSE` directly
+/// after it has decided under `PROCESS_TABLE` that the handle being closed
+/// was the last alias.
+pub(crate) fn vfs_service_close_pub(service_handle: u64) {
+    vfs_service_close(service_handle);
 }
 
 // ---------------------------------------------------------------------------
@@ -6136,34 +6589,70 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
         return NEG_EBADF;
     }
     let mut ext2_inode = None;
+    let mut vfs_handle = None;
     // Close-time cleanup for resource-backed FDs.
     if let Some(entry) = current_fd_entry(fd) {
         match &entry.backend {
             FdBackend::PipeRead { pipe_id } => crate::pipe::pipe_close_reader(*pipe_id),
             FdBackend::PipeWrite { pipe_id } => crate::pipe::pipe_close_writer(*pipe_id),
-            FdBackend::Socket { handle } => crate::net::free_socket(*handle),
+            FdBackend::Socket { handle } => release_socket_handle(*handle),
             FdBackend::UnixSocket { handle } => crate::net::unix::free_unix_socket(*handle),
             FdBackend::PtyMaster { pty_id } => crate::pty::close_master(*pty_id),
             FdBackend::PtySlave { pty_id } => crate::pty::close_slave(*pty_id),
             FdBackend::Epoll { instance_id } => epoll_free(*instance_id),
             FdBackend::Ext2Disk { inode_num, .. } => ext2_inode = Some(*inode_num),
+            FdBackend::VfsService { service_handle, .. } => vfs_handle = Some(*service_handle),
             _ => {}
         }
     }
     // Remove this FD from all epoll interest lists to prevent stale references.
     epoll_remove_fd(fd);
+    // Clear the slot and — for VfsService / Ext2Disk backends — decide
+    // whether this was the last alias under the SAME PROCESS_TABLE lock
+    // acquisition. Two concurrent closes of sibling aliases would otherwise
+    // both observe count==0 after each drops its own lock, and both would
+    // tear down server-side state (double VFS_CLOSE after a vfs_server
+    // handle recycle force-closes an unrelated file; double ext2 inode free
+    // corrupts block accounting).
     let mut found = false;
-    with_current_fd_mut(fd, |slot| {
-        if slot.is_some() {
-            *slot = None;
-            found = true;
+    let mut ext2_reap = None;
+    let mut vfs_last_close = None;
+    {
+        let pid = crate::process::current_pid();
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            if let Some(shared) = proc.shared_fd_table.clone() {
+                let mut lock = shared.lock();
+                if lock[fd].take().is_some() {
+                    found = true;
+                }
+            } else if let Some(slot) = proc.fd_table.get_mut(fd)
+                && slot.take().is_some()
+            {
+                found = true;
+            }
         }
-    });
+        if found {
+            if let Some(inode_num) = ext2_inode
+                && crate::process::ext2_inode_open_count_locked(&table, inode_num) == 0
+            {
+                ext2_reap = Some(inode_num);
+            }
+            if let Some(handle) = vfs_handle
+                && crate::process::vfs_handle_open_count_locked(&table, handle) == 0
+            {
+                vfs_last_close = Some(handle);
+            }
+        }
+    }
     if !found {
         return NEG_EBADF;
     }
-    if let Some(inode_num) = ext2_inode {
-        cleanup_ext2_inode_if_unused(inode_num);
+    if let Some(inode_num) = ext2_reap {
+        reap_unused_ext2_inode(inode_num);
+    }
+    if let Some(handle) = vfs_last_close {
+        vfs_service_close(handle);
     }
     0
 }
@@ -6558,6 +7047,7 @@ pub(super) fn sys_linux_fstat(fd: u64, stat_ptr: u64) -> u64 {
             (0x8000 | m as u32, u, g, fallback_size, 0)
         }
         FdBackend::Epoll { .. } => (0x2000 | 0o600, 0, 0, 0, 0),
+        FdBackend::VfsService { file_size, .. } => (0x8000 | 0o444, 0, 0, *file_size as u64, 0),
     };
 
     stat[24..28].copy_from_slice(&mode.to_ne_bytes());
@@ -6625,6 +7115,7 @@ pub(super) fn sys_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
         FdBackend::Stdin | FdBackend::Stdout => ramdisk_statfs(),
         FdBackend::PipeRead { .. } | FdBackend::PipeWrite { .. } => pipefs_statfs(),
         FdBackend::Socket { .. } | FdBackend::UnixSocket { .. } => sockfs_statfs(),
+        FdBackend::VfsService { .. } => ext2_statfs(),
     };
     write_statfs_to_user(buf_ptr, &stat)
 }
@@ -6701,6 +7192,12 @@ fn path_metadata(abs_path: &str) -> Option<(u32, u32, u16)> {
         return Some((0, 0, 0o755));
     }
     // ext2 root filesystem — check for any path.
+    //
+    // DAC decisions must stay on kernel-verified metadata: a compromised or
+    // misbehaving ring-3 `vfs_server` could otherwise spoof uid/gid/mode via
+    // `VFS_STAT_PATH` and defeat the access checks in `open_user_path`. The
+    // service is only trusted for user-visible `stat` / `getdents` behavior
+    // (see `sys_fstat` / `sys_getdents`), not for enforcement paths.
     if let Some(rel) = ext2_root_path(abs_path)
         && crate::fs::ext2::is_mounted()
     {
@@ -6975,6 +7472,7 @@ pub(super) fn sys_linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         FdBackend::Fat32Disk { file_size, .. } | FdBackend::Ext2Disk { file_size, .. } => {
             *file_size as usize
         }
+        FdBackend::VfsService { file_size, .. } => *file_size as usize,
     };
 
     let offset = offset as i64;
@@ -7538,7 +8036,7 @@ pub(super) fn sys_linux_munmap(addr: u64, len: u64) -> u64 {
     }
 
     if freed_count > 0 {
-        log::info!(
+        log::debug!(
             "[munmap] freed {} pages @ {:#x} (len={:#x})",
             freed_count,
             addr,
@@ -8350,6 +8848,69 @@ fn serial_echo_bytes(bytes: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 54: sys_block_read — raw sector reads for ring-3 storage servers
+// ---------------------------------------------------------------------------
+
+/// Allowed caller binaries for raw block reads.
+const STORAGE_SERVICE_UID: u32 = 200;
+const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
+/// Read raw disk sectors into a userspace buffer.
+///
+/// Args:
+///   - `start_sector`: absolute LBA of the first sector
+///   - `count`: number of 512-byte sectors to read
+///   - `buf_ptr`: userspace destination address
+///   - `buf_len`: size of the destination buffer in bytes
+///
+/// Returns 0 on success, or a negative errno on error.
+/// Capped at 128 sectors (64 KiB) per call for safety.
+///
+/// Only supervised storage services may call this syscall. The kernel requires
+/// both a dedicated service euid and an expected service binary path so
+/// ordinary users cannot gain raw-disk access by directly exec'ing a public
+/// `/bin/*_server` binary.
+fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    // Restrict to supervised storage services.
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_READ_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+
+    const MAX_SECTORS: usize = 128; // 64 KiB
+
+    let count = count as usize;
+    if count == 0 || count > MAX_SECTORS {
+        return NEG_EINVAL;
+    }
+
+    let needed = count * 512;
+    if needed > buf_len as usize {
+        return NEG_EINVAL;
+    }
+
+    let mut kernel_buf = alloc::vec![0u8; needed];
+    match crate::blk::read_sectors(start_sector, count, &mut kernel_buf) {
+        Ok(()) => {
+            if UserSliceWo::new(buf_ptr, needed)
+                .and_then(|s| s.copy_from_kernel(&kernel_buf))
+                .is_err()
+            {
+                return NEG_EFAULT;
+            }
+            0
+        }
+        Err(_) => NEG_EIO,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T020: brk(addr)
 // ---------------------------------------------------------------------------
 
@@ -8605,7 +9166,8 @@ pub(super) fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_chdir(path_ptr: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
+    // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
+    // can issue blocking IPC via the VFS service (Phase 54).
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -9127,6 +9689,28 @@ pub(super) fn sys_linux_fstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags:
             if crate::fs::ext2::is_mounted()
                 && let Some(rel) = ext2_root_path(name)
             {
+                if vfs_service_can_handle_path(name)
+                    && let Ok(vfs_stat) = vfs_service_stat_path(name)
+                {
+                    let mut stat = [0u8; 144];
+                    stat[8..16].copy_from_slice(&vfs_stat.ino.to_ne_bytes());
+                    stat[16..24].copy_from_slice(&vfs_stat.nlink.to_ne_bytes());
+                    stat[24..28].copy_from_slice(&vfs_stat.mode.to_ne_bytes());
+                    stat[28..32].copy_from_slice(&vfs_stat.uid.to_ne_bytes());
+                    stat[32..36].copy_from_slice(&vfs_stat.gid.to_ne_bytes());
+                    stat[48..56].copy_from_slice(&vfs_stat.size.to_ne_bytes());
+                    stat[56..64].copy_from_slice(&vfs_stat.blksize.to_ne_bytes());
+                    stat[72..80].copy_from_slice(&vfs_stat.atime.to_ne_bytes());
+                    stat[88..96].copy_from_slice(&vfs_stat.mtime.to_ne_bytes());
+                    stat[104..112].copy_from_slice(&vfs_stat.ctime.to_ne_bytes());
+                    if UserSliceWo::new(stat_ptr, stat.len())
+                        .and_then(|s| s.copy_from_kernel(&stat))
+                        .is_err()
+                    {
+                        return NEG_EFAULT;
+                    }
+                    return 0;
+                }
                 let vol = crate::fs::ext2::EXT2_VOLUME.lock();
                 if let Some(vol) = vol.as_ref()
                     && let Ok(ino) = vol.resolve_path(rel)
@@ -9976,7 +10560,10 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
+    let (_, _, euid, _) = current_process_ids();
+    if euid != 0 {
+        return NEG_EPERM;
+    }
     let mut buf_target = [0u8; 512];
     let target = match read_user_cstr(target_ptr, &mut buf_target) {
         Some(s) => s,
@@ -9989,36 +10576,36 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
         None => return NEG_EFAULT,
     };
 
+    // Resolve the target BEFORE taking MOUNT_OP_LOCK — path resolution can
+    // issue blocking IPC, and holding a spinlock across that call deadlocks
+    // SMP peers (Phase 54 SMP race).
     let cwd = current_cwd();
-    let resolved_target = resolve_path(&cwd, target);
-
-    if fstype != "vfat" && fstype != "ext2" {
-        log::warn!("[mount] unsupported fstype: {}", fstype);
-        return NEG_EINVAL;
+    let lexical_target = resolve_path(&cwd, target);
+    let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
+        return NEG_ENOTDIR;
     }
 
-    // Support mounting at / (ext2 root) or /data (legacy).
-    if resolved_target != "/" && resolved_target != "/data" {
-        log::warn!(
-            "[mount] unsupported mountpoint {}; only / and /data are supported",
-            resolved_target
-        );
-        return NEG_EINVAL;
-    }
+    let action = match vfs_service_mount_action(&resolved_target, fstype) {
+        Ok(action) => action,
+        Err(err) => {
+            log::warn!(
+                "[mount] rejected mount target={} fstype={}: {}",
+                resolved_target,
+                fstype,
+                err as i64
+            );
+            return err;
+        }
+    };
 
-    // vfat can only mount at /data, not /.
-    if fstype == "vfat" && resolved_target == "/" {
-        log::warn!("[mount] vfat cannot be mounted at /; only /data is supported for vfat");
-        return NEG_EINVAL;
-    }
+    // Serialize the actual mount mutation with other mount/umount operations.
+    let _mount_guard = MOUNT_OP_LOCK.lock();
 
-    // ext2 can only mount at /, not /data.
-    if fstype == "ext2" && resolved_target == "/data" {
-        log::warn!("[mount] ext2 cannot be mounted at /data; only / is supported for ext2");
-        return NEG_EINVAL;
-    }
-
-    if fstype == "ext2" {
+    if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_EXT2_ROOT {
         let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
             Some(p) => p,
             None => {
@@ -10037,8 +10624,7 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
                 NEG_EIO
             }
         }
-    } else {
-        // fstype == "vfat"
+    } else if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_VFAT_DATA {
         let (base_lba, _sector_count) = match crate::blk::mbr::probe() {
             Some(p) => p,
             None => {
@@ -10061,11 +10647,12 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
                 NEG_EIO
             }
         }
+    } else {
+        NEG_EINVAL
     }
 }
 
 pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
     if flags != 0 {
         return NEG_EINVAL;
     }
@@ -10081,17 +10668,31 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
+    // Resolve the target BEFORE taking MOUNT_OP_LOCK — path resolution can
+    // issue blocking IPC, and holding a spinlock across that call deadlocks
+    // SMP peers (Phase 54 SMP race).
     let cwd = current_cwd();
-    let resolved_target = resolve_path(&cwd, target);
-    if resolved_target != "/" && resolved_target != "/data" {
-        return NEG_EINVAL;
+    let lexical_target = resolve_path(&cwd, target);
+    let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if !matches!(path_node_nofollow(&resolved_target), Ok(PathNodeKind::Dir)) {
+        return NEG_ENOTDIR;
     }
+    let action = match vfs_service_umount_action(&resolved_target) {
+        Ok(action) => action,
+        Err(err) => return err,
+    };
+
+    // Serialize the actual umount mutation with other mount/umount operations.
+    let _mount_guard = MOUNT_OP_LOCK.lock();
 
     let table = crate::process::PROCESS_TABLE.lock();
     let busy = table.iter().any(|proc| {
         mount_contains_path(&resolved_target, &proc.cwd)
             || proc
-                .fd_table
+                .fd_table_snapshot()
                 .iter()
                 .flatten()
                 .any(|entry| mount_holds_fd(&resolved_target, &entry.backend))
@@ -10101,14 +10702,14 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
         return NEG_EBUSY;
     }
 
-    match resolved_target.as_str() {
-        "/" => {
+    match action {
+        kernel_core::fs::vfs_protocol::VFS_UMOUNT_EXT2_ROOT => {
             if !crate::fs::ext2::is_mounted() {
                 return NEG_EINVAL;
             }
             crate::fs::ext2::unmount_ext2();
         }
-        "/data" => {
+        kernel_core::fs::vfs_protocol::VFS_UMOUNT_VFAT_DATA => {
             if !crate::fs::fat32::is_mounted() {
                 return NEG_EINVAL;
             }
@@ -10142,7 +10743,9 @@ fn mount_contains_path(target: &str, path: &str) -> bool {
 
 fn mount_holds_fd(target: &str, backend: &FdBackend) -> bool {
     match (target, backend) {
-        ("/", FdBackend::Ext2Disk { .. }) | ("/data", FdBackend::Fat32Disk { .. }) => true,
+        ("/", FdBackend::Ext2Disk { .. })
+        | ("/", FdBackend::VfsService { .. })
+        | ("/data", FdBackend::Fat32Disk { .. }) => true,
         (_, FdBackend::Dir { path }) => mount_contains_path(target, path),
         _ => false,
     }
@@ -10243,6 +10846,7 @@ pub(super) fn sys_linux_ftruncate(fd: u64, length: u64) -> u64 {
             // FAT32/ext2 truncate not yet implemented.
             NEG_EINVAL
         }
+        FdBackend::VfsService { .. } => NEG_EROFS, // read-only
     }
 }
 
@@ -10367,6 +10971,9 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         if !seen.contains("tmp") {
             entries.push((alloc::string::String::from("tmp"), DT_DIR));
         }
+        if !seen.contains("run") {
+            entries.push((alloc::string::String::from("run"), DT_DIR));
+        }
         if !seen.contains("proc") {
             entries.push((alloc::string::String::from("proc"), DT_DIR));
         }
@@ -10379,6 +10986,22 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
     } else if crate::fs::ext2::is_mounted() {
         // ext2 subdirectory listing (e.g. /home, /etc).
         if let Some(rel) = ext2_root_path(&dir_path) {
+            if vfs_service_can_list_dir(&dir_path) {
+                match vfs_service_list_dir(&dir_path, offset, buf_ptr, max_bytes) {
+                    Ok((bytes, next_offset)) => {
+                        if bytes == 0 {
+                            return 0;
+                        }
+                        with_current_fd_mut(fd_idx, |slot| {
+                            if let Some(e) = slot {
+                                e.offset = next_offset;
+                            }
+                        });
+                        return bytes as u64;
+                    }
+                    Err(err) => return err,
+                }
+            }
             // Merge entries from both ramdisk and ext2 for overlaid dirs.
             let mut seen = alloc::collections::BTreeSet::new();
             if let Some(children) = crate::fs::ramdisk::ramdisk_list_dir(&dir_path) {
@@ -10573,67 +11196,22 @@ pub(super) fn sys_access(path_ptr: u64) -> u64 {
     };
 
     let cwd = current_cwd();
-    let resolved = resolve_path(&cwd, name);
-
-    // Phase 21: /dev/null always exists.
-    // Phase 22: /dev/ptmx and /dev/pts/* always exist.
-    if resolved == "/dev/null"
-        || resolved == "/dev/zero"
-        || resolved == "/dev/urandom"
-        || resolved == "/dev/random"
-        || resolved == "/dev/full"
-        || resolved == "/dev/ptmx"
-        || resolved.starts_with("/dev/pts/")
-    {
-        return 0;
-    }
-
-    // Check ramdisk.
-    if crate::fs::ramdisk::ramdisk_lookup(&resolved).is_some() {
-        return 0;
-    }
-    // Check tmpfs.
-    if let Some(rel) = tmpfs_relative_path(&resolved) {
-        if rel.is_empty() {
-            return 0; // /tmp itself
-        }
-        let tmpfs = crate::fs::tmpfs::TMPFS.lock();
-        if tmpfs.stat(rel).is_ok() {
-            return 0;
-        }
-    }
-
-    // Phase 31: check ext2 root filesystem.
-    if crate::fs::ext2::is_mounted() {
-        let vol = crate::fs::ext2::EXT2_VOLUME.lock();
-        if let Some(vol) = vol.as_ref() {
-            let rel = resolved.trim_start_matches('/');
-            if vol.resolve_path(rel).is_ok() {
-                return 0;
+    let lexical = resolve_path(&cwd, name);
+    match resolve_existing_fs_path(&lexical, true) {
+        Ok(_) => 0,
+        Err(err) => {
+            if lexical.starts_with("/usr/") {
+                let rel = lexical.trim_start_matches('/');
+                let vol = crate::fs::fat32::FAT32_VOLUME.lock();
+                if let Some(vol) = vol.as_ref()
+                    && vol.lookup(rel).is_ok()
+                {
+                    return 0;
+                }
             }
+            err
         }
     }
-
-    // Phase 31: check FAT32 (/data mount and /usr paths mapped onto it).
-    {
-        let fat_rel = if let Some(stripped) = resolved.strip_prefix("/data/") {
-            Some(stripped)
-        } else if resolved.starts_with("/usr/") {
-            Some(resolved.trim_start_matches('/'))
-        } else {
-            None
-        };
-        if let Some(rel) = fat_rel {
-            let vol = crate::fs::fat32::FAT32_VOLUME.lock();
-            if let Some(vol) = vol.as_ref()
-                && vol.lookup(rel).is_ok()
-            {
-                return 0;
-            }
-        }
-    }
-
-    NEG_ENOENT
 }
 
 // ---------------------------------------------------------------------------
@@ -11004,7 +11582,7 @@ fn sys_clone_thread(
         "clone-thread",
     );
 
-    log::info!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
+    log::debug!("[p{}] clone_thread → child tid {}", parent_pid, child_pid);
     child_pid as u64
 }
 
@@ -12183,6 +12761,14 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
         Some(h) => h,
         None => return NEG_ENFILE,
     };
+    // Phase 54 Track C: notify net_udp service about new UDP socket.
+    if proto == SocketProtocol::Udp && net_udp_service_available() {
+        let err = net_udp_service_create(handle);
+        if err != 0 {
+            release_socket_handle(handle);
+            return err;
+        }
+    }
     let entry = FdEntry {
         backend: FdBackend::Socket { handle },
         offset: 0,
@@ -12194,7 +12780,7 @@ pub(super) fn sys_socket(domain: u64, socktype: u64, protocol: u64) -> u64 {
     match alloc_fd(0, entry) {
         Some(fd) => fd as u64,
         None => {
-            crate::net::free_socket(handle);
+            release_socket_handle(handle);
             NEG_EMFILE
         }
     }
@@ -12225,8 +12811,21 @@ pub(super) fn sys_bind(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
 
     match proto {
         crate::net::SocketProtocol::Udp => {
-            if !crate::net::udp::bind(port) {
-                return NEG_EADDRINUSE;
+            // Phase 54 Track C: delegate binding policy to net_udp service.
+            if net_udp_service_available() {
+                let err = net_udp_service_bind(handle, port, local_ip);
+                if err != 0 {
+                    return err;
+                }
+                // Service approved — register in kernel mechanism layer too
+                // so ingress datagrams are queued for this port.  Ignore the
+                // return value: the service is the policy authority.
+                let _ = crate::net::udp::bind(port);
+            } else {
+                // Fallback: no service, kernel owns policy directly.
+                if !crate::net::udp::bind(port) {
+                    return NEG_EADDRINUSE;
+                }
             }
             crate::net::with_socket_mut(handle, |s| {
                 s.local_addr = local_ip;
@@ -12336,16 +12935,34 @@ pub(super) fn sys_connect(fd: u64, addr_ptr: u64, addr_len: u64) -> u64 {
             }
         }
         crate::net::SocketProtocol::Udp => {
-            // Auto-bind an ephemeral port if not already bound
-            let needs_bind = crate::net::with_socket(handle, |s| !s.udp_bound).unwrap_or(true);
-            if needs_bind {
-                let ephemeral = crate::arch::x86_64::interrupts::tick_count() as u16 | 0xC000;
-                if crate::net::udp::bind(ephemeral) {
+            // Phase 54 Track C: delegate connect policy to net_udp service.
+            if net_udp_service_available() {
+                let (err, ephemeral_port) = net_udp_service_connect(handle, ip, port);
+                if err != 0 {
+                    return err;
+                }
+                // If the service auto-bound an ephemeral port, register in
+                // kernel mechanism layer and update socket state.
+                if ephemeral_port != 0 {
+                    let _ = crate::net::udp::bind(ephemeral_port);
                     crate::net::with_socket_mut(handle, |s| {
-                        s.local_port = ephemeral;
+                        s.local_port = ephemeral_port;
                         s.local_addr = crate::net::config::our_ip();
                         s.udp_bound = true;
                     });
+                }
+            } else {
+                // Fallback: kernel owns policy directly.
+                let needs_bind = crate::net::with_socket(handle, |s| !s.udp_bound).unwrap_or(true);
+                if needs_bind {
+                    let ephemeral = crate::arch::x86_64::interrupts::tick_count() as u16 | 0xC000;
+                    if crate::net::udp::bind(ephemeral) {
+                        crate::net::with_socket_mut(handle, |s| {
+                            s.local_port = ephemeral;
+                            s.local_addr = crate::net::config::our_ip();
+                            s.udp_bound = true;
+                        });
+                    }
                 }
             }
             crate::net::with_socket_mut(handle, |s| {
@@ -12458,7 +13075,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 if addr_ptr != 0 {
                     if addr_len_ptr == 0 {
                         // Linux requires addrlen when addr is non-null
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     let mut len_buf = [0u8; 4];
@@ -12466,15 +13083,15 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_to_kernel(&mut len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                     if u32::from_ne_bytes(len_buf) < 16 {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EINVAL;
                     }
                     if let Err(e) = sockaddr_to_user(addr_ptr, remote_ip, remote_port) {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return e;
                     }
                 }
@@ -12485,7 +13102,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                         .and_then(|s| s.copy_from_kernel(&len_buf))
                         .is_err()
                     {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EFAULT;
                     }
                 }
@@ -12502,7 +13119,7 @@ pub(super) fn sys_accept(fd: u64, addr_ptr: u64, addr_len_ptr: u64) -> u64 {
                 match alloc_fd(0, entry) {
                     Some(new_fd) => return new_fd as u64,
                     None => {
-                        crate::net::free_socket(new_handle);
+                        release_socket_handle(new_handle);
                         return NEG_EMFILE;
                     }
                 }
@@ -12621,7 +13238,18 @@ pub(super) fn sys_sendto(
                     if dst_port == 0 {
                         return NEG_ENOTCONN;
                     }
-                    crate::net::udp::send(dst_ip, dst_port, local_port, &tmp[..capped]);
+                    // Phase 54 Track C: service validates, then kernel transmits.
+                    let src_port = if net_udp_service_available() {
+                        let (err, sp) =
+                            net_udp_service_sendto_params(handle, dst_ip, dst_port, capped);
+                        if err != 0 {
+                            return err;
+                        }
+                        sp
+                    } else {
+                        local_port
+                    };
+                    crate::net::udp::send(dst_ip, dst_port, src_port, &tmp[..capped]);
                     capped as u64
                 }
                 crate::net::SocketProtocol::Icmp => {
@@ -12803,40 +13431,53 @@ pub(super) fn sys_recvfrom_socket(
                         crate::task::yield_now();
                     }
                 }
-                crate::net::SocketProtocol::Udp => loop {
-                    if let Some(dgram) = crate::net::udp::recv(local_port) {
-                        let n = dgram.data.len().min(capped);
-                        if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
-                            .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
-                            .is_err()
-                        {
-                            return NEG_EFAULT;
+                crate::net::SocketProtocol::Udp => {
+                    // Phase 54 Track C: service validates which port to recv from.
+                    let recv_port = if net_udp_service_available() {
+                        let (err, port) = net_udp_service_recvfrom_port(handle);
+                        if err != 0 {
+                            return err;
                         }
-                        if addr_ptr != 0 {
-                            if let Err(e) = sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
+                        port
+                    } else {
+                        local_port
+                    };
+                    loop {
+                        if let Some(dgram) = crate::net::udp::recv(recv_port) {
+                            let n = dgram.data.len().min(capped);
+                            if UserSliceWo::new(buf_ptr, dgram.data[..n].len())
+                                .and_then(|s| s.copy_from_kernel(&dgram.data[..n]))
+                                .is_err()
                             {
-                                return e;
+                                return NEG_EFAULT;
                             }
-                            if addr_len_ptr != 0 {
-                                let len_buf = 16u32.to_ne_bytes();
-                                if UserSliceWo::new(addr_len_ptr, len_buf.len())
-                                    .and_then(|s| s.copy_from_kernel(&len_buf))
-                                    .is_err()
+                            if addr_ptr != 0 {
+                                if let Err(e) =
+                                    sockaddr_to_user(addr_ptr, dgram.src_ip, dgram.src_port)
                                 {
-                                    return NEG_EFAULT;
+                                    return e;
+                                }
+                                if addr_len_ptr != 0 {
+                                    let len_buf = 16u32.to_ne_bytes();
+                                    if UserSliceWo::new(addr_len_ptr, len_buf.len())
+                                        .and_then(|s| s.copy_from_kernel(&len_buf))
+                                        .is_err()
+                                    {
+                                        return NEG_EFAULT;
+                                    }
                                 }
                             }
+                            return n as u64;
                         }
-                        return n as u64;
+                        if nonblock {
+                            return NEG_EAGAIN;
+                        }
+                        if has_pending_signal() {
+                            return NEG_EINTR;
+                        }
+                        crate::task::yield_now();
                     }
-                    if nonblock {
-                        return NEG_EAGAIN;
-                    }
-                    if has_pending_signal() {
-                        return NEG_EINTR;
-                    }
-                    crate::task::yield_now();
-                },
+                }
                 crate::net::SocketProtocol::Icmp => {
                     // Wait for ICMP echo reply
                     use crate::net::icmp::{PING_REPLY_RECEIVED, PING_REPLY_TICK};
@@ -13422,6 +14063,7 @@ fn fd_poll_events(entry: &FdEntry) -> i16 {
             }
         }
         FdBackend::Epoll { .. } => 0, // epoll FDs not themselves pollable
+        FdBackend::VfsService { .. } => POLLIN, // always readable
     }
 }
 
@@ -14384,4 +15026,166 @@ pub(super) fn sys_ktrace(core_id: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     }
 
     write_count as u64
+}
+
+// ===========================================================================
+// Phase 54 Track C: UDP network service facade
+// ===========================================================================
+
+/// Returns `true` when the ring-3 `net_udp` service is registered and the
+/// current caller is *not* the service itself (prevents recursion).
+fn net_udp_service_available() -> bool {
+    !is_current_exec_path("/bin/net_server") && crate::ipc::registry::is_registered("net_udp")
+}
+
+/// Tell the service about a newly-allocated kernel socket handle.
+fn net_udp_service_create(kernel_handle: u32) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_CREATE;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let mut msg = Message::new(NET_UDP_CREATE);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.label // 0 on success
+}
+
+/// Forward bind to the service (port binding policy decision).
+fn net_udp_service_bind(kernel_handle: u32, port: u16, ip: [u8; 4]) -> u64 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_BIND;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return NEG_EIO,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINVAL,
+    };
+
+    let ip_u32 =
+        ((ip[0] as u64) << 24) | ((ip[1] as u64) << 16) | ((ip[2] as u64) << 8) | (ip[3] as u64);
+
+    let mut msg = Message::new(NET_UDP_BIND);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = port as u64;
+    msg.data[2] = ip_u32;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.label
+}
+
+/// Forward connect to the service. Returns (errno, ephemeral_port).
+fn net_udp_service_connect(kernel_handle: u32, ip: [u8; 4], port: u16) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::{NET_UDP_CONNECT, pack_ip_port};
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_CONNECT);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = pack_ip_port(ip, port);
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Validate a sendto — returns (errno, src_port) from the service.
+fn net_udp_service_sendto_params(
+    kernel_handle: u32,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    len: usize,
+) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::{NET_UDP_SENDTO, pack_ip_port};
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_SENDTO);
+    msg.data[0] = kernel_handle as u64;
+    msg.data[1] = pack_ip_port(dst_ip, dst_port);
+    msg.data[2] = len as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Validate a recvfrom — returns (errno, local_port) from the service.
+fn net_udp_service_recvfrom_port(kernel_handle: u32) -> (u64, u16) {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_RECVFROM;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return (NEG_EIO, 0),
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return (NEG_EINVAL, 0),
+    };
+
+    let mut msg = Message::new(NET_UDP_RECVFROM);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    (reply.label, reply.data[0] as u16)
+}
+
+/// Tell the service a socket was closed. Returns the port that was unbound.
+fn net_udp_service_close(kernel_handle: u32) -> u16 {
+    use crate::ipc::{endpoint, message::Message, registry};
+    use crate::task::scheduler;
+    use kernel_core::net::udp_protocol::NET_UDP_CLOSE;
+
+    let ep = match registry::lookup_endpoint_id("net_udp") {
+        Some(ep) => ep,
+        None => return 0,
+    };
+    let task = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return 0,
+    };
+
+    let mut msg = Message::new(NET_UDP_CLOSE);
+    msg.data[0] = kernel_handle as u64;
+    let reply = endpoint::call_msg(task, ep, msg);
+    reply.data[0] as u16
+}
+
+fn release_socket_handle(handle: u32) {
+    let hold_udp_last_ref = net_udp_service_available();
+    let result = crate::net::free_socket_with_result(handle, hold_udp_last_ref);
+    if result.needs_finalization {
+        net_udp_service_close(handle);
+        crate::net::finalize_socket_close(handle);
+    }
+}
+
+pub fn release_socket_pub(handle: u32) {
+    release_socket_handle(handle);
 }

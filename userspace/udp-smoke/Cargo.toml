@@ -1,0 +1,7 @@
+[package]
+name = "udp-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

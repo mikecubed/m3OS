@@ -78,6 +78,7 @@ pub use registry::RegistryError;
 /// | 14 | 0x110D | `ipc_call_buf(ep_cap, label, data0, buf_ptr, buf_len)` | `arg0..4` → label |
 /// | 15 | 0x110E | `ipc_recv_msg(ep_cap, msg_ptr, buf_ptr, buf_len)` | `arg0..3` → label |
 /// | 16 | 0x110F | `ipc_reply_recv_msg(reply_cap, label, ep_cap, msg_ptr, buf_ptr)` | `arg0..4` → label |
+/// | 17 | 0x1110 | `ipc_store_reply_bulk(buf_ptr, buf_len)` | `arg0, arg1` → 0 or u64::MAX |
 ///
 /// Syscall 5 (`ipc_reply_recv`) uses only 3 args (reply_cap, label, ep_cap)
 /// because the syscall ABI currently forwards only 3 arguments through the
@@ -116,7 +117,7 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     // UserReturnState, so blocking IPC paths no longer need manual
     // restore_caller_context calls.
 
-    // Syscalls 10, 11, and 12 do not use arg0 as a cap handle — handle them
+    // Syscalls 10, 11, 12, and 17 do not use arg0 as a cap handle — handle them
     // before the cap-lookup preamble.
     if number == 10 {
         return ipc_lookup_service(task_id, arg0, arg1);
@@ -126,6 +127,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
     }
     if number == 12 {
         return ipc_create_endpoint(task_id);
+    }
+    if number == 17 {
+        return ipc_store_reply_bulk(task_id, arg0, arg1);
     }
 
     // Range-check arg0 before casting to CapHandle (u32) to prevent
@@ -194,12 +198,17 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         4 => {
             // ipc_reply(reply_cap_handle, label, data0)
-            match cap {
-                Capability::Reply(caller_id) => {
-                    // Consume the one-shot reply cap before replying.
-                    let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            //
+            // Atomically check-and-remove the reply cap before replying.
+            // The earlier `task_cap` peek is racy against
+            // `revoke_reply_caps_for`: between the peek and the remove, a
+            // signal delivery could wake the caller with the EINTR sentinel
+            // and drop the cap. Running `endpoint::reply` after that would
+            // clobber the caller's state.
+            match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(caller_id)) => {
                     let reply = message::Message::with2(arg1, arg2, 0);
-                    endpoint::reply(caller_id, reply);
+                    endpoint::reply(task_id, caller_id, reply);
                     0
                 }
                 _ => u64::MAX,
@@ -210,21 +219,23 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // ep_cap is in arg2 (the third syscall argument), fitting the 3-arg
             // limit of the current syscall asm stub.
             // Blocks until a new message arrives on the endpoint.
-            let caller_id = match cap {
-                Capability::Reply(id) => id,
-                _ => return u64::MAX,
-            };
-            // Range-check arg2 (ep_cap handle) before casting to CapHandle.
+            //
+            // Validate the ep handle first so a bad ep_cap does not strand the
+            // reply cap. Range-check arg2 before casting to CapHandle.
             if arg2 > u64::from(u32::MAX) {
                 return u64::MAX;
             }
-            // Validate the endpoint handle carried in arg2.
             let ep_id = match scheduler::task_cap(task_id, arg2 as CapHandle) {
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
-            // Consume reply cap (arg0 already range-checked above).
-            let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            // Atomically check-and-remove the reply cap. If revocation raced
+            // between the earlier peek and here, the caller was already woken
+            // with the EINTR sentinel — do not deliver a stale reply.
+            let caller_id = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(id)) => id,
+                _ => return u64::MAX,
+            };
             let reply = message::Message::new(arg1);
             endpoint::reply_recv(task_id, caller_id, ep_id, reply)
         }
@@ -288,10 +299,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // msg_ptr = arg3
             // buf_ptr = arg4
             // buf_len = r9 (read from per-core saved registers)
-            let caller_id = match cap {
-                Capability::Reply(id) => id,
-                _ => return u64::MAX,
-            };
+            //
+            // Validate the ep handle first so a bad ep_cap does not strand
+            // the reply cap.
             if arg2 > u64::from(u32::MAX) {
                 return u64::MAX;
             }
@@ -299,9 +309,15 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
-            let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            // Atomically check-and-remove the reply cap. If revocation raced
+            // between the earlier peek and here, the caller was already woken
+            // with the EINTR sentinel — do not deliver a stale reply.
+            let caller_id = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(id)) => id,
+                _ => return u64::MAX,
+            };
             let reply = message::Message::new(arg1);
-            endpoint::reply(caller_id, reply);
+            endpoint::reply(task_id, caller_id, reply);
             // Read buf_len from the 6th syscall register (r9), capped at
             // MAX_BULK_LEN to match ipc_recv_msg's bounds.
             let buf_len = crate::smp::per_core().syscall_user_r9;
@@ -353,11 +369,28 @@ fn ipc_register_service(
     }
 }
 
+/// Internal-only services that userspace is not allowed to look up by name.
+///
+/// These services act as a private kernel-side facade (e.g., `vfs_server` is
+/// only ever meant to be called via kernel syscall routing that already
+/// enforces DAC). Handing out endpoint capabilities to arbitrary userspace
+/// tasks would let unprivileged code bypass the kernel's access checks and
+/// drive the service directly.
+const PRIVATE_SERVICE_NAMES: &[&str] = &["vfs", "net_udp"];
+
+fn is_private_service_name(name: &str) -> bool {
+    PRIVATE_SERVICE_NAMES.contains(&name)
+}
+
 /// Syscall 10: look up a named endpoint and insert it into the caller's cap table.
 ///
 /// `name_ptr` is a userspace virtual address pointing to `name_len` bytes of
 /// UTF-8. The name is safely copied from the caller's address space via
 /// `copy_from_user`. Invalid or unmapped pointers return an error.
+///
+/// Private services (see `PRIVATE_SERVICE_NAMES`) are never exposed to
+/// userspace — lookups for those names fail as if the service were not
+/// registered.
 ///
 /// Returns the new [`CapHandle`] cast to `u64`, or `u64::MAX` on any error.
 fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64) -> u64 {
@@ -379,6 +412,9 @@ fn ipc_lookup_service(task_id: crate::task::TaskId, name_ptr: u64, name_len: u64
         Ok(s) => s,
         Err(_) => return u64::MAX,
     };
+    if is_private_service_name(name) {
+        return u64::MAX;
+    }
     match registry::with_lookup(name, |ep_id| {
         crate::task::scheduler::insert_cap(task_id, Capability::Endpoint(ep_id))
     }) {
@@ -565,4 +601,36 @@ fn ipc_recv_msg(
     }
 
     msg.label
+}
+
+// ---------------------------------------------------------------------------
+// Reply bulk data helper (Phase 54)
+// ---------------------------------------------------------------------------
+
+/// Syscall 17 (0x1110): store bulk data to be sent with the next IPC reply.
+///
+/// Copies `buf_len` bytes from the caller's userspace address `buf_ptr` into
+/// the caller's `pending_bulk` slot.  The data is transferred to the reply
+/// target when [`endpoint::reply`] is called (which now does `transfer_bulk`
+/// from server → caller).
+///
+/// Returns `0` on success, or `u64::MAX` on error.
+fn ipc_store_reply_bulk(task_id: crate::task::TaskId, buf_ptr: u64, buf_len: u64) -> u64 {
+    use crate::task::scheduler;
+
+    let len = buf_len as usize;
+    if len == 0 || len > MAX_BULK_LEN {
+        return u64::MAX;
+    }
+
+    let mut bulk = alloc::vec![0u8; len];
+    if UserSliceRo::new(buf_ptr, bulk.len())
+        .and_then(|s| s.copy_to_kernel(&mut bulk))
+        .is_err()
+    {
+        return u64::MAX;
+    }
+
+    scheduler::deliver_bulk(task_id, bulk);
+    0
 }

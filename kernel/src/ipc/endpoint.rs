@@ -518,11 +518,31 @@ pub fn call(caller: TaskId, ep_id: EndpointId, msg: Message) -> u64 {
     call_msg(caller, ep_id, msg).label
 }
 
+/// Remove a task from any endpoint sender/receiver wait queues.
+///
+/// Used when signal delivery needs to interrupt a task blocked inside IPC so it
+/// can return to userspace and observe the pending signal.
+pub fn cancel_task_wait(task_id: TaskId) {
+    let mut reg = ENDPOINTS.lock();
+    let slot_count = reg.slot_count();
+    for i in 0..slot_count {
+        if let Some(ep) = reg.get_mut(EndpointId(i as u8)) {
+            ep.receivers.retain(|&receiver| receiver != task_id);
+            ep.senders.retain(|pending| pending.task != task_id);
+        }
+    }
+}
+
 /// Reply to a blocked caller.
 ///
-/// Wakes the caller task and delivers `reply_msg` to it.
+/// Wakes the caller task and delivers `reply_msg` to it.  If the `server`
+/// task has pending bulk data (set via `ipc_store_reply_bulk`), it is
+/// transferred to the caller alongside the message (Phase 54).
+///
 /// The reply capability must have been removed by the caller before invoking.
-pub fn reply(caller: TaskId, reply_msg: Message) {
+pub fn reply(server: TaskId, caller: TaskId, reply_msg: Message) {
+    // Phase 54: transfer any reply bulk data from server → caller.
+    transfer_bulk(server, caller);
     scheduler::deliver_message(caller, reply_msg);
     // ep is u32::MAX because reply() operates on a caller TaskId, not an
     // endpoint — the reply capability was already consumed by the caller.
@@ -541,7 +561,7 @@ pub fn reply(caller: TaskId, reply_msg: Message) {
 /// Atomically: deliver reply to `caller`, then block on `ep_id` for the
 /// next incoming message.  Returns the next message label.
 pub fn reply_recv(server: TaskId, caller: TaskId, ep_id: EndpointId, reply_msg: Message) -> u64 {
-    reply(caller, reply_msg);
+    reply(server, caller, reply_msg);
     recv(server, ep_id)
 }
 
@@ -556,7 +576,7 @@ pub fn reply_recv_msg(
     ep_id: EndpointId,
     reply_msg: Message,
 ) -> Message {
-    reply(caller, reply_msg);
+    reply(server, caller, reply_msg);
     recv_msg(server, ep_id)
 }
 

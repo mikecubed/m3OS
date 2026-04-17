@@ -523,6 +523,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "fat_server"
+version = "0.54.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "fatfs"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -820,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.53.0"
+version = "0.54.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -950,6 +958,14 @@ dependencies = [
  "rand_core 0.6.4",
  "sha3",
  "zeroize",
+]
+
+[[package]]
+name = "net_server"
+version = "0.54.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
 ]
 
 [[package]]
@@ -1498,6 +1514,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "smoke-runner"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "snafu"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1818,6 +1841,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "udp-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1874,6 +1904,14 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vfs_server"
+version = "0.54.0"
+dependencies = [
+ "kernel-core",
+ "syscall-lib",
+]
 
 [[package]]
 name = "virtue"

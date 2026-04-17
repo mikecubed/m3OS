@@ -2,7 +2,9 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use syscall_lib::{exit, gettimeofday, serial_print, syscall0, syscall1, syscall6};
+use syscall_lib::{
+    WNOHANG, exit, fork, gettimeofday, serial_print, syscall0, syscall1, syscall6, waitpid,
+};
 
 const SYS_CLONE: u64 = 56;
 const SYS_EXIT: u64 = 60;
@@ -371,9 +373,23 @@ fn test_thread_exit() -> bool {
     true
 }
 
-fn arm_exit_group_spinner() -> bool {
-    serial_print("thread-test: test 4 -- arm exit_group live sibling... ");
+fn now_micros() -> i128 {
+    let (sec, usec) = gettimeofday();
+    if sec < 0 {
+        -1
+    } else {
+        (sec as i128) * 1_000_000 + (usec as i128)
+    }
+}
 
+/// Returns true when `deadline_us` has elapsed or the clock is unavailable
+/// (so loops can't hang forever if `gettimeofday` keeps failing).
+fn deadline_reached(deadline_us: i128) -> bool {
+    let now = now_micros();
+    now < 0 || now >= deadline_us
+}
+
+fn arm_exit_group_spinner() -> bool {
     static CHILD_TID4: AtomicU32 = AtomicU32::new(0);
     CHILD_TID4.store(0, Ordering::Release);
     EXIT_GROUP_SPINNER_STARTED.store(0, Ordering::Release);
@@ -385,36 +401,89 @@ fn arm_exit_group_spinner() -> bool {
     );
 
     if t == u64::MAX || t == 0 {
-        serial_print("FAIL (clone failed)\n");
         return false;
     }
 
-    let (start_sec, start_usec) = gettimeofday();
-    let deadline_us = if start_sec >= 0 {
-        (start_sec as i128) * 1_000_000 + (start_usec as i128) + 1_000_000
-    } else {
-        -1
-    };
+    let start = now_micros();
+    if start < 0 {
+        return false;
+    }
+    let deadline_us = start + 5_000_000;
 
     loop {
         if EXIT_GROUP_SPINNER_STARTED.load(Ordering::Acquire) != 0 {
-            serial_print("PASS\n");
             return true;
         }
         let _ = unsafe { syscall0(SYS_GETTID) };
-        if deadline_us >= 0 {
-            let (now_sec, now_usec) = gettimeofday();
-            if now_sec >= 0 {
-                let now_us = (now_sec as i128) * 1_000_000 + (now_usec as i128);
-                if now_us >= deadline_us {
-                    break;
-                }
-            }
+        if deadline_reached(deadline_us) {
+            break;
         }
     }
 
-    serial_print("SKIP (spinner start timeout)\n");
     false
+}
+
+fn test_exit_group_teardown() -> bool {
+    serial_print("thread-test: test 4 -- exit_group live sibling... ");
+
+    let pid = fork();
+    if pid < 0 {
+        serial_print("FAIL (fork failed)\n");
+        return false;
+    }
+
+    if pid == 0 {
+        if !arm_exit_group_spinner() {
+            exit(2);
+        }
+        unsafe { syscall1(SYS_EXIT_GROUP, 0) };
+        exit(3)
+    }
+
+    let child_pid = pid as i32;
+    let start = now_micros();
+    if start < 0 {
+        serial_print("FAIL (gettimeofday failed)\n");
+        return false;
+    }
+    let deadline_us = start + 5_000_000;
+    let mut status = 0i32;
+
+    loop {
+        let waited = waitpid(child_pid, &mut status, WNOHANG);
+        if waited == pid {
+            let exit_code = (status >> 8) & 0xff;
+            match exit_code {
+                0 => {
+                    serial_print("PASS\n");
+                    return true;
+                }
+                2 => {
+                    serial_print("FAIL (spinner start timeout)\n");
+                    return false;
+                }
+                3 => {
+                    serial_print("FAIL (exit_group returned)\n");
+                    return false;
+                }
+                code => {
+                    serial_print("FAIL (child exit=");
+                    print_num(code as u64);
+                    serial_print(")\n");
+                    return false;
+                }
+            }
+        }
+        if waited < 0 {
+            serial_print("FAIL (waitpid failed)\n");
+            return false;
+        }
+        if deadline_reached(deadline_us) {
+            serial_print("FAIL (waitpid timeout)\n");
+            return false;
+        }
+        let _ = unsafe { syscall0(SYS_GETTID) };
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -442,9 +511,10 @@ pub extern "C" fn _start() -> ! {
         failed += 1;
     }
 
-    let exit_group_spinner_started = arm_exit_group_spinner();
-    if exit_group_spinner_started {
+    if test_exit_group_teardown() {
         passed += 1;
+    } else {
+        failed += 1;
     }
 
     serial_print("thread-test: ");
@@ -457,10 +527,7 @@ pub extern "C" fn _start() -> ! {
         serial_print("thread-test: ALL TESTS PASSED\n");
     }
 
-    serial_print("thread-test: final exit_group with live sibling\n");
-
-    unsafe { syscall1(SYS_EXIT_GROUP, if failed == 0 { 0 } else { 1 }) };
-    exit(1)
+    exit(if failed == 0 { 0 } else { 1 })
 }
 
 #[panic_handler]

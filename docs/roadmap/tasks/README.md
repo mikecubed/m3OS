@@ -252,9 +252,10 @@ flowchart TD
 | 52c | Kernel architecture evolution | Complete | `phase-52c` | [Tasks](./52c-kernel-architecture-evolution-tasks.md) |
 | 52d | Kernel completion and roadmap alignment | Complete | `phase-52d` | [Tasks](./52d-kernel-completion-and-roadmap-alignment-tasks.md) |
 | 53 | Headless hardening | Complete | `phase-53` | [Tasks](./53-headless-hardening-tasks.md) |
+| 54 | Deep serverization | Complete | `phase-54` | [Tasks](./54-deep-serverization-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **54 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **55 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 

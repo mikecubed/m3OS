@@ -13,6 +13,9 @@ members = [
     "userspace/shell",
     # Phase 23 userspace ping
     "userspace/ping",
+    # Phase 54 validation probe
+    "userspace/udp-smoke",
+    "userspace/smoke-runner",
     # Phase 26 text editor
     "userspace/edit",
     # Phase 27 user accounts
@@ -48,9 +51,9 @@ members = [
     "userspace/console_server",
     "userspace/kbd_server",
     "userspace/stdin_feeder",
-    # Future userspace servers:
-    # "userspace/vfs_server",
-    # "userspace/fat_server",
+    "userspace/vfs_server",
+    "userspace/fat_server",
+    "userspace/net_server",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

@@ -1,6 +1,6 @@
 # Release Phase R07 — Deep Serverization
 
-**Status:** Proposed  
+**Status:** Complete  
 **Depends on:** [R05 — First Service Extractions](./R05-first-service-extractions.md)  
 **Official roadmap phases covered:** [Phase 8](../../roadmap/08-storage-and-vfs.md),
 [Phase 16](../../roadmap/16-network.md),
@@ -22,8 +22,10 @@ broad-kernel design. Storage, namespace resolution, and networking are the
 largest policy-heavy subsystems still living in ring 0, and they dominate both
 attack surface and architectural honesty.
 
-This phase exists because a project cannot keep saying "the real microkernel move
-comes later" forever. At some point, the large subsystems have to move.
+Phase 54 closes that gap for the first meaningful slices: rootfs pathname/VFS
+policy now routes through supervised `fat_server`/`vfs_server` services, and UDP
+policy now routes through the supervised `net_server` (`net_udp`) service while
+the kernel keeps the object/transport facade and degraded-mode fallback paths.
 
 ```mermaid
 flowchart LR

@@ -12,7 +12,7 @@ use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, write_str};
 syscall_lib::entry_point!(main);
 
 const PASSWD_PATH: &[u8] = b"/etc/passwd\0";
-const STATUS_PATH: &[u8] = b"/var/run/services.status\0";
+const STATUS_PATH: &[u8] = b"/run/services.status\0";
 
 fn parse_u32_bytes(s: &[u8]) -> Option<u32> {
     let mut val: u32 = 0;
@@ -134,7 +134,7 @@ fn cmd_remove(user: &str) -> i32 {
         return 1;
     }
 
-    // Signal crond to reload by reading its PID from /var/run/services.status.
+    // Signal crond to reload by reading its PID from /run/services.status.
     let mut status_buf = [0u8; 4096];
     let sn = {
         let fd = syscall_lib::open(STATUS_PATH, 0, 0);

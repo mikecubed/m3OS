@@ -278,6 +278,9 @@ fn fd_target(backend: &FdBackend) -> Option<String> {
         FdBackend::Epoll { instance_id } => {
             Some(alloc::format!("anon_inode:[eventpoll:{instance_id}]"))
         }
+        FdBackend::VfsService { service_handle, .. } => {
+            Some(alloc::format!("vfs:[handle={service_handle}]"))
+        }
     }
 }
 
@@ -354,7 +357,10 @@ fn render_mounts() -> String {
     };
     out.push_str(root_fs);
     out.push_str("proc /proc proc rw 0 0\n");
+    // `/tmp` and `/run` share the same tmpfs instance as distinct top-level
+    // directories. See kernel/src/fs/tmpfs.rs.
     out.push_str("tmpfs /tmp tmpfs rw 0 0\n");
+    out.push_str("tmpfs /run tmpfs rw 0 0\n");
     out.push_str("dev /dev ramfs rw 0 0\n");
     if crate::fs::fat32::is_mounted() {
         out.push_str("/dev/vda1 /data vfat rw 0 0\n");
