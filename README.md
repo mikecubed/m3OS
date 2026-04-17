@@ -11,44 +11,84 @@ roadmap toward stronger service isolation and broader platform support.
 
 Required for the supported headless/reference path:
 
-- nightly Rust (the repo pins `nightly` in `rust-toolchain.toml`)
-- QEMU (`qemu-system-x86_64` plus `qemu-img`)
-- OVMF firmware
-- `debugfs` from `e2fsprogs` (used to populate the ext2 data disk)
+- **Rust** — nightly toolchain (pinned via `rust-toolchain.toml`). Install via [rustup](https://rustup.rs/).
+- **QEMU** — `qemu-system-x86_64` plus `qemu-img`
+- **OVMF** — UEFI firmware for QEMU
+- **e2fsprogs** — `mkfs.ext2` and `debugfs` (used to build the ext2 data disk)
 
-Optional extras that widen what gets bundled into the image:
+Optional, each unlocks an additional build target or workflow:
 
-- `curl`, `tar`, and `sha256sum` to refresh the Lua/zlib host cache in `target/ports-src/`
-- `musl-gcc` for the musl-linked C demo/test binaries
-- `rustup target add x86_64-unknown-linux-musl` for the Rust `std` demo crates
-- `sbsign` and `sbverify` for `cargo xtask image --sign`
+- **musl cross-compiler** — required for the C userspace and musl-linked Rust demos
+- **`rustup target add x86_64-unknown-linux-musl`** — required for the Rust `std` demo crates
+- **`curl`, `tar`, `sha256sum`** — required to refresh the Lua/zlib port cache in `target/ports-src/`
+- **`sbsigntool`** (`sbsign`/`sbverify`) — required for `cargo xtask image --sign` (Secure Boot)
 
-Missing optional tools either skip those extras with warnings or leave the
-cold-cache refresh path unavailable. The baseline headless image/build path
-still works when the relevant caches are already primed.
+Missing optional tools are skipped with warnings rather than blocking the build.
+
+#### Install on Ubuntu / Debian (including WSL)
+
+```bash
+sudo apt install qemu-system-x86 qemu-utils ovmf e2fsprogs \
+                 musl-tools sbsigntool curl build-essential
+```
+
+#### Install on Arch Linux (including Omarchy)
+
+```bash
+sudo pacman -S qemu-base edk2-ovmf e2fsprogs sbsigntools curl
+# musl cross-compiler comes from the AUR:
+yay -S musl-gcc-cross-bin
+```
+
+The xtask build system auto-detects both Debian/Ubuntu toolchain names
+(`x86_64-linux-musl-gcc`) and Arch cross-compiler names
+(`x86_64-unknown-linux-musl1.2-gcc`), and searches the OVMF paths for both
+distros.
+
+#### Install Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add x86_64-unknown-linux-musl   # for Rust std demos
+```
+
+### First-time setup
+
+After cloning, install the git hooks so quality gates run before each commit/push:
+
+```bash
+./setup.sh
+```
+
+### Build and run
 
 ```bash
 # Build and run in headless QEMU (serial only)
-cargo +nightly xtask run
+cargo xtask run
 
-# Recreate the ext2 data disk, then run the same headless workflow
-cargo +nightly xtask run --fresh
+# Recreate the ext2 data disk, then run headless
+cargo xtask run --fresh
 
-# Build and run in QEMU with a window for framebuffer + keyboard input
-cargo +nightly xtask run-gui
+# Build and run in QEMU with a framebuffer window + keyboard input
+cargo xtask run-gui
 
 # Build a bootable disk image (UEFI raw + VHDX for Hyper-V)
-cargo +nightly xtask image
+cargo xtask image
+
+# Lint, format-check, run host-side kernel-core tests
+cargo xtask check
 ```
 
-`cargo +nightly xtask run` is the primary supported workflow. It builds
+`cargo xtask run` is the primary supported workflow. It builds
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img`, keeps the companion ext2
 data disk at `target/x86_64-unknown-none/release/disk.img`, and also emits
 `target/x86_64-unknown-none/release/boot-uefi-m3os.vhdx`. `run-gui` is available for
 framebuffer debugging, but the headless serial path is the reference system.
 
 `run-gui` launches QEMU with an SDL window so the guest PS/2 keyboard can be used.
-Click the QEMU window to grab input, then press `Ctrl+Alt+G` to release it.
+Click the QEMU window to grab input, then press `Ctrl+Alt+G` to release it. On
+Wayland-based desktops, if keyboard input feels unresponsive, prefix the command
+with `SDL_VIDEODRIVER=x11` to force SDL through XWayland.
 
 ## Project Layout
 
@@ -81,9 +121,9 @@ Full documentation lives in [`docs/`](docs/README.md):
 ## Headless/Reference System
 
 m3OS targets a **headless/reference baseline** as its primary supported
-configuration: `cargo +nightly xtask run` boots
+configuration: `cargo xtask run` boots
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img` together with
-`target/x86_64-unknown-none/release/disk.img` in QEMU, and `cargo +nightly xtask image`
+`target/x86_64-unknown-none/release/disk.img` in QEMU, and `cargo xtask image`
 builds the same artifacts without launching QEMU. The supported workflow is to boot,
 log in, inspect services, verify storage and logging, compile bounded software, diagnose failures, and shut down cleanly over
 the serial/headless path. SSH is the default remote-admin path; telnet is available

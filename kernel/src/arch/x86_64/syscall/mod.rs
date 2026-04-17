@@ -4004,7 +4004,6 @@ unsafe fn cow_clone_user_pages(
                         if !pte.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
                             continue;
                         }
-
                         let vaddr: u64 = ((p4 as u64) << 39)
                             | ((p3 as u64) << 30)
                             | ((p2 as u64) << 21)
@@ -4012,6 +4011,38 @@ unsafe fn cow_clone_user_pages(
 
                         let src_phys = pte.addr();
                         let flags = pte.flags();
+
+                        // BIT_11 marks device/MMIO frames (e.g. framebuffer)
+                        // outside the buddy allocator's range. Map them in
+                        // the child with identical flags (shared hardware
+                        // memory), but skip CoW and refcounting.
+                        if flags.contains(PageTableFlags::BIT_11) {
+                            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(vaddr))
+                                .map_err(|_| {
+                                crate::mm::elf::ElfError::MappingFailed("invalid vaddr in fork")
+                            })?;
+                            let frame = PhysFrame::from_start_address(src_phys)
+                                .expect("CoW: unaligned device frame address");
+                            let parent_flags = PageTableFlags::PRESENT
+                                | PageTableFlags::WRITABLE
+                                | PageTableFlags::USER_ACCESSIBLE;
+                            dst_mapper
+                                .map_to_with_table_flags(
+                                    page,
+                                    frame,
+                                    flags,
+                                    parent_flags,
+                                    &mut frame_alloc,
+                                )
+                                .map_err(|_| {
+                                    crate::mm::elf::ElfError::MappingFailed(
+                                        "map_to failed for device frame in fork",
+                                    )
+                                })?
+                                .ignore();
+                            continue;
+                        }
+
                         let was_writable = flags.contains(PageTableFlags::WRITABLE);
 
                         // Compute child flags: if the page was writable, clear

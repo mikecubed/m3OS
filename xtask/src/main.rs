@@ -353,10 +353,33 @@ fn build_musl_bins() {
         ),
     ];
 
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => {
+            eprintln!(
+                "warning: musl cross-compiler not found — skipping C binary builds \
+                 (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch to enable)"
+            );
+            // Create empty placeholders so include_bytes! doesn't fail.
+            for (_, name) in bins {
+                let dst = initrd.join(format!("{name}"));
+                if !dst.exists() {
+                    fs::write(&dst, b"").unwrap_or_else(|e| {
+                        eprintln!(
+                            "warning: failed to create placeholder {}: {e}",
+                            dst.display()
+                        );
+                    });
+                }
+            }
+            return;
+        }
+    };
+
     for (src_rel, name) in bins {
         let src = root.join(src_rel);
         let dst = initrd.join(format!("{name}"));
-        let status = match Command::new("musl-gcc")
+        let status = match Command::new(cc)
             .args([
                 "-static",
                 "-O2",
@@ -369,26 +392,23 @@ fn build_musl_bins() {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
-                    "warning: musl-gcc not found — skipping C binary builds (install musl-tools to enable)"
+                    "warning: {cc} disappeared between probe and execution — skipping {name}"
                 );
-                // Create empty placeholders so include_bytes! doesn't fail.
-                for (_, name) in bins {
-                    let dst = initrd.join(format!("{name}"));
-                    if !dst.exists() {
-                        fs::write(&dst, b"").unwrap_or_else(|e| {
-                            eprintln!(
-                                "warning: failed to create placeholder {}: {e}",
-                                dst.display()
-                            );
-                        });
-                    }
+                let dst = initrd.join(format!("{name}"));
+                if !dst.exists() {
+                    fs::write(&dst, b"").unwrap_or_else(|e| {
+                        eprintln!(
+                            "warning: failed to create placeholder {}: {e}",
+                            dst.display()
+                        );
+                    });
                 }
-                return;
+                continue;
             }
-            Err(e) => panic!("failed to run musl-gcc for {name}: {e}"),
+            Err(e) => panic!("failed to run {cc} for {name}: {e}"),
         };
         if !status.success() {
-            eprintln!("musl-gcc failed for {name}");
+            eprintln!("{cc} failed for {name}");
             std::process::exit(1);
         }
         println!("musl: {} → target/generated-initrd/{name}", src.display());
@@ -668,27 +688,19 @@ fn build_pdpmake() {
     args.push("-o".to_string());
     args.push(make_elf.to_str().unwrap().to_string());
 
-    let cc = if Command::new("x86_64-linux-musl-gcc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-    {
-        "x86_64-linux-musl-gcc"
-    } else {
-        "musl-gcc"
-    };
-
-    let status = match Command::new(cc).args(&args).status() {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("warning: {cc} not found — skipping pdpmake build");
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => {
+            eprintln!("warning: musl cross-compiler not found — skipping pdpmake build");
             if !make_elf.exists() {
                 fs::write(&make_elf, b"").unwrap();
             }
             return;
         }
+    };
+
+    let status = match Command::new(cc).args(&args).status() {
+        Ok(s) => s,
         Err(e) => panic!("failed to run {cc} for pdpmake: {e}"),
     };
     if !status.success() {
@@ -890,16 +902,15 @@ fn build_doom() {
     }
 
     // Detect musl cross-compiler.
-    let cc = if Command::new("x86_64-linux-musl-gcc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-    {
-        "x86_64-linux-musl-gcc"
-    } else {
-        "musl-gcc"
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => {
+            eprintln!("warning: musl cross-compiler not found — skipping doom build");
+            if !doom_bin.exists() {
+                fs::write(&doom_bin, b"").unwrap();
+            }
+            return;
+        }
     };
 
     // Include path: point to the doomgeneric source so dg_m3os.c can
@@ -988,28 +999,16 @@ fn build_tcc() -> Option<PathBuf> {
     }
 
     // Check for musl cross-compiler.
-    let cc = if Command::new("x86_64-linux-musl-gcc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-    {
-        "x86_64-linux-musl-gcc"
-    } else if Command::new("musl-gcc")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-    {
-        "musl-gcc"
-    } else {
-        eprintln!(
-            "warning: musl cross-compiler not found — skipping TCC build \
-             (install musl-tools to enable Phase 31)"
-        );
-        return None;
+    let cc = match find_musl_cc() {
+        Some(cc) => cc,
+        None => {
+            eprintln!(
+                "warning: musl cross-compiler not found — skipping TCC build \
+                 (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch \
+                 to enable Phase 31)"
+            );
+            return None;
+        }
     };
 
     // Clone TCC source.
@@ -1039,6 +1038,15 @@ fn build_tcc() -> Option<PathBuf> {
         }
     }
 
+    // Clean stale artifacts before reconfiguring (a cached c2str.exe from a
+    // previous build with different flags may be dynamically linked and fail).
+    let _ = Command::new("make")
+        .current_dir(&tcc_src)
+        .args(["clean"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
     // Configure TCC.
     // Use --extra-ldflags=-static to produce a fully static, non-PIE binary.
     // The --extra-cflags=-static alone doesn't prevent PIE on newer toolchains.
@@ -1048,7 +1056,7 @@ fn build_tcc() -> Option<PathBuf> {
         .args([
             "./configure",
             "--prefix=/usr",
-            &format!("--cc={cc}"),
+            &format!("--cc={cc} -static"),
             "--extra-cflags=-static",
             "--extra-ldflags=-static -no-pie",
             "--cpu=x86_64",
@@ -1362,6 +1370,31 @@ fn convert_to_vhdx(uefi_image: &Path) {
     }
 }
 
+/// Find a musl cross-compiler on the system.
+///
+/// Checks for `x86_64-linux-musl-gcc` (Debian/Ubuntu cross-compiler),
+/// `x86_64-unknown-linux-musl1.2-gcc` (Arch `musl-gcc-cross-bin`),
+/// and `musl-gcc` (Debian/Ubuntu `musl-tools` wrapper), in that order.
+fn find_musl_cc() -> Option<&'static str> {
+    let candidates = [
+        "x86_64-linux-musl-gcc",
+        "x86_64-unknown-linux-musl1.2-gcc",
+        "musl-gcc",
+    ];
+    for cc in candidates {
+        if Command::new(cc)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Some(cc);
+        }
+    }
+    None
+}
+
 fn find_ovmf() -> PathBuf {
     if let Ok(path) = std::env::var("OVMF_PATH") {
         let p = PathBuf::from(&path);
@@ -1376,6 +1409,12 @@ fn find_ovmf() -> PathBuf {
         "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         "/usr/share/qemu/OVMF.fd",
+        // Arch Linux (edk2-ovmf package) uses .4m suffix and x64/ subdirectory.
+        // Prefer the combined OVMF.4m.fd since it works with -bios; the split
+        // OVMF_CODE.4m.fd requires pflash setup with a separate VARS file.
+        "/usr/share/ovmf/x64/OVMF.4m.fd",
+        "/usr/share/OVMF/x64/OVMF.4m.fd",
+        "/usr/share/edk2/x64/OVMF.4m.fd",
     ];
 
     for path in &candidates {
@@ -4307,14 +4346,24 @@ fn create_data_disk(output_dir: &Path, enable_telnet: bool, smoke_test_mode: boo
     }
 
     // Format with mkfs.ext2 (4K blocks, ext2 rev 0, no optional features).
+    // Newer e2fsprogs (>=1.47.4, Arch) removed -r; try -E revision=0 first
+    // (rev 0 implies no features, so -O none is not needed), then fall back
+    // to -r 0 -O none for older versions (Ubuntu 22.04/24.04).
     let mkfs_status = Command::new("mkfs.ext2")
-        .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
+        .args(["-b", "4096", "-L", "m3data", "-E", "revision=0", "-q"])
         .arg(&part_tmp)
         .status()
         .expect("failed to run mkfs.ext2 — is e2fsprogs installed?");
     if !mkfs_status.success() {
-        eprintln!("Error: mkfs.ext2 failed (exit {})", mkfs_status);
-        std::process::exit(1);
+        let fallback = Command::new("mkfs.ext2")
+            .args(["-b", "4096", "-L", "m3data", "-O", "none", "-r", "0", "-q"])
+            .arg(&part_tmp)
+            .status()
+            .expect("failed to run mkfs.ext2");
+        if !fallback.success() {
+            eprintln!("Error: mkfs.ext2 failed (exit {})", fallback);
+            std::process::exit(1);
+        }
     }
 
     // Populate files using debugfs.
