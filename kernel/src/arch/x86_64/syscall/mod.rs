@@ -476,7 +476,13 @@ fn resolve_create_path(lexical: &str, follow_final: bool) -> Result<alloc::strin
 }
 
 fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
+    // MOUNT_OP_LOCK is intentionally NOT held here. Path resolution can issue
+    // blocking IPC via `path_node_nofollow` → `vfs_service_stat_path`; holding
+    // a spinlock across that call deadlocks any SMP peer that tries to acquire
+    // the same lock (Phase 54 SMP race). Mount/umount mutation is serialized
+    // by MOUNT_OP_LOCK in `sys_linux_mount` / `sys_linux_umount2`; read-only
+    // consumers rely on the per-volume locks (`EXT2_VOLUME`, `FAT32_VOLUME`,
+    // `ipc::registry`) for consistency.
     if raw_path.is_empty() {
         return NEG_ENOENT;
     }
@@ -523,8 +529,6 @@ fn open_user_path(dirfd: u64, raw_path: &str, flags: u64, mode_arg: u64) -> u64 
                 return NEG_EACCES;
             }
         }
-        // Release mount lock before IPC to avoid blocking other openers.
-        drop(_mount_guard);
         let routed = vfs_service_open(&resolved, flags);
         if routed != NEG_ENOENT && routed != NEG_EIO {
             return routed;
@@ -3519,7 +3523,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     };
 
     let (resolved_name, exec_owned, exec_static) = {
-        let _mount_guard = MOUNT_OP_LOCK.lock();
+        // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
+        // can issue blocking IPC via the VFS service (Phase 54). Per-volume
+        // locks protect read consistency.
 
         // Follow the final symlink like Linux execve().
         let lexical = match resolve_path_from_dirfd(AT_FDCWD, raw_name) {
@@ -9146,7 +9152,8 @@ pub(super) fn sys_linux_getcwd(buf_ptr: u64, size: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_chdir(path_ptr: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
+    // MOUNT_OP_LOCK intentionally not held — `resolve_existing_fs_path`
+    // can issue blocking IPC via the VFS service (Phase 54).
     let mut buf = [0u8; 512];
     let name = match read_user_cstr(path_ptr, &mut buf) {
         Some(n) => n,
@@ -10539,7 +10546,6 @@ pub(super) fn sys_linux_rename(old_ptr: u64, new_ptr: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
     let (_, _, euid, _) = current_process_ids();
     if euid != 0 {
         return NEG_EPERM;
@@ -10556,6 +10562,9 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
         None => return NEG_EFAULT,
     };
 
+    // Resolve the target BEFORE taking MOUNT_OP_LOCK — path resolution can
+    // issue blocking IPC, and holding a spinlock across that call deadlocks
+    // SMP peers (Phase 54 SMP race).
     let cwd = current_cwd();
     let lexical_target = resolve_path(&cwd, target);
     let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
@@ -10578,6 +10587,9 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
             return err;
         }
     };
+
+    // Serialize the actual mount mutation with other mount/umount operations.
+    let _mount_guard = MOUNT_OP_LOCK.lock();
 
     if action == kernel_core::fs::vfs_protocol::VFS_MOUNT_EXT2_ROOT {
         let (base_lba, _) = match crate::blk::mbr::probe_ext2() {
@@ -10627,7 +10639,6 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
 }
 
 pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
-    let _mount_guard = MOUNT_OP_LOCK.lock();
     if flags != 0 {
         return NEG_EINVAL;
     }
@@ -10643,6 +10654,9 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
         None => return NEG_EFAULT,
     };
 
+    // Resolve the target BEFORE taking MOUNT_OP_LOCK — path resolution can
+    // issue blocking IPC, and holding a spinlock across that call deadlocks
+    // SMP peers (Phase 54 SMP race).
     let cwd = current_cwd();
     let lexical_target = resolve_path(&cwd, target);
     let resolved_target = match resolve_existing_fs_path(&lexical_target, true) {
@@ -10656,6 +10670,9 @@ pub(super) fn sys_linux_umount2(target_ptr: u64, flags: u64) -> u64 {
         Ok(action) => action,
         Err(err) => return err,
     };
+
+    // Serialize the actual umount mutation with other mount/umount operations.
+    let _mount_guard = MOUNT_OP_LOCK.lock();
 
     let table = crate::process::PROCESS_TABLE.lock();
     let busy = table.iter().any(|proc| {
