@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Currently at kernel v0.51.0 with a functional userspace including init, login, shell, coreutils, networking, true SMP multitasking (per-core syscalls, per-CPU run queues, priority scheduling, load balancing, CPU affinity), persistent storage, signals, a text editor, multi-user accounts with permission enforcement, PTY (pseudo-terminal) pairs, a telnet server for remote shell access, an SSH server for encrypted remote access (using the sunset IO-less SSH library), build tools, a robust memory subsystem with buddy allocator, slab caches, demand paging, mprotect, and working munmap, real-time clock with wall-clock timekeeping, I/O multiplexing with wait-queue-driven poll/select/epoll and non-blocking I/O, Unix domain sockets for local IPC, kernel-level threading with clone(CLONE_THREAD), real futex wait/wake queues, thread groups, and per-thread TLS, a userspace cryptography library (SHA-256, HMAC, HKDF, ChaCha20-Poly1305, AES-256-CTR, Ed25519, X25519, CSPRNG) with sha256sum and genkey utilities, Rust cross-compilation support for musl-linked std programs (hello-rust, sysinfo-rust, httpd-rust, calc-rust, todo-rust) with a custom x86_64-m3os target spec, a BSD-style ports system for building and installing third-party software from source (Lua, zlib, bc, sbase, mandoc, minizip) with dependency resolution and package tracking, a data-driven service manager (enhanced init) with dependency-ordered boot, restart backoff with crash classification, per-service stop timeouts, directory-scanned service configs, system logging (syslogd via /dev/log Unix socket with init lifecycle integration), cron scheduling (crond with standard crontab format), orderly shutdown/reboot with orphan reaping via sys_reboot syscall, and administration commands (service list/status/start/stop/restart/enable/disable, logger, shutdown, reboot, hostname, who, w, last, crontab), capability-based IPC with grants, bulk-data transport, and ring-3-safe service registry.
+**m3OS** (technical name: `m3os`) is a toy bootable OS in Rust: microkernel architecture, x86_64, UEFI boot. Kernel v0.51.0 with functional userspace (init, shell, coreutils, networking, SMP, storage, signals, editor, multi-user, PTY, telnet/SSH servers, crypto, musl cross-compilation, ports system, service manager, IPC). See `docs/appendix/codebase-map.md` for full workspace and source layout.
 
 ## Build & Run
 
@@ -82,67 +82,7 @@ Ring 0 (kernel/):                Ring 3 (userspace/):
   - SMP (multi-core boot + IPI)
 ```
 
-### Workspace Crates
-
-```
-Cargo.toml                # workspace root (default-members = ["kernel"])
-kernel/                   # main OS kernel binary (no_std)
-kernel-core/              # shared library — host-testable pure logic (no_std + std feature)
-xtask/                    # build system (host, std)
-userspace/
-  syscall-lib/            # syscall wrapper library for userspace Rust binaries
-  exit0/                  # test binary: simple exit
-  fork-test/              # test binary: fork behavior
-  echo-args/              # test binary: argument echo
-  init/                   # PID 1 init daemon
-  shell/                  # sh0 shell (binary name: sh0)
-  ping/                   # ICMP ping utility
-  edit/                   # full-screen text editor (kibi-style)
-  login/                  # login authentication (Phase 27)
-  su/                     # switch user (Phase 27)
-  passwd/                 # change password (Phase 27)
-  adduser/                # create user account (Phase 27)
-  pty-test/               # PTY subsystem test (Phase 29)
-  unix-socket-test/       # Unix domain socket test (Phase 39)
-  thread-test/            # Threading primitives test (Phase 40)
-  crypto-lib/             # Cryptography library (Phase 42)
-  crypto-test/            # Crypto integration test (Phase 42)
-  telnetd/                # Telnet server daemon (Phase 30)
-  sshd/                   # SSH server daemon (Phase 43)
-  syslogd/                # System logging daemon (Phase 46)
-  crond/                  # Cron scheduler daemon (Phase 46)
-  coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
-  coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey, service, logger, shutdown, reboot, hostname, who, w, last, crontab
-  demo-project/           # Multi-file C demo project for make testing (Phase 32)
-  hello-c/                # C hello world test
-  signal-test/            # C signal handling test
-  stdin-test/             # C stdin test
-  tmpfs-test/             # C tmpfs test
-  # Phase 44: musl-linked Rust std programs (standalone crates, NOT workspace members)
-  hello-rust/             # Rust std hello world (musl cross-compiled, Phase 44)
-  sysinfo-rust/           # System info tool via std::fs (Phase 44)
-  httpd-rust/             # Minimal HTTP server via std::net (Phase 44)
-  calc-rust/              # Interactive calculator via std::io (Phase 44)
-  todo-rust/              # Persistent todo list via std::fs (Phase 44)
-```
-
-### Ports Tree Layout (Phase 45)
-
-```
-ports/
-  port.sh                 # port command (installed at /usr/bin/port)
-  lang/lua/               # Lua 5.4.7 scripting language port
-  lib/zlib/               # zlib 1.3.1 compression library port
-  math/bc/                # bc calculator port
-  core/sbase/             # suckless Unix tools port (basename, seq, rev, etc.)
-  doc/mandoc/             # man page formatter port
-  util/minizip/           # zlib-dependent test port
-  <category>/<program>/
-    Portfile              # metadata: NAME, VERSION, DESCRIPTION, CATEGORY, DEPS
-    Makefile              # targets: fetch, patch, build, install, clean
-    src/                  # bundled source code
-    patches/              # m3OS-specific patches
-```
+See `docs/appendix/codebase-map.md` for workspace crates, ports tree, and source layouts.
 
 ### Adding a New Userspace Binary
 
@@ -153,52 +93,6 @@ Adding a new userspace binary requires changes in **four** places. Missing any o
 3. **Ramdisk embedding** — add an `include_bytes!` static and a `BIN_ENTRIES` tuple in `kernel/src/fs/ramdisk.rs`. Generated binaries are staged by `xtask` under `target/generated-initrd/`; checked-in static initrd assets remain under `kernel/initrd/`. Without the ramdisk entry, `execve` returns ENOENT.
 4. **Service config (if daemon)** — add a `.conf` file to the ext2 data disk builder in `xtask/src/main.rs` (`populate_ext2_files` function) AND to the `KNOWN_CONFIGS` fallback list in `userspace/init/src/main.rs`. Run `cargo xtask clean` to recreate the disk.
 
-### Kernel Source Layout
-
-```
-kernel/src/
-  main.rs              # entry point, boot sequence
-  serial.rs            # serial I/O + log backend
-  pipe.rs              # inter-process pipes
-  pty.rs               # PTY pair table and lifecycle (Phase 29)
-  rtc.rs               # CMOS real-time clock driver (Phase 34)
-  signal.rs            # POSIX-style signal handling
-  stdin.rs             # stdin abstraction
-  tty.rs               # TTY/terminal subsystem
-  testing.rs           # QEMU test framework
-  arch/x86_64/         # GDT, IDT (APIC-based), paging, syscall gate
-  acpi/                # ACPI table parsing (RSDP, MADT)
-  blk/                 # block devices: VirtIO-blk, MBR parsing
-  fb/                  # framebuffer console driver
-  fs/                  # VFS layer, FAT32, tmpfs, ramdisk, protocol
-  ipc/                 # endpoints, capabilities, messages, notifications, registry
-  mm/                  # buddy frame allocator, paging, heap, slab caches, user_space, ELF loader
-  net/                 # IPv4, ARP, Ethernet, ICMP, TCP, UDP, Unix domain sockets, VirtIO-net, dispatch
-  pci/                 # PCI device enumeration
-  process/             # process management (fork, exec, exit, wait, threads, futex)
-  smp/                 # AP boot, IPI, TLB shootdown
-  task/                # scheduler (SMP-aware round-robin)
-kernel/initrd/           # static initrd assets checked into source
-target/generated-initrd/ # xtask-staged generated binaries embedded by ramdisk
-```
-
-### kernel-core Source Layout
-
-```
-kernel-core/src/
-  lib.rs               # module declarations
-  types.rs             # shared types
-  buddy.rs             # buddy frame allocator (Phase 33)
-  slab.rs              # slab cache allocator (Phase 33)
-  time.rs              # time conversion library (Phase 34)
-  fb.rs                # framebuffer abstractions
-  pipe.rs              # pipe abstractions
-  pty.rs               # PTY pair state, ring buffers (Phase 29)
-  tty.rs               # TTY abstractions
-  fs/                  # FAT32, MBR, tmpfs abstractions
-  ipc/                 # capability, message, registry abstractions
-  net/                 # ARP, Ethernet, ICMP, IPv4, TCP, UDP abstractions
-```
 
 ## Critical Conventions
 
@@ -286,40 +180,7 @@ Parse memory regions, framebuffer, RSDP during `kernel_main` init and store in t
 
 ## Documentation in `docs/`
 
-Read before making significant changes:
-
-| File | When |
-|---|---|
-| `docs/appendix/architecture-and-syscalls.md` | Orientation — kernel vs. userspace split, syscall ABI |
-| `docs/02-memory.md` | Before touching frame allocator, page tables, or heap |
-| `docs/06-ipc.md` | Before touching `kernel/src/ipc/` or syscalls |
-| `docs/08-storage-and-vfs.md` | Before touching `kernel/src/fs/` or block devices |
-| `docs/appendix/testing.md` | Before writing kernel tests or modifying the xtask harness |
-| `docs/11-elf-loader-and-process-model.md` | Before touching ELF loading or process lifecycle |
-| `docs/12-posix-compatibility-layer.md` | Before adding syscalls or POSIX behavior |
-| `docs/16-network.md` | Before touching `kernel/src/net/` |
-| `docs/19-signal-handlers.md` | Before touching signal delivery |
-| `docs/22-tty-terminal.md` | Before touching TTY/terminal subsystem |
-| `docs/25-smp.md` | Before touching SMP or multi-core code |
-| `docs/26-text-editor.md` | Before touching the edit binary or userspace heap allocator |
-| `docs/29-pty-subsystem.md` | Before touching PTY pairs, session management, or controlling terminals |
-| `docs/30-telnet-server.md` | Before touching telnetd, socket refcounting, or network server architecture |
-| `docs/32-build-tools.md` | Before touching make/pdpmake, ar, build utilities, or demo project |
-| `docs/33-kernel-memory.md` | Before touching buddy allocator, slab caches, munmap, or meminfo |
-| `docs/34-timekeeping.md` | Before touching RTC, clock_gettime, gettimeofday, or time conversion |
-| `docs/roadmap/39-unix-domain-sockets.md` | Before touching Unix domain sockets, AF_UNIX, socketpair, or `kernel/src/net/unix.rs` |
-| `docs/roadmap/42-crypto-primitives.md` | Before touching crypto-lib, sha256sum, genkey, or RustCrypto integration |
-| `docs/roadmap/43-ssh-server.md` | Before touching sshd, sunset integration, host keys, or SSH authentication |
-| `docs/43a-crash-diagnostics.md` | Before touching panic_diag, fault handler diagnostics, or scheduler/fork/IPC assertions |
-| `docs/43b-kernel-trace-ring.md` | Before touching trace_ring, trace events, per-core trace rings, or sys_ktrace |
-| `docs/43c-regression-stress-ci.md` | Before touching xtask regression/stress commands, CI workflows, or proptest/loom tests |
-| `docs/roadmap/44-rust-cross-compilation.md` | Before touching musl Rust cross-compilation, xtask musl Rust builds, or custom target specs |
-| `docs/roadmap/45-ports-system.md` | Before touching ports tree, port command, Portfile format, or xtask ports integration |
-| `docs/roadmap/46-system-services.md` | Before touching init service manager, syslogd, crond, service command, or sys_reboot |
-| `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
-| `docs/roadmap/README.md` | Open design questions and per-phase scope |
-
-Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01–48) with corresponding `docs/roadmap/tasks/` breakdowns.
+Before making significant changes to a subsystem, read the corresponding phase doc. Full index in `docs/appendix/codebase-map.md`. Roadmaps and task lists live in `docs/roadmap/` (phases 01-48).
 
 ### Documentation templates — all docs must conform
 
