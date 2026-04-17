@@ -10971,6 +10971,9 @@ pub(super) fn sys_linux_getdents64(fd: u64, buf_ptr: u64, count: u64) -> u64 {
         if !seen.contains("tmp") {
             entries.push((alloc::string::String::from("tmp"), DT_DIR));
         }
+        if !seen.contains("run") {
+            entries.push((alloc::string::String::from("run"), DT_DIR));
+        }
         if !seen.contains("proc") {
             entries.push((alloc::string::String::from("proc"), DT_DIR));
         }
