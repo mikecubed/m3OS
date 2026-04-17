@@ -74,8 +74,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // When built with `cargo test`, run the generated test harness and exit.
     // Placed after mm::init so that tests can use heap allocations.
+    // `tmpfs::init()` is deferred to after this block so its heap / frame
+    // usage doesn't perturb the frame-allocator baseline that some tests
+    // snapshot.
     #[cfg(test)]
     test_main();
+
+    // Phase 54: populate tmpfs with /tmp and /run top-level directories.
+    // Must run after heap init so tmpfs allocations succeed, before any
+    // task that opens files under those paths.
+    fs::tmpfs::init();
 
     // P9-T002: initialise framebuffer text console (fixed-font renderer).
     if let Some((buf_ptr, info)) = fb_parts {

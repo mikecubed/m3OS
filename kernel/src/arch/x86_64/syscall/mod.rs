@@ -200,7 +200,12 @@ fn basename(path: &str) -> &str {
 }
 
 fn path_node_nofollow(abs_path: &str) -> Result<PathNodeKind, u64> {
-    if abs_path == "/" || abs_path == "/tmp" || abs_path == "/dev" || abs_path == "/dev/pts" {
+    if abs_path == "/"
+        || abs_path == "/tmp"
+        || abs_path == "/run"
+        || abs_path == "/dev"
+        || abs_path == "/dev/pts"
+    {
         return Ok(PathNodeKind::Dir);
     }
     if let Some(node) = crate::fs::procfs::path_node(abs_path) {
@@ -5557,20 +5562,29 @@ fn read_file_from_disk(path: &str) -> Result<alloc::vec::Vec<u8>, u64> {
 /// Returns `Some(relative_path)` if so (e.g. "/tmp/foo" → "foo").
 /// Rejects paths containing `.`, `..`, or empty segments to prevent
 /// traversal outside the `/tmp` mount boundary.
+/// Return the tmpfs-internal path for `path`, or `None` if `path` does not
+/// live on tmpfs.
+///
+/// The shared tmpfs instance mounts both `/tmp` and `/run` as top-level
+/// directories. The returned path preserves the mount-point prefix (`tmp/…`
+/// or `run/…`) so the tmpfs tree resolves to the correct sub-tree — callers
+/// simply pass the result to `TMPFS.stat`, `TMPFS.write_file`, etc.
+///
+/// - `/tmp` or `/run` → `Some("tmp")` / `Some("run")` (the mount-point dir).
+/// - `/tmp/foo/bar` → `Some("tmp/foo/bar")`.
+/// - Anything else, or a path with `.`, `..`, or empty segments → `None`.
 fn tmpfs_relative_path(path: &str) -> Option<&str> {
     let trimmed = path.trim_start_matches('/');
-    let rest = if trimmed == "tmp" {
-        ""
-    } else {
-        trimmed.strip_prefix("tmp/")?
+    let rest = match trimmed {
+        "tmp" | "run" => trimmed,
+        _ if trimmed.starts_with("tmp/") || trimmed.starts_with("run/") => trimmed,
+        _ => return None,
     };
 
-    // For non-empty relative paths, reject `.`, `..`, and empty segments.
-    if !rest.is_empty() {
-        for segment in rest.split('/') {
-            if segment.is_empty() || segment == "." || segment == ".." {
-                return None;
-            }
+    // Reject `.`, `..`, and empty segments anywhere in the path.
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return None;
         }
     }
 
@@ -5604,8 +5618,8 @@ fn fat32_relative_path(path: &str) -> Option<&str> {
 /// Returns `None` only for paths claimed by tmpfs (`/tmp`) or that
 /// fail traversal validation.
 fn ext2_root_path(path: &str) -> Option<&str> {
-    // /tmp is always tmpfs, never ext2
-    if path == "/tmp" || path.starts_with("/tmp/") {
+    // /tmp and /run are always tmpfs, never ext2.
+    if path == "/tmp" || path.starts_with("/tmp/") || path == "/run" || path.starts_with("/run/") {
         return None;
     }
 
