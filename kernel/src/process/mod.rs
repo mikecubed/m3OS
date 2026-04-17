@@ -269,6 +269,7 @@ pub fn close_cloexec_fds(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
+    let mut vfs_handles = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -288,6 +289,9 @@ pub fn close_cloexec_fds(pid: Pid) {
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
+                    FdBackend::VfsService { service_handle, .. } => {
+                        vfs_handles.push(*service_handle)
+                    }
                     _ => {}
                 }
                 *slot = None;
@@ -318,6 +322,9 @@ pub fn close_cloexec_fds(pid: Pid) {
     for inode_num in ext2_inodes {
         crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
     }
+    for handle in vfs_handles {
+        crate::arch::x86_64::syscall::cleanup_vfs_handle_if_unused(handle);
+    }
 }
 
 /// Close all open file descriptors for a process.
@@ -337,6 +344,7 @@ pub fn close_all_fds_for(pid: Pid) {
     let mut unix_sockets = alloc::vec::Vec::new();
     let mut epolls = alloc::vec::Vec::new();
     let mut ext2_inodes = alloc::vec::Vec::new();
+    let mut vfs_handles = alloc::vec::Vec::new();
     {
         let mut table = PROCESS_TABLE.lock();
         let proc = match table.find_mut(pid) {
@@ -354,6 +362,9 @@ pub fn close_all_fds_for(pid: Pid) {
                     FdBackend::UnixSocket { handle } => unix_sockets.push(*handle),
                     FdBackend::Epoll { instance_id } => epolls.push(*instance_id),
                     FdBackend::Ext2Disk { inode_num, .. } => ext2_inodes.push(*inode_num),
+                    FdBackend::VfsService { service_handle, .. } => {
+                        vfs_handles.push(*service_handle)
+                    }
                     _ => {}
                 }
             }
@@ -383,6 +394,9 @@ pub fn close_all_fds_for(pid: Pid) {
     for inode_num in ext2_inodes {
         crate::arch::x86_64::syscall::cleanup_ext2_inode_if_unused(inode_num);
     }
+    for handle in vfs_handles {
+        crate::arch::x86_64::syscall::cleanup_vfs_handle_if_unused(handle);
+    }
 }
 
 /// Count open ext2-backed file descriptors referencing `inode_num`.
@@ -408,6 +422,38 @@ pub fn ext2_inode_open_count(inode_num: u32) -> usize {
                     },
                     ..
                 } if *fd_inode == inode_num
+            ) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Count open VFS-service file descriptors referencing `service_handle`.
+///
+/// Used so `close()` / `execve()`-CLOEXEC / `exit()` only send a single
+/// `VFS_CLOSE` to the ring-3 `vfs_server` when the *last* fd aliasing a
+/// given service handle goes away (Phase 54). Without this, a process that
+/// dup()s or fork()s a VFS-backed fd would have any subsequent close tear
+/// down the server-side handle for every remaining alias.
+pub fn vfs_handle_open_count(service_handle: u64) -> usize {
+    let table = PROCESS_TABLE.lock();
+    let mut count = 0usize;
+    for proc in table.iter() {
+        if proc.thread_group.is_some() && proc.tid != proc.tgid {
+            continue;
+        }
+        let snapshot = proc.fd_table_snapshot();
+        for entry in snapshot.iter().flatten() {
+            if matches!(
+                entry,
+                FdEntry {
+                    backend: FdBackend::VfsService {
+                        service_handle: h, ..
+                    },
+                    ..
+                } if *h == service_handle
             ) {
                 count += 1;
             }

@@ -52,7 +52,13 @@ syscall_lib::entry_point!(program_main);
 
 const REPLY_CAP_HANDLE: u32 = 1;
 const MAX_HANDLES: usize = 64;
-const MAX_BINDINGS: usize = 16;
+/// Maximum number of simultaneously bound or connected UDP ports.
+///
+/// Mirrors the kernel's historical `net::MAX_SOCKETS = 32` ceiling so the
+/// Phase 54 userspace UDP service doesn't silently cut that capacity in
+/// half. Must be kept in sync with `kernel::net::MAX_SOCKETS` until both
+/// sides converge on a shared limit.
+const MAX_BINDINGS: usize = 32;
 
 /// Negative errno values (matches kernel convention).
 const NEG_EINVAL: u64 = (-22_i64) as u64;

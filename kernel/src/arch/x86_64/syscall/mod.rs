@@ -6546,6 +6546,17 @@ pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
     let _ = vol.free_inode(inode_num);
 }
 
+/// Send `VFS_CLOSE` to the ring-3 `vfs_server` only when the caller just
+/// removed the last fd aliasing `service_handle` (Phase 54). Safe to call
+/// after the fd slot has already been cleared — the counting helper
+/// excludes the now-empty slot.
+pub(crate) fn cleanup_vfs_handle_if_unused(service_handle: u64) {
+    if crate::process::vfs_handle_open_count(service_handle) != 0 {
+        return;
+    }
+    vfs_service_close(service_handle);
+}
+
 // ---------------------------------------------------------------------------
 // T015 (close) / T013 (close)
 // ---------------------------------------------------------------------------
@@ -6591,9 +6602,11 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     if let Some(inode_num) = ext2_inode {
         cleanup_ext2_inode_if_unused(inode_num);
     }
-    // Phase 54: notify userspace VFS server that handle is closed.
+    // Phase 54: only tear down the server-side handle when the last alias
+    // goes away — dup/fork can leave sibling fds pointing at the same
+    // service_handle.
     if let Some(handle) = vfs_handle {
-        vfs_service_close(handle);
+        cleanup_vfs_handle_if_unused(handle);
     }
     0
 }
