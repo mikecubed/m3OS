@@ -47,8 +47,12 @@ const ENV_HOME: &[u8] = b"HOME=/\0";
 const ENV_TERM: &[u8] = b"TERM=m3os\0";
 const ENV_EDITOR: &[u8] = b"EDITOR=/bin/edit\0";
 
-const STATUS_FILE: &[u8] = b"/var/run/services.status\0";
-const CMD_FILE: &[u8] = b"/var/run/init.cmd\0";
+// Runtime state files live on tmpfs (/tmp) — matching Linux's /run convention.
+// Putting them on ext2 causes init's periodic writes (every 10 s) to synchronously
+// spin-poll virtio_blk under EXT2_VOLUME, stalling core 0 for ~900 ms and delaying
+// every other task on that core's run queue (Phase 54 scheduler stall).
+const STATUS_FILE: &[u8] = b"/tmp/services.status\0";
+const CMD_FILE: &[u8] = b"/tmp/init.cmd\0";
 
 /// Known service config files to try opening (no readdir available).
 const KNOWN_CONFIGS: &[&[u8]] = &[

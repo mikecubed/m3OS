@@ -15,8 +15,8 @@ use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, nanosleep, write_str};
 
 syscall_lib::entry_point!(main);
 
-const STATUS_PATH: &[u8] = b"/var/run/services.status\0";
-const CMD_PATH: &[u8] = b"/var/run/init.cmd\0";
+const STATUS_PATH: &[u8] = b"/tmp/services.status\0";
+const CMD_PATH: &[u8] = b"/tmp/init.cmd\0";
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> isize {
     let fd = syscall_lib::open(path, 0, 0);

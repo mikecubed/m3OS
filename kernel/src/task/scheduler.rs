@@ -582,8 +582,10 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
     let mut task = Task::new(entry, name);
     let mut sched = SCHEDULER.lock();
     let target = least_loaded_core(&sched);
+    let now = crate::arch::x86_64::interrupts::tick_count();
     task.assigned_core = target;
-    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+    task.last_migrated_tick = now;
+    task.last_ready_tick = now;
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
     enqueue_to_core(target, idx);
@@ -595,8 +597,10 @@ pub fn spawn(entry: fn() -> !, name: &'static str) {
 pub fn spawn_on_current_core(entry: fn() -> !, name: &'static str) {
     let mut task = Task::new(entry, name);
     let core = crate::smp::per_core().core_id;
+    let now = crate::arch::x86_64::interrupts::tick_count();
     task.assigned_core = core;
-    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+    task.last_migrated_tick = now;
+    task.last_ready_tick = now;
     let mut sched = SCHEDULER.lock();
     let idx = alloc_task_slot(&mut sched, task);
     drop(sched);
@@ -612,8 +616,10 @@ pub fn spawn_fork_task(ctx: crate::process::ForkChildCtx, name: &'static str) ->
     let fork_rsp = ctx.user_rsp;
     let mut task = Task::new(crate::process::fork_child_trampoline, name);
     let mut sched = SCHEDULER.lock();
+    let now = crate::arch::x86_64::interrupts::tick_count();
     task.assigned_core = current_core;
-    task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+    task.last_migrated_tick = now;
+    task.last_ready_tick = now;
     // Publish the child PID before the first dispatch so pid-based lifecycle
     // operations (for example exit_group teardown) can target the task even if
     // it has not reached fork_child_trampoline yet.
@@ -1175,9 +1181,10 @@ pub fn wake_task(id: TaskId) -> bool {
                             crate::arch::x86_64::interrupts::tick_count();
                         (None, true)
                     } else {
+                        let now = crate::arch::x86_64::interrupts::tick_count();
                         sched.tasks[idx].state = TaskState::Ready;
-                        sched.tasks[idx].last_migrated_tick =
-                            crate::arch::x86_64::interrupts::tick_count();
+                        sched.tasks[idx].last_migrated_tick = now;
+                        sched.tasks[idx].last_ready_tick = now;
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
                             true,
@@ -1417,6 +1424,7 @@ pub fn run() -> ! {
                         let task = &mut sched.tasks[task_idx];
                         if task.state == TaskState::BlockedOnNotif && !task.switching_out {
                             task.state = TaskState::Ready;
+                            task.last_ready_tick = crate::arch::x86_64::interrupts::tick_count();
                             Some((task.assigned_core, task_idx))
                         } else {
                             None
@@ -1454,17 +1462,30 @@ pub fn run() -> ! {
         }
 
         // Pick the next ready task and atomically mark it Running.
+        // `stale_info` carries (pid, name, last_ready_tick, ticks_stale) when
+        // ready-to-running latency exceeds the diagnostic threshold; logged
+        // after the lock is dropped (Phase 54 diagnostic).
+        let mut stale_info: Option<(u32, &'static str, u64, u64)> = None;
         let next = {
             let mut sched = SCHEDULER.lock();
             if let Some((rsp, idx)) = sched.pick_next(core_id) {
-                sched.tasks[idx].state = TaskState::Running;
+                let now = crate::arch::x86_64::interrupts::tick_count();
+                let is_idle = sched.idle_tasks.contains(&Some(idx));
+                let task = &mut sched.tasks[idx];
+                let stale_ticks = now.saturating_sub(task.last_ready_tick);
+                // 50 ticks ≈ 500 ms at 100 Hz — catches the 1-second hang
+                // pattern without spamming on normal brief waits.
+                if stale_ticks >= 50 && !is_idle {
+                    stale_info = Some((task.pid, task.name, task.last_ready_tick, stale_ticks));
+                }
+                task.state = TaskState::Running;
+                task.start_tick = now;
                 debug_assert!(
                     sched.tasks[idx].state == TaskState::Running,
                     "dispatch: task idx={} not Running after mark on core {}",
                     idx,
                     core_id
                 );
-                sched.tasks[idx].start_tick = crate::arch::x86_64::interrupts::tick_count();
                 set_current_task_idx(Some(idx));
                 crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::Dispatch {
                     task_idx: idx as u32,
@@ -1476,6 +1497,17 @@ pub fn run() -> ! {
                 None
             }
         };
+
+        if let Some((pid, name, last_ready, stale_ticks)) = stale_info {
+            log::warn!(
+                "[sched] stale-ready: pid={} name={} core={} stale~{}ms (ready_at_tick={})",
+                pid,
+                name,
+                core_id,
+                stale_ticks * 10,
+                last_ready
+            );
+        }
 
         let (task_rsp, _task_idx) = match next {
             Some(t) => t,
@@ -1666,6 +1698,10 @@ pub fn run() -> ! {
         if switched >= 0 {
             let sidx = switched as usize;
             let saved_rsp = take_per_core_switch_save_rsp(core_id as usize);
+            // `hog_info` carries (pid, name, ran_ticks, final_state) when the
+            // task held the CPU for longer than the diagnostic threshold;
+            // logged after the SCHEDULER lock is dropped.
+            let mut hog_info: Option<(u32, &'static str, u64, TaskState)> = None;
             let enqueue = {
                 let mut sched = SCHEDULER.lock();
                 debug_assert!(
@@ -1692,6 +1728,17 @@ pub fn run() -> ! {
                     }
                     task.switching_out = false;
 
+                    // Phase 54 diagnostic: detect CPU-hog patterns. If a task
+                    // held the CPU for >= 20 ticks (~200 ms) before yielding,
+                    // log it. Suggests a syscall that spin-waits (e.g.
+                    // virtio_blk poll under contention) rather than a normal
+                    // interactive task.
+                    let now = crate::arch::x86_64::interrupts::tick_count();
+                    let ran_ticks = now.saturating_sub(task.start_tick);
+                    if ran_ticks >= 20 {
+                        hog_info = Some((task.pid, task.name, ran_ticks, task.state));
+                    }
+
                     let wake_after_switch = task.wake_after_switch;
                     let blocked = matches!(
                         task.state,
@@ -1708,8 +1755,9 @@ pub fn run() -> ! {
 
                     if (wake_after_switch && blocked) || reenqueue_after_yield {
                         task.state = TaskState::Ready;
+                        task.last_ready_tick = now;
                         if reenqueue_after_yield {
-                            task.last_migrated_tick = crate::arch::x86_64::interrupts::tick_count();
+                            task.last_migrated_tick = now;
                         }
                         Some((task.assigned_core, sidx))
                     } else {
@@ -1719,6 +1767,17 @@ pub fn run() -> ! {
                     None
                 }
             };
+
+            if let Some((pid, name, ran_ticks, final_state)) = hog_info {
+                log::warn!(
+                    "[sched] cpu-hog: pid={} name={} core={} ran~{}ms final_state={:?}",
+                    pid,
+                    name,
+                    core_id,
+                    ran_ticks * 10,
+                    final_state
+                );
+            }
             crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::SwitchOut {
                 task_idx: sidx as u32,
                 core: core_id,
