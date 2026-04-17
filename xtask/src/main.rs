@@ -357,7 +357,8 @@ fn build_musl_bins() {
         Some(cc) => cc,
         None => {
             eprintln!(
-                "warning: musl cross-compiler not found — skipping C binary builds (install musl-tools to enable)"
+                "warning: musl cross-compiler not found — skipping C binary builds \
+                 (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch to enable)"
             );
             // Create empty placeholders so include_bytes! doesn't fail.
             for (_, name) in bins {
@@ -389,6 +390,21 @@ fn build_musl_bins() {
             .status()
         {
             Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "warning: {cc} disappeared between probe and execution — skipping {name}"
+                );
+                let dst = initrd.join(format!("{name}"));
+                if !dst.exists() {
+                    fs::write(&dst, b"").unwrap_or_else(|e| {
+                        eprintln!(
+                            "warning: failed to create placeholder {}: {e}",
+                            dst.display()
+                        );
+                    });
+                }
+                continue;
+            }
             Err(e) => panic!("failed to run {cc} for {name}: {e}"),
         };
         if !status.success() {
@@ -988,7 +1004,8 @@ fn build_tcc() -> Option<PathBuf> {
         None => {
             eprintln!(
                 "warning: musl cross-compiler not found — skipping TCC build \
-                 (install musl-tools to enable Phase 31)"
+                 (install musl-tools on Debian/Ubuntu or musl-gcc-cross-bin on Arch \
+                 to enable Phase 31)"
             );
             return None;
         }
@@ -1370,7 +1387,7 @@ fn find_musl_cc() -> Option<&'static str> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_ok_and(|s| s.success())
         {
             return Some(cc);
         }

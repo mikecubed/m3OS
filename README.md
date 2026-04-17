@@ -121,9 +121,9 @@ Full documentation lives in [`docs/`](docs/README.md):
 ## Headless/Reference System
 
 m3OS targets a **headless/reference baseline** as its primary supported
-configuration: `cargo +nightly xtask run` boots
+configuration: `cargo xtask run` boots
 `target/x86_64-unknown-none/release/boot-uefi-m3os.img` together with
-`target/x86_64-unknown-none/release/disk.img` in QEMU, and `cargo +nightly xtask image`
+`target/x86_64-unknown-none/release/disk.img` in QEMU, and `cargo xtask image`
 builds the same artifacts without launching QEMU. The supported workflow is to boot,
 log in, inspect services, verify storage and logging, compile bounded software, diagnose failures, and shut down cleanly over
 the serial/headless path. SSH is the default remote-admin path; telnet is available
