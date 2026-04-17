@@ -8,8 +8,8 @@
 //! - Reap children, auto-restart per policy
 //! - Handle SIGTERM for orderly shutdown
 //! - Spawn login session separately (not a managed service)
-//! - Accept control commands via `/var/run/init.cmd`
-//! - Write service status to `/var/run/services.status`
+//! - Accept control commands via `/run/init.cmd`
+//! - Write service status to `/run/services.status`
 //! - Never exit (kernel panics if PID 1 dies)
 #![no_std]
 #![no_main]
@@ -1466,7 +1466,7 @@ impl ServiceManager {
         false
     }
 
-    /// Write service status to `/var/run/services.status`.
+    /// Write service status to `/run/services.status`.
     fn write_status_file(&self) {
         let fd = open(STATUS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
         if fd < 0 {
@@ -1566,7 +1566,7 @@ impl ServiceManager {
         }
     }
 
-    /// Check for control commands in `/var/run/init.cmd`.
+    /// Check for control commands in `/run/init.cmd`.
     fn check_control_commands(&mut self) {
         let fd = open(CMD_FILE, O_RDONLY, 0);
         if fd < 0 {

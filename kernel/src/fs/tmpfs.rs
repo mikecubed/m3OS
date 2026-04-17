@@ -10,7 +10,12 @@
 //!
 //! Userspace paths like `/tmp/foo` and `/run/foo` are distinct inside the
 //! tree (different parent directories), so they cannot collide. Permissions
-//! are enforced per-node, so `/run` is not exposed to non-root listing.
+//! are enforced per-node. `/run` is world-readable by design (matching the
+//! Linux convention where non-root processes can `ls /run`) — confidentiality
+//! of individual runtime-state files relies on their own mode / ownership,
+//! not on hiding the directory itself. Files like `init.cmd` are created
+//! with mode `0600` and owned by root so non-root openers are refused at
+//! the file level.
 #![allow(dead_code)]
 
 use spin::Mutex;

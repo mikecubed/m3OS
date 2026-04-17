@@ -657,6 +657,20 @@ fn handle_open(
     msg: &syscall_lib::IpcMessage,
     recv_buf: &[u8],
 ) -> (u64, u64) {
+    // Defensive flag validation. The kernel's `vfs_service_should_route`
+    // already gates this path on read-only, non-creating, non-truncating
+    // opens — but the server owns its own contract. Reject anything with
+    // an access mode other than O_RDONLY, or with creation / truncation /
+    // exclusive bits set, so a future kernel change or a misbehaving
+    // caller surfaces a clear EINVAL instead of a silent success.
+    const O_ACCMODE: u64 = 0o3;
+    // O_CREAT=0x40, O_EXCL=0x80, O_TRUNC=0x200, O_APPEND=0x400.
+    const MUTATING_FLAGS: u64 = 0x40 | 0x80 | 0x200 | 0x400;
+    let flags = msg.data[0];
+    if flags & O_ACCMODE != 0 || flags & MUTATING_FLAGS != 0 {
+        return (NEG_EINVAL, 0);
+    }
+
     let path = match decode_path(recv_buf, msg.data[1] as usize) {
         Ok(path) => path,
         Err(errno) => return (errno, 0),

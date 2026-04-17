@@ -68,13 +68,21 @@ fn program_main(_args: &[&str]) -> i32 {
         // Using a specific errno (not the u64::MAX transport sentinel) lets
         // callers tell "service up, op not implemented" from "IPC failure".
         msg = syscall_lib::IpcMessage::new(0);
-        syscall_lib::ipc_reply_recv_msg(
+        let ret = syscall_lib::ipc_reply_recv_msg(
             REPLY_CAP_HANDLE,
             NEG_ENOSYS,
             ep_handle,
             &mut msg,
             &mut buf,
         );
+        if ret == u64::MAX {
+            // Reply cap missing or revoked — either the sender used
+            // `ipc_send` (no reply expected) or a signal revoked the cap
+            // before we got here. In both cases no reply is owed; fall
+            // back to a plain recv so this loop does not hot-spin on the
+            // failing reply-recv syscall.
+            syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut buf);
+        }
     }
 }
 

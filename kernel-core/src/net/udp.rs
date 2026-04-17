@@ -61,7 +61,13 @@ struct PortBinding {
     queue: VecDeque<UdpDatagram>,
 }
 
-const MAX_BINDINGS: usize = 16;
+/// Must match `userspace/net_server/src/main.rs::MAX_BINDINGS` so every bind
+/// the service approves can actually be installed in the mechanism layer.
+/// With a smaller cap here the kernel's `udp::bind()` silently returned
+/// `false` in the service-approved branch and the kernel call site ignored
+/// it (the service is the policy authority), so ingress datagrams on those
+/// ports never queued.
+const MAX_BINDINGS: usize = 32;
 const MAX_QUEUE_LEN: usize = 32;
 
 /// UDP port binding table — testable pure-logic struct.
@@ -73,10 +79,7 @@ impl UdpBindings {
     /// Create a new empty binding table.
     pub const fn new() -> Self {
         Self {
-            bindings: [
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-                None, None,
-            ],
+            bindings: [const { None }; MAX_BINDINGS],
         }
     }
 
