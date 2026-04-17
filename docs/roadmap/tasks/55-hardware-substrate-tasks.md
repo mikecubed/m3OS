@@ -199,7 +199,8 @@
 - [ ] VirtIO-blk uses `map_bar` instead of hardcoded BAR0 I/O port extraction
 - [ ] VirtIO-blk uses `DmaBuffer` for virtqueue descriptor and buffer allocations instead of raw `alloc_contiguous_frames`
 - [ ] VirtIO-blk uses `register_device_irq` instead of ad-hoc ISR wiring
-- [ ] VirtIO-net receives the same migration as VirtIO-blk
+- [ ] VirtIO-blk completion path switches from spin-polling the used ring in `read_sectors` / `write_sectors` to IRQ-driven wakeup: the IRQ handler walks the used ring and wakes one task per completion via `wake_task`, and requesters `block_current_unless_woken` instead of busy-looping while holding `DRIVER` (routed here from `docs/debug/54-followups.md` item 5)
+- [ ] VirtIO-net receives the same migration as VirtIO-blk, including IRQ-driven receive completion
 - [ ] Both VirtIO drivers register through `register_driver` / `probe_all_drivers`
 - [ ] All existing QEMU tests pass unchanged after the migration
 
