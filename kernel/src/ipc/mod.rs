@@ -198,10 +198,15 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
         }
         4 => {
             // ipc_reply(reply_cap_handle, label, data0)
-            match cap {
-                Capability::Reply(caller_id) => {
-                    // Consume the one-shot reply cap before replying.
-                    let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            //
+            // Atomically check-and-remove the reply cap before replying.
+            // The earlier `task_cap` peek is racy against
+            // `revoke_reply_caps_for`: between the peek and the remove, a
+            // signal delivery could wake the caller with the EINTR sentinel
+            // and drop the cap. Running `endpoint::reply` after that would
+            // clobber the caller's state.
+            match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(caller_id)) => {
                     let reply = message::Message::with2(arg1, arg2, 0);
                     endpoint::reply(task_id, caller_id, reply);
                     0
@@ -214,21 +219,23 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // ep_cap is in arg2 (the third syscall argument), fitting the 3-arg
             // limit of the current syscall asm stub.
             // Blocks until a new message arrives on the endpoint.
-            let caller_id = match cap {
-                Capability::Reply(id) => id,
-                _ => return u64::MAX,
-            };
-            // Range-check arg2 (ep_cap handle) before casting to CapHandle.
+            //
+            // Validate the ep handle first so a bad ep_cap does not strand the
+            // reply cap. Range-check arg2 before casting to CapHandle.
             if arg2 > u64::from(u32::MAX) {
                 return u64::MAX;
             }
-            // Validate the endpoint handle carried in arg2.
             let ep_id = match scheduler::task_cap(task_id, arg2 as CapHandle) {
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
-            // Consume reply cap (arg0 already range-checked above).
-            let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            // Atomically check-and-remove the reply cap. If revocation raced
+            // between the earlier peek and here, the caller was already woken
+            // with the EINTR sentinel — do not deliver a stale reply.
+            let caller_id = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(id)) => id,
+                _ => return u64::MAX,
+            };
             let reply = message::Message::new(arg1);
             endpoint::reply_recv(task_id, caller_id, ep_id, reply)
         }
@@ -292,10 +299,9 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
             // msg_ptr = arg3
             // buf_ptr = arg4
             // buf_len = r9 (read from per-core saved registers)
-            let caller_id = match cap {
-                Capability::Reply(id) => id,
-                _ => return u64::MAX,
-            };
+            //
+            // Validate the ep handle first so a bad ep_cap does not strand
+            // the reply cap.
             if arg2 > u64::from(u32::MAX) {
                 return u64::MAX;
             }
@@ -303,7 +309,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u
                 Ok(Capability::Endpoint(id)) => id,
                 _ => return u64::MAX,
             };
-            let _ = scheduler::remove_task_cap(task_id, arg0 as CapHandle);
+            // Atomically check-and-remove the reply cap. If revocation raced
+            // between the earlier peek and here, the caller was already woken
+            // with the EINTR sentinel — do not deliver a stale reply.
+            let caller_id = match scheduler::remove_task_cap(task_id, arg0 as CapHandle) {
+                Ok(Capability::Reply(id)) => id,
+                _ => return u64::MAX,
+            };
             let reply = message::Message::new(arg1);
             endpoint::reply(task_id, caller_id, reply);
             // Read buf_len from the 6th syscall register (r9), capped at

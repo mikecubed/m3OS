@@ -316,11 +316,27 @@ impl Ext2State {
 
 /// Maximum concurrent open handles.
 const MAX_HANDLES: usize = 32;
+// Slot index occupies the low 16 bits of the packed handle. MAX_HANDLES
+// (32) comfortably fits — the static check below guards against future
+// bumps silently colliding with the generation field.
+const _: () = assert!(MAX_HANDLES <= 0x1_0000);
+
+/// Bits reserved for the slot index in the packed handle encoding.
+const HANDLE_SLOT_BITS: u32 = 16;
+/// Mask selecting the slot index from a packed handle.
+const HANDLE_SLOT_MASK: u64 = (1 << HANDLE_SLOT_BITS) - 1;
 
 /// An open handle tracked by the server.
 struct OpenHandle {
     inode_num: u32,
     file_size: u32,
+    /// Generation counter bumped on each (re-)allocation of this slot.
+    /// Protects against force-closing a recycled handle when a stale
+    /// `VFS_CLOSE` arrives out of order (defence-in-depth against
+    /// kernel-side refcount races on SMP — the generation on an
+    /// incoming request must match the slot's current generation, else
+    /// the request is rejected as `EBADF`).
+    generation: u16,
     in_use: bool,
 }
 
@@ -333,6 +349,7 @@ impl HandleTable {
         const EMPTY: OpenHandle = OpenHandle {
             inode_num: 0,
             file_size: 0,
+            generation: 0,
             in_use: false,
         };
         HandleTable {
@@ -343,30 +360,59 @@ impl HandleTable {
     fn alloc(&mut self, inode_num: u32, file_size: u32) -> Option<u64> {
         for (i, h) in self.handles.iter_mut().enumerate() {
             if !h.in_use {
+                // Bump generation BEFORE marking in_use so a concurrent stale
+                // request sees the new generation the moment the slot comes
+                // back into circulation.
+                h.generation = h.generation.wrapping_add(1);
                 h.inode_num = inode_num;
                 h.file_size = file_size;
                 h.in_use = true;
-                return Some(i as u64);
+                return Some(encode_handle(h.generation, i as u16));
             }
         }
         None
     }
 
     fn get(&self, handle: u64) -> Option<&OpenHandle> {
-        let idx = handle as usize;
-        if idx < MAX_HANDLES && self.handles[idx].in_use {
+        let (generation, idx) = decode_handle(handle);
+        let idx = idx as usize;
+        if idx < MAX_HANDLES
+            && self.handles[idx].in_use
+            && self.handles[idx].generation == generation
+        {
             Some(&self.handles[idx])
         } else {
             None
         }
     }
 
-    fn free(&mut self, handle: u64) {
-        let idx = handle as usize;
-        if idx < MAX_HANDLES {
+    fn free(&mut self, handle: u64) -> bool {
+        let (generation, idx) = decode_handle(handle);
+        let idx = idx as usize;
+        if idx < MAX_HANDLES
+            && self.handles[idx].in_use
+            && self.handles[idx].generation == generation
+        {
             self.handles[idx].in_use = false;
+            true
+        } else {
+            false
         }
     }
+}
+
+/// Pack `(generation, slot)` into a `u64` handle.
+fn encode_handle(generation: u16, slot: u16) -> u64 {
+    ((generation as u64) << HANDLE_SLOT_BITS) | (slot as u64)
+}
+
+/// Unpack `(generation, slot)` from a `u64` handle. The kernel stores the
+/// handle as the low 32 bits of the packed VFS_OPEN reply, which leaves
+/// 16 bits of generation + 16 bits of slot — plenty for `MAX_HANDLES = 32`.
+fn decode_handle(handle: u64) -> (u16, u16) {
+    let generation = ((handle >> HANDLE_SLOT_BITS) & 0xFFFF) as u16;
+    let slot = (handle & HANDLE_SLOT_MASK) as u16;
+    (generation, slot)
 }
 
 // ---------------------------------------------------------------------------
@@ -694,8 +740,13 @@ fn handle_read(
 
 fn handle_close(handles: &mut HandleTable, msg: &syscall_lib::IpcMessage) -> (u64, u64) {
     let handle_id = msg.data[0];
-    handles.free(handle_id);
-    (0, 0)
+    if handles.free(handle_id) {
+        (0, 0)
+    } else {
+        // Stale or unknown handle — reject cleanly so a racing refcount bug
+        // on the kernel side cannot force-close a recycled slot.
+        (NEG_EBADF, 0)
+    }
 }
 
 fn handle_stat_path(

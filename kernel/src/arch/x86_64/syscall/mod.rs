@@ -6528,7 +6528,12 @@ pub(super) fn sys_linux_openat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
     open_user_path(dirfd, rel_name, flags, mode_arg)
 }
 
-pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
+/// Truncate and free the ext2 inode when its on-disk links_count has reached
+/// zero. The caller MUST have verified (under `PROCESS_TABLE`) that no open
+/// fd aliases this inode — this function intentionally skips a recount so
+/// two cores concurrently closing siblings of the same inode cannot both
+/// observe count==0 after each drops its own lock.
+pub(crate) fn reap_unused_ext2_inode(inode_num: u32) {
     let mut vol = crate::fs::ext2::EXT2_VOLUME.lock();
     let Some(vol) = vol.as_mut() else {
         return;
@@ -6539,21 +6544,14 @@ pub(crate) fn cleanup_ext2_inode_if_unused(inode_num: u32) {
     if inode.links_count != 0 {
         return;
     }
-    if crate::process::ext2_inode_open_count(inode_num) != 0 {
-        return;
-    }
     let _ = vol.truncate_file(inode_num, &mut inode);
     let _ = vol.free_inode(inode_num);
 }
 
-/// Send `VFS_CLOSE` to the ring-3 `vfs_server` only when the caller just
-/// removed the last fd aliasing `service_handle` (Phase 54). Safe to call
-/// after the fd slot has already been cleared — the counting helper
-/// excludes the now-empty slot.
-pub(crate) fn cleanup_vfs_handle_if_unused(service_handle: u64) {
-    if crate::process::vfs_handle_open_count(service_handle) != 0 {
-        return;
-    }
+/// Public wrapper so `kernel/src/process` can issue `VFS_CLOSE` directly
+/// after it has decided under `PROCESS_TABLE` that the handle being closed
+/// was the last alias.
+pub(crate) fn vfs_service_close_pub(service_handle: u64) {
     vfs_service_close(service_handle);
 }
 
@@ -6589,24 +6587,52 @@ pub(super) fn sys_linux_close(fd: u64) -> u64 {
     }
     // Remove this FD from all epoll interest lists to prevent stale references.
     epoll_remove_fd(fd);
+    // Clear the slot and — for VfsService / Ext2Disk backends — decide
+    // whether this was the last alias under the SAME PROCESS_TABLE lock
+    // acquisition. Two concurrent closes of sibling aliases would otherwise
+    // both observe count==0 after each drops its own lock, and both would
+    // tear down server-side state (double VFS_CLOSE after a vfs_server
+    // handle recycle force-closes an unrelated file; double ext2 inode free
+    // corrupts block accounting).
     let mut found = false;
-    with_current_fd_mut(fd, |slot| {
-        if slot.is_some() {
-            *slot = None;
-            found = true;
+    let mut ext2_reap = None;
+    let mut vfs_last_close = None;
+    {
+        let pid = crate::process::current_pid();
+        let mut table = crate::process::PROCESS_TABLE.lock();
+        if let Some(proc) = table.find_mut(pid) {
+            if let Some(shared) = proc.shared_fd_table.clone() {
+                let mut lock = shared.lock();
+                if lock[fd].take().is_some() {
+                    found = true;
+                }
+            } else if let Some(slot) = proc.fd_table.get_mut(fd)
+                && slot.take().is_some()
+            {
+                found = true;
+            }
         }
-    });
+        if found {
+            if let Some(inode_num) = ext2_inode
+                && crate::process::ext2_inode_open_count_locked(&table, inode_num) == 0
+            {
+                ext2_reap = Some(inode_num);
+            }
+            if let Some(handle) = vfs_handle
+                && crate::process::vfs_handle_open_count_locked(&table, handle) == 0
+            {
+                vfs_last_close = Some(handle);
+            }
+        }
+    }
     if !found {
         return NEG_EBADF;
     }
-    if let Some(inode_num) = ext2_inode {
-        cleanup_ext2_inode_if_unused(inode_num);
+    if let Some(inode_num) = ext2_reap {
+        reap_unused_ext2_inode(inode_num);
     }
-    // Phase 54: only tear down the server-side handle when the last alias
-    // goes away — dup/fork can leave sibling fds pointing at the same
-    // service_handle.
-    if let Some(handle) = vfs_handle {
-        cleanup_vfs_handle_if_unused(handle);
+    if let Some(handle) = vfs_last_close {
+        vfs_service_close(handle);
     }
     0
 }

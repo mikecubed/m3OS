@@ -1211,6 +1211,23 @@ pub fn deliver_message(id: TaskId, msg: Message) {
     }
 }
 
+/// Store a [`Message`] only if the task's pending slot is empty.
+///
+/// Returns `true` if the message was installed. Used by signal delivery so
+/// a racing legitimate server reply already parked in `pending_msg` is not
+/// clobbered by the EINTR sentinel — the signal simply remains pending and
+/// fires on the next syscall boundary.
+pub fn try_deliver_message(id: TaskId, msg: Message) -> bool {
+    let mut sched = SCHEDULER.lock();
+    if let Some(idx) = sched.find(id)
+        && sched.tasks[idx].pending_msg.is_none()
+    {
+        sched.tasks[idx].pending_msg = Some(msg);
+        return true;
+    }
+    false
+}
+
 /// Remove every `Capability::Reply(target)` from every task's capability
 /// table.
 ///

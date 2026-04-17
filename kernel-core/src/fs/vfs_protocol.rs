@@ -30,6 +30,11 @@
 ///          `data[0]` packs the opaque service handle in the low 32 bits and
 ///          the file size (clamped to `u32::MAX`) in the high 32 bits — the
 ///          kernel unpacks both to seed the FdBackend::VfsService handle.
+///          The low 32 bits are further split by `vfs_server` into a 16-bit
+///          generation counter (upper) and a 16-bit slot index (lower); a
+///          stale `VFS_CLOSE` whose generation no longer matches the live
+///          slot is rejected as `EBADF` without affecting the recycled
+///          handle's file.
 pub const VFS_OPEN: u64 = 10;
 
 /// Read bytes from an open handle.
