@@ -23,6 +23,7 @@ pub mod amdvi_page_table;
 pub mod amdvi_regs;
 pub mod contract;
 pub mod device_map;
+pub mod identity;
 pub mod iova;
 pub mod regions;
 pub mod tables;
