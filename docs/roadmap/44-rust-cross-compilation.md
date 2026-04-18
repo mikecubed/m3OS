@@ -1,6 +1,6 @@
 # Phase 44 - Rust Cross-Compilation Pipeline
 
-**Status:** In Progress
+**Status:** Complete
 **Source Ref:** phase-44
 **Depends on:** Phase 12 (POSIX Compat) ✅, Phase 14 (Shell and Tools) ✅, Phase 24 (Persistent Storage) ✅
 **Builds on:** Extends Phase 12's Linux syscall ABI compatibility layer to run Rust
@@ -227,3 +227,23 @@ running on Linux, and our kernel provides enough of the Linux ABI to make them w
 - Crate registry access from inside the OS
 - Remote debugging (gdb stub)
 - Dynamic linking of Rust programs
+
+## Status Notes (Closure)
+
+Phase 44 closes with the musl-linked `std` path as the supported way to ship
+Rust programs that use the standard library. All five demonstration crates exist
+under `userspace/{hello,sysinfo,httpd,calc,todo}-rust/`, each as a non-workspace
+crate (`[workspace]` table at the top of every `Cargo.toml`) so that the
+workspace-wide `x86_64-unknown-none` default target does not interfere with the
+musl build. The xtask integration lives in `xtask/src/main.rs` —
+`build_musl_rust_bins()` (line 430) compiles the crates with
+`--target x86_64-unknown-linux-musl`, sets `RUSTFLAGS="-C relocation-model=static
+-C target-feature=+crt-static"` to produce ET_EXEC binaries that the kernel ELF
+loader accepts, strips the outputs, and stages them under
+`target/generated-initrd/` for embedding via the
+`generated_initrd_asset!` macro in `kernel/src/fs/ramdisk.rs`. The custom
+`x86_64-m3os.json` target spec exists at the project root for `no_std` programs
+that want to identify the OS at compile time via `#[cfg(target_os = "m3os")]`;
+it is functionally equivalent to `x86_64-unknown-none` and does not require
+existing crates to migrate. The full residual gap analysis and recommended
+follow-on work live in [`docs/appendix/rust-std-userspace.md`](../appendix/rust-std-userspace.md).
