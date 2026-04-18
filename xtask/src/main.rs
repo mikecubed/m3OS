@@ -27,6 +27,86 @@ enum QemuDisplayMode {
     Gui,
 }
 
+/// Optional QEMU device attachments selected via `--device <name>`.
+///
+/// Phase 55 (F.1) exposes reproducible real-hardware QEMU configurations:
+/// `--device nvme` appends an NVMe drive; `--device e1000` replaces the default
+/// virtio-net NIC with the Intel 82540EM classic e1000. Defaults (all fields
+/// `false`) preserve the legacy VirtIO-blk + VirtIO-net behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceSet {
+    /// Attach a QEMU NVMe controller with a 64 MiB backing image.
+    nvme: bool,
+    /// Replace the default virtio-net NIC with the Intel 82540EM e1000.
+    e1000: bool,
+}
+
+/// Parse `--device <name>` flags out of `args` and return the resulting
+/// [`DeviceSet`] plus the remaining arguments.
+///
+/// Supported names: `nvme`, `e1000`. Unknown names return an error rather than
+/// silently dropping through so a typo is caught immediately.
+fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), String> {
+    let mut devices = DeviceSet::default();
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--device" {
+            index += 1;
+            let name = args
+                .get(index)
+                .ok_or_else(|| "missing value for `--device`".to_string())?;
+            apply_device_flag(name.as_str(), &mut devices)?;
+        } else if let Some(name) = arg.strip_prefix("--device=") {
+            apply_device_flag(name, &mut devices)?;
+        } else {
+            remaining.push(arg.clone());
+        }
+        index += 1;
+    }
+
+    Ok((devices, remaining))
+}
+
+fn apply_device_flag(name: &str, devices: &mut DeviceSet) -> Result<(), String> {
+    match name {
+        "nvme" => devices.nvme = true,
+        "e1000" => devices.e1000 = true,
+        other => {
+            return Err(format!(
+                "unknown `--device` value `{other}` (supported: nvme, e1000)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Path to the QEMU NVMe backing image used by `--device nvme`.
+fn nvme_image_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("target/nvme.img")
+}
+
+/// Ensure the NVMe backing image exists as a 64 MiB zeroed file. The image is
+/// regenerated if missing but otherwise reused so operator-written data
+/// survives across `cargo xtask run --device nvme` invocations.
+fn ensure_nvme_image(workspace_root: &Path) -> PathBuf {
+    let path = nvme_image_path(workspace_root);
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let file = File::create(&path)
+            .unwrap_or_else(|e| panic!("failed to create NVMe image at {}: {e}", path.display()));
+        // 64 MiB = 64 * 1024 * 1024 bytes.
+        file.set_len(64 * 1024 * 1024)
+            .unwrap_or_else(|e| panic!("failed to size NVMe image {}: {e}", path.display()));
+        println!("Created NVMe image: {} (64 MiB)", path.display());
+    }
+    path
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let subcommand = args.get(1).map(|s| s.as_str());
@@ -42,12 +122,22 @@ fn main() {
             cmd_image(&image_args);
         }
         Some("run") => {
-            let fresh = args.iter().any(|a| a == "--fresh");
-            cmd_run(fresh);
+            let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            let fresh = remaining.iter().any(|a| a == "--fresh");
+            cmd_run(fresh, devices);
         }
         Some("run-gui") => {
-            let fresh = args.iter().any(|a| a == "--fresh");
-            cmd_run_gui(fresh);
+            let (devices, remaining) = extract_device_flags(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            let fresh = remaining.iter().any(|a| a == "--fresh");
+            cmd_run_gui(fresh, devices);
         }
         Some("check") => cmd_check(),
         Some("fmt") => {
@@ -115,7 +205,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh]|run-gui [--fresh]|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display]|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--device nvme|e1000]...|run-gui [--fresh] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -1441,6 +1531,56 @@ fn qemu_smp_count() -> u32 {
 }
 
 fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
+    qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default())
+}
+
+/// Resolve the NVMe backing-image path for `devices` and assemble QEMU args.
+///
+/// Wrapper around the pure [`qemu_args_with_devices_resolved`] that performs
+/// the filesystem side effect (creating `target/nvme.img` if missing) only
+/// when the caller actually asks for NVMe. Non-test callers use this; the
+/// unit tests pass an explicit dummy path to the pure function to stay
+/// hermetic (Comment 6 from PR #113 review).
+fn qemu_args_with_devices(
+    uefi_image: &Path,
+    ovmf: &Path,
+    display_mode: QemuDisplayMode,
+    devices: DeviceSet,
+) -> Vec<String> {
+    let nvme_path = if devices.nvme {
+        Some(ensure_nvme_image(&workspace_root()))
+    } else {
+        None
+    };
+    qemu_args_with_devices_resolved(
+        uefi_image,
+        ovmf,
+        display_mode,
+        devices,
+        nvme_path.as_deref(),
+    )
+}
+
+/// Pure QEMU argument assembly with optional Phase 55 device overrides.
+///
+/// * `devices.nvme = true` appends `-drive file=<nvme_image>,if=none,id=nvme0
+///   -device nvme,serial=deadbeef,drive=nvme0` using the caller-supplied
+///   `nvme_image` (never touches the filesystem itself).
+/// * `devices.e1000 = true` replaces the default `virtio-net-pci,netdev=net0`
+///   device with `-device e1000,netdev=net0`. The netdev itself is unchanged
+///   (QEMU SLIRP user-mode networking), so hostfwd rules still apply.
+///
+/// `DeviceSet::default()` preserves the legacy VirtIO-blk + VirtIO-net path.
+///
+/// Panics if `devices.nvme` is true but `nvme_image` is `None` — a
+/// programming error the wrapper above prevents.
+fn qemu_args_with_devices_resolved(
+    uefi_image: &Path,
+    ovmf: &Path,
+    display_mode: QemuDisplayMode,
+    devices: DeviceSet,
+    nvme_image: Option<&Path>,
+) -> Vec<String> {
     let mut args = vec![
         "-bios".to_string(),
         ovmf.display().to_string(),
@@ -1473,10 +1613,16 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
 
     // Phase 16: virtio-net NIC with QEMU user-mode networking.
     // Phase 30: port-forward host 2323 → guest 23 for telnet access.
-    // Use a plain netdev for test mode to avoid port conflicts.
+    // Phase 55 (F.1): `--device e1000` swaps the virtio-net-pci device out for
+    // the Intel 82540EM classic e1000. The netdev remains unchanged.
+    let nic_device = if devices.e1000 {
+        "e1000,netdev=net0"
+    } else {
+        "virtio-net-pci,netdev=net0"
+    };
     args.extend([
         "-device".to_string(),
-        "virtio-net-pci,netdev=net0".to_string(),
+        nic_device.to_string(),
         "-netdev".to_string(),
         "user,id=net0,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22".to_string(),
     ]);
@@ -1490,13 +1636,32 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
         ]);
     }
 
+    // Phase 55 (F.1): `--device nvme` adds a second drive behind a QEMU NVMe
+    // controller. The caller (`qemu_args_with_devices`) resolves the backing
+    // image path via `ensure_nvme_image`; this function itself is pure so
+    // unit tests can exercise it without writing to `target/nvme.img`.
+    if devices.nvme {
+        let nvme_path =
+            nvme_image.expect("qemu_args_with_devices_resolved: devices.nvme requires nvme_image");
+        args.extend([
+            "-drive".to_string(),
+            format!("file={},if=none,id=nvme0,format=raw", nvme_path.display()),
+            "-device".to_string(),
+            "nvme,serial=deadbeef,drive=nvme0".to_string(),
+        ]);
+    }
+
     args.extend(["-no-reboot".to_string()]);
     args
 }
 
 fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
+    launch_qemu_with_devices(uefi_image, display_mode, DeviceSet::default());
+}
+
+fn launch_qemu_with_devices(uefi_image: &Path, display_mode: QemuDisplayMode, devices: DeviceSet) {
     let ovmf = find_ovmf();
-    let args = qemu_run_args(uefi_image, &ovmf, display_mode);
+    let args = qemu_run_args_with_devices(uefi_image, &ovmf, display_mode, devices);
 
     if display_mode == QemuDisplayMode::Gui {
         println!(
@@ -1512,8 +1677,18 @@ fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
     std::process::exit(normalize_run_qemu_exit(status.code()));
 }
 
+#[cfg(test)]
 fn qemu_run_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> Vec<String> {
-    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    qemu_run_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default())
+}
+
+fn qemu_run_args_with_devices(
+    uefi_image: &Path,
+    ovmf: &Path,
+    display_mode: QemuDisplayMode,
+    devices: DeviceSet,
+) -> Vec<String> {
+    let mut args = qemu_args_with_devices(uefi_image, ovmf, display_mode, devices);
     args.retain(|arg| arg != "-no-reboot");
     args.extend([
         "-device".to_string(),
@@ -1725,9 +1900,16 @@ struct TestArgs {
     test_name: Option<String>,
     timeout_secs: u64,
     display: bool,
+    devices: DeviceSet,
 }
 
 fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
+    // Extract `--device` flags first so they are available to the test harness
+    // even when interleaved with other flags. Phase 55 (F.1): lets operators
+    // run `cargo xtask test --device nvme` to exercise the NVMe smoke path.
+    let (devices, args) = extract_device_flags(args)?;
+    let args: &[String] = &args;
+
     let mut test_name = None;
     let mut timeout_secs = 60u64;
     let mut display = false;
@@ -1774,6 +1956,7 @@ fn parse_test_args(args: &[String]) -> Result<TestArgs, String> {
         test_name,
         timeout_secs,
         display,
+        devices,
     })
 }
 
@@ -1852,13 +2035,23 @@ fn build_test_binaries(test_name: Option<&str>) -> Vec<PathBuf> {
 }
 
 /// QEMU arguments for running a test kernel: headless, with ISA debug exit device.
+#[cfg(test)]
 fn qemu_test_args(uefi_image: &Path, ovmf: &Path, display: bool) -> Vec<String> {
+    qemu_test_args_with_devices(uefi_image, ovmf, display, DeviceSet::default())
+}
+
+fn qemu_test_args_with_devices(
+    uefi_image: &Path,
+    ovmf: &Path,
+    display: bool,
+    devices: DeviceSet,
+) -> Vec<String> {
     let display_mode = if display {
         QemuDisplayMode::Gui
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    let mut args = qemu_args_with_devices(uefi_image, ovmf, display_mode, devices);
     // Strip hostfwd from netdev to avoid port conflicts during tests.
     for arg in args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") {
@@ -1886,7 +2079,8 @@ fn cmd_test(test_args: &TestArgs) {
         println!("\n--- Running test: {name} ---");
 
         let uefi_image = create_uefi_image(binary);
-        let args = qemu_test_args(&uefi_image, &ovmf, test_args.display);
+        let args =
+            qemu_test_args_with_devices(&uefi_image, &ovmf, test_args.display, test_args.devices);
 
         let mut child = Command::new("qemu-system-x86_64")
             .args(&args)
@@ -5841,7 +6035,7 @@ fn cmd_clean() {
     }
 }
 
-fn cmd_run(fresh: bool) {
+fn cmd_run(fresh: bool, devices: DeviceSet) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -5853,10 +6047,10 @@ fn cmd_run(fresh: bool) {
         }
     }
     create_data_disk(uefi_image.parent().unwrap(), false, false);
-    launch_qemu(&uefi_image, QemuDisplayMode::Headless);
+    launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Headless, devices);
 }
 
-fn cmd_run_gui(fresh: bool) {
+fn cmd_run_gui(fresh: bool, devices: DeviceSet) {
     let kernel_binary = build_kernel();
     let uefi_image = create_uefi_image(&kernel_binary);
     convert_to_vhdx(&uefi_image);
@@ -5868,7 +6062,7 @@ fn cmd_run_gui(fresh: bool) {
         }
     }
     create_data_disk(uefi_image.parent().unwrap(), false, false);
-    launch_qemu(&uefi_image, QemuDisplayMode::Gui);
+    launch_qemu_with_devices(&uefi_image, QemuDisplayMode::Gui, devices);
 }
 
 fn cmd_runner(kernel_binary: PathBuf) {
@@ -7167,40 +7361,113 @@ mod tests {
     }
 
     fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
-        steps
-            .iter()
-            .map(|step| match step {
-                SmokeStep::Wait { label, .. }
-                | SmokeStep::Send { label, .. }
-                | SmokeStep::WaitEither { label, .. } => *label,
-                SmokeStep::Sleep { .. } => "sleep",
-            })
-            .collect()
+        let mut out = Vec::new();
+        for step in steps {
+            match step {
+                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => out.push(*label),
+                SmokeStep::WaitEither {
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    out.push(*label);
+                    out.extend(smoke_step_labels(extra_steps_a));
+                    out.extend(smoke_step_labels(extra_steps_b));
+                }
+                SmokeStep::Sleep { .. } => out.push("sleep"),
+            }
+        }
+        out
     }
 
     fn send_input_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Send { input, label } if *label == target_label => Some(*input),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Send { input, label } if *label == target_label => return Some(*input),
+                SmokeStep::WaitEither {
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if let Some(v) = send_input_for_label(extra_steps_a, target_label) {
+                        return Some(v);
+                    }
+                    if let Some(v) = send_input_for_label(extra_steps_b, target_label) {
+                        return Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
+    /// Recursive: returns the first matching label's pattern. For
+    /// `WaitEither` steps, reports `pattern_a` (the preferred match).
+    /// Recurses into both `extra_steps_a` and `extra_steps_b` so assertions
+    /// about injected sub-steps (e.g. `BOOT_MARKER_SETTLE`) resolve.
     fn wait_pattern_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Wait { pattern, label, .. } if *label == target_label => Some(*pattern),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Wait { pattern, label, .. } if *label == target_label => {
+                    return Some(*pattern);
+                }
+                SmokeStep::WaitEither {
+                    pattern_a,
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if *label == target_label {
+                        return Some(*pattern_a);
+                    }
+                    if let Some(p) = wait_pattern_for_label(extra_steps_a, target_label) {
+                        return Some(p);
+                    }
+                    if let Some(p) = wait_pattern_for_label(extra_steps_b, target_label) {
+                        return Some(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
+    /// Recursive sibling of [`wait_pattern_for_label`]: returns the first
+    /// matching label's timeout. For `WaitEither` steps, reports the
+    /// step's top-level `timeout_secs`.
     fn wait_timeout_for_label(steps: &[SmokeStep], target_label: &str) -> Option<u64> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Wait {
-                timeout_secs,
-                label,
-                ..
-            } if *label == target_label => Some(*timeout_secs),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Wait {
+                    timeout_secs,
+                    label,
+                    ..
+                } if *label == target_label => return Some(*timeout_secs),
+                SmokeStep::WaitEither {
+                    timeout_secs,
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if *label == target_label {
+                        return Some(*timeout_secs);
+                    }
+                    if let Some(t) = wait_timeout_for_label(extra_steps_a, target_label) {
+                        return Some(t);
+                    }
+                    if let Some(t) = wait_timeout_for_label(extra_steps_b, target_label) {
+                        return Some(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
@@ -7223,6 +7490,127 @@ mod tests {
 
         assert!(args.windows(2).any(|window| window == ["-display", "none"]));
         assert!(args.windows(2).any(|window| window == ["-serial", "stdio"]));
+    }
+
+    // --------------------------------------------------------------
+    // Phase 55 (F.1): `--device nvme|e1000` flag parsing + QEMU wiring
+    // --------------------------------------------------------------
+
+    #[test]
+    fn extract_device_flags_defaults_empty() {
+        let (devices, rest) = extract_device_flags(&[]).unwrap();
+        assert_eq!(devices, DeviceSet::default());
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn extract_device_flags_parses_space_separated() {
+        let input = string_args(&["--device", "nvme", "--fresh", "--device", "e1000"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert!(devices.nvme);
+        assert!(devices.e1000);
+        assert_eq!(rest, vec!["--fresh".to_string()]);
+    }
+
+    #[test]
+    fn extract_device_flags_parses_equals_form() {
+        let input = string_args(&["--device=nvme", "--device=e1000"]);
+        let (devices, _) = extract_device_flags(&input).unwrap();
+        assert!(devices.nvme);
+        assert!(devices.e1000);
+    }
+
+    #[test]
+    fn extract_device_flags_rejects_unknown_name() {
+        let input = string_args(&["--device", "realtek"]);
+        let err = extract_device_flags(&input).unwrap_err();
+        assert!(err.contains("unknown `--device` value `realtek`"));
+    }
+
+    #[test]
+    fn extract_device_flags_rejects_missing_value() {
+        let input = string_args(&["--device"]);
+        let err = extract_device_flags(&input).unwrap_err();
+        assert!(err.contains("missing value"));
+    }
+
+    #[test]
+    fn qemu_args_default_uses_virtio_net() {
+        let args = qemu_args(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-net-pci,netdev=net0"])
+        );
+        // Default has no e1000 and no NVMe.
+        assert!(!args.iter().any(|arg| arg.starts_with("e1000")));
+        assert!(!args.iter().any(|arg| arg.contains("nvme")));
+    }
+
+    #[test]
+    fn qemu_args_with_e1000_replaces_virtio_net() {
+        let args = qemu_args_with_devices(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: false,
+                e1000: true,
+            },
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "e1000,netdev=net0"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| window == ["-device", "virtio-net-pci,netdev=net0"])
+        );
+    }
+
+    #[test]
+    fn qemu_args_with_nvme_appends_nvme_drive() {
+        // Use the pure resolver directly with a fake path so the test does
+        // not create or touch `target/nvme.img` — keeps the suite hermetic
+        // under sandboxed / read-only CI environments (PR #113 Comment 6).
+        let fake_nvme = Path::new("/tmp/m3os-test-nvme-never-created.img");
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: true,
+                e1000: false,
+            },
+            Some(fake_nvme),
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "virtio-net-pci,netdev=net0"]),
+            "virtio-net should remain the default NIC when only --device nvme is set"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["-device", "nvme,serial=deadbeef,drive=nvme0"]),
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("if=none,id=nvme0,format=raw")),
+            "expected NVMe backing-drive fragment with if=none and id=nvme0"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains(fake_nvme.to_str().unwrap())),
+            "expected NVMe drive fragment to reference the caller-provided path"
+        );
+        assert!(
+            !fake_nvme.exists(),
+            "qemu_args_with_devices_resolved must not create the NVMe backing image"
+        );
     }
 
     #[test]
@@ -7476,17 +7864,21 @@ mod tests {
             ),
             Some("SMOKE:auth:PASS")
         );
+        // tcc-compile + hello are now WaitEither steps that accept PASS or
+        // SKIP (M3OS_SMOKE_SKIP_TCC_COMPILE=1 in fast/headless CI); labels
+        // gained the "or skipped" suffix and the tcc budget moved from
+        // 180s to 600s to absorb TCG slowness.
         assert_eq!(
             wait_timeout_for_label(
                 &smoke_test_script(false),
-                "guest/tcc: smoke runner compiled hello world"
+                "guest/tcc: smoke runner compiled hello world or skipped"
             ),
-            Some(180)
+            Some(600)
         );
         assert_eq!(
             wait_pattern_for_label(
                 &smoke_test_script(false),
-                "guest/hello: smoke runner ran compiled hello world"
+                "guest/hello: smoke runner ran compiled hello or skipped"
             ),
             Some("SMOKE:hello:PASS")
         );

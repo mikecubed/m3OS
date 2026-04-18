@@ -9,6 +9,7 @@ pub mod arp;
 pub mod config;
 #[allow(dead_code)]
 pub mod dispatch;
+pub mod e1000;
 pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
@@ -16,6 +17,74 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 pub mod virtio_net;
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// ===========================================================================
+// Unified NIC wake flag — used by the network task's park/unpark.
+// ===========================================================================
+
+/// Shared signal for `block_current_unless_woken` in the network task.
+///
+/// Both NIC ISRs (`virtio_net::virtio_net_irq_handler`,
+/// `e1000::e1000_interrupt_handler`) set this in addition to their
+/// driver-specific progress flag. The network task parks exclusively on this
+/// flag so a wake from either driver reliably unblocks it — fixing the race
+/// where only one driver's flag was observed at park time.
+pub static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
+
+// ===========================================================================
+// Driver dispatch — Phase 55 E.4
+// ===========================================================================
+
+/// Transmit-side error type for driver-facing send calls.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetError {
+    /// The link is currently down; the caller should drop or retry later.
+    LinkDown,
+    /// No network driver has initialized; nothing to transmit on.
+    NotReady,
+    /// Packet length is zero or exceeds the driver's per-slot buffer.
+    TooLarge,
+    /// The TX ring is full; the oldest descriptor is still owned by
+    /// hardware.
+    TxRingFull,
+}
+
+/// Send a raw Ethernet frame through whichever NIC driver is initialized.
+///
+/// Dispatches to e1000 when `E1000_READY` is set; otherwise falls back to
+/// virtio-net for QEMU's default `virtio-net-pci` configuration.  The upper
+/// stack (`arp.rs`, `ipv4.rs`) routes all transmits through this entry
+/// point so switching between drivers at runtime requires no upper-layer
+/// change.
+///
+/// Errors are currently logged and swallowed to preserve the existing
+/// `send_frame` surface (virtio-net exposes a `fn(_) -> ()`); callers that
+/// need the error can use [`e1000::e1000_transmit`] directly.
+pub fn send_frame(frame: &[u8]) {
+    if e1000::E1000_READY.load(Ordering::Acquire) {
+        match e1000::e1000_transmit(frame) {
+            Ok(()) => {}
+            Err(e) => {
+                log::debug!("[net] e1000 send_frame failed: {:?}", e);
+            }
+        }
+        return;
+    }
+    virtio_net::send_frame(frame);
+}
+
+/// Returns the MAC address of whichever NIC driver initialized first — used
+/// by `arp` / `ipv4` to stamp outgoing frames.
+#[allow(dead_code)]
+pub fn mac_address() -> Option<kernel_core::types::MacAddr> {
+    if let Some(m) = e1000::mac_address() {
+        return Some(m);
+    }
+    virtio_net::mac_address()
+}
 
 // ===========================================================================
 // Socket table — Phase 23

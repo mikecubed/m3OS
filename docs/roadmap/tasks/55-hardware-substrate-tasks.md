@@ -1,6 +1,6 @@
 # Phase 55 — Hardware Substrate: Task List
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-55
 **Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 16 (Network) ✅, Phase 24 (Persistent Storage) ✅, Phase 54 (Deep Serverization) ✅
 **Goal:** Extend the QEMU/VirtIO-first system into a narrow, testable real-hardware story with a documented donor strategy, a reusable hardware-access layer, and at least one serious real-hardware storage and networking path on named reference targets.
@@ -9,12 +9,12 @@
 
 | Track | Scope | Dependencies | Status |
 |---|---|---|---|
-| A | Donor strategy and reference hardware matrix | None | Planned |
-| B | PCI modernization (PCIe MCFG, MSI/MSI-X, device binding) | A | Planned |
-| C | Hardware-access layer (BAR mapping, DMA, IRQ delivery) | B, Phase 53a (buddy allocator) | Planned |
-| D | NVMe storage driver | B, C | Planned |
-| E | Intel e1000 network driver | B, C | Planned |
-| F | Validation, documentation, and version | D, E | Planned |
+| A | Donor strategy and reference hardware matrix | None | ✅ Done |
+| B | PCI modernization (PCIe MCFG, MSI/MSI-X, device binding) | A | ✅ Done |
+| C | Hardware-access layer (BAR mapping, DMA, IRQ delivery) | B, Phase 53a (buddy allocator) | ✅ Done |
+| D | NVMe storage driver | B, C | ✅ Done |
+| E | Intel e1000 network driver | B, C | ✅ Done |
+| F | Validation, documentation, and version | D, E | ✅ Done |
 
 ---
 

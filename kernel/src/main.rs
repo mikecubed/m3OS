@@ -146,26 +146,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
-    // Phase 16: Initialize virtio-net driver and route its IRQ.
+    // Phase 16: Initialize NIC drivers.  Phase 55 Track E adds the Intel
+    // 82540EM (e1000) driver alongside virtio-net; both register with the
+    // PCI driver framework so `probe_all_drivers` binds whichever device
+    // QEMU (or real hardware) exposes.  Ordering: register e1000 before
+    // virtio-net so a single probe pass covers both without a second
+    // `probe_all_drivers()` call.
+    net::e1000::register();
     net::virtio_net::init();
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
-        // Route the virtio-net PCI interrupt through the I/O APIC.
-        let mut irq_routed = false;
-        if let Some(dev) = net::virtio_net::find_virtio_net_device()
-            && acpi::io_apic_address().is_some()
-            && dev.interrupt_line != 0xFF
-        {
-            arch::x86_64::apic::route_pci_irq(
-                dev.interrupt_line,
-                arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
-            );
-            irq_routed = true;
-        }
-        VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
-        if !irq_routed {
-            log::warn!("[net] virtio-net IRQ not routed — net_task will use periodic polling");
-        }
-    }
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
@@ -230,8 +218,12 @@ fn init_task() -> ! {
     task::spawn(console_server_task, "console");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
-    // Spawn Phase 16 network processing task.
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+    // Spawn Phase 16 network processing task.  Either virtio-net (legacy)
+    // or e1000 (Phase 55 Track E) being ready is enough to justify the
+    // task; it drains whichever driver's IRQ flag is set.
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire)
+        || net::e1000::E1000_READY.load(core::sync::atomic::Ordering::Acquire)
+    {
         task::spawn(net_task, "net");
     }
 
@@ -547,54 +539,44 @@ fn serial_echo(s: &str) {
 // Network task (P16-T055)
 // ---------------------------------------------------------------------------
 
-/// Whether the virtio-net IRQ was successfully routed through the I/O APIC.
-/// Set during kernel_main init; read by net_task to choose IRQ vs polling mode.
-static VIRTIO_NET_IRQ_ROUTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// Background task that processes incoming network frames.
 ///
-/// Polls the virtio-net driver for received frames and dispatches them through
-/// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
+/// Phase 55 C.5: the virtio-net driver installs its RX IRQ through the HAL
+/// (`install_msi_irq` / `install_intx_irq`); the ISR sets
+/// [`net::virtio_net::NET_IRQ_WOKEN`] and wakes this task. Between IRQs the
+/// task parks via [`task::scheduler::block_current_unless_woken`]; on wake
+/// it drains all pending frames through the network dispatch stack.
 fn net_task() -> ! {
-    let has_irq_routing = VIRTIO_NET_IRQ_ROUTED.load(core::sync::atomic::Ordering::Acquire);
-    if !has_irq_routing {
-        log::info!("[net] no APIC routing — using periodic poll mode");
+    // Register this task's id with every NIC driver that can wake us.  Both
+    // virtio-net (legacy path) and e1000 (Phase 55 Track E) point their
+    // ISRs at this task id via `wake_task`.
+    if let Some(id) = task::scheduler::current_task_id() {
+        net::virtio_net::set_net_task_id(id);
+        net::e1000::set_net_task_id(id);
     }
     log::info!("[net] network processing task started");
 
-    let mut last_poll_tick: u64 = 0;
-
     loop {
-        if has_irq_routing {
-            // IRQ-driven path: drain work signaled by the IRQ flag.
-            while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-                .swap(false, core::sync::atomic::Ordering::Acquire)
-            {
-                net::dispatch::process_rx();
-            }
-
-            task::yield_now();
-
-            // Race-free sleep.
-            x86_64::instructions::interrupts::disable();
-            if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
-                x86_64::instructions::interrupts::enable_and_hlt();
-            } else {
-                x86_64::instructions::interrupts::enable();
-            }
-        } else {
-            // Legacy PIC fallback: the virtio-net IRQ is not routed, so poll
-            // process_rx() every ~10 ticks (~100ms at 100 Hz).
-            let now = arch::x86_64::interrupts::tick_count();
-            if now.wrapping_sub(last_poll_tick) >= 10 {
-                net::dispatch::process_rx();
-                last_poll_tick = now;
-            }
-            task::yield_now();
+        // Clear the unified wake flag up front so any edge set between now
+        // and park is still observable. Driver-specific flags remain the
+        // "this driver has pending work" signals consumed by the drain loop.
+        net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
+        let mut any =
+            net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        any |= net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        while any {
+            // Handle a fresh link-up edge before draining so the first RX
+            // packet off a new link doesn't contend with a stale TX ring.
+            net::e1000::drain_link_up_edge();
+            net::dispatch::process_rx();
+            any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire)
+                | net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         }
+        // Park on the unified flag: either NIC's ISR sets it so a wake from
+        // either driver reliably unblocks the task. If an IRQ fires between
+        // the drain-loop exit and the park, `block_current_unless_woken`
+        // observes `NIC_WOKEN` set and returns immediately without sleeping.
+        task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
 }
 

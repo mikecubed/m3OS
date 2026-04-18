@@ -141,8 +141,33 @@ kernel/src/pci/mod.rs           PCI config space enumeration
 ## Deferred
 
 - ACPI AML interpreter and dynamic hardware events
-- PCIe extended config space (MCFG / MMIO)
-- MSI / MSI-X interrupt routing
 - HPET as timer source
 - Application Processor startup (Phase 17: SMP)
 - PCI BAR MMIO mapping for device drivers (Phase 16: Network)
+
+## Phase 55 Additions (PCIe MCFG, MSI/MSI-X)
+
+Phase 15 originally deferred PCIe extended config space and MSI/MSI-X. Both
+were added in Phase 55 as prerequisites for NVMe and to prepare the kernel
+for PCIe-era devices:
+
+- **PCIe MCFG / MMIO configuration space.** The ACPI MCFG table is parsed
+  during init, extracting base address, segment group, and bus range.
+  `pcie_mmio_config_read` / `pcie_mmio_config_write` (in
+  `kernel/src/pci/mod.rs`) reach the full 4096-byte extended config space,
+  which the legacy port-I/O path could not address. Legacy
+  `pci_config_read_*` / `pci_config_write_*` remain as fallback when MCFG
+  is absent.
+- **MSI and MSI-X capability parsing.** PCI capability list walking finds
+  MSI (cap ID `0x05`) and MSI-X (cap ID `0x11`) structures and decodes them
+  into `MsiCapability` / `MsixCapability` types. `allocate_msi_vectors`
+  programs the capability and returns allocated APIC vector numbers
+  routed to the correct IDT entries. Devices without MSI/MSI-X fall back
+  to legacy INTx, which is how classic e1000 (QEMU 82540EM) is wired.
+- **Device claim protocol.** `claim_pci_device` returns an exclusive
+  `PciDeviceHandle` so two drivers cannot bind the same device. This is
+  the ownership gate used by the NVMe, e1000, and migrated VirtIO drivers.
+
+See [Phase 55 — Hardware Substrate](./55-hardware-substrate.md) for how
+these pieces compose into the hardware-access layer that the NVMe and
+e1000 drivers use.

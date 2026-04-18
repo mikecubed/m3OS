@@ -41,7 +41,18 @@ m3OS already has enough low-level substrate to start real hardware support in a 
 
 But the current tree is still heavily **QEMU- and VirtIO-centric**:
 
-| Current capability | Current reality |
+> **Phase 55 update (kernel v0.55.0).** The "Current reality" rows below
+> describe the pre-Phase-55 state that motivated the strategy recorded in
+> this doc. After Phase 55, PCIe MCFG is parsed, MSI/MSI-X is routed, a
+> reusable hardware-access layer (BAR mapping, DMA, device-IRQ
+> installation, device claim) exists, and the project has shipped native
+> NVMe and Intel 82540EM classic e1000 drivers. The donor strategy in this
+> doc was followed: specs first, Redox second — and neither the NVMe nor
+> the e1000 driver imported code from Redox. See
+> [Phase 55 — Hardware Substrate](../55-hardware-substrate.md) for the
+> current state. The rows below are kept as historical context.
+
+| Current capability | Current reality (pre-Phase 55) |
 |---|---|
 | PCI discovery | `kernel/src/pci/mod.rs` still uses legacy config-space I/O via ports `0xCF8/0xCFC`, not PCIe MCFG MMIO |
 | Device inventory | the kernel stores up to 64 discovered PCI functions in a static array |

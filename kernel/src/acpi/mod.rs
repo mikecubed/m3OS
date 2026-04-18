@@ -1,10 +1,12 @@
 //! ACPI table discovery and parsing.
 //!
-//! Parses the RSDP, RSDT/XSDT, MADT, and FADT tables from firmware-provided
-//! ACPI structures.  Physical addresses are converted to virtual pointers via
-//! the identity-mapped physical memory region (`mm::phys_offset()`).
+//! Parses the RSDP, RSDT/XSDT, MADT, FADT, and MCFG tables from
+//! firmware-provided ACPI structures.  Physical addresses are converted to
+//! virtual pointers via the identity-mapped physical memory region
+//! (`mm::phys_offset()`).
 
 use core::ptr;
+use kernel_core::pci::McfgEntry;
 use spin::Once;
 use x86_64::PhysAddr;
 
@@ -106,6 +108,22 @@ pub struct MadtInfo {
 }
 
 static MADT_INFO: Once<MadtInfo> = Once::new();
+
+// ---------------------------------------------------------------------------
+// Phase 55 (B.1): MCFG table — PCIe Enhanced Configuration Access Mechanism
+// ---------------------------------------------------------------------------
+
+/// Maximum number of MCFG allocations we remember.  QEMU's `q35` machine
+/// advertises a single entry; even real hardware rarely exceeds a handful.
+pub const MAX_MCFG_ENTRIES: usize = 8;
+
+/// Parsed MCFG allocations, as read from the ACPI `MCFG` table.
+pub struct McfgInfo {
+    pub entries: [McfgEntry; MAX_MCFG_ENTRIES],
+    pub count: usize,
+}
+
+static MCFG_INFO: Once<McfgInfo> = Once::new();
 
 // ---------------------------------------------------------------------------
 // P15-T003: RSDP validation
@@ -439,6 +457,65 @@ fn parse_fadt() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 55 (B.1): MCFG parsing
+// ---------------------------------------------------------------------------
+
+fn parse_mcfg() {
+    let hdr_ptr = match find_table(b"MCFG") {
+        Some(p) => p,
+        None => {
+            log::info!("[acpi] MCFG table not found (legacy port I/O PCI only)");
+            return;
+        }
+    };
+
+    let hdr_virt = hdr_ptr as usize;
+    if !validate_sdt(hdr_virt) {
+        log::warn!("[acpi] MCFG checksum invalid");
+        return;
+    }
+
+    // SAFETY: hdr_ptr points to a valid MCFG in identity-mapped memory.
+    let header: AcpiSdtHeader = unsafe { ptr::read_unaligned(hdr_ptr) };
+    let table_length = header.length as usize;
+
+    // SAFETY: table_length is bounded by validate_sdt's MAX_SDT_LENGTH.
+    let bytes = unsafe { core::slice::from_raw_parts(hdr_virt as *const u8, table_length) };
+
+    let mut entries = [McfgEntry {
+        base_address: 0,
+        segment_group: 0,
+        start_bus: 0,
+        end_bus: 0,
+    }; MAX_MCFG_ENTRIES];
+
+    let count = kernel_core::pci::parse_mcfg(bytes, &mut entries);
+
+    if count == 0 {
+        log::info!("[acpi] MCFG present but no allocations parsed");
+        return;
+    }
+
+    for (i, e) in entries.iter().enumerate().take(count) {
+        log::info!(
+            "[acpi] MCFG[{}]: base={:#x} seg={} bus [{:#04x}..={:#04x}]",
+            i,
+            e.base_address,
+            e.segment_group,
+            e.start_bus,
+            e.end_bus
+        );
+    }
+
+    MCFG_INFO.call_once(|| McfgInfo { entries, count });
+}
+
+/// Returns the parsed MCFG allocations, or `None` if MCFG was absent.
+pub fn mcfg_entries() -> Option<&'static [McfgEntry]> {
+    MCFG_INFO.get().map(|m| &m.entries[..m.count])
+}
+
+// ---------------------------------------------------------------------------
 // P15-T010: Log discovery results
 // ---------------------------------------------------------------------------
 
@@ -567,6 +644,7 @@ pub fn init(rsdp_addr: Option<u64>) {
     // Parse individual tables.
     parse_madt();
     parse_fadt();
+    parse_mcfg();
     log_discovery();
 }
 

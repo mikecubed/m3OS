@@ -379,7 +379,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // Hardware IRQs
     idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
-    idt[InterruptIndex::VirtioNet as u8].set_handler_fn(virtio_net_handler);
+    // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
+    // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
+    // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
     idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
@@ -389,6 +391,31 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[crate::smp::ipi::IPI_RESCHEDULE].set_handler_fn(reschedule_ipi_handler);
     idt[crate::smp::ipi::IPI_TLB_SHOOTDOWN].set_handler_fn(tlb_shootdown_ipi_handler);
     idt[crate::smp::ipi::IPI_CACHE_DRAIN].set_handler_fn(cache_drain_ipi_handler);
+
+    // Phase 55 C.3: device MSI / MSI-X vector stubs.
+    // Each stub dispatches through DEVICE_IRQ_TABLE; callers register
+    // handlers at runtime via `register_device_irq`.
+    let bank: &[(u8, extern "x86-interrupt" fn(InterruptStackFrame))] = &[
+        (DEVICE_IRQ_VECTOR_BASE, device_irq_stub_0),
+        (DEVICE_IRQ_VECTOR_BASE + 1, device_irq_stub_1),
+        (DEVICE_IRQ_VECTOR_BASE + 2, device_irq_stub_2),
+        (DEVICE_IRQ_VECTOR_BASE + 3, device_irq_stub_3),
+        (DEVICE_IRQ_VECTOR_BASE + 4, device_irq_stub_4),
+        (DEVICE_IRQ_VECTOR_BASE + 5, device_irq_stub_5),
+        (DEVICE_IRQ_VECTOR_BASE + 6, device_irq_stub_6),
+        (DEVICE_IRQ_VECTOR_BASE + 7, device_irq_stub_7),
+        (DEVICE_IRQ_VECTOR_BASE + 8, device_irq_stub_8),
+        (DEVICE_IRQ_VECTOR_BASE + 9, device_irq_stub_9),
+        (DEVICE_IRQ_VECTOR_BASE + 10, device_irq_stub_10),
+        (DEVICE_IRQ_VECTOR_BASE + 11, device_irq_stub_11),
+        (DEVICE_IRQ_VECTOR_BASE + 12, device_irq_stub_12),
+        (DEVICE_IRQ_VECTOR_BASE + 13, device_irq_stub_13),
+        (DEVICE_IRQ_VECTOR_BASE + 14, device_irq_stub_14),
+        (DEVICE_IRQ_VECTOR_BASE + 15, device_irq_stub_15),
+    ];
+    for (vec, stub) in bank {
+        idt[*vec].set_handler_fn(*stub);
+    }
 
     idt
 });
@@ -663,6 +690,11 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
 pub enum InterruptIndex {
     Timer = 32,
     Keyboard = 33,
+    /// Reserved. Was used for virtio-net pre-Phase-55; virtio-net now
+    /// allocates from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE` via
+    /// the HAL. Kept in the enum so the vector number isn't silently
+    /// repurposed before we decide what (if anything) to put here.
+    #[allow(dead_code)]
     VirtioNet = 34,
     Serial = 36,
     Spurious = 0xFF,
@@ -932,32 +964,6 @@ extern "x86-interrupt" fn cache_drain_ipi_handler(_stack_frame: InterruptStackFr
 }
 
 // ---------------------------------------------------------------------------
-// virtio-net IRQ handler (P16-T011, P16-T012)
-// ---------------------------------------------------------------------------
-
-/// Tracks whether a virtio-net interrupt has fired (for polling by the net task).
-pub static VIRTIO_NET_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
-
-extern "x86-interrupt" fn virtio_net_handler(_stack_frame: InterruptStackFrame) {
-    // Read ISR status to acknowledge the interrupt on the device side.
-    // This is lock-free (reads io_base from an atomic) to avoid deadlock
-    // if the interrupt fires while send_frame/recv_frames holds the DRIVER lock.
-    let _isr = crate::net::virtio_net::isr_status();
-
-    // Signal to the network processing task that frames may be available.
-    VIRTIO_NET_IRQ_PENDING.store(true, Ordering::Release);
-
-    if USING_APIC.load(Ordering::Relaxed) {
-        super::apic::lapic_eoi();
-    } else {
-        unsafe {
-            PICS.lock()
-                .notify_end_of_interrupt(InterruptIndex::VirtioNet as u8);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Serial (COM1) IRQ handler — vector 36
 // ---------------------------------------------------------------------------
 
@@ -972,4 +978,172 @@ extern "x86-interrupt" fn serial_handler(_stack_frame: InterruptStackFrame) {
                 .notify_end_of_interrupt(InterruptIndex::Serial as u8);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55 C.3 — device IRQ contract
+// ---------------------------------------------------------------------------
+//
+// Drivers register MSI / MSI-X / legacy-INTx handlers via
+// [`crate::pci::register_device_irq`]. Each registered vector walks through a
+// pre-declared stub (see `device_irq_stub_N` below) which dispatches to the
+// installed handler and sends EOI. Handlers run in ISR context and must obey
+// the ISR contract: no allocation, no blocking, no IPC. The expected body is
+// "read/ack a device register, signal a wait queue via `wake_task`, return."
+//
+// We reserve a bank of 16 consecutive IDT vectors starting at
+// [`DEVICE_IRQ_VECTOR_BASE`]. That is enough for the virtio + NVMe + e1000
+// targets this phase adds. If a driver asks for more vectors than are
+// available, registration returns `None` and the driver is expected to fall
+// back to legacy INTx routing or fail init.
+
+/// Base IDT vector for device MSI / MSI-X handlers.
+///
+/// Must match the `MSI_VECTOR_BASE` used by the kernel-side MSI pool so the
+/// allocated vector numbers land on installed IDT stubs. The `+ 0x10` gap
+/// above the existing 0x60 baseline leaves room for the PIC/IPI block.
+pub const DEVICE_IRQ_VECTOR_BASE: u8 = 0x60;
+
+/// Number of device IRQ slots covered by the stub bank.
+pub const DEVICE_IRQ_VECTOR_COUNT: u8 = 16;
+
+/// Entry in the device IRQ dispatch table.
+pub struct DeviceIrqEntry {
+    /// Driver-supplied handler. Runs in ISR context.
+    pub handler: fn(),
+    /// IRQ kind — legacy INTx handlers gate on ISR status; MSI/MSI-X skip it.
+    pub kind: DeviceIrqKind,
+}
+
+/// What kind of interrupt this is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceIrqKind {
+    /// Legacy INTx (level-triggered, potentially shared). Handler contract:
+    /// check the device's ISR status register and return early if this
+    /// interrupt is not for you.
+    LegacyIntx,
+    /// MSI or MSI-X (vector-specific, not shared).
+    Msi,
+}
+
+/// Installed handlers, keyed by vector offset from [`DEVICE_IRQ_VECTOR_BASE`].
+///
+/// Written rarely (device init), read on every matching IRQ. Guarded by a
+/// spin mutex; the ISR path uses a copy snapshot outside the lock.
+static DEVICE_IRQ_TABLE: Mutex<[Option<DeviceIrqEntry>; DEVICE_IRQ_VECTOR_COUNT as usize]> =
+    Mutex::new([const { None }; DEVICE_IRQ_VECTOR_COUNT as usize]);
+
+/// Install `entry` at `vector`. Returns `Err` if the vector is outside the
+/// device-IRQ bank or already occupied.
+///
+/// The critical section runs with interrupts disabled so an MSI/MSI-X vector
+/// firing on this CPU cannot re-enter `dispatch_device_irq` and deadlock on
+/// `DEVICE_IRQ_TABLE`.
+pub fn register_device_irq(vector: u8, entry: DeviceIrqEntry) -> Result<(), &'static str> {
+    if !(DEVICE_IRQ_VECTOR_BASE..DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT).contains(&vector)
+    {
+        return Err("vector out of device IRQ range");
+    }
+    let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tbl = DEVICE_IRQ_TABLE.lock();
+        if tbl[idx].is_some() {
+            return Err("device IRQ vector already registered");
+        }
+        tbl[idx] = Some(entry);
+        Ok(())
+    })
+}
+
+/// Remove the handler installed at `vector`. Silently ignores missing entries.
+///
+/// The critical section runs with interrupts disabled for the same reason
+/// as `register_device_irq` — the dispatch path locks the same table from
+/// ISR context.
+#[allow(dead_code)]
+pub fn unregister_device_irq(vector: u8) {
+    if !(DEVICE_IRQ_VECTOR_BASE..DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT).contains(&vector)
+    {
+        return;
+    }
+    let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tbl = DEVICE_IRQ_TABLE.lock();
+        tbl[idx] = None;
+    });
+}
+
+/// Dispatch a device IRQ to its registered handler. Runs in ISR context.
+///
+/// Snapshots the handler pointer under the lock, then releases the lock
+/// before invoking so the handler itself can (for example) call
+/// `register_device_irq` for a sibling queue without reentering.
+#[inline(always)]
+fn dispatch_device_irq(vector: u8) {
+    let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
+    let snapshot: Option<(fn(), DeviceIrqKind)> = {
+        let tbl = DEVICE_IRQ_TABLE.lock();
+        tbl[idx].as_ref().map(|e| (e.handler, e.kind))
+    };
+    if let Some((h, _kind)) = snapshot {
+        h();
+    }
+    // Always EOI, even if no handler — spurious interrupts must not stall the
+    // APIC.
+    if USING_APIC.load(Ordering::Relaxed) {
+        super::apic::lapic_eoi();
+    }
+}
+
+// Stubs — one per vector slot. The IDT requires a real
+// `extern "x86-interrupt"` function at each vector; we cannot generate them
+// at runtime. Each stub thunks to `dispatch_device_irq` with a compile-time
+// vector number.
+extern "x86-interrupt" fn device_irq_stub_0(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE);
+}
+extern "x86-interrupt" fn device_irq_stub_1(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 1);
+}
+extern "x86-interrupt" fn device_irq_stub_2(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 2);
+}
+extern "x86-interrupt" fn device_irq_stub_3(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 3);
+}
+extern "x86-interrupt" fn device_irq_stub_4(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 4);
+}
+extern "x86-interrupt" fn device_irq_stub_5(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 5);
+}
+extern "x86-interrupt" fn device_irq_stub_6(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 6);
+}
+extern "x86-interrupt" fn device_irq_stub_7(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 7);
+}
+extern "x86-interrupt" fn device_irq_stub_8(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 8);
+}
+extern "x86-interrupt" fn device_irq_stub_9(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 9);
+}
+extern "x86-interrupt" fn device_irq_stub_10(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 10);
+}
+extern "x86-interrupt" fn device_irq_stub_11(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 11);
+}
+extern "x86-interrupt" fn device_irq_stub_12(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 12);
+}
+extern "x86-interrupt" fn device_irq_stub_13(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 13);
+}
+extern "x86-interrupt" fn device_irq_stub_14(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 14);
+}
+extern "x86-interrupt" fn device_irq_stub_15(_: InterruptStackFrame) {
+    dispatch_device_irq(DEVICE_IRQ_VECTOR_BASE + 15);
 }

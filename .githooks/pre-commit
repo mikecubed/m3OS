@@ -1,5 +1,9 @@
 #!/bin/sh
-# Pre-commit hook: run clippy + rustfmt check before every commit.
+# Pre-commit hook: run clippy + rustfmt check before every commit, plus
+# the xtask-side host unit tests (fast — script-shape assertions that
+# previously fell out of gate coverage because `cargo xtask check` only
+# runs clippy/fmt/kernel-core).
+#
 # To bypass in an emergency: git commit --no-verify
 
 set -e
@@ -16,3 +20,6 @@ fi
 
 echo "pre-commit: running cargo xtask check..."
 cargo xtask check
+
+echo "pre-commit: running cargo test -p xtask..."
+cargo test -p xtask --target x86_64-unknown-linux-gnu
