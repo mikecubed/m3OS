@@ -1,16 +1,17 @@
 ---
-current-task: "PR #113 review resolution — 12 copilot-reviewer threads on feat/55-hardware-substrate (2 passes)"
+current-task: "PR #113 review resolution — 13 copilot-reviewer threads on feat/55-hardware-substrate (3 passes)"
 current-phase: "resolved"
 next-action: "await PR merge by developer"
 workspace: "feat/55-hardware-substrate (PR #113)"
-last-updated: "2026-04-18T17:05:00Z"
+last-updated: "2026-04-18T17:45:00Z"
 ---
 
 ## Review surface
 
-PR #113: feat/55-hardware-substrate → main, 12 review threads from
-copilot-pull-request-reviewer across two review passes (10 pre-fix +
-2 post-fix). All 12 threads triaged, replied to, and resolved.
+PR #113: feat/55-hardware-substrate → main, 13 review threads from
+copilot-pull-request-reviewer across three review passes (10 pre-fix +
+2 post-fix + 1 post-fix). All 13 threads triaged, replied to, and
+resolved.
 
 ## Decisions
 
@@ -31,24 +32,39 @@ copilot-pull-request-reviewer across two review passes (10 pre-fix +
 
 ### Pass 2 — 2 threads (post-fix review, 2026-04-18T16:16Z)
 
+| #  | Thread ID                 | Location                                     | Evidence | Action | Commit    |
+|----|---------------------------|----------------------------------------------|----------|--------|-----------|
+| 11 | PRRT_kwDORTRVIM578_zX     | kernel/src/mm/dma.rs:133                     | valid    | fixed  | 8ec0d00   |
+| 12 | PRRT_kwDORTRVIM578_za     | docs/roadmap/55-hardware-substrate.md:141,143| valid    | fixed  | 8ec0d00   |
+
+### Pass 3 — 1 thread (post-fix review, 2026-04-18T17:34Z)
+
 | #  | Thread ID                 | Location                                     | Evidence | Action | Commit      |
 |----|---------------------------|----------------------------------------------|----------|--------|-------------|
-| 11 | PRRT_kwDORTRVIM578_zX     | kernel/src/mm/dma.rs:133                     | valid    | fixed  | (this pass) |
-| 12 | PRRT_kwDORTRVIM578_za     | docs/roadmap/55-hardware-substrate.md:141,143| valid    | fixed  | (this pass) |
+| 13 | PRRT_kwDORTRVIM579SpA     | docs/roadmap/55-hardware-substrate.md:172    | valid    | fixed  | (this pass) |
 
 - Pass 1: 9 accepted fixes landed in commit 1d219fe8 (`fix(phase-55):
   address 9 copilot-reviewer comments on PR #113`); Comment 2 declined
   with rationale (standard Linux `alloc_skb`-in-softirq pattern — the
   per-frame copy must stay inside the critical section until the
   descriptor is recycled).
-- Pass 2: both comments fixed this pass. Comment 11 — added a
+- Pass 2: both comments fixed in commit 8ec0d00. Comment 11 — added a
   `DmaError::SizeOverflow` variant and routed `checked_mul` overflow
   through it instead of reusing `ZeroSize`, with a regression test that
   distinguishes the two paths. Comment 12 — updated the Reference
   Hardware Matrix NVMe and e1000 rows from "QEMU emulation planned"
   to "QEMU emulation validated (Phase 55)" to match the rest of the
   doc's Status: Complete claim.
-- All 12 threads replied-to and resolved via the `resolveReviewThread`
+- Pass 3: comment 13 fixed this pass. Aligned the NVMe Reference QEMU
+  configuration snippet with what `cargo xtask run --device nvme`
+  actually emits: `file=target/nvme.img,if=none,id=nvme0,format=raw`
+  instead of the shortened `file=nvme.img,if=none,id=nvme0`. Extended
+  the Notes line to call out the workspace-rooted path + reference
+  `ensure_nvme_image` and to explain the `format=raw` rationale
+  (suppresses QEMU's format-probe warning). This closes the drift the
+  section's own prose ("implementation and documentation cannot drift
+  apart") was written to prevent.
+- All 13 threads replied-to and resolved via the `resolveReviewThread`
   GraphQL mutation.
 
 ## Files Touched
@@ -64,12 +80,16 @@ Commit 1d219fe8 — 7 files, +210 / −90:
 - `xtask/src/main.rs` (qemu_args_with_devices_resolved pure function; NVMe
   test uses dummy path, asserts file never created)
 
-Pass 2 commit — 2 files:
+Commit 8ec0d00 (Pass 2) — 2 files:
 - `kernel/src/mm/dma.rs` (new `DmaError::SizeOverflow` variant;
   `checked_mul` overflow routed to it; regression test
   `dma_buffer_new_array_reports_overflow_distinctly_from_zero_size`)
 - `docs/roadmap/55-hardware-substrate.md` (NVMe + e1000 matrix rows
   updated to "QEMU emulation validated (Phase 55)")
+
+Pass 3 commit — 1 file:
+- `docs/roadmap/55-hardware-substrate.md` (NVMe Reference QEMU snippet
+  + Notes realigned with the xtask emission)
 
 ## Validation
 
@@ -94,14 +114,19 @@ Pass 2 (pre-push):
 - `cargo xtask test` — 28 kernel QEMU tests pass (27 prior + 1 new
   `dma_buffer_new_array_reports_overflow_distinctly_from_zero_size`).
 
+Pass 3 (pre-push):
+- `cargo xtask check` — clippy clean, rustfmt clean, kernel-core and
+  passwd host tests pass. Docs-only change — no new tests required.
+
 ## Workflow outcome measures
 
-- discovery-reuse: yes (skipped formal scout brief on both passes —
+- discovery-reuse: yes (skipped formal scout brief on all three passes —
   review items were narrow enough that a durable brief would have added
-  overhead; triage grounded in direct reads of each referenced file span).
+  overhead; triage grounded in direct reads of each referenced file span
+  and cross-checks against xtask emission on Pass 3).
 - rescue-attempts: 0
-- re-review-loops: 0 (fixes applied serially by the main agent on both
-  passes; no implementer/reviewer split for low-ambiguity reviews).
+- re-review-loops: 0 (fixes applied serially by the main agent on all
+  three passes; no implementer/reviewer split for low-ambiguity reviews).
 - stall-events: 0
 - escalations: 0
 - declined-items: 1 (Pass 1 Comment 2) with rationale posted on-thread.

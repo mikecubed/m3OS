@@ -166,10 +166,10 @@ The exact QEMU invocations that Phase 55 development and CI target. These are re
 **NVMe reference configuration:**
 
 ```
--drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0
+-drive file=target/nvme.img,if=none,id=nvme0,format=raw -device nvme,serial=deadbeef,drive=nvme0
 ```
 
-Notes: `nvme.img` is the backing file for the NVMe namespace. The `serial=deadbeef` value is arbitrary but required by QEMU. This is an **addition** to the existing VirtIO-blk boot disk, not a replacement for it.
+Notes: `target/nvme.img` is the workspace-rooted backing file for the NVMe namespace — `cargo xtask run --device nvme` creates it on first use and reuses it across invocations so operator-written data survives (see `ensure_nvme_image` in `xtask/src/main.rs`). Validators running the raw QEMU flags directly must invoke QEMU from the workspace root (or substitute an absolute path). `format=raw` matches the xtask default and suppresses QEMU's format-probe warning. The `serial=deadbeef` value is arbitrary but required by QEMU. This is an **addition** to the existing VirtIO-blk boot disk, not a replacement for it.
 
 **e1000 reference configuration:**
 
