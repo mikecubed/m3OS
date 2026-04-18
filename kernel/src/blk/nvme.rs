@@ -1,35 +1,31 @@
 //! NVMe controller driver — Phase 55 Track D.
 //!
-//! This commit (D.1) brings the controller up to a known-good state:
+//! Layering:
 //!
-//! * PCI discovery via the HAL ([`crate::pci::register_driver`] +
-//!   [`crate::pci::probe_all_drivers`]); match rule is "mass storage / NVM
-//!   Express programming interface" so we do not need to enumerate vendor
-//!   IDs by hand.
-//! * BAR0 mapped through [`crate::pci::bar::map_bar`]; memory space + bus
-//!   mastering enabled in the PCI command register.
-//! * `CAP` is parsed via [`kernel_core::nvme::NvmeCap`]; `CAP.DSTRD` gives
-//!   the doorbell stride we stash for later queue programming, `CAP.TO`
-//!   bounds the reset polling window so a wedged device does not hang ring
-//!   0 forever.
-//! * Controller reset: clear `CC.EN`, wait (bounded) for `CSTS.RDY=0`. The
-//!   enable side is left for D.2 because it requires valid admin queue
-//!   base addresses programmed first.
-//!
-//! Admin queue + Identify (D.2), I/O queue + block read/write (D.3), and
-//! MSI/MSI-X completion path (D.4) layer on top of this driver state.
+//! * **D.0 (kernel-core)** — register offsets, SQ/CQ layouts, capability
+//!   accessors — live in [`kernel_core::nvme`].
+//! * **D.1** — PCI discovery, BAR0 MMIO mapping, `CAP`/`VS` parsing,
+//!   controller reset with bounded `CAP.TO` timeout.
+//! * **D.2 (this commit)** — admin queue bring-up, controller enable, Identify
+//!   Controller / Identify Namespace; polled completions with a bounded
+//!   per-command timeout.
+//! * **D.3** — I/O queue pair, block read/write with PRP lists.
+//! * **D.4** — MSI/MSI-X completion handler + waiter table.
 //!
 //! # Ring-0 placement
 //!
-//! This driver is ring 0 because Phase 55 is about enabling real-hardware
-//! paths, not about building a userspace device-driver host. The contracts
-//! here (probe, identify, read/write) are written so a future userspace
-//! driver host can lift them without changing call sites.
+//! This driver is ring 0 (Phase 55 deliberately widens the TCB to ship a
+//! real-hardware path). The public contract (`probe`, Identify, block I/O)
+//! is written so a future userspace driver host can lift the call sites
+//! without surgery.
 
-use core::sync::atomic::AtomicBool;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::nvme as knvme;
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 
+use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, MmioRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
 
@@ -53,41 +49,52 @@ const NVME_PROG_IF: u8 = 0x02;
 /// falsely declare the reset wedged.
 const RESET_SAFETY_MARGIN_TICKS: u64 = 1_000;
 
+/// Upper bound on a single admin command completion, in ticks (ms).
+/// Identify, Create I/O CQ/SQ should all complete in well under a second on
+/// QEMU; we give a generous 5 seconds before surfacing a bounded error.
+const ADMIN_COMMAND_TIMEOUT_TICKS: u64 = 5_000;
+
+/// Queue depth for the admin queue. 64 is well above what a single-threaded
+/// bring-up sequence needs (we never have more than 2-3 admin commands
+/// in-flight) and stays far below every `CAP.MQES` value we expect in the
+/// wild.
+const ADMIN_QUEUE_ENTRIES: usize = 64;
+
 // ===========================================================================
 // Controller state
 // ===========================================================================
 
 /// Single bound NVMe controller. One per device — a second matching device
-/// is declined rather than bound. The admin queue (D.2) and I/O queue (D.3)
-/// hang off this struct once their bring-up sub-tasks land.
+/// is declined rather than bound.
 pub struct NvmeController {
     /// PCI claim handle — held for the life of the driver.
     #[allow(dead_code)]
     pci: pci::PciDeviceHandle,
     /// BAR0 MMIO region. Size checked at probe time to cover the doorbell
-    /// range (>= 0x1000 bytes). Used by D.2 for the enable sequence and by
-    /// D.3 for doorbell writes.
-    #[allow(dead_code)]
+    /// range (>= 0x1000 bytes).
     regs: MmioRegion,
-    /// Decoded `CAP.DSTRD` stride in bytes (minimum 4). Used by later
-    /// sub-tasks to compute per-queue doorbell offsets.
-    #[allow(dead_code)]
+    /// Decoded `CAP.DSTRD` stride in bytes (minimum 4).
     doorbell_stride_bytes: usize,
     /// `CAP.MQES + 1` — maximum queue entries the hardware will accept.
-    #[allow(dead_code)]
     max_queue_entries: u16,
-    /// Raw `VS` register contents, useful for diagnostic logging and for a
-    /// future sysfs-style surface.
+    /// Raw `VS` register contents.
     #[allow(dead_code)]
     version: u32,
-    /// `CAP.TO`-derived polling window in ticks (ms). Reused by the enable
-    /// sequence (D.2) for the same bounded-timeout rule.
-    #[allow(dead_code)]
+    /// `CAP.TO`-derived polling window in ticks (ms).
     reset_timeout_ticks: u64,
+    /// Admin queue pair (D.2).
+    admin: Option<AdminQueue>,
+    /// Active namespace identifier. Picked during Identify as the first
+    /// active namespace.
+    namespace_id: u32,
+    /// Namespace capacity in LBAs.
+    namespace_lbas: u64,
+    /// Sector size in bytes (`2^LBADS`). Typically 512 on QEMU.
+    namespace_sector_bytes: u32,
 }
 
-// SAFETY: NvmeController is only accessed under DRIVER.lock(). The MMIO
-// region holds raw addresses that stay valid for the driver's lifetime.
+// SAFETY: NvmeController is only accessed under DRIVER.lock(). MMIO
+// addresses stay valid for the life of the driver.
 unsafe impl Send for NvmeController {}
 
 pub(super) static DRIVER: Mutex<Option<NvmeController>> = Mutex::new(None);
@@ -98,7 +105,46 @@ pub(super) static DRIVER: Mutex<Option<NvmeController>> = Mutex::new(None);
 pub static NVME_READY: AtomicBool = AtomicBool::new(false);
 
 // ===========================================================================
-// Driver registration (D.1)
+// Admin queue
+// ===========================================================================
+
+/// Completion slot returned to the submitter. We split this out of the
+/// waiter so the completion-processing path can write into a stable
+/// location without re-allocating vectors.
+#[derive(Clone, Copy, Default)]
+struct NvmeCompletionSlot {
+    /// Command-specific result field from the completion entry. Stored but
+    /// currently unused — D.3 Create-I/O-SQ uses it to confirm the assigned
+    /// queue id on some firmware.
+    #[allow(dead_code)]
+    result: u32,
+    status_code: u16,
+    filled: bool,
+}
+
+struct AdminQueue {
+    sq: DmaBuffer<[knvme::NvmeCommand]>,
+    cq: DmaBuffer<[knvme::NvmeCompletion]>,
+    queue_entries: u16,
+    sq_tail: u16,
+    cq_head: u16,
+    /// Phase tag for the next expected completion. NVMe uses a toggling
+    /// phase bit so we can detect "new" entries without a head pointer
+    /// round trip.
+    phase: bool,
+    /// Per-CID completion slots. `slots[i]` matches a command with
+    /// `CID == i as u16`.
+    slots: Vec<NvmeCompletionSlot>,
+    /// Monotonically increasing command id. Wrapped via `% queue_entries`
+    /// before being stored in a command.
+    next_cid: u16,
+}
+
+// SAFETY: AdminQueue is only accessed under DRIVER.lock().
+unsafe impl Send for AdminQueue {}
+
+// ===========================================================================
+// Driver registration
 // ===========================================================================
 
 /// Register the NVMe driver with the PCI HAL. Called from `blk::init()`.
@@ -113,9 +159,7 @@ pub fn register() {
     });
 }
 
-/// Driver init entry invoked by `probe_all_drivers`. Narrows on programming
-/// interface `0x02` (NVM Express) since `0x01:0x08` is shared with future
-/// NVMe command-set variants (e.g. ZNS, Key-Value).
+/// Driver init entry invoked by `probe_all_drivers`.
 fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
     let dev = *handle.device();
 
@@ -154,14 +198,13 @@ fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         return DriverProbeResult::Failed("BAR0 too small for doorbell range");
     }
 
-    // Enable memory space + bus mastering on the PCI side.
+    // Enable memory space + bus mastering.
     let cmd = handle.read_config_u16(0x04);
     if cmd & 0x06 != 0x06 {
         handle.write_config_u16(0x04, cmd | 0x06);
         log::info!("[nvme] PCI command: enabled memory space + bus mastering");
     }
 
-    // Parse CAP / VS so the caller knows queue limits and doorbell stride.
     let cap_raw = regs.read_reg::<u64>(knvme::NvmeRegs::CAP);
     let cap = knvme::NvmeCap(cap_raw);
     let version = regs.read_reg::<u32>(knvme::NvmeRegs::VS);
@@ -193,31 +236,29 @@ fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         max_queue_entries,
         version,
         reset_timeout_ticks,
+        admin: None,
+        namespace_id: 0,
+        namespace_lbas: 0,
+        namespace_sector_bytes: 0,
     });
-    log::info!("[nvme] controller in RESET state; admin queue bring-up pending (D.2)");
+    log::info!("[nvme] controller in RESET state; admin queue bring-up starting");
+
+    if let Err(e) = bring_up_admin_and_identify() {
+        log::error!("[nvme] admin bring-up failed: {}", e);
+        *DRIVER.lock() = None;
+        return DriverProbeResult::Failed(e);
+    }
     DriverProbeResult::Bound
 }
 
 /// Compute the reset / enable polling window in tick_count ms.
-///
-/// `CAP.TO` is in 500 ms units; zero is interpreted as the implementation
-/// default (we treat as one unit). The safety margin prevents false timeouts
-/// on devices that overshoot their advertised budget slightly.
 fn reset_timeout_ticks(to_500ms_units: u8) -> u64 {
     let units = to_500ms_units.max(1) as u64;
     units.saturating_mul(500) + RESET_SAFETY_MARGIN_TICKS
 }
 
 /// Spin on `f()` until it returns true or the tick budget expires.
-///
-/// Why two budgets:
-///   * `budget_ticks` guards against a device that simply never acknowledges
-///     its state change. The tick budget starts ticking once the timer IRQ
-///     is firing; if we call this before that (during kernel bring-up),
-///     `tick_count()` stays at zero and the tick check cannot fire.
-///   * `MAX_SPIN_ITERATIONS` bounds the early-boot case so we cannot lock
-///     up the BSP if NVMe bring-up runs before the timer is up.
-pub(super) fn wait_until<F>(mut f: F, budget_ticks: u64) -> Result<(), &'static str>
+fn wait_until<F>(mut f: F, budget_ticks: u64) -> Result<(), &'static str>
 where
     F: FnMut() -> bool,
 {
@@ -255,24 +296,353 @@ fn reset_controller(regs: &MmioRegion, timeout_ticks: u64) -> Result<(), &'stati
     Ok(())
 }
 
+/// Enable the controller after admin queues are programmed. Bounded by
+/// `timeout_ticks`.
+fn enable_controller(regs: &MmioRegion, timeout_ticks: u64) -> Result<(), &'static str> {
+    // CC: IOSQES=6 (64-byte SQ entry, 2^6), IOCQES=4 (16-byte CQ entry,
+    // 2^4), MPS=0 (4 KiB), AMS=0 (round-robin), CSS=0 (NVM), SHN=0, EN=1.
+    let cc = (6u32 << knvme::CC_IOSQES_SHIFT)
+        | (4u32 << knvme::CC_IOCQES_SHIFT)
+        | (0u32 << knvme::CC_MPS_SHIFT)
+        | (0u32 << knvme::CC_AMS_SHIFT)
+        | (0u32 << knvme::CC_CSS_SHIFT)
+        | (0u32 << knvme::CC_SHN_SHIFT)
+        | knvme::CC_EN;
+    regs.write_reg::<u32>(knvme::NvmeRegs::CC, cc);
+
+    wait_until(
+        || {
+            let csts = regs.read_reg::<u32>(knvme::NvmeRegs::CSTS);
+            // CSTS.CFS means fatal status — stop waiting so the caller can
+            // surface the error rather than hit the timeout.
+            csts & (knvme::CSTS_RDY | knvme::CSTS_CFS) != 0
+        },
+        timeout_ticks,
+    )
+    .map_err(|_| "nvme enable timeout waiting for CSTS.RDY=1")?;
+
+    let csts = regs.read_reg::<u32>(knvme::NvmeRegs::CSTS);
+    if csts & knvme::CSTS_CFS != 0 {
+        return Err("nvme controller reported fatal status during enable");
+    }
+    log::info!("[nvme] controller enabled (CSTS.RDY set)");
+    Ok(())
+}
+
+/// Program `AQA` (queue sizes) and `ASQ` / `ACQ` (queue base addresses).
+fn program_admin_queue_registers(regs: &MmioRegion, sq_phys: u64, cq_phys: u64, entries: u16) {
+    // AQA.ASQS (bits 11:0) and .ACQS (bits 27:16) both encode `entries - 1`.
+    let qsize = (entries.saturating_sub(1)) as u32;
+    let aqa = (qsize & 0x0FFF) | ((qsize & 0x0FFF) << 16);
+    regs.write_reg::<u32>(knvme::NvmeRegs::AQA, aqa);
+    regs.write_reg::<u64>(knvme::NvmeRegs::ASQ, sq_phys);
+    regs.write_reg::<u64>(knvme::NvmeRegs::ACQ, cq_phys);
+}
+
 // ===========================================================================
-// Public init entry + capability info
+// Admin queue bring-up + Identify
 // ===========================================================================
 
-/// Register the NVMe driver and run a probe pass. Called from tests or from
-/// an alternative boot path that wants to bring up NVMe alone. The normal
-/// boot flow uses [`super::init`] which aggregates all block drivers into
-/// one probe pass.
+fn bring_up_admin_and_identify() -> Result<(), &'static str> {
+    // Allocate SQ/CQ buffers, program AQA/ASQ/ACQ, install the admin queue
+    // into the driver, enable the controller.
+    let (sq_phys, cq_phys, entries, timeout_ticks) = {
+        let mut drv = DRIVER.lock();
+        let d = drv.as_mut().ok_or("driver gone during admin init")?;
+        let entries = ADMIN_QUEUE_ENTRIES.min(d.max_queue_entries as usize).max(2) as u16;
+        let sq = DmaBuffer::<knvme::NvmeCommand>::new_array(entries as usize)
+            .map_err(|_| "admin SQ DMA alloc failed")?;
+        let cq = DmaBuffer::<knvme::NvmeCompletion>::new_array(entries as usize)
+            .map_err(|_| "admin CQ DMA alloc failed")?;
+        let sq_phys = sq.physical_address().as_u64();
+        let cq_phys = cq.physical_address().as_u64();
+        program_admin_queue_registers(&d.regs, sq_phys, cq_phys, entries);
+        let slots = alloc::vec![NvmeCompletionSlot::default(); entries as usize];
+        d.admin = Some(AdminQueue {
+            sq,
+            cq,
+            queue_entries: entries,
+            sq_tail: 0,
+            cq_head: 0,
+            phase: true,
+            slots,
+            next_cid: 0,
+        });
+        log::info!(
+            "[nvme] admin queue installed: {} entries, SQ phys {:#x}, CQ phys {:#x}",
+            entries,
+            sq_phys,
+            cq_phys
+        );
+        (sq_phys, cq_phys, entries, d.reset_timeout_ticks)
+    };
+    let _ = (sq_phys, cq_phys, entries); // silence unused-var warning once all three have been logged.
+
+    {
+        let drv = DRIVER.lock();
+        let d = drv.as_ref().ok_or("driver gone before enable")?;
+        enable_controller(&d.regs, timeout_ticks)?;
+    }
+
+    // Identify Controller.
+    let ident_controller_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
+        .map_err(|_| "identify controller DMA alloc failed")?;
+    {
+        let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
+        cmd.prp1 = ident_controller_buf.physical_address().as_u64();
+        cmd.cdw10 = knvme::IDENTIFY_CNS_CONTROLLER;
+        let c = submit_admin_command(cmd)?;
+        if c.status_code != 0 {
+            log::error!(
+                "[nvme] Identify Controller failed: status={:#x}",
+                c.status_code
+            );
+            return Err("nvme identify controller failed");
+        }
+        let bytes: &[u8] = &ident_controller_buf;
+        log_ident_controller_fields(bytes);
+    }
+
+    // Identify Active Namespace List (CNS=2). Pick the first non-zero NSID.
+    let ident_nslist_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
+        .map_err(|_| "identify ns-list DMA alloc failed")?;
+    let selected_nsid = {
+        let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
+        cmd.prp1 = ident_nslist_buf.physical_address().as_u64();
+        cmd.cdw10 = 0x02; // CNS: active namespace list
+        cmd.nsid = 0;
+        match submit_admin_command(cmd) {
+            Ok(c) if c.status_code == 0 => {
+                let bytes: &[u8] = &ident_nslist_buf;
+                let mut found = 0u32;
+                for chunk in bytes.chunks_exact(4).take(1024) {
+                    let nsid = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    if nsid != 0 {
+                        found = nsid;
+                        break;
+                    }
+                }
+                if found == 0 { 1 } else { found }
+            }
+            _ => {
+                log::info!("[nvme] namespace list unavailable — defaulting to nsid=1");
+                1
+            }
+        }
+    };
+
+    // Identify Namespace for the selected NSID.
+    let ident_ns_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
+        .map_err(|_| "identify namespace DMA alloc failed")?;
+    let nsze;
+    let sector_bytes;
+    {
+        let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
+        cmd.prp1 = ident_ns_buf.physical_address().as_u64();
+        cmd.nsid = selected_nsid;
+        cmd.cdw10 = knvme::IDENTIFY_CNS_NAMESPACE;
+        let c = submit_admin_command(cmd)?;
+        if c.status_code != 0 {
+            log::error!(
+                "[nvme] Identify Namespace nsid={} failed: status={:#x}",
+                selected_nsid,
+                c.status_code
+            );
+            return Err("nvme identify namespace failed");
+        }
+        let bytes: &[u8] = &ident_ns_buf;
+        nsze = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let ncap = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        // LBAF0 is at offset 128. LBADS in bits 23:16 is log2 of sector
+        // size.
+        let lbaf0 = u32::from_le_bytes([bytes[128], bytes[129], bytes[130], bytes[131]]);
+        let lbads = (lbaf0 >> 16) & 0xFF;
+        sector_bytes = 1u32 << lbads;
+        log::info!(
+            "[nvme] nsid={}: nsze={} ncap={} sector={}B (LBADS={})",
+            selected_nsid,
+            nsze,
+            ncap,
+            sector_bytes,
+            lbads
+        );
+    }
+
+    {
+        let mut drv = DRIVER.lock();
+        let d = drv.as_mut().ok_or("driver gone after identify")?;
+        d.namespace_id = selected_nsid;
+        d.namespace_lbas = nsze;
+        d.namespace_sector_bytes = sector_bytes;
+    }
+    Ok(())
+}
+
+/// Log the ASCII-ish fields of an Identify Controller data structure. We
+/// trim trailing spaces/nuls for readability.
+fn log_ident_controller_fields(bytes: &[u8]) {
+    fn trim(s: &[u8]) -> &[u8] {
+        let end = s
+            .iter()
+            .rposition(|&b| b != b' ' && b != 0)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        &s[..end]
+    }
+    if bytes.len() < 72 {
+        return;
+    }
+    // Layout: VID 0..2, SSVID 2..4, SN 4..24, MN 24..64, FR 64..72.
+    let sn = trim(&bytes[4..24]);
+    let mn = trim(&bytes[24..64]);
+    let fr = trim(&bytes[64..72]);
+    log::info!(
+        "[nvme] model=\"{}\" serial=\"{}\" firmware=\"{}\"",
+        core::str::from_utf8(mn).unwrap_or("<non-utf8>"),
+        core::str::from_utf8(sn).unwrap_or("<non-utf8>"),
+        core::str::from_utf8(fr).unwrap_or("<non-utf8>")
+    );
+}
+
+/// Submit a single admin command and poll (bounded) for its completion.
+///
+/// The IRQ handler is not installed during admin bring-up — D.4 layers it
+/// on — so submission and completion live in the same function.  The
+/// polling side uses `wait_until` to keep the iteration capped even if the
+/// timer tick has not yet started.
+fn submit_admin_command(mut cmd: knvme::NvmeCommand) -> Result<NvmeCompletionSlot, &'static str> {
+    // Phase 1: allocate a CID, write the SQ entry, kick the doorbell. All
+    // under the driver lock with interrupts off so the IRQ handler (once
+    // installed in D.4) cannot fire against partial state.
+    let (doorbell_off, regs_virt, cid) = interrupts::without_interrupts(|| {
+        let mut drv = DRIVER.lock();
+        let d = drv.as_mut().ok_or("driver gone during admin submit")?;
+        let stride = d.doorbell_stride_bytes;
+        let regs_virt = d.regs.virt_base();
+        let admin = d.admin.as_mut().ok_or("admin queue not initialized")?;
+        let entries = admin.queue_entries;
+        let cid = admin.next_cid % entries;
+        // Place CID into CDW0 bits 31:16.
+        cmd.cdw0 = (cmd.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+        // Reset this slot so a previous stale completion cannot be picked
+        // up by mistake.
+        admin.slots[cid as usize] = NvmeCompletionSlot::default();
+        admin.sq[admin.sq_tail as usize] = cmd;
+        admin.sq_tail = (admin.sq_tail + 1) % entries;
+        admin.next_cid = admin.next_cid.wrapping_add(1);
+        // Publish the SQ entry before writing the doorbell (the device is
+        // a separate bus master and must see the full command body).
+        core::sync::atomic::fence(Ordering::Release);
+        let doorbell_off = knvme::NvmeRegs::doorbell_offset(0, false, stride);
+        Ok::<(usize, usize, u16), &'static str>((doorbell_off, regs_virt, cid))
+    })?;
+
+    // Write the new tail pointer to the submission-queue tail doorbell.
+    // Read the tail value back under the lock so we do not publish a stale
+    // pointer if two callers race (admin bring-up is single-threaded but
+    // keep the code pattern consistent with the I/O path in D.3).
+    let tail = interrupts::without_interrupts(|| {
+        let drv = DRIVER.lock();
+        drv.as_ref()
+            .and_then(|d| d.admin.as_ref().map(|a| a.sq_tail))
+    })
+    .ok_or("admin queue gone before doorbell ring")?;
+    // SAFETY: `regs_virt + doorbell_off` is inside BAR0 (verified in probe
+    // that BAR0 >= 0x1000 bytes, and doorbells start at 0x1000 which is
+    // within the page on every NVMe controller we target).
+    unsafe {
+        core::ptr::write_volatile((regs_virt + doorbell_off) as *mut u32, tail as u32);
+    }
+
+    // Phase 2: drain the CQ until our CID completes or the budget expires.
+    let start = crate::arch::x86_64::interrupts::tick_count();
+    loop {
+        let filled = interrupts::without_interrupts(|| {
+            let mut drv = DRIVER.lock();
+            let d = drv.as_mut()?;
+            let regs_virt = d.regs.virt_base();
+            let stride = d.doorbell_stride_bytes;
+            let admin = d.admin.as_mut()?;
+            drain_admin_cq_locked(admin, regs_virt, stride);
+            let slot = admin.slots[cid as usize];
+            Some(slot)
+        });
+        if let Some(slot) = filled
+            && slot.filled
+        {
+            return Ok(slot);
+        }
+        let now = crate::arch::x86_64::interrupts::tick_count();
+        if now.wrapping_sub(start) >= ADMIN_COMMAND_TIMEOUT_TICKS {
+            return Err("admin command timed out");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Drain all new completion entries from the admin CQ. Called from the
+/// polled path above; D.4 calls the same helper from the IRQ handler.
+fn drain_admin_cq_locked(admin: &mut AdminQueue, regs_virt: usize, stride: usize) {
+    loop {
+        let entry = admin.cq[admin.cq_head as usize];
+        let phase = knvme::completion_phase(&entry);
+        if phase != admin.phase {
+            break; // stale entry from previous pass
+        }
+        let cid = entry.cid;
+        if (cid as usize) < admin.slots.len() {
+            admin.slots[cid as usize] = NvmeCompletionSlot {
+                result: entry.result,
+                status_code: knvme::completion_status_code(&entry),
+                filled: true,
+            };
+        }
+        admin.cq_head = (admin.cq_head + 1) % admin.queue_entries;
+        if admin.cq_head == 0 {
+            admin.phase = !admin.phase;
+        }
+        // Advance the CQ head doorbell so the device can reuse the slot.
+        let doorbell = knvme::NvmeRegs::doorbell_offset(0, true, stride);
+        // SAFETY: regs_virt is BAR0 base; the doorbell range is page 1.
+        unsafe {
+            core::ptr::write_volatile((regs_virt + doorbell) as *mut u32, admin.cq_head as u32);
+        }
+    }
+}
+
+// ===========================================================================
+// Public entry points
+// ===========================================================================
+
+/// Register the NVMe driver and run a probe pass. Kept for backwards
+/// compatibility; the normal boot flow uses [`super::init`].
 #[allow(dead_code)]
 pub fn init() {
     register();
     pci::probe_all_drivers();
 }
 
-/// Controller version (raw `VS` register) for diagnostic callers. Returns 0
-/// when no controller is bound.
+/// Controller version (raw `VS` register).
 #[allow(dead_code)]
 pub fn controller_version() -> u32 {
     let drv = DRIVER.lock();
     drv.as_ref().map(|d| d.version).unwrap_or(0)
+}
+
+/// Capacity of the active namespace in LBAs.
+#[allow(dead_code)]
+pub fn namespace_capacity_lbas() -> u64 {
+    let drv = DRIVER.lock();
+    drv.as_ref().map(|d| d.namespace_lbas).unwrap_or(0)
+}
+
+/// Sector size (LBA format) of the active namespace in bytes.
+#[allow(dead_code)]
+pub fn namespace_sector_bytes() -> u32 {
+    let drv = DRIVER.lock();
+    drv.as_ref().map(|d| d.namespace_sector_bytes).unwrap_or(0)
 }
