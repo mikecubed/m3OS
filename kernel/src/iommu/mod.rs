@@ -34,6 +34,13 @@
 //! `kernel-core::iommu::contract` module docs; this comment mirrors the rule
 //! so grep from the kernel side finds it.
 
+// Vendor-specific IOMMU implementations. Each vendor module owns its own
+// hardware state and exposes an [`kernel_core::iommu::contract::IommuUnit`]
+// impl. Tracks land in parallel: Track C (Intel VT-d) adds `pub mod intel;`
+// and `pub mod fault;`; Track D (AMD-Vi) adds `pub mod amd;`. The additions
+// are on separate lines to keep merge resolution mechanical.
+pub mod amd;
+
 use alloc::vec::Vec;
 use spin::Once;
 
