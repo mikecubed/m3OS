@@ -254,7 +254,7 @@ flowchart TD
 | 53 | Headless hardening | Complete | `phase-53` | [Tasks](./53-headless-hardening-tasks.md) |
 | 54 | Deep serverization | Complete | `phase-54` | [Tasks](./54-deep-serverization-tasks.md) |
 | 54a | Post-serverization kernel hygiene | Planned | `phase-54a` | [Tasks](./54a-post-serverization-kernel-hygiene-tasks.md) |
-| 55 | Hardware Substrate | Planned | `phase-55` | [Tasks](./55-hardware-substrate-tasks.md) |
+| 55 | Hardware Substrate (PCIe MCFG, MSI/MSI-X, hardware-access layer, NVMe, Intel 82540EM e1000) | Complete | `phase-55` | [Tasks](./55-hardware-substrate-tasks.md) |
 
 ### Future Task Docs
 Task docs for Phases **56 and later** are intentionally deferred until closer to implementation time.

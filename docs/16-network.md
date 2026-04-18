@@ -157,3 +157,35 @@ every layer of the network model from NIC driver to transport protocol.
 - Multiple simultaneous TCP connections beyond 4
 - IPv6, DNS, DHCP, TLS
 - Non-blocking socket I/O (epoll/select/poll)
+
+## Phase 55 Additions (Intel 82540EM e1000)
+
+Phase 16 shipped VirtIO-net as the only supported NIC. Phase 55 adds the
+Intel 82540EM classic e1000 (`0x8086:0x100E`) as the first non-VirtIO
+networking path. The e1000 driver lives in `kernel/src/net/e1000.rs` and
+uses the same hardware-access layer as the post-C.5 VirtIO-net driver:
+
+- **Scope: 82540EM only.** The e1000e family (82574, 82576, etc.) is
+  different silicon with a separate register layout and is **not**
+  supported. Later phases will handle it.
+- **Bring-up.** `e1000_probe` claims the device, maps BAR0 as MMIO,
+  executes the global reset (`CTRL.RST`), reads the MAC from
+  `RAL0`/`RAH0`, zeroes the multicast table, allocates 256-entry TX and
+  RX `DmaBuffer` rings with 2 KiB per-descriptor packet buffers, and
+  programs `RCTL` / `TCTL`.
+- **Interrupts.** QEMU's classic e1000 has no MSI-X capability, so the
+  driver takes the legacy-INTx fallback on the PCI interrupt line. The
+  ISR reads `ICR` (read-to-clear), walks the RX ring from software tail
+  to hardware head, and wakes the `net_task`.
+- **Stack integration.** `net/mod.rs` dispatches `send_frame` /
+  `mac_address` to e1000 when `E1000_READY` is set, else VirtIO-net.
+  The existing ARP, IPv4, TCP, UDP, and ICMP code works unchanged on
+  either NIC.
+- **Operator usage.** `cargo xtask run --device e1000` launches QEMU
+  with the e1000 instead of VirtIO-net. SLIRP `10.0.2.2` / hostfwd TCP
+  rules still apply, so ICMP ping, telnet, and SSH tests remain valid.
+
+See [Phase 55 — Hardware Substrate](./55-hardware-substrate.md) for the
+driver architecture, the reference matrix (including the IOMMU caveat for
+physical-hardware targets), and how e1000 plugs into the hardware-access
+layer that also serves NVMe and the migrated VirtIO drivers.

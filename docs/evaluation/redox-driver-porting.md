@@ -1,5 +1,19 @@
 # Feasibility of Porting Redox OS Drivers to m3OS
 
+> **Phase 55 update (kernel v0.55.0).** Phase 55 shipped native NVMe and Intel
+> 82540EM classic e1000 drivers **without** porting code from Redox's `nvmed`
+> or `e1000d`. Both drivers were written directly from specs (NVMe 1.4, Intel
+> 82540EM manual) using the existing VirtIO drivers as a behavioral
+> reference. The thesis in this doc — that the hardware-logic cores are
+> portable but the Redox integration glue is not — held up: on the first
+> two "high feasibility" targets the project never needed the hardware-logic
+> cores either, because the m3OS hardware-access layer and the VirtIO
+> references were sufficient. The analysis below remains the project's
+> reference for later phases that may do heavier Redox porting (USB xHCI,
+> audio, graphics). See
+> [Phase 55 — Hardware Substrate](../55-hardware-substrate.md) for the
+> shipped state.
+
 ## Bottom line
 
 Redox OS has the richest set of userspace Rust hardware drivers in the hobby-OS ecosystem: ~30 drivers covering storage, networking, USB, graphics, audio, and input. They are well-structured, Rust-native, and MIT-licensed. But **direct code reuse is not realistic without substantial infrastructure work in m3OS first**, and even then, only the hardware-logic cores of Redox drivers are portable—not the system integration glue.
