@@ -7361,40 +7361,113 @@ mod tests {
     }
 
     fn smoke_step_labels(steps: &[SmokeStep]) -> Vec<&'static str> {
-        steps
-            .iter()
-            .map(|step| match step {
-                SmokeStep::Wait { label, .. }
-                | SmokeStep::Send { label, .. }
-                | SmokeStep::WaitEither { label, .. } => *label,
-                SmokeStep::Sleep { .. } => "sleep",
-            })
-            .collect()
+        let mut out = Vec::new();
+        for step in steps {
+            match step {
+                SmokeStep::Wait { label, .. } | SmokeStep::Send { label, .. } => out.push(*label),
+                SmokeStep::WaitEither {
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    out.push(*label);
+                    out.extend(smoke_step_labels(extra_steps_a));
+                    out.extend(smoke_step_labels(extra_steps_b));
+                }
+                SmokeStep::Sleep { .. } => out.push("sleep"),
+            }
+        }
+        out
     }
 
     fn send_input_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Send { input, label } if *label == target_label => Some(*input),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Send { input, label } if *label == target_label => return Some(*input),
+                SmokeStep::WaitEither {
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if let Some(v) = send_input_for_label(extra_steps_a, target_label) {
+                        return Some(v);
+                    }
+                    if let Some(v) = send_input_for_label(extra_steps_b, target_label) {
+                        return Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
+    /// Recursive: returns the first matching label's pattern. For
+    /// `WaitEither` steps, reports `pattern_a` (the preferred match).
+    /// Recurses into both `extra_steps_a` and `extra_steps_b` so assertions
+    /// about injected sub-steps (e.g. `BOOT_MARKER_SETTLE`) resolve.
     fn wait_pattern_for_label(steps: &[SmokeStep], target_label: &str) -> Option<&'static str> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Wait { pattern, label, .. } if *label == target_label => Some(*pattern),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Wait { pattern, label, .. } if *label == target_label => {
+                    return Some(*pattern);
+                }
+                SmokeStep::WaitEither {
+                    pattern_a,
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if *label == target_label {
+                        return Some(*pattern_a);
+                    }
+                    if let Some(p) = wait_pattern_for_label(extra_steps_a, target_label) {
+                        return Some(p);
+                    }
+                    if let Some(p) = wait_pattern_for_label(extra_steps_b, target_label) {
+                        return Some(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
+    /// Recursive sibling of [`wait_pattern_for_label`]: returns the first
+    /// matching label's timeout. For `WaitEither` steps, reports the
+    /// step's top-level `timeout_secs`.
     fn wait_timeout_for_label(steps: &[SmokeStep], target_label: &str) -> Option<u64> {
-        steps.iter().find_map(|step| match step {
-            SmokeStep::Wait {
-                timeout_secs,
-                label,
-                ..
-            } if *label == target_label => Some(*timeout_secs),
-            _ => None,
-        })
+        for step in steps {
+            match step {
+                SmokeStep::Wait {
+                    timeout_secs,
+                    label,
+                    ..
+                } if *label == target_label => return Some(*timeout_secs),
+                SmokeStep::WaitEither {
+                    timeout_secs,
+                    label,
+                    extra_steps_a,
+                    extra_steps_b,
+                    ..
+                } => {
+                    if *label == target_label {
+                        return Some(*timeout_secs);
+                    }
+                    if let Some(t) = wait_timeout_for_label(extra_steps_a, target_label) {
+                        return Some(t);
+                    }
+                    if let Some(t) = wait_timeout_for_label(extra_steps_b, target_label) {
+                        return Some(t);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
@@ -7791,17 +7864,21 @@ mod tests {
             ),
             Some("SMOKE:auth:PASS")
         );
+        // tcc-compile + hello are now WaitEither steps that accept PASS or
+        // SKIP (M3OS_SMOKE_SKIP_TCC_COMPILE=1 in fast/headless CI); labels
+        // gained the "or skipped" suffix and the tcc budget moved from
+        // 180s to 600s to absorb TCG slowness.
         assert_eq!(
             wait_timeout_for_label(
                 &smoke_test_script(false),
-                "guest/tcc: smoke runner compiled hello world"
+                "guest/tcc: smoke runner compiled hello world or skipped"
             ),
-            Some(180)
+            Some(600)
         );
         assert_eq!(
             wait_pattern_for_label(
                 &smoke_test_script(false),
-                "guest/hello: smoke runner ran compiled hello world"
+                "guest/hello: smoke runner ran compiled hello or skipped"
             ),
             Some("SMOKE:hello:PASS")
         );
