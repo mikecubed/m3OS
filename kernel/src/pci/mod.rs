@@ -1152,6 +1152,11 @@ pub fn allocate_msi_vectors(dev: &PciDevice, count: u8) -> Option<AllocatedMsi> 
 pub struct DeviceIrq {
     vector: u8,
     kind: crate::arch::x86_64::interrupts::DeviceIrqKind,
+    /// For MSI/MSI-X kinds, which specific capability was programmed.
+    /// `None` for LegacyIntx. Drivers that need to know the difference
+    /// (e.g. legacy virtio shifts its register layout only when MSI-X
+    /// is enabled, not plain MSI) check this.
+    msi_kind: Option<MsiKind>,
 }
 
 #[allow(dead_code)]
@@ -1164,6 +1169,12 @@ impl DeviceIrq {
     /// IRQ kind — `Msi` for MSI/MSI-X, `LegacyIntx` for shared INTx.
     pub fn kind(&self) -> crate::arch::x86_64::interrupts::DeviceIrqKind {
         self.kind
+    }
+
+    /// For MSI-family interrupts, which capability (MSI or MSI-X) was
+    /// actually programmed. `None` for `LegacyIntx`.
+    pub fn msi_kind(&self) -> Option<MsiKind> {
+        self.msi_kind
     }
 }
 
@@ -1189,6 +1200,7 @@ impl PciDeviceHandle {
         Ok(DeviceIrq {
             vector: alloc.first_vector,
             kind: crate::arch::x86_64::interrupts::DeviceIrqKind::Msi,
+            msi_kind: Some(alloc.kind),
         })
     }
 
@@ -1213,6 +1225,7 @@ impl PciDeviceHandle {
         Ok(DeviceIrq {
             vector: idt_vector,
             kind: crate::arch::x86_64::interrupts::DeviceIrqKind::LegacyIntx,
+            msi_kind: None,
         })
     }
 }

@@ -48,7 +48,18 @@ const VIRTIO_QUEUE_NOTIFY: u16 = 0x10; // 16-bit write
 const VIRTIO_DEVICE_STATUS: u16 = 0x12; // 8-bit read/write
 const VIRTIO_ISR_STATUS: u16 = 0x13; // 8-bit read
 
-// virtio-net device-specific registers start at offset 0x14 for legacy.
+// MSI-X vector registers — only present in the legacy header when MSI-X
+// is enabled at the PCI level (see virtio 0.9.5 §2.1.2). Enabling MSI-X
+// shifts the device-specific config area forward by 4 bytes. Plain MSI
+// does **not** insert these registers.
+#[allow(dead_code)]
+const VIRTIO_MSI_CONFIG_VECTOR: u16 = 0x14;
+const VIRTIO_MSI_QUEUE_VECTOR: u16 = 0x16;
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
+
+// virtio-net device-specific registers start at offset 0x14 when MSI-X is
+// disabled, 0x18 when MSI-X is enabled. The driver reads MAC + link status
+// before enabling MSI-X so the pre-shift offsets are safe to use here.
 const VIRTIO_NET_MAC_BASE: u16 = 0x14; // 6 bytes: MAC address
 #[allow(dead_code)]
 const VIRTIO_NET_STATUS: u16 = 0x1A; // 16-bit: link status
@@ -750,6 +761,38 @@ fn init_with_handle(handle: pci::PciDeviceHandle) {
     let irq = match handle.install_msi_irq(virtio_net_irq_handler) {
         Ok(i) => {
             log::info!("[virtio-net] MSI IRQ on vector {:#x}", i.vector());
+            // Legacy virtio quirk: `install_msi_irq` enables MSI-X at the
+            // PCI level and programs table entry 0, but the device still
+            // has every virtqueue mapped to VIRTIO_MSI_NO_VECTOR by
+            // default. Point both RX (queue 0) and TX (queue 1) at
+            // MSI-X table entry 0 — we only allocated one vector, so
+            // both queues share it and the single ISR drains both
+            // directions. Without this write no MSI fires and the net
+            // task parks forever. The queue-vector register only exists
+            // when MSI-X is enabled — plain MSI does not insert it.
+            if i.msi_kind() == Some(pci::MsiKind::MsiX) {
+                let mut bound = true;
+                for queue_index in [0u16, 1u16] {
+                    port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, queue_index);
+                    port.write_reg::<u16>(VIRTIO_MSI_QUEUE_VECTOR, 0);
+                    let readback = port.read_reg::<u16>(VIRTIO_MSI_QUEUE_VECTOR);
+                    if readback == VIRTIO_MSI_NO_VECTOR {
+                        log::error!(
+                            "[virtio-net] device refused MSI-X vector binding for queue {} — NIC will stall",
+                            queue_index
+                        );
+                        bound = false;
+                        break;
+                    }
+                }
+                if !bound {
+                    return;
+                }
+                log::info!(
+                    "[virtio-net] queues 0+1 bound to MSI-X table entry 0 (vector {:#x})",
+                    i.vector()
+                );
+            }
             Some(i)
         }
         Err(_) => {

@@ -7,10 +7,14 @@
 //!   that used to live inline here).
 //! * Descriptor ring, scratch, and DMA buffers are [`crate::mm::dma::DmaBuffer`]
 //!   instead of raw `alloc_contiguous_frames` + `phys_offset` arithmetic.
-//! * Completion is IRQ-driven: the IRQ handler walks the used ring, wakes one
-//!   task per completion via `wake_task`, and `read_sectors`/`write_sectors`
-//!   park the calling task with `block_current_unless_woken` instead of busy
-//!   spinning.  Routed here from `docs/debug/54-followups.md` item 5.
+//! * Completion: the IRQ handler walks the used ring and is wired up for
+//!   future async consumers, but `read_sectors`/`write_sectors` poll the
+//!   used ring from task context rather than parking on the scheduler.
+//!   Scheduler-park was measured to round-trip a context switch (and an
+//!   optional cross-core IPI wake) per sector under SMP, making ext2 boot
+//!   walks pathologically slow; the completion arrives in well under a
+//!   scheduler tick so polling is the right shape for this size of request.
+//!   Routed here from `docs/debug/54-followups.md` item 5.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +25,7 @@ use x86_64::instructions::interrupts;
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
-use crate::task::scheduler::{block_current_unless_woken, current_task_id, wake_task};
+use crate::task::scheduler::{current_task_id, wake_task};
 
 // ===========================================================================
 // PCI device IDs
@@ -44,7 +48,18 @@ const VIRTIO_QUEUE_NOTIFY: u16 = 0x10;
 const VIRTIO_DEVICE_STATUS: u16 = 0x12;
 const VIRTIO_ISR_STATUS: u16 = 0x13;
 
-// virtio-blk device-specific config starts at offset 0x14 for legacy.
+// MSI-X vector registers — only present in the legacy header when MSI-X
+// is enabled at the PCI level (see virtio 0.9.5 §2.1.2). Enabling MSI-X
+// shifts the device-specific config area forward by 4 bytes. Plain MSI
+// does **not** insert these registers.
+#[allow(dead_code)]
+const VIRTIO_MSI_CONFIG_VECTOR: u16 = 0x14;
+const VIRTIO_MSI_QUEUE_VECTOR: u16 = 0x16;
+const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF;
+
+// virtio-blk device-specific config starts at offset 0x14 when MSI-X is
+// disabled, 0x18 when MSI-X is enabled. The driver reads capacity before
+// enabling MSI-X so the pre-shift offset is safe to use here.
 const VIRTIO_BLK_CFG_CAPACITY: u16 = 0x14;
 
 // ===========================================================================
@@ -215,9 +230,10 @@ impl Virtqueue {
         })
     }
 
-    /// Enqueue a 3-descriptor chain for a block I/O request. The caller will
-    /// `block_current_unless_woken(&woken_flag)` after releasing the DRIVER
-    /// lock; the IRQ handler walks the used ring and wakes the matching task.
+    /// Enqueue a 3-descriptor chain for a block I/O request. The caller
+    /// polls the used ring (with `drain_used_from_irq`) after releasing the
+    /// DRIVER lock; the IRQ handler can also drain the used ring, but the
+    /// submitter does not depend on it to unblock.
     #[allow(clippy::too_many_arguments)]
     fn submit_request(
         &mut self,
@@ -549,10 +565,25 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
         Ok(unsafe { scratch_virt.add(64) })
     });
     let status_virt = status_virt_result?;
-    // Phase 2: park until the IRQ handler wakes us. Must be done with
-    // interrupts enabled (i.e. *outside* the without_interrupts scope above)
-    // so the ISR can fire and call wake_task.
-    block_current_unless_woken(&REQ_WOKEN);
+    // Phase 2: poll the used ring for the completion. The IRQ handler
+    // also drains the used ring (and is still wired up for any future
+    // async consumer), but we deliberately do not park on `REQ_WOKEN`
+    // here: the scheduler-park path round-trips a context switch and an
+    // optional cross-core wake on every sector, which makes boot-time
+    // readdir / inode walks take minutes under SMP. Polling matches the
+    // pre-Phase-55 virtio-blk performance profile and is safe because
+    // the completion arrives in well under a scheduler tick.
+    while !REQ_WOKEN.load(Ordering::Acquire) {
+        interrupts::without_interrupts(|| {
+            if let Some(ref mut d) = *DRIVER.lock() {
+                d.request_queue.drain_used_from_irq();
+            }
+        });
+        if REQ_WOKEN.load(Ordering::Acquire) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     // Phase 3: read the status byte (driver lock re-acquired to ensure
     // memory ordering). Same IF-off rule as the submit side.
     let status = interrupts::without_interrupts(|| {
@@ -685,6 +716,29 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
     let irq = match handle.install_msi_irq(virtio_blk_irq_handler) {
         Ok(i) => {
             log::info!("[virtio-blk] MSI IRQ on vector {:#x}", i.vector());
+            // Legacy virtio quirk: `install_msi_irq` enables the MSI-X
+            // capability at the PCI level and programs the MSI-X table
+            // entry, but the *device* still has every virtqueue mapped to
+            // VIRTIO_MSI_NO_VECTOR by default. Until we point queue 0 at
+            // MSI-X table entry 0 the device will never raise a completion
+            // MSI and `block_current_unless_woken` parks forever. The
+            // queue-vector register at offset 0x16 only exists when MSI-X
+            // is enabled — plain MSI does not insert it, so guard on
+            // `msi_kind() == Some(MsiX)`.
+            if i.msi_kind() == Some(pci::MsiKind::MsiX) {
+                port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, 0);
+                port.write_reg::<u16>(VIRTIO_MSI_QUEUE_VECTOR, 0);
+                let readback = port.read_reg::<u16>(VIRTIO_MSI_QUEUE_VECTOR);
+                if readback == VIRTIO_MSI_NO_VECTOR {
+                    return DriverProbeResult::Failed(
+                        "device refused MSI-X vector binding for queue 0",
+                    );
+                }
+                log::info!(
+                    "[virtio-blk] queue 0 bound to MSI-X table entry 0 (vector {:#x})",
+                    i.vector()
+                );
+            }
             Some(i)
         }
         Err(_) => {
