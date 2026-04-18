@@ -9,12 +9,18 @@
 //! * **D.2** — admin queue bring-up, controller enable, Identify Controller /
 //!   Identify Namespace; polled completions with a bounded per-command
 //!   timeout.
-//! * **D.3 (this commit)** — one I/O queue pair via Create I/O CQ / Create I/O
-//!   SQ, `nvme_read_sectors` / `nvme_write_sectors` using PRP entries (with a
+//! * **D.3** — one I/O queue pair via Create I/O CQ / Create I/O SQ,
+//!   `nvme_read_sectors` / `nvme_write_sectors` using PRP entries (with a
 //!   PRP-list overflow page for buffers spanning >2 pages). `NVME_READY` is
 //!   set; the block dispatch layer ([`super::read_sectors`] /
 //!   [`super::write_sectors`]) prefers NVMe when ready.
-//! * **D.4** — MSI/MSI-X completion handler + waiter table.
+//! * **D.4 (this commit)** — MSI / MSI-X completion handler. The handler
+//!   drains both admin and I/O CQs in one ISR invocation (phase-bit walk),
+//!   writes the CQ-head doorbells, and wakes blocked tasks via `wake_task`.
+//!   When the task context is available and IRQ registration succeeds, the
+//!   submitter parks itself with `block_current_unless_woken`. Environments
+//!   where MSI / MSI-X allocation fails fall back to the polled path
+//!   preserved from D.3.
 //!
 //! # Ring-0 placement
 //!
@@ -26,12 +32,14 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::nvme as knvme;
+use kernel_core::types::TaskId;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, MmioRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
+use crate::task::scheduler::{block_current_unless_woken, current_task_id, wake_task};
 
 // ===========================================================================
 // PCI class / subclass / programming interface
@@ -104,6 +112,12 @@ pub struct NvmeController {
     admin: Option<AdminQueue>,
     /// I/O queue pair (D.3). `None` until `bring_up_io_queue` succeeds.
     io: Option<IoQueuePair>,
+    /// Completion IRQ registration (D.4). `Some` when an MSI / MSI-X or
+    /// legacy-INTx handler is installed; `None` forces the polled
+    /// completion fallback. Held for the life of the driver so the
+    /// dispatch stub does not land on a stale handler.
+    #[allow(dead_code)]
+    irq: Option<pci::DeviceIrq>,
     /// Active namespace identifier. Picked during Identify as the first
     /// active namespace.
     namespace_id: u32,
@@ -128,18 +142,31 @@ pub static NVME_READY: AtomicBool = AtomicBool::new(false);
 // Admin queue
 // ===========================================================================
 
-/// Completion slot returned to the submitter. We split this out of the
-/// waiter so the completion-processing path can write into a stable
-/// location without re-allocating vectors.
-#[derive(Clone, Copy, Default)]
+/// Completion slot returned to the submitter. The IRQ handler writes the
+/// completion in place and sets `filled`; the submitter observes the slot
+/// after being woken (D.4) or after polling it directly (D.3 fallback).
+#[derive(Clone, Copy)]
 struct NvmeCompletionSlot {
     /// Command-specific result field from the completion entry. Stored but
-    /// currently unused — D.3 Create-I/O-SQ uses it to confirm the assigned
-    /// queue id on some firmware.
+    /// currently unused by our submitters.
     #[allow(dead_code)]
     result: u32,
     status_code: u16,
     filled: bool,
+    /// TaskId to wake when this slot is filled. `TaskId(0)` means "no
+    /// waiter" — the polled path picks it up by observing `filled`.
+    waker_task: TaskId,
+}
+
+impl Default for NvmeCompletionSlot {
+    fn default() -> Self {
+        Self {
+            result: 0,
+            status_code: 0,
+            filled: false,
+            waker_task: TaskId(0),
+        }
+    }
 }
 
 struct AdminQueue {
@@ -188,6 +215,11 @@ struct IoQueuePair {
 
 // SAFETY: IoQueuePair is only accessed under DRIVER.lock().
 unsafe impl Send for IoQueuePair {}
+
+/// Single wake flag used by the I/O path. Requests are fully serialized
+/// under DRIVER.lock(), so only one task waits at a time — reusing one
+/// flag matches virtio-blk's `REQ_WOKEN` pattern.
+static IO_REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 
 // ===========================================================================
 // Driver registration
@@ -284,6 +316,7 @@ fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         reset_timeout_ticks,
         admin: None,
         io: None,
+        irq: None,
         namespace_id: 0,
         namespace_lbas: 0,
         namespace_sector_bytes: 0,
@@ -705,10 +738,16 @@ fn drain_admin_cq_locked(admin: &mut AdminQueue, regs_virt: usize, stride: usize
         }
         let cid = entry.cid;
         if (cid as usize) < admin.slots.len() {
+            // Preserve the waker_task so the ISR can wake a parked
+            // submitter — the admin path is polled during bring-up, so
+            // this is a no-op in practice, but keeps the invariant
+            // symmetric with the I/O drain.
+            let waker = admin.slots[cid as usize].waker_task;
             admin.slots[cid as usize] = NvmeCompletionSlot {
                 result: entry.result,
                 status_code: knvme::completion_status_code(&entry),
                 filled: true,
+                waker_task: waker,
             };
         }
         admin.cq_head = (admin.cq_head + 1) % admin.queue_entries;
@@ -799,7 +838,87 @@ fn bring_up_io_queue() -> Result<(), &'static str> {
         IO_QUEUE_ID,
         entries
     );
+
+    // D.4 — install the completion IRQ. Best-effort: a failure here leaves
+    // `irq = None` and the submit path falls back to polled completions.
+    install_completion_irq();
     Ok(())
+}
+
+/// Try to install an MSI / MSI-X handler for the completion queues; fall
+/// back to legacy INTx; log and leave `irq = None` if nothing is available.
+fn install_completion_irq() {
+    let mut drv = DRIVER.lock();
+    let Some(d) = drv.as_mut() else {
+        return;
+    };
+    // Prefer MSI-X (which the HAL's install_msi_irq routes through MSI or
+    // MSI-X depending on what the device advertises).
+    match d.pci.install_msi_irq(nvme_completion_handler) {
+        Ok(irq) => {
+            log::info!(
+                "[nvme] MSI/MSI-X IRQ installed on vector {:#x}",
+                irq.vector()
+            );
+            d.irq = Some(irq);
+            return;
+        }
+        Err(_) => {
+            log::info!("[nvme] no MSI/MSI-X capability — trying legacy INTx");
+        }
+    }
+    // Legacy INTx fallback: pick a dedicated vector from the device-IRQ
+    // bank. virtio-blk uses BASE+2 and virtio-net uses BASE+0 (C.5), so we
+    // reserve BASE+4 for NVMe to avoid collisions.
+    const NVME_INTX_VECTOR: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + 4;
+    match d
+        .pci
+        .install_intx_irq(NVME_INTX_VECTOR, nvme_completion_handler)
+    {
+        Ok(irq) => {
+            let dev = *d.pci.device();
+            if dev.interrupt_line != 0xFF && crate::acpi::io_apic_address().is_some() {
+                crate::arch::x86_64::apic::route_pci_irq(dev.interrupt_line, NVME_INTX_VECTOR);
+                log::info!(
+                    "[nvme] legacy INTx line {} routed to vector {:#x}",
+                    dev.interrupt_line,
+                    NVME_INTX_VECTOR
+                );
+            } else {
+                log::warn!(
+                    "[nvme] legacy INTx registered but no I/O APIC — polled fallback will fire"
+                );
+            }
+            d.irq = Some(irq);
+        }
+        Err(_) => {
+            log::warn!("[nvme] no IRQ available — requests will complete via the polled fallback");
+        }
+    }
+}
+
+/// NVMe completion IRQ handler. Runs in ISR context.
+///
+/// Contract (per AGENTS.md interrupt-handler rules):
+///   * no allocation, no blocking, no IPC;
+///   * drain every pending entry in both the admin CQ and the I/O CQ
+///     (phase-bit walk);
+///   * wake any registered waiter task via `wake_task`.
+///
+/// EOI is sent by the device-IRQ dispatch stub after we return.
+fn nvme_completion_handler() {
+    let mut drv = DRIVER.lock();
+    let Some(d) = drv.as_mut() else {
+        return;
+    };
+    let regs_virt = d.regs.virt_base();
+    let stride = d.doorbell_stride_bytes;
+    if let Some(admin) = d.admin.as_mut() {
+        drain_admin_cq_locked(admin, regs_virt, stride);
+    }
+    if let Some(io) = d.io.as_mut() {
+        drain_io_cq_locked(io, regs_virt, stride);
+    }
 }
 
 /// Read `count` logical blocks starting at `start_lba` into `buf`. `buf`
@@ -893,7 +1012,27 @@ fn do_io_with_dma(
     dma: &DmaBuffer<[u8]>,
     byte_len: usize,
 ) -> Result<(), u16> {
-    let (doorbell_off, regs_virt, cid) = interrupts::without_interrupts(|| {
+    // Reset the wake flag before publishing the request. Subsequent wake
+    // from the ISR will set it; the order of "reset -> submit -> block" is
+    // important: if the ISR fires between submit and block, `woken` is
+    // already true and `block_current_unless_woken` returns immediately.
+    IO_REQ_WOKEN.store(false, Ordering::Release);
+    // `current_task_id` dereferences per-core data via `gs_base`; calling
+    // it before `smp::init_bsp_per_core` panics. During driver bring-up
+    // (the data-path smoke in `nvme_probe`) SMP is not yet initialized, so
+    // we fall back to the polled completion path by reporting "no waiter".
+    let waker = if crate::smp::is_per_core_ready() {
+        current_task_id().unwrap_or(TaskId(0))
+    } else {
+        TaskId(0)
+    };
+
+    // Phase 1: allocate a CID, copy the command into the ring, advance
+    // sq_tail under the driver lock with interrupts off. The ISR also
+    // takes DRIVER.lock() so IF-off is required to avoid the ISR spinning
+    // on our held `spin::Mutex`. Same rule as virtio-blk (documented in
+    // its Fix 1 comment).
+    let (doorbell_off, regs_virt, cid, irq_installed) = interrupts::without_interrupts(|| {
         let mut drv = DRIVER.lock();
         let d = drv.as_mut().ok_or(0xFFFFu16)?;
         let nsid = d.namespace_id;
@@ -912,7 +1051,7 @@ fn do_io_with_dma(
         }
         let stride = d.doorbell_stride_bytes;
         let regs_virt = d.regs.virt_base();
-        // Build PRP1/PRP2 (and optionally a PRP list) for the DMA buffer.
+        let irq_installed = d.irq.is_some();
         let dma_phys = dma.physical_address().as_u64();
         let (prp1, prp2) =
             build_prp_pair(d.io.as_mut().ok_or(0xFFFFu16)?, dma_phys, byte_len).ok_or(0xFFFFu16)?;
@@ -925,15 +1064,17 @@ fn do_io_with_dma(
         cmd.prp2 = prp2;
         cmd.cdw10 = (start_lba & 0xFFFF_FFFF) as u32;
         cmd.cdw11 = (start_lba >> 32) as u32;
-        // NLB is zero-based: `lba_count - 1` in bits 15:0 of CDW12.
         cmd.cdw12 = lba_count.saturating_sub(1) & 0xFFFF;
-        io.slots[cid as usize] = NvmeCompletionSlot::default();
+        io.slots[cid as usize] = NvmeCompletionSlot {
+            waker_task: waker,
+            ..NvmeCompletionSlot::default()
+        };
         io.sq[io.sq_tail as usize] = cmd;
         io.sq_tail = (io.sq_tail + 1) % entries;
         io.next_cid = io.next_cid.wrapping_add(1);
         core::sync::atomic::fence(Ordering::Release);
         let doorbell = knvme::NvmeRegs::doorbell_offset(IO_QUEUE_ID, false, stride);
-        Ok::<(usize, usize, u16), u16>((doorbell, regs_virt, cid))
+        Ok::<(usize, usize, u16, bool), u16>((doorbell, regs_virt, cid, irq_installed))
     })?;
 
     let tail = interrupts::without_interrupts(|| {
@@ -947,34 +1088,100 @@ fn do_io_with_dma(
         core::ptr::write_volatile((regs_virt + doorbell_off) as *mut u32, tail as u32);
     }
 
-    // Poll for completion. D.4 will install the IRQ handler which drains
-    // into the same slot; until then we poll directly with a bounded budget.
-    let start = crate::arch::x86_64::interrupts::tick_count();
-    loop {
-        let slot = interrupts::without_interrupts(|| {
-            let mut drv = DRIVER.lock();
-            let d = drv.as_mut()?;
-            let regs_virt = d.regs.virt_base();
-            let stride = d.doorbell_stride_bytes;
-            let io = d.io.as_mut()?;
-            drain_io_cq_locked(io, regs_virt, stride);
-            Some(io.slots[cid as usize])
+    // Phase 2: wait for the completion. IRQ-driven path parks the task;
+    // polled fallback walks the CQ under a bounded budget.
+    if irq_installed && waker.0 != 0 {
+        // Park the task until the ISR wakes us. `block_current_unless_woken`
+        // re-checks `IO_REQ_WOKEN` under the scheduler lock so a wake that
+        // races the block cannot be lost.
+        block_current_unless_woken(&IO_REQ_WOKEN);
+        // After waking, drain once under the lock in case more than one
+        // completion arrived between the IRQ and our wake-up (rare with a
+        // single request in flight, but cheap to guard).
+        interrupts::without_interrupts(|| {
+            if let Some(d) = DRIVER.lock().as_mut() {
+                let regs_virt = d.regs.virt_base();
+                let stride = d.doorbell_stride_bytes;
+                if let Some(io) = d.io.as_mut() {
+                    drain_io_cq_locked(io, regs_virt, stride);
+                }
+            }
         });
-        if let Some(slot) = slot
-            && slot.filled
-        {
-            return if slot.status_code == 0 {
-                Ok(())
-            } else {
-                Err(slot.status_code)
-            };
+    } else {
+        // Polled fallback: drain periodically until the slot fills or the
+        // bounded budget expires.
+        let start = crate::arch::x86_64::interrupts::tick_count();
+        loop {
+            let slot = interrupts::without_interrupts(|| {
+                let mut drv = DRIVER.lock();
+                let d = drv.as_mut()?;
+                let regs_virt = d.regs.virt_base();
+                let stride = d.doorbell_stride_bytes;
+                let io = d.io.as_mut()?;
+                drain_io_cq_locked(io, regs_virt, stride);
+                Some(io.slots[cid as usize])
+            });
+            if let Some(slot) = slot
+                && slot.filled
+            {
+                return if slot.status_code == 0 {
+                    Ok(())
+                } else {
+                    Err(slot.status_code)
+                };
+            }
+            let now = crate::arch::x86_64::interrupts::tick_count();
+            if now.wrapping_sub(start) >= ADMIN_COMMAND_TIMEOUT_TICKS {
+                log::error!("[nvme] I/O command timed out (polled)");
+                return Err(0xFFFF);
+            }
+            core::hint::spin_loop();
         }
-        let now = crate::arch::x86_64::interrupts::tick_count();
-        if now.wrapping_sub(start) >= ADMIN_COMMAND_TIMEOUT_TICKS {
-            log::error!("[nvme] I/O command timed out");
-            return Err(0xFFFF);
+    }
+
+    // Phase 3: read the completion status out of the slot. Re-acquire the
+    // lock with IF off so the ISR cannot race us on the same slot.
+    let slot = interrupts::without_interrupts(|| {
+        DRIVER
+            .lock()
+            .as_ref()
+            .and_then(|d| d.io.as_ref().map(|io| io.slots[cid as usize]))
+    })
+    .ok_or(0xFFFFu16)?;
+    if !slot.filled {
+        // ISR fired but the slot was overwritten or we looked before the
+        // completion drained. Fall through to a short polled wait.
+        let start = crate::arch::x86_64::interrupts::tick_count();
+        loop {
+            let (filled, sc) = interrupts::without_interrupts(|| {
+                let mut drv = DRIVER.lock();
+                let Some(d) = drv.as_mut() else {
+                    return (false, 0xFFFFu16);
+                };
+                let regs_virt = d.regs.virt_base();
+                let stride = d.doorbell_stride_bytes;
+                let Some(io) = d.io.as_mut() else {
+                    return (false, 0xFFFFu16);
+                };
+                drain_io_cq_locked(io, regs_virt, stride);
+                let s = io.slots[cid as usize];
+                (s.filled, s.status_code)
+            });
+            if filled {
+                return if sc == 0 { Ok(()) } else { Err(sc) };
+            }
+            let now = crate::arch::x86_64::interrupts::tick_count();
+            if now.wrapping_sub(start) >= ADMIN_COMMAND_TIMEOUT_TICKS {
+                log::error!("[nvme] I/O completion slot never filled");
+                return Err(0xFFFF);
+            }
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
+    }
+    if slot.status_code == 0 {
+        Ok(())
+    } else {
+        Err(slot.status_code)
     }
 }
 
@@ -1025,11 +1232,21 @@ fn drain_io_cq_locked(io: &mut IoQueuePair, regs_virt: usize, stride: usize) {
         }
         let cid = entry.cid;
         if (cid as usize) < io.slots.len() {
+            let waker = io.slots[cid as usize].waker_task;
             io.slots[cid as usize] = NvmeCompletionSlot {
                 result: entry.result,
                 status_code: knvme::completion_status_code(&entry),
                 filled: true,
+                waker_task: waker,
             };
+            // Publish + wake the blocked task (D.4). The flag is consumed
+            // by `block_current_unless_woken`; the wake_task call delivers
+            // the reschedule IPI so the blocked task re-enters the
+            // scheduler and observes the filled slot.
+            IO_REQ_WOKEN.store(true, Ordering::Release);
+            if waker.0 != 0 {
+                wake_task(waker);
+            }
         }
         io.cq_head = (io.cq_head + 1) % io.queue_entries;
         if io.cq_head == 0 {
