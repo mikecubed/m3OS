@@ -6,6 +6,7 @@ pub mod address_space;
 pub mod buddy;
 pub mod cred;
 pub mod cross_cpu_free;
+pub mod e1000;
 pub mod fb;
 pub mod fs;
 pub mod input;
