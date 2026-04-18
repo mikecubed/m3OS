@@ -1,11 +1,39 @@
 //! Reserved-region set algebra — pure logic, host-testable.
 //!
-//! Scaffolding stubs for Phase 55a Track A.3. The real implementation is
-//! introduced in a follow-up commit; this commit lands only the failing
-//! test suite and the minimum type surface the tests need to compile.
+//! DMAR RMRR entries (firmware GPU framebuffer, ACPI reclaim, EFI runtime)
+//! and IVRS unity-map ranges describe memory that must remain identity-mapped
+//! in every IOMMU domain or the affected device hangs. Both Intel VT-d and
+//! AMD-Vi consume the same set-algebra helpers; declaring them once keeps the
+//! two vendor paths free of parallel bugs.
+//!
+//! # Invariants
+//!
+//! After any mutation, the backing vector is sorted by `start` and contains
+//! no two overlapping or touching ranges. "Touching" means the end of one
+//! range equals the start of the next — such ranges are merged because they
+//! form a contiguous span; their flag bitmasks are combined via bitwise OR.
+//!
+//! # Design
+//!
+//! Addresses are plain `u64` values: this module is intentionally free of any
+//! `x86_64` crate dependency so it is host-testable. `contains` runs a binary
+//! search over the sorted vector, giving `O(log N)` lookup.
 
 use alloc::vec::Vec;
 
+/// A flag bitmask describing properties of a reserved region.
+///
+/// Bits are interpreted by the caller. Typical values:
+///
+/// | Bit | Meaning            |
+/// |----:|--------------------|
+/// |   0 | writable           |
+/// |   1 | executable         |
+/// |   2 | cacheable          |
+/// |   3 | firmware-owned     |
+///
+/// Operations on a `ReservedRegionSet` combine flags via bitwise OR when two
+/// regions merge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RegionFlags(pub u32);
 
@@ -16,15 +44,22 @@ impl RegionFlags {
     pub const CACHEABLE: Self = Self(1 << 2);
     pub const FIRMWARE_OWNED: Self = Self(1 << 3);
 
-    pub const fn union(self, _other: Self) -> Self {
-        Self(0)
+    /// Combine two flag masks via bitwise OR.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
+    /// Raw bit access for callers that need to test specific bits.
     pub const fn bits(self) -> u32 {
         self.0
     }
 }
 
+/// A single reserved physical-memory region.
+///
+/// `start` is a physical address expressed as `u64` (pure logic — no
+/// `x86_64::PhysAddr` dependency). `len` is the length in bytes. A region
+/// covers `[start, start + len)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservedRegion {
     pub start: u64,
@@ -33,51 +68,144 @@ pub struct ReservedRegion {
 }
 
 impl ReservedRegion {
+    /// One past the last byte covered by this region, as a `u64`.
+    ///
+    /// Saturating arithmetic: a region whose nominal end overflows is treated
+    /// as ending at `u64::MAX`. This lets us reason about set algebra without
+    /// panicking on pathological input.
     pub fn end(&self) -> u64 {
-        0
+        self.start.saturating_add(self.len as u64)
     }
 
-    pub fn contains_addr(&self, _addr: u64) -> bool {
-        false
+    /// Returns `true` if `addr` lies within `[start, end)`.
+    pub fn contains_addr(&self, addr: u64) -> bool {
+        addr >= self.start && addr < self.end()
     }
 }
 
+/// A sorted, non-overlapping, non-touching set of reserved regions.
+///
+/// Construction: start empty via [`ReservedRegionSet::new`], then insert
+/// regions one at a time with [`ReservedRegionSet::insert`] or merge in
+/// another set with [`ReservedRegionSet::union`]. Every mutating operation
+/// restores the invariant that `regions` is sorted by `start` and contains
+/// no overlapping or touching spans.
 #[derive(Clone, Debug, Default)]
 pub struct ReservedRegionSet {
     regions: Vec<ReservedRegion>,
 }
 
 impl ReservedRegionSet {
+    /// Create an empty set.
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),
         }
     }
 
-    pub fn insert(&mut self, _region: ReservedRegion) {
-        // Stub — real implementation in follow-up commit.
+    /// Insert a region and merge with any overlapping or touching neighbors.
+    ///
+    /// Flags of merged regions are combined with bitwise OR. Zero-length
+    /// regions are ignored (they contribute nothing to the set).
+    pub fn insert(&mut self, region: ReservedRegion) {
+        if region.len == 0 {
+            return;
+        }
+        // Binary-search for the insertion point by `start`. `binary_search_by`
+        // returns `Err(idx)` when no element matches; `Ok(idx)` when an element
+        // with the same `start` is already present. Both outcomes point at the
+        // correct insertion index for maintaining sort order.
+        let pos = self
+            .regions
+            .binary_search_by(|r| r.start.cmp(&region.start))
+            .unwrap_or_else(|i| i);
+        self.regions.insert(pos, region);
+        self.merge_overlapping();
     }
 
-    pub fn union(&mut self, _other: &ReservedRegionSet) {
-        // Stub — real implementation in follow-up commit.
+    /// Union every region from `other` into `self`.
+    ///
+    /// Overlapping and touching regions merge; flags combine via bitwise OR.
+    pub fn union(&mut self, other: &ReservedRegionSet) {
+        if other.regions.is_empty() {
+            return;
+        }
+        // Append then sort once; a single merge pass then collapses any
+        // overlaps or touches.
+        self.regions.extend_from_slice(&other.regions);
+        self.regions.sort_by_key(|r| r.start);
+        self.merge_overlapping();
     }
 
+    /// Merge overlapping or touching neighbors in a single left-to-right pass.
+    ///
+    /// Visible in-crate so the `iommu` subsystem can re-run the normalization
+    /// step if it rebuilds the backing vector directly. Callers outside this
+    /// crate should use [`insert`](Self::insert) or [`union`](Self::union),
+    /// which maintain the invariant automatically.
     pub(crate) fn merge_overlapping(&mut self) {
-        // Stub — real implementation in follow-up commit.
+        if self.regions.len() < 2 {
+            return;
+        }
+        let mut merged: Vec<ReservedRegion> = Vec::with_capacity(self.regions.len());
+        // Iterate the sorted input; each iteration either extends the last
+        // merged region or pushes a new one.
+        for r in self.regions.iter().copied() {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end() => {
+                    // Overlapping or touching: extend `last` to cover `r`.
+                    let new_end = core::cmp::max(last.end(), r.end());
+                    // Recompute length as (end - start). Saturate at
+                    // `usize::MAX` so pathological pre-overflow input never
+                    // panics; real-world reserved regions are far smaller.
+                    let span = new_end.saturating_sub(last.start);
+                    last.len = if span > usize::MAX as u64 {
+                        usize::MAX
+                    } else {
+                        span as usize
+                    };
+                    last.flags = last.flags.union(r.flags);
+                }
+                _ => {
+                    merged.push(r);
+                }
+            }
+        }
+        self.regions = merged;
     }
 
-    pub fn contains(&self, _addr: u64) -> Option<&ReservedRegion> {
-        None
+    /// Return the region containing `addr`, if any.
+    ///
+    /// Runs in `O(log N)` via binary search over the sorted backing vector.
+    pub fn contains(&self, addr: u64) -> Option<&ReservedRegion> {
+        // Find the rightmost region whose `start <= addr`. Binary search
+        // returns `Ok(i)` when `regions[i].start == addr` (that region is the
+        // candidate) or `Err(i)` where `i` is the first index with a greater
+        // `start`; the candidate is then `i - 1`.
+        let idx = match self.regions.binary_search_by(|r| r.start.cmp(&addr)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let region = self.regions.get(idx)?;
+        if region.contains_addr(addr) {
+            Some(region)
+        } else {
+            None
+        }
     }
 
+    /// Iterate every region in `start`-order.
     pub fn iter(&self) -> impl Iterator<Item = &ReservedRegion> {
         self.regions.iter()
     }
 
+    /// Return the number of regions in the set.
     pub fn len(&self) -> usize {
         self.regions.len()
     }
 
+    /// Return `true` if the set contains no regions.
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
