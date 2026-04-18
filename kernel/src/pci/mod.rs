@@ -499,3 +499,405 @@ pub fn pci_scan_and_log() {
 pub fn init() {
     pci_scan_and_log();
 }
+
+// ===========================================================================
+// PCI capability walking + MSI / MSI-X parsing (Phase 55 B.2)
+//
+// The MSI / MSI-X surface is forward-compatible: Track C's `DeviceIrq`
+// contract and Track D/E NVMe / e1000 drivers are the first callers.  For
+// the B.2 landing commit nothing in the kernel yet calls `allocate_msi_vectors`,
+// so we `#[allow(dead_code)]` each item individually below.
+// ===========================================================================
+
+/// Maximum capability-list entries we will traverse before giving up — guards
+/// against circular capability pointers on malformed hardware.
+const MAX_CAP_WALK: usize = 48;
+
+/// Walk the PCI capability list for `(bus, device, function)` and pass each
+/// `(cap_id, cap_offset)` pair to `visit` until it returns `Some`.
+///
+/// `cap_offset` is the byte offset of the capability structure within PCI
+/// configuration space. `cap_id` is read from offset 0 of the capability;
+/// `next_ptr` is read from offset 1 and traversed until zero or we hit the
+/// guard limit.
+#[allow(dead_code)]
+pub fn walk_capabilities<F, R>(bus: u8, device: u8, function: u8, mut visit: F) -> Option<R>
+where
+    F: FnMut(u8, u8) -> Option<R>,
+{
+    // Status register bit 4 indicates a capabilities list is present.
+    let status = pci_config_read_u16(bus, device, function, kpci::PCI_STATUS);
+    if status & kpci::PCI_STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    let mut next = pci_config_read_u8(bus, device, function, kpci::PCI_CAPABILITIES_POINTER) & 0xFC;
+    let mut steps = 0;
+    while next != 0 && steps < MAX_CAP_WALK {
+        let cap_id = pci_config_read_u8(bus, device, function, next);
+        let next_ptr = pci_config_read_u8(bus, device, function, next.wrapping_add(1)) & 0xFC;
+        if let Some(result) = visit(cap_id, next) {
+            return Some(result);
+        }
+        // Guard against a cap pointing at itself.
+        if next_ptr == next {
+            break;
+        }
+        next = next_ptr;
+        steps += 1;
+    }
+    None
+}
+
+/// Find a capability with the given ID.  Returns the offset of the capability
+/// header in config space, or `None` if absent.
+#[allow(dead_code)]
+pub fn find_capability(bus: u8, device: u8, function: u8, cap_id: u8) -> Option<u8> {
+    walk_capabilities(bus, device, function, |id, off| {
+        if id == cap_id { Some(off) } else { None }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// MSI (legacy) capability
+// ---------------------------------------------------------------------------
+
+/// A parsed MSI capability.  Describes what the device supports and where in
+/// config space to program the message address/data.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct MsiCapability {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    /// Offset in config space of the capability header.
+    pub cap_offset: u8,
+    /// Value of the Message Control register at discovery time.
+    pub control: u16,
+    pub is_64bit: bool,
+    pub per_vector_mask: bool,
+    /// Number of vectors the device can request (power of two, 1..=32).
+    pub multi_message_capable: u8,
+}
+
+#[allow(dead_code)]
+impl MsiCapability {
+    fn read(bus: u8, device: u8, function: u8, cap_offset: u8) -> Self {
+        let control = pci_config_read_u16(
+            bus,
+            device,
+            function,
+            cap_offset + kpci::MSI_MESSAGE_CONTROL,
+        );
+        let is_64bit = control & kpci::MSI_CTRL_64BIT != 0;
+        let per_vector_mask = control & kpci::MSI_CTRL_PER_VECTOR_MASK != 0;
+        let multi_message_capable = kpci::msi_decode_mmc_count(control);
+        Self {
+            bus,
+            device,
+            function,
+            cap_offset,
+            control,
+            is_64bit,
+            per_vector_mask,
+            multi_message_capable,
+        }
+    }
+
+    /// Program Message Address/Data for a single delivered vector and enable
+    /// MSI.  `apic_lapic_id` is the target LAPIC ID (bits 19:12 of the MSI
+    /// address), `vector` is the IDT vector (bits 7:0 of the MSI data).
+    fn program_single(&self, apic_lapic_id: u8, vector: u8, count: u8) {
+        // MSI address: FEEx_xxxx with target LAPIC ID in bits 19:12.
+        let addr_low: u32 = 0xFEE0_0000 | ((apic_lapic_id as u32) << 12);
+        let addr_high: u32 = 0;
+        pci_config_write_u32_any(
+            self.bus,
+            self.device,
+            self.function,
+            (self.cap_offset + kpci::MSI_MESSAGE_ADDRESS) as u16,
+            addr_low,
+        );
+        if self.is_64bit {
+            pci_config_write_u32_any(
+                self.bus,
+                self.device,
+                self.function,
+                (self.cap_offset + kpci::MSI_MESSAGE_ADDRESS_HIGH) as u16,
+                addr_high,
+            );
+        }
+        // MSI data: delivery mode 000 (fixed), trigger edge, vector in bits 7:0.
+        let data_off = kpci::msi_data_offset(self.is_64bit);
+        pci_config_write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            self.cap_offset + data_off,
+            vector as u16,
+        );
+
+        // Update Message Control: enable + MME = log2(count).
+        let new_mc = kpci::msi_encode_mme(self.control, count) | kpci::MSI_CTRL_ENABLE;
+        pci_config_write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            self.cap_offset + kpci::MSI_MESSAGE_CONTROL,
+            new_mc,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MSI-X capability
+// ---------------------------------------------------------------------------
+
+/// A parsed MSI-X capability.  The table itself lives in BAR-mapped MMIO at
+/// `(table_bar, table_offset)`; the pending-bit array at `(pba_bar,
+/// pba_offset)`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct MsixCapability {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub cap_offset: u8,
+    pub control: u16,
+    /// Number of entries in the MSI-X table (decoded from control field).
+    pub table_size: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
+}
+
+#[allow(dead_code)]
+impl MsixCapability {
+    fn read(bus: u8, device: u8, function: u8, cap_offset: u8) -> Self {
+        let control = pci_config_read_u16(
+            bus,
+            device,
+            function,
+            cap_offset + kpci::MSIX_MESSAGE_CONTROL,
+        );
+        let table_size = kpci::msix_decode_table_size(control);
+        let raw_table =
+            pci_config_read_u32(bus, device, function, cap_offset + kpci::MSIX_TABLE_OFFSET);
+        let raw_pba =
+            pci_config_read_u32(bus, device, function, cap_offset + kpci::MSIX_PBA_OFFSET);
+        let (table_bar, table_offset) = kpci::msix_decode_offset_bir(raw_table);
+        let (pba_bar, pba_offset) = kpci::msix_decode_offset_bir(raw_pba);
+        Self {
+            bus,
+            device,
+            function,
+            cap_offset,
+            control,
+            table_size,
+            table_bar,
+            table_offset,
+            pba_bar,
+            pba_offset,
+        }
+    }
+
+    /// Compute the kernel-virtual pointer to the MSI-X table.  Uses the
+    /// existing BAR-raw encoding in [`PciDevice::bars`], mapped via
+    /// `phys_offset`.
+    ///
+    /// This is a minimal local helper — the full BAR mapping abstraction is
+    /// Track C. We only support 64-bit memory BARs here (MSI-X table must be
+    /// in MMIO per spec; BAR0/1 or a 64-bit pair starting at `table_bar`).
+    fn table_virt_addr(&self, bars: [u32; 6]) -> Option<usize> {
+        let bir = self.table_bar as usize;
+        if bir >= bars.len() {
+            return None;
+        }
+        let bar_lo = bars[bir];
+        // Must be memory BAR (bit 0 == 0).
+        if bar_lo & 0x1 != 0 {
+            return None;
+        }
+        let is_64 = (bar_lo >> 1) & 0x3 == 0x2;
+        let base_phys: u64 = if is_64 {
+            if bir + 1 >= bars.len() {
+                return None;
+            }
+            let hi = bars[bir + 1] as u64;
+            (bar_lo as u64 & 0xFFFF_FFF0) | (hi << 32)
+        } else {
+            (bar_lo as u64) & 0xFFFF_FFF0
+        };
+        let phys = base_phys + self.table_offset as u64;
+        Some((crate::mm::phys_offset() + phys) as usize)
+    }
+
+    /// Program table entry `index` to deliver `vector` to `apic_lapic_id`.
+    /// Each MSI-X table entry is 16 bytes: addr_low, addr_high, data, vector
+    /// control (bit 0 = masked).
+    fn program_entry(&self, bars: [u32; 6], index: u16, apic_lapic_id: u8, vector: u8) -> bool {
+        let Some(table_virt) = self.table_virt_addr(bars) else {
+            return false;
+        };
+        let entry_base = table_virt + (index as usize) * 16;
+        let addr_low: u32 = 0xFEE0_0000 | ((apic_lapic_id as u32) << 12);
+        let addr_high: u32 = 0;
+        let data: u32 = vector as u32;
+        // SAFETY: MSI-X table is MMIO mapped via phys_offset; each 4-byte
+        // field is aligned within a 16-byte entry boundary.
+        unsafe {
+            ptr::write_volatile(entry_base as *mut u32, addr_low);
+            ptr::write_volatile((entry_base + 4) as *mut u32, addr_high);
+            ptr::write_volatile((entry_base + 8) as *mut u32, data);
+            // Clear the vector mask bit to enable delivery.
+            ptr::write_volatile((entry_base + 12) as *mut u32, 0);
+        }
+        true
+    }
+
+    /// Enable the MSI-X function and clear the function-mask bit.
+    fn enable(&self) {
+        let new_mc = (self.control & !kpci::MSIX_CTRL_FN_MASK) | kpci::MSIX_CTRL_ENABLE;
+        pci_config_write_u16(
+            self.bus,
+            self.device,
+            self.function,
+            self.cap_offset + kpci::MSIX_MESSAGE_CONTROL,
+            new_mc,
+        );
+    }
+}
+
+/// Find the MSI capability for a device, if any.
+#[allow(dead_code)]
+pub fn find_msi(bus: u8, device: u8, function: u8) -> Option<MsiCapability> {
+    let off = find_capability(bus, device, function, kpci::CAP_ID_MSI)?;
+    Some(MsiCapability::read(bus, device, function, off))
+}
+
+/// Find the MSI-X capability for a device, if any.
+#[allow(dead_code)]
+pub fn find_msix(bus: u8, device: u8, function: u8) -> Option<MsixCapability> {
+    let off = find_capability(bus, device, function, kpci::CAP_ID_MSIX)?;
+    Some(MsixCapability::read(bus, device, function, off))
+}
+
+// ---------------------------------------------------------------------------
+// MSI vector allocation pool (Phase 55 B.2)
+// ---------------------------------------------------------------------------
+
+/// Lowest IDT vector we hand out for device MSI / MSI-X interrupts.  Vectors
+/// 32..=47 are reserved for legacy PIC/APIC IRQs and the SMP IPI block.
+#[allow(dead_code)]
+pub const MSI_VECTOR_BASE: u8 = 0x60;
+/// One past the highest IDT vector we will hand out.  The APIC spurious
+/// vector is 0xFF, and we leave 0xF0–0xFE alone for future expansion.
+#[allow(dead_code)]
+pub const MSI_VECTOR_TOP: u8 = 0xEF;
+
+static MSI_POOL: Mutex<kpci::MsiVectorAllocator> = Mutex::new(kpci::MsiVectorAllocator::new(
+    MSI_VECTOR_BASE,
+    MSI_VECTOR_TOP,
+));
+
+/// Reserve `count` consecutive MSI vectors.  `count` must be a power of two.
+#[allow(dead_code)]
+pub fn reserve_msi_vectors(count: u8) -> Option<u8> {
+    MSI_POOL.lock().allocate(count)
+}
+
+// ---------------------------------------------------------------------------
+// Allocated vector record
+// ---------------------------------------------------------------------------
+
+/// Result of a successful MSI or MSI-X vector allocation for a device.
+/// Vectors are returned as an inclusive range starting at `first_vector`.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct AllocatedMsi {
+    /// First IDT vector (subsequent ones are `first_vector + i`).
+    pub first_vector: u8,
+    pub count: u8,
+    pub kind: MsiKind,
+}
+
+/// Which capability was programmed.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsiKind {
+    Msi,
+    MsiX,
+}
+
+/// Allocate `count` MSI or MSI-X vectors for a device and program the
+/// capability.  Prefers MSI-X when available, falls back to MSI, returns
+/// `None` if neither capability is present or no vectors are free.
+///
+/// `count` must be a power of two.  The caller is expected to register
+/// handlers for the returned vectors through the IDT path (Track C will make
+/// this uniform via the `DeviceIrq` contract).
+#[allow(dead_code)]
+pub fn allocate_msi_vectors(dev: &PciDevice, count: u8) -> Option<AllocatedMsi> {
+    if !count.is_power_of_two() {
+        return None;
+    }
+    let apic_id = crate::arch::x86_64::apic::current_lapic_id();
+
+    if let Some(msix) = find_msix(dev.bus, dev.device, dev.function)
+        && msix.table_size as u32 >= count as u32
+    {
+        let first_vector = reserve_msi_vectors(count)?;
+        for i in 0..count {
+            if !msix.program_entry(dev.bars, i as u16, apic_id, first_vector + i) {
+                log::warn!(
+                    "[pci-msi] device {:04x}:{:04x} MSI-X table BAR unmappable; aborting",
+                    dev.vendor_id,
+                    dev.device_id
+                );
+                return None;
+            }
+        }
+        msix.enable();
+        log::info!(
+            "[pci-msi] {:04x}:{:04x}: MSI-X vectors {:#x}..{:#x} (lapic {})",
+            dev.vendor_id,
+            dev.device_id,
+            first_vector,
+            first_vector + count - 1,
+            apic_id
+        );
+        return Some(AllocatedMsi {
+            first_vector,
+            count,
+            kind: MsiKind::MsiX,
+        });
+    }
+
+    if let Some(msi) = find_msi(dev.bus, dev.device, dev.function)
+        && msi.multi_message_capable >= count
+    {
+        let first_vector = reserve_msi_vectors(count)?;
+        msi.program_single(apic_id, first_vector, count);
+        log::info!(
+            "[pci-msi] {:04x}:{:04x}: MSI vectors {:#x}..{:#x} (lapic {})",
+            dev.vendor_id,
+            dev.device_id,
+            first_vector,
+            first_vector + count - 1,
+            apic_id
+        );
+        return Some(AllocatedMsi {
+            first_vector,
+            count,
+            kind: MsiKind::Msi,
+        });
+    }
+
+    // No MSI/MSI-X available — caller should fall back to legacy INTx.
+    log::info!(
+        "[pci-msi] {:04x}:{:04x}: no MSI/MSI-X capability — fall back to INTx",
+        dev.vendor_id,
+        dev.device_id
+    );
+    None
+}

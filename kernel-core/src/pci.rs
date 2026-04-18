@@ -223,6 +223,44 @@ pub fn msi_encode_mme(mc: u16, enable_count: u8) -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// MSI IDT-vector allocation (pure arithmetic — kernel side owns the static)
+// ---------------------------------------------------------------------------
+
+/// A minimal bump-style allocator for IDT vector ranges used by MSI / MSI-X.
+///
+/// MSI requires contiguous, aligned vectors: when the device asks for `count`
+/// vectors the starting vector must be a multiple of `count`.  The kernel-side
+/// `MSI_POOL` wraps this in a `Mutex` and passes the hardware-global `base`
+/// and `top`.
+pub struct MsiVectorAllocator {
+    next: u8,
+    top: u8,
+}
+
+impl MsiVectorAllocator {
+    pub const fn new(base: u8, top: u8) -> Self {
+        Self { next: base, top }
+    }
+
+    /// Reserve `count` consecutive vectors aligned to `count`.  `count` must
+    /// be a power of two in 1..=32.  Returns the first vector, or `None` if
+    /// the pool is exhausted.
+    pub fn allocate(&mut self, count: u8) -> Option<u8> {
+        if count == 0 || !count.is_power_of_two() || count > 32 {
+            return None;
+        }
+        let mask = count.wrapping_sub(1);
+        let aligned_start = (self.next.checked_add(mask)?) & !mask;
+        let end = (aligned_start as u16) + count as u16;
+        if end > self.top as u16 {
+            return None;
+        }
+        self.next = end as u8;
+        Some(aligned_start)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -430,5 +468,36 @@ mod tests {
         assert_eq!(msi_mask_offset(true), 0x10);
         assert_eq!(msi_pending_offset(false), 0x10);
         assert_eq!(msi_pending_offset(true), 0x14);
+    }
+
+    #[test]
+    fn msi_vector_allocator_aligns_to_count() {
+        let mut pool = MsiVectorAllocator::new(0x60, 0xF0);
+        // count=1: no alignment constraint — start at 0x60.
+        assert_eq!(pool.allocate(1), Some(0x60));
+        assert_eq!(pool.allocate(1), Some(0x61));
+        // count=4: next aligned-to-4 is 0x64.
+        assert_eq!(pool.allocate(4), Some(0x64));
+        // Allocator advanced past end of the 4-wide block.
+        assert_eq!(pool.allocate(1), Some(0x68));
+        // count=8: next aligned-to-8 is 0x70.
+        assert_eq!(pool.allocate(8), Some(0x70));
+    }
+
+    #[test]
+    fn msi_vector_allocator_rejects_non_power_of_two_and_oversize() {
+        let mut pool = MsiVectorAllocator::new(0x60, 0xF0);
+        assert_eq!(pool.allocate(0), None);
+        assert_eq!(pool.allocate(3), None);
+        assert_eq!(pool.allocate(64), None);
+    }
+
+    #[test]
+    fn msi_vector_allocator_returns_none_when_full() {
+        let mut pool = MsiVectorAllocator::new(0xE0, 0xF0);
+        assert_eq!(pool.allocate(8), Some(0xE0));
+        assert_eq!(pool.allocate(8), Some(0xE8));
+        // Only 0x10 vectors in the pool, exhausted now.
+        assert_eq!(pool.allocate(1), None);
     }
 }
