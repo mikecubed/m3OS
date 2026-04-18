@@ -346,11 +346,13 @@ fn e1000_interrupt_handler() {
         let driver = DRIVER.lock();
         match driver.as_ref() {
             Some(d) => {
+                // ICR on the 82540EM is read-to-clear: the read returns the
+                // set cause bits and atomically clears them.  §13.4.17 does
+                // not require writing the value back, and QEMU's emulated
+                // e1000 does not expect it — removing the echo-write keeps
+                // the ISR minimal and rules out any write-after-clear
+                // re-latching edge cases.
                 let icr = d.read_reg(E1000Regs::ICR);
-                // The §13 spec says ICR is read-to-clear on the 82540EM, but
-                // some revisions require an explicit write-back of the same
-                // bits.  Writing the value we just read is idempotent.
-                d.write_reg(E1000Regs::ICR, icr);
                 // Also refresh the last-status snapshot while we hold the
                 // lock so a shell poll doesn't race a writer.
                 let status = d.read_reg(E1000Regs::STATUS);
@@ -751,12 +753,13 @@ fn init_with_handle(handle: pci::PciDeviceHandle) -> Result<(), &'static str> {
         }
     };
 
-    // Arm the causes we care about: RX timer (RXT0), RX threshold (RXDMT0),
-    // RX overrun (RXO), and link-status change (LSC).  TX completions are
-    // handled inline in `e1000_transmit`; we don't need TXDW interrupts.
-    let ims = irq_cause::RXT0 | irq_cause::RXDMT0 | irq_cause::RXO | irq_cause::LSC;
-    mmio.write_reg::<u32>(E1000Regs::IMS, ims);
-
+    // Publish the driver **before** arming IMS.  If we armed IMS first, an
+    // LSC / RXT0 could fire before `DRIVER` is `Some`, the ISR would return
+    // early without reading ICR, and the interrupt would remain asserted on
+    // a level-triggered INTx line — producing an interrupt storm that
+    // stalls the CPU.  (MSI is edge-triggered and wouldn't storm, but
+    // QEMU's classic e1000 has no MSI capability so we always take the INTx
+    // path here.)
     let device = E1000Device {
         pci: handle,
         mmio,
@@ -767,6 +770,19 @@ fn init_with_handle(handle: pci::PciDeviceHandle) -> Result<(), &'static str> {
     };
     *DRIVER.lock() = Some(device);
     E1000_READY.store(true, Ordering::Release);
+
+    // Arm the causes we care about: RX timer (RXT0), RX threshold (RXDMT0),
+    // RX overrun (RXO), and link-status change (LSC).  TX completions are
+    // handled inline in `e1000_transmit`; we don't need TXDW interrupts.
+    // Read back through the stored driver so we use the same MMIO alias
+    // the ISR will see.
+    {
+        let ims = irq_cause::RXT0 | irq_cause::RXDMT0 | irq_cause::RXO | irq_cause::LSC;
+        let d = DRIVER.lock();
+        if let Some(dev) = d.as_ref() {
+            dev.write_reg(E1000Regs::IMS, ims);
+        }
+    }
     log::info!("[e1000] driver initialized successfully");
     Ok(())
 }

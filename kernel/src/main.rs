@@ -218,8 +218,12 @@ fn init_task() -> ! {
     task::spawn(console_server_task, "console");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
-    // Spawn Phase 16 network processing task.
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
+    // Spawn Phase 16 network processing task.  Either virtio-net (legacy)
+    // or e1000 (Phase 55 Track E) being ready is enough to justify the
+    // task; it drains whichever driver's IRQ flag is set.
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire)
+        || net::e1000::E1000_READY.load(core::sync::atomic::Ordering::Acquire)
+    {
         task::spawn(net_task, "net");
     }
 
