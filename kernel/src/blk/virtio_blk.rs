@@ -382,6 +382,9 @@ struct VirtioBlkReq {
 
 #[allow(dead_code)]
 struct VirtioBlkDriver {
+    /// Claim handle — held for the driver's lifetime so no other driver can
+    /// re-bind to the same function.
+    pci: pci::PciDeviceHandle,
     io_base: u16,
     capacity_sectors: u64,
     request_queue: Virtqueue,
@@ -544,20 +547,25 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
 }
 
 // ===========================================================================
-// PCI device discovery (P24-T006)
+// PCI device discovery (P24-T006 + Phase 55 B.3)
 // ===========================================================================
 
-/// Find the virtio-blk device in the PCI device list.
-fn find_virtio_blk_device() -> Option<pci::PciDevice> {
-    let mut index = 0;
-    while let Some(dev) = pci::pci_device(index) {
-        if dev.vendor_id == VIRTIO_BLK_VENDOR
-            && (dev.device_id == VIRTIO_BLK_DEVICE_LEGACY
-                || dev.device_id == VIRTIO_BLK_DEVICE_TRANSITIONAL)
-        {
-            return Some(dev);
+/// Claim the virtio-blk device through the Phase-55 claim protocol.  Tries
+/// the legacy device ID first, then the transitional ID.
+fn claim_virtio_blk() -> Option<pci::PciDeviceHandle> {
+    for device_id in [VIRTIO_BLK_DEVICE_LEGACY, VIRTIO_BLK_DEVICE_TRANSITIONAL] {
+        match pci::claim_pci_device(VIRTIO_BLK_VENDOR, device_id, "virtio-blk") {
+            Ok(h) => return Some(h),
+            Err(pci::ClaimError::NotFound) => continue,
+            Err(pci::ClaimError::AlreadyClaimed) => {
+                log::warn!(
+                    "[virtio-blk] vendor {:04x} device {:04x} already claimed",
+                    VIRTIO_BLK_VENDOR,
+                    device_id
+                );
+                return None;
+            }
         }
-        index += 1;
     }
     None
 }
@@ -571,14 +579,15 @@ fn find_virtio_blk_device() -> Option<pci::PciDevice> {
 /// Finds the device on PCI, performs virtio reset + feature negotiation,
 /// sets up the request virtqueue, and reads the disk capacity.
 pub fn init() {
-    // P24-T006: Find the virtio-blk device.
-    let dev = match find_virtio_blk_device() {
-        Some(d) => d,
+    // Phase 55 B.3: claim the device through the registry.
+    let handle = match claim_virtio_blk() {
+        Some(h) => h,
         None => {
             log::warn!("[virtio-blk] no virtio-blk device found on PCI bus");
             return;
         }
     };
+    let dev = *handle.device();
 
     log::info!(
         "[virtio-blk] found device {:04x}:{:04x} at {:02x}:{:02x}.{}",
@@ -599,9 +608,9 @@ pub fn init() {
     log::info!("[virtio-blk] BAR0 I/O base: {:#x}", io_base);
 
     // Ensure PCI command register has I/O space (bit 0) and bus mastering (bit 2).
-    let cmd = pci::pci_config_read_u16(dev.bus, dev.device, dev.function, 0x04);
+    let cmd = handle.read_config_u16(0x04);
     if cmd & 0x05 != 0x05 {
-        pci::pci_config_write_u16(dev.bus, dev.device, dev.function, 0x04, cmd | 0x05);
+        handle.write_config_u16(0x04, cmd | 0x05);
         log::info!("[virtio-blk] PCI command: enabled I/O space + bus mastering");
     }
 
@@ -686,6 +695,7 @@ pub fn init() {
     let dma_virt = (crate::mm::phys_offset() + dma_phys) as *mut u8;
 
     let driver = VirtioBlkDriver {
+        pci: handle,
         io_base,
         capacity_sectors,
         request_queue,

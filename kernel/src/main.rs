@@ -150,13 +150,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     net::virtio_net::init();
     if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
         // Route the virtio-net PCI interrupt through the I/O APIC.
+        // Phase 55 B.3: interrupt_line is read through the driver's claimed
+        // handle rather than re-scanning PCI config space.
         let mut irq_routed = false;
-        if let Some(dev) = net::virtio_net::find_virtio_net_device()
+        if let Some(line) = net::virtio_net::pci_interrupt_line()
             && acpi::io_apic_address().is_some()
-            && dev.interrupt_line != 0xFF
         {
             arch::x86_64::apic::route_pci_irq(
-                dev.interrupt_line,
+                line,
                 arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
             );
             irq_routed = true;
