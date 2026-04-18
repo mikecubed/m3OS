@@ -1,8 +1,15 @@
-//! PCI bus enumeration via Configuration Space mechanism #1 (I/O ports 0xCF8/0xCFC).
+//! PCI bus enumeration and configuration-space access.
 //!
 //! Scans all 256 buses, 32 devices per bus, up to 8 functions per device,
 //! and stores discovered devices in a static list for later use.
+//!
+//! Configuration space access:
+//! * Legacy mechanism #1 (I/O ports `0xCF8` / `0xCFC`) — always available.
+//! * PCIe ECAM (MMIO via the MCFG ACPI allocation) — preferred when present,
+//!   required for extended config space (offsets >= 256). See Phase 55 B.1.
 
+use core::ptr;
+use kernel_core::pci as kpci;
 use spin::Mutex;
 use x86_64::instructions::{interrupts, port::Port};
 
@@ -22,11 +29,11 @@ fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         | ((offset as u32) & 0xFC)
 }
 
-/// Read a 32-bit value from PCI configuration space.
+/// Legacy I/O-port read: 32-bit value from the first 256 bytes of config space.
 ///
 /// Interrupts are disabled for the duration of the two-port transaction
 /// to prevent races on the shared CONFIG_ADDRESS/CONFIG_DATA pair.
-fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+fn legacy_pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     let addr = config_address(bus, device, function, offset);
     interrupts::without_interrupts(|| {
         // SAFETY: Ports 0xCF8 and 0xCFC are the well-defined PCI configuration
@@ -39,6 +46,107 @@ fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
             data_port.read()
         }
     })
+}
+
+fn legacy_pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let addr = config_address(bus, device, function, offset);
+    interrupts::without_interrupts(|| {
+        // SAFETY: standard PCI mechanism-#1 write.
+        unsafe {
+            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+            let mut data_port = Port::<u32>::new(CONFIG_DATA);
+            addr_port.write(addr);
+            data_port.write(value);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PCIe ECAM (MMIO) configuration space — Phase 55 B.1
+// ---------------------------------------------------------------------------
+
+/// Translate a segment/bus to a kernel-virtual pointer into the ECAM region,
+/// if the bus is covered by an MCFG allocation.
+///
+/// Returns the base virtual address of the 4 KiB ECAM page for `(bus, device,
+/// function)` with the first `offset` bytes already added on.
+fn ecam_virt_addr(
+    segment_group: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Option<usize> {
+    let entries = crate::acpi::mcfg_entries()?;
+    let entry = kpci::mcfg_find_base(entries, segment_group, bus)?;
+    let phys = entry.ecam_address(bus, device, function, offset);
+    Some((crate::mm::phys_offset() + phys) as usize)
+}
+
+/// Read a 32-bit value from PCIe MMIO configuration space (ECAM).  Returns
+/// `None` if no MCFG allocation covers the target bus.
+pub fn pcie_mmio_config_read(bus: u8, device: u8, function: u8, offset: u16) -> Option<u32> {
+    debug_assert_eq!(offset & 3, 0, "PCIe MMIO u32 offset must be 4-byte aligned");
+    debug_assert!(offset < 4096, "PCIe MMIO offset must be < 4096");
+    let virt = ecam_virt_addr(0, bus, device, function, offset)?;
+    // SAFETY: ECAM MMIO regions are identity-mapped via phys_offset() and
+    // guaranteed aligned to 4 bytes by the debug assertion.
+    let value = unsafe { ptr::read_volatile(virt as *const u32) };
+    Some(value)
+}
+
+/// Write a 32-bit value to PCIe MMIO configuration space (ECAM).  Returns
+/// `false` if no MCFG allocation covers the target bus; the caller should
+/// fall back to legacy I/O.
+pub fn pcie_mmio_config_write(bus: u8, device: u8, function: u8, offset: u16, value: u32) -> bool {
+    debug_assert_eq!(offset & 3, 0, "PCIe MMIO u32 offset must be 4-byte aligned");
+    debug_assert!(offset < 4096, "PCIe MMIO offset must be < 4096");
+    let Some(virt) = ecam_virt_addr(0, bus, device, function, offset) else {
+        return false;
+    };
+    // SAFETY: ECAM MMIO regions are identity-mapped via phys_offset() and
+    // guaranteed aligned to 4 bytes by the debug assertion.
+    unsafe { ptr::write_volatile(virt as *mut u32, value) };
+    true
+}
+
+/// Read a 32-bit config value.  Uses PCIe MMIO when available (required for
+/// offsets >= 256), otherwise legacy I/O (offsets < 256 only).
+fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+    if let Some(v) = pcie_mmio_config_read(bus, device, function, offset) {
+        return v;
+    }
+    // Legacy fallback: only the first 256 bytes are reachable.
+    debug_assert!(
+        offset < 256,
+        "extended config space requires MCFG/ECAM; bus {} dev {} func {} offset {:#x} unreachable via legacy I/O",
+        bus,
+        device,
+        function,
+        offset
+    );
+    legacy_pci_config_read_u32(bus, device, function, offset as u8)
+}
+
+fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+    if pcie_mmio_config_write(bus, device, function, offset, value) {
+        return;
+    }
+    debug_assert!(
+        offset < 256,
+        "extended config space requires MCFG/ECAM; bus {} dev {} func {} offset {:#x} unreachable via legacy I/O",
+        bus,
+        device,
+        function,
+        offset
+    );
+    legacy_pci_config_write_u32(bus, device, function, offset as u8, value);
+}
+
+/// Legacy-compatible 32-bit config read (first 256 bytes only, u8 offset).
+/// Prefers ECAM MMIO when available so that behaviour is uniform.
+fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    pci_config_read_u32_any(bus, device, function, offset as u16)
 }
 
 /// Read a 16-bit value from PCI configuration space.
@@ -62,7 +170,8 @@ pub fn pci_config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
     ((dword >> shift) & 0xFF) as u8
 }
 
-/// Write a 16-bit value to PCI configuration space.
+/// Write a 16-bit value to PCI configuration space.  Routes through ECAM
+/// MMIO when available, otherwise legacy mechanism #1 ports.
 #[allow(dead_code)]
 pub fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
     debug_assert_eq!(
@@ -70,22 +179,80 @@ pub fn pci_config_write_u16(bus: u8, device: u8, function: u8, offset: u8, value
         0,
         "PCI config u16 offset must be 2-byte aligned"
     );
-    let addr = config_address(bus, device, function, offset);
-    interrupts::without_interrupts(|| {
-        // Read-modify-write: read the 32-bit dword, patch the 16-bit half.
-        // SAFETY: standard PCI configuration space mechanism #1.
-        unsafe {
-            let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
-            let mut data_port = Port::<u32>::new(CONFIG_DATA);
-            addr_port.write(addr);
-            let dword = data_port.read();
-            let shift = ((offset & 2) as u32) * 8;
-            let mask = !(0xFFFFu32 << shift);
-            let patched = (dword & mask) | ((value as u32) << shift);
-            addr_port.write(addr);
-            data_port.write(patched);
+    let dword_offset = offset & !0x3;
+    let dword = pci_config_read_u32_any(bus, device, function, dword_offset as u16);
+    let shift = ((offset & 2) as u32) * 8;
+    let mask = !(0xFFFFu32 << shift);
+    let patched = (dword & mask) | ((value as u32) << shift);
+    pci_config_write_u32_any(bus, device, function, dword_offset as u16, patched);
+}
+
+/// Read a 16-bit value from PCIe extended configuration space (offsets
+/// `0..4096`).  Returns `None` if the bus is not covered by MCFG and the
+/// offset is >= 256.
+#[allow(dead_code)]
+pub fn pcie_config_read_u16(bus: u8, device: u8, function: u8, offset: u16) -> Option<u16> {
+    debug_assert_eq!(
+        offset & 1,
+        0,
+        "PCIe config u16 offset must be 2-byte aligned"
+    );
+    debug_assert!(offset < 4096, "PCIe config offset must be < 4096");
+    let dword_offset = offset & !0x3;
+    let dword = if offset < 256 {
+        pci_config_read_u32_any(bus, device, function, dword_offset)
+    } else {
+        pcie_mmio_config_read(bus, device, function, dword_offset)?
+    };
+    let shift = ((offset & 2) as u32) * 8;
+    Some(((dword >> shift) & 0xFFFF) as u16)
+}
+
+/// Read an 8-bit value from PCIe extended configuration space.
+#[allow(dead_code)]
+pub fn pcie_config_read_u8(bus: u8, device: u8, function: u8, offset: u16) -> Option<u8> {
+    debug_assert!(offset < 4096, "PCIe config offset must be < 4096");
+    let dword_offset = offset & !0x3;
+    let dword = if offset < 256 {
+        pci_config_read_u32_any(bus, device, function, dword_offset)
+    } else {
+        pcie_mmio_config_read(bus, device, function, dword_offset)?
+    };
+    let shift = ((offset & 3) as u32) * 8;
+    Some(((dword >> shift) & 0xFF) as u8)
+}
+
+/// Write a 16-bit value to PCIe extended configuration space.  Returns
+/// `false` if the offset is >= 256 and no MCFG allocation covers the bus.
+#[allow(dead_code)]
+pub fn pcie_config_write_u16(bus: u8, device: u8, function: u8, offset: u16, value: u16) -> bool {
+    debug_assert_eq!(
+        offset & 1,
+        0,
+        "PCIe config u16 offset must be 2-byte aligned"
+    );
+    debug_assert!(offset < 4096, "PCIe config offset must be < 4096");
+    let dword_offset = offset & !0x3;
+    if offset >= 256 && crate::acpi::mcfg_entries().is_none() {
+        return false;
+    }
+    let dword = if offset < 256 {
+        pci_config_read_u32_any(bus, device, function, dword_offset)
+    } else {
+        match pcie_mmio_config_read(bus, device, function, dword_offset) {
+            Some(v) => v,
+            None => return false,
         }
-    });
+    };
+    let shift = ((offset & 2) as u32) * 8;
+    let mask = !(0xFFFFu32 << shift);
+    let patched = (dword & mask) | ((value as u32) << shift);
+    if offset < 256 {
+        pci_config_write_u32_any(bus, device, function, dword_offset, patched);
+        true
+    } else {
+        pcie_mmio_config_write(bus, device, function, dword_offset, patched)
+    }
 }
 
 // ---------------------------------------------------------------------------
