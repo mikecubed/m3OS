@@ -41,6 +41,21 @@ Clients need a documented way to submit surfaces or damage updates and receive i
 
 The graphical stack must fit the existing service model. This includes startup, focus ownership, recovery after crashes, and the rules for falling back to text-mode administration when needed.
 
+### Goal-A contract points (tiling-first compositor preconditions)
+
+`docs/appendix/gui/tiling-compositor-path.md` identifies four design decisions that Phase 56 must make early so a later keyboard-driven tiling compositor (Goal A — the omarchy/Hyprland *experience* on the Phase 56 substrate, without GPU dependencies and without Wayland) can land as additive policy code rather than a protocol rewrite. Phase 56 delivers the contract points only; the tiling-specific implementations (layout engine, chord engine, workspace state machine, native bar/launcher/lockscreen clients, animation engine) are explicitly Phase 56b / 57b / 57c work.
+
+| Goal-A decision | Phase 56 contract point | Delivered by |
+|---|---|---|
+| Layout policy in a swappable module from day one | A `LayoutPolicy` trait plus a default `FloatingLayout`; no toplevel geometry logic lives outside the trait | Phase 56 task list tracks A.7 and E.1 |
+| Keybind grab hook keyed on modifier sets ("swallow before client") | The input dispatcher checks a `(modifier_mask, keycode) → handler` bind table before focus routing; matched `KeyDown` (and paired `KeyUp`/`KeyRepeat`) are not forwarded to any client | Phase 56 task list tracks A.5 and D.4 |
+| Layer-shell-equivalent surface role | A `Layer` surface role with layer ordering, anchors, exclusive zones, and keyboard-interactivity modes | Phase 56 task list tracks A.6 and E.2 |
+| Control socket as a first-class protocol element | A separate AF_UNIX control endpoint with a minimum verb set (`version`, `list-surfaces`, `focus`, `register-bind`, `unregister-bind`, `subscribe`) and a subscribable event stream | Phase 56 task list tracks A.8 and E.4 |
+
+**Explicitly out of scope for Phase 56:** tiling layout algorithms (dwindle / master-stack / BSP / manual), workspace state machines, keybind chord / leader-key / per-mode binding tables, the `m3ctl`-driven scripting surface beyond the minimum verb set, and any native bar / launcher / notification / lockscreen clients. These are the realistic next increments on top of the Phase 56 substrate and are tracked separately in the Goal-A staging plan inside `docs/appendix/gui/tiling-compositor-path.md`.
+
+**Explicitly non-Wayland.** The Phase 56 client protocol is a m3OS-native protocol over AF_UNIX + Phase 50 page grants. No `wl_shm`, no libwayland, no wlroots, no Mesa/llvmpipe. See `docs/appendix/gui/wayland-gap-analysis.md` for the sizing of the three Wayland-direction paths and why none of them are in Phase 56.
+
 ## Critical and Non-Deferrable Items
 
 | Item | Why it cannot be deferred in this phase |
@@ -111,7 +126,7 @@ The client protocol defines the long-term shape of the GUI stack more than any s
 
 ## Companion Task List
 
-- Phase 56 task list — defer until implementation planning begins.
+- [Phase 56 Task List](./tasks/56-display-and-input-architecture-tasks.md)
 
 ## How Real OS Implementations Differ
 
@@ -122,6 +137,11 @@ The client protocol defines the long-term shape of the GUI stack more than any s
 ## Deferred Until Later
 
 - Rich widget/toolkit ecosystems
-- Hardware-accelerated composition
-- USB HID breadth beyond the needs of the first supported session
-- Desktop polish such as clipboard managers, notifications, and richer shells
+- Hardware-accelerated composition and live blur / shader effects
+- Tiling layout algorithms (dwindle, master-stack, BSP, manual), workspace state machines, keybind chord engine, and `hyprctl`-style scripting surface beyond the minimum control-socket verbs — Phase 56b territory per `docs/appendix/gui/tiling-compositor-path.md`
+- Native bar / launcher / notification daemon / lockscreen client implementations — Phase 57b territory
+- Animation engine (timing curves, vblank-aligned scheduling, window-move/fade/workspace-slide animations) — Phase 57c territory
+- Wayland protocol support of any kind (`wl_shm` shim, libwayland port, Mesa + llvmpipe, GPU-aware buffer transport) — see `docs/appendix/gui/wayland-gap-analysis.md` for sizing
+- USB HID breadth beyond the PS/2 AUX mouse needed for the first supported session
+- International / non-US keymap layouts, IME, dead keys, and compose sequences
+- Desktop polish such as clipboard managers, notifications, drag-and-drop, and richer shells

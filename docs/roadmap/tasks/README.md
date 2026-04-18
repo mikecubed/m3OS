@@ -268,9 +268,10 @@ flowchart TD
 | 55 | Hardware Substrate (PCIe MCFG, MSI/MSI-X, hardware-access layer, NVMe, Intel 82540EM e1000) | Complete | `phase-55` | [Tasks](./55-hardware-substrate-tasks.md) |
 | 55a | IOMMU Substrate (ACPI DMAR/IVRS, per-device VT-d/AMD-Vi domains, IOMMU-routed DMA) | Planned | `phase-55a` | Deferred until implementation planning |
 | 55b | Ring-3 Driver Host (capability-gated device-host syscalls, supervised userspace NVMe + e1000 drivers) | Planned | `phase-55b` | Deferred until implementation planning |
+| 56 | Display and Input Architecture | Planned | `phase-56` | [Tasks](./56-display-and-input-architecture-tasks.md) |
 
 ### Future Task Docs
-Task docs for Phases **55a, 55b, and 56 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **55a, 55b, and 57 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 
