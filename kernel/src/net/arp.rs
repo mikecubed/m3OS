@@ -4,7 +4,7 @@
 use spin::Mutex;
 
 use super::ethernet::{self, MAC_BROADCAST};
-use super::virtio_net::{self, MacAddr};
+use super::virtio_net::MacAddr;
 
 pub use kernel_core::net::arp::{ARP_OP_REPLY, ARP_OP_REQUEST, ArpPacket, build, parse};
 pub use kernel_core::types::Ipv4Addr;
@@ -85,7 +85,7 @@ pub fn resolve(target_ip: Ipv4Addr) -> Option<MacAddr> {
 
 /// Send an ARP request to resolve `target_ip`.
 pub fn send_request(target_ip: Ipv4Addr) {
-    let our_mac = match virtio_net::mac_address() {
+    let our_mac = match super::mac_address() {
         Some(m) => m,
         None => return,
     };
@@ -95,7 +95,7 @@ pub fn send_request(target_ip: Ipv4Addr) {
 
     let frame = ethernet::build(MAC_BROADCAST, our_mac, ethernet::ETHERTYPE_ARP, &arp_pkt);
 
-    virtio_net::send_frame(&frame);
+    super::send_frame(&frame);
     log::debug!(
         "[arp] sent request: who has {}.{}.{}.{}?",
         target_ip[0],
@@ -130,7 +130,7 @@ pub fn handle_arp(pkt: &ArpPacket) {
         ARP_OP_REQUEST => {
             let our_ip = super::config::our_ip();
             if pkt.target_ip == our_ip {
-                let our_mac = match virtio_net::mac_address() {
+                let our_mac = match super::mac_address() {
                     Some(m) => m,
                     None => return,
                 };
@@ -138,7 +138,7 @@ pub fn handle_arp(pkt: &ArpPacket) {
                 let reply = build(ARP_OP_REPLY, our_mac, our_ip, pkt.sender_mac, pkt.sender_ip);
                 let frame =
                     ethernet::build(pkt.sender_mac, our_mac, ethernet::ETHERTYPE_ARP, &reply);
-                virtio_net::send_frame(&frame);
+                super::send_frame(&frame);
 
                 log::debug!(
                     "[arp] sent reply to {}.{}.{}.{}",

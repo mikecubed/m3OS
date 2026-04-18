@@ -3,7 +3,6 @@
 use super::arp::{self, Ipv4Addr};
 use super::config;
 use super::ethernet;
-use super::virtio_net;
 
 #[allow(unused_imports)]
 pub use kernel_core::net::ipv4::{
@@ -12,7 +11,7 @@ pub use kernel_core::net::ipv4::{
 
 /// Send an IPv4 packet to the given destination.
 pub fn send(dst_ip: Ipv4Addr, protocol: u8, payload: &[u8]) {
-    let our_mac = match virtio_net::mac_address() {
+    let our_mac = match super::mac_address() {
         Some(m) => m,
         None => return,
     };
@@ -34,7 +33,7 @@ pub fn send(dst_ip: Ipv4Addr, protocol: u8, payload: &[u8]) {
 
     let ip_pkt = build(our_ip, dst_ip, protocol, payload);
     let frame = ethernet::build(dst_mac, our_mac, ethernet::ETHERTYPE_IPV4, &ip_pkt);
-    virtio_net::send_frame(&frame);
+    super::send_frame(&frame);
 }
 
 /// Dispatch a received IPv4 packet to the appropriate protocol handler.
