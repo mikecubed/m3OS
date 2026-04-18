@@ -64,7 +64,12 @@ struct DomainState {
 }
 
 /// A single live mapping recorded by the mock.
+///
+/// `len` and `flags` are recorded but not consulted by the current
+/// smoke test; the Track F.4 contract suite will assert on them
+/// directly, so they are kept on the struct rather than dropped.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct Mapping {
     phys: PhysAddr,
     len: usize,
@@ -86,6 +91,10 @@ impl MockUnit {
     }
 
     /// Count of live mappings across every domain the mock owns.
+    ///
+    /// Reserved for use by the Track F.4 contract suite; the smoke
+    /// test in this worktree asserts on `lookup_phys` instead.
+    #[allow(dead_code)]
     pub fn live_mapping_count(&self) -> usize {
         self.mappings.len()
     }
@@ -168,7 +177,8 @@ impl IommuUnit for MockUnit {
         if self.mappings.contains_key(&(domain, iova)) {
             return Err(DomainError::AlreadyMapped);
         }
-        self.mappings.insert((domain, iova), Mapping { phys, len, flags });
+        self.mappings
+            .insert((domain, iova), Mapping { phys, len, flags });
         Ok(())
     }
 

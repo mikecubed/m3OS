@@ -9,9 +9,7 @@
 mod fixtures;
 
 use fixtures::mock_unit::{MOCK_CAPABILITIES, MockUnit};
-use kernel_core::iommu::contract::{
-    DomainError, FaultRecord, IommuUnit, Iova, MapFlags, PhysAddr,
-};
+use kernel_core::iommu::contract::{DomainError, FaultRecord, IommuUnit, Iova, MapFlags, PhysAddr};
 
 fn noop_fault_handler(_record: &FaultRecord) {}
 
@@ -44,7 +42,10 @@ fn bring_up_create_map_unmap_destroy_round_trip() {
     assert!(unit.has_fault_handler());
 
     let caps = unit.capabilities();
-    assert_eq!(caps.address_width_bits, MOCK_CAPABILITIES.address_width_bits);
+    assert_eq!(
+        caps.address_width_bits,
+        MOCK_CAPABILITIES.address_width_bits
+    );
 
     unit.destroy_domain(domain).expect("destroy should succeed");
 }
