@@ -164,11 +164,13 @@ flowchart TD
 
     %% Hardware, local-system, and release gate phases
     P54a --> P55["Phase 55<br/>Hardware Substrate"]
+    P55 --> P55a["Phase 55a<br/>IOMMU Substrate"]
+    P55a --> P55b["Phase 55b<br/>Ring-3 Driver Host"]
     P47 --> P56["Phase 56<br/>Display and Input Architecture"]
-    P55 --> P56
+    P55b --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
     P53 --> P58["Phase 58<br/>Release 1.0 Gate"]
-    P55 --> P58
+    P55b --> P58
     P57 -.->|optional local-system branch| P58
 
     %% Post-1.0 platform growth
@@ -284,11 +286,13 @@ flowchart TD
 | 54 | Deep Serverization | Move meaningful storage/VFS and UDP policy slices into supervised ring-3 services with explicit degraded-mode fallbacks | Complete | `phase-54` | [Phase 54](./54-deep-serverization.md) | [Tasks](./tasks/54-deep-serverization-tasks.md) |
 | 54a | Post-Serverization Kernel Hygiene | Close the CLOEXEC/NONBLOCK plumbing gap and relocate arch-syscall cleanup wrappers into their owning subsystems | Planned | `phase-54a` | [Phase 54a](./54a-post-serverization-kernel-hygiene.md) | [Tasks](./tasks/54a-post-serverization-kernel-hygiene-tasks.md) |
 
-### Hardware, Local-System, and Release Phases (55 complete, 56+ planned)
+### Hardware, Local-System, and Release Phases (55 complete, 55a+ planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
 | 55 | Hardware Substrate | A narrow, real-hardware support story: PCIe MCFG + MSI/MSI-X, reusable hardware-access layer, NVMe storage, Intel 82540EM e1000 networking | Complete | `phase-55` | [Phase 55](./55-hardware-substrate.md) | [Tasks](./tasks/55-hardware-substrate-tasks.md) |
+| 55a | IOMMU Substrate | ACPI DMAR/IVRS parsing, per-device VT-d / AMD-Vi domains, IOMMU-routed `DmaBuffer<T>`, closes the Phase 55 IOMMU caveat | Planned | `phase-55a` | [Phase 55a](./55a-iommu-substrate.md) | Deferred until implementation planning |
+| 55b | Ring-3 Driver Host | Capability-gated device-host syscalls, supervised userspace NVMe and e1000 drivers, completes the Phase 55 ring-3 extraction deferral | Planned | `phase-55b` | [Phase 55b](./55b-ring-3-driver-host.md) | Deferred until implementation planning |
 | 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Planned | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | Deferred until implementation planning |
 | 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Planned | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | Deferred until implementation planning |
 | 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |
@@ -387,9 +391,24 @@ gantt
     Structural Hardening :done, p52b, after p52a, 1
     Architecture Evol.   :done, p52c, after p52b, 1
     Completion + Align   :done, p52d, after p52c, 1
-    Memory Modernization :p53a, after p52d, 1
-    Headless Hardening   :p53, after p53a, 1
-    Deep Serverization   :p54, after p53, 1
+    Memory Modernization :done, p53a, after p52d, 1
+    Headless Hardening   :done, p53, after p53a, 1
+    Deep Serverization   :done, p54, after p53, 1
+    Post-Serverization Hygiene :p54a, after p54, 1
+
+    section Hardware, Local-System, and Release (complete/planned)
+    Hardware Substrate      :done, p55, after p54a, 1
+    IOMMU Substrate         :p55a, after p55, 1
+    Ring-3 Driver Host      :p55b, after p55a, 1
+    Display and Input       :p56, after p55b, 1
+    Audio and Local Session :p57, after p56, 1
+    Release 1.0 Gate        :p58, after p57, 1
+
+    section Post-1.0 Platform Growth (planned)
+    Cross-Compiled Toolchains :p59, after p58, 1
+    Networking and GitHub     :p60, after p59, 1
+    Node.js                   :p61, after p60, 1
+    Claude Code               :p62, after p61, 1
 ```
 
 ## Required Documentation for Every Phase

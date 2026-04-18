@@ -366,9 +366,11 @@ future phase can revisit them as scope expands.
 
 - Broad laptop/desktop hardware certification
 - Wi-Fi, GPU, and USB peripheral matrices
-- IOMMU-aware DMA isolation (VT-d / AMD-Vi)
+- IOMMU-aware DMA isolation (VT-d / AMD-Vi) — tracked as
+  [Phase 55a — IOMMU Substrate](./roadmap/55a-iommu-substrate.md)
 - Ring-3 extraction of the NVMe and e1000 drivers following the Phase 54
-  `vfs_server` / `net_server` pattern
+  `vfs_server` / `net_server` pattern — tracked as
+  [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md)
 - Hardware-acceleration features not needed for the reference targets
 - e1000e family (82574, 82576, etc.), AHCI, xHCI, Realtek, HDA
 - PCIe AER, D3cold power management, hot-plug

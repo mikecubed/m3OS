@@ -123,7 +123,8 @@ A hardware phase is only finished if the project can reproduce the bring-up and 
 
 - Broad laptop/desktop certification
 - Wide Wi-Fi, GPU, and USB peripheral matrices
-- IOMMU-heavy isolation work
+- IOMMU-heavy isolation work — tracked as [Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md)
+- Ring-3 extraction of the NVMe and e1000 drivers — tracked as [Phase 55b — Ring-3 Driver Host](./55b-ring-3-driver-host.md)
 - Hardware-acceleration features not needed for the reference targets
 
 ## Reference Hardware Matrix

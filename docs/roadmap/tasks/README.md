@@ -143,6 +143,17 @@ flowchart TD
     P52a --> P52b["Phase 52b Tasks"]
     P52b --> P52c["Phase 52c Tasks"]
     P52c --> P52d["Phase 52d Tasks"]
+
+    %% Memory, hardening, serverization
+    P52d --> P53a["Phase 53a Tasks"]
+    P53a --> P53["Phase 53 Tasks"]
+    P53 --> P54["Phase 54 Tasks"]
+    P54 --> P54a["Phase 54a Tasks"]
+
+    %% Hardware substrate and extraction
+    P54a --> P55["Phase 55 Tasks"]
+    P55 --> P55a["Phase 55a Tasks"]
+    P55a --> P55b["Phase 55b Tasks"]
 ```
 
 ## Task Documents
@@ -255,9 +266,11 @@ flowchart TD
 | 54 | Deep serverization | Complete | `phase-54` | [Tasks](./54-deep-serverization-tasks.md) |
 | 54a | Post-serverization kernel hygiene | Planned | `phase-54a` | [Tasks](./54a-post-serverization-kernel-hygiene-tasks.md) |
 | 55 | Hardware Substrate (PCIe MCFG, MSI/MSI-X, hardware-access layer, NVMe, Intel 82540EM e1000) | Complete | `phase-55` | [Tasks](./55-hardware-substrate-tasks.md) |
+| 55a | IOMMU Substrate (ACPI DMAR/IVRS, per-device VT-d/AMD-Vi domains, IOMMU-routed DMA) | Planned | `phase-55a` | Deferred until implementation planning |
+| 55b | Ring-3 Driver Host (capability-gated device-host syscalls, supervised userspace NVMe + e1000 drivers) | Planned | `phase-55b` | Deferred until implementation planning |
 
 ### Future Task Docs
-Task docs for Phases **56 and later** are intentionally deferred until closer to implementation time.
+Task docs for Phases **55a, 55b, and 56 and later** are intentionally deferred until closer to implementation time.
 
 The main roadmap phases now define:
 
