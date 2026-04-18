@@ -24,3 +24,5 @@ pub mod device_map;
 pub mod iova;
 pub mod regions;
 pub mod tables;
+pub mod vtd_page_table;
+pub mod vtd_regs;
