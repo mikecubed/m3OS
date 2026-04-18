@@ -14,28 +14,44 @@
 //!   [`regions::ReservedRegionSet`] for the shared reserved-region pre-map
 //!   helper (E.4 / B.2 acceptance).
 //!
-//! # Test-first stub
+//! # AMD-Vi unity-map extraction — scope
 //!
-//! The tests in this file arrive in the first 55a-B commit; the
-//! implementation bodies currently return empty / placeholder values so the
-//! tests fail at runtime. Commit 2 replaces the stubs with the real logic.
+//! Per the AMD I/O Virtualization spec, unity-map address regions live in
+//! **IVMD** (I/O Virtualization Memory Definition) sub-tables of IVRS, not
+//! inside IVHD device entries. The Track A decoder currently decodes IVHD
+//! blocks (10h / 11h / 40h) but not IVMD; IVMD handling is planned for the
+//! AMD-Vi implementation track (D). [`reserved_regions_from_ivrs`] therefore
+//! returns an empty set, documented inline, and logs zero regions on AMD
+//! platforms. When Track D lands an IVMD decoder this function will be
+//! extended to populate the same set. This is explicitly recorded as a B.2
+//! deviation in the commit trail.
 
 use alloc::vec::Vec;
 
-use super::device_map::IommuUnitDescriptor;
-use super::regions::ReservedRegionSet;
-use super::tables::{DmarTables, IvrsTables};
+use super::device_map::{IommuUnitDescriptor, IommuVendor, ScopeRange};
+use super::regions::{RegionFlags, ReservedRegion, ReservedRegionSet};
+use super::tables::{DeviceScope, DmarTables, IvhdDeviceEntry, IvrsTables};
 
 // ---------------------------------------------------------------------------
 // Public types — reserved-region summaries
 // ---------------------------------------------------------------------------
 
 /// Summary of one reserved region for boot-time logging.
+///
+/// The kernel-side wrapper uses this to emit a single structured log line
+/// per region without re-walking the RMRR list; keeping the summary in
+/// `kernel-core` lets the host test that the boot-time log would cover
+/// every region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedRegionSummary {
+    /// Which ACPI table the region came from.
     pub source_table: ReservedRegionSource,
+    /// Zero-based index within that table's list of reserved entries
+    /// (e.g. RMRR index for DMAR).
     pub source_index: usize,
+    /// Physical start address.
     pub start: u64,
+    /// Length in bytes. Guaranteed >= 1 for every summarized region.
     pub len: u64,
 }
 
@@ -49,41 +65,187 @@ pub enum ReservedRegionSource {
 }
 
 // ---------------------------------------------------------------------------
-// Unit descriptor extraction (stubs)
+// Unit descriptor extraction
 // ---------------------------------------------------------------------------
 
 /// Build an [`IommuUnitDescriptor`] list from a decoded DMAR table.
 ///
-/// Stub: returns empty. Real impl in commit 2.
-pub fn iommu_units_from_dmar(_tables: &DmarTables) -> Vec<IommuUnitDescriptor> {
-    Vec::new()
+/// One descriptor is produced per DRHD. A DRHD whose `flags` bit 0
+/// (`INCLUDE_PCI_ALL`) is set expands to a single `0..=255` scope within
+/// its segment; other DRHDs produce one [`ScopeRange`] per device-scope
+/// entry covering `[start_bus, start_bus]` — bus-start granularity is
+/// sufficient for Phase 55a routing.
+pub fn iommu_units_from_dmar(tables: &DmarTables) -> Vec<IommuUnitDescriptor> {
+    let mut out = Vec::with_capacity(tables.drhds.len());
+    for (idx, drhd) in tables.drhds.iter().enumerate() {
+        let include_all = (drhd.flags & 0x01) != 0;
+        let scopes = if include_all {
+            // Synthesize a full-bus scope so the map builder knows which
+            // segment the `INCLUDE_PCI_ALL` unit lives in.
+            alloc::vec![ScopeRange {
+                segment: drhd.segment,
+                bus_start: 0,
+                bus_end: 255,
+            }]
+        } else {
+            drhd_scopes_to_ranges(drhd.segment, &drhd.device_scopes)
+        };
+        out.push(IommuUnitDescriptor {
+            unit_index: idx,
+            vendor: IommuVendor::Vtd,
+            register_base: drhd.register_base_address,
+            scopes,
+            include_all,
+        });
+    }
+    out
 }
 
 /// Build an [`IommuUnitDescriptor`] list from a decoded IVRS table.
 ///
-/// Stub: returns empty. Real impl in commit 2.
-pub fn iommu_units_from_ivrs(_tables: &IvrsTables) -> Vec<IommuUnitDescriptor> {
-    Vec::new()
+/// One descriptor is produced per IVHD block. A block with no decoded
+/// device entries is treated as "claim the whole segment" (include-all).
+pub fn iommu_units_from_ivrs(tables: &IvrsTables) -> Vec<IommuUnitDescriptor> {
+    let mut out = Vec::with_capacity(tables.ivhd_blocks.len());
+    for (idx, ivhd) in tables.ivhd_blocks.iter().enumerate() {
+        let scopes = ivhd_entries_to_ranges(ivhd.pci_segment, &ivhd.device_entries);
+        let include_all = scopes.is_empty();
+        let scopes = if include_all {
+            alloc::vec![ScopeRange {
+                segment: ivhd.pci_segment,
+                bus_start: 0,
+                bus_end: 255,
+            }]
+        } else {
+            scopes
+        };
+        out.push(IommuUnitDescriptor {
+            unit_index: idx,
+            vendor: IommuVendor::AmdVi,
+            register_base: ivhd.iommu_base_address,
+            scopes,
+            include_all,
+        });
+    }
+    out
+}
+
+/// Convert a DMAR DRHD's device-scope list into a flat [`ScopeRange`] vector.
+///
+/// Each device-scope entry's `start_bus` is the primary bus the scope
+/// claims. Phase 55a uses bus-start granularity everywhere; a future phase
+/// could look up secondary bus numbers via PCI config space to widen the
+/// range.
+fn drhd_scopes_to_ranges(segment: u16, scopes: &[DeviceScope]) -> Vec<ScopeRange> {
+    scopes
+        .iter()
+        .map(|s| ScopeRange {
+            segment,
+            bus_start: s.start_bus,
+            bus_end: s.start_bus,
+        })
+        .collect()
+}
+
+/// Convert an IVHD block's device-entry list into a [`ScopeRange`] vector.
+///
+/// Entries are processed left to right:
+///
+/// - `Select` produces a single-bus claim at `device_id >> 8`.
+/// - A pending `StartRange` followed by `EndRange` produces a range
+///   `[start_bus, end_bus]` using each entry's `device_id >> 8`.
+/// - `AliasSelect` / `AliasStartRange` are treated like their non-alias
+///   counterparts for bus-range purposes; the alias relationship is not
+///   part of bus-granularity routing.
+fn ivhd_entries_to_ranges(segment: u16, entries: &[IvhdDeviceEntry]) -> Vec<ScopeRange> {
+    let mut out = Vec::new();
+    let mut pending_start: Option<u8> = None;
+    for entry in entries {
+        match entry {
+            IvhdDeviceEntry::Select { device_id, .. }
+            | IvhdDeviceEntry::AliasSelect { device_id, .. } => {
+                let bus = (device_id >> 8) as u8;
+                out.push(ScopeRange {
+                    segment,
+                    bus_start: bus,
+                    bus_end: bus,
+                });
+            }
+            IvhdDeviceEntry::StartRange { device_id, .. }
+            | IvhdDeviceEntry::AliasStartRange { device_id, .. } => {
+                pending_start = Some((device_id >> 8) as u8);
+            }
+            IvhdDeviceEntry::EndRange { device_id, .. } => {
+                if let Some(start) = pending_start.take() {
+                    let end = (device_id >> 8) as u8;
+                    out.push(ScopeRange {
+                        segment,
+                        bus_start: core::cmp::min(start, end),
+                        bus_end: core::cmp::max(start, end),
+                    });
+                }
+                // A stray EndRange with no preceding StartRange is ignored.
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
-// Reserved-region extraction (stubs)
+// Reserved-region extraction — DMAR RMRRs
 // ---------------------------------------------------------------------------
 
-/// Extract RMRR regions from a decoded DMAR table.
+/// Extract RMRR regions from a decoded DMAR table into a [`ReservedRegionSet`].
 ///
-/// Stub: returns empty. Real impl in commit 2.
+/// Every RMRR becomes a [`ReservedRegion`] covering `[base_addr, limit_addr + 1)`
+/// with the `FIRMWARE_OWNED`, `WRITABLE`, and `CACHEABLE` flags set (firmware
+/// regions must remain identity-mapped writable to whoever owns them).
+/// Overlapping or touching RMRRs merge via the set's insert path.
+///
+/// RMRRs whose `base > limit` (malformed firmware) are skipped without
+/// panicking; no summary is emitted for skipped entries.
 pub fn reserved_regions_from_dmar(
-    _tables: &DmarTables,
+    tables: &DmarTables,
 ) -> (ReservedRegionSet, Vec<ReservedRegionSummary>) {
-    (ReservedRegionSet::new(), Vec::new())
+    let mut set = ReservedRegionSet::new();
+    let mut summaries = Vec::with_capacity(tables.rmrrs.len());
+    for (idx, rmrr) in tables.rmrrs.iter().enumerate() {
+        if rmrr.base_addr > rmrr.limit_addr {
+            continue;
+        }
+        // RMRR limit_addr is inclusive, so length = limit - base + 1.
+        let len_u64 = rmrr
+            .limit_addr
+            .saturating_sub(rmrr.base_addr)
+            .saturating_add(1);
+        let len = if len_u64 > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            len_u64 as usize
+        };
+        set.insert(ReservedRegion {
+            start: rmrr.base_addr,
+            len,
+            flags: RegionFlags::FIRMWARE_OWNED
+                .union(RegionFlags::WRITABLE)
+                .union(RegionFlags::CACHEABLE),
+        });
+        summaries.push(ReservedRegionSummary {
+            source_table: ReservedRegionSource::DmarRmrr,
+            source_index: idx,
+            start: rmrr.base_addr,
+            len: len_u64,
+        });
+    }
+    (set, summaries)
 }
 
 /// Extract reserved regions from a decoded IVRS table.
 ///
 /// AMD-Vi unity maps live in IVMD sub-tables which the Track A decoder does
-/// not yet decode. This stub is a documented no-op; Track D will extend it
-/// when IVMD support lands.
+/// not yet decode. This stub returns an empty set so the B.2 caller shape
+/// stays consistent across vendors. Track D will extend this when IVMD
+/// support lands.
 pub fn reserved_regions_from_ivrs(
     _tables: &IvrsTables,
 ) -> (ReservedRegionSet, Vec<ReservedRegionSummary>) {
@@ -92,12 +254,26 @@ pub fn reserved_regions_from_ivrs(
 
 /// Combined extraction path for both tables.
 ///
-/// Stub: returns empty. Real impl in commit 2.
+/// Merges DMAR RMRR regions (currently the only source) with any future
+/// IVRS IVMD regions. Returns the merged set together with the combined
+/// summary list so the kernel wrapper can emit one log line per summary.
 pub fn reserved_regions_from_tables(
-    _dmar: Option<&DmarTables>,
-    _ivrs: Option<&IvrsTables>,
+    dmar: Option<&DmarTables>,
+    ivrs: Option<&IvrsTables>,
 ) -> (ReservedRegionSet, Vec<ReservedRegionSummary>) {
-    (ReservedRegionSet::new(), Vec::new())
+    let mut set = ReservedRegionSet::new();
+    let mut summaries = Vec::new();
+    if let Some(d) = dmar {
+        let (s, sm) = reserved_regions_from_dmar(d);
+        set.union(&s);
+        summaries.extend(sm);
+    }
+    if let Some(i) = ivrs {
+        let (s, sm) = reserved_regions_from_ivrs(i);
+        set.union(&s);
+        summaries.extend(sm);
+    }
+    (set, summaries)
 }
 
 // ---------------------------------------------------------------------------

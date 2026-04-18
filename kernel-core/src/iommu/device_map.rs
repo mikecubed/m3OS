@@ -9,12 +9,14 @@
 //! That keeps hot-path DMA claim / release cheap even on platforms with many
 //! units.
 //!
-//! # Test-first stub
+//! # Design
 //!
-//! The tests in this file arrive in the first 55a-B commit; the
-//! implementation arrives in the second commit. `build` and `lookup`
-//! currently return placeholder values so the tests below fail, preserving
-//! the TDD red-phase evidence in `git log`.
+//! Addresses and IDs are plain scalar values (`u64`, `u16`, `u8`). This
+//! module intentionally avoids any dependency on `x86_64` so it stays
+//! host-testable. The acceptance criterion names `lookup(segment, bus,
+//! device, function)` returning `Option<usize>` where the returned index is
+//! into the caller's descriptor vector; that is exactly the shape exposed
+//! here.
 
 use alloc::vec::Vec;
 
@@ -47,10 +49,13 @@ pub struct ScopeRange {
 }
 
 impl ScopeRange {
-    /// `true` if the BDF falls within this range. Implementation lands in
-    /// commit 2; stub returns `false` so the red-phase test fails.
-    pub fn contains(&self, _segment: u16, _bus: u8) -> bool {
-        false
+    /// `true` if the BDF falls within this range (segment matches and bus
+    /// number is inside the inclusive range). Device and function fields
+    /// are ignored because DRHD / IVHD scopes operate at bus granularity;
+    /// filtering by specific `(device, function)` pairs is left to future
+    /// phases that need it.
+    pub fn contains(&self, segment: u16, bus: u8) -> bool {
+        self.segment == segment && bus >= self.bus_start && bus <= self.bus_end
     }
 }
 
@@ -84,7 +89,6 @@ pub struct DeviceToUnitMap {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 struct Entry {
     segment: u16,
     bus_start: u8,
@@ -95,24 +99,67 @@ struct Entry {
 impl DeviceToUnitMap {
     /// Build a map from a slice of unit descriptors.
     ///
-    /// Stub: returns an empty map. Replaced by the real impl in commit 2.
-    pub fn build(_descriptors: &[IommuUnitDescriptor]) -> Self {
-        Self {
-            entries: Vec::new(),
+    /// Each descriptor contributes one entry per scope in its `scopes`
+    /// vector. Descriptors with `include_all == true` contribute a single
+    /// `bus_start=0, bus_end=255` entry, whose segment is inferred from
+    /// the descriptor's first scope (or 0 when the scope vector is empty).
+    ///
+    /// Callers must pass descriptors whose `unit_index` equals the slice
+    /// position; that invariant is preserved by `iommu_units_from_acpi`.
+    pub fn build(descriptors: &[IommuUnitDescriptor]) -> Self {
+        let mut entries = Vec::new();
+        for desc in descriptors {
+            if desc.include_all {
+                // Derive the segment from the descriptor's first scope;
+                // fall back to 0 if the scope list is empty.
+                let segment = desc.scopes.first().map(|s| s.segment).unwrap_or(0);
+                entries.push(Entry {
+                    segment,
+                    bus_start: 0,
+                    bus_end: 255,
+                    unit_index: desc.unit_index,
+                });
+            } else {
+                for scope in &desc.scopes {
+                    entries.push(Entry {
+                        segment: scope.segment,
+                        bus_start: scope.bus_start,
+                        bus_end: scope.bus_end,
+                        unit_index: desc.unit_index,
+                    });
+                }
+            }
         }
+        // Sort by (segment, bus_start) so binary search can find the
+        // rightmost candidate in O(log N).
+        entries.sort_by_key(|e| (e.segment, e.bus_start));
+        Self { entries }
     }
 
     /// Look up the unit index that owns `(segment, bus, device, function)`.
     ///
-    /// Stub: always returns `None`. Replaced in commit 2.
-    pub fn lookup(
-        &self,
-        _segment: u16,
-        _bus: u8,
-        _device: u8,
-        _function: u8,
-    ) -> Option<usize> {
-        None
+    /// Returns `None` if no unit claims the BDF. `device` and `function`
+    /// are accepted for forward compatibility but currently ignored —
+    /// matching is at bus granularity because that is the level at which
+    /// DRHD / IVHD scopes declare their claims.
+    pub fn lookup(&self, segment: u16, bus: u8, _device: u8, _function: u8) -> Option<usize> {
+        // Binary-search for the rightmost entry with `(segment, bus_start)
+        // <= (segment, bus)`; confirm `bus_end >= bus`.
+        let target = (segment, bus);
+        let idx = match self
+            .entries
+            .binary_search_by_key(&target, |e| (e.segment, e.bus_start))
+        {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let entry = self.entries.get(idx)?;
+        if entry.segment == segment && bus >= entry.bus_start && bus <= entry.bus_end {
+            Some(entry.unit_index)
+        } else {
+            None
+        }
     }
 
     /// Number of flattened scope entries (not unit count).
