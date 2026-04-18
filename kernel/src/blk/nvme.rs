@@ -6,10 +6,14 @@
 //!   accessors — live in [`kernel_core::nvme`].
 //! * **D.1** — PCI discovery, BAR0 MMIO mapping, `CAP`/`VS` parsing,
 //!   controller reset with bounded `CAP.TO` timeout.
-//! * **D.2 (this commit)** — admin queue bring-up, controller enable, Identify
-//!   Controller / Identify Namespace; polled completions with a bounded
-//!   per-command timeout.
-//! * **D.3** — I/O queue pair, block read/write with PRP lists.
+//! * **D.2** — admin queue bring-up, controller enable, Identify Controller /
+//!   Identify Namespace; polled completions with a bounded per-command
+//!   timeout.
+//! * **D.3 (this commit)** — one I/O queue pair via Create I/O CQ / Create I/O
+//!   SQ, `nvme_read_sectors` / `nvme_write_sectors` using PRP entries (with a
+//!   PRP-list overflow page for buffers spanning >2 pages). `NVME_READY` is
+//!   set; the block dispatch layer ([`super::read_sectors`] /
+//!   [`super::write_sectors`]) prefers NVMe when ready.
 //! * **D.4** — MSI/MSI-X completion handler + waiter table.
 //!
 //! # Ring-0 placement
@@ -60,6 +64,20 @@ const ADMIN_COMMAND_TIMEOUT_TICKS: u64 = 5_000;
 /// wild.
 const ADMIN_QUEUE_ENTRIES: usize = 64;
 
+/// Queue depth for the single I/O queue pair (Phase 55 scope). 64 entries is
+/// more than enough — we serialize one request at a time under the driver
+/// lock, same as virtio-blk today.
+const IO_QUEUE_ENTRIES: usize = 64;
+
+/// Hardware page size we assume for PRP arithmetic. NVMe per-spec supports
+/// `2^(12 + MPSMIN) ..= 2^(12 + MPSMAX)`; we fix to 4 KiB because everything
+/// else in the kernel (frame allocator, `DmaBuffer`) works in 4 KiB pages.
+const NVME_PAGE_BYTES: usize = 4096;
+
+/// Our I/O queue is always qid=1 (admin is qid=0, only one data queue for
+/// Phase 55). Kept as a named constant so the doorbell math is self-explanatory.
+const IO_QUEUE_ID: u16 = 1;
+
 // ===========================================================================
 // Controller state
 // ===========================================================================
@@ -84,6 +102,8 @@ pub struct NvmeController {
     reset_timeout_ticks: u64,
     /// Admin queue pair (D.2).
     admin: Option<AdminQueue>,
+    /// I/O queue pair (D.3). `None` until `bring_up_io_queue` succeeds.
+    io: Option<IoQueuePair>,
     /// Active namespace identifier. Picked during Identify as the first
     /// active namespace.
     namespace_id: u32,
@@ -142,6 +162,32 @@ struct AdminQueue {
 
 // SAFETY: AdminQueue is only accessed under DRIVER.lock().
 unsafe impl Send for AdminQueue {}
+
+// ===========================================================================
+// I/O queue (D.3)
+// ===========================================================================
+
+/// One I/O queue pair — submission + completion. Phase 55 ships exactly one
+/// of these; multiple pairs (per-CPU, per-namespace) are deferred.
+struct IoQueuePair {
+    sq: DmaBuffer<[knvme::NvmeCommand]>,
+    cq: DmaBuffer<[knvme::NvmeCompletion]>,
+    queue_entries: u16,
+    sq_tail: u16,
+    cq_head: u16,
+    /// Phase tag tracker — same convention as [`AdminQueue::phase`].
+    phase: bool,
+    /// Per-CID slots. Mirrors the admin-queue waiter layout.
+    slots: Vec<NvmeCompletionSlot>,
+    next_cid: u16,
+    /// Persistent PRP list page used when a request spans more than two
+    /// pages. Allocated once and reused because we serialize at most one
+    /// request in flight.
+    prp_list: DmaBuffer<[u64]>,
+}
+
+// SAFETY: IoQueuePair is only accessed under DRIVER.lock().
+unsafe impl Send for IoQueuePair {}
 
 // ===========================================================================
 // Driver registration
@@ -237,6 +283,7 @@ fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         version,
         reset_timeout_ticks,
         admin: None,
+        io: None,
         namespace_id: 0,
         namespace_lbas: 0,
         namespace_sector_bytes: 0,
@@ -248,7 +295,70 @@ fn nvme_probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         *DRIVER.lock() = None;
         return DriverProbeResult::Failed(e);
     }
+
+    if let Err(e) = bring_up_io_queue() {
+        log::error!("[nvme] I/O queue bring-up failed: {}", e);
+        *DRIVER.lock() = None;
+        return DriverProbeResult::Failed(e);
+    }
+
+    NVME_READY.store(true, Ordering::Release);
+    let (nsid, capacity) = {
+        let drv = DRIVER.lock();
+        drv.as_ref()
+            .map(|d| (d.namespace_id, d.namespace_lbas))
+            .unwrap_or((0, 0))
+    };
+    log::info!(
+        "[nvme] driver initialized; active nsid={} capacity={} sectors",
+        nsid,
+        capacity
+    );
+
+    // Data-path smoke: write a sector-sized pattern to LBA 0 and read it
+    // back. Catches PRP construction / doorbell / completion-decode bugs
+    // early so they do not show up later as silent filesystem corruption.
+    // If the smoke fails, NVMe stays bound but NVME_READY is cleared so the
+    // block dispatch layer falls back to virtio-blk.
+    if let Err(e) = data_path_smoke() {
+        log::error!("[nvme] data-path smoke failed: {:#x}; falling back", e);
+        NVME_READY.store(false, Ordering::Release);
+    }
     DriverProbeResult::Bound
+}
+
+/// One-shot smoke test: write a known pattern to LBA 0, read it back, and
+/// verify every byte matches. Runs once from `nvme_probe` before the
+/// scheduler starts, so a silent I/O bug (PRP layout, doorbell offset,
+/// phase-bit off-by-one) surfaces at bring-up rather than when userspace
+/// first touches the device.
+fn data_path_smoke() -> Result<(), u16> {
+    let sector = namespace_sector_bytes() as usize;
+    if sector == 0 {
+        return Err(0xFFFF);
+    }
+    let mut tx = alloc::vec::Vec::with_capacity(sector);
+    for i in 0..sector {
+        tx.push(((i * 31 + 7) & 0xFF) as u8);
+    }
+    write_sectors(0, 1, &tx)?;
+    let mut rx = alloc::vec![0u8; sector];
+    read_sectors(0, 1, &mut rx)?;
+    if rx != tx {
+        log::error!(
+            "[nvme] smoke mismatch: first differing byte at offset {}",
+            rx.iter()
+                .zip(tx.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0)
+        );
+        return Err(0xFFFE);
+    }
+    log::info!(
+        "[nvme] data-path smoke OK ({}B round-trip at LBA 0)",
+        sector
+    );
+    Ok(())
 }
 
 /// Compute the reset / enable polling window in tick_count ms.
@@ -610,6 +720,325 @@ fn drain_admin_cq_locked(admin: &mut AdminQueue, regs_virt: usize, stride: usize
         // SAFETY: regs_virt is BAR0 base; the doorbell range is page 1.
         unsafe {
             core::ptr::write_volatile((regs_virt + doorbell) as *mut u32, admin.cq_head as u32);
+        }
+    }
+}
+
+// ===========================================================================
+// I/O queue bring-up + read/write (D.3)
+// ===========================================================================
+
+/// Allocate the I/O SQ/CQ, issue Create I/O CQ (0x05) and Create I/O SQ
+/// (0x01), and install the queue pair on the controller.
+///
+/// D.4 will replace the polled completion path with an IRQ-driven one; the
+/// PRP + command-building code here stays unchanged.
+fn bring_up_io_queue() -> Result<(), &'static str> {
+    let (sq_phys, cq_phys, entries) = {
+        let mut drv = DRIVER.lock();
+        let d = drv.as_mut().ok_or("driver gone during I/O init")?;
+        let entries = IO_QUEUE_ENTRIES.min(d.max_queue_entries as usize).max(2) as u16;
+        let sq = DmaBuffer::<knvme::NvmeCommand>::new_array(entries as usize)
+            .map_err(|_| "I/O SQ DMA alloc failed")?;
+        let cq = DmaBuffer::<knvme::NvmeCompletion>::new_array(entries as usize)
+            .map_err(|_| "I/O CQ DMA alloc failed")?;
+        let prp_list =
+            DmaBuffer::<u64>::new_array(512).map_err(|_| "I/O PRP list DMA alloc failed")?;
+        let sq_phys = sq.physical_address().as_u64();
+        let cq_phys = cq.physical_address().as_u64();
+        let slots = alloc::vec![NvmeCompletionSlot::default(); entries as usize];
+        d.io = Some(IoQueuePair {
+            sq,
+            cq,
+            queue_entries: entries,
+            sq_tail: 0,
+            cq_head: 0,
+            phase: true,
+            slots,
+            next_cid: 0,
+            prp_list,
+        });
+        (sq_phys, cq_phys, entries)
+    };
+
+    // Create I/O Completion Queue (opcode 0x05).
+    //   CDW10 = ((size-1) << 16) | qid
+    //   CDW11 = (vector << 16) | IEN(bit1) | PC(bit0)
+    // Vector 0 during D.3 — D.4 programs the actual MSI/MSI-X vector via
+    // the HAL and the MSI-X table entry 0 matches the admin vector, which
+    // QEMU accepts.
+    {
+        let mut cmd = knvme::NvmeCommand::new(knvme::OP_CREATE_IO_CQ, 0);
+        cmd.prp1 = cq_phys;
+        cmd.cdw10 = ((entries.saturating_sub(1) as u32) << 16) | (IO_QUEUE_ID as u32);
+        cmd.cdw11 = 0b11; // IEN=1, PC=1, vector=0
+        let c = submit_admin_command(cmd)?;
+        if c.status_code != 0 {
+            log::error!("[nvme] Create I/O CQ failed: status={:#x}", c.status_code);
+            return Err("create I/O CQ failed");
+        }
+    }
+
+    // Create I/O Submission Queue (opcode 0x01).
+    //   CDW10 = ((size-1) << 16) | qid
+    //   CDW11 = (CQ id << 16) | QPRIO(14:13) | PC(bit0)
+    {
+        let mut cmd = knvme::NvmeCommand::new(knvme::OP_CREATE_IO_SQ, 0);
+        cmd.prp1 = sq_phys;
+        cmd.cdw10 = ((entries.saturating_sub(1) as u32) << 16) | (IO_QUEUE_ID as u32);
+        cmd.cdw11 = ((IO_QUEUE_ID as u32) << 16) | 1u32; // PC=1, QPRIO=00 (urgent/medium)
+        let c = submit_admin_command(cmd)?;
+        if c.status_code != 0 {
+            log::error!("[nvme] Create I/O SQ failed: status={:#x}", c.status_code);
+            return Err("create I/O SQ failed");
+        }
+    }
+
+    log::info!(
+        "[nvme] I/O queue pair ready: qid={} entries={}",
+        IO_QUEUE_ID,
+        entries
+    );
+    Ok(())
+}
+
+/// Read `count` logical blocks starting at `start_lba` into `buf`. `buf`
+/// must be at least `count * sector_bytes` bytes. Returns `Err` with the
+/// raw NVMe status code on device error; `0xFFFF` signals a driver-level
+/// failure (no NVMe, buffer too small, timeout).
+#[allow(dead_code)]
+pub fn read_sectors(start_lba: u64, count: usize, buf: &mut [u8]) -> Result<(), u16> {
+    if !NVME_READY.load(Ordering::Acquire) {
+        return Err(0xFFFF);
+    }
+    let sector_bytes = namespace_sector_bytes_nonzero()?;
+    let needed = count.checked_mul(sector_bytes).ok_or(0xFFFEu16)?;
+    if buf.len() < needed {
+        log::error!(
+            "[nvme] read_sectors: buffer too small ({} < {})",
+            buf.len(),
+            needed
+        );
+        return Err(0xFFFE);
+    }
+    // Build a DMA staging buffer large enough for the whole transfer; use
+    // either the persistent single-page data buffer (fast path) or a fresh
+    // allocation when the request spans more than one page.
+    do_io_to_user_buffer(knvme::OP_IO_READ, start_lba, count, sector_bytes, buf)
+}
+
+/// Write `count` logical blocks starting at `start_lba` from `buf` to the
+/// default namespace.
+#[allow(dead_code)]
+pub fn write_sectors(start_lba: u64, count: usize, buf: &[u8]) -> Result<(), u16> {
+    if !NVME_READY.load(Ordering::Acquire) {
+        return Err(0xFFFF);
+    }
+    let sector_bytes = namespace_sector_bytes_nonzero()?;
+    let needed = count.checked_mul(sector_bytes).ok_or(0xFFFEu16)?;
+    if buf.len() < needed {
+        log::error!(
+            "[nvme] write_sectors: buffer too small ({} < {})",
+            buf.len(),
+            needed
+        );
+        return Err(0xFFFE);
+    }
+    // Stage into a DMA buffer, then issue the write.
+    let dma = DmaBuffer::<[u8]>::new_bytes(needed.max(NVME_PAGE_BYTES), NVME_PAGE_BYTES)
+        .map_err(|_| 0xFFFFu16)?;
+    // SAFETY: dma is a fresh buffer we own; source is a caller-provided
+    // slice of `needed` bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), dma.as_ptr() as *mut u8, needed);
+    }
+    do_io_with_dma(knvme::OP_IO_WRITE, start_lba, count as u32, &dma, needed)
+}
+
+fn namespace_sector_bytes_nonzero() -> Result<usize, u16> {
+    let bytes = namespace_sector_bytes();
+    if bytes == 0 {
+        Err(0xFFFF)
+    } else {
+        Ok(bytes as usize)
+    }
+}
+
+/// Issue a Read and copy the DMA page's contents into `buf`.
+fn do_io_to_user_buffer(
+    opcode: u8,
+    start_lba: u64,
+    count: usize,
+    sector_bytes: usize,
+    buf: &mut [u8],
+) -> Result<(), u16> {
+    let needed = count * sector_bytes;
+    let dma = DmaBuffer::<[u8]>::new_bytes(needed.max(NVME_PAGE_BYTES), NVME_PAGE_BYTES)
+        .map_err(|_| 0xFFFFu16)?;
+    do_io_with_dma(opcode, start_lba, count as u32, &dma, needed)?;
+    // SAFETY: dma is driver-owned and lives until this function returns.
+    unsafe {
+        core::ptr::copy_nonoverlapping(dma.as_ptr(), buf.as_mut_ptr(), needed);
+    }
+    Ok(())
+}
+
+/// Submit an I/O Read/Write covering the full `dma` buffer and wait for the
+/// completion. Handles PRP list construction for requests spanning more
+/// than two pages.
+fn do_io_with_dma(
+    opcode: u8,
+    start_lba: u64,
+    lba_count: u32,
+    dma: &DmaBuffer<[u8]>,
+    byte_len: usize,
+) -> Result<(), u16> {
+    let (doorbell_off, regs_virt, cid) = interrupts::without_interrupts(|| {
+        let mut drv = DRIVER.lock();
+        let d = drv.as_mut().ok_or(0xFFFFu16)?;
+        let nsid = d.namespace_id;
+        let capacity = d.namespace_lbas;
+        if capacity == 0
+            || start_lba >= capacity
+            || start_lba.saturating_add(lba_count as u64) > capacity
+        {
+            log::error!(
+                "[nvme] I/O LBA {}+{} out of bounds (capacity {})",
+                start_lba,
+                lba_count,
+                capacity
+            );
+            return Err(0xFFFFu16);
+        }
+        let stride = d.doorbell_stride_bytes;
+        let regs_virt = d.regs.virt_base();
+        // Build PRP1/PRP2 (and optionally a PRP list) for the DMA buffer.
+        let dma_phys = dma.physical_address().as_u64();
+        let (prp1, prp2) =
+            build_prp_pair(d.io.as_mut().ok_or(0xFFFFu16)?, dma_phys, byte_len).ok_or(0xFFFFu16)?;
+        let io = d.io.as_mut().ok_or(0xFFFFu16)?;
+        let entries = io.queue_entries;
+        let cid = io.next_cid % entries;
+        let mut cmd = knvme::NvmeCommand::new(opcode, cid);
+        cmd.nsid = nsid;
+        cmd.prp1 = prp1;
+        cmd.prp2 = prp2;
+        cmd.cdw10 = (start_lba & 0xFFFF_FFFF) as u32;
+        cmd.cdw11 = (start_lba >> 32) as u32;
+        // NLB is zero-based: `lba_count - 1` in bits 15:0 of CDW12.
+        cmd.cdw12 = lba_count.saturating_sub(1) & 0xFFFF;
+        io.slots[cid as usize] = NvmeCompletionSlot::default();
+        io.sq[io.sq_tail as usize] = cmd;
+        io.sq_tail = (io.sq_tail + 1) % entries;
+        io.next_cid = io.next_cid.wrapping_add(1);
+        core::sync::atomic::fence(Ordering::Release);
+        let doorbell = knvme::NvmeRegs::doorbell_offset(IO_QUEUE_ID, false, stride);
+        Ok::<(usize, usize, u16), u16>((doorbell, regs_virt, cid))
+    })?;
+
+    let tail = interrupts::without_interrupts(|| {
+        let drv = DRIVER.lock();
+        drv.as_ref()
+            .and_then(|d| d.io.as_ref().map(|io| io.sq_tail))
+    })
+    .ok_or(0xFFFFu16)?;
+    // SAFETY: `regs_virt + doorbell_off` is within BAR0 (verified at probe).
+    unsafe {
+        core::ptr::write_volatile((regs_virt + doorbell_off) as *mut u32, tail as u32);
+    }
+
+    // Poll for completion. D.4 will install the IRQ handler which drains
+    // into the same slot; until then we poll directly with a bounded budget.
+    let start = crate::arch::x86_64::interrupts::tick_count();
+    loop {
+        let slot = interrupts::without_interrupts(|| {
+            let mut drv = DRIVER.lock();
+            let d = drv.as_mut()?;
+            let regs_virt = d.regs.virt_base();
+            let stride = d.doorbell_stride_bytes;
+            let io = d.io.as_mut()?;
+            drain_io_cq_locked(io, regs_virt, stride);
+            Some(io.slots[cid as usize])
+        });
+        if let Some(slot) = slot
+            && slot.filled
+        {
+            return if slot.status_code == 0 {
+                Ok(())
+            } else {
+                Err(slot.status_code)
+            };
+        }
+        let now = crate::arch::x86_64::interrupts::tick_count();
+        if now.wrapping_sub(start) >= ADMIN_COMMAND_TIMEOUT_TICKS {
+            log::error!("[nvme] I/O command timed out");
+            return Err(0xFFFF);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Build PRP1 and PRP2 for a DMA buffer covering `byte_len` bytes.
+///
+/// Layout rules (NVMe spec §4.3):
+///   * Transfer <= 1 page: PRP1 = buffer PA, PRP2 unused.
+///   * Transfer <= 2 pages: PRP1 = buffer PA, PRP2 = buffer_pa + PAGE_BYTES.
+///   * Transfer > 2 pages: PRP1 = buffer PA, PRP2 = PRP-list PA; the PRP
+///     list is an array of u64 PAs, one per subsequent page.
+fn build_prp_pair(io: &mut IoQueuePair, buffer_pa: u64, byte_len: usize) -> Option<(u64, u64)> {
+    let page = NVME_PAGE_BYTES as u64;
+    if byte_len == 0 {
+        return None;
+    }
+    let pages = byte_len.div_ceil(NVME_PAGE_BYTES);
+    if pages <= 1 {
+        return Some((buffer_pa, 0));
+    }
+    if pages == 2 {
+        return Some((buffer_pa, buffer_pa + page));
+    }
+    // > 2 pages — fill the PRP list page with PAs for pages 2..N.
+    let remaining_pages = pages - 1;
+    if remaining_pages > io.prp_list.len() {
+        log::error!(
+            "[nvme] PRP list too small: need {} entries, have {}",
+            remaining_pages,
+            io.prp_list.len()
+        );
+        return None;
+    }
+    for i in 0..remaining_pages {
+        io.prp_list[i] = buffer_pa + ((i as u64) + 1) * page;
+    }
+    Some((buffer_pa, io.prp_list.physical_address().as_u64()))
+}
+
+/// Drain all new completions from the I/O CQ. Same pattern as
+/// [`drain_admin_cq_locked`], called from both the polled path above (D.3)
+/// and the IRQ handler (D.4).
+fn drain_io_cq_locked(io: &mut IoQueuePair, regs_virt: usize, stride: usize) {
+    loop {
+        let entry = io.cq[io.cq_head as usize];
+        let phase = knvme::completion_phase(&entry);
+        if phase != io.phase {
+            break;
+        }
+        let cid = entry.cid;
+        if (cid as usize) < io.slots.len() {
+            io.slots[cid as usize] = NvmeCompletionSlot {
+                result: entry.result,
+                status_code: knvme::completion_status_code(&entry),
+                filled: true,
+            };
+        }
+        io.cq_head = (io.cq_head + 1) % io.queue_entries;
+        if io.cq_head == 0 {
+            io.phase = !io.phase;
+        }
+        let doorbell = knvme::NvmeRegs::doorbell_offset(IO_QUEUE_ID, true, stride);
+        // SAFETY: regs_virt is BAR0 base; doorbells live on page 1.
+        unsafe {
+            core::ptr::write_volatile((regs_virt + doorbell) as *mut u32, io.cq_head as u32);
         }
     }
 }
