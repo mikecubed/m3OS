@@ -138,9 +138,9 @@ These targets are validated in the project's CI / xtask harness and are the prim
 | Device class | Target | PCI vendor:device | QEMU flag | Physical test hardware | Validation status |
 |---|---|---|---|---|---|
 | Block storage (VirtIO) | VirtIO-blk (existing baseline) | `0x1af4:0x1001` | `-drive file=disk.img,if=virtio` (default) | none at this time | QEMU emulation validated (baseline, pre-Phase 55) |
-| Block storage (NVMe) | QEMU NVMe controller | `0x1b36:0x0010` | `-drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0` | none at this time | QEMU emulation planned; physical target deferred |
+| Block storage (NVMe) | QEMU NVMe controller | `0x1b36:0x0010` | `-drive file=nvme.img,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0` | none at this time | QEMU emulation validated (Phase 55); physical target deferred |
 | Network (VirtIO) | VirtIO-net (existing baseline) | `0x1af4:0x1000` | `-netdev user,id=net0 -device virtio-net,netdev=net0` (default) | none at this time | QEMU emulation validated (baseline, pre-Phase 55) |
-| Network (Intel e1000) | Intel 82540EM classic e1000 | `0x8086:0x100E` | `-device e1000,netdev=net0 -netdev user,id=net0` | none at this time | QEMU emulation planned; physical target deferred |
+| Network (Intel e1000) | Intel 82540EM classic e1000 | `0x8086:0x100E` | `-device e1000,netdev=net0 -netdev user,id=net0` | none at this time | QEMU emulation validated (Phase 55); physical target deferred |
 
 Notes on the QEMU entries:
 

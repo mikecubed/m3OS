@@ -43,6 +43,9 @@ use super::frame_allocator;
 pub enum DmaError {
     /// The requested size or count is zero.
     ZeroSize,
+    /// `size_of::<T>() * count` overflowed `usize` — the request is too large
+    /// to describe, independent of whether the allocator could satisfy it.
+    SizeOverflow,
     /// Alignment is not a power of two, or larger than the page size (we map
     /// via phys-offset at page granularity).
     UnsupportedAlignment,
@@ -130,7 +133,7 @@ impl<T> DmaBuffer<T> {
         }
         let size = mem::size_of::<T>()
             .checked_mul(count)
-            .ok_or(DmaError::ZeroSize)?;
+            .ok_or(DmaError::SizeOverflow)?;
         if size == 0 {
             return Err(DmaError::ZeroSize);
         }
@@ -377,6 +380,21 @@ mod tests {
         assert_eq!(
             DmaBuffer::<[u8]>::new_bytes(4096, 8192).err(),
             Some(DmaError::UnsupportedAlignment)
+        );
+    }
+
+    #[test_case]
+    fn dma_buffer_new_array_reports_overflow_distinctly_from_zero_size() {
+        // count == 0 is a zero-sized request, not an overflow.
+        assert_eq!(
+            DmaBuffer::<u64>::new_array(0).err(),
+            Some(DmaError::ZeroSize)
+        );
+        // size_of::<u64>() * usize::MAX overflows usize on a 64-bit target —
+        // callers must be able to distinguish this from a zero-size request.
+        assert_eq!(
+            DmaBuffer::<u64>::new_array(usize::MAX).err(),
+            Some(DmaError::SizeOverflow)
         );
     }
 }
