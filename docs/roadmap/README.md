@@ -160,9 +160,10 @@ flowchart TD
     P53a --> P53
     P52d --> P54["Phase 54<br/>Deep Serverization"]
     P53 --> P54
+    P54 --> P54a["Phase 54a<br/>Post-Serverization Kernel Hygiene"]
 
     %% Hardware, local-system, and release gate phases
-    P54 --> P55["Phase 55<br/>Hardware Substrate"]
+    P54a --> P55["Phase 55<br/>Hardware Substrate"]
     P47 --> P56["Phase 56<br/>Display and Input Architecture"]
     P55 --> P56
     P56 --> P57["Phase 57<br/>Audio and Local Session"]
@@ -281,12 +282,13 @@ flowchart TD
 | 53a | Kernel Memory Modernization | Per-CPU page cache, magazine-based slab allocator, size-class GlobalAlloc, SMP-scalable allocation | Complete | `phase-53a` | [Phase 53a](./53a-kernel-memory-modernization.md) | [Tasks](./tasks/53a-kernel-memory-modernization-tasks.md) |
 | 53 | Headless Hardening | Define the supported headless/reference workflow and release gates | Complete | `phase-53` | [Phase 53](./53-headless-hardening.md) | [Tasks](./tasks/53-headless-hardening-tasks.md) |
 | 54 | Deep Serverization | Move meaningful storage/VFS and UDP policy slices into supervised ring-3 services with explicit degraded-mode fallbacks | Complete | `phase-54` | [Phase 54](./54-deep-serverization.md) | [Tasks](./tasks/54-deep-serverization-tasks.md) |
+| 54a | Post-Serverization Kernel Hygiene | Close the CLOEXEC/NONBLOCK plumbing gap and relocate arch-syscall cleanup wrappers into their owning subsystems | Planned | `phase-54a` | [Phase 54a](./54a-post-serverization-kernel-hygiene.md) | [Tasks](./tasks/54a-post-serverization-kernel-hygiene-tasks.md) |
 
 ### Hardware, Local-System, and Release Phases (planned)
 
 | Phase | Theme | Primary Outcome | Status | Source Ref | Milestone | Tasks |
 |---|---|---|---|---|---|---|
-| 55 | Hardware Substrate | A narrow, real-hardware support story exists on a reference matrix | Planned | `phase-55` | [Phase 55](./55-hardware-substrate.md) | Deferred until implementation planning |
+| 55 | Hardware Substrate | A narrow, real-hardware support story exists on a reference matrix | Planned | `phase-55` | [Phase 55](./55-hardware-substrate.md) | [Tasks](./tasks/55-hardware-substrate-tasks.md) |
 | 56 | Display and Input Architecture | A userspace display service owns presentation and routed input | Planned | `phase-56` | [Phase 56](./56-display-and-input-architecture.md) | Deferred until implementation planning |
 | 57 | Audio and Local Session | The first coherent local graphical session adds audible output and a useful client baseline | Planned | `phase-57` | [Phase 57](./57-audio-and-local-session.md) | Deferred until implementation planning |
 | 58 | Release 1.0 Gate | The project defines and validates an honest 1.0 support matrix | Planned | `phase-58` | [Phase 58](./58-release-1-0-gate.md) | Deferred until implementation planning |

@@ -241,3 +241,4 @@ directories. Source for Lua and zlib is fetched at build time and staged alongsi
 - Mirror/repository support
 - Network fetching of source tarballs
 - Cross-compilation of ports on the host
+- `/var/run → /run` compatibility symlink — add when the first port hardcodes `/var/run` for its PID file. Our own userspace (init, service, crontab) uses `/run` directly; `/var/run` is a Linux backwards-compatibility shim. At revisit time, add the symlink in the ext2 disk builder (or a runtime bootstrap) and verify kernel symlink resolution crosses the ext2 → tmpfs boundary cleanly. (Routed from `docs/debug/54-followups.md` item 3.)
