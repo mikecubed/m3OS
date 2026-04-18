@@ -146,9 +146,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
-    // Phase 16: Initialize virtio-net driver. Phase 55 C.5 moved IRQ
-    // routing inside the driver (`install_msi_irq` / `install_intx_irq`
-    // via the HAL), so there is nothing to do here beyond the init call.
+    // Phase 16: Initialize NIC drivers.  Phase 55 Track E adds the Intel
+    // 82540EM (e1000) driver alongside virtio-net; both register with the
+    // PCI driver framework so `probe_all_drivers` binds whichever device
+    // QEMU (or real hardware) exposes.  Ordering: register e1000 before
+    // virtio-net so a single probe pass covers both without a second
+    // `probe_all_drivers()` call.
+    net::e1000::register();
     net::virtio_net::init();
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
@@ -539,20 +543,31 @@ fn serial_echo(s: &str) {
 /// task parks via [`task::scheduler::block_current_unless_woken`]; on wake
 /// it drains all pending frames through the network dispatch stack.
 fn net_task() -> ! {
-    // Register this task's id with the driver so the ISR can wake us.
+    // Register this task's id with every NIC driver that can wake us.  Both
+    // virtio-net (legacy path) and e1000 (Phase 55 Track E) point their
+    // ISRs at this task id via `wake_task`.
     if let Some(id) = task::scheduler::current_task_id() {
         net::virtio_net::set_net_task_id(id);
+        net::e1000::set_net_task_id(id);
     }
     log::info!("[net] network processing task started");
 
     loop {
-        // Drain all pending work signalled by the IRQ flag. Using
-        // `swap(false)` means we consume exactly one edge per loop body;
-        // if the ISR sets the flag after we swap but before we park, the
-        // check inside `block_current_unless_woken` will see it and
+        // Drain all pending work signalled by either driver's IRQ flag.
+        // Using `swap(false)` means we consume exactly one edge per loop
+        // body; if either ISR sets a flag after we swap but before we park,
+        // the check inside `block_current_unless_woken` will see it and
         // return immediately.
-        while net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire) {
+        let mut any =
+            net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        any |= net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        while any {
+            // Handle a fresh link-up edge before draining so the first RX
+            // packet off a new link doesn't contend with a stale TX ring.
+            net::e1000::drain_link_up_edge();
             net::dispatch::process_rx();
+            any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire)
+                | net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         }
         task::scheduler::block_current_unless_woken(&net::virtio_net::NET_IRQ_WOKEN);
     }
