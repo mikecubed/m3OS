@@ -2,6 +2,7 @@
 //! Memory management is a core kernel primitive — frame allocation, page tables, and address space isolation must remain ring-0.
 
 pub mod debug;
+pub mod dma;
 pub mod elf;
 pub mod frame_allocator;
 pub mod heap;
