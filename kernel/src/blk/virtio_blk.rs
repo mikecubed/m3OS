@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_core::types::TaskId;
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 use crate::mm::dma::DmaBuffer;
 use crate::pci::bar::{BarMapping, PortRegion};
@@ -437,14 +438,16 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
             );
             return Err(status);
         }
-        // Copy from DMA buffer to caller's buffer.
-        let dma_virt: *mut u8 = {
+        // Copy from DMA buffer to caller's buffer. See Fix 1 note in
+        // `do_request`: the driver lock must be taken with IF off to stay
+        // out of the ISR's way.
+        let dma_virt: *mut u8 = interrupts::without_interrupts(|| {
             let d = DRIVER.lock();
             match d.as_ref() {
                 Some(d) => d.dma_virt,
                 None => core::ptr::null_mut(),
             }
-        };
+        });
         if dma_virt.is_null() {
             return Err(0xFF);
         }
@@ -473,7 +476,10 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
     for i in 0..count {
         let sector = start_sector + i as u64;
         let offset = i * SECTOR_SIZE;
-        {
+        // Stage the sector into the DMA buffer. See Fix 1 note in
+        // `do_request`: the driver lock must be taken with IF off to stay
+        // out of the ISR's way.
+        let stage_result: Result<(), u8> = interrupts::without_interrupts(|| {
             let mut d = DRIVER.lock();
             let driver = d.as_mut().ok_or(0xFFu8)?;
             // SAFETY: dma_virt is driver-owned scratch; only one task writes
@@ -485,7 +491,9 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
                     SECTOR_SIZE,
                 );
             }
-        }
+            Ok(())
+        });
+        stage_result?;
         let status = do_request(VIRTIO_BLK_T_OUT, sector)?;
         if status != 0 {
             log::error!(
@@ -502,8 +510,18 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
 /// Submit a single-sector request and wait for completion via the IRQ.
 fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
     // Phase 1: enqueue under the DRIVER lock.
+    //
+    // Correctness: the kick write to VIRTIO_QUEUE_NOTIFY at the end of
+    // `submit_request` can cause the device MSI/INTx to fire on this CPU
+    // before `DRIVER.lock()` is released. Our ISR also takes `DRIVER.lock()`,
+    // so without IF-off the ISR would spin forever on the held `spin::Mutex`.
+    // Wrapping the critical section in `without_interrupts` keeps the IRQ
+    // pending in the LAPIC until we drop the guard; the ISR then runs
+    // normally and drains the used ring. MSI is programmed to this CPU's
+    // LAPIC and legacy INTx is routed to the BSP, so no other core can hold
+    // the mutex while the ISR fires elsewhere.
     REQ_WOKEN.store(false, Ordering::Release);
-    let status_virt: *mut u8 = {
+    let status_virt_result: Result<*mut u8, u8> = interrupts::without_interrupts(|| {
         let mut d = DRIVER.lock();
         let driver = d.as_mut().ok_or(0xFFu8)?;
         if sector >= driver.capacity_sectors {
@@ -528,18 +546,21 @@ fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
         );
         // SAFETY: scratch_virt is driver-owned; the status byte lives at +64
         // (set up in submit_request).
-        unsafe { scratch_virt.add(64) }
-    };
-    // Phase 2: park until the IRQ handler wakes us.
+        Ok(unsafe { scratch_virt.add(64) })
+    });
+    let status_virt = status_virt_result?;
+    // Phase 2: park until the IRQ handler wakes us. Must be done with
+    // interrupts enabled (i.e. *outside* the without_interrupts scope above)
+    // so the ISR can fire and call wake_task.
     block_current_unless_woken(&REQ_WOKEN);
     // Phase 3: read the status byte (driver lock re-acquired to ensure
-    // memory ordering).
-    let status = {
+    // memory ordering). Same IF-off rule as the submit side.
+    let status = interrupts::without_interrupts(|| {
         let _d = DRIVER.lock();
         // SAFETY: status_virt lives in the driver's scratch page, valid
         // for the life of the driver.
         unsafe { core::ptr::read_volatile(status_virt) }
-    };
+    });
     Ok(status)
 }
 
