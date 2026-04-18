@@ -12,8 +12,15 @@
 //! - [`iova`] — IOVA space allocator pure logic.
 //! - [`regions`] — reserved-region set algebra shared by VT-d RMRR and
 //!   AMD-Vi unity-map handling.
+//! - [`device_map`] — pure-logic `(segment, bus, device, function) →
+//!   unit_index` map used to route a PCI device to its owning IOMMU unit.
+//! - [`acpi_integration`] — converters turning decoded `DmarTables` /
+//!   `IvrsTables` into the shapes kernel-side code consumes (unit
+//!   descriptors, reserved-region sets).
 
+pub mod acpi_integration;
 pub mod contract;
+pub mod device_map;
 pub mod iova;
 pub mod regions;
 pub mod tables;

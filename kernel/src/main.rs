@@ -13,6 +13,7 @@ mod arch;
 mod blk;
 mod fb;
 mod fs;
+mod iommu;
 mod ipc;
 mod mm;
 mod net;
@@ -108,6 +109,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // P15: ACPI table discovery — parse RSDP, RSDT/XSDT, MADT, FADT.
     acpi::init(rsdp_addr);
+
+    // Phase 55a (B): IOMMU discovery — consume decoded DMAR / IVRS tables,
+    // build unit descriptor list, device-to-unit map, and reserved-region
+    // set. No hardware bring-up yet (Tracks C / D / E follow).
+    iommu::init();
 
     // Phase 34: Read RTC and establish boot wall-clock time.
     rtc::init_rtc();
