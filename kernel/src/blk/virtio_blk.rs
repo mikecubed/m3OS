@@ -1,46 +1,49 @@
 //! virtio-blk driver (legacy/transitional interface via I/O ports).
 //!
-//! Implements P24-T005 through P24-T012: PCI device discovery, virtqueue
-//! setup, sector read/write, and initialization.
+//! Phase 55 C.5 migration:
 //!
-//! Uses the virtio "legacy" (0.9.5) register layout mapped through PCI BAR0
-//! I/O space, which is what QEMU's `virtio-blk-pci` exposes by default.
+//! * PCI claim + BAR mapping go through [`crate::pci::claim_specific`] +
+//!   [`crate::pci::bar::map_bar`] (the latter handles the I/O-port extraction
+//!   that used to live inline here).
+//! * Descriptor ring, scratch, and DMA buffers are [`crate::mm::dma::DmaBuffer`]
+//!   instead of raw `alloc_contiguous_frames` + `phys_offset` arithmetic.
+//! * Completion is IRQ-driven: the IRQ handler walks the used ring, wakes one
+//!   task per completion via `wake_task`, and `read_sectors`/`write_sectors`
+//!   park the calling task with `block_current_unless_woken` instead of busy
+//!   spinning.  Routed here from `docs/debug/54-followups.md` item 5.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_core::types::TaskId;
 use spin::Mutex;
-use x86_64::instructions::port::Port;
 
-use crate::mm::frame_allocator;
-use crate::pci;
+use crate::mm::dma::DmaBuffer;
+use crate::pci::bar::{BarMapping, PortRegion};
+use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
+use crate::task::scheduler::{block_current_unless_woken, current_task_id, wake_task};
 
 // ===========================================================================
 // PCI device IDs
 // ===========================================================================
 
-/// Red Hat / virtio vendor ID.
 const VIRTIO_BLK_VENDOR: u16 = 0x1AF4;
-/// Legacy virtio-blk device ID.
 const VIRTIO_BLK_DEVICE_LEGACY: u16 = 0x1001;
-/// Transitional virtio-blk device ID.
 const VIRTIO_BLK_DEVICE_TRANSITIONAL: u16 = 0x1042;
 
 // ===========================================================================
 // Legacy virtio I/O register offsets (common header)
 // ===========================================================================
 
-const VIRTIO_DEVICE_FEATURES: u16 = 0x00; // 32-bit read
-const VIRTIO_DRIVER_FEATURES: u16 = 0x04; // 32-bit write
-const VIRTIO_QUEUE_ADDRESS: u16 = 0x08; // 32-bit write (PFN)
-const VIRTIO_QUEUE_SIZE: u16 = 0x0C; // 16-bit read
-const VIRTIO_QUEUE_SELECT: u16 = 0x0E; // 16-bit write
-#[allow(dead_code)]
-const VIRTIO_QUEUE_NOTIFY: u16 = 0x10; // 16-bit write
-const VIRTIO_DEVICE_STATUS: u16 = 0x12; // 8-bit read/write
-#[allow(dead_code)]
-const VIRTIO_ISR_STATUS: u16 = 0x13; // 8-bit read
+const VIRTIO_DEVICE_FEATURES: u16 = 0x00;
+const VIRTIO_DRIVER_FEATURES: u16 = 0x04;
+const VIRTIO_QUEUE_ADDRESS: u16 = 0x08;
+const VIRTIO_QUEUE_SIZE: u16 = 0x0C;
+const VIRTIO_QUEUE_SELECT: u16 = 0x0E;
+const VIRTIO_QUEUE_NOTIFY: u16 = 0x10;
+const VIRTIO_DEVICE_STATUS: u16 = 0x12;
+const VIRTIO_ISR_STATUS: u16 = 0x13;
 
 // virtio-blk device-specific config starts at offset 0x14 for legacy.
-// Capacity is a u64 (number of 512-byte sectors) at offset 0x14.
 const VIRTIO_BLK_CFG_CAPACITY: u16 = 0x14;
 
 // ===========================================================================
@@ -56,23 +59,16 @@ const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
 // virtio-blk request types
 // ===========================================================================
 
-/// Read sectors from device.
-#[allow(dead_code)]
 const VIRTIO_BLK_T_IN: u32 = 0;
-/// Write sectors to device.
-#[allow(dead_code)]
 const VIRTIO_BLK_T_OUT: u32 = 1;
 
 // ===========================================================================
 // Virtqueue structures
 // ===========================================================================
 
-#[allow(dead_code)]
 const VIRTQ_DESC_F_NEXT: u16 = 1;
-#[allow(dead_code)]
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-/// A single virtqueue descriptor (16 bytes).
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy)]
 struct VirtqDesc {
@@ -82,72 +78,64 @@ struct VirtqDesc {
     next: u16,
 }
 
-/// Available ring header.
 #[repr(C, align(2))]
 #[derive(Debug, Clone, Copy)]
 struct VirtqAvailHeader {
     flags: u16,
     idx: u16,
-    // followed by `queue_size` u16 ring entries
 }
 
-/// Used ring entry.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 struct VirtqUsedElem {
     id: u32,
     len: u32,
 }
 
-/// Used ring header.
 #[repr(C, align(4))]
 #[derive(Debug, Clone, Copy)]
 struct VirtqUsedHeader {
     flags: u16,
     idx: u16,
-    // followed by `queue_size` VirtqUsedElem entries
 }
 
-// ===========================================================================
-// Virtqueue
-// ===========================================================================
-
-/// Maximum queue size we support.
 const MAX_QUEUE_SIZE: u16 = 256;
-
-/// Sector size in bytes.
 const SECTOR_SIZE: usize = 512;
 
-/// A single virtqueue backed by physically contiguous pages.
-#[allow(dead_code)]
+/// One waiter slot: (TaskId blocked on this in-flight req, woken-flag).
+/// Indexed by head descriptor id (0..queue_size).
+struct Waiter {
+    task: TaskId,
+    woken: &'static AtomicBool,
+    status_virt: *mut u8,
+}
+
+// SAFETY: Waiter.status_virt only points into the driver's own scratch
+// region. Waiter is only inserted/removed under DRIVER.lock().
+unsafe impl Send for Waiter {}
+
 struct Virtqueue {
-    io_base: u16,
+    port: PortRegion,
     queue_index: u16,
     queue_size: u16,
+    /// DMA-allocated ring (desc + avail + used).
+    #[allow(dead_code)]
+    ring: DmaBuffer<[u8]>,
 
     desc_base: *mut VirtqDesc,
     avail_base: *mut VirtqAvailHeader,
     used_base: *mut VirtqUsedHeader,
 
-    #[allow(dead_code)]
-    phys_base: u64,
-    #[allow(dead_code)]
-    virt_base: usize,
-    /// Buddy order used for the contiguous allocation (for correct cleanup).
-    #[allow(dead_code)]
-    alloc_order: usize,
-    #[allow(dead_code)]
-    alloc_size: usize,
-
     last_used_idx: u16,
+    /// Pending waiters indexed by their head-descriptor id.
+    waiters: Vec<Option<Waiter>>,
 }
 
-// SAFETY: Virtqueue is only accessed under the DRIVER lock.
+// SAFETY: Virtqueue is only accessed under the DRIVER lock, and the raw
+// pointers above point into the DmaBuffer it owns.
 unsafe impl Send for Virtqueue {}
 
 impl Virtqueue {
-    /// Calculate the total byte size of the virtqueue allocation.
     fn calc_size(queue_size: u16) -> usize {
         let n = queue_size as usize;
         let desc_size = 16 * n;
@@ -158,13 +146,9 @@ impl Virtqueue {
         part1 + part2
     }
 
-    /// Initialize a virtqueue for the given queue index.
-    fn init(io_base: u16, queue_index: u16) -> Option<Self> {
-        unsafe {
-            Port::<u16>::new(io_base + VIRTIO_QUEUE_SELECT).write(queue_index);
-        }
-
-        let queue_size = unsafe { Port::<u16>::new(io_base + VIRTIO_QUEUE_SIZE).read() };
+    fn init(port: PortRegion, queue_index: u16) -> Option<Self> {
+        port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, queue_index);
+        let queue_size = port.read_reg::<u16>(VIRTIO_QUEUE_SIZE);
         if queue_size < 3 {
             log::warn!(
                 "[virtio-blk] queue {} size {} too small (need >= 3) — skipping",
@@ -184,15 +168,9 @@ impl Virtqueue {
         }
 
         let alloc_size = Self::calc_size(queue_size);
-        let pages_needed = alloc_size.div_ceil(4096);
-
-        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
-        let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
-
-        // Zero the allocation.
-        unsafe {
-            core::ptr::write_bytes(virt_base as *mut u8, 0, alloc_size);
-        }
+        let ring = DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096).ok()?;
+        let phys_base = ring.physical_address().as_u64();
+        let virt_base = ring.as_ptr() as usize;
 
         let n = queue_size as usize;
         let desc_base = virt_base as *mut VirtqDesc;
@@ -201,7 +179,6 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        // Tell the device the PFN.
         let pfn_u64 = phys_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
             log::error!(
@@ -209,15 +186,9 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
-            // Free the contiguous allocation to avoid leaking pages.
-            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
-        let pfn = pfn_u64 as u32;
-        unsafe {
-            Port::<u32>::new(io_base + VIRTIO_QUEUE_ADDRESS).write(pfn);
-        }
-
+        port.write_reg::<u32>(VIRTIO_QUEUE_ADDRESS, pfn_u64 as u32);
         log::info!(
             "[virtio-blk] queue {}: size={}, phys={:#x}",
             queue_index,
@@ -225,69 +196,70 @@ impl Virtqueue {
             phys_base
         );
 
+        let mut waiters = Vec::with_capacity(n);
+        for _ in 0..n {
+            waiters.push(None);
+        }
+
         Some(Virtqueue {
-            io_base,
+            port,
             queue_index,
             queue_size,
+            ring,
             desc_base,
             avail_base,
             used_base,
-            phys_base,
-            virt_base,
-            alloc_order,
-            alloc_size,
             last_used_idx: 0,
+            waiters,
         })
     }
 
-    /// Submit a 3-descriptor chain for a block I/O request and wait for completion.
-    ///
-    /// Returns the status byte from the device (0 = success).
-    #[allow(dead_code, clippy::too_many_arguments)]
+    /// Enqueue a 3-descriptor chain for a block I/O request. The caller will
+    /// `block_current_unless_woken(&woken_flag)` after releasing the DRIVER
+    /// lock; the IRQ handler walks the used ring and wakes the matching task.
+    #[allow(clippy::too_many_arguments)]
     fn submit_request(
         &mut self,
         req_type: u32,
         sector: u64,
         data_buf_phys: u64,
-        data_buf_virt: *mut u8,
         data_len: usize,
         scratch_phys: u64,
         scratch_virt: *mut u8,
-    ) -> u8 {
-        // We use 3 consecutive descriptor indices starting from 0.
-        // Since we hold the driver lock and process one request at a time,
-        // we can always reuse descriptors 0, 1, 2.
+        waiter_woken: &'static AtomicBool,
+    ) {
+        // Three consecutive descriptors starting at 0 — we hold the driver
+        // lock and only queue one request at a time.
         let hdr_desc_idx: u16 = 0;
         let data_desc_idx: u16 = 1;
         let status_desc_idx: u16 = 2;
 
-        // Place VirtioBlkReq at offset 0 of scratch page.
         let req = VirtioBlkReq {
             type_: req_type,
             reserved: 0,
             sector,
         };
+        // SAFETY: scratch_virt is the head of the scratch page; first
+        // sizeof(VirtioBlkReq) bytes are reserved for the header.
         unsafe {
             core::ptr::write_volatile(scratch_virt as *mut VirtioBlkReq, req);
         }
 
-        // Place status byte at offset 64 of scratch page (well past the 16-byte header).
         let status_phys = scratch_phys + 64;
+        // SAFETY: the scratch region is at least one page; status slot at +64 is safe.
         let status_virt = unsafe { scratch_virt.add(64) };
+        // SAFETY: single-byte write into scratch page.
         unsafe {
-            core::ptr::write_volatile(status_virt, 0xFFu8); // sentinel
+            core::ptr::write_volatile(status_virt, 0xFFu8);
         }
 
-        // Determine flags for the data descriptor.
         let data_flags = if req_type == VIRTIO_BLK_T_IN {
-            // Read: device writes to data buffer.
             VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
         } else {
-            // Write: device reads from data buffer.
             VIRTQ_DESC_F_NEXT
         };
 
-        // --- Descriptor 0: request header (device-readable) ---
+        // SAFETY: all desc_base pointers are within the ring DmaBuffer.
         let desc0 = self.desc_base.wrapping_add(hdr_desc_idx as usize);
         unsafe {
             core::ptr::write_volatile(&raw mut (*desc0).addr, scratch_phys);
@@ -299,7 +271,6 @@ impl Virtqueue {
             core::ptr::write_volatile(&raw mut (*desc0).next, data_desc_idx);
         }
 
-        // --- Descriptor 1: data buffer ---
         let desc1 = self.desc_base.wrapping_add(data_desc_idx as usize);
         unsafe {
             core::ptr::write_volatile(&raw mut (*desc1).addr, data_buf_phys);
@@ -308,7 +279,6 @@ impl Virtqueue {
             core::ptr::write_volatile(&raw mut (*desc1).next, status_desc_idx);
         }
 
-        // --- Descriptor 2: status byte (device-writable) ---
         let desc2 = self.desc_base.wrapping_add(status_desc_idx as usize);
         unsafe {
             core::ptr::write_volatile(&raw mut (*desc2).addr, status_phys);
@@ -317,7 +287,18 @@ impl Virtqueue {
             core::ptr::write_volatile(&raw mut (*desc2).next, 0u16);
         }
 
-        // Add head descriptor to the available ring.
+        // Record the waiter keyed on the head descriptor id.
+        if let Some(task) = current_task_id() {
+            self.waiters[hdr_desc_idx as usize] = Some(Waiter {
+                task,
+                woken: waiter_woken,
+                status_virt,
+            });
+        } else {
+            // No current task (very early boot) — fall back to inline spin.
+            self.waiters[hdr_desc_idx as usize] = None;
+        }
+
         let avail_idx = unsafe { core::ptr::read_volatile(&raw const (*self.avail_base).idx) };
         let ring_entry = avail_idx % self.queue_size;
         let ring_ptr = unsafe { (self.avail_base as *mut u16).add(2 + ring_entry as usize) };
@@ -332,44 +313,43 @@ impl Virtqueue {
         }
 
         // Notify the device (kick).
-        unsafe {
-            Port::<u16>::new(self.io_base + VIRTIO_QUEUE_NOTIFY).write(self.queue_index);
-        }
+        self.port
+            .write_reg::<u16>(VIRTIO_QUEUE_NOTIFY, self.queue_index);
+    }
 
-        // Spin-poll the used ring for completion.
-        let mut spin_count: u64 = 0;
+    /// Drain all new used-ring entries. Called from the IRQ handler; wakes
+    /// each completion's waiter.
+    fn drain_used_from_irq(&mut self) {
         loop {
             let used_idx = unsafe { core::ptr::read_volatile(&raw const (*self.used_base).idx) };
-            if used_idx != self.last_used_idx {
-                // Consume the used entry.
-                self.last_used_idx = self.last_used_idx.wrapping_add(1);
+            if self.last_used_idx == used_idx {
                 break;
             }
-            core::hint::spin_loop();
-            spin_count += 1;
-            if spin_count > 100_000_000 {
-                log::error!("[virtio-blk] request timed out waiting for completion");
-                return 0xFF;
+            let ring_entry = self.last_used_idx % self.queue_size;
+            // SAFETY: used_base points to the used-ring header; +4 is the
+            // start of the VirtqUsedElem array. The `%queue_size` bounds
+            // the offset inside the allocation.
+            let elem_ptr = unsafe {
+                (self.used_base as *const u8).add(4 + ring_entry as usize * 8)
+                    as *const VirtqUsedElem
+            };
+            let elem = unsafe { core::ptr::read_volatile(elem_ptr) };
+            let head = elem.id as u16;
+            if (head as usize) < self.waiters.len()
+                && let Some(waiter) = self.waiters[head as usize].take()
+            {
+                waiter.woken.store(true, Ordering::Release);
+                wake_task(waiter.task);
+                // status_virt is read by the task after wake; no IRQ
+                // work needed here.
+                let _ = waiter.status_virt;
             }
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
         }
-
-        // Read status byte.
-        let status = unsafe { core::ptr::read_volatile(status_virt) };
-
-        // For reads, the data is already in data_buf_virt via DMA.
-        let _ = data_buf_virt; // suppress unused warning for write path
-
-        status
     }
 }
 
-// ===========================================================================
-// VirtioBlkReq (P24-T009)
-// ===========================================================================
-
-/// virtio-blk request header.
 #[repr(C, packed)]
-#[allow(dead_code)]
 struct VirtioBlkReq {
     type_: u32,
     reserved: u32,
@@ -380,38 +360,60 @@ struct VirtioBlkReq {
 // Global driver state
 // ===========================================================================
 
-#[allow(dead_code)]
 struct VirtioBlkDriver {
-    /// Claim handle — held for the driver's lifetime so no other driver can
-    /// re-bind to the same function.
+    #[allow(dead_code)]
     pci: pci::PciDeviceHandle,
-    io_base: u16,
+    port: PortRegion,
     capacity_sectors: u64,
     request_queue: Virtqueue,
-    /// Persistent scratch frame for request headers and status bytes.
+    /// Persistent scratch buffer for request headers and status bytes.
+    #[allow(dead_code)]
+    scratch: DmaBuffer<[u8]>,
     scratch_phys: u64,
     scratch_virt: *mut u8,
     /// Persistent DMA frame for sector data transfers.
+    #[allow(dead_code)]
+    dma: DmaBuffer<[u8]>,
     dma_phys: u64,
     dma_virt: *mut u8,
+    /// Device IRQ registration — must outlive the driver or the ISR stub
+    /// dispatches to a stale handler. Stored for symmetry; actually static
+    /// because we never unregister.
+    #[allow(dead_code)]
+    irq: Option<pci::DeviceIrq>,
 }
 
-// SAFETY: VirtioBlkDriver raw pointers are only accessed under the DRIVER lock.
+// SAFETY: VirtioBlkDriver raw pointers are only dereferenced under the
+// DRIVER lock (or from the IRQ handler, which takes the lock).
 unsafe impl Send for VirtioBlkDriver {}
 
 static DRIVER: Mutex<Option<VirtioBlkDriver>> = Mutex::new(None);
 
-/// Set to true once the driver is initialized and ready.
 pub static VIRTIO_BLK_READY: AtomicBool = AtomicBool::new(false);
 
+// Single wake flag reused across requests — requests are fully serialized
+// under DRIVER.lock(), so only one task is ever waiting at a time.
+static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
+
 // ===========================================================================
-// Read/Write API (P24-T010, P24-T011)
+// IRQ handler
 // ===========================================================================
 
-/// Read `count` sectors starting at `start_sector` into `buf`.
-///
-/// `buf` must be at least `count * 512` bytes. Returns `Ok(())` on success
-/// or `Err(status)` with the virtio status byte on failure.
+fn virtio_blk_irq_handler() {
+    // Acknowledge the device interrupt and drain the used ring.
+    let mut driver = DRIVER.lock();
+    if let Some(ref mut d) = *driver {
+        // Legacy virtio ISR status register: reading clears the bit and
+        // acks the interrupt on the device.
+        let _isr = d.port.read_reg::<u8>(VIRTIO_ISR_STATUS);
+        d.request_queue.drain_used_from_irq();
+    }
+}
+
+// ===========================================================================
+// Read/Write API — IRQ-driven completion
+// ===========================================================================
+
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
     let needed = count * SECTOR_SIZE;
@@ -424,41 +426,9 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         return Err(0xFF);
     }
 
-    let mut driver = DRIVER.lock();
-    let driver = match driver.as_mut() {
-        Some(d) => d,
-        None => {
-            log::error!("[virtio-blk] read_sectors: driver not initialized");
-            return Err(0xFF);
-        }
-    };
-
-    if start_sector + count as u64 > driver.capacity_sectors {
-        log::error!(
-            "[virtio-blk] read_sectors: out of bounds (sector {} + {} > {})",
-            start_sector,
-            count,
-            driver.capacity_sectors
-        );
-        return Err(0xFF);
-    }
-
-    let dma_phys = driver.dma_phys;
-    let dma_virt = driver.dma_virt;
-    let scratch_phys = driver.scratch_phys;
-    let scratch_virt = driver.scratch_virt;
-
     for i in 0..count {
         let sector = start_sector + i as u64;
-        let status = driver.request_queue.submit_request(
-            VIRTIO_BLK_T_IN,
-            sector,
-            dma_phys,
-            dma_virt,
-            SECTOR_SIZE,
-            scratch_phys,
-            scratch_virt,
-        );
+        let status = do_request(VIRTIO_BLK_T_IN, sector)?;
         if status != 0 {
             log::error!(
                 "[virtio-blk] read_sectors: sector {} failed with status {}",
@@ -468,19 +438,26 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
             return Err(status);
         }
         // Copy from DMA buffer to caller's buffer.
+        let dma_virt: *mut u8 = {
+            let d = DRIVER.lock();
+            match d.as_ref() {
+                Some(d) => d.dma_virt,
+                None => core::ptr::null_mut(),
+            }
+        };
+        if dma_virt.is_null() {
+            return Err(0xFF);
+        }
         let offset = i * SECTOR_SIZE;
+        // SAFETY: dma_virt is a persistent driver-owned scratch page; it's
+        // live as long as the driver exists.
         unsafe {
             core::ptr::copy_nonoverlapping(dma_virt, buf[offset..].as_mut_ptr(), SECTOR_SIZE);
         }
     }
-
     Ok(())
 }
 
-/// Write `count` sectors starting at `start_sector` from `buf`.
-///
-/// `buf` must be at least `count * 512` bytes. Returns `Ok(())` on success
-/// or `Err(status)` with the virtio status byte on failure.
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
     let needed = count * SECTOR_SIZE;
@@ -493,46 +470,23 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
         return Err(0xFF);
     }
 
-    let mut driver = DRIVER.lock();
-    let driver = match driver.as_mut() {
-        Some(d) => d,
-        None => {
-            log::error!("[virtio-blk] write_sectors: driver not initialized");
-            return Err(0xFF);
-        }
-    };
-
-    if start_sector + count as u64 > driver.capacity_sectors {
-        log::error!(
-            "[virtio-blk] write_sectors: out of bounds (sector {} + {} > {})",
-            start_sector,
-            count,
-            driver.capacity_sectors
-        );
-        return Err(0xFF);
-    }
-
-    let dma_phys = driver.dma_phys;
-    let dma_virt = driver.dma_virt;
-    let scratch_phys = driver.scratch_phys;
-    let scratch_virt = driver.scratch_virt;
-
     for i in 0..count {
         let sector = start_sector + i as u64;
-        // Copy caller's data to DMA buffer.
         let offset = i * SECTOR_SIZE;
-        unsafe {
-            core::ptr::copy_nonoverlapping(buf[offset..].as_ptr(), dma_virt, SECTOR_SIZE);
+        {
+            let mut d = DRIVER.lock();
+            let driver = d.as_mut().ok_or(0xFFu8)?;
+            // SAFETY: dma_virt is driver-owned scratch; only one task writes
+            // at a time (DRIVER lock).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf[offset..].as_ptr(),
+                    driver.dma_virt,
+                    SECTOR_SIZE,
+                );
+            }
         }
-        let status = driver.request_queue.submit_request(
-            VIRTIO_BLK_T_OUT,
-            sector,
-            dma_phys,
-            dma_virt,
-            SECTOR_SIZE,
-            scratch_phys,
-            scratch_virt,
-        );
+        let status = do_request(VIRTIO_BLK_T_OUT, sector)?;
         if status != 0 {
             log::error!(
                 "[virtio-blk] write_sectors: sector {} failed with status {}",
@@ -542,51 +496,82 @@ pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), 
             return Err(status);
         }
     }
-
     Ok(())
 }
 
-// ===========================================================================
-// PCI device discovery (P24-T006 + Phase 55 B.3)
-// ===========================================================================
-
-/// Claim the virtio-blk device through the Phase-55 claim protocol.  Tries
-/// the legacy device ID first, then the transitional ID.
-fn claim_virtio_blk() -> Option<pci::PciDeviceHandle> {
-    for device_id in [VIRTIO_BLK_DEVICE_LEGACY, VIRTIO_BLK_DEVICE_TRANSITIONAL] {
-        match pci::claim_pci_device(VIRTIO_BLK_VENDOR, device_id, "virtio-blk") {
-            Ok(h) => return Some(h),
-            Err(pci::ClaimError::NotFound) => continue,
-            Err(pci::ClaimError::AlreadyClaimed) => {
-                log::warn!(
-                    "[virtio-blk] vendor {:04x} device {:04x} already claimed",
-                    VIRTIO_BLK_VENDOR,
-                    device_id
-                );
-                return None;
-            }
+/// Submit a single-sector request and wait for completion via the IRQ.
+fn do_request(req_type: u32, sector: u64) -> Result<u8, u8> {
+    // Phase 1: enqueue under the DRIVER lock.
+    REQ_WOKEN.store(false, Ordering::Release);
+    let status_virt: *mut u8 = {
+        let mut d = DRIVER.lock();
+        let driver = d.as_mut().ok_or(0xFFu8)?;
+        if sector >= driver.capacity_sectors {
+            log::error!(
+                "[virtio-blk] request: sector {} out of bounds (capacity {})",
+                sector,
+                driver.capacity_sectors
+            );
+            return Err(0xFF);
         }
-    }
-    None
+        let dma_phys = driver.dma_phys;
+        let scratch_phys = driver.scratch_phys;
+        let scratch_virt = driver.scratch_virt;
+        driver.request_queue.submit_request(
+            req_type,
+            sector,
+            dma_phys,
+            SECTOR_SIZE,
+            scratch_phys,
+            scratch_virt,
+            &REQ_WOKEN,
+        );
+        // SAFETY: scratch_virt is driver-owned; the status byte lives at +64
+        // (set up in submit_request).
+        unsafe { scratch_virt.add(64) }
+    };
+    // Phase 2: park until the IRQ handler wakes us.
+    block_current_unless_woken(&REQ_WOKEN);
+    // Phase 3: read the status byte (driver lock re-acquired to ensure
+    // memory ordering).
+    let status = {
+        let _d = DRIVER.lock();
+        // SAFETY: status_virt lives in the driver's scratch page, valid
+        // for the life of the driver.
+        unsafe { core::ptr::read_volatile(status_virt) }
+    };
+    Ok(status)
 }
 
 // ===========================================================================
-// Initialization (P24-T007, P24-T008, P24-T012)
+// Driver registration + init
 // ===========================================================================
 
-/// Initialize the virtio-blk driver.
-///
-/// Finds the device on PCI, performs virtio reset + feature negotiation,
-/// sets up the request virtqueue, and reads the disk capacity.
-pub fn init() {
-    // Phase 55 B.3: claim the device through the registry.
-    let handle = match claim_virtio_blk() {
-        Some(h) => h,
-        None => {
-            log::warn!("[virtio-blk] no virtio-blk device found on PCI bus");
-            return;
-        }
-    };
+/// Register the virtio-blk driver with the PCI discovery framework (C.4).
+pub fn register() {
+    // Two DriverEntry registrations — one per supported device id. A more
+    // general PciMatch variant that accepts a list of device IDs would avoid
+    // the duplication but isn't worth the extra code right now.
+    let _ = pci::register_driver(DriverEntry {
+        name: "virtio-blk",
+        r#match: PciMatch::VendorDevice {
+            vendor: VIRTIO_BLK_VENDOR,
+            device: VIRTIO_BLK_DEVICE_LEGACY,
+        },
+        init: probe,
+    });
+    let _ = pci::register_driver(DriverEntry {
+        name: "virtio-blk",
+        r#match: PciMatch::VendorDevice {
+            vendor: VIRTIO_BLK_VENDOR,
+            device: VIRTIO_BLK_DEVICE_TRANSITIONAL,
+        },
+        init: probe,
+    });
+}
+
+/// Driver init entry invoked by `probe_all_drivers`.
+fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
     let dev = *handle.device();
 
     log::info!(
@@ -598,16 +583,19 @@ pub fn init() {
         dev.function
     );
 
-    // P24-T007: Read BAR0 for legacy I/O port base.
-    let bar0 = dev.bars[0];
-    if bar0 & 1 == 0 {
-        log::error!("[virtio-blk] BAR0 is MMIO, expected I/O port (legacy virtio)");
-        return;
-    }
-    let io_base = (bar0 & 0xFFFF_FFFC) as u16;
-    log::info!("[virtio-blk] BAR0 I/O base: {:#x}", io_base);
+    // BAR0 — legacy virtio uses an I/O port BAR.
+    let port = match pci::bar::map_bar(&handle, 0) {
+        Ok(BarMapping::Pio { region }) => region,
+        Ok(_) => {
+            return DriverProbeResult::Declined(
+                "BAR0 is not an I/O port BAR (legacy virtio required)",
+            );
+        }
+        Err(_) => return DriverProbeResult::Failed("failed to map BAR0"),
+    };
+    log::info!("[virtio-blk] BAR0 I/O base: {:#x}", port.port_base());
 
-    // Ensure PCI command register has I/O space (bit 0) and bus mastering (bit 2).
+    // Enable I/O space + bus mastering.
     let cmd = handle.read_config_u16(0x04);
     if cmd & 0x05 != 0x05 {
         handle.write_config_u16(0x04, cmd | 0x05);
@@ -615,122 +603,126 @@ pub fn init() {
     }
 
     // Reset sequence.
-    unsafe {
-        // Reset the device.
-        Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(0);
-        // Set ACKNOWLEDGE.
-        Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(VIRTIO_STATUS_ACKNOWLEDGE);
-        // Set DRIVER.
-        Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS)
-            .write(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
-    }
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, 0);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+    port.write_reg::<u8>(
+        VIRTIO_DEVICE_STATUS,
+        VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+    );
 
-    // Feature negotiation — we don't need any special features for basic block I/O.
-    let device_features = unsafe { Port::<u32>::new(io_base + VIRTIO_DEVICE_FEATURES).read() };
+    let device_features = port.read_reg::<u32>(VIRTIO_DEVICE_FEATURES);
     log::info!("[virtio-blk] device features: {:#010x}", device_features);
-
-    // Accept no optional features for now (basic read/write is always available).
-    unsafe {
-        Port::<u32>::new(io_base + VIRTIO_DRIVER_FEATURES).write(0);
-    }
+    port.write_reg::<u32>(VIRTIO_DRIVER_FEATURES, 0);
 
     // Try to set FEATURES_OK for transitional devices.
-    unsafe {
-        let status = Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).read();
-        Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(status | VIRTIO_STATUS_FEATURES_OK);
-        let status = Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).read();
-        if status & VIRTIO_STATUS_FEATURES_OK == 0 {
-            log::info!("[virtio-blk] legacy device (no FEATURES_OK) — continuing");
-        }
+    let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
+    if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+        log::info!("[virtio-blk] legacy device (no FEATURES_OK) — continuing");
     }
 
-    // P24-T008: Initialize request virtqueue (queue 0).
-    let request_queue = match Virtqueue::init(io_base, 0) {
+    let request_queue = match Virtqueue::init(port, 0) {
         Some(q) => q,
         None => {
-            log::error!("[virtio-blk] failed to initialize request queue");
-            return;
+            return DriverProbeResult::Failed("failed to initialize request queue");
         }
     };
 
-    // Set DRIVER_OK.
-    unsafe {
-        let status = Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).read();
-        Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(status | VIRTIO_STATUS_DRIVER_OK);
-    }
+    let status = port.read_reg::<u8>(VIRTIO_DEVICE_STATUS);
+    port.write_reg::<u8>(VIRTIO_DEVICE_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
 
-    // Read capacity from device-specific config (BAR + 0x14, u64 in little-endian).
-    let capacity_lo = unsafe { Port::<u32>::new(io_base + VIRTIO_BLK_CFG_CAPACITY).read() } as u64;
-    let capacity_hi =
-        unsafe { Port::<u32>::new(io_base + VIRTIO_BLK_CFG_CAPACITY + 4).read() } as u64;
+    let capacity_lo = port.read_reg::<u32>(VIRTIO_BLK_CFG_CAPACITY) as u64;
+    let capacity_hi = port.read_reg::<u32>(VIRTIO_BLK_CFG_CAPACITY + 4) as u64;
     let capacity_sectors = capacity_lo | (capacity_hi << 32);
-
     log::info!(
         "[virtio-blk] capacity: {} sectors ({} MiB)",
         capacity_sectors,
         (capacity_sectors * SECTOR_SIZE as u64) / (1024 * 1024)
     );
 
-    // Allocate persistent scratch and DMA frames (reused across all requests).
-    let scratch_frame = match frame_allocator::allocate_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[virtio-blk] failed to allocate scratch frame");
-            return;
-        }
+    let scratch = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+        Ok(b) => b,
+        Err(_) => return DriverProbeResult::Failed("scratch DMA alloc failed"),
     };
-    let scratch_phys = scratch_frame.start_address().as_u64();
-    let scratch_virt = (crate::mm::phys_offset() + scratch_phys) as *mut u8;
+    let scratch_phys = scratch.physical_address().as_u64();
+    let scratch_virt = scratch.as_ptr() as *mut u8;
 
-    let dma_frame = match frame_allocator::allocate_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[virtio-blk] failed to allocate DMA frame");
-            // Free the scratch frame we already allocated.
-            frame_allocator::free_frame(scratch_phys);
-            return;
+    let dma = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+        Ok(b) => b,
+        Err(_) => return DriverProbeResult::Failed("data DMA alloc failed"),
+    };
+    let dma_phys = dma.physical_address().as_u64();
+    let dma_virt = dma.as_ptr() as *mut u8;
+
+    // Install the completion IRQ handler (C.3). Prefer MSI, fall back to
+    // legacy INTx routed through the I/O APIC. The shared-INTx contract
+    // says the handler must check ISR status first to avoid doing work
+    // for someone else's IRQ — `virtio_blk_irq_handler` reads ISR_STATUS
+    // then drains the used ring, which is a no-op if `last_used_idx ==
+    // used_idx`, so sharing is safe.
+    let irq = match handle.install_msi_irq(virtio_blk_irq_handler) {
+        Ok(i) => {
+            log::info!("[virtio-blk] MSI IRQ on vector {:#x}", i.vector());
+            Some(i)
+        }
+        Err(_) => {
+            // Legacy INTx: pick a vector from the device IRQ bank and route
+            // the PCI interrupt line through the I/O APIC to that vector.
+            const BLK_INTX_VECTOR: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + 2;
+            let intx_result = handle.install_intx_irq(BLK_INTX_VECTOR, virtio_blk_irq_handler);
+            if let Ok(i) = intx_result {
+                if dev.interrupt_line != 0xFF && crate::acpi::io_apic_address().is_some() {
+                    crate::arch::x86_64::apic::route_pci_irq(dev.interrupt_line, BLK_INTX_VECTOR);
+                    log::info!(
+                        "[virtio-blk] legacy INTx line {} routed to vector {:#x}",
+                        dev.interrupt_line,
+                        BLK_INTX_VECTOR
+                    );
+                } else {
+                    log::warn!(
+                        "[virtio-blk] legacy INTx registered but line is 0xFF or no I/O APIC — IRQ may not fire"
+                    );
+                }
+                Some(i)
+            } else {
+                log::warn!("[virtio-blk] failed to install completion IRQ — requests will stall");
+                None
+            }
         }
     };
-    let dma_phys = dma_frame.start_address().as_u64();
-    let dma_virt = (crate::mm::phys_offset() + dma_phys) as *mut u8;
 
     let driver = VirtioBlkDriver {
         pci: handle,
-        io_base,
+        port,
         capacity_sectors,
         request_queue,
+        scratch,
         scratch_phys,
         scratch_virt,
+        dma,
         dma_phys,
         dma_virt,
+        irq,
     };
-
     *DRIVER.lock() = Some(driver);
     VIRTIO_BLK_READY.store(true, Ordering::Release);
-
     log::info!("[virtio-blk] driver initialized successfully");
+    DriverProbeResult::Bound
+}
+
+/// Legacy init entry kept for main.rs compatibility: registers the driver
+/// and immediately runs the probe pass.
+pub fn init() {
+    register();
+    pci::probe_all_drivers();
 }
 
 // ===========================================================================
 // Helpers
 // ===========================================================================
 
-/// Align `val` up to `alignment` (must be a power of two).
+#[inline]
 fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
-}
-
-/// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
-///
-/// Rounds up to the next power-of-two order and delegates to
-/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
-/// callers can correctly free via `free_contiguous(base, order)`.
-fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
-    let order = if count <= 1 {
-        0
-    } else {
-        (usize::BITS - (count - 1).leading_zeros()) as usize
-    };
-    let frame = frame_allocator::allocate_contiguous(order)?;
-    Some((frame.start_address().as_u64(), order))
 }

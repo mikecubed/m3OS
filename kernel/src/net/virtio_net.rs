@@ -5,6 +5,18 @@
 //!
 //! Uses the virtio "legacy" (0.9.5) register layout mapped through PCI BAR0
 //! I/O space, which is what QEMU's `virtio-net-pci` exposes by default.
+//!
+//! Phase 55 C.5 migration:
+//!   * PCI BAR0 is looked up through [`crate::pci::bar::map_bar`].
+//!   * Virtqueue rings and per-descriptor buffers are allocated through
+//!     [`crate::mm::dma::DmaBuffer`] instead of raw `alloc_contiguous_frames`.
+//!   * The driver registers itself with [`crate::pci::register_driver`]; the
+//!     kernel's [`crate::pci::probe_all_drivers`] pass binds the device.
+//!   * The RX IRQ path still routes through the dedicated
+//!     `InterruptIndex::VirtioNet` handler (which signals the poll-driven
+//!     `net_task`) — that handler already walks the used ring
+//!     IRQ-driven-style via the `VIRTIO_NET_IRQ_PENDING` flag, so no
+//!     behaviour change is needed beyond the allocator switch.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,8 +24,10 @@ use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
+use crate::mm::dma::DmaBuffer;
 use crate::mm::frame_allocator;
-use crate::pci;
+use crate::pci::bar::{BarMapping, PortRegion};
+use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
 
 // ===========================================================================
 // Legacy virtio I/O register offsets (common header)
@@ -119,25 +133,21 @@ struct Virtqueue {
     /// Number of entries in the queue.
     queue_size: u16,
 
-    // Pointers into the physically contiguous virtqueue allocation.
+    /// DMA-allocated ring memory (desc + avail + used sub-tables laid out
+    /// per the virtio 0.9.5 spec inside this one allocation).
+    ring: DmaBuffer<[u8]>,
+
+    // Pointers into the `ring` allocation (precomputed during init).
     desc_base: *mut VirtqDesc,
     avail_base: *mut VirtqAvailHeader,
     used_base: *mut VirtqUsedHeader,
 
-    /// Physical base address of the virtqueue allocation (page-aligned).
-    phys_base: u64,
-    /// Virtual base address.
-    virt_base: usize,
-    /// Buddy order used for the contiguous allocation (for correct cleanup).
-    #[allow(dead_code)]
-    alloc_order: usize,
-    /// Total size of the allocation in bytes.
-    #[allow(dead_code)]
-    alloc_size: usize,
-
-    /// Per-descriptor buffer virtual addresses (for reading data back).
+    /// Per-descriptor DMA buffers — one 4 KiB page per slot, owned by the
+    /// virtqueue.  Dropping the Vec returns all buffers to the buddy.
+    buffer_dmas: Vec<DmaBuffer<[u8]>>,
+    /// Cached kernel-virtual pointers — same length as buffer_dmas.
     buffers: Vec<*mut u8>,
-    /// Per-descriptor buffer physical addresses (for descriptor addr field).
+    /// Cached physical addresses — same length as buffer_dmas.
     buf_phys: Vec<u64>,
 
     /// Our last-seen used ring index.
@@ -192,18 +202,23 @@ impl Virtqueue {
         }
 
         let alloc_size = Self::calc_size(queue_size);
-        let pages_needed = alloc_size.div_ceil(4096);
 
-        // Allocate physically contiguous pages.
-        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
-        let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
+        // Phase 55 C.5: allocate the virtqueue ring via DmaBuffer instead of
+        // raw frame allocator calls.
+        let ring = match DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!(
+                    "[virtio-net] queue {}: ring DmaBuffer alloc failed: {:?}",
+                    queue_index,
+                    e
+                );
+                return None;
+            }
+        };
+        let phys_base = ring.physical_address().as_u64();
+        let virt_base = ring.as_ptr() as usize;
 
-        // Zero the allocation.
-        unsafe {
-            core::ptr::write_bytes(virt_base as *mut u8, 0, alloc_size);
-        }
-
-        // Compute sub-structure offsets.
         let n = queue_size as usize;
         let desc_base = virt_base as *mut VirtqDesc;
         let avail_offset = 16 * n;
@@ -211,7 +226,6 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        // Tell the device the page frame number of the queue.
         // Legacy virtio uses a 32-bit PFN register; fail if memory is above 4 GiB.
         let pfn_u64 = phys_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
@@ -220,8 +234,6 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
-            // Free the contiguous allocation to avoid leaking pages.
-            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -236,28 +248,27 @@ impl Virtqueue {
             phys_base
         );
 
-        // Allocate per-descriptor buffers.
+        // Phase 55 C.5: per-descriptor buffers via DmaBuffer (one 4 KiB page
+        // each). Dropping `buffer_dmas` returns every page to the buddy.
+        let mut buffer_dmas: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(n);
         let mut buffers = Vec::with_capacity(n);
         let mut buf_phys = Vec::with_capacity(n);
         for _ in 0..n {
-            let buf_frame = frame_allocator::allocate_frame()?;
-            let bp = buf_frame.start_address().as_u64();
-            let bv = (crate::mm::phys_offset() + bp) as *mut u8;
-            buffers.push(bv);
-            buf_phys.push(bp);
+            let dma = DmaBuffer::<[u8]>::new_bytes(4096, 4096).ok()?;
+            buffers.push(dma.as_ptr() as *mut u8);
+            buf_phys.push(dma.physical_address().as_u64());
+            buffer_dmas.push(dma);
         }
 
         Some(Virtqueue {
             io_base,
             queue_index,
             queue_size,
+            ring,
             desc_base,
             avail_base,
             used_base,
-            phys_base,
-            virt_base,
-            alloc_order,
-            alloc_size,
+            buffer_dmas,
             buffers,
             buf_phys,
             last_used_idx: 0,
@@ -531,19 +542,18 @@ pub fn isr_status() -> u8 {
 // Initialization (P16-T001 through P16-T010)
 // ===========================================================================
 
-/// Initialize the virtio-net driver.
+/// Legacy init entry — registers the driver and runs the probe pass.
 ///
-/// Finds the device on PCI, performs virtio reset + feature negotiation,
-/// sets up RX and TX virtqueues, and reads the MAC address.
+/// Kept for `main.rs` compatibility. New code should prefer
+/// `pci::probe_all_drivers` after calling `register()`.
 pub fn init() {
-    // Phase 55 B.3: claim the device through the registry.
-    let handle = match claim_virtio_net() {
-        Some(h) => h,
-        None => {
-            log::warn!("[virtio-net] no virtio-net device found on PCI bus");
-            return;
-        }
-    };
+    register();
+    pci::probe_all_drivers();
+}
+
+/// Driver init body — takes a claimed PCI handle (from the driver-framework
+/// probe pass).
+fn init_with_handle(handle: pci::PciDeviceHandle) {
     let dev = *handle.device();
 
     log::info!(
@@ -555,13 +565,20 @@ pub fn init() {
         dev.function
     );
 
-    // P16-T002: Read BAR0 for legacy I/O port base.
-    let bar0 = dev.bars[0];
-    if bar0 & 1 == 0 {
-        log::error!("[virtio-net] BAR0 is MMIO, expected I/O port (legacy virtio)");
-        return;
-    }
-    let io_base = (bar0 & 0xFFFF_FFFC) as u16;
+    // Phase 55 C.1: BAR0 lookup goes through the HAL.  Legacy virtio-net
+    // exposes an I/O port BAR; anything else is a configuration error.
+    let port: PortRegion = match pci::bar::map_bar(&handle, 0) {
+        Ok(BarMapping::Pio { region }) => region,
+        Ok(_) => {
+            log::error!("[virtio-net] BAR0 is MMIO, expected I/O port (legacy virtio)");
+            return;
+        }
+        Err(e) => {
+            log::error!("[virtio-net] BAR0 map failed: {:?}", e);
+            return;
+        }
+    };
+    let io_base = port.port_base();
     log::info!("[virtio-net] BAR0 I/O base: {:#x}", io_base);
 
     // Ensure PCI command register has I/O space (bit 0) and bus mastering
@@ -672,33 +689,41 @@ pub fn init() {
     log::info!("[virtio-net] driver initialized successfully");
 }
 
+// PCI device discovery (Phase 55 C.4 + C.5) now runs through
+// `register_driver` + `probe_all_drivers`. The bespoke `claim_virtio_net`
+// helper used in Phase 55 B.3 has been removed.
+
 // ===========================================================================
-// PCI device discovery (P16-T001 + Phase 55 B.3)
+// Driver registration (Phase 55 C.4 / C.5)
 // ===========================================================================
 
-/// Claim the virtio-net device through the Phase-55 claim protocol.
+/// Register the virtio-net driver with the PCI discovery framework.
 ///
-/// Only matches vendor 0x1AF4, device 0x1000 (legacy/transitional virtio-net).
-/// Device 0x1041 (modern virtio-net) is not supported — the driver only
-/// implements the legacy I/O-port register layout.
-fn claim_virtio_net() -> Option<pci::PciDeviceHandle> {
-    match pci::claim_pci_device(0x1AF4, 0x1000, "virtio-net") {
-        Ok(h) => {
-            // Confirm the class/subclass match as well — the legacy bridge
-            // device uses the same vendor, so avoid double-binding.
-            if h.device().class_code == 0x02 && h.device().subclass == 0x00 {
-                Some(h)
-            } else {
-                // Dropping the handle releases the claim.
-                drop(h);
-                None
-            }
-        }
-        Err(pci::ClaimError::NotFound) => None,
-        Err(pci::ClaimError::AlreadyClaimed) => {
-            log::warn!("[virtio-net] vendor 1af4 device 1000 already claimed");
-            None
-        }
+/// Uses `PciMatch::Full` so we disambiguate the 0x1AF4:0x1000 vendor/device
+/// pair from other virtio devices with the same IDs (e.g. the legacy bridge).
+/// The full Ethernet class/subclass 0x02:0x00 must match.
+pub fn register() {
+    let _ = pci::register_driver(DriverEntry {
+        name: "virtio-net",
+        r#match: PciMatch::Full {
+            vendor: 0x1AF4,
+            device: 0x1000,
+            class: 0x02,
+            subclass: 0x00,
+        },
+        init: probe,
+    });
+}
+
+/// Driver probe — invoked by [`pci::probe_all_drivers`]. Wraps the original
+/// `init` body so callers can continue to use the legacy `init()` entry
+/// point.
+fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
+    init_with_handle(handle);
+    if VIRTIO_NET_READY.load(Ordering::Acquire) {
+        DriverProbeResult::Bound
+    } else {
+        DriverProbeResult::Failed("virtio-net init failed")
     }
 }
 
@@ -711,17 +736,10 @@ fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
 }
 
-/// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
-///
-/// Rounds up to the next power-of-two order and delegates to
-/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
-/// callers can correctly free via `free_contiguous(base, order)`.
-fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
-    let order = if count <= 1 {
-        0
-    } else {
-        (usize::BITS - (count - 1).leading_zeros()) as usize
-    };
-    let frame = frame_allocator::allocate_contiguous(order)?;
-    Some((frame.start_address().as_u64(), order))
+// Keep `frame_allocator` import alive — still used for ISR-path cache
+// accounting in the kernel-wide `available_count` helpers, and may be
+// re-used by a future zero-copy RX path here.
+#[allow(dead_code)]
+fn _keep_frame_allocator_import_alive() {
+    let _ = frame_allocator::total_frames;
 }

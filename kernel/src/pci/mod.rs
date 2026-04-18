@@ -262,6 +262,7 @@ pub fn pcie_config_write_u16(bus: u8, device: u8, function: u8, offset: u16, val
 // ---------------------------------------------------------------------------
 
 /// Error returned when a claim cannot be granted.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimError {
     /// No PCI function with the requested vendor/device IDs was found.
@@ -425,6 +426,7 @@ pub(crate) static PCI_DEVICE_REGISTRY: Mutex<PciDeviceRegistry> =
 /// Only the first matching function is considered — callers that need to
 /// disambiguate multi-function devices should use
 /// [`claim_pci_device_by_bdf`].
+#[allow(dead_code)]
 pub fn claim_pci_device(
     vendor_id: u16,
     device_id: u16,
