@@ -14,6 +14,7 @@ pub mod log_ring;
 pub mod magazine;
 pub mod mm;
 pub mod net;
+pub mod nvme;
 pub mod pci;
 pub mod pipe;
 pub mod prng;
