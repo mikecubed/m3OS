@@ -19,6 +19,8 @@
 //!   descriptors, reserved-region sets).
 
 pub mod acpi_integration;
+pub mod amdvi_page_table;
+pub mod amdvi_regs;
 pub mod contract;
 pub mod device_map;
 pub mod iova;
