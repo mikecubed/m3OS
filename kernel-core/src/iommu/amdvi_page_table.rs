@@ -165,7 +165,7 @@ pub fn walk(root_phys: u64, iova: u64, mem: &dyn PhysMemAccess) -> Option<u64> {
         // 9 bits per level; level 3 contributes bits 47:39, level 2
         // 38:30, level 1 29:21, level 0 20:12. Final 12 bits are offset.
         let shift = 12 + 9 * (level as u32);
-        let index = ((iova >> shift) & 0x1FF) as u64;
+        let index = (iova >> shift) & 0x1FF;
         let entry_phys = table_phys + index * 8;
         let raw = mem.read_u64(entry_phys)?;
         let entry = AmdViPageTableEntry::decode(raw);

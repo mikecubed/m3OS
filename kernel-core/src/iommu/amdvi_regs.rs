@@ -279,9 +279,7 @@ impl CommandEntry {
     pub fn invalidate_devtab_entry(device_id: u16) -> Self {
         let opcode = CommandOpcode::INVALIDATE_DEVTAB_ENTRY as u64;
         let word0 = (opcode << 60) | (device_id as u64);
-        Self {
-            words: [word0, 0],
-        }
+        Self { words: [word0, 0] }
     }
 
     /// Build an INVALIDATE_IOMMU_PAGES command covering the entire
@@ -293,7 +291,8 @@ impl CommandEntry {
         // word1 bits 63:12 = address. For "all" with S=1 the address bits
         // are set to the spec's all-ones encoding 0x7FFF_FFFF_FFFF_FFFF >> 0.
         let word0 = (opcode << 60) | ((domain_id as u64) << 32);
-        let word1 = (!0u64 & !0xFFFu64) | 0x1; // address bits all-1 + S bit.
+        // Address bits all-1 in bits 63:12, plus the S (size) bit 0.
+        let word1 = !0xFFFu64 | 0x1;
         Self {
             words: [word0, word1],
         }
@@ -519,9 +518,7 @@ mod tests {
     fn io_page_fault_decode_extracts_device_and_address() {
         // code=2 in bits 63:60, device_id=0x0100 in bits 15:0,
         // domain_id=0x0005 in bits 47:32.
-        let word0 = ((EventCode::IO_PAGE_FAULT as u64) << 60)
-            | (0x0005u64 << 32)
-            | 0x0100u64;
+        let word0 = ((EventCode::IO_PAGE_FAULT as u64) << 60) | (0x0005u64 << 32) | 0x0100u64;
         let word1 = 0xDEAD_BEEF_0000u64;
         let event = EventEntry::new(word0, word1);
         let decoded = event.decode();
