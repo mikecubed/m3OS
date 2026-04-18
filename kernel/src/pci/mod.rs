@@ -8,6 +8,8 @@
 //! * PCIe ECAM (MMIO via the MCFG ACPI allocation) — preferred when present,
 //!   required for extended config space (offsets >= 256). See Phase 55 B.1.
 
+pub mod bar;
+
 use core::ptr;
 use kernel_core::pci as kpci;
 use spin::Mutex;
@@ -112,7 +114,7 @@ pub fn pcie_mmio_config_write(bus: u8, device: u8, function: u8, offset: u16, va
 
 /// Read a 32-bit config value.  Uses PCIe MMIO when available (required for
 /// offsets >= 256), otherwise legacy I/O (offsets < 256 only).
-fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+pub(crate) fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
     if let Some(v) = pcie_mmio_config_read(bus, device, function, offset) {
         return v;
     }
@@ -128,7 +130,7 @@ fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u3
     legacy_pci_config_read_u32(bus, device, function, offset as u8)
 }
 
-fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+pub(crate) fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
     if pcie_mmio_config_write(bus, device, function, offset, value) {
         return;
     }
@@ -911,35 +913,15 @@ impl MsixCapability {
         }
     }
 
-    /// Compute the kernel-virtual pointer to the MSI-X table.  Uses the
-    /// existing BAR-raw encoding in [`PciDevice::bars`], mapped via
-    /// `phys_offset`.
+    /// Compute the kernel-virtual pointer to the MSI-X table.
     ///
-    /// This is a minimal local helper — the full BAR mapping abstraction is
-    /// Track C. We only support 64-bit memory BARs here (MSI-X table must be
-    /// in MMIO per spec; BAR0/1 or a 64-bit pair starting at `table_bar`).
+    /// Delegates to the [`bar`] module's shared BAR decoder so that MSI-X
+    /// table mapping and driver BAR mapping (Phase 55 C.1) go through the
+    /// same codepath. Returns `None` if the table BAR is an I/O BAR (not
+    /// valid for MSI-X per spec), uses a reserved encoding, or a 64-bit BAR
+    /// claims a non-existent partner slot.
     fn table_virt_addr(&self, bars: [u32; 6]) -> Option<usize> {
-        let bir = self.table_bar as usize;
-        if bir >= bars.len() {
-            return None;
-        }
-        let bar_lo = bars[bir];
-        // Must be memory BAR (bit 0 == 0).
-        if bar_lo & 0x1 != 0 {
-            return None;
-        }
-        let is_64 = (bar_lo >> 1) & 0x3 == 0x2;
-        let base_phys: u64 = if is_64 {
-            if bir + 1 >= bars.len() {
-                return None;
-            }
-            let hi = bars[bir + 1] as u64;
-            (bar_lo as u64 & 0xFFFF_FFF0) | (hi << 32)
-        } else {
-            (bar_lo as u64) & 0xFFFF_FFF0
-        };
-        let phys = base_phys + self.table_offset as u64;
-        Some((crate::mm::phys_offset() + phys) as usize)
+        bar::bar_mmio_virt_offset(bars, self.table_bar, self.table_offset)
     }
 
     /// Program table entry `index` to deliver `vector` to `apic_lapic_id`.

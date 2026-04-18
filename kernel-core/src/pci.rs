@@ -214,12 +214,174 @@ pub fn msi_decode_mmc_count(mc: u16) -> u8 {
 /// Encode the MSI multiple-message enable count into the MME field of the
 /// Message Control register (raw field is log2 of count, 0..=5).
 ///
+/// The count is rounded **up** to the next power of two via
+/// [`u8::next_power_of_two`]; callers that need exact counts must pass values
+/// that are already powers of two (the kernel-side caller gates on
+/// [`u8::is_power_of_two`]).
+///
 /// Returns the full Message Control value with the MME field replaced.
 pub fn msi_encode_mme(mc: u16, enable_count: u8) -> u16 {
     let count = enable_count.clamp(1, 32);
-    // log2 of the nearest power-of-two <= count.
+    // log2 of the count rounded up to the next power of two (capped at 5 to
+    // keep the 3-bit MME field valid — 2^5 = 32 vectors maximum).
     let log2 = (count.next_power_of_two().trailing_zeros() as u16).min(5);
     (mc & !MSI_CTRL_MME_MASK) | (log2 << 4)
+}
+
+// ---------------------------------------------------------------------------
+// BAR decoding (Phase 55 C.1)
+// ---------------------------------------------------------------------------
+//
+// PCI BARs (type 0 header, offset 0x10..0x28) encode three things in their low
+// bits:
+//
+//   * bit 0: 0 = memory space BAR, 1 = I/O (port) BAR.
+//   * bits 2:1 (memory BAR only): BAR width — `00` = 32-bit, `10` = 64-bit.
+//     `01` is reserved (legacy "below-1 MiB"), `11` is reserved.
+//   * bit 3 (memory BAR only): prefetchable.
+//
+// The address portion of the BAR lives in the upper bits:
+//   * memory BAR: `raw & 0xFFFF_FFF0` gives the low 32 bits of the base.
+//   * I/O BAR: `raw & 0xFFFF_FFFC` gives the port base.
+//
+// 64-bit memory BARs occupy *two* consecutive BAR slots: the low slot's upper
+// bits are the base's low 32 bits, and the next slot's full 32 bits are the
+// base's high 32 bits.
+//
+// Size is determined by the standard write-ones / read-back algorithm:
+// write `0xFFFFFFFF` into the BAR, read it back, mask off the type bits, and
+// `size = !(readback) + 1`. The caller does the two register pokes; pure math
+// lives here so it can be tested on the host.
+
+/// Low-bit mask for memory-BAR address bits (strips type + prefetchable).
+pub const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0;
+/// Low-bit mask for I/O-BAR address bits (strips the I/O flag + reserved bit 1).
+pub const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
+
+/// BAR "type" decoded from the raw BAR register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarType {
+    /// 32-bit memory-mapped BAR — occupies one BAR slot.
+    Memory32 { prefetchable: bool },
+    /// 64-bit memory-mapped BAR — occupies this slot plus the next.
+    Memory64 { prefetchable: bool },
+    /// I/O port BAR — occupies one BAR slot.
+    Io,
+}
+
+impl BarType {
+    /// Decode the low bits of a BAR register.
+    ///
+    /// Returns `None` if the BAR uses a reserved width encoding (type field
+    /// `01` or `11` on a memory BAR). Callers should treat reserved as "skip
+    /// this slot" — it is not necessarily a driver error but it cannot be
+    /// mapped.
+    pub fn decode(raw: u32) -> Option<Self> {
+        if raw & 0x1 != 0 {
+            // I/O BAR — type bits 2:1 are reserved / ignored.
+            return Some(BarType::Io);
+        }
+        let width = (raw >> 1) & 0x3;
+        let prefetchable = (raw >> 3) & 0x1 != 0;
+        match width {
+            0b00 => Some(BarType::Memory32 { prefetchable }),
+            0b10 => Some(BarType::Memory64 { prefetchable }),
+            // 0b01 (reserved, historically "below 1 MiB") and 0b11 (reserved).
+            _ => None,
+        }
+    }
+
+    /// True if this BAR occupies two consecutive BAR slots.
+    pub fn is_64bit(&self) -> bool {
+        matches!(self, BarType::Memory64 { .. })
+    }
+
+    /// True if this BAR is memory-mapped (not I/O).
+    pub fn is_memory(&self) -> bool {
+        matches!(self, BarType::Memory32 { .. } | BarType::Memory64 { .. })
+    }
+
+    /// True if this BAR is prefetchable (memory BARs only).
+    pub fn is_prefetchable(&self) -> bool {
+        match self {
+            BarType::Memory32 { prefetchable } | BarType::Memory64 { prefetchable } => {
+                *prefetchable
+            }
+            BarType::Io => false,
+        }
+    }
+}
+
+/// Extract the low 32 bits of the BAR base address from the raw register value.
+///
+/// For memory BARs this strips the type + prefetchable bits; for I/O BARs it
+/// strips the I/O flag and the reserved bit 1. The caller combines the result
+/// with the high 32 bits of a 64-bit BAR (via [`combine_bar_64`]) as needed.
+pub fn bar_base_low(raw: u32, bar_type: BarType) -> u32 {
+    match bar_type {
+        BarType::Memory32 { .. } | BarType::Memory64 { .. } => raw & BAR_MEM_ADDR_MASK,
+        BarType::Io => raw & BAR_IO_ADDR_MASK,
+    }
+}
+
+/// Combine a 64-bit BAR's low and high 32-bit halves into a full 64-bit base.
+///
+/// `raw_low` is the raw BAR register at the low slot; `raw_high` is the raw
+/// 32 bits at `low_slot + 1`. This stripping the type bits out of the low half
+/// before shifting the high half in.
+pub fn combine_bar_64(raw_low: u32, raw_high: u32) -> u64 {
+    ((raw_low & BAR_MEM_ADDR_MASK) as u64) | ((raw_high as u64) << 32)
+}
+
+/// Decode a BAR size from a sizing read-back.
+///
+/// The standard PCI BAR sizing dance:
+///
+///   1. Save the original BAR value.
+///   2. Write `0xFFFFFFFF` to the BAR.
+///   3. Read it back.
+///   4. Restore the original BAR value.
+///   5. Pass `(raw_original, raw_sizing_readback)` to this function.
+///
+/// For 64-bit memory BARs, the caller passes the 64-bit readback
+/// (low half from the low slot + high half from the next slot) via
+/// [`decode_bar_size_64`] instead.
+///
+/// Returns the BAR size in bytes, or `0` if the BAR is unimplemented (readback
+/// returned all zeros after masking).
+pub fn decode_bar_size_32(raw_original: u32, raw_readback: u32) -> u32 {
+    let bar_type = match BarType::decode(raw_original) {
+        Some(t) => t,
+        None => return 0,
+    };
+    let mask = match bar_type {
+        BarType::Memory32 { .. } | BarType::Memory64 { .. } => BAR_MEM_ADDR_MASK,
+        BarType::Io => BAR_IO_ADDR_MASK,
+    };
+    let masked = raw_readback & mask;
+    if masked == 0 {
+        // BAR not implemented.
+        return 0;
+    }
+    (!masked).wrapping_add(1)
+}
+
+/// Decode a 64-bit BAR size from a sizing read-back across both slots.
+///
+/// `raw_low` is the original BAR register; `readback_low` and `readback_high`
+/// are the 32-bit values read back after writing `0xFFFFFFFF` to both the low
+/// and high slots. The result is the size in bytes, or `0` if unimplemented.
+pub fn decode_bar_size_64(raw_low: u32, readback_low: u32, readback_high: u32) -> u64 {
+    // Ensure we were actually given a 64-bit memory BAR.
+    match BarType::decode(raw_low) {
+        Some(BarType::Memory64 { .. }) => {}
+        _ => return 0,
+    }
+    let combined = ((readback_low & BAR_MEM_ADDR_MASK) as u64) | ((readback_high as u64) << 32);
+    if combined == 0 {
+        return 0;
+    }
+    (!combined).wrapping_add(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,5 +661,114 @@ mod tests {
         assert_eq!(pool.allocate(8), Some(0xE8));
         // Only 0x10 vectors in the pool, exhausted now.
         assert_eq!(pool.allocate(1), None);
+    }
+
+    // ------------------------------------------------------------------
+    // BAR decoder tests — Phase 55 C.1 acceptance item 7.
+    //
+    // Coverage:
+    //   (1) 32-bit MMIO BAR type + size.
+    //   (2) PIO BAR type + size.
+    //   (3) 64-bit MMIO BAR across two slots (upper-half decoding).
+    //   (4) Prefetchable flag + zero-size ("unimplemented") BAR handling.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn bar_decode_32bit_mmio_type_and_size() {
+        // 32-bit memory BAR at 0xFEBF_0000, size 0x1000 (4 KiB).
+        // Low bits: bit 0 = 0 (memory), bits 2:1 = 00 (32-bit), bit 3 = 0 (non-prefetchable).
+        let raw = 0xFEBF_0000;
+        let bar_type = BarType::decode(raw).expect("valid 32-bit memory BAR");
+        assert_eq!(
+            bar_type,
+            BarType::Memory32 {
+                prefetchable: false
+            }
+        );
+        assert!(bar_type.is_memory());
+        assert!(!bar_type.is_64bit());
+        assert!(!bar_type.is_prefetchable());
+        assert_eq!(bar_base_low(raw, bar_type), 0xFEBF_0000);
+
+        // Size readback: write-ones then read back 0xFFFFF000 -> size = 0x1000.
+        // Sizing reads back `!size + 1` in the address bits, so 0xFFFF_F000 -> 0x1000.
+        let readback = 0xFFFF_F000;
+        assert_eq!(decode_bar_size_32(raw, readback), 0x1000);
+    }
+
+    #[test]
+    fn bar_decode_pio_type_and_size() {
+        // I/O BAR at port 0xC000, size 0x20 (32 bytes).
+        // Low bits: bit 0 = 1 (I/O). Bit 1 is reserved (0). Remaining bits are the port base.
+        let raw = 0x0000_C001;
+        let bar_type = BarType::decode(raw).expect("valid I/O BAR");
+        assert_eq!(bar_type, BarType::Io);
+        assert!(!bar_type.is_memory());
+        assert!(!bar_type.is_64bit());
+        assert!(!bar_type.is_prefetchable());
+        assert_eq!(bar_base_low(raw, bar_type), 0x0000_C000);
+
+        // Size readback: 0xFFFFFFE0 (masked) with I/O mask -> size 0x20.
+        // Sizing readback `FFFF_FFE1` keeps bit 0 set (I/O marker); decode masks it off.
+        let readback = 0xFFFF_FFE1;
+        assert_eq!(decode_bar_size_32(raw, readback), 0x20);
+    }
+
+    #[test]
+    fn bar_decode_64bit_mmio_type_and_upper_half() {
+        // 64-bit memory BAR: base 0x1_FEBF_0000, size 0x1_0000_0000 (4 GiB).
+        // Low slot: 0xFEBF_0000 with type bits 0b100 (memory, 64-bit, non-prefetchable).
+        // High slot: 0x0000_0001.
+        let raw_low = 0xFEBF_0004; // bits 2:1 = 10 (64-bit).
+        let raw_high = 0x0000_0001;
+        let bar_type = BarType::decode(raw_low).expect("valid 64-bit memory BAR");
+        assert_eq!(
+            bar_type,
+            BarType::Memory64 {
+                prefetchable: false
+            }
+        );
+        assert!(bar_type.is_64bit());
+        assert!(!bar_type.is_prefetchable());
+
+        let base = combine_bar_64(raw_low, raw_high);
+        assert_eq!(base, 0x0000_0001_FEBF_0000);
+
+        // Sizing readback for a 4 GiB BAR: low half reads 0x0000_0000,
+        // high half reads 0xFFFF_FFFF. Combined: 0xFFFF_FFFF_0000_0000 -> size 1 GiB * 4 = 0x1_0000_0000.
+        let readback_low = 0x0000_0000;
+        let readback_high = 0xFFFF_FFFF;
+        assert_eq!(
+            decode_bar_size_64(raw_low, readback_low, readback_high),
+            0x0000_0001_0000_0000
+        );
+    }
+
+    #[test]
+    fn bar_decode_prefetchable_flag_and_zero_size_handling() {
+        // Prefetchable 64-bit memory BAR.
+        let raw = 0xE000_000C; // type bits 0b1100: memory, 64-bit, prefetchable.
+        let bar_type = BarType::decode(raw).expect("valid prefetchable 64-bit BAR");
+        assert_eq!(bar_type, BarType::Memory64 { prefetchable: true });
+        assert!(bar_type.is_prefetchable());
+
+        // 32-bit prefetchable.
+        let raw32 = 0xD000_0008; // type bits 0b1000: memory, 32-bit, prefetchable.
+        let bar_type32 = BarType::decode(raw32).expect("valid prefetchable 32-bit BAR");
+        assert_eq!(bar_type32, BarType::Memory32 { prefetchable: true });
+        assert!(bar_type32.is_prefetchable());
+
+        // Zero-size / unimplemented BAR: sizing readback is all zeros in the
+        // address bits. The decoder must return size = 0 (not panic or
+        // overflow on !0 + 1).
+        let raw_imp = 0x0000_0000; // memory BAR type, unimplemented.
+        assert_eq!(decode_bar_size_32(raw_imp, 0x0000_0000), 0);
+
+        // Reserved BAR width encoding (type field 0b01 or 0b11 on memory BAR)
+        // decodes to None — caller must skip the slot.
+        assert!(BarType::decode(0xFEBF_0002).is_none()); // reserved 0b01
+        assert!(BarType::decode(0xFEBF_0006).is_none()); // reserved 0b11
+        // decode_bar_size_32 on a reserved BAR returns 0 rather than panic.
+        assert_eq!(decode_bar_size_32(0xFEBF_0002, 0xFFFF_F000), 0);
     }
 }
