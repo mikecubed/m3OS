@@ -34,6 +34,9 @@
 //! `kernel-core::iommu::contract` module docs; this comment mirrors the rule
 //! so grep from the kernel side finds it.
 
+pub mod fault;
+pub mod intel;
+
 use alloc::vec::Vec;
 use spin::Once;
 

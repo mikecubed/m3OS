@@ -136,9 +136,10 @@ impl VtdPageTableEntry {
         // and internal "available" bits in [11:2] & [11:8] are stripped so
         // decode(encode(x)) is the identity on constructed entries.
         let ppn = raw & PTE_PPN_MASK;
-        let flags = raw & (VtdPteFlags::READ.0 as u64
-            | VtdPteFlags::WRITE.0 as u64
-            | VtdPteFlags::SUPER_PAGE.0 as u64);
+        let flags = raw
+            & (VtdPteFlags::READ.0 as u64
+                | VtdPteFlags::WRITE.0 as u64
+                | VtdPteFlags::SUPER_PAGE.0 as u64);
         Self(ppn | flags)
     }
 
@@ -236,8 +237,8 @@ pub fn walk(
         // Super-page terminal at PDPT (level 1 → 1 GiB) or PD (level 2 → 2 MiB).
         if pte.is_super_page() {
             let size_bit = match level {
-                1 => 1u64 << 30, // 1 GiB
-                2 => 1u64 << 21, // 2 MiB
+                1 => 1u64 << 30,  // 1 GiB
+                2 => 1u64 << 21,  // 2 MiB
                 _ => return None, // SP at PML4 is reserved in the spec
             };
             if (page_sizes_supported & size_bit) == 0 {
@@ -272,7 +273,9 @@ pub struct VecPhysMem {
 impl VecPhysMem {
     /// New zero-initialised window of `size` bytes.
     pub fn new(size: usize) -> Self {
-        Self { mem: alloc::vec![0u8; size] }
+        Self {
+            mem: alloc::vec![0u8; size],
+        }
     }
 
     /// Write a 64-bit word at `phys`. Out-of-bounds writes are silently
@@ -280,9 +283,9 @@ impl VecPhysMem {
     pub fn write_u64(&mut self, phys: u64, value: u64) {
         let start = phys as usize;
         let bytes = value.to_le_bytes();
-        for i in 0..8 {
+        for (i, byte) in bytes.iter().enumerate() {
             if start + i < self.mem.len() {
-                self.mem[start + i] = bytes[i];
+                self.mem[start + i] = *byte;
             }
         }
     }
@@ -365,11 +368,8 @@ mod tests {
     #[test]
     fn level_index_extracts_correct_nine_bits() {
         // IOVA: PML4=0x1A3, PDPT=0x055, PD=0x0F2, PT=0x011, offset=0x123
-        let iova = (0x1A3u64 << 39)
-            | (0x055u64 << 30)
-            | (0x0F2u64 << 21)
-            | (0x011u64 << 12)
-            | 0x123u64;
+        let iova =
+            (0x1A3u64 << 39) | (0x055u64 << 30) | (0x0F2u64 << 21) | (0x011u64 << 12) | 0x123u64;
         assert_eq!(level_index(iova, 0), 0x1A3);
         assert_eq!(level_index(iova, 1), 0x055);
         assert_eq!(level_index(iova, 2), 0x0F2);
@@ -419,7 +419,8 @@ mod tests {
     #[test]
     fn walker_resolves_4k_leaf() {
         let mut mem = VecPhysMem::new(0x10000);
-        let iova: u64 = (0x100u64 << 39) | (0x50u64 << 30) | (0x80u64 << 21) | (0x11u64 << 12) | 0x456;
+        let iova: u64 =
+            (0x100u64 << 39) | (0x50u64 << 30) | (0x80u64 << 21) | (0x11u64 << 12) | 0x456;
         let phys_target: u64 = 0x5000;
         let root = build_single_leaf_table(
             &mut mem,
