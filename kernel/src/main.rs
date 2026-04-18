@@ -146,27 +146,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
-    // Phase 16: Initialize virtio-net driver and route its IRQ.
+    // Phase 16: Initialize virtio-net driver. Phase 55 C.5 moved IRQ
+    // routing inside the driver (`install_msi_irq` / `install_intx_irq`
+    // via the HAL), so there is nothing to do here beyond the init call.
     net::virtio_net::init();
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
-        // Route the virtio-net PCI interrupt through the I/O APIC.
-        // Phase 55 B.3: interrupt_line is read through the driver's claimed
-        // handle rather than re-scanning PCI config space.
-        let mut irq_routed = false;
-        if let Some(line) = net::virtio_net::pci_interrupt_line()
-            && acpi::io_apic_address().is_some()
-        {
-            arch::x86_64::apic::route_pci_irq(
-                line,
-                arch::x86_64::interrupts::InterruptIndex::VirtioNet as u8,
-            );
-            irq_routed = true;
-        }
-        VIRTIO_NET_IRQ_ROUTED.store(irq_routed, core::sync::atomic::Ordering::Release);
-        if !irq_routed {
-            log::warn!("[net] virtio-net IRQ not routed — net_task will use periodic polling");
-        }
-    }
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
     if cfg!(debug_assertions) {
@@ -548,54 +531,30 @@ fn serial_echo(s: &str) {
 // Network task (P16-T055)
 // ---------------------------------------------------------------------------
 
-/// Whether the virtio-net IRQ was successfully routed through the I/O APIC.
-/// Set during kernel_main init; read by net_task to choose IRQ vs polling mode.
-static VIRTIO_NET_IRQ_ROUTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 /// Background task that processes incoming network frames.
 ///
-/// Polls the virtio-net driver for received frames and dispatches them through
-/// the network stack (Ethernet → ARP/IPv4 → ICMP/UDP/TCP).
+/// Phase 55 C.5: the virtio-net driver installs its RX IRQ through the HAL
+/// (`install_msi_irq` / `install_intx_irq`); the ISR sets
+/// [`net::virtio_net::NET_IRQ_WOKEN`] and wakes this task. Between IRQs the
+/// task parks via [`task::scheduler::block_current_unless_woken`]; on wake
+/// it drains all pending frames through the network dispatch stack.
 fn net_task() -> ! {
-    let has_irq_routing = VIRTIO_NET_IRQ_ROUTED.load(core::sync::atomic::Ordering::Acquire);
-    if !has_irq_routing {
-        log::info!("[net] no APIC routing — using periodic poll mode");
+    // Register this task's id with the driver so the ISR can wake us.
+    if let Some(id) = task::scheduler::current_task_id() {
+        net::virtio_net::set_net_task_id(id);
     }
     log::info!("[net] network processing task started");
 
-    let mut last_poll_tick: u64 = 0;
-
     loop {
-        if has_irq_routing {
-            // IRQ-driven path: drain work signaled by the IRQ flag.
-            while arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-                .swap(false, core::sync::atomic::Ordering::Acquire)
-            {
-                net::dispatch::process_rx();
-            }
-
-            task::yield_now();
-
-            // Race-free sleep.
-            x86_64::instructions::interrupts::disable();
-            if !arch::x86_64::interrupts::VIRTIO_NET_IRQ_PENDING
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
-                x86_64::instructions::interrupts::enable_and_hlt();
-            } else {
-                x86_64::instructions::interrupts::enable();
-            }
-        } else {
-            // Legacy PIC fallback: the virtio-net IRQ is not routed, so poll
-            // process_rx() every ~10 ticks (~100ms at 100 Hz).
-            let now = arch::x86_64::interrupts::tick_count();
-            if now.wrapping_sub(last_poll_tick) >= 10 {
-                net::dispatch::process_rx();
-                last_poll_tick = now;
-            }
-            task::yield_now();
+        // Drain all pending work signalled by the IRQ flag. Using
+        // `swap(false)` means we consume exactly one edge per loop body;
+        // if the ISR sets the flag after we swap but before we park, the
+        // check inside `block_current_unless_woken` will see it and
+        // return immediately.
+        while net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire) {
+            net::dispatch::process_rx();
         }
+        task::scheduler::block_current_unless_woken(&net::virtio_net::NET_IRQ_WOKEN);
     }
 }
 

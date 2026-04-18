@@ -379,7 +379,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // Hardware IRQs
     idt[InterruptIndex::Timer as u8].set_handler_fn(timer_handler);
     idt[InterruptIndex::Keyboard as u8].set_handler_fn(keyboard_handler);
-    idt[InterruptIndex::VirtioNet as u8].set_handler_fn(virtio_net_handler);
+    // Vector 34 (`InterruptIndex::VirtioNet`) is reserved but no longer
+    // installed — Phase 55 C.5 migrated virtio-net to the HAL IRQ contract
+    // (allocated from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE`).
     idt[InterruptIndex::Serial as u8].set_handler_fn(serial_handler);
 
     // APIC spurious interrupt vector — must NOT send EOI.
@@ -688,6 +690,11 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
 pub enum InterruptIndex {
     Timer = 32,
     Keyboard = 33,
+    /// Reserved. Was used for virtio-net pre-Phase-55; virtio-net now
+    /// allocates from the device-IRQ bank at `DEVICE_IRQ_VECTOR_BASE` via
+    /// the HAL. Kept in the enum so the vector number isn't silently
+    /// repurposed before we decide what (if anything) to put here.
+    #[allow(dead_code)]
     VirtioNet = 34,
     Serial = 36,
     Spurious = 0xFF,
@@ -954,32 +961,6 @@ extern "x86-interrupt" fn tlb_shootdown_ipi_handler(_stack_frame: InterruptStack
 extern "x86-interrupt" fn cache_drain_ipi_handler(_stack_frame: InterruptStackFrame) {
     crate::mm::frame_allocator::handle_cache_drain_ipi();
     super::apic::lapic_eoi();
-}
-
-// ---------------------------------------------------------------------------
-// virtio-net IRQ handler (P16-T011, P16-T012)
-// ---------------------------------------------------------------------------
-
-/// Tracks whether a virtio-net interrupt has fired (for polling by the net task).
-pub static VIRTIO_NET_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
-
-extern "x86-interrupt" fn virtio_net_handler(_stack_frame: InterruptStackFrame) {
-    // Read ISR status to acknowledge the interrupt on the device side.
-    // This is lock-free (reads io_base from an atomic) to avoid deadlock
-    // if the interrupt fires while send_frame/recv_frames holds the DRIVER lock.
-    let _isr = crate::net::virtio_net::isr_status();
-
-    // Signal to the network processing task that frames may be available.
-    VIRTIO_NET_IRQ_PENDING.store(true, Ordering::Release);
-
-    if USING_APIC.load(Ordering::Relaxed) {
-        super::apic::lapic_eoi();
-    } else {
-        unsafe {
-            PICS.lock()
-                .notify_end_of_interrupt(InterruptIndex::VirtioNet as u8);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
