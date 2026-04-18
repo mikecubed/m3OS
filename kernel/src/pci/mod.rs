@@ -256,6 +256,216 @@ pub fn pcie_config_write_u16(bus: u8, device: u8, function: u8, offset: u16, val
 }
 
 // ---------------------------------------------------------------------------
+// Phase 55 (B.3): Device claim / driver binding
+// ---------------------------------------------------------------------------
+
+/// Error returned when a claim cannot be granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    /// No PCI function with the requested vendor/device IDs was found.
+    NotFound,
+    /// The device exists but another driver has already claimed it.
+    AlreadyClaimed,
+}
+
+/// Exclusive handle to a claimed PCI function.  Driver code treats this as
+/// the canonical way to read and write its device's configuration space:
+/// the handle carries the bus/device/function address, a copy of the
+/// discovered metadata, and the registry slot used to release the claim on
+/// drop.
+///
+/// The handle is `!Copy` and `!Clone`; ownership represents exclusive access
+/// for the claim's lifetime.  Track C will build the BAR/DMA/IRQ layer on
+/// top of this type.
+pub struct PciDeviceHandle {
+    dev: PciDevice,
+    /// Index into `PCI_DEVICE_REGISTRY`. Used on drop to free the claim.
+    slot: usize,
+}
+
+#[allow(dead_code)]
+impl PciDeviceHandle {
+    /// The underlying device descriptor (bus/device/function + cached
+    /// vendor/device/class/BARs).
+    pub fn device(&self) -> &PciDevice {
+        &self.dev
+    }
+
+    pub fn bus(&self) -> u8 {
+        self.dev.bus
+    }
+
+    pub fn device_number(&self) -> u8 {
+        self.dev.device
+    }
+
+    pub fn function(&self) -> u8 {
+        self.dev.function
+    }
+
+    pub fn vendor_id(&self) -> u16 {
+        self.dev.vendor_id
+    }
+
+    pub fn device_id(&self) -> u16 {
+        self.dev.device_id
+    }
+
+    pub fn bars(&self) -> [u32; 6] {
+        self.dev.bars
+    }
+
+    /// Read a 16-bit value from this device's configuration space.
+    pub fn read_config_u16(&self, offset: u8) -> u16 {
+        pci_config_read_u16(self.dev.bus, self.dev.device, self.dev.function, offset)
+    }
+
+    /// Write a 16-bit value to this device's configuration space.
+    pub fn write_config_u16(&self, offset: u8, value: u16) {
+        pci_config_write_u16(
+            self.dev.bus,
+            self.dev.device,
+            self.dev.function,
+            offset,
+            value,
+        )
+    }
+
+    /// Read an 8-bit value from this device's configuration space.
+    #[allow(dead_code)]
+    pub fn read_config_u8(&self, offset: u8) -> u8 {
+        pci_config_read_u8(self.dev.bus, self.dev.device, self.dev.function, offset)
+    }
+
+    /// Allocate MSI or MSI-X vectors for this device (Phase 55 B.2).
+    #[allow(dead_code)]
+    pub fn allocate_msi_vectors(&self, count: u8) -> Option<AllocatedMsi> {
+        allocate_msi_vectors(&self.dev, count)
+    }
+}
+
+impl Drop for PciDeviceHandle {
+    fn drop(&mut self) {
+        // Return the registry slot to the free pool.  Drivers currently never
+        // unload, so this runs only in tests or teardown paths.
+        let mut reg = PCI_DEVICE_REGISTRY.lock();
+        if let Some(slot) = reg.slots.get_mut(self.slot) {
+            *slot = None;
+        }
+    }
+}
+
+/// One entry in the claim registry.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct ClaimSlot {
+    /// bus/device/function of the claimed PCI function.
+    bus: u8,
+    device: u8,
+    function: u8,
+    /// Driver name for diagnostic logging.
+    driver: &'static str,
+}
+
+const MAX_PCI_CLAIMS: usize = 64;
+
+pub(crate) struct PciDeviceRegistry {
+    slots: [Option<ClaimSlot>; MAX_PCI_CLAIMS],
+}
+
+impl PciDeviceRegistry {
+    const fn new() -> Self {
+        Self {
+            slots: [None; MAX_PCI_CLAIMS],
+        }
+    }
+
+    /// Returns true if `(bus, device, function)` is already in the table.
+    fn is_claimed(&self, bus: u8, device: u8, function: u8) -> bool {
+        self.slots.iter().any(|s| {
+            s.map(|c| c.bus == bus && c.device == device && c.function == function)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Reserve a slot for `(bus, device, function)`; returns the slot index.
+    fn reserve(
+        &mut self,
+        bus: u8,
+        device: u8,
+        function: u8,
+        driver: &'static str,
+    ) -> Option<usize> {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(ClaimSlot {
+                    bus,
+                    device,
+                    function,
+                    driver,
+                });
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) static PCI_DEVICE_REGISTRY: Mutex<PciDeviceRegistry> =
+    Mutex::new(PciDeviceRegistry::new());
+
+/// Claim a PCI function matching `(vendor_id, device_id)`.  Returns an
+/// exclusive [`PciDeviceHandle`], or an error if no match is found or the
+/// device is already claimed.
+///
+/// `driver` is a short name like `"virtio-blk"` used for diagnostic logging.
+///
+/// Only the first matching function is considered — callers that need to
+/// disambiguate multi-function devices should use
+/// [`claim_pci_device_by_bdf`].
+pub fn claim_pci_device(
+    vendor_id: u16,
+    device_id: u16,
+    driver: &'static str,
+) -> Result<PciDeviceHandle, ClaimError> {
+    let mut found: Option<PciDevice> = None;
+    let mut idx = 0;
+    while let Some(dev) = pci_device(idx) {
+        if dev.vendor_id == vendor_id && dev.device_id == device_id {
+            found = Some(dev);
+            break;
+        }
+        idx += 1;
+    }
+    let dev = found.ok_or(ClaimError::NotFound)?;
+    claim_specific(dev, driver)
+}
+
+/// Claim a specific `PciDevice` discovered during enumeration.  Useful when
+/// a driver matches on class code or walks the device list itself.
+pub fn claim_specific(dev: PciDevice, driver: &'static str) -> Result<PciDeviceHandle, ClaimError> {
+    let mut reg = PCI_DEVICE_REGISTRY.lock();
+    if reg.is_claimed(dev.bus, dev.device, dev.function) {
+        return Err(ClaimError::AlreadyClaimed);
+    }
+    let slot = reg
+        .reserve(dev.bus, dev.device, dev.function, driver)
+        .ok_or(ClaimError::AlreadyClaimed)?;
+    drop(reg);
+    log::info!(
+        "[pci] claim: {} -> {:04x}:{:04x} {:02x}:{:02x}.{} (slot {})",
+        driver,
+        dev.vendor_id,
+        dev.device_id,
+        dev.bus,
+        dev.device,
+        dev.function,
+        slot
+    );
+    Ok(PciDeviceHandle { dev, slot })
+}
+
+// ---------------------------------------------------------------------------
 // PciDevice (P15-T035)
 // ---------------------------------------------------------------------------
 

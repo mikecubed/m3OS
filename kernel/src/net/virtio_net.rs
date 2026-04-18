@@ -402,6 +402,9 @@ pub use kernel_core::types::MacAddr;
 
 #[allow(dead_code)]
 struct VirtioNetDriver {
+    /// Claim handle — held for the driver's lifetime so no other driver can
+    /// re-bind to the same function.
+    pci: pci::PciDeviceHandle,
     io_base: u16,
     mac: MacAddr,
     rx_queue: Virtqueue,
@@ -423,6 +426,19 @@ static ISR_IO_BASE: AtomicU16 = AtomicU16::new(0);
 #[allow(dead_code)]
 pub fn mac_address() -> Option<MacAddr> {
     DRIVER.lock().as_ref().map(|d| d.mac)
+}
+
+/// Returns the legacy PCI interrupt line of the claimed virtio-net device,
+/// or `None` if the device hasn't been initialised or has no INTx.
+///
+/// Used by `kernel_main` to program the I/O APIC for INTx routing now that
+/// the PCI handle lives inside the driver (Phase 55 B.3).
+pub fn pci_interrupt_line() -> Option<u8> {
+    DRIVER
+        .lock()
+        .as_ref()
+        .map(|d| d.pci.device().interrupt_line)
+        .filter(|&line| line != 0xFF)
 }
 
 // ===========================================================================
@@ -520,15 +536,15 @@ pub fn isr_status() -> u8 {
 /// Finds the device on PCI, performs virtio reset + feature negotiation,
 /// sets up RX and TX virtqueues, and reads the MAC address.
 pub fn init() {
-    // P16-T001: Find the virtio-net device.
-    let dev = find_virtio_net_device();
-    let dev = match dev {
-        Some(d) => d,
+    // Phase 55 B.3: claim the device through the registry.
+    let handle = match claim_virtio_net() {
+        Some(h) => h,
         None => {
             log::warn!("[virtio-net] no virtio-net device found on PCI bus");
             return;
         }
     };
+    let dev = *handle.device();
 
     log::info!(
         "[virtio-net] found device {:04x}:{:04x} at {:02x}:{:02x}.{}",
@@ -550,9 +566,9 @@ pub fn init() {
 
     // Ensure PCI command register has I/O space (bit 0) and bus mastering
     // (bit 2) enabled — required for port I/O and DMA respectively.
-    let cmd = pci::pci_config_read_u16(dev.bus, dev.device, dev.function, 0x04);
+    let cmd = handle.read_config_u16(0x04);
     if cmd & 0x05 != 0x05 {
-        pci::pci_config_write_u16(dev.bus, dev.device, dev.function, 0x04, cmd | 0x05);
+        handle.write_config_u16(0x04, cmd | 0x05);
         log::info!("[virtio-net] PCI command: enabled I/O space + bus mastering");
     }
 
@@ -630,6 +646,7 @@ pub fn init() {
     }
 
     let mut driver = VirtioNetDriver {
+        pci: handle,
         io_base,
         mac,
         rx_queue,
@@ -656,27 +673,33 @@ pub fn init() {
 }
 
 // ===========================================================================
-// PCI device discovery (P16-T001)
+// PCI device discovery (P16-T001 + Phase 55 B.3)
 // ===========================================================================
 
-/// Find the virtio-net device in the PCI device list.
+/// Claim the virtio-net device through the Phase-55 claim protocol.
 ///
 /// Only matches vendor 0x1AF4, device 0x1000 (legacy/transitional virtio-net).
 /// Device 0x1041 (modern virtio-net) is not supported — the driver only
 /// implements the legacy I/O-port register layout.
-pub fn find_virtio_net_device() -> Option<pci::PciDevice> {
-    let mut index = 0;
-    while let Some(dev) = pci::pci_device(index) {
-        if dev.vendor_id == 0x1AF4
-            && dev.device_id == 0x1000
-            && dev.class_code == 0x02
-            && dev.subclass == 0x00
-        {
-            return Some(dev);
+fn claim_virtio_net() -> Option<pci::PciDeviceHandle> {
+    match pci::claim_pci_device(0x1AF4, 0x1000, "virtio-net") {
+        Ok(h) => {
+            // Confirm the class/subclass match as well — the legacy bridge
+            // device uses the same vendor, so avoid double-binding.
+            if h.device().class_code == 0x02 && h.device().subclass == 0x00 {
+                Some(h)
+            } else {
+                // Dropping the handle releases the claim.
+                drop(h);
+                None
+            }
         }
-        index += 1;
+        Err(pci::ClaimError::NotFound) => None,
+        Err(pci::ClaimError::AlreadyClaimed) => {
+            log::warn!("[virtio-net] vendor 1af4 device 1000 already claimed");
+            None
+        }
     }
-    None
 }
 
 // ===========================================================================
