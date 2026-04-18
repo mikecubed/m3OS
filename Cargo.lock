@@ -524,7 +524,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fat_server"
-version = "0.54.0"
+version = "0.55.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.54.0"
+version = "0.55.0"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "net_server"
-version = "0.54.0"
+version = "0.55.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",
@@ -1907,7 +1907,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vfs_server"
-version = "0.54.0"
+version = "0.55.0"
 dependencies = [
  "kernel-core",
  "syscall-lib",

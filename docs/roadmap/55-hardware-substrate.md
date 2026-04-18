@@ -1,6 +1,6 @@
 # Phase 55 - Hardware Substrate
 
-**Status:** Planned
+**Status:** Complete
 **Source Ref:** phase-55
 **Depends on:** Phase 15 (Hardware Discovery) ✅, Phase 16 (Network) ✅, Phase 24 (Persistent Storage) ✅, Phase 54 (Deep Serverization) ✅
 **Builds on:** Extends the QEMU/VirtIO-first system into a narrow, testable real-hardware story without abandoning the userspace-service direction established by the earlier convergence phases
@@ -184,4 +184,18 @@ Notes: This **replaces** the default VirtIO-net device for that run. The `user` 
 
 ## Evaluation Gate Verification
 
-Verification of the four evaluation-gate rows above (service-boundary readiness, donor-source readiness, validation environment, release posture) is deferred to the close of Phase 55, once Tracks B through F have landed. Task A.4 in `docs/roadmap/tasks/55-hardware-substrate-tasks.md` owns that verification work and records its results in the Phase 55 learning doc (`docs/55-hardware-substrate.md`). Until then, the gate remains open and no Phase 55 closure activities (version bump, roadmap row flip to Complete) should proceed.
+All four evaluation-gate rows have been verified at Phase 55 close (Track F).
+The authoritative narrative lives in the "Evaluation Gate Verification"
+section of [docs/55-hardware-substrate.md](../55-hardware-substrate.md)
+(learning doc); the results are summarised here for cross-reference:
+
+| Gate | Verification status at close |
+|---|---|
+| Service-boundary readiness | Verified. Phase 54 serverization narrowed the kernel enough that NVMe and e1000 do not widen the TCB beyond the hardware-access-layer contract. Ring-0 placement is a deliberate trade-off with a documented ring-3 extraction path (see "Ring-0 placement is deliberate and bounded" in the task-doc Documentation Notes). |
+| Donor-source readiness | Verified. NVMe spec 1.4 and Intel 82540EM manual §13.4/§13.5 were the primary sources; Redox `nvmed` and `e1000d` remained the closest Rust external donors but no Redox code was imported. Details in the learning doc's "Specific Redox drivers consulted" subsection. |
+| Validation environment | Verified. Task F.1 exposes the Reference QEMU Configurations as `cargo xtask run --device nvme` and `cargo xtask run --device e1000`, plus their combination. The xtask flags reproduce the exact QEMU fragments recorded above. Physical-hardware validation is deferred per the IOMMU caveat on the matrix. |
+| Release posture | Verified. The Reference Hardware Matrix above is the narrow hardware promise for the milestone; entries outside the matrix are out of scope. The matrix is cross-referenced from both this design doc and the learning doc. |
+
+With all four gates verified, Phase 55 closure activities (kernel version
+bump to `0.55.0`, roadmap row flip to Complete, cross-subsystem doc updates)
+proceed in Track F.

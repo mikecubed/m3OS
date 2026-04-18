@@ -1,11 +1,11 @@
 # Release Phase R08 — Hardware Substrate
 
-**Status:** Proposed  
+**Status:** Phase 55 Complete — non-display workstreams landed; Phase 56 (display / input) still planned
 **Depends on:** [R07 — Deep Serverization](./R07-deep-serverization.md)  
 **Official roadmap phases covered:** [Phase 15](../../roadmap/15-hardware-discovery.md),
 [Phase 16](../../roadmap/16-network.md),
 [Phase 24](../../roadmap/24-persistent-storage.md),
-[Phase 55](../../roadmap/55-hardware-substrate.md),
+[Phase 55](../../roadmap/55-hardware-substrate.md) ✅,
 [Phase 56](../../roadmap/56-display-and-input-architecture.md)
 **Primary evaluation docs:** [Hardware Driver Strategy](../hardware-driver-strategy.md),
 [Redox Driver Porting](../redox-driver-porting.md),
@@ -107,3 +107,36 @@ benefits both the headless/admin path and the later local desktop path.
   acceptable on the first reference matrix?
 - Is PS/2 mouse enough for the first local-system milestone, or must USB HID be
   in scope before 1.0?
+
+## Phase 55 Completion Status
+
+Phase 55 (the non-display workstream of R08) landed in kernel v0.55.0:
+
+- **Hardware-access layer** is live in `kernel/src/pci/bar.rs`,
+  `kernel/src/mm/dma.rs`, and `kernel/src/pci/mod.rs` (device claim, driver
+  registry, MSI/MSI-X vector allocation, `DeviceIrq` installation).
+- **PCIe MCFG** is parsed from ACPI and extended config space is reachable
+  via `pcie_mmio_config_read` / `pcie_mmio_config_write`. Legacy port-I/O
+  config space remains as a fallback.
+- **NVMe** (`kernel/src/blk/nvme.rs`) is the first non-VirtIO storage
+  driver. Reset, admin queue, Identify, I/O queue pair, PRP-based read/write,
+  and MSI/MSI-X completion all work on QEMU's NVMe controller. The
+  in-kernel data-path smoke test (512-byte round-trip at LBA 0) passes on
+  every bring-up.
+- **Intel 82540EM classic e1000** (`kernel/src/net/e1000.rs`) is the first
+  non-VirtIO network driver. Reset, TX/RX rings, INTx-only completion path
+  (QEMU classic e1000 has no MSI-X), and network-stack integration via
+  `net/mod.rs` all work. e1000e family, Realtek, and other NICs remain out
+  of scope.
+- **Validation tooling.** `cargo xtask run --device nvme` and
+  `cargo xtask run --device e1000` reproduce the reference QEMU
+  configurations; they can be combined. The Reference Hardware Matrix in
+  [Phase 55 roadmap](../../roadmap/55-hardware-substrate.md) names the
+  supported targets and their IOMMU caveat.
+- **Reference hardware promise.** Phase 55 commits to QEMU emulation of
+  the reference targets; physical-hardware support is deferred per the
+  matrix. The donor strategy (specs first, Redox second) was followed; no
+  Redox code was imported.
+
+The PS/2 mouse and display-side workstreams remain planned under Phase 56.
+USB HID is still deferred to a later phase.

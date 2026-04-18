@@ -236,3 +236,44 @@ use:
 If the ext2 image is corrupted or the writable path is no longer trustworthy,
 recreate it with `cargo xtask run --fresh` (or `cargo xtask clean` followed by a
 normal run).
+
+## Phase 55 Additions (NVMe)
+
+Phase 24 shipped VirtIO-blk as the only supported block device. Phase 55
+adds NVMe (`kernel/src/blk/nvme.rs`) as the first non-VirtIO storage path.
+NVMe is architecturally close to VirtIO — submission and completion queues,
+doorbell registers, MSI/MSI-X completion — which made it the highest-leverage
+first real-hardware storage target.
+
+- **Bring-up.** `nvme_probe` matches on PCI class `01:08:02`, claims the
+  device via the hardware-access layer, maps BAR0, executes a controller
+  reset bounded by `CAP.TO`, programs the admin queue (`AQA`/`ASQ`/`ACQ`),
+  and enables the controller.
+- **Identify.** Identify Controller records model/serial/firmware strings;
+  Identify Namespace records the namespace capacity and LBA format.
+- **I/O queue pair.** A single I/O CQ + SQ pair is created (qid=1, 64
+  entries). Read and Write commands use Physical Region Page (PRP) lists
+  with an overflow PRP-list page for transfers spanning more than two
+  pages.
+- **Completion path.** MSI-X is installed when available (the QEMU NVMe
+  controller advertises it); the handler drains both admin and I/O
+  completion queues by walking the phase bit and wakes blocked tasks via
+  `wake_task`. A polling fallback exists if MSI allocation fails.
+- **Dispatch policy.** `blk/mod.rs` dispatches `read_sectors` /
+  `write_sectors` to NVMe when `NVME_READY` is set, else VirtIO-blk. A
+  proper multi-device block layer is deferred — Phase 55 is deliberately
+  simple.
+- **Smoke test.** At end of probe, the driver writes a deterministic
+  512-byte pattern to LBA 0, reads it back, and compares. On mismatch
+  it clears `NVME_READY` so the dispatch layer falls back to VirtIO-blk
+  instead of silently corrupting data.
+- **Operator usage.** `cargo xtask run --device nvme` attaches a 64 MiB
+  NVMe drive at `target/nvme.img` and the kernel logs
+  `nvme data-path smoke OK (512B round-trip at LBA 0)` when bring-up
+  succeeds.
+
+NVMe pure-logic types (`NvmeCommand`, `NvmeCompletion`, `NvmeCap`, opcode
+constants) live in `kernel-core/src/nvme.rs` and are host-testable. See
+[Phase 55 — Hardware Substrate](./55-hardware-substrate.md) for the driver
+architecture, the reference matrix (including the IOMMU caveat for
+physical-hardware NVMe), and how NVMe plugs into the hardware-access layer.

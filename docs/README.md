@@ -62,6 +62,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Kernel Memory Modernization](./53a-kernel-memory-modernization.md) | 53a | Per-CPU page cache, magazine slabs, size-class allocator cutover, cross-CPU frees, and allocator-local reclaim |
 | [Headless Hardening](./53-headless-hardening.md) | 53 | Supported headless/reference workflow, validation gates, operator model, and non-goals |
 | [Deep Serverization](./54-deep-serverization.md) | 54 | Userspace-owned storage/VFS and UDP policy slices, degraded-mode fallback contracts, and the signal/IPC shutdown fix needed to make them operable |
+| [Hardware Substrate](./55-hardware-substrate.md) | 55 | PCIe MCFG + MSI/MSI-X, reusable hardware-access layer (BAR mapping, DMA, device IRQ), NVMe storage driver, Intel 82540EM classic e1000 network driver, reference hardware matrix |
 
 ### Roadmap
 
