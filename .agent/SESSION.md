@@ -1,9 +1,9 @@
 ---
-current-task: "PR #113 review resolution — 13 copilot-reviewer threads on feat/55-hardware-substrate (3 passes)"
-current-phase: "resolved"
-next-action: "await PR merge by developer"
+current-task: "PR #113 review resolution — 14 copilot-reviewer threads on feat/55-hardware-substrate (4 passes)"
+current-phase: "fix-batch-1-complete"
+next-action: "commit + push + reply + resolve thread 14"
 workspace: "feat/55-hardware-substrate (PR #113)"
-last-updated: "2026-04-18T17:45:00Z"
+last-updated: "2026-04-18T20:55:00Z"
 ---
 
 ## Review surface
@@ -41,7 +41,23 @@ resolved.
 
 | #  | Thread ID                 | Location                                     | Evidence | Action | Commit      |
 |----|---------------------------|----------------------------------------------|----------|--------|-------------|
-| 13 | PRRT_kwDORTRVIM579SpA     | docs/roadmap/55-hardware-substrate.md:172    | valid    | fixed  | (this pass) |
+| 13 | PRRT_kwDORTRVIM579SpA     | docs/roadmap/55-hardware-substrate.md:172    | valid    | fixed  | e11baa4     |
+
+### Pass 4 — 1 thread (post-fix review, 2026-04-18T20:39Z)
+
+| #  | Thread ID                 | Location                                     | Evidence | Action | Commit      |
+|----|---------------------------|----------------------------------------------|----------|--------|-------------|
+| 14 | PRRT_kwDORTRVIM57-Bk-     | kernel/src/pci/bar.rs:337                    | valid    | fixed  | (this pass) |
+
+- Pass 4: `map_bar`'s "Memory type note" contradicts `ensure_uncacheable`.
+  `map_bar` claims cache-disabled PAT selection is used at boot and that
+  `NO_CACHE | WRITE_THROUGH` per-PTE patching is "future" work; in fact
+  `ensure_uncacheable` performs that exact patch on every 4 KiB leaf PTE
+  covering the BAR right now, and the phys-offset mapping is writeback
+  (per `ensure_uncacheable`'s own docstring). Also `ensure_uncacheable`
+  doc mentions only `NO_CACHE` while the code ORs both `NO_CACHE` and
+  `WRITE_THROUGH`. Docs-only fix: reconcile both docstrings to the
+  behavior that actually runs.
 
 - Pass 1: 9 accepted fixes landed in commit 1d219fe8 (`fix(phase-55):
   address 9 copilot-reviewer comments on PR #113`); Comment 2 declined
@@ -115,6 +131,10 @@ Pass 2 (pre-push):
   `dma_buffer_new_array_reports_overflow_distinctly_from_zero_size`).
 
 Pass 3 (pre-push):
+- `cargo xtask check` — clippy clean, rustfmt clean, kernel-core and
+  passwd host tests pass. Docs-only change — no new tests required.
+
+Pass 4 (pre-push):
 - `cargo xtask check` — clippy clean, rustfmt clean, kernel-core and
   passwd host tests pass. Docs-only change — no new tests required.
 

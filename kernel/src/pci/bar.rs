@@ -322,19 +322,26 @@ impl BarMapping {
 ///
 /// Reads the raw BAR value, performs the write-ones/read-back sizing dance,
 /// restores the BAR, and returns a [`BarMapping`]. MMIO BARs are exposed via
-/// the kernel's physical-memory offset identity mapping; they are treated as
-/// uncacheable by virtue of the underlying page table entries (see below).
+/// the kernel's physical-memory offset identity mapping; [`ensure_uncacheable`]
+/// then marks the 4 KiB leaf PTEs covering the region so stores reach the
+/// device on every write.
 ///
 /// # Memory type note
 ///
-/// The x86-64 kernel maps all physical memory via the bootloader's physical
-/// memory offset using cache-disabled PAT selection for device memory ranges.
-/// MMIO addresses above the boot-visible RAM range are outside the allocator's
-/// tracking but still backed by the identity-mapped physical memory window the
-/// bootloader set up for the kernel. Future IOMMU / custom-mapped drivers may
-/// allocate a private PTE with `NO_CACHE | WRITE_THROUGH` set — for now
-/// QEMU-emulated BARs behave correctly on the shared mapping because the x86
-/// MTRRs default to UC for high MMIO ranges.
+/// The bootloader establishes the physical-memory offset map with writeback
+/// caching because it spans normal RAM. Rather than reshape the boot-time
+/// map for every device range, [`ensure_uncacheable`] patches each 4 KiB PTE
+/// that backs the BAR by OR'ing in `NO_CACHE | WRITE_THROUGH` — see that
+/// function's docs for the exact algorithm, limits, and failure handling.
+///
+/// Where a BAR happens to fall under a huge-page (2 MiB / 1 GiB) mapping, the
+/// per-page PTE patch is skipped — we do not currently promote huge pages to
+/// 4 KiB leaves. On QEMU this is not an issue in practice because MMIO sits
+/// above the boot-visible RAM range, outside any huge-page RAM mapping; in
+/// the residual case the CPU falls back to the default UC memory type for
+/// high MMIO (x86 MTRR default behaviour), keeping device writes correct.
+/// Dedicated MMIO PAT slots and real-hardware IOMMU mapping with privately
+/// allocated PTEs are deferred to a later phase.
 ///
 /// # Returns
 ///
@@ -447,20 +454,26 @@ pub fn map_bar(handle: &PciDeviceHandle, bar_index: u8) -> Result<BarMapping, Ba
 // Cache-disable hint
 // ---------------------------------------------------------------------------
 
-/// Mark the PTE(s) covering `[virt_base, virt_base + size)` as NO_CACHE.
+/// Mark the PTE(s) covering `[virt_base, virt_base + size)` as uncacheable
+/// (`NO_CACHE | WRITE_THROUGH`).
 ///
 /// On boot the physical-memory offset mapping uses writeback caching because
 /// it spans normal RAM. For MMIO BAR regions we want uncacheable access so
 /// that stores reach the device on every write. We walk the active page
-/// table with `OffsetPageTable` and OR in `PageTableFlags::NO_CACHE` on any
-/// matching 4 KiB entry; if a range is covered by a huge page we leave it
-/// alone (it is typically RAM-mapped above the BAR range and the device's
-/// CPU MTRR selects the UC memory type for MMIO addresses by default on
-/// QEMU).
+/// table with `OffsetPageTable` and, for each 4 KiB leaf in range, OR in
+/// `PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH` while
+/// preserving every other bit (`NO_EXECUTE`, `GLOBAL`, custom bits, etc.).
+/// If a range is covered by a huge page (2 MiB / 1 GiB), we leave it alone —
+/// no huge-page promotion. In practice QEMU puts MMIO above the boot-visible
+/// RAM range where the kernel's huge-page RAM mapping does not reach, so the
+/// leaf patch covers every BAR we care about; if a BAR did fall under a huge
+/// page, the CPU would fall back to its default UC memory type for high MMIO
+/// (x86 MTRR default behaviour).
 ///
 /// Failures here are downgraded to a warning — `map_bar` still returns a
 /// valid `BarMapping` and the driver can fall back to the shared mapping.
-/// The full MMIO PAT plumbing is deferred to a later phase.
+/// Dedicated MMIO PAT slots and real-hardware IOMMU-mapped private PTEs are
+/// deferred to a later phase.
 #[allow(dead_code)]
 fn ensure_uncacheable(virt_base: usize, size: u64) {
     use x86_64::VirtAddr;
