@@ -291,12 +291,7 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn make_drhd(
-        flags: u8,
-        segment: u16,
-        base: u64,
-        scopes: Vec<DeviceScope>,
-    ) -> DmaRemappingUnit {
+    fn make_drhd(flags: u8, segment: u16, base: u64, scopes: Vec<DeviceScope>) -> DmaRemappingUnit {
         DmaRemappingUnit {
             flags,
             segment,
@@ -447,7 +442,9 @@ mod tests {
     #[test]
     fn ivrs_empty_device_list_is_include_all() {
         let mut tables = IvrsTables::default();
-        tables.ivhd_blocks.push(make_ivhd(0x40, 0xf000_0000, 0, vec![]));
+        tables
+            .ivhd_blocks
+            .push(make_ivhd(0x40, 0xf000_0000, 0, vec![]));
         let descs = iommu_units_from_ivrs(&tables);
         assert!(descs[0].include_all);
         assert_eq!(descs[0].scopes[0].bus_start, 0);
@@ -535,7 +532,8 @@ mod tests {
     #[test]
     fn reserved_regions_from_ivrs_is_noop_stub() {
         let mut ivrs = IvrsTables::default();
-        ivrs.ivhd_blocks.push(make_ivhd(0x10, 0xf000_0000, 0, vec![]));
+        ivrs.ivhd_blocks
+            .push(make_ivhd(0x10, 0xf000_0000, 0, vec![]));
         let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
         assert!(set.is_empty());
         assert!(summaries.is_empty());

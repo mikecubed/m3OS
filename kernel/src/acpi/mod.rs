@@ -6,6 +6,7 @@
 //! (`mm::phys_offset()`).
 
 use core::ptr;
+use kernel_core::iommu::tables::{DmarTables, IvrsTables, decode_dmar, decode_ivrs};
 use kernel_core::pci::McfgEntry;
 use spin::Once;
 use x86_64::PhysAddr;
@@ -124,6 +125,18 @@ pub struct McfgInfo {
 }
 
 static MCFG_INFO: Once<McfgInfo> = Once::new();
+
+// ---------------------------------------------------------------------------
+// Phase 55a (B.1): DMAR / IVRS decoded tables
+// ---------------------------------------------------------------------------
+
+/// Parsed DMAR (Intel VT-d) tables, populated by `parse_dmar` if DMAR is
+/// present in the ACPI table list.
+static DMAR_TABLES: Once<DmarTables> = Once::new();
+
+/// Parsed IVRS (AMD-Vi) tables, populated by `parse_ivrs` if IVRS is
+/// present in the ACPI table list.
+static IVRS_TABLES: Once<IvrsTables> = Once::new();
 
 // ---------------------------------------------------------------------------
 // P15-T003: RSDP validation
@@ -516,6 +529,101 @@ pub fn mcfg_entries() -> Option<&'static [McfgEntry]> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 55a (B.1): DMAR / IVRS parsing
+// ---------------------------------------------------------------------------
+
+/// Locate, validate, and decode the DMAR (Intel VT-d) ACPI table.
+///
+/// On success the decoded [`DmarTables`] is cached in [`DMAR_TABLES`].
+/// Missing DMAR is not an error (IOMMU is optional); the function logs
+/// and returns without populating the `Once`.
+fn parse_dmar() {
+    let hdr_ptr = match find_table(b"DMAR") {
+        Some(p) => p,
+        None => {
+            log::info!("[acpi] DMAR table not found (Intel VT-d absent)");
+            return;
+        }
+    };
+
+    let hdr_virt = hdr_ptr as usize;
+    if !validate_sdt(hdr_virt) {
+        log::warn!("[acpi] DMAR checksum invalid");
+        return;
+    }
+
+    // SAFETY: hdr_ptr points to a valid DMAR in identity-mapped memory.
+    let header: AcpiSdtHeader = unsafe { ptr::read_unaligned(hdr_ptr) };
+    let table_length = header.length as usize;
+
+    // SAFETY: table_length is bounded by validate_sdt's MAX_SDT_LENGTH.
+    let bytes = unsafe { core::slice::from_raw_parts(hdr_virt as *const u8, table_length) };
+
+    match decode_dmar(bytes) {
+        Ok(tables) => {
+            log::info!(
+                "[acpi] DMAR decoded: {} DRHD, {} RMRR, {} ATSR, {} RHSA (unknown subtables: {})",
+                tables.drhds.len(),
+                tables.rmrrs.len(),
+                tables.atsrs.len(),
+                tables.rhsas.len(),
+                tables.unknown_subtables,
+            );
+            DMAR_TABLES.call_once(|| tables);
+        }
+        Err(e) => log::warn!("[acpi] DMAR decode failed: {:?}", e),
+    }
+}
+
+/// Locate, validate, and decode the IVRS (AMD-Vi) ACPI table.
+fn parse_ivrs() {
+    let hdr_ptr = match find_table(b"IVRS") {
+        Some(p) => p,
+        None => {
+            log::info!("[acpi] IVRS table not found (AMD-Vi absent)");
+            return;
+        }
+    };
+
+    let hdr_virt = hdr_ptr as usize;
+    if !validate_sdt(hdr_virt) {
+        log::warn!("[acpi] IVRS checksum invalid");
+        return;
+    }
+
+    // SAFETY: hdr_ptr points to a valid IVRS in identity-mapped memory.
+    let header: AcpiSdtHeader = unsafe { ptr::read_unaligned(hdr_ptr) };
+    let table_length = header.length as usize;
+
+    // SAFETY: table_length is bounded by validate_sdt's MAX_SDT_LENGTH.
+    let bytes = unsafe { core::slice::from_raw_parts(hdr_virt as *const u8, table_length) };
+
+    match decode_ivrs(bytes) {
+        Ok(tables) => {
+            log::info!(
+                "[acpi] IVRS decoded: {} IVHD blocks (unknown blocks: {})",
+                tables.ivhd_blocks.len(),
+                tables.unknown_blocks,
+            );
+            IVRS_TABLES.call_once(|| tables);
+        }
+        Err(e) => log::warn!("[acpi] IVRS decode failed: {:?}", e),
+    }
+}
+
+/// Returns the parsed DMAR tables, or `None` if DMAR was absent or
+/// failed to decode.
+pub fn dmar_tables() -> Option<&'static DmarTables> {
+    DMAR_TABLES.get()
+}
+
+/// Returns the parsed IVRS tables, or `None` if IVRS was absent or
+/// failed to decode.
+pub fn ivrs_tables() -> Option<&'static IvrsTables> {
+    IVRS_TABLES.get()
+}
+
+// ---------------------------------------------------------------------------
 // P15-T010: Log discovery results
 // ---------------------------------------------------------------------------
 
@@ -645,6 +753,8 @@ pub fn init(rsdp_addr: Option<u64>) {
     parse_madt();
     parse_fadt();
     parse_mcfg();
+    parse_dmar();
+    parse_ivrs();
     log_discovery();
 }
 

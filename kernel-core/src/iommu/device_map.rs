@@ -257,13 +257,7 @@ mod tests {
 
     #[test]
     fn include_all_covers_every_bus() {
-        let map = DeviceToUnitMap::build(&[desc(
-            0,
-            IommuVendor::Vtd,
-            0xfed9_0000,
-            vec![],
-            true,
-        )]);
+        let map = DeviceToUnitMap::build(&[desc(0, IommuVendor::Vtd, 0xfed9_0000, vec![], true)]);
         for bus in [0u8, 1, 7, 127, 200, 255] {
             assert_eq!(map.lookup(0, bus, 0, 0), Some(0));
         }
@@ -312,7 +306,11 @@ mod tests {
             0,
             IommuVendor::AmdVi,
             0xf000_0000,
-            vec![scope(0, 0x00, 0x0f), scope(0, 0x40, 0x4f), scope(0, 0xa0, 0xaf)],
+            vec![
+                scope(0, 0x00, 0x0f),
+                scope(0, 0x40, 0x4f),
+                scope(0, 0xa0, 0xaf),
+            ],
             false,
         )]);
         assert_eq!(map.lookup(0, 0x00, 0, 0), Some(0));
