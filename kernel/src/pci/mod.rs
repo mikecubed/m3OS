@@ -982,12 +982,41 @@ pub fn find_msix(bus: u8, device: u8, function: u8) -> Option<MsixCapability> {
 
 /// Lowest IDT vector we hand out for device MSI / MSI-X interrupts.  Vectors
 /// 32..=47 are reserved for legacy PIC/APIC IRQs and the SMP IPI block.
+///
+/// Kept in lockstep with
+/// [`crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE`] (and the
+/// assertion below): the MSI pool must not advertise vectors that the IDT
+/// stub bank cannot dispatch.
 #[allow(dead_code)]
-pub const MSI_VECTOR_BASE: u8 = 0x60;
-/// One past the highest IDT vector we will hand out.  The APIC spurious
-/// vector is 0xFF, and we leave 0xF0–0xFE alone for future expansion.
+pub const MSI_VECTOR_BASE: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE;
+/// One past the highest IDT vector we will hand out (exclusive upper bound
+/// used by [`kpci::MsiVectorAllocator`]).
+///
+/// Derived from the device IRQ stub bank in `arch::x86_64::interrupts` so an
+/// allocation from this pool always lands on a registered dispatcher.
+/// Before Phase 55 review, this was a hand-picked `0xEF` which advertised
+/// 143 vectors while the stub bank only had 16 — `allocate_msi_vectors`
+/// would hand out e.g. `0x90`, `register_device_irq` would return "vector
+/// out of device IRQ range", and driver init would fail late.
+///
+/// 16 vectors is comfortably enough for Phase 55: NVMe needs 1 admin + 1
+/// I/O = 2, e1000 needs 1, VirtIO-blk needs 1, VirtIO-net needs 1 — total 5
+/// vectors. If that ever tightens, grow the stub bank in
+/// `arch::x86_64::interrupts` first; `MSI_VECTOR_TOP` will follow
+/// automatically.
 #[allow(dead_code)]
-pub const MSI_VECTOR_TOP: u8 = 0xEF;
+pub const MSI_VECTOR_TOP: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE
+    + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT;
+
+// Compile-time guard: catch future drift if either side is tweaked in
+// isolation. See `DEVICE_IRQ_VECTOR_BASE` / `DEVICE_IRQ_VECTOR_COUNT` in
+// `kernel::arch::x86_64::interrupts`.
+const _: () = assert!(MSI_VECTOR_BASE == crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE);
+const _: () = assert!(
+    MSI_VECTOR_TOP
+        == crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE
+            + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT
+);
 
 static MSI_POOL: Mutex<kpci::MsiVectorAllocator> = Mutex::new(kpci::MsiVectorAllocator::new(
     MSI_VECTOR_BASE,
