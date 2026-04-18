@@ -732,8 +732,10 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
     DriverProbeResult::Bound
 }
 
-/// Legacy init entry kept for main.rs compatibility: registers the driver
-/// and immediately runs the probe pass.
+/// Legacy init entry: registers the driver and immediately runs the probe
+/// pass. Kept for backwards compatibility and tests; the normal boot flow
+/// goes through [`super::init`] which aggregates all block drivers.
+#[allow(dead_code)]
 pub fn init() {
     register();
     pci::probe_all_drivers();
