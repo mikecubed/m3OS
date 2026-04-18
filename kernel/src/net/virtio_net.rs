@@ -5,15 +5,35 @@
 //!
 //! Uses the virtio "legacy" (0.9.5) register layout mapped through PCI BAR0
 //! I/O space, which is what QEMU's `virtio-net-pci` exposes by default.
+//!
+//! Phase 55 C.5 migration (now complete for IRQ handling as well):
+//!   * PCI BAR0 is looked up through [`crate::pci::bar::map_bar`].
+//!   * Virtqueue rings and per-descriptor buffers are allocated through
+//!     [`crate::mm::dma::DmaBuffer`] instead of raw `alloc_contiguous_frames`.
+//!   * The driver registers itself with [`crate::pci::register_driver`]; the
+//!     kernel's [`crate::pci::probe_all_drivers`] pass binds the device.
+//!   * The RX IRQ is installed through
+//!     [`crate::pci::PciDeviceHandle::install_msi_irq`] (preferred) or
+//!     [`crate::pci::PciDeviceHandle::install_intx_irq`] (fallback). The
+//!     registered handler wakes the network task via
+//!     [`crate::task::scheduler::wake_task`], and the task parks on a
+//!     [`crate::task::scheduler::block_current_unless_woken`] flag — the
+//!     same pattern as virtio-blk. The legacy `InterruptIndex::VirtioNet`
+//!     vector 34 path is gone.
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_core::types::TaskId;
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 use x86_64::instructions::port::Port;
 
+use crate::mm::dma::DmaBuffer;
 use crate::mm::frame_allocator;
-use crate::pci;
+use crate::pci::bar::{BarMapping, PortRegion};
+use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
+use crate::task::scheduler::wake_task;
 
 // ===========================================================================
 // Legacy virtio I/O register offsets (common header)
@@ -119,25 +139,21 @@ struct Virtqueue {
     /// Number of entries in the queue.
     queue_size: u16,
 
-    // Pointers into the physically contiguous virtqueue allocation.
+    /// DMA-allocated ring memory (desc + avail + used sub-tables laid out
+    /// per the virtio 0.9.5 spec inside this one allocation).
+    ring: DmaBuffer<[u8]>,
+
+    // Pointers into the `ring` allocation (precomputed during init).
     desc_base: *mut VirtqDesc,
     avail_base: *mut VirtqAvailHeader,
     used_base: *mut VirtqUsedHeader,
 
-    /// Physical base address of the virtqueue allocation (page-aligned).
-    phys_base: u64,
-    /// Virtual base address.
-    virt_base: usize,
-    /// Buddy order used for the contiguous allocation (for correct cleanup).
-    #[allow(dead_code)]
-    alloc_order: usize,
-    /// Total size of the allocation in bytes.
-    #[allow(dead_code)]
-    alloc_size: usize,
-
-    /// Per-descriptor buffer virtual addresses (for reading data back).
+    /// Per-descriptor DMA buffers — one 4 KiB page per slot, owned by the
+    /// virtqueue.  Dropping the Vec returns all buffers to the buddy.
+    buffer_dmas: Vec<DmaBuffer<[u8]>>,
+    /// Cached kernel-virtual pointers — same length as buffer_dmas.
     buffers: Vec<*mut u8>,
-    /// Per-descriptor buffer physical addresses (for descriptor addr field).
+    /// Cached physical addresses — same length as buffer_dmas.
     buf_phys: Vec<u64>,
 
     /// Our last-seen used ring index.
@@ -192,18 +208,23 @@ impl Virtqueue {
         }
 
         let alloc_size = Self::calc_size(queue_size);
-        let pages_needed = alloc_size.div_ceil(4096);
 
-        // Allocate physically contiguous pages.
-        let (phys_base, alloc_order) = alloc_contiguous_frames(pages_needed)?;
-        let virt_base = (crate::mm::phys_offset() + phys_base) as usize;
+        // Phase 55 C.5: allocate the virtqueue ring via DmaBuffer instead of
+        // raw frame allocator calls.
+        let ring = match DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!(
+                    "[virtio-net] queue {}: ring DmaBuffer alloc failed: {:?}",
+                    queue_index,
+                    e
+                );
+                return None;
+            }
+        };
+        let phys_base = ring.physical_address().as_u64();
+        let virt_base = ring.as_ptr() as usize;
 
-        // Zero the allocation.
-        unsafe {
-            core::ptr::write_bytes(virt_base as *mut u8, 0, alloc_size);
-        }
-
-        // Compute sub-structure offsets.
         let n = queue_size as usize;
         let desc_base = virt_base as *mut VirtqDesc;
         let avail_offset = 16 * n;
@@ -211,7 +232,6 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        // Tell the device the page frame number of the queue.
         // Legacy virtio uses a 32-bit PFN register; fail if memory is above 4 GiB.
         let pfn_u64 = phys_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
@@ -220,8 +240,6 @@ impl Virtqueue {
                 queue_index,
                 phys_base
             );
-            // Free the contiguous allocation to avoid leaking pages.
-            frame_allocator::free_contiguous(phys_base, alloc_order);
             return None;
         }
         let pfn = pfn_u64 as u32;
@@ -236,28 +254,27 @@ impl Virtqueue {
             phys_base
         );
 
-        // Allocate per-descriptor buffers.
+        // Phase 55 C.5: per-descriptor buffers via DmaBuffer (one 4 KiB page
+        // each). Dropping `buffer_dmas` returns every page to the buddy.
+        let mut buffer_dmas: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(n);
         let mut buffers = Vec::with_capacity(n);
         let mut buf_phys = Vec::with_capacity(n);
         for _ in 0..n {
-            let buf_frame = frame_allocator::allocate_frame()?;
-            let bp = buf_frame.start_address().as_u64();
-            let bv = (crate::mm::phys_offset() + bp) as *mut u8;
-            buffers.push(bv);
-            buf_phys.push(bp);
+            let dma = DmaBuffer::<[u8]>::new_bytes(4096, 4096).ok()?;
+            buffers.push(dma.as_ptr() as *mut u8);
+            buf_phys.push(dma.physical_address().as_u64());
+            buffer_dmas.push(dma);
         }
 
         Some(Virtqueue {
             io_base,
             queue_index,
             queue_size,
+            ring,
             desc_base,
             avail_base,
             used_base,
-            phys_base,
-            virt_base,
-            alloc_order,
-            alloc_size,
+            buffer_dmas,
             buffers,
             buf_phys,
             last_used_idx: 0,
@@ -409,6 +426,9 @@ struct VirtioNetDriver {
     mac: MacAddr,
     rx_queue: Virtqueue,
     tx_queue: Virtqueue,
+    /// IRQ registration — must outlive the driver or the ISR stub
+    /// dispatches to a stale handler. Kept around for the driver's lifetime.
+    irq: Option<pci::DeviceIrq>,
 }
 
 static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
@@ -416,16 +436,27 @@ static DRIVER: Mutex<Option<VirtioNetDriver>> = Mutex::new(None);
 /// Set to true once the driver is initialized and ready.
 pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 
-/// Lock-free copy of io_base for use in the interrupt handler.
-/// Set once during init() and never changes. The ISR reads this instead of
-/// taking the DRIVER mutex, avoiding deadlock when an IRQ fires while
-/// send_frame/recv_frames holds the lock.
-static ISR_IO_BASE: AtomicU16 = AtomicU16::new(0);
+/// `TaskId` of the network processing task, registered from `kernel_main`
+/// via [`set_net_task_id`]. Read by the IRQ handler to wake the task when
+/// packets arrive. `None` until the task is spawned.
+static NET_TASK_ID: Mutex<Option<TaskId>> = Mutex::new(None);
+
+/// Signal flag for `block_current_unless_woken` in the network task.
+/// The ISR sets it, `net_task` consumes it via swap. Public so the task
+/// running in `main.rs::net_task` can use it directly.
+pub static NET_IRQ_WOKEN: AtomicBool = AtomicBool::new(false);
+
+/// Register the network task's [`TaskId`] so the IRQ handler can call
+/// `wake_task` on it. Must be called from the task's own body before it
+/// parks.
+pub fn set_net_task_id(id: TaskId) {
+    *NET_TASK_ID.lock() = Some(id);
+}
 
 /// Returns the MAC address of the virtio-net device, if initialized.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<MacAddr> {
-    DRIVER.lock().as_ref().map(|d| d.mac)
+    interrupts::without_interrupts(|| DRIVER.lock().as_ref().map(|d| d.mac))
 }
 
 /// Returns the legacy PCI interrupt line of the claimed virtio-net device,
@@ -433,12 +464,52 @@ pub fn mac_address() -> Option<MacAddr> {
 ///
 /// Used by `kernel_main` to program the I/O APIC for INTx routing now that
 /// the PCI handle lives inside the driver (Phase 55 B.3).
+#[allow(dead_code)]
 pub fn pci_interrupt_line() -> Option<u8> {
-    DRIVER
-        .lock()
-        .as_ref()
-        .map(|d| d.pci.device().interrupt_line)
-        .filter(|&line| line != 0xFF)
+    interrupts::without_interrupts(|| {
+        DRIVER
+            .lock()
+            .as_ref()
+            .map(|d| d.pci.device().interrupt_line)
+            .filter(|&line| line != 0xFF)
+    })
+}
+
+// ===========================================================================
+// IRQ handler
+// ===========================================================================
+
+/// Acknowledge the device interrupt (read-to-clear ISR status) and wake the
+/// network task so it can drain the RX ring. Runs in ISR context.
+///
+/// Must obey the ISR contract: no allocation, no blocking, no IPC. The only
+/// work it does under `DRIVER.lock()` is read a single port byte; all frame
+/// processing happens in `net_task`.
+///
+/// Correctness — see the Fix 1 note in `blk/virtio_blk.rs`: the
+/// `send_frame`/`recv_frames` task-path takes `DRIVER.lock()` and must wrap
+/// that in `without_interrupts` so the ISR cannot fire on this CPU while
+/// the lock is held.
+fn virtio_net_irq_handler() {
+    // Ack the device-side interrupt by reading ISR status. We take the
+    // driver lock briefly to get the port base — which is cheap and safe
+    // because task-path callers wrap their critical sections in
+    // without_interrupts.
+    if let Some(d) = DRIVER.lock().as_ref() {
+        // SAFETY: io_base is a valid legacy virtio I/O base the driver
+        // probed and owns; reading ISR status is a side-effect-free ack.
+        unsafe {
+            let _isr = Port::<u8>::new(d.io_base + VIRTIO_ISR_STATUS).read();
+        }
+    }
+    // Signal the polling path and wake the task. The task consumes
+    // NET_IRQ_WOKEN with `swap(false, ...)` so missed edges don't
+    // accumulate; wake_task makes the task Ready so it runs on the next
+    // scheduler tick.
+    NET_IRQ_WOKEN.store(true, Ordering::Release);
+    if let Some(id) = *NET_TASK_ID.lock() {
+        let _ = wake_task(id);
+    }
 }
 
 // ===========================================================================
@@ -450,35 +521,40 @@ pub fn pci_interrupt_line() -> Option<u8> {
 /// Returns a vector of raw Ethernet frames (without the virtio-net header).
 #[allow(dead_code)]
 pub fn recv_frames() -> Vec<Vec<u8>> {
-    let mut driver = DRIVER.lock();
-    let driver = match driver.as_mut() {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
+    // The driver lock must be taken with IF off so the ISR (which also
+    // takes the lock) cannot fire on this CPU mid-critical-section. See
+    // Fix 1 note in `blk/virtio_blk.rs`.
+    interrupts::without_interrupts(|| {
+        let mut driver = DRIVER.lock();
+        let driver = match driver.as_mut() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
 
-    let completed = driver.rx_queue.poll_used();
-    let mut frames = Vec::new();
-    let reposted = !completed.is_empty();
+        let completed = driver.rx_queue.poll_used();
+        let mut frames = Vec::new();
+        let reposted = !completed.is_empty();
 
-    for (desc_idx, len) in completed {
-        if (len as usize) > VIRTIO_NET_HDR_SIZE {
-            let raw = driver.rx_queue.read_buffer(desc_idx, len);
-            // Strip the virtio-net header.
-            frames.push(raw[VIRTIO_NET_HDR_SIZE..].to_vec());
+        for (desc_idx, len) in completed {
+            if (len as usize) > VIRTIO_NET_HDR_SIZE {
+                let raw = driver.rx_queue.read_buffer(desc_idx, len);
+                // Strip the virtio-net header.
+                frames.push(raw[VIRTIO_NET_HDR_SIZE..].to_vec());
+            }
+            // Re-post the buffer for future receives.
+            driver.rx_queue.post_recv_buffer(desc_idx);
         }
-        // Re-post the buffer for future receives.
-        driver.rx_queue.post_recv_buffer(desc_idx);
-    }
 
-    // Notify the device that new RX buffers are available so reception
-    // doesn't stall once the initial batch is consumed.
-    if reposted {
-        unsafe {
-            Port::<u16>::new(driver.io_base + VIRTIO_QUEUE_NOTIFY).write(0);
+        // Notify the device that new RX buffers are available so reception
+        // doesn't stall once the initial batch is consumed.
+        if reposted {
+            unsafe {
+                Port::<u16>::new(driver.io_base + VIRTIO_QUEUE_NOTIFY).write(0);
+            }
         }
-    }
 
-    frames
+        frames
+    })
 }
 
 /// Send a raw Ethernet frame via the TX virtqueue.
@@ -486,15 +562,6 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
 /// Prepends the 10-byte virtio-net header (all zeros for simple sends).
 #[allow(dead_code)]
 pub fn send_frame(frame: &[u8]) {
-    let mut driver = DRIVER.lock();
-    let driver = match driver.as_mut() {
-        Some(d) => d,
-        None => {
-            log::warn!("[virtio-net] send_frame: driver not initialized");
-            return;
-        }
-    };
-
     // Reject oversize frames before allocating to avoid wasteful allocations
     // that send_buffer() would drop anyway.
     let total = VIRTIO_NET_HDR_SIZE + frame.len();
@@ -508,42 +575,41 @@ pub fn send_frame(frame: &[u8]) {
         return;
     }
 
-    // Build: virtio-net header (10 bytes of zeros) + Ethernet frame.
+    // Build: virtio-net header (10 bytes of zeros) + Ethernet frame. The
+    // allocation happens outside the driver lock to minimise the critical
+    // section (spin::Mutex held, IF off).
     let mut buf = vec![0u8; total];
     buf[VIRTIO_NET_HDR_SIZE..].copy_from_slice(frame);
 
-    driver.tx_queue.send_buffer(&buf);
-}
-
-/// Read and clear the ISR status register. Called from the interrupt handler.
-///
-/// This is lock-free — reads io_base from an atomic rather than taking the
-/// DRIVER mutex, so it is safe to call from an ISR context.
-pub fn isr_status() -> u8 {
-    let base = ISR_IO_BASE.load(Ordering::Relaxed);
-    if base == 0 {
-        return 0;
-    }
-    unsafe { Port::<u8>::new(base + VIRTIO_ISR_STATUS).read() }
+    interrupts::without_interrupts(|| {
+        let mut driver = DRIVER.lock();
+        let driver = match driver.as_mut() {
+            Some(d) => d,
+            None => {
+                log::warn!("[virtio-net] send_frame: driver not initialized");
+                return;
+            }
+        };
+        driver.tx_queue.send_buffer(&buf);
+    });
 }
 
 // ===========================================================================
 // Initialization (P16-T001 through P16-T010)
 // ===========================================================================
 
-/// Initialize the virtio-net driver.
+/// Legacy init entry — registers the driver and runs the probe pass.
 ///
-/// Finds the device on PCI, performs virtio reset + feature negotiation,
-/// sets up RX and TX virtqueues, and reads the MAC address.
+/// Kept for `main.rs` compatibility. New code should prefer
+/// `pci::probe_all_drivers` after calling `register()`.
 pub fn init() {
-    // Phase 55 B.3: claim the device through the registry.
-    let handle = match claim_virtio_net() {
-        Some(h) => h,
-        None => {
-            log::warn!("[virtio-net] no virtio-net device found on PCI bus");
-            return;
-        }
-    };
+    register();
+    pci::probe_all_drivers();
+}
+
+/// Driver init body — takes a claimed PCI handle (from the driver-framework
+/// probe pass).
+fn init_with_handle(handle: pci::PciDeviceHandle) {
     let dev = *handle.device();
 
     log::info!(
@@ -555,13 +621,20 @@ pub fn init() {
         dev.function
     );
 
-    // P16-T002: Read BAR0 for legacy I/O port base.
-    let bar0 = dev.bars[0];
-    if bar0 & 1 == 0 {
-        log::error!("[virtio-net] BAR0 is MMIO, expected I/O port (legacy virtio)");
-        return;
-    }
-    let io_base = (bar0 & 0xFFFF_FFFC) as u16;
+    // Phase 55 C.1: BAR0 lookup goes through the HAL.  Legacy virtio-net
+    // exposes an I/O port BAR; anything else is a configuration error.
+    let port: PortRegion = match pci::bar::map_bar(&handle, 0) {
+        Ok(BarMapping::Pio { region }) => region,
+        Ok(_) => {
+            log::error!("[virtio-net] BAR0 is MMIO, expected I/O port (legacy virtio)");
+            return;
+        }
+        Err(e) => {
+            log::error!("[virtio-net] BAR0 map failed: {:?}", e);
+            return;
+        }
+    };
+    let io_base = port.port_base();
     log::info!("[virtio-net] BAR0 I/O base: {:#x}", io_base);
 
     // Ensure PCI command register has I/O space (bit 0) and bus mastering
@@ -645,12 +718,58 @@ pub fn init() {
         Port::<u8>::new(io_base + VIRTIO_DEVICE_STATUS).write(status | VIRTIO_STATUS_DRIVER_OK);
     }
 
+    // Install the RX IRQ through the Phase 55 C.3 HAL contract. Prefer
+    // MSI, fall back to legacy INTx routed through the I/O APIC. The
+    // handler reads ISR status, sets NET_IRQ_WOKEN, and wakes the net
+    // task — all non-blocking work.
+    //
+    // The legacy-INTx handler contract says to check ISR status first to
+    // avoid doing work for a sibling device's shared IRQ;
+    // `virtio_net_irq_handler` reads ISR status, so sharing is safe.
+    let dev_copy = dev;
+    let irq = match handle.install_msi_irq(virtio_net_irq_handler) {
+        Ok(i) => {
+            log::info!("[virtio-net] MSI IRQ on vector {:#x}", i.vector());
+            Some(i)
+        }
+        Err(_) => {
+            // Legacy INTx: pick a vector from the device IRQ bank and route
+            // the PCI interrupt line through the I/O APIC to that vector.
+            const NET_INTX_VECTOR: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + 3;
+            let intx_result = handle.install_intx_irq(NET_INTX_VECTOR, virtio_net_irq_handler);
+            if let Ok(i) = intx_result {
+                if dev_copy.interrupt_line != 0xFF && crate::acpi::io_apic_address().is_some() {
+                    crate::arch::x86_64::apic::route_pci_irq(
+                        dev_copy.interrupt_line,
+                        NET_INTX_VECTOR,
+                    );
+                    log::info!(
+                        "[virtio-net] legacy INTx line {} routed to vector {:#x}",
+                        dev_copy.interrupt_line,
+                        NET_INTX_VECTOR
+                    );
+                } else {
+                    log::warn!(
+                        "[virtio-net] legacy INTx registered but line is 0xFF or no I/O APIC — IRQ may not fire"
+                    );
+                }
+                Some(i)
+            } else {
+                log::warn!(
+                    "[virtio-net] failed to install completion IRQ — net_task will rely on periodic polling"
+                );
+                None
+            }
+        }
+    };
+
     let mut driver = VirtioNetDriver {
         pci: handle,
         io_base,
         mac,
         rx_queue,
         tx_queue,
+        irq,
     };
 
     // P16-T008: Post initial receive buffers.
@@ -663,42 +782,47 @@ pub fn init() {
         Port::<u16>::new(io_base + VIRTIO_QUEUE_NOTIFY).write(0);
     }
 
-    // Store io_base for lock-free ISR access before publishing driver state.
-    ISR_IO_BASE.store(io_base, Ordering::Release);
-
     *DRIVER.lock() = Some(driver);
     VIRTIO_NET_READY.store(true, Ordering::Release);
 
     log::info!("[virtio-net] driver initialized successfully");
 }
 
+// PCI device discovery (Phase 55 C.4 + C.5) now runs through
+// `register_driver` + `probe_all_drivers`. The bespoke `claim_virtio_net`
+// helper used in Phase 55 B.3 has been removed.
+
 // ===========================================================================
-// PCI device discovery (P16-T001 + Phase 55 B.3)
+// Driver registration (Phase 55 C.4 / C.5)
 // ===========================================================================
 
-/// Claim the virtio-net device through the Phase-55 claim protocol.
+/// Register the virtio-net driver with the PCI discovery framework.
 ///
-/// Only matches vendor 0x1AF4, device 0x1000 (legacy/transitional virtio-net).
-/// Device 0x1041 (modern virtio-net) is not supported — the driver only
-/// implements the legacy I/O-port register layout.
-fn claim_virtio_net() -> Option<pci::PciDeviceHandle> {
-    match pci::claim_pci_device(0x1AF4, 0x1000, "virtio-net") {
-        Ok(h) => {
-            // Confirm the class/subclass match as well — the legacy bridge
-            // device uses the same vendor, so avoid double-binding.
-            if h.device().class_code == 0x02 && h.device().subclass == 0x00 {
-                Some(h)
-            } else {
-                // Dropping the handle releases the claim.
-                drop(h);
-                None
-            }
-        }
-        Err(pci::ClaimError::NotFound) => None,
-        Err(pci::ClaimError::AlreadyClaimed) => {
-            log::warn!("[virtio-net] vendor 1af4 device 1000 already claimed");
-            None
-        }
+/// Uses `PciMatch::Full` so we disambiguate the 0x1AF4:0x1000 vendor/device
+/// pair from other virtio devices with the same IDs (e.g. the legacy bridge).
+/// The full Ethernet class/subclass 0x02:0x00 must match.
+pub fn register() {
+    let _ = pci::register_driver(DriverEntry {
+        name: "virtio-net",
+        r#match: PciMatch::Full {
+            vendor: 0x1AF4,
+            device: 0x1000,
+            class: 0x02,
+            subclass: 0x00,
+        },
+        init: probe,
+    });
+}
+
+/// Driver probe — invoked by [`pci::probe_all_drivers`]. Wraps the original
+/// `init` body so callers can continue to use the legacy `init()` entry
+/// point.
+fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
+    init_with_handle(handle);
+    if VIRTIO_NET_READY.load(Ordering::Acquire) {
+        DriverProbeResult::Bound
+    } else {
+        DriverProbeResult::Failed("virtio-net init failed")
     }
 }
 
@@ -711,17 +835,10 @@ fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
 }
 
-/// Allocate `count` physically contiguous 4 KiB frames via the buddy allocator.
-///
-/// Rounds up to the next power-of-two order and delegates to
-/// `frame_allocator::allocate_contiguous()`. Returns `(base_phys, order)` so
-/// callers can correctly free via `free_contiguous(base, order)`.
-fn alloc_contiguous_frames(count: usize) -> Option<(u64, usize)> {
-    let order = if count <= 1 {
-        0
-    } else {
-        (usize::BITS - (count - 1).leading_zeros()) as usize
-    };
-    let frame = frame_allocator::allocate_contiguous(order)?;
-    Some((frame.start_address().as_u64(), order))
+// Keep `frame_allocator` import alive — still used for ISR-path cache
+// accounting in the kernel-wide `available_count` helpers, and may be
+// re-used by a future zero-copy RX path here.
+#[allow(dead_code)]
+fn _keep_frame_allocator_import_alive() {
+    let _ = frame_allocator::total_frames;
 }

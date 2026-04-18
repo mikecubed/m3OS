@@ -8,6 +8,8 @@
 //! * PCIe ECAM (MMIO via the MCFG ACPI allocation) — preferred when present,
 //!   required for extended config space (offsets >= 256). See Phase 55 B.1.
 
+pub mod bar;
+
 use core::ptr;
 use kernel_core::pci as kpci;
 use spin::Mutex;
@@ -112,7 +114,7 @@ pub fn pcie_mmio_config_write(bus: u8, device: u8, function: u8, offset: u16, va
 
 /// Read a 32-bit config value.  Uses PCIe MMIO when available (required for
 /// offsets >= 256), otherwise legacy I/O (offsets < 256 only).
-fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
+pub(crate) fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u32 {
     if let Some(v) = pcie_mmio_config_read(bus, device, function, offset) {
         return v;
     }
@@ -128,7 +130,7 @@ fn pci_config_read_u32_any(bus: u8, device: u8, function: u8, offset: u16) -> u3
     legacy_pci_config_read_u32(bus, device, function, offset as u8)
 }
 
-fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+pub(crate) fn pci_config_write_u32_any(bus: u8, device: u8, function: u8, offset: u16, value: u32) {
     if pcie_mmio_config_write(bus, device, function, offset, value) {
         return;
     }
@@ -260,6 +262,7 @@ pub fn pcie_config_write_u16(bus: u8, device: u8, function: u8, offset: u16, val
 // ---------------------------------------------------------------------------
 
 /// Error returned when a claim cannot be granted.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimError {
     /// No PCI function with the requested vendor/device IDs was found.
@@ -423,6 +426,7 @@ pub(crate) static PCI_DEVICE_REGISTRY: Mutex<PciDeviceRegistry> =
 /// Only the first matching function is considered — callers that need to
 /// disambiguate multi-function devices should use
 /// [`claim_pci_device_by_bdf`].
+#[allow(dead_code)]
 pub fn claim_pci_device(
     vendor_id: u16,
     device_id: u16,
@@ -911,35 +915,15 @@ impl MsixCapability {
         }
     }
 
-    /// Compute the kernel-virtual pointer to the MSI-X table.  Uses the
-    /// existing BAR-raw encoding in [`PciDevice::bars`], mapped via
-    /// `phys_offset`.
+    /// Compute the kernel-virtual pointer to the MSI-X table.
     ///
-    /// This is a minimal local helper — the full BAR mapping abstraction is
-    /// Track C. We only support 64-bit memory BARs here (MSI-X table must be
-    /// in MMIO per spec; BAR0/1 or a 64-bit pair starting at `table_bar`).
+    /// Delegates to the [`bar`] module's shared BAR decoder so that MSI-X
+    /// table mapping and driver BAR mapping (Phase 55 C.1) go through the
+    /// same codepath. Returns `None` if the table BAR is an I/O BAR (not
+    /// valid for MSI-X per spec), uses a reserved encoding, or a 64-bit BAR
+    /// claims a non-existent partner slot.
     fn table_virt_addr(&self, bars: [u32; 6]) -> Option<usize> {
-        let bir = self.table_bar as usize;
-        if bir >= bars.len() {
-            return None;
-        }
-        let bar_lo = bars[bir];
-        // Must be memory BAR (bit 0 == 0).
-        if bar_lo & 0x1 != 0 {
-            return None;
-        }
-        let is_64 = (bar_lo >> 1) & 0x3 == 0x2;
-        let base_phys: u64 = if is_64 {
-            if bir + 1 >= bars.len() {
-                return None;
-            }
-            let hi = bars[bir + 1] as u64;
-            (bar_lo as u64 & 0xFFFF_FFF0) | (hi << 32)
-        } else {
-            (bar_lo as u64) & 0xFFFF_FFF0
-        };
-        let phys = base_phys + self.table_offset as u64;
-        Some((crate::mm::phys_offset() + phys) as usize)
+        bar::bar_mmio_virt_offset(bars, self.table_bar, self.table_offset)
     }
 
     /// Program table entry `index` to deliver `vector` to `apic_lapic_id`.
@@ -998,12 +982,41 @@ pub fn find_msix(bus: u8, device: u8, function: u8) -> Option<MsixCapability> {
 
 /// Lowest IDT vector we hand out for device MSI / MSI-X interrupts.  Vectors
 /// 32..=47 are reserved for legacy PIC/APIC IRQs and the SMP IPI block.
+///
+/// Kept in lockstep with
+/// [`crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE`] (and the
+/// assertion below): the MSI pool must not advertise vectors that the IDT
+/// stub bank cannot dispatch.
 #[allow(dead_code)]
-pub const MSI_VECTOR_BASE: u8 = 0x60;
-/// One past the highest IDT vector we will hand out.  The APIC spurious
-/// vector is 0xFF, and we leave 0xF0–0xFE alone for future expansion.
+pub const MSI_VECTOR_BASE: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE;
+/// One past the highest IDT vector we will hand out (exclusive upper bound
+/// used by [`kpci::MsiVectorAllocator`]).
+///
+/// Derived from the device IRQ stub bank in `arch::x86_64::interrupts` so an
+/// allocation from this pool always lands on a registered dispatcher.
+/// Before Phase 55 review, this was a hand-picked `0xEF` which advertised
+/// 143 vectors while the stub bank only had 16 — `allocate_msi_vectors`
+/// would hand out e.g. `0x90`, `register_device_irq` would return "vector
+/// out of device IRQ range", and driver init would fail late.
+///
+/// 16 vectors is comfortably enough for Phase 55: NVMe needs 1 admin + 1
+/// I/O = 2, e1000 needs 1, VirtIO-blk needs 1, VirtIO-net needs 1 — total 5
+/// vectors. If that ever tightens, grow the stub bank in
+/// `arch::x86_64::interrupts` first; `MSI_VECTOR_TOP` will follow
+/// automatically.
 #[allow(dead_code)]
-pub const MSI_VECTOR_TOP: u8 = 0xEF;
+pub const MSI_VECTOR_TOP: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE
+    + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT;
+
+// Compile-time guard: catch future drift if either side is tweaked in
+// isolation. See `DEVICE_IRQ_VECTOR_BASE` / `DEVICE_IRQ_VECTOR_COUNT` in
+// `kernel::arch::x86_64::interrupts`.
+const _: () = assert!(MSI_VECTOR_BASE == crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE);
+const _: () = assert!(
+    MSI_VECTOR_TOP
+        == crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE
+            + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT
+);
 
 static MSI_POOL: Mutex<kpci::MsiVectorAllocator> = Mutex::new(kpci::MsiVectorAllocator::new(
     MSI_VECTOR_BASE,
@@ -1110,4 +1123,291 @@ pub fn allocate_msi_vectors(dev: &PciDevice, count: u8) -> Option<AllocatedMsi> 
         dev.device_id
     );
     None
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55 C.3 — driver-facing IRQ contract
+// ---------------------------------------------------------------------------
+//
+// High-level shape:
+//
+//   let irq = handle.install_msi_irq(my_isr)?;       // prefers MSI/MSI-X.
+//   let irq = handle.install_intx_irq(my_isr)?;      // legacy INTx fallback.
+//
+// In both cases `my_isr: fn()` is called in ISR context. It must:
+//
+//   * Read/ack the device register (e.g. virtio ISR status, NVMe
+//     completion doorbell).
+//   * NOT allocate, NOT block, NOT take IPC locks.
+//   * Signal a wait queue / Notification / AtomicBool so a task context
+//     can do the real work.
+//
+// The returned [`DeviceIrq`] records the allocated vector and kind; drivers
+// hold it alongside their device state so the vector stays live for the
+// driver's lifetime. No current caller unloads, so `Drop` is a no-op.
+
+/// An allocated device IRQ vector plus its registered handler.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DeviceIrq {
+    vector: u8,
+    kind: crate::arch::x86_64::interrupts::DeviceIrqKind,
+}
+
+#[allow(dead_code)]
+impl DeviceIrq {
+    /// IDT vector assigned to this interrupt.
+    pub fn vector(&self) -> u8 {
+        self.vector
+    }
+
+    /// IRQ kind — `Msi` for MSI/MSI-X, `LegacyIntx` for shared INTx.
+    pub fn kind(&self) -> crate::arch::x86_64::interrupts::DeviceIrqKind {
+        self.kind
+    }
+}
+
+#[allow(dead_code)]
+impl PciDeviceHandle {
+    /// Install `handler` for this device's MSI / MSI-X vector.
+    ///
+    /// Returns `Err` if the device has no MSI / MSI-X capability, no free
+    /// vector is available in the device IRQ bank, or registration fails.
+    /// The caller is expected to fall back to
+    /// [`Self::install_intx_irq`] when this returns `Err`.
+    ///
+    /// Only a single vector is supported here; multi-vector MSI-X (e.g.
+    /// NVMe with multiple I/O queues) is a future extension.
+    pub fn install_msi_irq(&self, handler: fn()) -> Result<DeviceIrq, &'static str> {
+        let dev = self.device();
+        let alloc = allocate_msi_vectors(dev, 1).ok_or("no MSI/MSI-X capability available")?;
+        let entry = crate::arch::x86_64::interrupts::DeviceIrqEntry {
+            handler,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::Msi,
+        };
+        crate::arch::x86_64::interrupts::register_device_irq(alloc.first_vector, entry)?;
+        Ok(DeviceIrq {
+            vector: alloc.first_vector,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::Msi,
+        })
+    }
+
+    /// Install `handler` as a legacy-INTx shared interrupt on the vector
+    /// given by `idt_vector`. The caller is responsible for routing the
+    /// device's PCI interrupt line through the I/O APIC (see
+    /// `arch::x86_64::apic::route_pci_irq`).
+    ///
+    /// Legacy INTx handlers must check the device's ISR status register
+    /// before doing any work — the interrupt line is potentially shared
+    /// with other devices.
+    pub fn install_intx_irq(
+        &self,
+        idt_vector: u8,
+        handler: fn(),
+    ) -> Result<DeviceIrq, &'static str> {
+        let entry = crate::arch::x86_64::interrupts::DeviceIrqEntry {
+            handler,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::LegacyIntx,
+        };
+        crate::arch::x86_64::interrupts::register_device_irq(idt_vector, entry)?;
+        Ok(DeviceIrq {
+            vector: idt_vector,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::LegacyIntx,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55 C.4 — driver registration and discovery
+// ---------------------------------------------------------------------------
+//
+// Drivers describe themselves with a [`DriverEntry`] that pairs a
+// [`PciMatch`] rule with an init function. [`register_driver`] adds the entry
+// to a global table; [`probe_all_drivers`] walks discovered PCI devices in
+// deterministic (bus, device, function) order and invokes matching init
+// functions for any unclaimed device.
+//
+// Driver init takes a [`PciDeviceHandle`] (the claim is already taken) and
+// returns success/failure. Failure drops the handle so another driver can
+// try the same device if desired (but typically a `NotFound` match doesn't
+// consume a claim).
+
+/// Match rule for a driver's device discovery. Either match a specific
+/// vendor/device pair, or a class/subclass pair (e.g. class 0x01 subclass
+/// 0x08 for NVMe).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub enum PciMatch {
+    /// Match by PCI vendor and device IDs.
+    VendorDevice { vendor: u16, device: u16 },
+    /// Match by PCI class + subclass. Useful for NVMe (0x01:0x08:0x02) or
+    /// Ethernet (0x02:0x00).
+    ClassSubclass { class: u8, subclass: u8 },
+    /// Match by vendor/device **and** class/subclass — disambiguates
+    /// multi-function vendor IDs. Example: virtio-net uses vendor 0x1AF4,
+    /// device 0x1000, class 0x02 subclass 0x00 to separate from other
+    /// 0x1AF4:0x1000 variants.
+    Full {
+        vendor: u16,
+        device: u16,
+        class: u8,
+        subclass: u8,
+    },
+}
+
+impl PciMatch {
+    #[allow(dead_code)]
+    fn matches(&self, dev: &PciDevice) -> bool {
+        match *self {
+            PciMatch::VendorDevice { vendor, device } => {
+                dev.vendor_id == vendor && dev.device_id == device
+            }
+            PciMatch::ClassSubclass { class, subclass } => {
+                dev.class_code == class && dev.subclass == subclass
+            }
+            PciMatch::Full {
+                vendor,
+                device,
+                class,
+                subclass,
+            } => {
+                dev.vendor_id == vendor
+                    && dev.device_id == device
+                    && dev.class_code == class
+                    && dev.subclass == subclass
+            }
+        }
+    }
+}
+
+/// Outcome of a driver init attempt.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum DriverProbeResult {
+    /// Driver bound and initialized successfully.
+    Bound,
+    /// Driver declined this device (e.g. unsupported variant).  The PCI
+    /// claim is dropped and another driver may be tried.
+    Declined(&'static str),
+    /// Driver attempted to bind but failed (bring-up error). Logged.
+    Failed(&'static str),
+}
+
+/// Init function signature. Receives a claimed PCI handle, returns an outcome.
+pub type DriverInitFn = fn(handle: PciDeviceHandle) -> DriverProbeResult;
+
+/// A single driver registered for discovery.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct DriverEntry {
+    /// Human-readable name for log output.
+    pub name: &'static str,
+    /// Match rule for selecting devices.
+    pub r#match: PciMatch,
+    /// Init function.
+    pub init: DriverInitFn,
+}
+
+const MAX_DRIVERS: usize = 16;
+
+struct DriverRegistry {
+    drivers: [Option<DriverEntry>; MAX_DRIVERS],
+    count: usize,
+}
+
+impl DriverRegistry {
+    const fn new() -> Self {
+        Self {
+            drivers: [None; MAX_DRIVERS],
+            count: 0,
+        }
+    }
+}
+
+static DRIVER_REGISTRY: Mutex<DriverRegistry> = Mutex::new(DriverRegistry::new());
+
+/// Register a driver for PCI discovery. Returns `Err` if the registry is full.
+#[allow(dead_code)]
+pub fn register_driver(entry: DriverEntry) -> Result<(), &'static str> {
+    let mut reg = DRIVER_REGISTRY.lock();
+    if reg.count >= MAX_DRIVERS {
+        return Err("driver registry full");
+    }
+    let idx = reg.count;
+    reg.drivers[idx] = Some(entry);
+    reg.count += 1;
+    log::info!(
+        "[pci-drv] registered driver `{}` (count now {})",
+        entry.name,
+        reg.count
+    );
+    Ok(())
+}
+
+/// Probe every discovered PCI device in (bus, device, function) order and
+/// invoke the init function of the first registered driver whose match rule
+/// matches an unclaimed device. Drivers that match but [`DriverProbeResult::Declined`]
+/// or [`DriverProbeResult::Failed`] release the claim so a later-registered
+/// driver can try.
+#[allow(dead_code)]
+pub fn probe_all_drivers() {
+    // Snapshot the driver list so the global lock is not held across init
+    // (drivers may themselves call into pci:: functions).
+    let drivers: alloc::vec::Vec<DriverEntry> = {
+        let reg = DRIVER_REGISTRY.lock();
+        reg.drivers
+            .iter()
+            .take(reg.count)
+            .filter_map(|e| *e)
+            .collect()
+    };
+    let device_count = pci_device_count();
+    for idx in 0..device_count {
+        let Some(dev) = pci_device(idx) else { continue };
+        // Skip devices already claimed (e.g. driver registered itself outside
+        // the probe path, or the user manually claimed in bring-up).
+        {
+            let reg = PCI_DEVICE_REGISTRY.lock();
+            if reg.is_claimed(dev.bus, dev.device, dev.function) {
+                continue;
+            }
+        }
+        for entry in &drivers {
+            if !entry.r#match.matches(&dev) {
+                continue;
+            }
+            // Try to claim. If another driver raced us and already claimed,
+            // skip and move on.
+            let handle = match claim_specific(dev, entry.name) {
+                Ok(h) => h,
+                Err(ClaimError::AlreadyClaimed) => break,
+                Err(ClaimError::NotFound) => continue,
+            };
+            log::info!(
+                "[pci-drv] probing `{}` for {:04x}:{:04x} at {:02x}:{:02x}.{}",
+                entry.name,
+                dev.vendor_id,
+                dev.device_id,
+                dev.bus,
+                dev.device,
+                dev.function
+            );
+            match (entry.init)(handle) {
+                DriverProbeResult::Bound => {
+                    log::info!("[pci-drv] `{}` bound successfully", entry.name);
+                    break;
+                }
+                DriverProbeResult::Declined(reason) => {
+                    log::info!("[pci-drv] `{}` declined: {}", entry.name, reason);
+                    // `handle` was moved into init and dropped on its return
+                    // path; the claim is already released.
+                    continue;
+                }
+                DriverProbeResult::Failed(reason) => {
+                    log::warn!("[pci-drv] `{}` failed: {}", entry.name, reason);
+                    break;
+                }
+            }
+        }
+    }
 }
