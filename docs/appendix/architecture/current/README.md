@@ -1,6 +1,6 @@
 # m3OS Current Architecture Reference
 
-**Version:** Kernel v0.54.0 (Phase 54)
+**Version:** Kernel v0.55.0 (Phase 55) — architectural snapshot below reflects the Phase-54 baseline; Phase 55 added the hardware-access layer, PCIe MCFG/MSI-X, NVMe, and e1000 without altering the subsystems described here.
 **Date:** 2026-04-13
 **Purpose:** Detailed documentation of the current m3OS kernel architecture, focusing on subsystems identified in the `copy_to_user` reliability bug investigation and the SSHD hang analysis.
 
