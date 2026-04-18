@@ -11,7 +11,7 @@
 |---|---|---|---|
 | A | `FdEntry` CLOEXEC / NONBLOCK plumbing | None | Planned |
 | B | Relocate `arch::x86_64::syscall::*_pub` wrappers into owning subsystems | None | Planned |
-| C | Backlog routing for items not owned by Phase 54a | A, B | Planned |
+| C | Phase closure: backlog routing and version bump | A, B | Planned |
 
 ---
 
@@ -134,7 +134,7 @@
 
 ---
 
-## Track C — Backlog routing for items not owned by Phase 54a
+## Track C — Phase closure: backlog routing and version bump
 
 ### C.1 — Trim `docs/debug/54-followups.md` to long-term backlog items only
 
@@ -167,6 +167,26 @@
 - [ ] Phase 45 design doc's `Deferred Until Later` section gains a bullet for the `/var/run → /run` symlink with the revisit condition from the followups file
 - [ ] The Phase 54 followups file no longer mentions item 3
 
+### C.4 — Version bump to 0.54.1
+
+**Files:**
+- `kernel/Cargo.toml`
+- `AGENTS.md` (project-overview version string — currently stuck at `v0.51.0`, two bumps behind the tree)
+- `README.md` (project overview / release notes, if a kernel version is mentioned)
+- `docs/roadmap/README.md` (Phase 54a status column)
+- `docs/roadmap/tasks/README.md` (Phase 54a status column)
+
+**Symbol:** `version` field (Cargo.toml) and prose version mentions (docs)
+**Why it matters:** Phase 54a is a patch-level aftermath phase on top of the `v0.54.0` baseline that closed Phase 54. Incrementing to `v0.54.1` signals that kernel hygiene has landed without implying the larger feature surface expected at `v0.55.0`, and gives downstream release work a distinct tag. Bumping here also surfaces the existing drift in `AGENTS.md`, which was never updated past `v0.51.0` — correcting it is in scope for this closure task.
+
+**Acceptance:**
+- [ ] `kernel/Cargo.toml` `[package].version` is `0.54.1`
+- [ ] `AGENTS.md` project-overview paragraph reflects kernel `v0.54.1` (corrects the stale `v0.51.0`)
+- [ ] `README.md` project description reflects the new kernel version if it mentions one
+- [ ] `docs/roadmap/README.md` Phase 54a row status is `Complete`
+- [ ] `docs/roadmap/tasks/README.md` Phase 54a row status is `Complete`
+- [ ] A repo-wide search for the previous `0.54.0` version string returns no user-facing references that should have been bumped (generated lockfiles excepted)
+
 ---
 
 ## Documentation Notes
@@ -175,3 +195,4 @@
 - Track B preserves behavior; no task in this track is allowed to change process-cleanup semantics or the VFS close refcounting landed in PR #108.
 - The CLOEXEC exposure is bounded: security-sensitive fd creation paths (`pipe2`, `socket(SOCK_CLOEXEC)`, `epoll_create1`, `accept4`, `socketpair`, `fcntl F_SETFD`) already honor the flag. Phase 54a closes the remaining `open`-family paths and the Phase 54 `vfs_service_open`.
 - Phase 54a is named `54a` to follow the `52a / 52b / 52c / 52d / 53a` aftermath-phase precedent.
+- Phase 54a closes the tree at `v0.54.1`, a patch-level bump on top of `v0.54.0`. Phase 55 takes over from that baseline and bumps to `v0.55.0` at its own close.

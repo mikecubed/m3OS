@@ -72,11 +72,19 @@ Each subsystem that owns an fd backend exposes its own free / release function. 
 - `grep -rn "cloexec: false, nonblock: false" kernel/src` returns only call sites that deliberately create a non-CLOEXEC fd, each carrying an inline comment explaining why.
 - `kernel/src/process/mod.rs` no longer imports any symbol from `crate::arch::x86_64::syscall`.
 - `docs/debug/54-followups.md` contains only the two long-term backlog items, each annotated with its owner.
+- Kernel version is bumped to `v0.54.1` across `kernel/Cargo.toml`, `AGENTS.md`, `README.md`, and both roadmap READMEs.
 - All existing QEMU tests pass unchanged.
 
 ## Companion Task List
 
 - [Phase 54a Task List](./tasks/54a-post-serverization-kernel-hygiene-tasks.md)
+
+## Related Documentation and Version Updates
+
+- When the phase lands, bump `kernel/Cargo.toml` to `0.54.1` — a patch-level bump on top of the `v0.54.0` baseline that Phase 54 closed.
+- Correct the stale `v0.51.0` mention in the `AGENTS.md` project-overview paragraph to `v0.54.1` in the same commit.
+- Update `README.md` if it mentions a kernel version, and set the Phase 54a row status to `Complete` in both `docs/roadmap/README.md` and `docs/roadmap/tasks/README.md`.
+- Phase 55 takes over from `v0.54.1` and bumps to `v0.55.0` at its own close; there is no intermediate re-bump in between.
 
 ## How Real OS Implementations Differ
 
