@@ -34,6 +34,13 @@
 //! `kernel-core::iommu::contract` module docs; this comment mirrors the rule
 //! so grep from the kernel side finds it.
 
+// Vendor-specific IOMMU implementations. Each vendor module owns its own
+// hardware state and exposes an [`kernel_core::iommu::contract::IommuUnit`]
+// impl. Track C lands VT-d (Intel) and the shared fault logger; Track D
+// lands AMD-Vi. Both implement the same trait and pass the same contract
+// suite (Track F.4), so a driver consuming `IommuUnit` is provably correct
+// across vendors.
+pub mod amd;
 pub mod fault;
 pub mod intel;
 
