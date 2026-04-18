@@ -1093,3 +1093,95 @@ pub fn allocate_msi_vectors(dev: &PciDevice, count: u8) -> Option<AllocatedMsi> 
     );
     None
 }
+
+// ---------------------------------------------------------------------------
+// Phase 55 C.3 — driver-facing IRQ contract
+// ---------------------------------------------------------------------------
+//
+// High-level shape:
+//
+//   let irq = handle.install_msi_irq(my_isr)?;       // prefers MSI/MSI-X.
+//   let irq = handle.install_intx_irq(my_isr)?;      // legacy INTx fallback.
+//
+// In both cases `my_isr: fn()` is called in ISR context. It must:
+//
+//   * Read/ack the device register (e.g. virtio ISR status, NVMe
+//     completion doorbell).
+//   * NOT allocate, NOT block, NOT take IPC locks.
+//   * Signal a wait queue / Notification / AtomicBool so a task context
+//     can do the real work.
+//
+// The returned [`DeviceIrq`] records the allocated vector and kind; drivers
+// hold it alongside their device state so the vector stays live for the
+// driver's lifetime. No current caller unloads, so `Drop` is a no-op.
+
+/// An allocated device IRQ vector plus its registered handler.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct DeviceIrq {
+    vector: u8,
+    kind: crate::arch::x86_64::interrupts::DeviceIrqKind,
+}
+
+#[allow(dead_code)]
+impl DeviceIrq {
+    /// IDT vector assigned to this interrupt.
+    pub fn vector(&self) -> u8 {
+        self.vector
+    }
+
+    /// IRQ kind — `Msi` for MSI/MSI-X, `LegacyIntx` for shared INTx.
+    pub fn kind(&self) -> crate::arch::x86_64::interrupts::DeviceIrqKind {
+        self.kind
+    }
+}
+
+#[allow(dead_code)]
+impl PciDeviceHandle {
+    /// Install `handler` for this device's MSI / MSI-X vector.
+    ///
+    /// Returns `Err` if the device has no MSI / MSI-X capability, no free
+    /// vector is available in the device IRQ bank, or registration fails.
+    /// The caller is expected to fall back to
+    /// [`Self::install_intx_irq`] when this returns `Err`.
+    ///
+    /// Only a single vector is supported here; multi-vector MSI-X (e.g.
+    /// NVMe with multiple I/O queues) is a future extension.
+    pub fn install_msi_irq(&self, handler: fn()) -> Result<DeviceIrq, &'static str> {
+        let dev = self.device();
+        let alloc = allocate_msi_vectors(dev, 1).ok_or("no MSI/MSI-X capability available")?;
+        let entry = crate::arch::x86_64::interrupts::DeviceIrqEntry {
+            handler,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::Msi,
+        };
+        crate::arch::x86_64::interrupts::register_device_irq(alloc.first_vector, entry)?;
+        Ok(DeviceIrq {
+            vector: alloc.first_vector,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::Msi,
+        })
+    }
+
+    /// Install `handler` as a legacy-INTx shared interrupt on the vector
+    /// given by `idt_vector`. The caller is responsible for routing the
+    /// device's PCI interrupt line through the I/O APIC (see
+    /// `arch::x86_64::apic::route_pci_irq`).
+    ///
+    /// Legacy INTx handlers must check the device's ISR status register
+    /// before doing any work — the interrupt line is potentially shared
+    /// with other devices.
+    pub fn install_intx_irq(
+        &self,
+        idt_vector: u8,
+        handler: fn(),
+    ) -> Result<DeviceIrq, &'static str> {
+        let entry = crate::arch::x86_64::interrupts::DeviceIrqEntry {
+            handler,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::LegacyIntx,
+        };
+        crate::arch::x86_64::interrupts::register_device_irq(idt_vector, entry)?;
+        Ok(DeviceIrq {
+            vector: idt_vector,
+            kind: crate::arch::x86_64::interrupts::DeviceIrqKind::LegacyIntx,
+        })
+    }
+}
