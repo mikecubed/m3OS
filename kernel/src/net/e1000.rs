@@ -29,7 +29,7 @@
 //!   selector — see `kernel/src/net/mod.rs`.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use kernel_core::e1000::{
     E1000Regs, E1000RxDesc, E1000TxDesc, ctrl, decode_mac_from_ra, irq_cause, rctl,
@@ -301,11 +301,15 @@ pub static LINK_UP_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// `TaskId` of the network processing task, registered once from
 /// `kernel_main::net_task` so the ISR can wake the task on every RX IRQ.
-static NET_TASK_ID: Mutex<Option<TaskId>> = Mutex::new(None);
+/// `0` means "not yet registered" — task IDs are allocated starting at 1 in
+/// `Task::new`, so 0 is a safe sentinel. An atomic is used because the ISR
+/// (which can fire on the same CPU as the setter) would otherwise deadlock
+/// on a spin::Mutex held with interrupts enabled.
+static NET_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Register the network task id with the e1000 driver.
 pub fn set_net_task_id(id: TaskId) {
-    *NET_TASK_ID.lock() = Some(id);
+    NET_TASK_ID.store(id.0, Ordering::Release);
 }
 
 /// Returns the MAC address, if the e1000 device is initialized.
@@ -372,11 +376,15 @@ fn e1000_interrupt_handler() {
 
     // Signal the task on any meaningful cause.  We wake on RXT0 (RX timer),
     // RXDMT0 (RX minimum threshold), and LSC so link-up can kick off the
-    // drain/prepare path in task context.
+    // drain/prepare path in task context.  The shared `net::NIC_WOKEN` flag
+    // is what `net_task` parks on, so set it alongside the driver-specific
+    // `E1000_IRQ_WOKEN`.
     let _ = icr;
     E1000_IRQ_WOKEN.store(true, Ordering::Release);
-    if let Some(id) = *NET_TASK_ID.lock() {
-        let _ = wake_task(id);
+    crate::net::NIC_WOKEN.store(true, Ordering::Release);
+    let raw = NET_TASK_ID.load(Ordering::Acquire);
+    if raw != 0 {
+        let _ = wake_task(TaskId(raw));
     }
 }
 

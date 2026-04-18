@@ -557,11 +557,10 @@ fn net_task() -> ! {
     log::info!("[net] network processing task started");
 
     loop {
-        // Drain all pending work signalled by either driver's IRQ flag.
-        // Using `swap(false)` means we consume exactly one edge per loop
-        // body; if either ISR sets a flag after we swap but before we park,
-        // the check inside `block_current_unless_woken` will see it and
-        // return immediately.
+        // Clear the unified wake flag up front so any edge set between now
+        // and park is still observable. Driver-specific flags remain the
+        // "this driver has pending work" signals consumed by the drain loop.
+        net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
         let mut any =
             net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         any |= net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
@@ -573,7 +572,11 @@ fn net_task() -> ! {
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire)
                 | net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         }
-        task::scheduler::block_current_unless_woken(&net::virtio_net::NET_IRQ_WOKEN);
+        // Park on the unified flag: either NIC's ISR sets it so a wake from
+        // either driver reliably unblocks the task. If an IRQ fires between
+        // the drain-loop exit and the park, `block_current_unless_woken`
+        // observes `NIC_WOKEN` set and returns immediately without sleeping.
+        task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
 }
 

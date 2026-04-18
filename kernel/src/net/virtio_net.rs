@@ -23,14 +23,13 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_core::types::TaskId;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 use x86_64::instructions::port::Port;
 
 use crate::mm::dma::DmaBuffer;
-use crate::mm::frame_allocator;
 use crate::pci::bar::{BarMapping, PortRegion};
 use crate::pci::{self, DriverEntry, DriverProbeResult, PciMatch};
 use crate::task::scheduler::wake_task;
@@ -438,8 +437,11 @@ pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 
 /// `TaskId` of the network processing task, registered from `kernel_main`
 /// via [`set_net_task_id`]. Read by the IRQ handler to wake the task when
-/// packets arrive. `None` until the task is spawned.
-static NET_TASK_ID: Mutex<Option<TaskId>> = Mutex::new(None);
+/// packets arrive. `0` means "not yet registered" — task IDs are allocated
+/// starting at 1 in `Task::new`, so 0 is a safe sentinel. An atomic is used
+/// because the ISR (which can fire on the same CPU as the setter) would
+/// otherwise deadlock on a spin::Mutex held with interrupts enabled.
+static NET_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Signal flag for `block_current_unless_woken` in the network task.
 /// The ISR sets it, `net_task` consumes it via swap. Public so the task
@@ -450,7 +452,7 @@ pub static NET_IRQ_WOKEN: AtomicBool = AtomicBool::new(false);
 /// `wake_task` on it. Must be called from the task's own body before it
 /// parks.
 pub fn set_net_task_id(id: TaskId) {
-    *NET_TASK_ID.lock() = Some(id);
+    NET_TASK_ID.store(id.0, Ordering::Release);
 }
 
 /// Returns the MAC address of the virtio-net device, if initialized.
@@ -505,10 +507,13 @@ fn virtio_net_irq_handler() {
     // Signal the polling path and wake the task. The task consumes
     // NET_IRQ_WOKEN with `swap(false, ...)` so missed edges don't
     // accumulate; wake_task makes the task Ready so it runs on the next
-    // scheduler tick.
+    // scheduler tick. The shared `net::NIC_WOKEN` flag is what `net_task`
+    // parks on, so set it alongside the driver-specific flag.
     NET_IRQ_WOKEN.store(true, Ordering::Release);
-    if let Some(id) = *NET_TASK_ID.lock() {
-        let _ = wake_task(id);
+    crate::net::NIC_WOKEN.store(true, Ordering::Release);
+    let raw = NET_TASK_ID.load(Ordering::Acquire);
+    if raw != 0 {
+        let _ = wake_task(TaskId(raw));
     }
 }
 
@@ -519,12 +524,19 @@ fn virtio_net_irq_handler() {
 /// Receive any pending Ethernet frames from the RX virtqueue.
 ///
 /// Returns a vector of raw Ethernet frames (without the virtio-net header).
+///
+/// The `without_interrupts` region is kept as small as possible: the
+/// descriptor read (`read_buffer`) must copy before we `post_recv_buffer`,
+/// so that alloc stays inside; the virtio-net-header strip happens outside
+/// the IF-off region to keep the worst-case interrupt latency bounded
+/// (PR #113 Comment 1 — partial fix; eliminates the redundant `.to_vec()`
+/// inside the critical section).
 #[allow(dead_code)]
 pub fn recv_frames() -> Vec<Vec<u8>> {
     // The driver lock must be taken with IF off so the ISR (which also
     // takes the lock) cannot fire on this CPU mid-critical-section. See
     // Fix 1 note in `blk/virtio_blk.rs`.
-    interrupts::without_interrupts(|| {
+    let mut raw_frames: Vec<Vec<u8>> = interrupts::without_interrupts(|| {
         let mut driver = DRIVER.lock();
         let driver = match driver.as_mut() {
             Some(d) => d,
@@ -532,14 +544,14 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
         };
 
         let completed = driver.rx_queue.poll_used();
-        let mut frames = Vec::new();
+        let mut raw = Vec::with_capacity(completed.len());
         let reposted = !completed.is_empty();
 
         for (desc_idx, len) in completed {
             if (len as usize) > VIRTIO_NET_HDR_SIZE {
-                let raw = driver.rx_queue.read_buffer(desc_idx, len);
-                // Strip the virtio-net header.
-                frames.push(raw[VIRTIO_NET_HDR_SIZE..].to_vec());
+                // One alloc-per-frame — unavoidable because the descriptor
+                // buffer must be copied before we recycle it below.
+                raw.push(driver.rx_queue.read_buffer(desc_idx, len));
             }
             // Re-post the buffer for future receives.
             driver.rx_queue.post_recv_buffer(desc_idx);
@@ -553,8 +565,16 @@ pub fn recv_frames() -> Vec<Vec<u8>> {
             }
         }
 
-        frames
-    })
+        raw
+    });
+
+    // Strip the virtio-net header in-place outside the IF-off region — this
+    // is a `Vec::drain` that does not reallocate, keeping the ISR-latency
+    // budget untouched.
+    for frame in &mut raw_frames {
+        frame.drain(..VIRTIO_NET_HDR_SIZE);
+    }
+    raw_frames
 }
 
 /// Send a raw Ethernet frame via the TX virtqueue.
@@ -833,12 +853,4 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
 /// Align `val` up to `alignment` (must be a power of two).
 fn align_up(val: usize, alignment: usize) -> usize {
     (val + alignment - 1) & !(alignment - 1)
-}
-
-// Keep `frame_allocator` import alive — still used for ISR-path cache
-// accounting in the kernel-wide `available_count` helpers, and may be
-// re-used by a future zero-copy RX path here.
-#[allow(dead_code)]
-fn _keep_frame_allocator_import_alive() {
-    let _ = frame_allocator::total_frames;
 }

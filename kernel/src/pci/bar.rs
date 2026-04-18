@@ -487,12 +487,17 @@ fn ensure_uncacheable(virt_base: usize, size: u64) {
         // If the translation succeeds and yields a 4 KiB leaf, patch NO_CACHE.
         // We do not promote huge pages to 4 KiB — MMIO typically sits above
         // RAM in QEMU and those pages aren't covered by huge-page mappings.
-        if matches!(mapper.translate(vaddr), TranslateResult::Mapped { .. }) {
+        if let TranslateResult::Mapped {
+            flags: existing, ..
+        } = mapper.translate(vaddr)
+        {
             let page = Page::<Size4KiB>::containing_address(vaddr);
-            let flags = PageTableFlags::PRESENT
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::NO_CACHE
-                | PageTableFlags::WRITE_THROUGH;
+            // Preserve every bit the kernel already chose for this leaf
+            // (e.g. GLOBAL, NO_EXECUTE, custom BIT_11 flags) and only OR in
+            // the cache-strength bits required for MMIO. Overwriting the
+            // full flag set here would silently clear NO_EXECUTE on the
+            // phys-offset map and change memory semantics for this range.
+            let flags = existing | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
             // Ignore errors — the mapping may be a huge page (PageSizeNotSupported)
             // or not present. In either case the driver's init will report the
             // real failure when it touches MMIO.

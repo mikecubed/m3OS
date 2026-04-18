@@ -1035,21 +1035,31 @@ static DEVICE_IRQ_TABLE: Mutex<[Option<DeviceIrqEntry>; DEVICE_IRQ_VECTOR_COUNT 
 
 /// Install `entry` at `vector`. Returns `Err` if the vector is outside the
 /// device-IRQ bank or already occupied.
+///
+/// The critical section runs with interrupts disabled so an MSI/MSI-X vector
+/// firing on this CPU cannot re-enter `dispatch_device_irq` and deadlock on
+/// `DEVICE_IRQ_TABLE`.
 pub fn register_device_irq(vector: u8, entry: DeviceIrqEntry) -> Result<(), &'static str> {
     if !(DEVICE_IRQ_VECTOR_BASE..DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT).contains(&vector)
     {
         return Err("vector out of device IRQ range");
     }
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
-    let mut tbl = DEVICE_IRQ_TABLE.lock();
-    if tbl[idx].is_some() {
-        return Err("device IRQ vector already registered");
-    }
-    tbl[idx] = Some(entry);
-    Ok(())
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tbl = DEVICE_IRQ_TABLE.lock();
+        if tbl[idx].is_some() {
+            return Err("device IRQ vector already registered");
+        }
+        tbl[idx] = Some(entry);
+        Ok(())
+    })
 }
 
 /// Remove the handler installed at `vector`. Silently ignores missing entries.
+///
+/// The critical section runs with interrupts disabled for the same reason
+/// as `register_device_irq` — the dispatch path locks the same table from
+/// ISR context.
 #[allow(dead_code)]
 pub fn unregister_device_irq(vector: u8) {
     if !(DEVICE_IRQ_VECTOR_BASE..DEVICE_IRQ_VECTOR_BASE + DEVICE_IRQ_VECTOR_COUNT).contains(&vector)
@@ -1057,8 +1067,10 @@ pub fn unregister_device_irq(vector: u8) {
         return;
     }
     let idx = (vector - DEVICE_IRQ_VECTOR_BASE) as usize;
-    let mut tbl = DEVICE_IRQ_TABLE.lock();
-    tbl[idx] = None;
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut tbl = DEVICE_IRQ_TABLE.lock();
+        tbl[idx] = None;
+    });
 }
 
 /// Dispatch a device IRQ to its registered handler. Runs in ISR context.

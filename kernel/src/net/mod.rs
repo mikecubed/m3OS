@@ -18,7 +18,20 @@ pub mod udp;
 pub mod unix;
 pub mod virtio_net;
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// ===========================================================================
+// Unified NIC wake flag — used by the network task's park/unpark.
+// ===========================================================================
+
+/// Shared signal for `block_current_unless_woken` in the network task.
+///
+/// Both NIC ISRs (`virtio_net::virtio_net_irq_handler`,
+/// `e1000::e1000_interrupt_handler`) set this in addition to their
+/// driver-specific progress flag. The network task parks exclusively on this
+/// flag so a wake from either driver reliably unblocks it — fixing the race
+/// where only one driver's flag was observed at park time.
+pub static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
 
 // ===========================================================================
 // Driver dispatch — Phase 55 E.4

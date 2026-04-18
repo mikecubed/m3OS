@@ -1534,21 +1534,52 @@ fn qemu_args(uefi_image: &Path, ovmf: &Path, display_mode: QemuDisplayMode) -> V
     qemu_args_with_devices(uefi_image, ovmf, display_mode, DeviceSet::default())
 }
 
-/// QEMU argument assembly with optional Phase 55 device overrides.
+/// Resolve the NVMe backing-image path for `devices` and assemble QEMU args.
 ///
-/// * `devices.nvme = true` appends `-drive file=<nvme.img>,if=none,id=nvme0
-///   -device nvme,serial=deadbeef,drive=nvme0` (NVMe reference configuration
-///   from the Phase 55 design doc).
-/// * `devices.e1000 = true` replaces the default `virtio-net-pci,netdev=net0`
-///   device with `-device e1000,netdev=net0`. The netdev itself is unchanged
-///   (QEMU SLIRP user-mode networking), so hostfwd rules still apply.
-///
-/// `DeviceSet::default()` preserves the legacy VirtIO-blk + VirtIO-net path.
+/// Wrapper around the pure [`qemu_args_with_devices_resolved`] that performs
+/// the filesystem side effect (creating `target/nvme.img` if missing) only
+/// when the caller actually asks for NVMe. Non-test callers use this; the
+/// unit tests pass an explicit dummy path to the pure function to stay
+/// hermetic (Comment 6 from PR #113 review).
 fn qemu_args_with_devices(
     uefi_image: &Path,
     ovmf: &Path,
     display_mode: QemuDisplayMode,
     devices: DeviceSet,
+) -> Vec<String> {
+    let nvme_path = if devices.nvme {
+        Some(ensure_nvme_image(&workspace_root()))
+    } else {
+        None
+    };
+    qemu_args_with_devices_resolved(
+        uefi_image,
+        ovmf,
+        display_mode,
+        devices,
+        nvme_path.as_deref(),
+    )
+}
+
+/// Pure QEMU argument assembly with optional Phase 55 device overrides.
+///
+/// * `devices.nvme = true` appends `-drive file=<nvme_image>,if=none,id=nvme0
+///   -device nvme,serial=deadbeef,drive=nvme0` using the caller-supplied
+///   `nvme_image` (never touches the filesystem itself).
+/// * `devices.e1000 = true` replaces the default `virtio-net-pci,netdev=net0`
+///   device with `-device e1000,netdev=net0`. The netdev itself is unchanged
+///   (QEMU SLIRP user-mode networking), so hostfwd rules still apply.
+///
+/// `DeviceSet::default()` preserves the legacy VirtIO-blk + VirtIO-net path.
+///
+/// Panics if `devices.nvme` is true but `nvme_image` is `None` — a
+/// programming error the wrapper above prevents.
+fn qemu_args_with_devices_resolved(
+    uefi_image: &Path,
+    ovmf: &Path,
+    display_mode: QemuDisplayMode,
+    devices: DeviceSet,
+    nvme_image: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "-bios".to_string(),
@@ -1606,10 +1637,12 @@ fn qemu_args_with_devices(
     }
 
     // Phase 55 (F.1): `--device nvme` adds a second drive behind a QEMU NVMe
-    // controller. The image is created on demand by `ensure_nvme_image` and
-    // lives at target/nvme.img so it stays out of the source tree.
+    // controller. The caller (`qemu_args_with_devices`) resolves the backing
+    // image path via `ensure_nvme_image`; this function itself is pure so
+    // unit tests can exercise it without writing to `target/nvme.img`.
     if devices.nvme {
-        let nvme_path = ensure_nvme_image(&workspace_root());
+        let nvme_path =
+            nvme_image.expect("qemu_args_with_devices_resolved: devices.nvme requires nvme_image");
         args.extend([
             "-drive".to_string(),
             format!("file={},if=none,id=nvme0,format=raw", nvme_path.display()),
@@ -7468,7 +7501,11 @@ mod tests {
 
     #[test]
     fn qemu_args_with_nvme_appends_nvme_drive() {
-        let args = qemu_args_with_devices(
+        // Use the pure resolver directly with a fake path so the test does
+        // not create or touch `target/nvme.img` — keeps the suite hermetic
+        // under sandboxed / read-only CI environments (PR #113 Comment 6).
+        let fake_nvme = Path::new("/tmp/m3os-test-nvme-never-created.img");
+        let args = qemu_args_with_devices_resolved(
             Path::new("target/boot-uefi-m3os.img"),
             Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
             QemuDisplayMode::Headless,
@@ -7476,6 +7513,7 @@ mod tests {
                 nvme: true,
                 e1000: false,
             },
+            Some(fake_nvme),
         );
         assert!(
             args.windows(2)
@@ -7490,6 +7528,15 @@ mod tests {
             args.iter()
                 .any(|arg| arg.contains("if=none,id=nvme0,format=raw")),
             "expected NVMe backing-drive fragment with if=none and id=nvme0"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains(fake_nvme.to_str().unwrap())),
+            "expected NVMe drive fragment to reference the caller-provided path"
+        );
+        assert!(
+            !fake_nvme.exists(),
+            "qemu_args_with_devices_resolved must not create the NVMe backing image"
         );
     }
 
