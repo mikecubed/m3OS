@@ -5,46 +5,92 @@ Extracted from AGENTS.md to keep active guidance lean.
 
 ## Workspace Crates
 
+The authoritative list lives in `Cargo.toml` under `workspace.members`. The
+map below mirrors it; when the two disagree, `Cargo.toml` wins.
+
 ```
 Cargo.toml                # workspace root (default-members = ["kernel"])
 kernel/                   # main OS kernel binary (no_std)
 kernel-core/              # shared library — host-testable pure logic (no_std + std feature)
 xtask/                    # build system (host, std)
 userspace/
+  # Phase 11 userspace test binaries
   syscall-lib/            # syscall wrapper library for userspace Rust binaries
   exit0/                  # test binary: simple exit
   fork-test/              # test binary: fork behavior
   echo-args/              # test binary: argument echo
+  # Phase 20 userspace init and shell
   init/                   # PID 1 init daemon
   shell/                  # sh0 shell (binary name: sh0)
+  # Phase 23 userspace ping
   ping/                   # ICMP ping utility
+  # Phase 54 validation probes
+  udp-smoke/              # UDP-path smoke probe used by the serverization validation bundle
+  smoke-runner/           # Harness that drives the smoke probes under the xtask regression command
+  # Phase 26 text editor
   edit/                   # full-screen text editor (kibi-style)
-  login/                  # login authentication (Phase 27)
-  su/                     # switch user (Phase 27)
-  passwd/                 # change password (Phase 27)
-  adduser/                # create user account (Phase 27)
-  pty-test/               # PTY subsystem test (Phase 29)
-  unix-socket-test/       # Unix domain socket test (Phase 39)
-  thread-test/            # Threading primitives test (Phase 40)
-  crypto-lib/             # Cryptography library (Phase 42)
-  crypto-test/            # Crypto integration test (Phase 42)
-  telnetd/                # Telnet server daemon (Phase 30)
-  sshd/                   # SSH server daemon (Phase 43)
-  syslogd/                # System logging daemon (Phase 46)
-  crond/                  # Cron scheduler daemon (Phase 46)
-  coreutils/              # C implementations: cat, cp, echo, env, grep, id, ls, mkdir, mv, pwd, rm, rmdir, sleep, true, false, prompt, whoami, touch, stat, wc, ar, install
+  # Phase 27 user accounts
+  login/                  # login authentication
+  su/                     # switch user
+  passwd/                 # change password
+  adduser/                # create user account
+  id/                     # print user/group IDs
+  whoami/                 # print current user
+  # Phase 29 PTY test
+  pty-test/               # PTY subsystem test
+  # Phase 39 Unix domain socket test
+  unix-socket-test/       # Unix domain socket test
+  # Phase 40 thread test
+  thread-test/            # Threading primitives test
+  # Phase 42 crypto
+  crypto-lib/             # Cryptography library
+  crypto-test/            # Crypto integration test
+  # Phase 43 SSH server
+  sshd/                   # SSH server daemon
+  # Phase 42b async executor
+  async-rt/               # Minimal async runtime for ring-3 services
+  # Rust coreutils (replacing C musl utilities)
   coreutils-rs/           # Rust implementations: true, false, echo, pwd, sleep, rm, mkdir, rmdir, mv, touch, stat, wc, ar, install, meminfo, date, uptime, sha256sum, genkey, service, logger, shutdown, reboot, hostname, who, w, last, crontab
+  coreutils-tests/        # Host-side tests for coreutils-rs
+  # Phase 46 system services
+  syslogd/                # System logging daemon
+  crond/                  # Cron scheduler daemon
+  # Phase 52 extracted services (ring-3)
+  console_server/         # Console / framebuffer service
+  kbd_server/             # Keyboard input service
+  stdin_feeder/           # Stdin routing helper used by the console / keyboard split
+  # Phase 54 extracted services (ring-3)
+  vfs_server/             # VFS policy service
+  fat_server/             # FAT filesystem service backing vfs_server
+  net_server/             # UDP networking policy service
+```
+
+### Non-member crates on disk
+
+These directories exist under `userspace/` but are deliberately **not**
+listed in `workspace.members` — they build through a different path or are
+retained as legacy fixtures. Do not expect `cargo build` or `cargo xtask
+check` to exercise them unless their dedicated entry point is invoked.
+
+```
+userspace/
+  # Phase 30 legacy telnet daemon — retained on disk; not currently built
+  telnetd/                # Telnet server daemon
+  # C-based legacy test binaries and ports — built through xtask-specific paths
+  coreutils/              # C implementations of cat/cp/echo/... (superseded by coreutils-rs)
   demo-project/           # Multi-file C demo project for make testing (Phase 32)
   hello-c/                # C hello world test
   signal-test/            # C signal handling test
   stdin-test/             # C stdin test
   tmpfs-test/             # C tmpfs test
-  # Phase 44: musl-linked Rust std programs (standalone crates, NOT workspace members)
-  hello-rust/             # Rust std hello world (musl cross-compiled, Phase 44)
-  sysinfo-rust/           # System info tool via std::fs (Phase 44)
-  httpd-rust/             # Minimal HTTP server via std::net (Phase 44)
-  calc-rust/              # Interactive calculator via std::io (Phase 44)
-  todo-rust/              # Persistent todo list via std::fs (Phase 44)
+  mmap-leak-test/         # Memory-map leak regression
+  doom/                   # Ported game (build via its own flow)
+  # Phase 44 musl-linked Rust std programs — cross-compiled via xtask musl path
+  hello-rust/             # Rust std hello world
+  sysinfo-rust/           # System info via std::fs
+  httpd-rust/             # Minimal HTTP server via std::net
+  calc-rust/              # Interactive calculator via std::io
+  todo-rust/              # Persistent todo list via std::fs
 ```
 
 ## Ports Tree Layout (Phase 45)
@@ -147,4 +193,4 @@ Read the relevant doc before making significant changes to that subsystem.
 | `docs/appendix/sunset-local-fork.md` | Before modifying sunset-local/ or the sshd session event loop |
 | `docs/roadmap/README.md` | Open design questions and per-phase scope |
 
-Phase-specific roadmaps and task lists live in `docs/roadmap/` (phases 01-48) with corresponding `docs/roadmap/tasks/` breakdowns.
+Phase-specific roadmaps and task lists live in `docs/roadmap/`, with corresponding `docs/roadmap/tasks/` breakdowns.

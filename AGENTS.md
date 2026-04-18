@@ -180,7 +180,7 @@ Parse memory regions, framebuffer, RSDP during `kernel_main` init and store in t
 
 ## Documentation in `docs/`
 
-Before making significant changes to a subsystem, read the corresponding phase doc. Full index in `docs/appendix/codebase-map.md`. Roadmaps and task lists live in `docs/roadmap/` (phases 01-48).
+Before making significant changes to a subsystem, read the corresponding phase doc. Full index in `docs/appendix/codebase-map.md`. Roadmaps and task lists live in `docs/roadmap/`.
 
 ### Documentation templates — all docs must conform
 
