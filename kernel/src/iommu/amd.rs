@@ -49,7 +49,7 @@ use spin::Mutex;
 
 use kernel_core::iommu::amdvi_page_table::{AmdViPageTableEntry, AmdViPteFlags};
 use kernel_core::iommu::amdvi_regs::{
-    CommandEntry, ControlBits, DecodedEvent, DeviceTableEntry, EventCode, EventEntry, PFN_MASK_40,
+    CommandEntry, ControlBits, DeviceTableEntry, EventCode, EventEntry, PFN_MASK_40,
     REG_CMD_BUF_BAR, REG_CMD_BUF_HEAD, REG_CMD_BUF_TAIL, REG_CONTROL, REG_DEV_TAB_BAR,
     REG_EVENT_LOG_BAR, REG_EVENT_LOG_HEAD, REG_EVENT_LOG_TAIL, REG_EXT_FEATURE, REG_MSI_ADDR_HI,
     REG_MSI_ADDR_LO, REG_MSI_CTRL, REG_MSI_DATA,
@@ -388,13 +388,29 @@ impl AmdViUnit {
             };
             let event = EventEntry::new(w0, w1);
             let decoded = event.decode();
-            self.log_event(decoded);
+            let record = FaultRecord {
+                requester_bdf: decoded.device_id,
+                fault_reason: decoded.code as u16,
+                iova: Iova(decoded.address),
+            };
+            // Use the shared fault-event logger (Track C's fault.rs) so the
+            // log format is identical across VT-d and AMD-Vi — required by
+            // the task list's DRY rule for fault logging.
+            crate::iommu::fault::log_fault_event(
+                "amdvi",
+                record.requester_bdf,
+                record.iova.0,
+                record.fault_reason,
+            );
+            // Additional AMD-Vi-specific context useful for debugging but
+            // not part of the shared format.
+            log::warn!(
+                "[iommu] amdvi-detail: unit={} domain={:#x} event_code={}",
+                self.unit_index,
+                decoded.domain_id,
+                event_code_name(decoded.code),
+            );
             if let Some(handler) = self.fault_handler {
-                let record = FaultRecord {
-                    requester_bdf: decoded.device_id,
-                    fault_reason: decoded.code as u16,
-                    iova: Iova(decoded.address),
-                };
                 handler(&record);
             }
             self.event_head = (self.event_head + 1) % ring_entries;
@@ -406,26 +422,18 @@ impl AmdViUnit {
         }
         count
     }
+}
 
-    /// Structured-log a decoded event. Matching format Track C's
-    /// `log_fault_event` will consume once the shared module lands; this
-    /// local implementation keeps the log shape stable in the interim.
-    fn log_event(&self, event: DecodedEvent) {
-        let code = match event.code {
-            EventCode::ILLEGAL_DEV_TABLE_ENTRY => "illegal_dev_table_entry",
-            EventCode::IO_PAGE_FAULT => "io_page_fault",
-            EventCode::DEV_TAB_HW_ERROR => "dev_tab_hw_error",
-            EventCode::PAGE_TAB_HW_ERROR => "page_tab_hw_error",
-            _ => "unknown",
-        };
-        log::warn!(
-            "[iommu] fault: vendor=amdvi unit={} requester_bdf={:#06x} reason={} domain={:#x} iova={:#x}",
-            self.unit_index,
-            event.device_id,
-            code,
-            event.domain_id,
-            event.address,
-        );
+/// Human-readable name for an AMD-Vi event-log code, used in the
+/// `amdvi-detail` log line emitted alongside the shared structured fault
+/// event.
+fn event_code_name(code: u8) -> &'static str {
+    match code {
+        EventCode::ILLEGAL_DEV_TABLE_ENTRY => "illegal_dev_table_entry",
+        EventCode::IO_PAGE_FAULT => "io_page_fault",
+        EventCode::DEV_TAB_HW_ERROR => "dev_tab_hw_error",
+        EventCode::PAGE_TAB_HW_ERROR => "page_tab_hw_error",
+        _ => "unknown",
     }
 }
 
