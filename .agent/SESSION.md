@@ -1,9 +1,9 @@
 ---
 current-task: "PR #113 review resolution — 14 copilot-reviewer threads on feat/55-hardware-substrate (4 passes)"
-current-phase: "fix-batch-1-complete"
-next-action: "commit + push + reply + resolve thread 14"
+current-phase: "resolved"
+next-action: "await PR merge by developer"
 workspace: "feat/55-hardware-substrate (PR #113)"
-last-updated: "2026-04-18T20:55:00Z"
+last-updated: "2026-04-18T21:20:00Z"
 ---
 
 ## Review surface
@@ -47,7 +47,7 @@ resolved.
 
 | #  | Thread ID                 | Location                                     | Evidence | Action | Commit      |
 |----|---------------------------|----------------------------------------------|----------|--------|-------------|
-| 14 | PRRT_kwDORTRVIM57-Bk-     | kernel/src/pci/bar.rs:337                    | valid    | fixed  | (this pass) |
+| 14 | PRRT_kwDORTRVIM57-Bk-     | kernel/src/pci/bar.rs:337                    | valid    | fixed  | 7f4b80e     |
 
 - Pass 4: `map_bar`'s "Memory type note" contradicts `ensure_uncacheable`.
   `map_bar` claims cache-disabled PAT selection is used at boot and that
