@@ -1185,3 +1185,198 @@ impl PciDeviceHandle {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 55 C.4 — driver registration and discovery
+// ---------------------------------------------------------------------------
+//
+// Drivers describe themselves with a [`DriverEntry`] that pairs a
+// [`PciMatch`] rule with an init function. [`register_driver`] adds the entry
+// to a global table; [`probe_all_drivers`] walks discovered PCI devices in
+// deterministic (bus, device, function) order and invokes matching init
+// functions for any unclaimed device.
+//
+// Driver init takes a [`PciDeviceHandle`] (the claim is already taken) and
+// returns success/failure. Failure drops the handle so another driver can
+// try the same device if desired (but typically a `NotFound` match doesn't
+// consume a claim).
+
+/// Match rule for a driver's device discovery. Either match a specific
+/// vendor/device pair, or a class/subclass pair (e.g. class 0x01 subclass
+/// 0x08 for NVMe).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub enum PciMatch {
+    /// Match by PCI vendor and device IDs.
+    VendorDevice { vendor: u16, device: u16 },
+    /// Match by PCI class + subclass. Useful for NVMe (0x01:0x08:0x02) or
+    /// Ethernet (0x02:0x00).
+    ClassSubclass { class: u8, subclass: u8 },
+    /// Match by vendor/device **and** class/subclass — disambiguates
+    /// multi-function vendor IDs. Example: virtio-net uses vendor 0x1AF4,
+    /// device 0x1000, class 0x02 subclass 0x00 to separate from other
+    /// 0x1AF4:0x1000 variants.
+    Full {
+        vendor: u16,
+        device: u16,
+        class: u8,
+        subclass: u8,
+    },
+}
+
+impl PciMatch {
+    #[allow(dead_code)]
+    fn matches(&self, dev: &PciDevice) -> bool {
+        match *self {
+            PciMatch::VendorDevice { vendor, device } => {
+                dev.vendor_id == vendor && dev.device_id == device
+            }
+            PciMatch::ClassSubclass { class, subclass } => {
+                dev.class_code == class && dev.subclass == subclass
+            }
+            PciMatch::Full {
+                vendor,
+                device,
+                class,
+                subclass,
+            } => {
+                dev.vendor_id == vendor
+                    && dev.device_id == device
+                    && dev.class_code == class
+                    && dev.subclass == subclass
+            }
+        }
+    }
+}
+
+/// Outcome of a driver init attempt.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum DriverProbeResult {
+    /// Driver bound and initialized successfully.
+    Bound,
+    /// Driver declined this device (e.g. unsupported variant).  The PCI
+    /// claim is dropped and another driver may be tried.
+    Declined(&'static str),
+    /// Driver attempted to bind but failed (bring-up error). Logged.
+    Failed(&'static str),
+}
+
+/// Init function signature. Receives a claimed PCI handle, returns an outcome.
+pub type DriverInitFn = fn(handle: PciDeviceHandle) -> DriverProbeResult;
+
+/// A single driver registered for discovery.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct DriverEntry {
+    /// Human-readable name for log output.
+    pub name: &'static str,
+    /// Match rule for selecting devices.
+    pub r#match: PciMatch,
+    /// Init function.
+    pub init: DriverInitFn,
+}
+
+const MAX_DRIVERS: usize = 16;
+
+struct DriverRegistry {
+    drivers: [Option<DriverEntry>; MAX_DRIVERS],
+    count: usize,
+}
+
+impl DriverRegistry {
+    const fn new() -> Self {
+        Self {
+            drivers: [None; MAX_DRIVERS],
+            count: 0,
+        }
+    }
+}
+
+static DRIVER_REGISTRY: Mutex<DriverRegistry> = Mutex::new(DriverRegistry::new());
+
+/// Register a driver for PCI discovery. Returns `Err` if the registry is full.
+#[allow(dead_code)]
+pub fn register_driver(entry: DriverEntry) -> Result<(), &'static str> {
+    let mut reg = DRIVER_REGISTRY.lock();
+    if reg.count >= MAX_DRIVERS {
+        return Err("driver registry full");
+    }
+    let idx = reg.count;
+    reg.drivers[idx] = Some(entry);
+    reg.count += 1;
+    log::info!(
+        "[pci-drv] registered driver `{}` (count now {})",
+        entry.name,
+        reg.count
+    );
+    Ok(())
+}
+
+/// Probe every discovered PCI device in (bus, device, function) order and
+/// invoke the init function of the first registered driver whose match rule
+/// matches an unclaimed device. Drivers that match but [`DriverProbeResult::Declined`]
+/// or [`DriverProbeResult::Failed`] release the claim so a later-registered
+/// driver can try.
+#[allow(dead_code)]
+pub fn probe_all_drivers() {
+    // Snapshot the driver list so the global lock is not held across init
+    // (drivers may themselves call into pci:: functions).
+    let drivers: alloc::vec::Vec<DriverEntry> = {
+        let reg = DRIVER_REGISTRY.lock();
+        reg.drivers
+            .iter()
+            .take(reg.count)
+            .filter_map(|e| *e)
+            .collect()
+    };
+    let device_count = pci_device_count();
+    for idx in 0..device_count {
+        let Some(dev) = pci_device(idx) else { continue };
+        // Skip devices already claimed (e.g. driver registered itself outside
+        // the probe path, or the user manually claimed in bring-up).
+        {
+            let reg = PCI_DEVICE_REGISTRY.lock();
+            if reg.is_claimed(dev.bus, dev.device, dev.function) {
+                continue;
+            }
+        }
+        for entry in &drivers {
+            if !entry.r#match.matches(&dev) {
+                continue;
+            }
+            // Try to claim. If another driver raced us and already claimed,
+            // skip and move on.
+            let handle = match claim_specific(dev, entry.name) {
+                Ok(h) => h,
+                Err(ClaimError::AlreadyClaimed) => break,
+                Err(ClaimError::NotFound) => continue,
+            };
+            log::info!(
+                "[pci-drv] probing `{}` for {:04x}:{:04x} at {:02x}:{:02x}.{}",
+                entry.name,
+                dev.vendor_id,
+                dev.device_id,
+                dev.bus,
+                dev.device,
+                dev.function
+            );
+            match (entry.init)(handle) {
+                DriverProbeResult::Bound => {
+                    log::info!("[pci-drv] `{}` bound successfully", entry.name);
+                    break;
+                }
+                DriverProbeResult::Declined(reason) => {
+                    log::info!("[pci-drv] `{}` declined: {}", entry.name, reason);
+                    // `handle` was moved into init and dropped on its return
+                    // path; the claim is already released.
+                    continue;
+                }
+                DriverProbeResult::Failed(reason) => {
+                    log::warn!("[pci-drv] `{}` failed: {}", entry.name, reason);
+                    break;
+                }
+            }
+        }
+    }
+}
