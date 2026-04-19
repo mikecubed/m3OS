@@ -200,3 +200,21 @@ being consumed inside `acpi/`. See
 subsystem-level architecture and
 [docs/roadmap/55a-iommu-substrate.md](./roadmap/55a-iommu-substrate.md)
 for the authoritative design.
+
+## Phase 55b Additions (Device-Host Capability Model)
+
+Phase 55b builds on the PCI claim protocol established in Phase 55 and the
+IOMMU domain lifetime established in Phase 55a to deliver a **device-host
+capability model**: rather than kernel drivers owning PCI devices in ring 0,
+a supervised ring-3 process holds a `Capability::Device` handle granted by
+the kernel after `sys_device_claim`. The handle gates every subsequent
+hardware operation — BAR mapping, DMA buffer allocation, and IRQ
+subscription — so the kernel never exposes raw physical addresses or interrupt
+vectors to userspace directly; only capability-indexed operations are allowed.
+The `claim_pci_device` path extended in Phase 55 is the ownership gate that
+makes this tractable: the kernel already tracks which BDF each handle covers,
+and Phase 55b extends that tracking to include a translation-domain association
+and a per-process capability table entry. See
+[Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md) for
+the full design, the four device-host syscalls, and the `driver_runtime` crate
+that ring-3 drivers use to consume this model.

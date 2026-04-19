@@ -296,13 +296,19 @@ driver with a typed error and keep running.
 
 ## How This Phase Differs From Later Memory Work
 
-- **Phase 55b (Ring-3 Driver Host)** will add a `sys_device_dma_alloc`
-  syscall that wraps `DmaBuffer::allocate` behind a device capability.
+- **Phase 55b (Ring-3 Driver Host)** adds the `sys_device_dma_alloc`
+  syscall (delivered in Track B.3) that wraps `DmaBuffer::allocate`
+  behind a device capability, surfacing the IOMMU-routed physical address
+  to the ring-3 driver as an IOVA the device can program directly.
   The device-keyed contract, per-device domain lifetime, and identity-
   fallback path delivered here are the primitives 55b's capability layer
-  will wrap. Any change to the `DmaBuffer` signature or the
-  `PciDeviceHandle` lifetime after this phase forces re-work in 55b, so
-  the Track A / E contracts are treated as stable once Phase 55a closes.
+  wraps. See
+  [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md)
+  for the full device-host syscall surface and the `driver_runtime` crate
+  that userspace `nvme_drv` / `e1000_drv` use to call it. Any change to
+  the `DmaBuffer` signature or the `PciDeviceHandle` lifetime after this
+  phase forces re-work in 55b, so the Track A / E contracts are treated
+  as stable once Phase 55a closes.
 - **Phase 56 (Display and Input Architecture)** assumes per-device
   isolation for its multi-client display service — one graphical
   client's device-visible buffers cannot reach another client's memory
