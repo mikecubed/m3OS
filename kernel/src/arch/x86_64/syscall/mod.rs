@@ -1973,6 +1973,14 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
         crate::ipc::cleanup::cleanup_task_ipc(task_id);
     }
 
+    // Phase 55b Track B.3: release every `Capability::Dma` held by this
+    // process BEFORE releasing the device claims so the `DmaSlot::drop`
+    // path can unmap IOVA against a still-live IOMMU domain. If the
+    // device claims were released first the domain would already be
+    // destroyed by `PciDeviceHandle::drop` and the IOVA unmap would be a
+    // no-op against a freed domain.
+    let _ = crate::syscall::device_host::release_dma_for_pid(pid);
+
     // Phase 55b Track B.1: release every `Capability::Device` held by this
     // process so the supervisor (Phase 46 / Phase 51) can restart a fresh
     // driver instance on the same BDF. Must run before FD close so the
