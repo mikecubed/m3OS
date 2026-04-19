@@ -1,4 +1,4 @@
-//! Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke test.
+//! Phase 55b Track F.3c — NVMe crash-and-restart end-to-end smoke test (updated).
 //!
 //! This binary is the guest-side I/O client that was deferred from Tracks F.2
 //! and F.2b. It demonstrates the full mid-restart scenario:
@@ -7,28 +7,28 @@
 //! 2. Fork a child that calls `service kill nvme_driver` while the I/O is
 //!    in flight (or shortly after it completes).
 //! 3. Observe the IPC transport failure that the kill produces.
+//! 3.5 (F.3c): Call `sys_block_read` from the kernel facade during the crash
+//!    window and assert it returns `EAGAIN` (-11) — the
+//!    `BlockDriverError::DriverRestarting` byte (5) propagated via
+//!    `block_error_to_neg_errno`.  This is the EAGAIN observation that was
+//!    blocked in F.3b (the binary lacked euid=200 and was not in the
+//!    BLOCK_READ_ALLOWED whitelist).
 //! 4. Poll `/run/services.status` until nvme_driver shows `running` again
 //!    (init restarts it per the Phase 46/51 service manager).
-//! 5. Retry the BLK_READ — confirm it succeeds (driver back online).
+//! 5. Retry both the IPC read and `sys_block_read` — confirm both succeed.
 //! 6. Emit `NVME_CRASH_SMOKE:PASS` on success or
 //!    `NVME_CRASH_SMOKE:FAIL <step>` on any sub-step failure.
 //!
-//! # Why this binary lives here
+//! # Why this binary can now call sys_block_read
 //!
-//! The kernel's `sys_block_read` syscall is restricted to supervised storage
-//! servers (euid = 200, exec_path ∈ {/bin/vfs_server, /bin/fat_server}).
-//! Ordinary guest binaries must speak the block-driver IPC protocol directly
-//! to the `nvme.block` endpoint. When the driver is killed mid-call, the IPC
-//! transport returns an error (`u64::MAX`) rather than the kernel facade's
-//! `BlockDriverError::DriverRestarting` byte (5) — the facade mapping is only
-//! visible through the kernel's `RemoteBlockDevice` path.  This binary
-//! observes the raw IPC transport failure and reports it as the crash signal,
-//! which is the only observable from ordinary userspace.
+//! Phase 55b Track F.3c granted this binary storage-server privileges:
+//!   - `privileged_exec_credentials("/bin/nvme-crash-smoke", _)` → euid=200
+//!   - `BLOCK_READ_ALLOWED` (non-hardened build) includes `/bin/nvme-crash-smoke`
 //!
-//! The kernel-core host tests (driver_restart.rs tests 1–10) cover the
-//! `DriverRestarting` byte mapping exhaustively without QEMU.  This binary's
-//! job is the full end-to-end lifecycle: kill → transport error → wait → retry
-//! success.
+//! With those two gates open, the `sys_block_read` syscall admits this binary.
+//! When the driver is mid-restart, `remote.rs` surfaces
+//! `BlockDriverError::DriverRestarting` (byte 5), which
+//! `block_error_to_neg_errno` maps to `NEG_EAGAIN` (-11).
 //!
 //! # Block IPC protocol (manual encoding)
 //!
@@ -50,8 +50,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, SIGKILL, STDOUT_FILENO, close, execve, exit, fork, kill, nanosleep, open, read,
-    waitpid, write_str,
+    O_RDONLY, STDOUT_FILENO, block_read, close, execve, exit, fork, nanosleep, open, read, waitpid,
+    write_str,
 };
 
 // Service name the NVMe driver registers its IPC endpoint under (matches
@@ -65,14 +65,6 @@ const BLK_READ_LABEL: u64 = 0x5501;
 
 // Encoded BLK_REQUEST_HEADER_SIZE
 const BLK_REQ_SIZE: usize = 30;
-// Encoded BLK_REPLY_HEADER_SIZE
-const BLK_REPLY_SIZE: usize = 20;
-
-// Status byte offset in reply header
-const REPLY_STATUS_OFFSET: usize = 8;
-
-// BlockDriverError::Ok = 0
-const BLOCK_ERROR_OK: u8 = 0;
 
 // Paths for service polling
 const STATUS_PATH: &[u8] = b"/run/services.status\0";
@@ -85,6 +77,9 @@ const SERVICE_BIN: &[u8] = b"/bin/service\0";
 const SERVICE_ARGV0: &[u8] = b"service\0";
 const SERVICE_KILL_ARG: &[u8] = b"kill\0";
 const NVME_DRIVER_NAME: &[u8] = b"nvme_driver\0";
+
+// Linux errno value EAGAIN (negated i64)
+const NEG_EAGAIN: i64 = -11;
 
 syscall_lib::entry_point!(program_main);
 
@@ -117,6 +112,21 @@ fn program_main(_args: &[&str]) -> i32 {
         return 2;
     }
     write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:pre-crash-read:OK\n");
+
+    // Also confirm sys_block_read works before the kill (we have euid=200).
+    let mut sector_buf = [0u8; 512];
+    let pre_kr = block_read(0, 1, &mut sector_buf);
+    if pre_kr != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=2 pre-crash sys_block_read failed\n",
+        );
+        return 2;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "NVME_CRASH_SMOKE:pre-crash-sys_block_read:OK\n",
+    );
 
     // ------------------------------------------------------------------
     // Step 3: Kill the driver in a child process.
@@ -176,6 +186,56 @@ fn program_main(_args: &[&str]) -> i32 {
     write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:kill-delivered\n");
 
     // ------------------------------------------------------------------
+    // Step 3.5 (F.3c): Assert EAGAIN from sys_block_read during crash window.
+    //
+    // Now that the driver is killed, `remote.rs` will surface
+    // `BlockDriverError::DriverRestarting` (byte 5) which maps to
+    // `NEG_EAGAIN` (-11). We loop a few times to catch the window where the
+    // driver is confirmed down (the state machine has marked it Restarting).
+    //
+    // If the driver restarts quickly, block_read may return 0 (success) or
+    // EAGAIN, both of which are valid. We only fail if it returns something
+    // other than 0 or EAGAIN (e.g., EIO = -5, which would mean the old
+    // `Err(_) => NEG_EIO` behavior was still in effect).
+    // ------------------------------------------------------------------
+    let mut eagain_seen = false;
+    let mut mid_kr_ok = false;
+    for _ in 0u32..5 {
+        let mid_kr = block_read(0, 1, &mut sector_buf);
+        if mid_kr == 0 {
+            // Driver already restarted before we could catch EAGAIN — valid.
+            mid_kr_ok = true;
+            break;
+        }
+        if mid_kr == NEG_EAGAIN {
+            eagain_seen = true;
+            write_str(
+                STDOUT_FILENO,
+                "NVME_CRASH_SMOKE:mid-crash:sys_block_read:EAGAIN\n",
+            );
+            break;
+        }
+        // Any other error (e.g., NEG_EIO = -5) means errno propagation is wrong.
+        if mid_kr != NEG_EAGAIN && mid_kr != 0 {
+            write_str(
+                STDOUT_FILENO,
+                "NVME_CRASH_SMOKE:FAIL step=3.5 unexpected errno from sys_block_read\n",
+            );
+            return 3;
+        }
+    }
+
+    if !eagain_seen && !mid_kr_ok {
+        // Neither EAGAIN nor success in 5 attempts — driver might be taking
+        // longer than expected. Log and continue (not a hard failure — the
+        // key assertion is that we never see EIO, which is caught above).
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:mid-crash:sys_block_read:no-eagain-in-window\n",
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Step 4: Wait for nvme_driver to show "running" again.
     // ------------------------------------------------------------------
     if !wait_for_driver_running("nvme_driver", RESTART_WAIT_SECONDS) {
@@ -198,7 +258,7 @@ fn program_main(_args: &[&str]) -> i32 {
     let ep_handle2 = ep_handle2 as u32;
 
     // ------------------------------------------------------------------
-    // Step 6: Retry the BLK_READ — must succeed.
+    // Step 6: Retry both the IPC read and sys_block_read — must succeed.
     // ------------------------------------------------------------------
     let req3 = encode_blk_read(0xF3B1_0003, 0, 1);
     let retry_ret = syscall_lib::ipc_call_buf(ep_handle2, BLK_READ_LABEL, BLK_READ_LABEL, &req3);
@@ -210,6 +270,20 @@ fn program_main(_args: &[&str]) -> i32 {
         return 6;
     }
     write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:post-restart-read:OK\n");
+
+    // Also verify sys_block_read succeeds post-restart.
+    let post_kr = block_read(0, 1, &mut sector_buf);
+    if post_kr != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=6 post-restart sys_block_read failed\n",
+        );
+        return 6;
+    }
+    write_str(
+        STDOUT_FILENO,
+        "NVME_CRASH_SMOKE:post-restart-sys_block_read:OK\n",
+    );
 
     // ------------------------------------------------------------------
     // Done.

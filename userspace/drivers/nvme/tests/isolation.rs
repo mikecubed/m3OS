@@ -27,18 +27,28 @@
 //!   (or synthesising a driver that deliberately calls with a stolen handle).
 //! - Observing the kernel's errno return across the process boundary.
 //!
-//! **Phase 55b F.3b progress:** Track F.3b delivered `userspace/nvme-crash-smoke/`
-//! which exercises the crash-and-restart lifecycle from the guest side (kill →
+//! ## Phase 55b F.3c status
+//!
+//! **F.3b progress:** Track F.3b delivered `userspace/nvme-crash-smoke/` which
+//! exercises the crash-and-restart lifecycle from the guest side (kill →
 //! IPC transport failure → restart → retry success). The cross-process capability
 //! injection scenario is a different and harder problem — it requires a "negative-
 //! path driver" binary that deliberately passes a wrong `CapHandle` in a syscall
-//! and a harness that can correlate the kernel's errno return to the injected
-//! value. That harness still does not exist.
+//! and a harness that can correlate the kernel's errno return to the injected value.
+//! That harness still does not exist.
+//!
+//! **F.3c progress:** Track F.3c resolved the privilege gate for `nvme-crash-smoke`
+//! (euid=200, BLOCK_READ_ALLOWED whitelist, EAGAIN propagation from `sys_block_read`).
+//! This is orthogonal to the capability-isolation stubs below — the cap-injection
+//! harness is the specific blocker for all four stubs, and F.3c did not build it.
 //!
 //! The stubs below remain deferred to phase-55c:
 //!
 //! > TODO(phase-55c): end-to-end cross-device negative path — spawn both
 //! > drivers, use wrong cap handle, assert `-EBADF` at the syscall return.
+//! > Specific blocker: "negative-path driver" binary + test supervisor that can
+//! > inject a stolen `CapHandle` integer into a live driver process's syscall and
+//! > read back the kernel's errno return across the process boundary.
 //!
 //! The stubs below mark where those tests will live so the file structure
 //! survives intact when the harness is built.
@@ -62,12 +72,16 @@
 /// Requires end-to-end supervised spawn + cross-process handle injection
 /// harness. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (lifecycle smoke); \
-            cross-device negative-path requires supervised spawn + CapHandle \
-            injection harness. Covered at kernel level by cross_device_mmio_denied."]
+#[ignore = "phase-55c deferred: F.3c resolved nvme-crash-smoke privilege gate (EAGAIN path); \
+            cross-device MMIO denial end-to-end is blocked on supervised spawn + CapHandle \
+            injection harness — orthogonal to F.3c privilege work. \
+            Covered at kernel level by cross_device_mmio_denied in kernel/src/main.rs."]
 fn cross_device_mmio_denied_end_to_end() {
     // Covered at the kernel registry level by `cross_device_mmio_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
+    // F.3c blocker: "negative-path driver" binary that deliberately passes the
+    // e1000 CapHandle to sys_device_mmio_map + a test supervisor that can observe
+    // the kernel's -EBADF return across the process boundary.
     todo!("end-to-end cross-device MMIO denial: needs supervised spawn + cap-injection harness")
 }
 
@@ -85,12 +99,16 @@ fn cross_device_mmio_denied_end_to_end() {
 /// Requires end-to-end supervised spawn + cross-process handle injection
 /// harness. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (lifecycle smoke); \
-            cross-device DMA negative-path requires supervised spawn + CapHandle \
-            injection harness. Covered at kernel level by cross_device_dma_denied."]
+#[ignore = "phase-55c deferred: F.3c resolved nvme-crash-smoke privilege gate (EAGAIN path); \
+            cross-device DMA denial end-to-end is blocked on supervised spawn + CapHandle \
+            injection harness — orthogonal to F.3c privilege work. \
+            Covered at kernel level by cross_device_dma_denied in kernel/src/main.rs."]
 fn cross_device_dma_denied_end_to_end() {
     // Covered at the kernel registry level by `cross_device_dma_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
+    // F.3c blocker: "negative-path driver" binary that deliberately passes the
+    // e1000 IOMMU domain CapHandle to sys_device_dma_alloc + a test supervisor
+    // that can observe -EBADF across the process boundary.
     todo!("end-to-end cross-device DMA denial: needs supervised spawn + cap-injection harness")
 }
 
@@ -107,12 +125,17 @@ fn cross_device_dma_denied_end_to_end() {
 /// Requires a "negative-path driver" binary capable of deliberate wrong-handle
 /// syscalls. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "phase-55c deferred: requires negative-path driver binary that \
-            deliberately passes a forged CapHandle in a device-host syscall. \
-            Covered at kernel level by capability_forge_denied."]
+#[ignore = "phase-55c deferred: F.3c resolved nvme-crash-smoke privilege gate (EAGAIN path); \
+            forged CapHandle denial end-to-end requires a negative-path driver binary that \
+            deliberately passes a synthesised CapHandle integer in a device-host syscall. \
+            Covered at kernel level by capability_forge_denied in kernel/src/main.rs."]
 fn capability_forge_denied_end_to_end() {
     // Covered at the kernel registry level by `capability_forge_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
+    // F.3c blocker: a binary that constructs a plausible-but-unissued CapHandle
+    // integer and passes it to any device-host syscall; a test supervisor that
+    // can read the kernel's -EBADF return across the process boundary without
+    // the process being able to observe it through normal error channels.
     todo!("end-to-end forged cap denial: needs negative-path driver binary")
 }
 
@@ -131,14 +154,19 @@ fn capability_forge_denied_end_to_end() {
 /// integer across the kill/restart boundary for the negative assertion.
 /// Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (kill → restart → \
-            retry lifecycle); asserting pre-crash CapHandle values are rejected \
-            by the restarted process requires cap-handle injection across the \
-            kill/restart boundary — no harness for that yet. \
+#[ignore = "phase-55c deferred: F.3c updated nvme-crash-smoke with EAGAIN observation \
+            (kill → EAGAIN from sys_block_read → restart → retry success); asserting \
+            pre-crash CapHandle values are rejected by the restarted process requires \
+            cap-handle injection across the kill/restart boundary — no harness for that yet. \
             Covered at kernel level by post_crash_handles_invalid_in_restarted_process."]
 fn post_crash_handles_invalid_end_to_end() {
     // Covered at the kernel registry level by
     // `post_crash_handles_invalid_in_restarted_process` in kernel/src/main.rs.
     // See module-level doc for gap analysis.
+    // F.3c blocker: recording a live CapHandle value from nvme_driver, killing it,
+    // waiting for restart (already works via nvme-crash-smoke), and then passing the
+    // pre-crash handle to any device-host syscall from the restarted process and
+    // reading back -EBADF requires a way to pass raw handle integers across the
+    // kill/restart boundary, which no test harness currently supports.
     todo!("end-to-end post-crash handle invalidation: needs cap-handle injection harness")
 }
