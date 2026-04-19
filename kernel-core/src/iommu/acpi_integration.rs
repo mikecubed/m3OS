@@ -16,15 +16,14 @@
 //!
 //! # AMD-Vi unity-map extraction — scope
 //!
-//! Per the AMD I/O Virtualization spec, unity-map address regions live in
-//! **IVMD** (I/O Virtualization Memory Definition) sub-tables of IVRS, not
-//! inside IVHD device entries. The Track A decoder currently decodes IVHD
-//! blocks (10h / 11h / 40h) but not IVMD; IVMD handling is planned for the
-//! AMD-Vi implementation track (D). [`reserved_regions_from_ivrs`] therefore
-//! returns an empty set, documented inline, and logs zero regions on AMD
-//! platforms. When Track D lands an IVMD decoder this function will be
-//! extended to populate the same set. This is explicitly recorded as a B.2
-//! deviation in the commit trail.
+//! Per AMD IOMMU spec §5.2.2, unity-map address regions live in **IVMD**
+//! (I/O Virtualization Memory Definition) sub-tables of IVRS, not inside
+//! IVHD device entries. The Track A decoder handles both: IVHD blocks
+//! (10h / 11h / 40h) feed [`iommu_units_from_ivrs`], and IVMD sub-tables
+//! (0x20 / 0x21 / 0x22) feed [`reserved_regions_from_ivrs`], which marks
+//! every IVMD as `FIRMWARE_OWNED | WRITABLE` and contributes to the
+//! shared [`ReservedRegionSet`]. The B.2 deviation that previously
+//! returned an empty set is now closed.
 
 use alloc::vec::Vec;
 
@@ -240,16 +239,48 @@ pub fn reserved_regions_from_dmar(
     (set, summaries)
 }
 
-/// Extract reserved regions from a decoded IVRS table.
+/// Extract IVMD unity-map regions from a decoded IVRS table into a
+/// [`ReservedRegionSet`].
 ///
-/// AMD-Vi unity maps live in IVMD sub-tables which the Track A decoder does
-/// not yet decode. This stub returns an empty set so the B.2 caller shape
-/// stays consistent across vendors. Track D will extend this when IVMD
-/// support lands.
+/// Every IVMD sub-table (types 0x20 / 0x21 / 0x22) describes a firmware-
+/// declared range that must stay identity-mapped in every IOMMU domain
+/// owned by the matching devices. For Phase 55a the scope (single BDF,
+/// BDF range, or all devices) is recorded but not yet consulted — the
+/// kernel pre-map path installs every IVMD range unconditionally. Raw
+/// flag bits are preserved on the underlying `IvrsMemDefinition`;
+/// reserved-region extraction always marks the output as
+/// `FIRMWARE_OWNED | WRITABLE` (AMD-Vi unity maps are writable by
+/// construction).
+///
+/// IVMDs with `length == 0` are skipped without recording a summary —
+/// they would contribute an empty span to the set.
 pub fn reserved_regions_from_ivrs(
-    _tables: &IvrsTables,
+    tables: &IvrsTables,
 ) -> (ReservedRegionSet, Vec<ReservedRegionSummary>) {
-    (ReservedRegionSet::new(), Vec::new())
+    let mut set = ReservedRegionSet::new();
+    let mut summaries = Vec::with_capacity(tables.ivmds.len());
+    for (idx, ivmd) in tables.ivmds.iter().enumerate() {
+        if ivmd.length == 0 {
+            continue;
+        }
+        let len = if ivmd.length > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            ivmd.length as usize
+        };
+        set.insert(ReservedRegion {
+            start: ivmd.start_addr,
+            len,
+            flags: RegionFlags::FIRMWARE_OWNED.union(RegionFlags::WRITABLE),
+        });
+        summaries.push(ReservedRegionSummary {
+            source_table: ReservedRegionSource::IvrsIvmd,
+            source_index: idx,
+            start: ivmd.start_addr,
+            len: ivmd.length,
+        });
+    }
+    (set, summaries)
 }
 
 /// Combined extraction path for both tables.
@@ -593,8 +624,7 @@ mod tests {
     #[test]
     fn zero_length_ivmd_is_skipped() {
         let mut ivrs = IvrsTables::default();
-        ivrs.ivmds
-            .push(make_ivmd(IvmdKind::All, 0x01, 0x1000, 0));
+        ivrs.ivmds.push(make_ivmd(IvmdKind::All, 0x01, 0x1000, 0));
         let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
         assert!(set.is_empty());
         assert!(summaries.is_empty());

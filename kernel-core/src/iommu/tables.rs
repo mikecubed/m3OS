@@ -456,6 +456,9 @@ pub fn decode_ivrs(bytes: &[u8]) -> Result<IvrsTables, IvrsParseError> {
             IVHD_TYPE_10H | IVHD_TYPE_11H | IVHD_TYPE_40H => {
                 tables.ivhd_blocks.push(parse_ivhd_block(block_bytes)?);
             }
+            IVMD_TYPE_ALL | IVMD_TYPE_SELECT | IVMD_TYPE_RANGE => {
+                tables.ivmds.push(parse_ivmd(block_bytes)?);
+            }
             _ => tables.unknown_blocks = tables.unknown_blocks.saturating_add(1),
         }
         cursor += block_len;
@@ -802,6 +805,60 @@ fn parse_ivhd_device_entries(mut bytes: &[u8]) -> Result<Vec<IvhdDeviceEntry>, I
         }
     }
     Ok(out)
+}
+
+/// Parse a single IVMD sub-table (types 0x20 / 0x21 / 0x22). `bytes`
+/// covers the whole sub-table starting at the type byte.
+///
+/// AMD IOMMU spec §5.2.2 defines the 32-byte fixed header:
+///
+/// ```text
+/// offset 0  type (1)
+/// offset 1  flags (1)
+/// offset 2  length (2)
+/// offset 4  device_id (2)
+/// offset 6  aux_data (2)
+/// offset 8  reserved (8)
+/// offset 16 start_addr (8)
+/// offset 24 length (8)
+/// ```
+///
+/// Anything past offset 32 is vendor-specific padding and is ignored —
+/// the outer cursor walk honors the block's declared length for the
+/// advance, so callers see the full region regardless.
+fn parse_ivmd(bytes: &[u8]) -> Result<IvrsMemDefinition, IvrsParseError> {
+    if bytes.len() < IVMD_FIXED_LEN {
+        return Err(IvrsParseError::TruncatedSubTable);
+    }
+    let ivmd_type = bytes[0];
+    let flags = bytes[1];
+    // bytes[2..4] = length (already validated by the caller).
+    let device_id = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let aux_data = u16::from_le_bytes([bytes[6], bytes[7]]);
+    // bytes[8..16] = reserved.
+    let start_addr = u64::from_le_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    let length = u64::from_le_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
+    let kind = match ivmd_type {
+        IVMD_TYPE_ALL => IvmdKind::All,
+        IVMD_TYPE_SELECT => IvmdKind::Select { device_id },
+        IVMD_TYPE_RANGE => IvmdKind::Range {
+            start_device_id: device_id,
+            end_device_id: aux_data,
+        },
+        // Caller only dispatches known types here; defensive fallback
+        // surfaces a spec violation rather than silently ignoring it.
+        _ => return Err(IvrsParseError::TruncatedSubTable),
+    };
+    Ok(IvrsMemDefinition {
+        kind,
+        flags,
+        start_addr,
+        length,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,10 +1606,7 @@ mod tests {
         let tables = decode_ivrs(&bytes).unwrap();
         assert_eq!(tables.ivmds.len(), 3);
         assert_eq!(tables.ivmds[0].kind, IvmdKind::All);
-        assert_eq!(
-            tables.ivmds[1].kind,
-            IvmdKind::Select { device_id: 0x0030 }
-        );
+        assert_eq!(tables.ivmds[1].kind, IvmdKind::Select { device_id: 0x0030 });
         assert_eq!(
             tables.ivmds[2].kind,
             IvmdKind::Range {
