@@ -460,6 +460,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "e1000-crash-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "e1000_driver"
 version = "0.55.2"
 dependencies = [

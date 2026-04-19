@@ -61,6 +61,8 @@ members = [
     "userspace/drivers/e1000",
     # Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke client
     "userspace/nvme-crash-smoke",
+    # Phase 55b Track F.3d-3 — e1000 crash-and-restart end-to-end smoke client
+    "userspace/e1000-crash-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

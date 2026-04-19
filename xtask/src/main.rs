@@ -311,6 +311,9 @@ fn build_userspace_bins() {
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
+        // Phase 55b Track F.3d-3: e1000 crash-and-restart end-to-end smoke
+        // client. No alloc dependency — syscall_lib only.
+        ("e1000-crash-smoke", "e1000-crash-smoke", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -6699,6 +6702,23 @@ fn regression_tests() -> Vec<RegressionTest> {
                 iommu: false,
             },
         });
+        // Phase 55b Track F.3d-3: e1000 crash-and-restart smoke.
+        // Exercises RemoteNic::send_frame → DriverRestarting (kernel log)
+        // and the kill → restart → send cycle. Requires --device e1000.
+        // Gated behind the same M3OS_ENABLE_CRASH_SMOKE env-var as the NVMe
+        // smoke; pass --test e1000-restart-crash to select only this test.
+        tests.push(RegressionTest {
+            name: "e1000-restart-crash",
+            description: "Phase 55b F.3d-3: e1000-crash-smoke — kill e1000_driver → \
+                 RESTART_SUSPECTED → restart → post-restart send success",
+            guest_steps: e1000_restart_crash_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: false,
+                e1000: true,
+                iommu: false,
+            },
+        });
     }
 
     tests
@@ -7017,6 +7037,69 @@ fn driver_restart_crash_steps() -> Vec<SmokeStep> {
         pattern: "# ",
         timeout_secs: 15,
         label: "guest/crash-smoke: shell prompt after smoke",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3d-3 e1000-restart-crash regression.
+///
+/// Requires `--device e1000` (enforced via `RegressionTest::devices`).
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for the e1000 driver bring-up marker (E1000_SMOKE:link:PASS).
+///   3. Launch `/bin/e1000-crash-smoke`.
+///   4. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
+///   5. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
+///   6. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
+///   7. Confirm `E1000_CRASH_SMOKE:PASS`.
+fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Wait for e1000 bring-up before launching the smoke binary.
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_SMOKE:link:PASS",
+        timeout_secs: 120,
+        label: "guest/e1000-crash-smoke: wait for e1000 bring-up",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/e1000-crash-smoke\n",
+        label: "guest/e1000-crash-smoke: launch e1000-crash-smoke",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:pre-crash-send:OK",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: pre-crash send OK",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:kill-delivered",
+        timeout_secs: 20,
+        label: "guest/e1000-crash-smoke: SIGKILL delivered to e1000_driver",
+    });
+
+    // Post-restart send may come before or after restart-confirmed depending
+    // on whether the driver is in server mode. Accept both orderings.
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:post-restart-send:OK",
+        timeout_secs: 30,
+        label: "guest/e1000-crash-smoke: post-restart send OK",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: shell prompt after smoke",
     });
 
     steps
