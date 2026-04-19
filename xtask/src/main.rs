@@ -8371,4 +8371,92 @@ mod tests {
             "ramdisk must expose a /drivers directory containing nvme"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.1 — service-manager registration for nvme_driver + e1000_driver
+    // -----------------------------------------------------------------------
+
+    /// Assert that nvme_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.  We look for the conf content string *before*
+    /// the tests module boundary so the test cannot be satisfied by the
+    /// assertion strings themselves.
+    #[test]
+    fn nvme_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        // The marker that delimits where production code ends and tests begin.
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=nvme_driver"),
+            "populate_ext2_files must embed a conf string containing `name=nvme_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/nvme"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/nvme`"
+        );
+        // Find the conf literal and verify no depends= key is present.
+        let start = prod.find("name=nvme_driver").expect("name=nvme_driver not found");
+        // Find closing delimiter of the string literal (the next `"` after start).
+        let end = prod[start..].find('"').map(|i| start + i).unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "nvme_driver.conf must NOT contain a depends= line (IOMMU substrate is kernel-internal)"
+        );
+        assert!(
+            prod.contains("restart=on-failure"),
+            "nvme_driver.conf must contain `restart=on-failure`"
+        );
+        assert!(
+            prod.contains("max_restart=5"),
+            "nvme_driver.conf must contain `max_restart=5`"
+        );
+    }
+
+    /// Assert that e1000_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.
+    #[test]
+    fn e1000_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=e1000_driver"),
+            "populate_ext2_files must embed a conf string containing `name=e1000_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/e1000"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/e1000`"
+        );
+        let start = prod.find("name=e1000_driver").expect("name=e1000_driver not found");
+        let end = prod[start..].find('"').map(|i| start + i).unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "e1000_driver.conf must NOT contain a depends= line"
+        );
+    }
+
+    /// Assert that both driver service names appear in init's KNOWN_CONFIGS list.
+    #[test]
+    fn driver_confs_in_init_known_configs() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("nvme_driver.conf"),
+            "init KNOWN_CONFIGS must include nvme_driver.conf"
+        );
+        assert!(
+            source.contains("e1000_driver.conf"),
+            "init KNOWN_CONFIGS must include e1000_driver.conf"
+        );
+    }
+
+    /// Assert that init emits a driver.registered structured event when a
+    /// driver service config is loaded.
+    #[test]
+    fn init_emits_driver_registered_event() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("driver.registered"),
+            "init must emit a structured `driver.registered` log event when a driver service is loaded"
+        );
+    }
 }
