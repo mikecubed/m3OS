@@ -29,6 +29,32 @@
 use crate::device_host::DRIVER_RESTART_TIMEOUT_MS;
 
 // ---------------------------------------------------------------------------
+// WaitOutcome — result of polling the restart-wait loop
+// ---------------------------------------------------------------------------
+
+/// Outcome returned by [`BlockDispatchState::check_restart_wait`].
+///
+/// The kernel facade drives a yield loop and calls `check_restart_wait` on
+/// each iteration. This type is the single-iteration decision:
+///
+/// - `Ready` — break out and retry IPC once.
+/// - `TimedOut` — break out and return EIO.
+/// - `Waiting` — driver not yet ready and budget remains; yield and retry.
+///
+/// Keeping the three-way split in pure-logic lets tests drive all branches
+/// without a real clock or scheduler.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WaitOutcome {
+    /// Driver became ready within the timeout window; caller should retry IPC.
+    Ready,
+    /// Timeout elapsed before the driver re-registered; caller should return EIO.
+    TimedOut,
+    /// Driver still mid-restart but budget not yet exhausted; caller should
+    /// yield and call `check_restart_wait` again.
+    Waiting,
+}
+
+// ---------------------------------------------------------------------------
 // RemoteDeviceError
 // ---------------------------------------------------------------------------
 
@@ -150,6 +176,37 @@ impl BlockDispatchState {
     /// Returns `true` when the driver is mid-restart.
     pub fn is_restarting(&self) -> bool {
         self.restarting
+    }
+
+    /// Single-shot poll of the restart-wait state machine with an injected clock.
+    ///
+    /// This is a **pure-logic, single-call decision function** — it does not
+    /// sleep or loop internally. The kernel facade calls this in a yield loop:
+    ///
+    /// ```text
+    /// let deadline = tick_count() + state.restart_deadline_ms as u64;
+    /// loop {
+    ///     match BlockDispatchState::check_restart_wait(
+    ///             tick_count(), deadline, !state.is_restarting()) {
+    ///         WaitOutcome::Ready   => { /* retry IPC once */ break; }
+    ///         WaitOutcome::TimedOut => return Err(0xFF),
+    ///         WaitOutcome::Waiting  => { yield_now(); }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// `now_ms` — current monotonic milliseconds (kernel: `tick_count()`).
+    /// `deadline_ms` — absolute deadline computed once before the loop.
+    /// `is_ready` — `true` when the driver has re-registered (i.e.
+    ///   `!state.is_restarting()`).
+    pub fn check_restart_wait(now_ms: u64, deadline_ms: u64, is_ready: bool) -> WaitOutcome {
+        if is_ready {
+            WaitOutcome::Ready
+        } else if now_ms >= deadline_ms {
+            WaitOutcome::TimedOut
+        } else {
+            WaitOutcome::Waiting
+        }
     }
 
     /// Check whether this state should dispatch to the remote driver.
@@ -440,6 +497,152 @@ mod tests {
             t.consume(write_grant),
             Err(RemoteDeviceError::GrantReplayed),
             "grant replay across requests must be rejected (Phase 50 single-use contract)"
+        );
+    }
+
+    // ---- check_restart_wait (D.4 timed-block pure-logic) --------------------
+
+    /// Driver ready immediately: should return Ready regardless of deadline.
+    #[test]
+    fn check_restart_wait_ready_when_driver_is_ready() {
+        let outcome = BlockDispatchState::check_restart_wait(
+            100,  // now_ms
+            1100, // deadline_ms (budget not yet expired)
+            true, // is_ready
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::Ready,
+            "driver ready before timeout → WaitOutcome::Ready"
+        );
+    }
+
+    /// Timeout elapsed before driver recovered: must return TimedOut.
+    #[test]
+    fn check_restart_wait_timed_out_when_deadline_passed() {
+        let outcome = BlockDispatchState::check_restart_wait(
+            1101,  // now_ms — past the deadline
+            1100,  // deadline_ms
+            false, // is_ready — driver still absent
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::TimedOut,
+            "past deadline with driver absent → WaitOutcome::TimedOut"
+        );
+    }
+
+    /// Deadline not yet reached and driver still absent: must return Waiting.
+    #[test]
+    fn check_restart_wait_waiting_when_within_budget() {
+        let outcome = BlockDispatchState::check_restart_wait(
+            200,   // now_ms — well inside the budget
+            1200,  // deadline_ms
+            false, // is_ready — driver still absent
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::Waiting,
+            "within budget, driver absent → WaitOutcome::Waiting so caller yields"
+        );
+    }
+
+    /// Exact deadline boundary: now == deadline should be treated as timed out.
+    #[test]
+    fn check_restart_wait_timed_out_at_exact_deadline() {
+        let outcome = BlockDispatchState::check_restart_wait(
+            1000, // now_ms == deadline_ms
+            1000, // deadline_ms
+            false,
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::TimedOut,
+            "now == deadline with driver absent → WaitOutcome::TimedOut"
+        );
+    }
+
+    /// Simulate the full wait-loop with a mock clock advancing each iteration.
+    /// The driver becomes ready at iteration 3 (t=300 ms into a 1000 ms budget).
+    #[test]
+    fn check_restart_wait_loop_driver_recovers_mid_wait() {
+        let budget_ms: u64 = 1000;
+        let start_ms: u64 = 0;
+        let deadline_ms = start_ms + budget_ms;
+        let recovery_at_ms: u64 = 300; // driver re-registers at t=300
+
+        let mut now = start_ms;
+        let mut outcome = WaitOutcome::Waiting;
+        let mut iterations = 0usize;
+        loop {
+            let is_ready = now >= recovery_at_ms;
+            outcome = BlockDispatchState::check_restart_wait(now, deadline_ms, is_ready);
+            match outcome {
+                WaitOutcome::Ready | WaitOutcome::TimedOut => break,
+                WaitOutcome::Waiting => {
+                    // Mock yield: advance clock by 100 ms.
+                    now += 100;
+                    iterations += 1;
+                    assert!(
+                        iterations < 20,
+                        "loop should terminate well before 20 iterations"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            outcome,
+            WaitOutcome::Ready,
+            "driver recovered at t=300 ms — loop must resolve to Ready"
+        );
+    }
+
+    /// Simulate the full wait-loop where the driver never recovers.
+    /// Must resolve to TimedOut after the budget expires.
+    #[test]
+    fn check_restart_wait_loop_driver_never_recovers() {
+        let budget_ms: u64 = 1000;
+        let start_ms: u64 = 0;
+        let deadline_ms = start_ms + budget_ms;
+
+        let mut now = start_ms;
+        let mut outcome = WaitOutcome::Waiting;
+        let mut iterations = 0usize;
+        loop {
+            outcome = BlockDispatchState::check_restart_wait(now, deadline_ms, false);
+            match outcome {
+                WaitOutcome::Ready | WaitOutcome::TimedOut => break,
+                WaitOutcome::Waiting => {
+                    now += 100; // advance 100 ms per mock yield
+                    iterations += 1;
+                    assert!(iterations < 50, "loop must terminate after budget expires");
+                }
+            }
+        }
+        assert_eq!(
+            outcome,
+            WaitOutcome::TimedOut,
+            "driver never recovered — loop must resolve to TimedOut after 1000 ms budget"
+        );
+        assert!(
+            now >= deadline_ms,
+            "clock must have reached or passed the deadline"
+        );
+    }
+
+    /// `check_restart_wait` with `is_ready = true` must return `Ready` even
+    /// when called at or past the deadline — driver recovery wins over timeout.
+    #[test]
+    fn check_restart_wait_ready_beats_expired_deadline() {
+        let outcome = BlockDispatchState::check_restart_wait(
+            9999, // now_ms — far past deadline
+            1000, // deadline_ms
+            true, // is_ready — driver just re-registered
+        );
+        assert_eq!(
+            outcome,
+            WaitOutcome::Ready,
+            "is_ready=true takes priority over expired deadline"
         );
     }
 }

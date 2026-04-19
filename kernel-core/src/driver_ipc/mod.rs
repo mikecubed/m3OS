@@ -11,4 +11,4 @@ pub mod blk_dispatch;
 pub mod block;
 pub mod net;
 
-pub use blk_dispatch::{BlockDispatchState, GrantIdTracker, RemoteDeviceError};
+pub use blk_dispatch::{BlockDispatchState, GrantIdTracker, RemoteDeviceError, WaitOutcome};
