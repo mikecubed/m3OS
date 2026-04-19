@@ -616,4 +616,67 @@ mod tests {
             Some(DmaError::SizeOverflow)
         );
     }
+
+    // ------------------------------------------------------------------
+    // Phase 55a Track F.2 — IOMMU-visible DmaBuffer invariants
+    // ------------------------------------------------------------------
+    //
+    // These tests exercise the observable contract between `DmaBuffer`
+    // and the IOMMU subsystem. Because vendor bring-up is deferred per
+    // Track E, the identity-fallback path is what every DmaBuffer
+    // allocation in Phase 55a actually takes; the assertions here pin
+    // that behavior so a future phase that enables translation flips
+    // the expected values and surfaces the change.
+
+    #[test_case]
+    fn dma_buffer_bus_address_matches_phys_when_iommu_inactive() {
+        // In identity fallback (`registry::translating() == false`),
+        // `install_iova_mapping` returns `phys` as the bus address and
+        // `mapping_len = 0`. Both are observable through the DmaBuffer
+        // accessors below.
+        assert!(
+            !registry::translating(),
+            "Phase 55a vendor bring-up is deferred; this test pins that \
+             `bus_address == physical_address` under identity fallback"
+        );
+        let buf = DmaBuffer::<[u8]>::test_allocate(4096).expect("alloc ok");
+        let phys = buf.physical_address().as_u64();
+        let bus = buf.bus_address();
+        assert_eq!(
+            bus, phys,
+            "identity fallback: bus_address must equal physical_address"
+        );
+        assert_ne!(phys, 0, "physical_address must be non-zero");
+        assert_eq!(phys & 0xFFF, 0, "page-aligned");
+    }
+
+    #[test_case]
+    fn dma_buffer_zero_initialization_is_observable() {
+        // F.2 cross-check: the allocation is zero-initialized before
+        // being handed out. Drivers that allocate a ring and immediately
+        // read it rely on this.
+        let buf = DmaBuffer::<[u8]>::test_allocate(8192).expect("alloc ok");
+        for byte in buf.iter() {
+            assert_eq!(*byte, 0, "DmaBuffer must be zero-initialized");
+        }
+    }
+
+    #[test_case]
+    fn dma_buffer_capacity_bytes_rounds_up_to_page() {
+        // Phase 55a: allocations round up to the buddy order needed.
+        // Requesting 1 byte yields at least 4 KiB.
+        let buf = DmaBuffer::<[u8]>::test_allocate(1).expect("one-byte request");
+        assert!(
+            buf.capacity_bytes() >= 4096,
+            "allocation must round up to page: got {}",
+            buf.capacity_bytes()
+        );
+        // 5 KiB request yields at least 8 KiB (order 1, two pages).
+        let buf = DmaBuffer::<[u8]>::test_allocate(5 * 1024).expect("5 KiB request");
+        assert!(
+            buf.capacity_bytes() >= 8 * 1024,
+            "5 KiB allocation must round to 8 KiB: got {}",
+            buf.capacity_bytes()
+        );
+    }
 }
