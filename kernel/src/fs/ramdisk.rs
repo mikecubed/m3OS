@@ -187,6 +187,8 @@ static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
 static NET_SERVER_ELF: &[u8] = generated_initrd_asset!("net_server");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
+// Phase 55b Track E.1: ring-3 e1000 NIC driver scaffold
+static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -539,6 +541,18 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
 
 static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
 
+// Phase 55b Track E.1: `/drivers/` hierarchy for ring-3 device drivers.
+// Looked up by the service manager / init using absolute paths like
+// `/drivers/e1000` (see docs/roadmap/tasks/55b-ring-3-driver-host-tasks.md
+// acceptance for E.1). Additional driver binaries (e.g. `/drivers/nvme`
+// from Track D.1) land here as their scaffolds ship.
+static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "e1000",
+    RamdiskNode::File {
+        content: E1000_DRIVER_ELF,
+    },
+)];
+
 static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
     (
         "bin",
@@ -556,6 +570,12 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
         "etc",
         RamdiskNode::Dir {
             children: ETC_ENTRIES,
+        },
+    ),
+    (
+        "drivers",
+        RamdiskNode::Dir {
+            children: DRIVERS_ENTRIES,
         },
     ),
 ];

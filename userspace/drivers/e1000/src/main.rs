@@ -1,20 +1,11 @@
-//! Phase 55b Track E.1 — ring-3 e1000 driver crate scaffold (RED).
+//! Phase 55b Track E.1 — ring-3 e1000 driver crate scaffold.
 //!
-//! This stub exists so the four-place wiring (workspace, xtask pipeline,
-//! ramdisk embedding, service config in F.1) has a concrete binary to
-//! point at before Track E.2 lands the real device bring-up. The
-//! `program_main` body is a logging shell — it records a boot-log marker
-//! so F.1's service-config integration can verify the spawn path, then
-//! exits cleanly. Real e1000 register programming, descriptor rings, and
-//! RX/TX path land in E.2 / E.3.
-//!
-//! # RED state
-//!
-//! The `BOOT_LOG_MARKER` constant is deliberately set to an incorrect
-//! value in this commit so the in-crate unit test fails. The Green
-//! commit flips the constant to `"e1000_driver: spawned"` and wires up
-//! the remaining three places (xtask `bins`, ramdisk `BIN_ENTRIES`,
-//! workspace member).
+//! Stub binary whose `program_main` writes a fixed boot-log marker and
+//! exits, so Track F.1 can register it under the service manager and
+//! Track E.2 / E.3 can replace the body with the real bring-up and
+//! RX/TX paths. Four-place wiring lives in root `Cargo.toml`,
+//! `xtask/src/main.rs`, and `kernel/src/fs/ramdisk.rs`; the service
+//! config (place 4) is deferred to Track F.1.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -53,7 +44,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 ///
 /// F.1's service-config smoke test greps the boot log for this line,
 /// so the exact spelling is load-bearing.
-pub const BOOT_LOG_MARKER: &str = "e1000_driver: TODO\n";
+pub const BOOT_LOG_MARKER: &str = "e1000_driver: spawned\n";
 
 #[cfg(not(test))]
 syscall_lib::entry_point!(program_main);

@@ -295,6 +295,9 @@ fn build_userspace_bins() {
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 55b Track E.1: ring-3 e1000 NIC driver scaffold (alloc for
+        // kernel-core / driver_runtime deps). Real bring-up lands in E.2/E.3.
+        ("e1000_driver", "e1000_driver", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
