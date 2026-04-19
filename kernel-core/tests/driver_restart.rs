@@ -33,19 +33,25 @@
 //! 8. e1000 analogue: `NetDriverError::DriverRestarting` exists and is
 //!    distinct from `NetDriverError::Ok` and `NetDriverError::LinkDown`.
 //!
-//! # What is NOT covered here (QEMU-heavy path)
+//! # What is NOT covered here (deferred to Track F.3)
 //!
-//! - Spawning an actual NVMe userspace driver process, issuing a real
-//!   write, and delivering SIGKILL mid-write. This requires a service-
-//!   manager SIGKILL API and a live `BlockDriverError::DriverRestarting`
-//!   observation on the client IPC path. See the FIXME stubs below.
-//! - Service-manager log events `driver.restart` and `driver.restarted`
-//!   require a structured log subscriber attached to the running init
-//!   process. The log-pipeline regression (`log-pipeline` xtask) exercises
-//!   the log path but does not drill into driver-restart events.
-//! - The "subsequent write to same LBA succeeds" path is exercised by the
-//!   Phase 55 storage round-trip regression (`storage-roundtrip` xtask)
-//!   once the ring-3 NVMe driver is wired into that regression.
+//! - Spawning an actual NVMe userspace driver process, issuing a real write,
+//!   and delivering SIGKILL mid-write (F.3). Phase 55b F.2b resolved the two
+//!   original blockers:
+//!     (a) `service kill <name>` is now in `userspace/coreutils-rs/src/service.rs`.
+//!     (b) `kernel/src/blk/remote.rs` now returns `BlockDriverError::DriverRestarting`
+//!         (byte 5) on IPC endpoint closure, not generic 0xFF.
+//!   What remains for F.3: a guest-accessible I/O-client binary that can trigger
+//!   a write mid-restart and inspect the returned error code. The QEMU regression
+//!   `driver-restart-guest` covers the boot/kill/restart cycle (enabled via
+//!   `M3OS_ENABLE_DRIVER_RESTART_REGRESSION`).
+//! - Service-manager log events `driver.restart` and `driver.restarted` require a
+//!   structured log subscriber attached to the running init process. The log-pipeline
+//!   regression (`log-pipeline` xtask) exercises the log path but does not drill into
+//!   driver-restart events.
+//! - The "subsequent write to same LBA succeeds" path is exercised by the Phase 55
+//!   storage round-trip regression (`storage-roundtrip` xtask) once the ring-3 NVMe
+//!   driver is wired into that regression.
 
 use kernel_core::device_host::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, RegistryError,
@@ -400,57 +406,78 @@ fn device_host_error_not_claimed_surfaces_from_registry_error() {
 // QEMU-heavy stubs (require SIGKILL API + BlockDriverError client observation)
 // ---------------------------------------------------------------------------
 
-/// FIXME(F.2-qemu): Spawn the NVMe driver process, issue a write, deliver
-/// SIGKILL mid-write, and assert the outstanding write returns
-/// `BlockDriverError::DriverRestarting` within `DRIVER_RESTART_TIMEOUT_MS`.
+/// FIXME(F.3): Spawn the NVMe driver process, issue a write mid-restart, and
+/// assert the outstanding write returns `BlockDriverError::DriverRestarting`
+/// within `DRIVER_RESTART_TIMEOUT_MS`.
 ///
-/// Blocked on:
-///   - A service-manager SIGKILL API accessible from xtask guest steps.
-///   - A client-side `RemoteBlockDevice::write` that surfaces
-///     `BlockDriverError::DriverRestarting` to the caller when the driver
-///     endpoint closes mid-call.
-///   - The `service status nvme_driver` guest command returning output
-///     parseable by the xtask smoke-script engine.
+/// **Phase 55b F.2b progress:** both F.2b blockers are now resolved:
+///   - `service kill <name>` is wired in `userspace/coreutils-rs/src/service.rs`:
+///     reads PID from `/run/services.status` and calls kill(2) with SIGKILL.
+///   - `kernel/src/blk/remote.rs` now returns `BlockDriverError::DriverRestarting`
+///     (wire byte 5) instead of generic 0xFF when the IPC endpoint closes mid-call.
+///   - `cargo xtask regression --test driver-restart-guest` (Phase 55b F.2b, gated
+///     behind M3OS_ENABLE_DRIVER_RESTART_REGRESSION) drives: boot → `service status
+///     nvme_driver` → `service kill nvme_driver` → observe restart log line → re-query
+///     status. Requires `--device nvme` (enforced via `RegressionTest::devices`).
 ///
-/// Once unblocked, this test should be the body of a `driver-restart`
-/// regression test registered in `regression_tests()` in `xtask/src/main.rs`.
+/// Still blocked on (Track F.3 — userspace isolation):
+///   A guest-accessible I/O-client binary that issues a block write, then
+///   has `service kill nvme_driver` race it mid-write, and inspects the
+///   returned error byte to confirm it equals `BlockDriverError::DriverRestarting`.
+///   No such binary exists yet; Track F.3 will add it and remove this ignore.
 #[test]
-#[ignore = "requires service-manager SIGKILL API + BlockDriverError::DriverRestarting \
-            observation in IPC client; see F.2 task-list gap note"]
+#[ignore = "F.3 deferred: service kill + DriverRestarting surface are wired (F.2b); \
+            remaining gap is a guest-side I/O-client binary that triggers a write \
+            mid-restart and asserts the returned error is DriverRestarting. \
+            See driver-restart-guest QEMU regression for the boot/kill/restart cycle."]
 fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
     // Test body intentionally empty — the ignore attribute is the artifact.
-    // When this guard is lifted, the body will:
-    //   1. boot guest
-    //   2. write to LBA 0 via nvme_driver
-    //   3. kill nvme_driver mid-write with SIGKILL
+    // When this guard is lifted the body will:
+    //   1. boot guest with --device nvme
+    //   2. launch guest I/O-client: write to LBA 0 asynchronously
+    //   3. race: `service kill nvme_driver` while write is in flight
     //   4. assert client receives DriverRestarting within DRIVER_RESTART_TIMEOUT_MS
     //   5. assert service logs driver.restart + driver.restarted
     //   6. assert subsequent write to LBA 0 succeeds
-    //   7. assert no partial-write corruption
+    //   7. assert no partial-write corruption (compare LBA 0 before and after)
 }
 
-/// FIXME(F.2-qemu): Analogous e1000 regression test.
+/// FIXME(F.3): Analogous e1000 regression test.
 ///
-/// Blocked on the same SIGKILL API plus a `RemoteNic::send_frame` path
-/// that surfaces `NetDriverError::DriverRestarting` to the net stack.
+/// **Phase 55b F.2b progress:** `service kill e1000_driver` is now available
+/// from the guest shell (same `service kill` subcommand). The `RemoteNic`
+/// error-surfacing path (`NetDriverError::DriverRestarting`) needs the same
+/// treatment as the block path, which is a Track F.3 item.
+///
+/// Blocked on (Track F.3):
+///   A guest-accessible net I/O-client that can trigger `send_frame` mid-restart
+///   and inspect the `NetDriverError` returned by the network facade. Once F.3
+///   lands this test loses the `#[ignore]`.
 #[test]
-#[ignore = "requires service-manager SIGKILL API + NetDriverError::DriverRestarting \
-            observation in IPC client; see F.2 task-list gap note"]
+#[ignore = "F.3 deferred: service kill is wired (F.2b); still needs RemoteNic \
+            DriverRestarting surfacing + a guest net I/O-client binary. \
+            See F.2 task-list gap note."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
     // intentionally empty — see FIXME above
 }
 
-/// FIXME(F.2-qemu): max_restart=5 enforcement in the running guest.
+/// FIXME(F.3): max_restart=5 enforcement in the running guest.
 ///
-/// The pure-logic variant of this test is `max_restart_enforcement_*`
-/// above. The QEMU variant must crash the driver 6 times via the guest
-/// shell, poll `service status nvme_driver`, and assert the output
-/// contains "failed" or equivalent.
+/// **Phase 55b F.2b progress:** `service kill <name>` is now available in the
+/// guest shell. The loop-kill-until-exhausted scenario is mechanically possible
+/// but requires the I/O-client binary from Track F.3 to interleave writes with
+/// kills so the restart count ticks up reliably without the driver recovering
+/// faster than the kill loop runs.
 ///
-/// Blocked on: reliable SIGKILL delivery from the guest shell without
-/// a dedicated `kill-driver` utility binary.
+/// Blocked on (Track F.3):
+///   A scripted kill-loop that races I/O to drive restart_count past max_restart
+///   within the QEMU regression timeout budget. The pure-logic analogue
+///   (`max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped`)
+///   already passes above.
 #[test]
-#[ignore = "requires guest-shell kill loop + service status parsing; see F.2 task-list gap note"]
+#[ignore = "F.3 deferred: service kill is wired (F.2b); needs guest I/O-client + \
+            scripted kill loop to drive restart count past max_restart reliably. \
+            See F.2 task-list gap note."]
 fn qemu_max_restart_exceeded_service_status_returns_failed() {
     // intentionally empty — see FIXME above
 }

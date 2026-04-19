@@ -110,10 +110,14 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
         return Err(0xFF);
     }
     // If the driver is already mid-restart on entry, wait for it first.
+    // On timeout, surface DriverRestarting so the caller can distinguish
+    // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
     if REMOTE_BLOCK.lock().state.is_restarting() {
         match wait_for_driver_restart() {
             WaitOutcome::Ready => {}
-            WaitOutcome::TimedOut | WaitOutcome::Waiting => return Err(0xFF),
+            WaitOutcome::TimedOut | WaitOutcome::Waiting => {
+                return Err(BlockDriverError::DriverRestarting.to_byte());
+            }
         }
     }
     // Attempt the IPC call; on failure wait + retry once.
@@ -123,7 +127,9 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
             on_ipc_error();
             match wait_for_driver_restart() {
                 WaitOutcome::Ready => do_read_ipc(start_sector, count, buf),
-                WaitOutcome::TimedOut | WaitOutcome::Waiting => Err(0xFF),
+                WaitOutcome::TimedOut | WaitOutcome::Waiting => {
+                    Err(BlockDriverError::DriverRestarting.to_byte())
+                }
             }
         }
     }
@@ -146,7 +152,12 @@ fn do_read_ipc(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8
     msg.data[1] = BLK_REQUEST_HEADER_SIZE as u64;
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
-        return Err(0xFF);
+        on_ipc_error();
+        // Surface DriverRestarting to the caller so it can distinguish a
+        // mid-restart error from a generic I/O error (Phase 55b Tracks D.4b
+        // and F.2b). The outer wait-retry loop sees this as a
+        // restart-suspected signal and decides whether to block or bail.
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
     let (reply_hdr, _) =
@@ -195,10 +206,14 @@ pub fn write_sectors(
         }
     }
     // If the driver is already mid-restart on entry, wait for it first.
+    // On timeout, surface DriverRestarting so the caller can distinguish
+    // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
     if REMOTE_BLOCK.lock().state.is_restarting() {
         match wait_for_driver_restart() {
             WaitOutcome::Ready => {}
-            WaitOutcome::TimedOut | WaitOutcome::Waiting => return Err(0xFF),
+            WaitOutcome::TimedOut | WaitOutcome::Waiting => {
+                return Err(BlockDriverError::DriverRestarting.to_byte());
+            }
         }
     }
     // Attempt the IPC call; on failure wait + retry once.
@@ -208,7 +223,9 @@ pub fn write_sectors(
             on_ipc_error();
             match wait_for_driver_restart() {
                 WaitOutcome::Ready => do_write_ipc(start_sector, count, buf, payload_grant),
-                WaitOutcome::TimedOut | WaitOutcome::Waiting => Err(0xFF),
+                WaitOutcome::TimedOut | WaitOutcome::Waiting => {
+                    Err(BlockDriverError::DriverRestarting.to_byte())
+                }
             }
         }
     }
@@ -233,7 +250,12 @@ fn do_write_ipc(start_sector: u64, count: usize, buf: &[u8], payload_grant: u32)
     msg.data[0] = start_sector;
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
-        return Err(0xFF);
+        on_ipc_error();
+        // Surface DriverRestarting to the caller so it can distinguish a
+        // mid-restart error from a generic I/O error (Phase 55b Tracks D.4b
+        // and F.2b). The outer wait-retry loop sees this as a
+        // restart-suspected signal and decides whether to block or bail.
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     let bulk_r = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
     let (reply_hdr, _) =
