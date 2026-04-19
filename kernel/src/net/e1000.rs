@@ -115,22 +115,22 @@ unsafe impl Send for TxDescRing {}
 // also work, but new_array keeps the descriptor count implicit.
 
 impl RxDescRing {
-    fn new() -> Result<Self, &'static str> {
-        let descs = DmaBuffer::<E1000RxDesc>::new_array(RX_RING_SIZE)
+    fn new(handle: &pci::PciDeviceHandle) -> Result<Self, &'static str> {
+        let descs = DmaBuffer::<E1000RxDesc>::allocate_array(handle, RX_RING_SIZE)
             .map_err(|_| "rx ring DMA alloc failed")?;
         // Acceptance requires ring length in bytes to be multiple of 128;
         // RX_RING_SIZE * 16 is always a multiple of 128 when RX_RING_SIZE is
         // a multiple of 8 (checked at compile time below).
         const _: () = assert!(RX_RING_SIZE.is_multiple_of(8));
         const _: () = assert!(RX_RING_SIZE <= 4096);
-        let ring_phys = descs.physical_address().as_u64();
+        let ring_phys = descs.bus_address();
 
         let mut bufs: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(RX_RING_SIZE);
         let mut buf_phys: Vec<u64> = Vec::with_capacity(RX_RING_SIZE);
         for _ in 0..RX_RING_SIZE {
-            let buf = DmaBuffer::<[u8]>::new_bytes(RX_BUF_SIZE, 4096)
+            let buf = DmaBuffer::<[u8]>::allocate(handle, RX_BUF_SIZE)
                 .map_err(|_| "rx buffer DMA alloc failed")?;
-            buf_phys.push(buf.physical_address().as_u64());
+            buf_phys.push(buf.bus_address());
             bufs.push(buf);
         }
 
@@ -177,19 +177,19 @@ impl RxDescRing {
 }
 
 impl TxDescRing {
-    fn new() -> Result<Self, &'static str> {
-        let descs = DmaBuffer::<E1000TxDesc>::new_array(TX_RING_SIZE)
+    fn new(handle: &pci::PciDeviceHandle) -> Result<Self, &'static str> {
+        let descs = DmaBuffer::<E1000TxDesc>::allocate_array(handle, TX_RING_SIZE)
             .map_err(|_| "tx ring DMA alloc failed")?;
         const _: () = assert!(TX_RING_SIZE.is_multiple_of(8));
         const _: () = assert!(TX_RING_SIZE <= 4096);
-        let ring_phys = descs.physical_address().as_u64();
+        let ring_phys = descs.bus_address();
 
         let mut bufs: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(TX_RING_SIZE);
         let mut buf_phys: Vec<u64> = Vec::with_capacity(TX_RING_SIZE);
         for _ in 0..TX_RING_SIZE {
-            let buf = DmaBuffer::<[u8]>::new_bytes(TX_BUF_SIZE, 4096)
+            let buf = DmaBuffer::<[u8]>::allocate(handle, TX_BUF_SIZE)
                 .map_err(|_| "tx buffer DMA alloc failed")?;
-            buf_phys.push(buf.physical_address().as_u64());
+            buf_phys.push(buf.bus_address());
             bufs.push(buf);
         }
 
@@ -688,8 +688,8 @@ fn init_with_handle(handle: pci::PciDeviceHandle) -> Result<(), &'static str> {
 
     // ---- E.2: rings ------------------------------------------------------
 
-    let mut rx = RxDescRing::new()?;
-    let tx = TxDescRing::new()?;
+    let mut rx = RxDescRing::new(&handle)?;
+    let tx = TxDescRing::new(&handle)?;
 
     let rx_ring_bytes = (RX_RING_SIZE * core::mem::size_of::<E1000RxDesc>()) as u32;
     let tx_ring_bytes = (TX_RING_SIZE * core::mem::size_of::<E1000TxDesc>()) as u32;
