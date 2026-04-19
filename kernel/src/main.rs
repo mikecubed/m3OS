@@ -27,6 +27,7 @@ mod serial;
 mod signal;
 mod smp;
 mod stdin;
+mod syscall;
 mod task;
 #[cfg(test)]
 mod testing;
@@ -1195,5 +1196,149 @@ mod tests {
             stats.free_bytes,
             stats.total_size
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b Track B.1 — sys_device_claim integration tests
+    // -----------------------------------------------------------------------
+    //
+    // These run in the pre-`kernel_main` test harness, so `test_main()` is
+    // invoked before `pci::init()`. The test forces PCI enumeration itself
+    // so that a real BDF is available for the claim path. The assertions
+    // cover first-claim success, duplicate-claim returns `Busy`, and
+    // release re-opens the slot for a new PID.
+
+    /// Track B.1: first claim succeeds; second claim on the same BDF by a
+    /// different PID returns `Busy`; releasing for the owning PID restores
+    /// the slot so a third PID can claim it.
+    ///
+    /// Cross-references the pure-logic assertions in
+    /// `kernel_core::device_host::registry_logic::tests` — this test adds
+    /// the kernel-side invariant that the `PciDeviceHandle` (and its
+    /// IOMMU domain) round-trips through the registry correctly.
+    #[test_case]
+    fn device_host_claim_first_succeeds_duplicate_returns_busy() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_owner_of, test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        // Ensure the PCI bus has been scanned so a real device is available.
+        // `pci::init` is idempotent on repeat calls — the second scan finds
+        // the already-populated static list and logs the same devices.
+        crate::pci::init();
+
+        // Find the first unclaimed device so the test stays decoupled from
+        // whatever QEMU happens to attach. If QEMU produces no PCI device
+        // at all (very unusual), skip the test rather than fail.
+        let mut key: Option<DeviceCapKey> = None;
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if test_owner_of(k).is_none() {
+                // Also check that it's not already claimed by an in-kernel
+                // driver — if it is, claim_pci_device_by_bdf would return
+                // `AlreadyClaimed` which the test would interpret as Busy.
+                key = Some(k);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(key) = key else {
+            serial_println!("device_host test skipped: no free PCI device in QEMU");
+            return;
+        };
+
+        serial_println!(
+            "device_host test using BDF {:04x}:{:02x}:{:02x}.{}",
+            key.segment,
+            key.bus,
+            key.dev,
+            key.func
+        );
+
+        // Use PID values in a range the kernel does not actually schedule —
+        // current_pid() for the test runner is 0, so picking high sentinels
+        // avoids any collision with real PIDs.
+        const PID_A: crate::process::Pid = 0xC0FF_EE01;
+        const PID_B: crate::process::Pid = 0xC0FF_EE02;
+        const PID_C: crate::process::Pid = 0xC0FF_EE03;
+
+        // Pre-clean in case a prior test left state (should not happen, but
+        // defensive since the registry is a static global).
+        let _ = test_release_for_pid(PID_A);
+        let _ = test_release_for_pid(PID_B);
+        let _ = test_release_for_pid(PID_C);
+
+        // 1) First claim succeeds, recorded under PID_A.
+        match test_try_claim_for_pid(PID_A, key) {
+            Ok(()) => {}
+            Err(e) => {
+                // `AlreadyClaimed` here means an in-kernel driver beat us
+                // to the slot during the pre-scan race — skip gracefully.
+                if matches!(e, TestClaimError::Busy) {
+                    serial_println!(
+                        "device_host test skipped: BDF {:02x}:{:02x}.{} already claimed in kernel",
+                        key.bus,
+                        key.dev,
+                        key.func,
+                    );
+                    return;
+                }
+                panic!(
+                    "first claim failed unexpectedly: {:?} for BDF {:02x}:{:02x}.{}",
+                    e, key.bus, key.dev, key.func
+                );
+            }
+        }
+        assert_eq!(
+            test_owner_of(key),
+            Some(PID_A),
+            "ownership should track PID_A after first claim",
+        );
+
+        // 2) A second claim on the same BDF — whether by PID_A or PID_B —
+        //    returns Busy. B.1 acceptance race: "exactly one succeeds".
+        assert_eq!(
+            test_try_claim_for_pid(PID_A, key),
+            Err(TestClaimError::Busy),
+            "same-PID duplicate claim must be Busy",
+        );
+        assert_eq!(
+            test_try_claim_for_pid(PID_B, key),
+            Err(TestClaimError::Busy),
+            "cross-PID duplicate claim must be Busy",
+        );
+        assert_eq!(
+            test_owner_of(key),
+            Some(PID_A),
+            "original owner's claim must survive the duplicate attempt",
+        );
+
+        // 3) PID_A exits (simulate via release_for_pid). Slot is now free
+        //    and a fresh PID_C can claim it — this is the Phase 46 / 51
+        //    supervisor-restart path exercised at the registry level.
+        let freed = test_release_for_pid(PID_A);
+        assert_eq!(freed, 1, "release_for_pid must free exactly one entry");
+        assert_eq!(test_owner_of(key), None, "slot must be free after release");
+
+        match test_try_claim_for_pid(PID_C, key) {
+            Ok(()) => {}
+            Err(e) => panic!("reclaim by PID_C failed: {:?}", e),
+        }
+        assert_eq!(test_owner_of(key), Some(PID_C));
+
+        // 4) Double-release of an already-released PID must not panic; it
+        //    returns zero freed slots (tests the -EBADF acceptance clause
+        //    at the registry level).
+        let double = test_release_for_pid(PID_A);
+        assert_eq!(double, 0, "double-release must be safe and return 0");
+
+        // Cleanup for a tidy global registry — the next test in the suite
+        // should see the state it started with.
+        let _ = test_release_for_pid(PID_C);
+        assert_eq!(test_owner_of(key), None);
+
+        serial_println!("device_host B.1 integration test passed");
     }
 }

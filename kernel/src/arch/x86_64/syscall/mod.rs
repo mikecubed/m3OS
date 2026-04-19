@@ -1208,6 +1208,20 @@ mod syscall_nr {
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     pub const IPC_LAST: u64 = 0x1110;
+
+    // -- device host (Phase 55b Track B) --
+    //
+    // Numbers are canonically declared in
+    // `kernel_core::device_host::syscalls`; re-exported here so the arch
+    // dispatcher's `match` arms can stay in one place. Do not redefine the
+    // numeric values — import the constants. `DEVICE_HOST_BASE` /
+    // `DEVICE_HOST_LAST` are re-exported for the Track B.2–B.4 implementers
+    // to match against once they land.
+    #[allow(unused_imports)]
+    pub use kernel_core::device_host::syscalls::{
+        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_DMA_ALLOC,
+        SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,6 +1570,36 @@ pub extern "C" fn syscall_handler(
                 crate::smp::per_core().syscall_user_r8,
             )
         }
+        // -- device host (Phase 55b Track B) --
+        SYS_DEVICE_CLAIM => {
+            // Signature: sys_device_claim(segment, bus, dev, func) -> isize.
+            // Pack the four u8/u16 args out of u64 registers. Out-of-range
+            // values for the u8 fields are rejected as -ENODEV because the
+            // BDF cannot exist.
+            let segment = arg0 as u16;
+            if arg0 > u64::from(u16::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u8::MAX)
+                || per_core_syscall_arg3() > u64::from(u8::MAX)
+            {
+                (-19_i64) as u64 // -ENODEV
+            } else {
+                let result = crate::syscall::device_host::sys_device_claim(
+                    segment,
+                    arg1 as u8,
+                    arg2 as u8,
+                    per_core_syscall_arg3() as u8,
+                );
+                result as u64
+            }
+        }
+        // B.2–B.4 reservations — dispatched to -ENOSYS until their tracks land.
+        // Keeping the arms explicit (rather than falling through to the
+        // catch-all) documents the block and prevents accidental reuse.
+        SYS_DEVICE_MMIO_MAP
+        | SYS_DEVICE_DMA_ALLOC
+        | SYS_DEVICE_DMA_HANDLE_INFO
+        | SYS_DEVICE_IRQ_SUBSCRIBE => NEG_ENOSYS,
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
             NEG_ENOSYS
@@ -1910,6 +1954,14 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     if let Some(task_id) = crate::task::scheduler::current_task_id() {
         crate::ipc::cleanup::cleanup_task_ipc(task_id);
     }
+
+    // Phase 55b Track B.1: release every `Capability::Device` held by this
+    // process so the supervisor (Phase 46 / Phase 51) can restart a fresh
+    // driver instance on the same BDF. Must run before FD close so the
+    // PciDeviceHandle's Drop (IOMMU domain teardown, PCI registry slot
+    // return) completes while the address space is still around for any
+    // per-BAR cleanup we might need later.
+    crate::syscall::device_host::release_claims_for_pid(pid);
 
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
