@@ -160,11 +160,20 @@ below mirrors the supported entries with learner-friendly framing.
 | Block storage (NVMe) | QEMU NVMe controller | `0x1b36:0x0010` | `cargo xtask run --device nvme` | Validated in QEMU |
 | Network (VirtIO) | VirtIO-net baseline | `0x1af4:0x1000` | default (`-device virtio-net-pci`) | Validated (baseline) |
 | Network (Intel e1000) | Intel 82540EM classic e1000 | `0x8086:0x100E` | `cargo xtask run --device e1000` | Validated in QEMU |
+| IOMMU (Intel VT-d) | QEMU `-device intel-iommu` | n/a | `cargo xtask run --iommu` | Validated via Phase 55a |
 
 The **physical-hardware promise** is deferred: Phase 55 commits to QEMU
-emulation only. The Reference Matrix in the design doc names the IOMMU caveat
-and the device classes that are out of scope (e1000e family, xHCI, AHCI,
-Realtek, HDA).
+emulation only. The Reference Matrix in the design doc names the device
+classes that are out of scope (e1000e family, xHCI, AHCI, Realtek, HDA).
+
+The **IOMMU caveat** that Phase 55 carried — that VT-d / AMD-Vi enabled
+systems could block driver DMA until IOMMU mappings existed — was
+closed by [Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md). The
+`cargo xtask run --iommu` configuration is the canonical validated-IOMMU
+entry; see the Phase 55a learning doc and
+[docs/roadmap/55a-iommu-substrate.md](./roadmap/55a-iommu-substrate.md)
+for the parser, per-device domains, and the identity fallback the default
+`cargo xtask run` configuration still uses.
 
 For the exact QEMU command fragments, see "Reference QEMU configurations" in
 [docs/roadmap/55-hardware-substrate.md](./roadmap/55-hardware-substrate.md).
@@ -293,9 +302,12 @@ if anything is wrong.
   of scope; so are AHCI, xHCI, Realtek NICs, HDA, and GPU/audio hardware.
   Each of those is expected to be its own phase with its own reference
   target.
-- **No IOMMU-aware DMA isolation.** The DMA path assumes a flat
-  physical-to-bus address identity. VT-d / AMD-Vi support is deferred —
-  the IOMMU caveat on the physical-hardware matrix is explicit about this.
+- **IOMMU-aware DMA isolation landed separately.** Phase 55 shipped the
+  flat physical-to-bus identity path; VT-d and AMD-Vi translated domains
+  landed in [Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md). Under
+  `cargo xtask run --iommu`, every `DmaBuffer` is routed through a per-
+  device IOMMU domain. Under plain `cargo xtask run`, Phase 55a's
+  `IdentityDomain` fallback preserves the Phase 55 behavior.
 - **Partial interrupt coverage.** MSI-X is plumbed for devices that
   advertise the capability (NVMe, VirtIO). Devices that only expose legacy
   INTx (classic e1000 under QEMU) work but lose per-queue vectors. A later
@@ -366,8 +378,8 @@ future phase can revisit them as scope expands.
 
 - Broad laptop/desktop hardware certification
 - Wi-Fi, GPU, and USB peripheral matrices
-- IOMMU-aware DMA isolation (VT-d / AMD-Vi) — tracked as
-  [Phase 55a — IOMMU Substrate](./roadmap/55a-iommu-substrate.md)
+- IOMMU-aware DMA isolation (VT-d / AMD-Vi) — delivered by
+  [Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md)
 - Ring-3 extraction of the NVMe and e1000 drivers following the Phase 54
   `vfs_server` / `net_server` pattern — tracked as
   [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md)
