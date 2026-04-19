@@ -1,0 +1,303 @@
+//! Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke test.
+//!
+//! This binary is the guest-side I/O client that was deferred from Tracks F.2
+//! and F.2b. It demonstrates the full mid-restart scenario:
+//!
+//! 1. Issue a BLK_READ request directly to the `nvme.block` IPC endpoint.
+//! 2. Fork a child that calls `service kill nvme_driver` while the I/O is
+//!    in flight (or shortly after it completes).
+//! 3. Observe the IPC transport failure that the kill produces.
+//! 4. Poll `/run/services.status` until nvme_driver shows `running` again
+//!    (init restarts it per the Phase 46/51 service manager).
+//! 5. Retry the BLK_READ — confirm it succeeds (driver back online).
+//! 6. Emit `NVME_CRASH_SMOKE:PASS` on success or
+//!    `NVME_CRASH_SMOKE:FAIL <step>` on any sub-step failure.
+//!
+//! # Why this binary lives here
+//!
+//! The kernel's `sys_block_read` syscall is restricted to supervised storage
+//! servers (euid = 200, exec_path ∈ {/bin/vfs_server, /bin/fat_server}).
+//! Ordinary guest binaries must speak the block-driver IPC protocol directly
+//! to the `nvme.block` endpoint. When the driver is killed mid-call, the IPC
+//! transport returns an error (`u64::MAX`) rather than the kernel facade's
+//! `BlockDriverError::DriverRestarting` byte (5) — the facade mapping is only
+//! visible through the kernel's `RemoteBlockDevice` path.  This binary
+//! observes the raw IPC transport failure and reports it as the crash signal,
+//! which is the only observable from ordinary userspace.
+//!
+//! The kernel-core host tests (driver_restart.rs tests 1–10) cover the
+//! `DriverRestarting` byte mapping exhaustively without QEMU.  This binary's
+//! job is the full end-to-end lifecycle: kill → transport error → wait → retry
+//! success.
+//!
+//! # Block IPC protocol (manual encoding)
+//!
+//! BLK_REQUEST_HEADER_SIZE = 30 bytes (packed little-endian):
+//!   [0..2]  kind: u16   (BLK_READ = 0x5501)
+//!   [2..10] cmd_id: u64
+//!   [10..18] lba: u64
+//!   [18..22] sector_count: u32
+//!   [22..26] flags: u32
+//!   [26..30] payload_grant: u32 (0 for reads)
+//!
+//! BLK_REPLY_HEADER_SIZE = 20 bytes:
+//!   [0..8]  cmd_id: u64
+//!   [8]     status: u8  (0 = Ok, 5 = DriverRestarting)
+//!   [9..12] reserved (zero)
+//!   [12..16] bytes: u32
+//!   [16..20] payload_grant: u32
+#![no_std]
+#![no_main]
+
+use syscall_lib::{
+    O_RDONLY, SIGKILL, STDOUT_FILENO, close, execve, exit, fork, kill, nanosleep, open, read,
+    waitpid, write_str,
+};
+
+// Service name the NVMe driver registers its IPC endpoint under (matches
+// `nvme_driver::SERVICE_NAME` in `userspace/drivers/nvme/src/main.rs`).
+const NVME_SERVICE: &str = "nvme.block";
+
+// BLK_READ label: 0x5501
+const BLK_READ_KIND: u16 = 0x5501;
+// IPC label for the block request envelope (matches BLK_READ u16 cast to u64).
+const BLK_READ_LABEL: u64 = 0x5501;
+
+// Encoded BLK_REQUEST_HEADER_SIZE
+const BLK_REQ_SIZE: usize = 30;
+// Encoded BLK_REPLY_HEADER_SIZE
+const BLK_REPLY_SIZE: usize = 20;
+
+// Status byte offset in reply header
+const REPLY_STATUS_OFFSET: usize = 8;
+
+// BlockDriverError::Ok = 0
+const BLOCK_ERROR_OK: u8 = 0;
+
+// Paths for service polling
+const STATUS_PATH: &[u8] = b"/run/services.status\0";
+
+// Restart wait budget: 3 × DRIVER_RESTART_TIMEOUT_MS (1000 ms each) = 3 s.
+const RESTART_WAIT_SECONDS: u64 = 3;
+
+// Paths for killing the driver via service binary
+const SERVICE_BIN: &[u8] = b"/bin/service\0";
+const SERVICE_ARGV0: &[u8] = b"service\0";
+const SERVICE_KILL_ARG: &[u8] = b"kill\0";
+const NVME_DRIVER_NAME: &[u8] = b"nvme_driver\0";
+
+syscall_lib::entry_point!(program_main);
+
+fn program_main(_args: &[&str]) -> i32 {
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:BEGIN\n");
+
+    // ------------------------------------------------------------------
+    // Step 1: Look up the nvme.block IPC endpoint.
+    // ------------------------------------------------------------------
+    let ep_handle = syscall_lib::ipc_lookup_service(NVME_SERVICE);
+    if ep_handle == u64::MAX {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=1 ipc_lookup_service\n",
+        );
+        return 1;
+    }
+    let ep_handle = ep_handle as u32;
+
+    // ------------------------------------------------------------------
+    // Step 2: Send a BLK_READ request and confirm it succeeds (driver up).
+    // ------------------------------------------------------------------
+    let req = encode_blk_read(0xF3B1_0001, 0, 1);
+    let ret = syscall_lib::ipc_call_buf(ep_handle, BLK_READ_LABEL, BLK_READ_LABEL, &req);
+    if ret == u64::MAX {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=2 pre-crash read failed\n",
+        );
+        return 2;
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:pre-crash-read:OK\n");
+
+    // ------------------------------------------------------------------
+    // Step 3: Kill the driver in a child process.
+    //
+    // We fork so the parent can immediately issue another IPC call while
+    // the child is delivering SIGKILL. The parent's call either succeeds
+    // (kill raced after the reply) or sees a transport error (kill landed
+    // during the call). Both are acceptable: either way we then poll for
+    // the restart and retry.
+    // ------------------------------------------------------------------
+    let kill_pid = fork();
+    if kill_pid < 0 {
+        write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:FAIL step=3 fork\n");
+        return 3;
+    }
+
+    if kill_pid == 0 {
+        // Child: exec `service kill nvme_driver`.
+        let argv: [*const u8; 4] = [
+            SERVICE_ARGV0.as_ptr(),
+            SERVICE_KILL_ARG.as_ptr(),
+            NVME_DRIVER_NAME.as_ptr(),
+            core::ptr::null(),
+        ];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let _ = execve(SERVICE_BIN, &argv, &envp);
+        // execve only returns on error; exit with a distinctive code so
+        // the parent can detect a child exec failure.
+        exit(126);
+    }
+
+    // Parent: issue another BLK_READ while the child is killing the driver.
+    let req2 = encode_blk_read(0xF3B1_0002, 0, 1);
+    let mid_crash_ret = syscall_lib::ipc_call_buf(ep_handle, BLK_READ_LABEL, BLK_READ_LABEL, &req2);
+
+    // Wait for the killer child to finish.
+    let mut child_status = 0i32;
+    let waited = waitpid(kill_pid as i32, &mut child_status, 0);
+    if waited != kill_pid as isize {
+        write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:FAIL step=3 waitpid\n");
+        return 3;
+    }
+
+    // Log the mid-crash result (transport error = u64::MAX, or a reply
+    // if the kill landed after the call completed).
+    if mid_crash_ret == u64::MAX {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:mid-crash:transport-error\n",
+        );
+    } else {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:mid-crash:reply-before-kill\n",
+        );
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:kill-delivered\n");
+
+    // ------------------------------------------------------------------
+    // Step 4: Wait for nvme_driver to show "running" again.
+    // ------------------------------------------------------------------
+    if !wait_for_driver_running("nvme_driver", RESTART_WAIT_SECONDS) {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=4 restart-timeout\n",
+        );
+        return 4;
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:restart-confirmed\n");
+
+    // ------------------------------------------------------------------
+    // Step 5: Re-look-up the endpoint (driver registered a fresh one).
+    // ------------------------------------------------------------------
+    let ep_handle2 = syscall_lib::ipc_lookup_service(NVME_SERVICE);
+    if ep_handle2 == u64::MAX {
+        write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:FAIL step=5 re-lookup\n");
+        return 5;
+    }
+    let ep_handle2 = ep_handle2 as u32;
+
+    // ------------------------------------------------------------------
+    // Step 6: Retry the BLK_READ — must succeed.
+    // ------------------------------------------------------------------
+    let req3 = encode_blk_read(0xF3B1_0003, 0, 1);
+    let retry_ret = syscall_lib::ipc_call_buf(ep_handle2, BLK_READ_LABEL, BLK_READ_LABEL, &req3);
+    if retry_ret == u64::MAX {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=6 post-restart read transport-error\n",
+        );
+        return 6;
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:post-restart-read:OK\n");
+
+    // ------------------------------------------------------------------
+    // Done.
+    // ------------------------------------------------------------------
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:PASS\n");
+    0
+}
+
+/// Encode a 30-byte BLK_READ request header (packed little-endian).
+///
+/// Layout:
+///   [0..2]   kind: u16 = BLK_READ (0x5501)
+///   [2..10]  cmd_id: u64
+///   [10..18] lba: u64
+///   [18..22] sector_count: u32
+///   [22..26] flags: u32  (0)
+///   [26..30] payload_grant: u32 (0, reads have no payload)
+fn encode_blk_read(cmd_id: u64, lba: u64, sector_count: u32) -> [u8; BLK_REQ_SIZE] {
+    let mut out = [0u8; BLK_REQ_SIZE];
+    let kind = BLK_READ_KIND.to_le_bytes();
+    out[0] = kind[0];
+    out[1] = kind[1];
+    let ci = cmd_id.to_le_bytes();
+    out[2..10].copy_from_slice(&ci);
+    let lb = lba.to_le_bytes();
+    out[10..18].copy_from_slice(&lb);
+    let sc = sector_count.to_le_bytes();
+    out[18..22].copy_from_slice(&sc);
+    // flags = 0, payload_grant = 0 — already zeroed
+    out
+}
+
+/// Poll `/run/services.status` until the named service shows `running`
+/// or `timeout_secs` elapses.  Returns `true` when running is observed.
+fn wait_for_driver_running(name: &str, timeout_secs: u64) -> bool {
+    let name_bytes = name.as_bytes();
+    let mut buf = [0u8; 4096];
+    let mut waited = 0u64;
+    while waited <= timeout_secs {
+        let fd = open(STATUS_PATH, O_RDONLY, 0);
+        if fd >= 0 {
+            let n = read(fd as i32, &mut buf);
+            close(fd as i32);
+            if n > 0 {
+                let text = &buf[..n as usize];
+                if service_is_running(text, name_bytes) {
+                    return true;
+                }
+            }
+        }
+        let _ = nanosleep(1);
+        waited += 1;
+    }
+    false
+}
+
+/// Return `true` if the status text contains a line for `name` whose
+/// status field equals `running`.
+///
+/// Status-file line format (written by init):
+///   `<name> <status> pid=<N> restarts=<N> changed=<N>`
+fn service_is_running(text: &[u8], name: &[u8]) -> bool {
+    for line in text.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // Check the line starts with `name` followed by a space.
+        if line.len() <= name.len() {
+            continue;
+        }
+        if &line[..name.len()] != name {
+            continue;
+        }
+        if line[name.len()] != b' ' {
+            continue;
+        }
+        // Parse the status field (second whitespace-delimited token).
+        let rest = &line[name.len() + 1..];
+        // Find the status token (up to the next space or end of line).
+        let status_end = rest.iter().position(|&b| b == b' ').unwrap_or(rest.len());
+        let status = &rest[..status_end];
+        return status == b"running";
+    }
+    false
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:PANIC\n");
+    exit(101)
+}

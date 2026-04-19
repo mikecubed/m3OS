@@ -1,0 +1,11 @@
+[package]
+name = "nvme-crash-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nvme-crash-smoke"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

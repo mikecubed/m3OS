@@ -192,6 +192,9 @@ static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
 // canonical driver path.
 static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
 static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
+// Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
+// Exposed under /bin so the QEMU regression can launch it from the shell.
+static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -530,6 +533,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     // Phase 47: DOOM
     ("doom", RamdiskNode::File { content: DOOM_BIN }),
+    // Phase 55b Track F.3b: NVMe crash-and-restart smoke client.
+    (
+        "nvme-crash-smoke",
+        RamdiskNode::File {
+            content: NVME_CRASH_SMOKE_ELF,
+        },
+    ),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
