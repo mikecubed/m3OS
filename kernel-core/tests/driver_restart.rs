@@ -488,29 +488,36 @@ fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() 
     // intentionally empty — see doc comment above for specific blockers
 }
 
-/// Phase 55b Track F.3c status: max-restart path unchanged from F.3b.
+/// Phase 55b Track F.3d-1: max-restart path resolved.
 ///
 /// **F.2b progress:** `service kill <name>` is available in the guest shell.
 ///
 /// **F.3b progress:** F.3b's `nvme-crash-smoke` binary kills the driver once
-///   and confirms the restart. Scripting 6 kills in sequence within the QEMU
-///   regression timeout budget (each kill → restart cycle takes ~1 s) is
-///   feasible but requires the binary to loop and count restarts. The pure-logic
-///   analogue (`max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped`)
+///   and confirms the restart. The pure-logic analogue
+///   (`max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped`)
 ///   already passes.
 ///
-/// **F.3c status:** F.3c updated `nvme-crash-smoke` to exercise the `sys_block_read`
-///   EAGAIN path during the crash window (step 3.5). The max-restart loop (6 kills)
-///   is still a separate work item. Remaining blocker:
-///   A scripted kill-loop in the guest binary that drives `restart_count` past
-///   `max_restart` (5) within the QEMU regression timeout budget (6 × ~1 s ≈ 6 s,
-///   well within 180 s), then reads `/run/services.status` and asserts the line
-///   for `nvme_driver` contains `permanently-stopped`.
-///   This test is also QEMU-only.
+/// **F.3c status:** F.3c wired EAGAIN observation in the single-kill path.
+///   The 6-kill loop was deferred.
+///
+/// **F.3d-1 status (resolved):** `userspace/max-restart-smoke/src/main.rs` is
+///   the guest-side binary that issues 6 sequential kills of `nvme_driver`
+///   (each preceded by a wait for `running`, except the 6th), then asserts
+///   `/run/services.status` shows `permanently-stopped` for `nvme_driver`.
+///   The authoritative QEMU regression is:
+///     `M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test max-restart-exceeded`
+///   This stub remains `#[ignore]` because it requires a live QEMU guest and
+///   cannot be expressed as a host unit test in kernel-core.
 #[test]
-#[ignore = "phase-55c max-restart deferred: F.3c wired EAGAIN observation in single-kill \
-            path; 6-kill loop + permanently-stopped assertion in the guest binary requires \
-            a looping variant of nvme-crash-smoke (not yet built). QEMU-only test."]
+#[ignore = "QEMU-only: the authoritative check is the `max-restart-exceeded` xtask \
+            regression (M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression \
+            --test max-restart-exceeded). The pure-logic enforcement is covered by \
+            max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped (above)."]
 fn qemu_max_restart_exceeded_service_status_returns_failed() {
-    // intentionally empty — see doc comment above for specific blocker
+    // intentionally empty — QEMU-only scenario.
+    // The `max-restart-exceeded` xtask regression exercises the full path:
+    //   1. Boot guest with --device nvme.
+    //   2. Wait for nvme_driver running (NVME_SMOKE:rw:PASS).
+    //   3. Run /bin/max-restart-smoke (6-kill loop).
+    //   4. Assert MAX_RESTART_SMOKE:PASS (permanently-stopped in services.status).
 }
