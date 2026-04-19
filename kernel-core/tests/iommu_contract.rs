@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use fixtures::mock_unit::{MOCK_CAPABILITIES, MockUnit};
 use kernel_core::iommu::contract::{
-    DomainError, FaultRecord, IommuError, IommuUnit, Iova, MapFlags, PhysAddr,
+    DomainError, DomainId, FaultRecord, IommuError, IommuUnit, Iova, MapFlags, PhysAddr,
 };
 
 // ---------------------------------------------------------------------------
@@ -402,6 +402,51 @@ fn destroying_already_destroyed_domain_returns_invalid() {
     let d2 = unit.create_domain().unwrap();
     assert_ne!(d2.id(), id, "new id must differ from destroyed id");
     unit.destroy_domain(d2).unwrap();
+}
+
+#[test]
+fn destroy_domain_error_paths_release_handle_without_panic() {
+    // Regression: every `destroy_domain` error return must consume
+    // (release) the DmaDomain handle. Missing release triggers the
+    // debug-build Drop leak assertion, so a contract-suite test that
+    // exercises the error paths would panic instead of asserting. This
+    // test checks all three MockUnit error paths — cross-unit handle,
+    // unknown domain id, already-destroyed — by reconstructing phantom
+    // `DmaDomain`s with known ids.
+    use kernel_core::iommu::contract::DmaDomain;
+    let mut unit = MockUnit::new(2);
+    unit.bring_up().unwrap();
+    let live = unit
+        .create_domain()
+        .expect("create must succeed post bring_up");
+    let live_id = live.id();
+
+    // (a) Handle belonging to a different unit index.
+    let wrong_unit = DmaDomain::new(live_id, 99);
+    let err = unit
+        .destroy_domain(wrong_unit)
+        .expect_err("cross-unit destroy must fail");
+    assert_eq!(err, IommuError::Invalid);
+
+    // (b) Handle with an id that was never created on this unit.
+    let unknown = DmaDomain::new(DomainId(0xDEAD), 2);
+    let err = unit
+        .destroy_domain(unknown)
+        .expect_err("unknown-domain destroy must fail");
+    assert_eq!(err, IommuError::Invalid);
+
+    // (c) Destroy the live domain, then try to destroy again via a
+    // freshly-minted phantom carrying the same id (which now points at
+    // a DomainState flagged `destroyed`).
+    unit.destroy_domain(live).expect("first destroy ok");
+    let double = DmaDomain::new(live_id, 2);
+    let err = unit
+        .destroy_domain(double)
+        .expect_err("double destroy must fail");
+    assert_eq!(err, IommuError::Invalid);
+    // Reaching here without a Drop-path panic is the assertion: every
+    // phantom handle was released inside `destroy_domain` rather than
+    // dropped bare.
 }
 
 extern crate alloc;

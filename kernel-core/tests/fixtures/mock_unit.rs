@@ -141,12 +141,22 @@ impl IommuUnit for MockUnit {
     }
 
     fn destroy_domain(&mut self, domain: DmaDomain) -> Result<(), IommuError> {
+        // `destroy_domain` consumes the handle on every path. The
+        // `DmaDomain` Drop impl fires a debug-build leak assertion unless
+        // `release()` is called first, so each error return must release
+        // before propagating — matching the contract enforced by the
+        // real `IdentityUnit` and kernel-side registry.
         if domain.unit_index() != self.unit_index {
+            domain.release();
             return Err(IommuError::Invalid);
         }
         let id = domain.id();
-        let state = self.domains.get_mut(&id).ok_or(IommuError::Invalid)?;
+        let Some(state) = self.domains.get_mut(&id) else {
+            domain.release();
+            return Err(IommuError::Invalid);
+        };
         if state.destroyed {
+            domain.release();
             return Err(IommuError::Invalid);
         }
         state.destroyed = true;

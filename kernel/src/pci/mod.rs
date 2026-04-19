@@ -287,10 +287,35 @@ pub enum ClaimError {
 /// same registry path.
 ///
 /// The handle is `!Copy` and `!Clone`; ownership represents exclusive
-/// access for the claim's lifetime. Because the domain is owned here,
-/// every [`crate::mm::DmaBuffer`] allocated against the handle sees a
-/// single consistent IOMMU context and Drop ordering guarantees the
-/// buffer's unmap precedes the domain's destroy.
+/// access for the claim's lifetime. Every [`crate::mm::DmaBuffer`]
+/// allocated against the handle is wired into a single consistent IOMMU
+/// context.
+///
+/// ## Caller requirement: buffer lifetime must not outlive the handle
+///
+/// [`crate::mm::DmaBuffer::allocate`] takes a shared reference to a
+/// `PciDeviceHandle` but does **not** tie the returned buffer's lifetime
+/// to the handle in the type system. Each buffer records a
+/// [`DomainSnapshot`] by value so Drop can unmap without touching the
+/// (potentially-gone) handle, which means nothing at compile time
+/// prevents a caller from letting a buffer outlive the handle that
+/// created it. If that happens, Drop will try to unmap against a
+/// domain that `destroy_domain` has already torn down.
+///
+/// Drivers must therefore uphold this ordering themselves:
+///
+/// 1. Drop every `DmaBuffer` the driver owns **before** dropping its
+///    `PciDeviceHandle`.
+/// 2. Equivalently, never `mem::forget` a handle whose buffers are
+///    still live, and never hand a buffer to a pool that outlives the
+///    claim.
+///
+/// The in-tree drivers (NVMe, e1000, virtio-blk, virtio-net) satisfy
+/// this by keeping both the handle and the rings on the same driver
+/// struct — Drop ordering on struct fields tears buffers down before
+/// the handle, which destroys the domain. Future lifetime-parameterised
+/// or refcount-based API work (tracked as follow-up) would turn this
+/// requirement into a compile-time guarantee.
 pub struct PciDeviceHandle {
     dev: PciDevice,
     /// Index into `PCI_DEVICE_REGISTRY`. Used on drop to free the claim.
