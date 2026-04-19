@@ -162,7 +162,7 @@ impl Virtqueue {
         part1 + part2
     }
 
-    fn init(port: PortRegion, queue_index: u16) -> Option<Self> {
+    fn init(handle: &pci::PciDeviceHandle, port: PortRegion, queue_index: u16) -> Option<Self> {
         port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, queue_index);
         let queue_size = port.read_reg::<u16>(VIRTIO_QUEUE_SIZE);
         if queue_size < 3 {
@@ -184,8 +184,11 @@ impl Virtqueue {
         }
 
         let alloc_size = Self::calc_size(queue_size);
-        let ring = DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096).ok()?;
-        let phys_base = ring.physical_address().as_u64();
+        let ring = DmaBuffer::<[u8]>::allocate(handle, alloc_size).ok()?;
+        // Under Phase 55a IOMMU translation this value is an IOVA (bus
+        // address), not a host physical address. Named `bus_base` to
+        // match that semantics rather than implying it is always a PA.
+        let bus_base = ring.bus_address();
         let virt_base = ring.as_ptr() as usize;
 
         let n = queue_size as usize;
@@ -195,21 +198,21 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        let pfn_u64 = phys_base / 4096;
+        let pfn_u64 = bus_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
             log::error!(
-                "[virtio-blk] queue {}: phys {:#x} too high for 32-bit legacy PFN",
+                "[virtio-blk] queue {}: bus {:#x} too high for 32-bit legacy PFN",
                 queue_index,
-                phys_base
+                bus_base
             );
             return None;
         }
         port.write_reg::<u32>(VIRTIO_QUEUE_ADDRESS, pfn_u64 as u32);
         log::info!(
-            "[virtio-blk] queue {}: size={}, phys={:#x}",
+            "[virtio-blk] queue {}: size={}, bus={:#x}",
             queue_index,
             queue_size,
-            phys_base
+            bus_base
         );
 
         let mut waiters = Vec::with_capacity(n);
@@ -674,7 +677,7 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         log::info!("[virtio-blk] legacy device (no FEATURES_OK) — continuing");
     }
 
-    let request_queue = match Virtqueue::init(port, 0) {
+    let request_queue = match Virtqueue::init(&handle, port, 0) {
         Some(q) => q,
         None => {
             return DriverProbeResult::Failed("failed to initialize request queue");
@@ -693,18 +696,18 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         (capacity_sectors * SECTOR_SIZE as u64) / (1024 * 1024)
     );
 
-    let scratch = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+    let scratch = match DmaBuffer::<[u8]>::allocate(&handle, 4096) {
         Ok(b) => b,
         Err(_) => return DriverProbeResult::Failed("scratch DMA alloc failed"),
     };
-    let scratch_phys = scratch.physical_address().as_u64();
+    let scratch_phys = scratch.bus_address();
     let scratch_virt = scratch.as_ptr() as *mut u8;
 
-    let dma = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+    let dma = match DmaBuffer::<[u8]>::allocate(&handle, 4096) {
         Ok(b) => b,
         Err(_) => return DriverProbeResult::Failed("data DMA alloc failed"),
     };
-    let dma_phys = dma.physical_address().as_u64();
+    let dma_phys = dma.bus_address();
     let dma_virt = dma.as_ptr() as *mut u8;
 
     // Install the completion IRQ handler (C.3). Prefer MSI, fall back to

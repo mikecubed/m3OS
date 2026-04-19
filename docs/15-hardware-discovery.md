@@ -171,3 +171,32 @@ for PCIe-era devices:
 See [Phase 55 — Hardware Substrate](./55-hardware-substrate.md) for how
 these pieces compose into the hardware-access layer that the NVMe and
 e1000 drivers use.
+
+## Phase 55a Additions (DMAR and IVRS)
+
+Phase 55a extended the ACPI parser with two more tables that describe
+DMA-remapping (IOMMU) hardware:
+
+- **DMAR** (DMA Remapping) — Intel VT-d. Contains DRHD entries (one per
+  IOMMU unit, with register base and device scope), RMRR entries
+  (firmware-reserved memory that must remain identity-mapped), and
+  ATSR/RHSA auxiliary tables.
+- **IVRS** (I/O Virtualization Reporting Structure) — AMD-Vi. Contains
+  IVHD blocks (types 10h, 11h, 40h) describing each IOMMU unit and its
+  device entries, plus IVMD unity-map records (the AMD equivalent of
+  RMRR).
+
+The pure-logic decoders live in
+[`kernel-core/src/iommu/tables.rs`](../kernel-core/src/iommu/tables.rs) and
+produce typed records with named error enums (`DmarParseError`,
+`IvrsParseError`). The kernel-side glue in `kernel/src/acpi/mod.rs` only
+locates the signatures, validates the checksum, and hands the body off;
+when both tables are present on a malformed multi-vendor platform, DMAR
+wins and IVRS is logged-and-ignored.
+
+The decoded unit descriptors feed the new IOMMU subsystem rather than
+being consumed inside `acpi/`. See
+[Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md) for the
+subsystem-level architecture and
+[docs/roadmap/55a-iommu-substrate.md](./roadmap/55a-iommu-substrate.md)
+for the authoritative design.

@@ -277,13 +277,71 @@ pub enum ClaimError {
 /// discovered metadata, and the registry slot used to release the claim on
 /// drop.
 ///
-/// The handle is `!Copy` and `!Clone`; ownership represents exclusive access
-/// for the claim's lifetime.  Track C will build the BAR/DMA/IRQ layer on
-/// top of this type.
+/// # IOMMU domain lifetime (Phase 55a Track E.1)
+///
+/// As of Phase 55a every claimed handle owns a [`kernel_core::iommu::contract::DmaDomain`]
+/// for the life of the claim. `claim_specific` looks up the owning IOMMU
+/// unit (via `iommu::device_to_unit`), asks that unit for a fresh domain
+/// via `iommu::registry::create_domain`, and stores the handle on
+/// [`PciDeviceHandle::domain`]. Drop tears the domain down through the
+/// same registry path.
+///
+/// The handle is `!Copy` and `!Clone`; ownership represents exclusive
+/// access for the claim's lifetime. Every [`crate::mm::DmaBuffer`]
+/// allocated against the handle is wired into a single consistent IOMMU
+/// context.
+///
+/// ## Caller requirement: buffer lifetime must not outlive the handle
+///
+/// [`crate::mm::DmaBuffer::allocate`] takes a shared reference to a
+/// `PciDeviceHandle` but does **not** tie the returned buffer's lifetime
+/// to the handle in the type system. Each buffer records a
+/// [`DomainSnapshot`] by value so Drop can unmap without touching the
+/// (potentially-gone) handle, which means nothing at compile time
+/// prevents a caller from letting a buffer outlive the handle that
+/// created it. If that happens, Drop will try to unmap against a
+/// domain that `destroy_domain` has already torn down.
+///
+/// Drivers must therefore uphold this ordering themselves:
+///
+/// 1. Drop every `DmaBuffer` the driver owns **before** dropping its
+///    `PciDeviceHandle`.
+/// 2. Equivalently, never `mem::forget` a handle whose buffers are
+///    still live, and never hand a buffer to a pool that outlives the
+///    claim.
+///
+/// The in-tree drivers (NVMe, e1000, virtio-blk, virtio-net) satisfy
+/// this by keeping both the handle and the rings on the same driver
+/// struct — Drop ordering on struct fields tears buffers down before
+/// the handle, which destroys the domain. Future lifetime-parameterised
+/// or refcount-based API work (tracked as follow-up) would turn this
+/// requirement into a compile-time guarantee.
 pub struct PciDeviceHandle {
     dev: PciDevice,
     /// Index into `PCI_DEVICE_REGISTRY`. Used on drop to free the claim.
     slot: usize,
+    /// The IOMMU domain assigned to this device for the claim's life.
+    /// Populated on successful claim; cleared by Drop before the handle
+    /// goes away so `destroy_domain` consumes the handle.
+    ///
+    /// `Option` because constructing a `PciDeviceHandle` before the
+    /// IOMMU subsystem is initialised (early bring-up) must not panic —
+    /// in that case domain creation is silently skipped and DMA
+    /// allocations flow through the identity-fallback path.
+    domain: Option<kernel_core::iommu::contract::DmaDomain>,
+    /// Which unit in the registry owns `domain`. Copied out of the
+    /// device-to-unit map at claim time so Drop does not need to
+    /// re-lookup (and so the registry lock is not held across Drop).
+    domain_unit_index: Option<usize>,
+}
+
+/// A snapshot of the domain attached to a handle, used by
+/// `DmaBuffer::allocate` to record where an IOVA mapping lives without
+/// taking a reference to the full `DmaDomain`.
+#[derive(Clone, Copy, Debug)]
+pub struct DomainSnapshot {
+    pub unit_index: usize,
+    pub domain: kernel_core::iommu::contract::DomainId,
 }
 
 #[allow(dead_code)]
@@ -345,12 +403,60 @@ impl PciDeviceHandle {
     pub fn allocate_msi_vectors(&self, count: u8) -> Option<AllocatedMsi> {
         allocate_msi_vectors(&self.dev, count)
     }
+
+    /// Snapshot of the IOMMU domain attached to this handle, if any.
+    ///
+    /// Returned as an `Option` because `claim_specific` may be called
+    /// before `iommu::init` has run, in which case the handle carries no
+    /// domain and DMA buffers fall through the identity path.
+    ///
+    /// `DmaBuffer::allocate` is the sole consumer — it needs just
+    /// enough information to route `map` / `unmap` calls to the right
+    /// unit without taking a reference to the underlying `DmaDomain`
+    /// (which must remain uniquely owned by this handle).
+    pub fn domain_snapshot(&self) -> Option<DomainSnapshot> {
+        let unit = self.domain_unit_index?;
+        let d = self.domain.as_ref()?;
+        Some(DomainSnapshot {
+            unit_index: unit,
+            domain: d.id(),
+        })
+    }
 }
 
 impl Drop for PciDeviceHandle {
     fn drop(&mut self) {
-        // Return the registry slot to the free pool.  Drivers currently never
-        // unload, so this runs only in tests or teardown paths.
+        // 1. Destroy the IOMMU domain before releasing the claim. Live
+        //    DMA buffers allocated against this handle **must** have
+        //    been dropped before the handle itself — they carry IOVA
+        //    mappings into this domain and releasing the domain first
+        //    would leak the IOVA space. Track E.1's ordering contract
+        //    enforces this at the driver layer.
+        if let (Some(domain), Some(unit_index)) = (self.domain.take(), self.domain_unit_index) {
+            match crate::iommu::registry::destroy_domain(unit_index, domain) {
+                Ok(()) => {
+                    log::debug!(
+                        "[pci] drop: destroyed domain for {:02x}:{:02x}.{}",
+                        self.dev.bus,
+                        self.dev.device,
+                        self.dev.function,
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[pci] drop: destroy_domain failed on unit {} for {:02x}:{:02x}.{}: {}",
+                        unit_index,
+                        self.dev.bus,
+                        self.dev.device,
+                        self.dev.function,
+                        e,
+                    );
+                }
+            }
+        }
+
+        // 2. Return the registry slot to the free pool. Drivers currently
+        //    never unload, so this runs only in tests or teardown paths.
         let mut reg = PCI_DEVICE_REGISTRY.lock();
         if let Some(slot) = reg.slots.get_mut(self.slot) {
             *slot = None;
@@ -447,6 +553,26 @@ pub fn claim_pci_device(
 
 /// Claim a specific `PciDevice` discovered during enumeration.  Useful when
 /// a driver matches on class code or walks the device list itself.
+///
+/// # IOMMU domain setup (Phase 55a Track E.1)
+///
+/// After the slot is reserved, this path:
+///
+/// 1. Looks up the IOMMU unit that owns the device via
+///    `iommu::device_to_unit`. If none is returned (e.g. boot has not
+///    yet reached `iommu::init`), the returned handle carries
+///    `domain == None`; DMA buffers allocated against it flow through
+///    the identity-fallback path.
+/// 2. Requests a fresh domain from `iommu::registry::create_domain`.
+/// 3. Pre-maps every firmware-declared reserved region in the new
+///    domain as an identity mapping, so firmware-owned devices
+///    (GPU framebuffers, ACPI reclaim) keep working.
+///
+/// On any IOMMU-side failure the claim is still granted (the device is
+/// still usable); we log the failure and attach `None` so the driver
+/// sees the identity-fallback path. This deliberately avoids making
+/// IOMMU bring-up a hard requirement for device discovery — a regressed
+/// IOMMU should degrade gracefully, not brick the system.
 pub fn claim_specific(dev: PciDevice, driver: &'static str) -> Result<PciDeviceHandle, ClaimError> {
     let mut reg = PCI_DEVICE_REGISTRY.lock();
     if reg.is_claimed(dev.bus, dev.device, dev.function) {
@@ -466,7 +592,65 @@ pub fn claim_specific(dev: PciDevice, driver: &'static str) -> Result<PciDeviceH
         dev.function,
         slot
     );
-    Ok(PciDeviceHandle { dev, slot })
+
+    let (domain, domain_unit_index) = attach_domain(&dev);
+
+    Ok(PciDeviceHandle {
+        dev,
+        slot,
+        domain,
+        domain_unit_index,
+    })
+}
+
+/// Look up the IOMMU unit for `dev`, request a domain, and pre-map any
+/// reserved regions. Returns `(None, None)` on any failure — the caller
+/// proceeds with an identity-fallback handle.
+fn attach_domain(
+    dev: &PciDevice,
+) -> (
+    Option<kernel_core::iommu::contract::DmaDomain>,
+    Option<usize>,
+) {
+    // Segment group is always 0 on current platforms; multi-segment
+    // PCI setups are a future extension.
+    let unit_index = match crate::iommu::device_to_unit(0, dev.bus, dev.device, dev.function) {
+        Some(i) => i,
+        None => {
+            // Either iommu::init hasn't run yet, or the device is not
+            // covered by any IOMMU unit (rare but valid — e.g. legacy
+            // devices scoped out of the DMAR). Fall through to no-domain.
+            return (None, None);
+        }
+    };
+    match crate::iommu::registry::create_domain(unit_index) {
+        Ok(domain) => {
+            let id = domain.id();
+            // Pre-map firmware reserved regions so RMRR-owned devices
+            // keep working (E.4).
+            crate::iommu::registry::pre_map_reserved(unit_index, id);
+            log::debug!(
+                "[pci] iommu: claim {:02x}:{:02x}.{} bound to unit {} domain {:?}",
+                dev.bus,
+                dev.device,
+                dev.function,
+                unit_index,
+                id,
+            );
+            (Some(domain), Some(unit_index))
+        }
+        Err(e) => {
+            log::warn!(
+                "[pci] iommu: create_domain on unit {} failed for {:02x}:{:02x}.{}: {} — falling back to identity",
+                unit_index,
+                dev.bus,
+                dev.device,
+                dev.function,
+                e,
+            );
+            (None, None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

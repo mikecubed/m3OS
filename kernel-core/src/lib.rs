@@ -10,6 +10,7 @@ pub mod e1000;
 pub mod fb;
 pub mod fs;
 pub mod input;
+pub mod iommu;
 pub mod ipc;
 pub mod log_ring;
 pub mod magazine;

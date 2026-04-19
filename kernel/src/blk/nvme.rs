@@ -493,12 +493,12 @@ fn bring_up_admin_and_identify() -> Result<(), &'static str> {
         let mut drv = DRIVER.lock();
         let d = drv.as_mut().ok_or("driver gone during admin init")?;
         let entries = ADMIN_QUEUE_ENTRIES.min(d.max_queue_entries as usize).max(2) as u16;
-        let sq = DmaBuffer::<knvme::NvmeCommand>::new_array(entries as usize)
+        let sq = DmaBuffer::<knvme::NvmeCommand>::allocate_array(&d.pci, entries as usize)
             .map_err(|_| "admin SQ DMA alloc failed")?;
-        let cq = DmaBuffer::<knvme::NvmeCompletion>::new_array(entries as usize)
+        let cq = DmaBuffer::<knvme::NvmeCompletion>::allocate_array(&d.pci, entries as usize)
             .map_err(|_| "admin CQ DMA alloc failed")?;
-        let sq_phys = sq.physical_address().as_u64();
-        let cq_phys = cq.physical_address().as_u64();
+        let sq_phys = sq.bus_address();
+        let cq_phys = cq.bus_address();
         program_admin_queue_registers(&d.regs, sq_phys, cq_phys, entries);
         let slots = alloc::vec![NvmeCompletionSlot::default(); entries as usize];
         d.admin = Some(AdminQueue {
@@ -528,11 +528,15 @@ fn bring_up_admin_and_identify() -> Result<(), &'static str> {
     }
 
     // Identify Controller.
-    let ident_controller_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
-        .map_err(|_| "identify controller DMA alloc failed")?;
+    let ident_controller_buf = {
+        let drv = DRIVER.lock();
+        let d = drv.as_ref().ok_or("driver gone before identify")?;
+        DmaBuffer::<[u8]>::allocate(&d.pci, 4096)
+            .map_err(|_| "identify controller DMA alloc failed")?
+    };
     {
         let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
-        cmd.prp1 = ident_controller_buf.physical_address().as_u64();
+        cmd.prp1 = ident_controller_buf.bus_address();
         cmd.cdw10 = knvme::IDENTIFY_CNS_CONTROLLER;
         let c = submit_admin_command(cmd)?;
         if c.status_code != 0 {
@@ -547,11 +551,15 @@ fn bring_up_admin_and_identify() -> Result<(), &'static str> {
     }
 
     // Identify Active Namespace List (CNS=2). Pick the first non-zero NSID.
-    let ident_nslist_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
-        .map_err(|_| "identify ns-list DMA alloc failed")?;
+    let ident_nslist_buf = {
+        let drv = DRIVER.lock();
+        let d = drv.as_ref().ok_or("driver gone before nslist")?;
+        DmaBuffer::<[u8]>::allocate(&d.pci, 4096)
+            .map_err(|_| "identify ns-list DMA alloc failed")?
+    };
     let selected_nsid = {
         let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
-        cmd.prp1 = ident_nslist_buf.physical_address().as_u64();
+        cmd.prp1 = ident_nslist_buf.bus_address();
         cmd.cdw10 = 0x02; // CNS: active namespace list
         cmd.nsid = 0;
         match submit_admin_command(cmd) {
@@ -575,13 +583,19 @@ fn bring_up_admin_and_identify() -> Result<(), &'static str> {
     };
 
     // Identify Namespace for the selected NSID.
-    let ident_ns_buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
-        .map_err(|_| "identify namespace DMA alloc failed")?;
+    let ident_ns_buf = {
+        let drv = DRIVER.lock();
+        let d = drv
+            .as_ref()
+            .ok_or("driver gone before identify namespace")?;
+        DmaBuffer::<[u8]>::allocate(&d.pci, 4096)
+            .map_err(|_| "identify namespace DMA alloc failed")?
+    };
     let nsze;
     let sector_bytes;
     {
         let mut cmd = knvme::NvmeCommand::new(knvme::OP_IDENTIFY, 0);
-        cmd.prp1 = ident_ns_buf.physical_address().as_u64();
+        cmd.prp1 = ident_ns_buf.bus_address();
         cmd.nsid = selected_nsid;
         cmd.cdw10 = knvme::IDENTIFY_CNS_NAMESPACE;
         let c = submit_admin_command(cmd)?;
@@ -777,14 +791,14 @@ fn bring_up_io_queue() -> Result<(), &'static str> {
         let mut drv = DRIVER.lock();
         let d = drv.as_mut().ok_or("driver gone during I/O init")?;
         let entries = IO_QUEUE_ENTRIES.min(d.max_queue_entries as usize).max(2) as u16;
-        let sq = DmaBuffer::<knvme::NvmeCommand>::new_array(entries as usize)
+        let sq = DmaBuffer::<knvme::NvmeCommand>::allocate_array(&d.pci, entries as usize)
             .map_err(|_| "I/O SQ DMA alloc failed")?;
-        let cq = DmaBuffer::<knvme::NvmeCompletion>::new_array(entries as usize)
+        let cq = DmaBuffer::<knvme::NvmeCompletion>::allocate_array(&d.pci, entries as usize)
             .map_err(|_| "I/O CQ DMA alloc failed")?;
-        let prp_list =
-            DmaBuffer::<u64>::new_array(512).map_err(|_| "I/O PRP list DMA alloc failed")?;
-        let sq_phys = sq.physical_address().as_u64();
-        let cq_phys = cq.physical_address().as_u64();
+        let prp_list = DmaBuffer::<u64>::allocate_array(&d.pci, 512)
+            .map_err(|_| "I/O PRP list DMA alloc failed")?;
+        let sq_phys = sq.bus_address();
+        let cq_phys = cq.bus_address();
         let slots = alloc::vec![NvmeCompletionSlot::default(); entries as usize];
         d.io = Some(IoQueuePair {
             sq,
@@ -964,8 +978,11 @@ pub fn write_sectors(start_lba: u64, count: usize, buf: &[u8]) -> Result<(), u16
         return Err(0xFFFE);
     }
     // Stage into a DMA buffer, then issue the write.
-    let dma = DmaBuffer::<[u8]>::new_bytes(needed.max(NVME_PAGE_BYTES), NVME_PAGE_BYTES)
-        .map_err(|_| 0xFFFFu16)?;
+    let dma = {
+        let drv = DRIVER.lock();
+        let d = drv.as_ref().ok_or(0xFFFFu16)?;
+        DmaBuffer::<[u8]>::allocate(&d.pci, needed.max(NVME_PAGE_BYTES)).map_err(|_| 0xFFFFu16)?
+    };
     // SAFETY: dma is a fresh buffer we own; source is a caller-provided
     // slice of `needed` bytes.
     unsafe {
@@ -992,8 +1009,11 @@ fn do_io_to_user_buffer(
     buf: &mut [u8],
 ) -> Result<(), u16> {
     let needed = count * sector_bytes;
-    let dma = DmaBuffer::<[u8]>::new_bytes(needed.max(NVME_PAGE_BYTES), NVME_PAGE_BYTES)
-        .map_err(|_| 0xFFFFu16)?;
+    let dma = {
+        let drv = DRIVER.lock();
+        let d = drv.as_ref().ok_or(0xFFFFu16)?;
+        DmaBuffer::<[u8]>::allocate(&d.pci, needed.max(NVME_PAGE_BYTES)).map_err(|_| 0xFFFFu16)?
+    };
     do_io_with_dma(opcode, start_lba, count as u32, &dma, needed)?;
     // SAFETY: dma is driver-owned and lives until this function returns.
     unsafe {
@@ -1052,7 +1072,7 @@ fn do_io_with_dma(
         let stride = d.doorbell_stride_bytes;
         let regs_virt = d.regs.virt_base();
         let irq_installed = d.irq.is_some();
-        let dma_phys = dma.physical_address().as_u64();
+        let dma_phys = dma.bus_address();
         let (prp1, prp2) =
             build_prp_pair(d.io.as_mut().ok_or(0xFFFFu16)?, dma_phys, byte_len).ok_or(0xFFFFu16)?;
         let io = d.io.as_mut().ok_or(0xFFFFu16)?;
@@ -1217,7 +1237,7 @@ fn build_prp_pair(io: &mut IoQueuePair, buffer_pa: u64, byte_len: usize) -> Opti
     for i in 0..remaining_pages {
         io.prp_list[i] = buffer_pa + ((i as u64) + 1) * page;
     }
-    Some((buffer_pa, io.prp_list.physical_address().as_u64()))
+    Some((buffer_pa, io.prp_list.bus_address()))
 }
 
 /// Drain all new completions from the I/O CQ. Same pattern as

@@ -195,7 +195,7 @@ impl Virtqueue {
     /// Initialize a virtqueue for the given queue index.
     ///
     /// Allocates physically contiguous pages and programs the device.
-    fn init(io_base: u16, queue_index: u16) -> Option<Self> {
+    fn init(handle: &pci::PciDeviceHandle, io_base: u16, queue_index: u16) -> Option<Self> {
         // Select the queue.
         unsafe {
             Port::<u16>::new(io_base + VIRTIO_QUEUE_SELECT).write(queue_index);
@@ -219,9 +219,11 @@ impl Virtqueue {
 
         let alloc_size = Self::calc_size(queue_size);
 
-        // Phase 55 C.5: allocate the virtqueue ring via DmaBuffer instead of
-        // raw frame allocator calls.
-        let ring = match DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096) {
+        // Phase 55a Track E: ring DMA buffer now owns an IOVA mapping
+        // in the device's IOMMU domain (identity-fallback when no IOMMU
+        // is translating). bus_address() is the canonical address to
+        // hand to the device.
+        let ring = match DmaBuffer::<[u8]>::allocate(handle, alloc_size) {
             Ok(b) => b,
             Err(e) => {
                 log::error!(
@@ -232,7 +234,11 @@ impl Virtqueue {
                 return None;
             }
         };
-        let phys_base = ring.physical_address().as_u64();
+        // Under Phase 55a IOMMU translation this value is an IOVA (bus
+        // address), not a host physical address — the device sees it,
+        // the host does not translate again. Named `bus_base` to match
+        // that semantics rather than implying it is always a PA.
+        let bus_base = ring.bus_address();
         let virt_base = ring.as_ptr() as usize;
 
         let n = queue_size as usize;
@@ -242,13 +248,14 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        // Legacy virtio uses a 32-bit PFN register; fail if memory is above 4 GiB.
-        let pfn_u64 = phys_base / 4096;
+        // Legacy virtio uses a 32-bit PFN register; fail if the bus
+        // address is above 4 GiB.
+        let pfn_u64 = bus_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
             log::error!(
-                "[virtio-net] queue {}: phys {:#x} too high for 32-bit legacy PFN",
+                "[virtio-net] queue {}: bus {:#x} too high for 32-bit legacy PFN",
                 queue_index,
-                phys_base
+                bus_base
             );
             return None;
         }
@@ -258,21 +265,22 @@ impl Virtqueue {
         }
 
         log::info!(
-            "[virtio-net] queue {}: size={}, phys={:#x}",
+            "[virtio-net] queue {}: size={}, bus={:#x}",
             queue_index,
             queue_size,
-            phys_base
+            bus_base
         );
 
-        // Phase 55 C.5: per-descriptor buffers via DmaBuffer (one 4 KiB page
-        // each). Dropping `buffer_dmas` returns every page to the buddy.
+        // Phase 55a Track E: per-descriptor buffers (one 4 KiB page
+        // each) now each carry an IOMMU mapping. Dropping `buffer_dmas`
+        // unmaps every IOVA range and returns every page to the buddy.
         let mut buffer_dmas: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(n);
         let mut buffers = Vec::with_capacity(n);
         let mut buf_phys = Vec::with_capacity(n);
         for _ in 0..n {
-            let dma = DmaBuffer::<[u8]>::new_bytes(4096, 4096).ok()?;
+            let dma = DmaBuffer::<[u8]>::allocate(handle, 4096).ok()?;
             buffers.push(dma.as_ptr() as *mut u8);
-            buf_phys.push(dma.physical_address().as_u64());
+            buf_phys.push(dma.bus_address());
             buffer_dmas.push(dma);
         }
 
@@ -711,14 +719,14 @@ fn init_with_handle(handle: pci::PciDeviceHandle) {
     }
 
     // P16-T005, P16-T006, P16-T007: Initialize RX and TX virtqueues.
-    let rx_queue = match Virtqueue::init(io_base, 0) {
+    let rx_queue = match Virtqueue::init(&handle, io_base, 0) {
         Some(q) => q,
         None => {
             log::error!("[virtio-net] failed to initialize RX queue");
             return;
         }
     };
-    let tx_queue = match Virtqueue::init(io_base, 1) {
+    let tx_queue = match Virtqueue::init(&handle, io_base, 1) {
         Some(q) => q,
         None => {
             log::error!("[virtio-net] failed to initialize TX queue");

@@ -4,8 +4,12 @@ A serious, still-maturing bootable operating system written in Rust, targeting
 **x86_64** with a **microkernel-inspired architecture**. Built for learning and
 experimentation, with a real userspace, networking, remote access, a bounded
 set of real-hardware drivers (NVMe storage, Intel 82540EM classic e1000
-networking) on top of the VirtIO baseline, and a roadmap toward stronger
-service isolation and broader platform support.
+networking) on top of the VirtIO baseline, an IOMMU substrate that routes
+device DMA through per-device VT-d / AMD-Vi translation domains, and a roadmap
+toward stronger service isolation and broader platform support.
+
+**Current kernel version:** v0.55.1 (Phase 55 hardware substrate + Phase 55a
+IOMMU substrate).
 
 ## Quick Start
 
