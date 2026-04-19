@@ -48,10 +48,11 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::exit(101)
 }
 
-// Track E.2 modules. Declared `pub` so `cargo test` can exercise the
-// public helpers; the binary crate still has a single `program_main`
-// entry point.
+// Track E.2 / E.3 modules. Declared `pub` so `cargo test` can exercise
+// the public helpers; the binary crate still has a single
+// `program_main` entry point.
 pub mod init;
+pub mod io;
 pub mod rings;
 
 /// Boot-log marker written to stdout when the driver scaffold starts.
