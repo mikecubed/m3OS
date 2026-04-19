@@ -112,7 +112,9 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
         on_ipc_error();
-        return Err(0xFF);
+        // Surface DriverRestarting to the caller so it can distinguish a
+        // mid-restart error from a generic I/O error (Phase 55b Track F.2).
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
     let (reply_hdr, _) =
@@ -172,7 +174,9 @@ pub fn write_sectors(
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
         on_ipc_error();
-        return Err(0xFF);
+        // Surface DriverRestarting to the caller so it can distinguish a
+        // mid-restart error from a generic I/O error (Phase 55b Track F.2).
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     let bulk_r = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
     let (reply_hdr, _) =

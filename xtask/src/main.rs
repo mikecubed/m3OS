@@ -6533,6 +6533,9 @@ struct RegressionTest {
     guest_steps: fn() -> Vec<SmokeStep>,
     /// How long the entire regression gets before being killed.
     timeout_secs: u64,
+    /// Optional device attachments (NVMe, e1000, IOMMU). Defaults to all-false
+    /// (VirtIO-blk + VirtIO-net) when not set.
+    devices: DeviceSet,
 }
 
 /// Return the list of registered regression tests.
@@ -6543,60 +6546,70 @@ fn regression_tests() -> Vec<RegressionTest> {
             description: "Rapid concurrent fork() from multiple parents",
             guest_steps: fork_overlap_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "ipc-wake",
             description: "Overlapping IPC send/recv/call/reply cycles",
             guest_steps: ipc_wake_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "pty-overlap",
             description: "Overlapping PTY allocation and shell spawning",
             guest_steps: pty_overlap_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "signal-reset",
             description: "Exec-time signal disposition reset (POSIX: handlers → SIG_DFL)",
             guest_steps: signal_reset_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "kbd-echo",
             description: "Keyboard input reaches shell via serial→TTY→stdin pipeline",
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "service-lifecycle",
             description: "Service list/status in the headless operator workflow",
             guest_steps: service_lifecycle_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "storage-roundtrip",
             description: "Ext2 write/read/delete round-trip on persistent storage",
             guest_steps: storage_roundtrip_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "serverization-fallback",
             description: "Phase 54 degraded-mode behavior after stopping vfs and net_udp",
             guest_steps: serverization_fallback_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "log-pipeline",
             description: "Logger injection via /dev/log and /var/log/messages verification",
             guest_steps: log_pipeline_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "security-floor",
             description: "Phase 48 security floor: shadow auth, credential transition, hash format",
             guest_steps: security_floor_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
     ];
 
@@ -6610,6 +6623,31 @@ fn regression_tests() -> Vec<RegressionTest> {
             description: "exit_group() reaps a live spinning sibling only after it quiesces",
             guest_steps: exit_group_teardown_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
+        });
+    }
+
+    // Phase 55b Track F.2: crash-and-restart regression.
+    //
+    // Requires the emulated NVMe device to be present so the nvme_driver
+    // service stays alive long enough to be killed via `service kill`.
+    // Gated behind M3OS_ENABLE_DRIVER_RESTART_REGRESSION because:
+    //   (a) it needs --device nvme QEMU args (heavier than standard tests),
+    //   (b) the "observe DriverRestarting from I/O path" acceptance bullet
+    //       is deferred to Track F.3 (userspace I/O client interception).
+    // Remove the env-gate when F.3 lands and the NVMe QEMU arg is folded
+    // into the base regression image.
+    if std::env::var_os("M3OS_ENABLE_DRIVER_RESTART_REGRESSION").is_some() {
+        tests.push(RegressionTest {
+            name: "driver-restart-guest",
+            description: "Phase 55b F.2: service kill nvme_driver → restart cycle in QEMU",
+            guest_steps: driver_restart_guest_steps,
+            timeout_secs: 120,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
         });
     }
 
@@ -6781,6 +6819,88 @@ fn service_lifecycle_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/service: prompt after status sshd",
     });
+    steps
+}
+
+/// Guest steps for the Phase 55b F.2 driver-restart regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// nvme_driver service is running and has a stable PID for `service kill`.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Verify nvme_driver is listed by init (`service status nvme_driver`).
+///   3. Deliver SIGKILL via `service kill nvme_driver`.
+///   4. Wait for init to log the restart event (`init: started 'nvme_driver'`).
+///   5. Verify subsequent `service status nvme_driver` shows running state.
+///
+/// "Observe DriverRestarting from the block I/O path" (Phase 55b F.2b) is
+/// deferred to Track F.3: it requires a userspace I/O client binary that
+/// can trigger a write mid-restart and inspect the error code returned by
+/// the `RemoteBlockDevice` facade. The xtask-level harness for that will
+/// replace this stub once F.3 lands.
+fn driver_restart_guest_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    // Let nvme_driver finish init and stabilise before querying status.
+    steps.push(SmokeStep::Sleep { millis: 3000 });
+
+    // Step 1 — verify nvme_driver is listed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status nvme_driver\n",
+        label: "guest/driver-restart: query nvme_driver status",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Name:",
+        timeout_secs: 15,
+        label: "guest/driver-restart: status shows Name field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: prompt after status",
+    });
+
+    // Step 2 — deliver SIGKILL to nvme_driver.
+    steps.push(SmokeStep::Send {
+        input: "/bin/service kill nvme_driver\n",
+        label: "guest/driver-restart: deliver SIGKILL to nvme_driver",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SIGKILL delivered",
+        timeout_secs: 10,
+        label: "guest/driver-restart: confirm SIGKILL delivered",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: prompt after kill",
+    });
+
+    // Step 3 — wait for init to restart nvme_driver.
+    // Init logs "init: started '<name>' pid=<N>" on each (re)start.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: started 'nvme_driver' pid=",
+        timeout_secs: 30,
+        label: "guest/driver-restart: init restarts nvme_driver",
+    });
+
+    // Step 4 — verify service shows running (or at least re-registered).
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status nvme_driver\n",
+        label: "guest/driver-restart: re-query nvme_driver status after restart",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "State:",
+        timeout_secs: 15,
+        label: "guest/driver-restart: status after restart shows State field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: final prompt",
+    });
+
     steps
 }
 
@@ -7203,7 +7323,11 @@ fn run_regression_test(
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    let mut args = if test.devices == DeviceSet::default() {
+        qemu_args(uefi_image, ovmf, display_mode)
+    } else {
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, test.devices)
+    };
     // Strip hostfwd to avoid port conflicts.
     for arg in args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") {
