@@ -4,12 +4,44 @@
 //! EtherType to the appropriate protocol handler.  Phase 55 E.4 added the
 //! e1000 path alongside the original virtio-net one — both funnel through
 //! the same ARP / IPv4 handlers so protocol state is driver-agnostic.
+//!
+//! Phase 55b E.4 adds the ring-3 RemoteNic path: frames received via IPC from
+//! the userspace e1000 driver are injected through [`process_rx_frames`], the
+//! same entry point used by the in-kernel drivers so the protocol handlers are
+//! completely driver-agnostic.
 
 use super::arp;
 use super::e1000;
 use super::ethernet;
 use super::ipv4;
 use super::virtio_net;
+
+/// Dispatch a single raw Ethernet frame into the protocol stack.
+///
+/// This is the shared entry point for all NIC drivers — both in-kernel
+/// (virtio-net, e1000) and ring-3 (`RemoteNic` via IPC). The frame must be
+/// a complete Ethernet frame starting at the 6-byte destination MAC.
+pub fn process_rx_frames(raw: &[u8]) {
+    let frame = match ethernet::parse(raw) {
+        Some(f) => f,
+        None => return,
+    };
+    match frame.ethertype {
+        ethernet::ETHERTYPE_ARP => {
+            if let Some(pkt) = arp::parse(&frame.payload) {
+                arp::handle_arp(&pkt);
+            }
+        }
+        ethernet::ETHERTYPE_IPV4 => {
+            if let Some((header, payload)) = ipv4::parse(&frame.payload) {
+                ipv4::handle_ipv4(&header, payload);
+            }
+        }
+        _ => {
+            // Unknown EtherType — drop silently.
+        }
+    }
+}
 
 /// Process all pending received frames.
 ///
@@ -24,25 +56,6 @@ pub fn process_rx() {
     frames.extend(virtio_net::recv_frames());
 
     for raw in &frames {
-        let frame = match ethernet::parse(raw) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        match frame.ethertype {
-            ethernet::ETHERTYPE_ARP => {
-                if let Some(pkt) = arp::parse(&frame.payload) {
-                    arp::handle_arp(&pkt);
-                }
-            }
-            ethernet::ETHERTYPE_IPV4 => {
-                if let Some((header, payload)) = ipv4::parse(&frame.payload) {
-                    ipv4::handle_ipv4(&header, payload);
-                }
-            }
-            _ => {
-                // Unknown EtherType — drop silently.
-            }
-        }
+        process_rx_frames(raw);
     }
 }

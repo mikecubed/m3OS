@@ -343,6 +343,38 @@ pub fn has_recv_data(conn_idx: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Reset pending retransmit timers on all TCP connections on link-down.
+// Called by RemoteNic::apply_link_event; allow dead_code until E.5 wires it.
+#[allow(dead_code)]
+///
+/// Phase 16 / Phase 55b E.4: called by `RemoteNic::apply_link_event` when the
+/// PHY goes down. Transitions every `Established` / `SynSent` / `SynReceived`
+/// connection to `Closed` so the upper layers (VFS, application) observe an
+/// error rather than a silent hang. The one-line call site in `remote.rs` is:
+///
+/// ```rust,ignore
+/// super::tcp::on_link_down();
+/// ```
+pub fn on_link_down() {
+    let mut conns = TCP_CONNS.lock();
+    for slot in conns.conns.iter_mut().flatten() {
+        match slot.state {
+            TcpState::Established
+            | TcpState::SynSent
+            | TcpState::SynReceived
+            | TcpState::FinWait1
+            | TcpState::FinWait2 => {
+                log::info!(
+                    "[tcp] on_link_down: resetting connection (state={:?})",
+                    slot.state,
+                );
+                slot.state = TcpState::Closed;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
     let (tcp_hdr, tcp_data) = match parse(payload) {
         Some(h) => h,

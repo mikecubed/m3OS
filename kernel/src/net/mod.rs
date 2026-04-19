@@ -13,6 +13,7 @@ pub mod e1000;
 pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
+pub mod remote;
 pub mod tcp;
 pub mod udp;
 pub mod unix;
@@ -54,16 +55,27 @@ pub enum NetError {
 
 /// Send a raw Ethernet frame through whichever NIC driver is initialized.
 ///
-/// Dispatches to e1000 when `E1000_READY` is set; otherwise falls back to
-/// virtio-net for QEMU's default `virtio-net-pci` configuration.  The upper
-/// stack (`arp.rs`, `ipv4.rs`) routes all transmits through this entry
-/// point so switching between drivers at runtime requires no upper-layer
-/// change.
+/// Dispatch priority (Phase 55b E.4):
+/// 1. `RemoteNic` — ring-3 e1000 driver via IPC, when registered.
+/// 2. In-kernel e1000 — when `E1000_READY` is set (Phase 55 in-kernel driver).
+/// 3. VirtIO-net — fallback for QEMU's default `virtio-net-pci` configuration.
 ///
-/// Errors are currently logged and swallowed to preserve the existing
-/// `send_frame` surface (virtio-net exposes a `fn(_) -> ()`); callers that
-/// need the error can use [`e1000::e1000_transmit`] directly.
+/// The upper stack (`arp.rs`, `ipv4.rs`) routes all transmits through this
+/// entry point so switching between drivers at runtime requires no upper-layer
+/// change. Errors are logged and swallowed to preserve the existing `fn(_) -> ()`
+/// surface; callers that need the error may call the driver directly.
 pub fn send_frame(frame: &[u8]) {
+    // Phase 55b E.4: RemoteNic has highest priority when a ring-3 driver is
+    // registered — matches the "RemoteNic first" acceptance criterion.
+    if remote::RemoteNic::is_registered() {
+        match remote::RemoteNic::send_frame(frame) {
+            Ok(()) => {}
+            Err(e) => {
+                log::debug!("[net] remote_nic send_frame failed: {:?}", e);
+            }
+        }
+        return;
+    }
     if e1000::E1000_READY.load(Ordering::Acquire) {
         match e1000::e1000_transmit(frame) {
             Ok(()) => {}
@@ -78,8 +90,13 @@ pub fn send_frame(frame: &[u8]) {
 
 /// Returns the MAC address of whichever NIC driver initialized first — used
 /// by `arp` / `ipv4` to stamp outgoing frames.
+///
+/// Priority mirrors [`send_frame`]: RemoteNic > in-kernel e1000 > VirtIO-net.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<kernel_core::types::MacAddr> {
+    if let Some(m) = remote::RemoteNic::mac_address() {
+        return Some(m);
+    }
     if let Some(m) = e1000::mac_address() {
         return Some(m);
     }
