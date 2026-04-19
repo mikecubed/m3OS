@@ -110,10 +110,7 @@ pub trait IpcBackend {
     /// `Err(DriverRuntimeError::Device(DeviceHostError::Internal))`
     /// if the underlying syscall reports an error. Implementations
     /// must not panic on transient errors.
-    fn recv(
-        &mut self,
-        endpoint: EndpointCap,
-    ) -> Result<RecvFrame, crate::DriverRuntimeError>;
+    fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvFrame, crate::DriverRuntimeError>;
 
     /// Reply to the in-flight request on the reply capability the
     /// kernel staged for the peer. Implementations stamp any
@@ -171,8 +168,7 @@ impl SyscallBackend {
     /// The single bulk-recv buffer size for driver servers. Matches
     /// the block / net schemas: the biggest driver-side message is a
     /// frame-sized net payload, bounded by `MAX_FRAME_BYTES`.
-    pub const MAX_BULK_RECV: usize =
-        kernel_core::driver_ipc::net::MAX_FRAME_BYTES as usize;
+    pub const MAX_BULK_RECV: usize = kernel_core::driver_ipc::net::MAX_FRAME_BYTES as usize;
 
     /// The one-shot reply-cap handle convention — Phase 50 stages
     /// the peer's reply capability at this fixed slot when the
@@ -182,10 +178,7 @@ impl SyscallBackend {
 }
 
 impl IpcBackend for SyscallBackend {
-    fn recv(
-        &mut self,
-        endpoint: EndpointCap,
-    ) -> Result<RecvFrame, crate::DriverRuntimeError> {
+    fn recv(&mut self, endpoint: EndpointCap) -> Result<RecvFrame, crate::DriverRuntimeError> {
         use alloc::vec;
         let mut msg = syscall_lib::IpcMessage::new(0);
         let mut buf = vec![0u8; Self::MAX_BULK_RECV];
@@ -325,10 +318,7 @@ pub(crate) mod mock {
     }
 
     impl IpcBackend for MockBackend {
-        fn recv(
-            &mut self,
-            _endpoint: EndpointCap,
-        ) -> Result<RecvFrame, crate::DriverRuntimeError> {
+        fn recv(&mut self, _endpoint: EndpointCap) -> Result<RecvFrame, crate::DriverRuntimeError> {
             match self.incoming.pop_front() {
                 Some(f) => Ok(f),
                 None => Err(crate::DriverRuntimeError::Device(
@@ -337,11 +327,7 @@ pub(crate) mod mock {
             }
         }
 
-        fn reply(
-            &mut self,
-            label: u64,
-            data0: u64,
-        ) -> Result<(), crate::DriverRuntimeError> {
+        fn reply(&mut self, label: u64, data0: u64) -> Result<(), crate::DriverRuntimeError> {
             let bulk = core::mem::take(&mut self.pending_bulk);
             self.replies.push(RecordedReply { label, data0, bulk });
             Ok(())
