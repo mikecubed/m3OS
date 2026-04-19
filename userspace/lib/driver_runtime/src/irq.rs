@@ -146,15 +146,16 @@ pub trait IrqBackend {
 }
 
 // ---------------------------------------------------------------------------
-// SyscallBackend — production backend built on syscall_lib
+// IrqBackend impl for the shared SyscallBackend
 // ---------------------------------------------------------------------------
+//
+// C.2 introduced `crate::syscall_backend::SyscallBackend` as the zero-sized
+// production backend for every driver_runtime wrapper. C.3 extends it here
+// with an `IrqBackend` impl so `IrqNotification<SyscallBackend>` resolves to
+// the same type drivers already use for `DeviceHandle` / `Mmio` / `DmaBuffer`.
+// No new struct is declared.
 
-/// Zero-sized production backend that issues real syscalls.
-///
-/// The default type parameter on [`IrqNotification`] so drivers do
-/// not need to name this explicitly.
-#[derive(Default, Clone, Copy, Debug)]
-pub struct SyscallBackend;
+pub use crate::syscall_backend::SyscallBackend;
 
 impl IrqBackend for SyscallBackend {
     fn subscribe(

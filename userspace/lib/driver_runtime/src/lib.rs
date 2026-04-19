@@ -79,7 +79,7 @@ pub use syscall_backend::SyscallBackend;
 // consumes, and the `irq_loop` convenience. Drivers that only
 // need the default syscall path `use driver_runtime::*;` and get
 // all four.
-pub use irq::{DeviceCapHandle, IrqBackend, IrqNotification, SyscallBackend, irq_loop};
+pub use irq::{DeviceCapHandle, IrqBackend, IrqNotification, irq_loop};
 
 /// Re-export of the authoritative `DriverRuntimeError` defined in
 /// `kernel-core`. Every public fallible method in this crate returns
