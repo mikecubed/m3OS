@@ -234,7 +234,11 @@ impl Virtqueue {
                 return None;
             }
         };
-        let phys_base = ring.bus_address();
+        // Under Phase 55a IOMMU translation this value is an IOVA (bus
+        // address), not a host physical address — the device sees it,
+        // the host does not translate again. Named `bus_base` to match
+        // that semantics rather than implying it is always a PA.
+        let bus_base = ring.bus_address();
         let virt_base = ring.as_ptr() as usize;
 
         let n = queue_size as usize;
@@ -244,13 +248,14 @@ impl Virtqueue {
         let used_offset = align_up(avail_offset + 4 + 2 * n + 2, 4096);
         let used_base = (virt_base + used_offset) as *mut VirtqUsedHeader;
 
-        // Legacy virtio uses a 32-bit PFN register; fail if memory is above 4 GiB.
-        let pfn_u64 = phys_base / 4096;
+        // Legacy virtio uses a 32-bit PFN register; fail if the bus
+        // address is above 4 GiB.
+        let pfn_u64 = bus_base / 4096;
         if pfn_u64 > u32::MAX as u64 {
             log::error!(
-                "[virtio-net] queue {}: phys {:#x} too high for 32-bit legacy PFN",
+                "[virtio-net] queue {}: bus {:#x} too high for 32-bit legacy PFN",
                 queue_index,
-                phys_base
+                bus_base
             );
             return None;
         }
@@ -260,10 +265,10 @@ impl Virtqueue {
         }
 
         log::info!(
-            "[virtio-net] queue {}: size={}, phys={:#x}",
+            "[virtio-net] queue {}: size={}, bus={:#x}",
             queue_index,
             queue_size,
-            phys_base
+            bus_base
         );
 
         // Phase 55a Track E: per-descriptor buffers (one 4 KiB page

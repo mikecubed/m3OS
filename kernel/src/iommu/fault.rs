@@ -21,10 +21,9 @@
 //! beyond the `log` crate backend (which the serial subsystem makes
 //! IRQ-safe). Keep new code in this file to the same standard.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use kernel_core::iommu::contract::{FaultHandlerFn, FaultRecord};
-use spin::Mutex;
 
 /// Monotonic count of IOMMU faults the kernel has observed since boot.
 ///
@@ -39,23 +38,37 @@ use spin::Mutex;
 /// synchronization requirements.
 static FAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Shared slot for the user-supplied fault callback. Held in a `Mutex`
-/// so installers serialize against one another; the IRQ path grabs a
-/// local copy (a single function pointer) and releases the lock before
-/// invoking the user code so the handler can itself call back into the
-/// IOMMU path without re-entering.
-pub static FAULT_HANDLER: Mutex<Option<FaultHandlerFn>> = Mutex::new(None);
+/// Shared slot for the user-supplied fault callback.
+///
+/// Held as a lock-free [`AtomicPtr`] rather than a mutex so the IRQ
+/// dispatch path can never block on installer code. On x86_64 a
+/// function pointer and a raw pointer share the same size, layout, and
+/// alignment, so a `FaultHandlerFn` round-trips cleanly through
+/// `AtomicPtr<()>` via `as`/`transmute`. `Release` on write pairs with
+/// `Acquire` on read to publish the handler to other cores; the IRQ
+/// path never allocates, never spins, and never contends with an
+/// installer.
+static FAULT_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install `handler` into the shared slot, replacing any previous one.
 pub fn install(handler: FaultHandlerFn) {
-    *FAULT_HANDLER.lock() = Some(handler);
+    FAULT_HANDLER.store(handler as *mut (), Ordering::Release);
 }
 
-/// Snapshot the current handler without holding the lock across the
-/// invocation. Called from IRQ context — returns `None` if the
-/// corresponding vendor never called `install_fault_handler`.
+/// Snapshot the current handler from IRQ context. Returns `None` if
+/// no vendor has called [`install`] yet. Lock-free and bounded — safe
+/// to invoke from an IOMMU-fault ISR.
 pub fn current() -> Option<FaultHandlerFn> {
-    *FAULT_HANDLER.lock()
+    let raw = FAULT_HANDLER.load(Ordering::Acquire);
+    if raw.is_null() {
+        None
+    } else {
+        // SAFETY: every non-null value in the slot was published by
+        // `install` from a valid `FaultHandlerFn`. Function pointers and
+        // `*mut ()` share size and alignment on x86_64, so the transmute
+        // round-trips the exact bit pattern `install` stored.
+        Some(unsafe { core::mem::transmute::<*mut (), FaultHandlerFn>(raw) })
+    }
 }
 
 /// Default IOMMU fault handler installed at boot so the IRQ vector is

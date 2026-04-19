@@ -186,9 +186,17 @@ pub fn install_units(units: Vec<RegisteredUnit>) {
 /// Install a single [`IdentityUnit`] as the sole registered unit. Used
 /// by the Track E.3 fallback path when ACPI reports no IOMMU or vendor
 /// bring-up fails.
+///
+/// `bring_up` is invoked on the unit before registration so the
+/// [`IommuUnit`] contract — which requires bring-up before
+/// `create_domain` — is satisfied for the identity fallback just like
+/// for real hardware units.
 pub fn install_identity_fallback() {
-    let unit = RegisteredUnit::Identity(IdentityUnit::new(0));
-    install_units(alloc::vec![unit]);
+    let mut identity = IdentityUnit::new(0);
+    identity
+        .bring_up()
+        .expect("IdentityUnit::bring_up is infallible");
+    install_units(alloc::vec![RegisteredUnit::Identity(identity)]);
 }
 
 /// `true` when at least one `IommuUnit` (real or identity-fallback) has
@@ -230,10 +238,18 @@ pub fn create_domain(unit_index: usize) -> Result<DmaDomain, IommuError> {
 }
 
 /// Destroy a previously-created domain on the given unit index.
+///
+/// On the out-of-range error path the passed [`DmaDomain`] is released
+/// so its debug-build Drop leak-guard does not fire — callers that hit
+/// a registry slot mismatch still get a clean error and the handle is
+/// consumed exactly once.
 #[allow(dead_code)]
 pub fn destroy_domain(unit_index: usize, domain: DmaDomain) -> Result<(), IommuError> {
     let mut reg = REGISTRY.lock();
-    let unit = reg.get_mut(unit_index).ok_or(IommuError::NotAvailable)?;
+    let Some(unit) = reg.get_mut(unit_index) else {
+        domain.release();
+        return Err(IommuError::NotAvailable);
+    };
     unit.destroy_domain(domain)
 }
 

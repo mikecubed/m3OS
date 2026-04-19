@@ -83,8 +83,11 @@ struct RxDescRing {
     /// `DmaBuffer` rather than one contiguous slab keeps Drop simple and
     /// mirrors the virtio-net approach.
     bufs: Vec<DmaBuffer<[u8]>>,
-    /// Cached physical address of the ring's first descriptor.
-    ring_phys: u64,
+    /// Cached bus address of the ring's first descriptor. Under Phase
+    /// 55a IOMMU translation this is an IOVA, not a host physical
+    /// address; the hardware sees it directly and the host does not
+    /// translate again.
+    ring_bus: u64,
     /// Cached per-slot buffer physical addresses.
     buf_phys: Vec<u64>,
     /// Software tail — the next slot the task will hand back to hardware.
@@ -95,7 +98,9 @@ struct RxDescRing {
 struct TxDescRing {
     descs: DmaBuffer<[E1000TxDesc]>,
     bufs: Vec<DmaBuffer<[u8]>>,
-    ring_phys: u64,
+    /// Bus address of the first descriptor — IOVA when IOMMU is active,
+    /// host physical otherwise.
+    ring_bus: u64,
     buf_phys: Vec<u64>,
     /// Next free software tail.  Hardware's TDT register tracks the same
     /// value (advanced by `e1000_transmit` after filling the slot).
@@ -123,7 +128,7 @@ impl RxDescRing {
         // a multiple of 8 (checked at compile time below).
         const _: () = assert!(RX_RING_SIZE.is_multiple_of(8));
         const _: () = assert!(RX_RING_SIZE <= 4096);
-        let ring_phys = descs.bus_address();
+        let ring_bus = descs.bus_address();
 
         let mut bufs: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(RX_RING_SIZE);
         let mut buf_phys: Vec<u64> = Vec::with_capacity(RX_RING_SIZE);
@@ -137,7 +142,7 @@ impl RxDescRing {
         let mut ring = RxDescRing {
             descs,
             bufs,
-            ring_phys,
+            ring_bus,
             buf_phys,
             next_to_read: 0,
         };
@@ -182,7 +187,7 @@ impl TxDescRing {
             .map_err(|_| "tx ring DMA alloc failed")?;
         const _: () = assert!(TX_RING_SIZE.is_multiple_of(8));
         const _: () = assert!(TX_RING_SIZE <= 4096);
-        let ring_phys = descs.bus_address();
+        let ring_bus = descs.bus_address();
 
         let mut bufs: Vec<DmaBuffer<[u8]>> = Vec::with_capacity(TX_RING_SIZE);
         let mut buf_phys: Vec<u64> = Vec::with_capacity(TX_RING_SIZE);
@@ -196,7 +201,7 @@ impl TxDescRing {
         let mut ring = TxDescRing {
             descs,
             bufs,
-            ring_phys,
+            ring_bus,
             buf_phys,
             next_to_write: 0,
         };
@@ -694,8 +699,8 @@ fn init_with_handle(handle: pci::PciDeviceHandle) -> Result<(), &'static str> {
     let rx_ring_bytes = (RX_RING_SIZE * core::mem::size_of::<E1000RxDesc>()) as u32;
     let tx_ring_bytes = (TX_RING_SIZE * core::mem::size_of::<E1000TxDesc>()) as u32;
 
-    mmio.write_reg::<u32>(E1000Regs::RDBAL, (rx.ring_phys & 0xFFFF_FFFF) as u32);
-    mmio.write_reg::<u32>(E1000Regs::RDBAH, (rx.ring_phys >> 32) as u32);
+    mmio.write_reg::<u32>(E1000Regs::RDBAL, (rx.ring_bus & 0xFFFF_FFFF) as u32);
+    mmio.write_reg::<u32>(E1000Regs::RDBAH, (rx.ring_bus >> 32) as u32);
     mmio.write_reg::<u32>(E1000Regs::RDLEN, rx_ring_bytes);
     mmio.write_reg::<u32>(E1000Regs::RDH, 0);
     // Hand every slot to hardware: RDT points at the last valid descriptor.
@@ -704,8 +709,8 @@ fn init_with_handle(handle: pci::PciDeviceHandle) -> Result<(), &'static str> {
     // Make sure the first pending descriptor is the slot the task will read.
     rx.next_to_read = 0;
 
-    mmio.write_reg::<u32>(E1000Regs::TDBAL, (tx.ring_phys & 0xFFFF_FFFF) as u32);
-    mmio.write_reg::<u32>(E1000Regs::TDBAH, (tx.ring_phys >> 32) as u32);
+    mmio.write_reg::<u32>(E1000Regs::TDBAL, (tx.ring_bus & 0xFFFF_FFFF) as u32);
+    mmio.write_reg::<u32>(E1000Regs::TDBAH, (tx.ring_bus >> 32) as u32);
     mmio.write_reg::<u32>(E1000Regs::TDLEN, tx_ring_bytes);
     mmio.write_reg::<u32>(E1000Regs::TDH, 0);
     mmio.write_reg::<u32>(E1000Regs::TDT, 0);

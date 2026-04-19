@@ -53,14 +53,18 @@ pub struct IdentityUnit {
     next_domain_id: u32,
     /// Domain IDs currently alive (awaiting `destroy_domain`).
     live_domains: Vec<DomainId>,
-    /// `true` after `bring_up` has been called at least once. The unit is
-    /// functional even before bring-up, but we honor the trait contract.
+    /// `true` after [`IommuUnit::bring_up`] has been called at least once.
+    /// The [`IommuUnit`] trait contract requires this to be true before any
+    /// `create_domain` / `map` / `flush` call; [`IdentityUnit`] honors that
+    /// gate so swapping a real VT-d / AMD-Vi unit for the identity fallback
+    /// does not change caller-observable ordering.
     brought_up: bool,
 }
 
 impl IdentityUnit {
-    /// Create a new identity-map unit. The unit is usable immediately; calling
-    /// [`IommuUnit::bring_up`] is still permitted (and idempotent).
+    /// Create a new identity-map unit. The caller must invoke
+    /// [`IommuUnit::bring_up`] before any other method — matching the
+    /// `IommuUnit` trait contract. Bring-up is infallible and idempotent.
     pub const fn new(unit_index: usize) -> Self {
         Self {
             unit_index,
@@ -88,6 +92,9 @@ impl IommuUnit for IdentityUnit {
     }
 
     fn create_domain(&mut self) -> Result<DmaDomain, IommuError> {
+        if !self.brought_up {
+            return Err(IommuError::NotAvailable);
+        }
         let id = DomainId(self.next_domain_id);
         self.next_domain_id = self.next_domain_id.saturating_add(1);
         self.live_domains.push(id);
@@ -95,6 +102,10 @@ impl IommuUnit for IdentityUnit {
     }
 
     fn destroy_domain(&mut self, domain: DmaDomain) -> Result<(), IommuError> {
+        if !self.brought_up {
+            domain.release();
+            return Err(IommuError::NotAvailable);
+        }
         if domain.unit_index() != self.unit_index {
             // The caller passed us a handle belonging to another unit. We
             // consume it here (release suppresses the Drop leak-guard) and
@@ -121,6 +132,9 @@ impl IommuUnit for IdentityUnit {
         len: usize,
         _flags: MapFlags,
     ) -> Result<(), DomainError> {
+        if !self.brought_up {
+            return Err(DomainError::InvalidRange);
+        }
         if len == 0 {
             return Err(DomainError::InvalidRange);
         }
@@ -132,6 +146,9 @@ impl IommuUnit for IdentityUnit {
     }
 
     fn unmap(&mut self, domain: DomainId, _iova: Iova, len: usize) -> Result<(), DomainError> {
+        if !self.brought_up {
+            return Err(DomainError::InvalidRange);
+        }
         if len == 0 {
             return Err(DomainError::InvalidRange);
         }
@@ -143,6 +160,9 @@ impl IommuUnit for IdentityUnit {
     }
 
     fn flush(&mut self, domain: DomainId) -> Result<(), IommuError> {
+        if !self.brought_up {
+            return Err(IommuError::NotAvailable);
+        }
         if !self.live_domains.contains(&domain) {
             return Err(IommuError::Invalid);
         }
@@ -189,6 +209,7 @@ mod tests {
     #[test]
     fn create_destroy_domain_cycle() {
         let mut unit = IdentityUnit::new(3);
+        unit.bring_up().unwrap();
         let domain = unit.create_domain().expect("create_domain should succeed");
         assert_eq!(domain.unit_index(), 3);
         assert_eq!(unit.live_domain_count(), 1);
@@ -201,6 +222,8 @@ mod tests {
     fn destroy_domain_with_wrong_unit_fails() {
         let mut unit_a = IdentityUnit::new(1);
         let mut unit_b = IdentityUnit::new(2);
+        unit_a.bring_up().unwrap();
+        unit_b.bring_up().unwrap();
         let domain = unit_a.create_domain().expect("create ok");
         // Fabricate a handle stamped with unit_a's index so unit_b must
         // reject it. `destroy_domain` consumes the handle regardless of
@@ -218,6 +241,7 @@ mod tests {
     #[test]
     fn create_domain_returns_unique_ids() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         let d1 = unit.create_domain().unwrap();
         let d2 = unit.create_domain().unwrap();
         let d3 = unit.create_domain().unwrap();
@@ -232,6 +256,7 @@ mod tests {
     #[test]
     fn map_unmap_succeed_as_noop() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         let domain = unit.create_domain().unwrap();
         let id = domain.id();
         // Identity mapping: IOVA == phys.
@@ -248,6 +273,7 @@ mod tests {
     #[test]
     fn zero_length_map_is_rejected() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         let domain = unit.create_domain().unwrap();
         let id = domain.id();
         let err = unit
@@ -260,6 +286,7 @@ mod tests {
     #[test]
     fn map_to_unknown_domain_fails() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         let stale = DomainId(42);
         let err = unit
             .map(stale, Iova(0x1000), PhysAddr(0x1000), 4096, MapFlags::READ)
@@ -270,6 +297,7 @@ mod tests {
     #[test]
     fn flush_unknown_domain_fails() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         let err = unit
             .flush(DomainId(99))
             .expect_err("flush on unknown domain must fail");
@@ -279,6 +307,7 @@ mod tests {
     #[test]
     fn install_fault_handler_succeeds_as_noop() {
         let mut unit = IdentityUnit::new(0);
+        unit.bring_up().unwrap();
         fn handler(_rec: &super::super::contract::FaultRecord) {}
         assert!(unit.install_fault_handler(handler).is_ok());
     }
@@ -298,6 +327,7 @@ mod tests {
     #[test]
     fn double_destroy_fails() {
         let mut unit = IdentityUnit::new(5);
+        unit.bring_up().unwrap();
         let domain = unit.create_domain().unwrap();
         let id = domain.id();
         // Build a second `DmaDomain` handle with the same id/unit — simulate
@@ -308,5 +338,54 @@ mod tests {
             .destroy_domain(phantom)
             .expect_err("double-destroy must fail");
         assert_eq!(err, IommuError::Invalid);
+    }
+
+    #[test]
+    fn create_domain_before_bring_up_returns_not_available() {
+        // The IommuUnit trait contract requires bring_up to succeed before
+        // create_domain. IdentityUnit honors that gate so identity-fallback
+        // slots cannot diverge from real vendor units on method ordering.
+        let mut unit = IdentityUnit::new(0);
+        let err = unit
+            .create_domain()
+            .expect_err("create_domain before bring_up must fail");
+        assert_eq!(err, IommuError::NotAvailable);
+    }
+
+    #[test]
+    fn map_before_bring_up_returns_invalid_range() {
+        let mut unit = IdentityUnit::new(0);
+        let err = unit
+            .map(
+                DomainId(1),
+                Iova(0x1000),
+                PhysAddr(0x1000),
+                4096,
+                MapFlags::READ,
+            )
+            .expect_err("map before bring_up must fail");
+        assert_eq!(err, DomainError::InvalidRange);
+    }
+
+    #[test]
+    fn flush_before_bring_up_returns_not_available() {
+        let mut unit = IdentityUnit::new(0);
+        let err = unit
+            .flush(DomainId(1))
+            .expect_err("flush before bring_up must fail");
+        assert_eq!(err, IommuError::NotAvailable);
+    }
+
+    #[test]
+    fn destroy_domain_before_bring_up_releases_handle() {
+        // The pre-bring-up error path still consumes the passed handle so
+        // the caller's DmaDomain Drop leak-guard stays quiet in debug
+        // builds. Failing to release here would panic on drop.
+        let mut unit = IdentityUnit::new(0);
+        let phantom = DmaDomain::new(DomainId(1), 0);
+        let err = unit
+            .destroy_domain(phantom)
+            .expect_err("destroy_domain before bring_up must fail");
+        assert_eq!(err, IommuError::NotAvailable);
     }
 }

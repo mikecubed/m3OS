@@ -17,21 +17,14 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 
 /// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
 ///
-/// Phase 55a Track F.1: exported as a single reusable slice so every
-/// IOMMU-aware launcher (cmd_run, cmd_run_gui, cmd_test) appends the same
-/// arguments. The legacy QEMU default is `pc-i440fx`, which does not
-/// accept `intel-iommu`; the single `-machine q35,kernel_irqchip=split`
-/// pair both switches to the q35 chipset and satisfies the
-/// `kernel_irqchip=split` requirement. `-device intel-iommu,x-scalable-mode=off`
-/// then activates the legacy-mode VT-d unit that Phase 55a targets.
-/// Constant lives once, consumed via [`append_iommu_args`] in QEMU-args
-/// assembly.
-pub const IOMMU_QEMU_ARGS: &[&str] = &[
-    "-machine",
-    "q35,kernel_irqchip=split",
-    "-device",
-    "intel-iommu,x-scalable-mode=off",
-];
+/// Phase 55a Track F.1: the IOMMU-specific device arguments appended
+/// whenever `--iommu` is set. The partnering `-machine q35,kernel_irqchip=split`
+/// requirement is emitted by [`build_machine_arg`], which also folds in any
+/// display-mode machine options (e.g. `pcspk-audiodev=noaudio` under `--gui`)
+/// so QEMU sees exactly one `-machine` flag rather than two — multiple
+/// `-machine` arguments would let the later invocation clobber the earlier
+/// one and silently drop settings.
+pub const IOMMU_QEMU_ARGS: &[&str] = &["-device", "intel-iommu,x-scalable-mode=off"];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
@@ -1635,10 +1628,16 @@ fn qemu_args_with_devices_resolved(
                 "sdl".to_string(),
                 "-audiodev".to_string(),
                 "none,id=noaudio".to_string(),
-                "-machine".to_string(),
-                "pcspk-audiodev=noaudio".to_string(),
             ]);
         }
+    }
+
+    // Phase 55a Track F.1: collect every required `-machine` property into a
+    // single comma-joined value. Emitting two `-machine` options would let QEMU
+    // silently drop the earlier one — e.g. `--gui --iommu` would lose
+    // `pcspk-audiodev=noaudio` when `q35,kernel_irqchip=split` followed it.
+    if let Some(value) = build_machine_arg(display_mode, devices.iommu) {
+        args.extend(["-machine".to_string(), value]);
     }
 
     // Phase 16: virtio-net NIC with QEMU user-mode networking.
@@ -1682,16 +1681,40 @@ fn qemu_args_with_devices_resolved(
     }
 
     // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
-    // the q35 machine. `IOMMU_QEMU_ARGS` carries both the `-device
-    // intel-iommu,x-scalable-mode=off` pair and the required
-    // `-machine kernel_irqchip=split` override (QEMU rejects `intel-iommu`
-    // under the default `on` irqchip model).
+    // the q35 machine. The partnering `q35,kernel_irqchip=split` machine
+    // property is emitted by `build_machine_arg` above; `IOMMU_QEMU_ARGS`
+    // carries only the `-device intel-iommu,x-scalable-mode=off` pair.
     if devices.iommu {
         args.extend(IOMMU_QEMU_ARGS.iter().map(|s| (*s).to_string()));
     }
 
     args.extend(["-no-reboot".to_string()]);
     args
+}
+
+/// Build the consolidated `-machine` value for a given launcher
+/// configuration, or `None` if no machine-level options are needed.
+///
+/// QEMU treats multiple `-machine` arguments as separate invocations —
+/// the later one wipes settings established by the earlier one — so
+/// every required property must ride on a single flag. `--iommu`
+/// contributes `q35,kernel_irqchip=split` (the VT-d device rejects the
+/// default `kernel_irqchip=on` model); `--gui` contributes
+/// `pcspk-audiodev=noaudio` (so the PC speaker does not try to bind a
+/// null audio backend). Combined configurations join both with a comma.
+fn build_machine_arg(display_mode: QemuDisplayMode, iommu: bool) -> Option<String> {
+    let mut opts: Vec<&'static str> = Vec::new();
+    if iommu {
+        opts.push("q35,kernel_irqchip=split");
+    }
+    if matches!(display_mode, QemuDisplayMode::Gui) {
+        opts.push("pcspk-audiodev=noaudio");
+    }
+    if opts.is_empty() {
+        None
+    } else {
+        Some(opts.join(","))
+    }
 }
 
 fn launch_qemu(uefi_image: &Path, display_mode: QemuDisplayMode) {
@@ -7729,17 +7752,14 @@ mod tests {
 
     #[test]
     fn iommu_qemu_args_constant_matches_live_wiring() {
-        // F.1 acceptance: the IOMMU args live as one reusable slice so
-        // callers never hand-roll them. Round-trip: constant value equals
-        // what qemu_args_with_devices emits when `iommu = true`.
+        // F.1 acceptance: the IOMMU device args live as one reusable slice
+        // so callers never hand-roll them. The partnering `-machine
+        // q35,kernel_irqchip=split` property is emitted separately (and
+        // potentially combined with GUI machine options) by
+        // `build_machine_arg`.
         assert_eq!(
             IOMMU_QEMU_ARGS,
-            &[
-                "-device",
-                "intel-iommu,x-scalable-mode=off",
-                "-machine",
-                "kernel_irqchip=split",
-            ]
+            &["-device", "intel-iommu,x-scalable-mode=off",]
         );
         let args = qemu_args_with_devices_resolved(
             Path::new("target/boot-uefi-m3os.img"),
@@ -7762,6 +7782,44 @@ mod tests {
                 .unwrap_or_else(|| panic!("IOMMU_QEMU_ARGS entry {want:?} missing from argv"));
             i += rel + 1;
         }
+    }
+
+    #[test]
+    fn qemu_args_with_iommu_and_gui_emit_single_machine_with_both_props() {
+        // Regression: `--iommu --gui` previously emitted two `-machine`
+        // arguments; QEMU would drop the earlier one's settings. The
+        // consolidated `-machine` value must contain both the IOMMU
+        // q35/kernel_irqchip properties and the GUI pcspk property.
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Gui,
+            DeviceSet {
+                nvme: false,
+                e1000: false,
+                iommu: true,
+            },
+            None,
+        );
+        let machine_count = args.iter().filter(|a| *a == "-machine").count();
+        assert_eq!(
+            machine_count, 1,
+            "exactly one `-machine` argument required, got {machine_count}"
+        );
+        let machine_idx = args.iter().position(|a| a == "-machine").unwrap();
+        let value = &args[machine_idx + 1];
+        assert!(
+            value.contains("q35"),
+            "consolidated -machine missing q35: {value}"
+        );
+        assert!(
+            value.contains("kernel_irqchip=split"),
+            "consolidated -machine missing kernel_irqchip=split: {value}"
+        );
+        assert!(
+            value.contains("pcspk-audiodev=noaudio"),
+            "consolidated -machine missing pcspk-audiodev=noaudio: {value}"
+        );
     }
 
     #[test]

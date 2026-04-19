@@ -241,9 +241,11 @@ pub fn init() {
                     },
                     reason,
                 );
-                units.push(RegisteredUnit::Identity(
-                    kernel_core::iommu::identity::IdentityUnit::new(slot),
-                ));
+                let mut identity = kernel_core::iommu::identity::IdentityUnit::new(slot);
+                identity
+                    .bring_up()
+                    .expect("IdentityUnit::bring_up is infallible");
+                units.push(RegisteredUnit::Identity(identity));
             }
         }
     }
