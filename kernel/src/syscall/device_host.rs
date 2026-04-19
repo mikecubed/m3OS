@@ -394,3 +394,44 @@ pub(crate) fn test_owner_of(key: DeviceCapKey) -> Option<Pid> {
     let reg = DEVICE_HOST_REGISTRY.lock();
     reg.core.owner_of(key)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track B.4 — test-only synthetic IRQ bridge (TDD RED)
+// ---------------------------------------------------------------------------
+//
+// The B.4 integration test exercises the end-to-end path:
+//
+//   1. `sys_device_irq_subscribe` accepts a claimed device cap,
+//   2. the ISR shim it installs signals the requested bit on the bound
+//      `Notification` atomically,
+//   3. `release_for_pid` tears the binding back down so the vector is
+//      reusable.
+//
+// In the RED commit this helper is a stub that returns `NotImplemented` so
+// the integration test fails. The GREEN commit that lands the syscall
+// replaces the body with the real synthetic-IRQ flow (MSI / MSI-X / INTx
+// → `device_irq_notification_shim` → `notification::signal_irq_bit`).
+
+/// Error surface for the test-only IRQ bridge helper. Lifted out of
+/// `cfg(test)`-only so the enum itself can carry `NotImplemented` in the
+/// RED commit while the GREEN commit extends it with BindFailed /
+/// NotificationUnavailable variants.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestIrqError {
+    /// The B.4 implementation is still the scaffold stub — the helper
+    /// cannot make progress until `sys_device_irq_subscribe` lands.
+    NotImplemented,
+}
+
+/// Synthetic IRQ bridge helper — see the module-level doc above.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub(crate) fn test_synthetic_irq_subscribe_and_signal(
+    pid: Pid,
+    key: DeviceCapKey,
+    bit_index: u8,
+    vector_offset: u8,
+) -> Result<u64, TestIrqError> {
+    Err(TestIrqError::NotImplemented)
+}

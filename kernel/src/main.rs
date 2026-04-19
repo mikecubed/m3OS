@@ -1341,4 +1341,100 @@ mod tests {
 
         serial_println!("device_host B.1 integration test passed");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b Track B.4 — IRQ-subscribe + notification bridging (RED)
+    // -----------------------------------------------------------------------
+
+    /// Track B.4: a synthetic device IRQ delivered through the device-IRQ
+    /// dispatch table (the same path a real MSI vector would take) sets the
+    /// requested bit atomically on the bound notification. `release_for_pid`
+    /// tears the binding down so the vector is reusable.
+    ///
+    /// The test reaches into `sys_device_irq_subscribe`'s internals via the
+    /// `test_synthetic_irq_subscribe_and_signal` helper — this bypasses MSI
+    /// capability programming (which cannot be done from the `test_main`
+    /// PID) and drives the ISR shim directly. Production callers go through
+    /// `allocate_msi_vectors` → IDT stub → `device_irq_notification_shim`;
+    /// the test substitutes `dispatch_device_irq_for_test` for the IDT stub
+    /// step and asserts identical side effects on the notification word.
+    ///
+    /// RED commit: the helper returns `Err(TestIrqError::NotImplemented)`
+    /// so this test fails. The GREEN commit wires the synthetic bridge.
+    #[test_case]
+    fn device_host_irq_subscribe_signals_notification_bit() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_release_for_pid, test_synthetic_irq_subscribe_and_signal,
+            test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        crate::pci::init();
+
+        // Pick a free BDF — mirror B.1's approach.
+        let mut key: Option<DeviceCapKey> = None;
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if crate::syscall::device_host::test_owner_of(k).is_none() {
+                key = Some(k);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(key) = key else {
+            serial_println!("device_host B.4 test skipped: no free PCI device in QEMU");
+            return;
+        };
+
+        const PID_D: crate::process::Pid = 0xC0FF_EE04;
+        let _ = test_release_for_pid(PID_D);
+
+        match test_try_claim_for_pid(PID_D, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "device_host B.4 test skipped: BDF {:02x}:{:02x}.{} already claimed",
+                    key.bus,
+                    key.dev,
+                    key.func,
+                );
+                return;
+            }
+            Err(e) => panic!("B.4 claim failed: {:?}", e),
+        }
+
+        // Bind bit 3 to vector offset 0. The helper allocates the
+        // notification, installs the binding, drives a synthetic IRQ, and
+        // returns the pending bits observed on the notification.
+        let pending = match test_synthetic_irq_subscribe_and_signal(PID_D, key, 3, 0) {
+            Ok(p) => p,
+            Err(e) => panic!("B.4 synthetic bind/signal failed: {:?}", e),
+        };
+        assert_eq!(
+            pending,
+            1u64 << 3,
+            "ISR shim must have set exactly bit 3 on the bound notification (got {:#x})",
+            pending,
+        );
+
+        // Drive a second synthetic IRQ through a different bit to prove the
+        // shim is re-armable (no mask state leaks across deliveries). The
+        // helper releases + re-allocates the notification internally, so
+        // each call starts from a pending=0 baseline.
+        let pending_bit7 = match test_synthetic_irq_subscribe_and_signal(PID_D, key, 7, 1) {
+            Ok(p) => p,
+            Err(e) => panic!("B.4 second synthetic bind failed: {:?}", e),
+        };
+        assert_eq!(pending_bit7, 1u64 << 7);
+
+        // Exit path: release_for_pid sweeps both IRQ bindings (there are
+        // none live at this point because the helper tears its binding
+        // down, but the full-lifecycle path runs for code coverage) and
+        // the claim itself.
+        let freed = test_release_for_pid(PID_D);
+        assert_eq!(freed, 1, "exactly one claim freed on exit");
+
+        serial_println!("device_host B.4 integration test passed");
+    }
 }

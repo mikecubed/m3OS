@@ -8,10 +8,14 @@
 // The module is `no_std` + `alloc`-only so it compiles for the kernel and is
 // still testable on the host via `cargo test -p kernel-core`.
 
+pub mod irq_logic;
 pub mod registry_logic;
 pub mod syscalls;
 pub mod types;
 
+pub use irq_logic::{
+    IrqBinding, IrqBindingRegistryCore, IrqRegistryError, MAX_IRQ_SUBSCRIPTIONS_PER_PID,
+};
 pub use registry_logic::{DeviceHostRegistryCore, RegistryError, RegistryPid};
 pub use types::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DmaHandle,
