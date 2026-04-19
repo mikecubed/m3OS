@@ -1,26 +1,26 @@
 //! Ethernet frame dispatch (P16-T016).
 //!
 //! Receives frames from the selected NIC driver and dispatches them based on
-//! EtherType to the appropriate protocol handler.  Phase 55 E.4 added the
-//! e1000 path alongside the original virtio-net one — both funnel through
-//! the same ARP / IPv4 handlers so protocol state is driver-agnostic.
+//! EtherType to the appropriate protocol handler.
 //!
-//! Phase 55b E.4 adds the ring-3 RemoteNic path: frames received via IPC from
-//! the userspace e1000 driver are injected through [`process_rx_frames`], the
-//! same entry point used by the in-kernel drivers so the protocol handlers are
-//! completely driver-agnostic.
+//! Phase 55b E.5: the in-kernel e1000 driver has been removed. The ring-3
+//! e1000 driver (`userspace/drivers/e1000`) delivers RX frames via
+//! `RemoteNic::inject_rx_frame` which calls [`process_rx_frames`] directly.
+//! `process_rx` now only drains virtio-net; RemoteNic frames arrive
+//! out-of-band through the IPC endpoint and are already dispatched before
+//! `process_rx` is called.
 
 use super::arp;
-use super::e1000;
 use super::ethernet;
 use super::ipv4;
 use super::virtio_net;
 
 /// Dispatch a single raw Ethernet frame into the protocol stack.
 ///
-/// This is the shared entry point for all NIC drivers — both in-kernel
-/// (virtio-net, e1000) and ring-3 (`RemoteNic` via IPC). The frame must be
-/// a complete Ethernet frame starting at the 6-byte destination MAC.
+/// This is the shared entry point for all NIC paths — the in-kernel virtio-net
+/// driver and the ring-3 e1000 driver via `RemoteNic::inject_rx_frame`. The
+/// frame must be a complete Ethernet frame starting at the 6-byte destination
+/// MAC.
 pub fn process_rx_frames(raw: &[u8]) {
     let frame = match ethernet::parse(raw) {
         Some(f) => f,
@@ -43,19 +43,15 @@ pub fn process_rx_frames(raw: &[u8]) {
     }
 }
 
-/// Process all pending received frames.
+/// Process all pending received frames from the in-kernel VirtIO-net driver.
 ///
 /// Called from the network processing task whenever a driver IRQ fires or on
-/// a periodic poll.  Drains every initialized NIC in turn; on typical QEMU
-/// configurations only one of `e1000` / `virtio-net` is present.
+/// a periodic poll. RX frames from the ring-3 e1000 driver
+/// (`userspace/drivers/e1000`) are injected directly via
+/// `RemoteNic::inject_rx_frame` → `process_rx_frames` and do not go through
+/// this function.
 pub fn process_rx() {
-    // Drain e1000 first when present; the driver's own IRQ path woke the
-    // task.  Virtio-net's `recv_frames` is cheap when idle (returns an empty
-    // Vec) so calling both in sequence is fine.
-    let mut frames = e1000::e1000_receive_packets();
-    frames.extend(virtio_net::recv_frames());
-
-    for raw in &frames {
+    for raw in &virtio_net::recv_frames() {
         process_rx_frames(raw);
     }
 }
