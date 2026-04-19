@@ -69,6 +69,18 @@ pub use dma::{DmaBuffer, DmaHandle};
 pub use mmio::{Mmio, MmioCacheMode, MmioWindowDescriptor};
 pub use syscall_backend::SyscallBackend;
 
+// ---------------------------------------------------------------------------
+// C.3 public surface re-exports
+// ---------------------------------------------------------------------------
+//
+// Track C.3 lands the concrete `IrqNotification` wrapper, the
+// `IrqBackend` indirection (so tests can swap in a mock), the
+// `DeviceCapHandle` minimal device-handle bound the wrapper
+// consumes, and the `irq_loop` convenience. Drivers that only
+// need the default syscall path `use driver_runtime::*;` and get
+// all four.
+pub use irq::{DeviceCapHandle, IrqBackend, IrqNotification, SyscallBackend, irq_loop};
+
 #[cfg(test)]
 mod tests {
     //! C.1 green smoke tests.

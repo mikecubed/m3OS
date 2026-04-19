@@ -90,6 +90,14 @@ use crate::device_host::{DeviceCapKey, DmaHandle, MmioWindowDescriptor};
 ///   exceeded its deadline without receiving a delivery. Bound by
 ///   [`crate::device_host::DRIVER_RESTART_TIMEOUT_MS`] for the
 ///   restart-bound tests in Tracks D, E, and F.
+/// - [`DriverRuntimeError::InvalidAck`][] — a driver called `ack` with
+///   a bit-mask the wrapper could not reconcile against the most
+///   recent `wait` delivery. Phase 55b Track C.3 introduces this
+///   variant so the `IrqNotification::ack` wrapper can fail typed
+///   rather than panic on stale-mask reuse or on bits outside the
+///   subscription's own assignment. See the crate-level
+///   documentation in `userspace/lib/driver_runtime/src/irq.rs` for
+///   the full semantics and the syscall-vs-no-op discussion.
 ///
 /// Variants carry data, not strings, so both kernel-side and userspace
 /// code can pattern-match without allocation. `#[non_exhaustive]` lets
@@ -112,6 +120,12 @@ pub enum DriverRuntimeError {
     /// [`IrqNotificationHandle::wait`] exceeded its deadline without a
     /// delivery.
     IrqTimeout,
+    /// An `IrqNotification::ack` call named bits the wrapper cannot
+    /// reconcile against the most recent `wait` delivery — either
+    /// bits outside the subscription's assigned mask, or bits the
+    /// previous `wait` did not return. Introduced by Phase 55b
+    /// Track C.3 for the ring-3 driver ack path.
+    InvalidAck,
 }
 
 impl From<DeviceHostError> for DriverRuntimeError {
