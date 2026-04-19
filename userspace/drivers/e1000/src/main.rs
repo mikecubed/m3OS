@@ -1,11 +1,7 @@
-//! Phase 55b Track E.1 — ring-3 e1000 driver crate scaffold.
-//!
-//! Stub binary whose `program_main` writes a fixed boot-log marker and
-//! exits, so Track F.1 can register it under the service manager and
-//! Track E.2 / E.3 can replace the body with the real bring-up and
-//! RX/TX paths. Four-place wiring lives in root `Cargo.toml`,
-//! `xtask/src/main.rs`, and `kernel/src/fs/ramdisk.rs`; the service
-//! config (place 4) is deferred to Track F.1.
+//! Phase 55b Track E.2 (Red) — tests land here before the bring-up
+//! implementation does. The Green commit fills in
+//! `init::E1000Device::bring_up` + ring allocators and wires them into
+//! `program_main` alongside a MAC-format log line.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -40,10 +36,10 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     syscall_lib::exit(101)
 }
 
+pub mod init;
+pub mod rings;
+
 /// Boot-log marker written to stdout when the driver scaffold starts.
-///
-/// F.1's service-config smoke test greps the boot log for this line,
-/// so the exact spelling is load-bearing.
 pub const BOOT_LOG_MARKER: &str = "e1000_driver: spawned\n";
 
 #[cfg(not(test))]
@@ -61,9 +57,6 @@ mod tests {
 
     #[test]
     fn boot_log_marker_matches_acceptance() {
-        // Track E.1 acceptance: `cargo xtask run` boot log records
-        // `e1000_driver: spawned`. The Red commit wires in an incorrect
-        // marker; the Green commit flips it to the real value.
         assert_eq!(BOOT_LOG_MARKER, "e1000_driver: spawned\n");
     }
 }
