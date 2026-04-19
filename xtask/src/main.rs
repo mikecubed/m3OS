@@ -1821,6 +1821,8 @@ fn cmd_check() {
         "crypto-lib",
         "crypto-test",
         "coreutils-rs",
+        // Phase 55b Track C.1 — ring-3 driver runtime library
+        "driver_runtime",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -1940,6 +1942,31 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 55b Track C.1: ensure the driver_runtime crate's host-side
+    // smoke tests (module surface + DriverRuntimeError lift) stay
+    // green. The authoritative behavioral suite against the abstract
+    // contracts lives in `kernel-core/tests/driver_runtime_contract.rs`
+    // and runs as part of the kernel-core tests invoked above; this
+    // runs the re-export smoke tests against the crate itself.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "driver_runtime",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ])
+        .status()
+        .expect("failed to run driver_runtime tests");
+
+    if !status.success() {
+        eprintln!(
+            "driver_runtime host tests failed — rerun `cargo test -p driver_runtime --target {KERNEL_CORE_HOST_TARGET}`"
+        );
+        std::process::exit(1);
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1953,7 +1980,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core and passwd host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, and driver_runtime host tests pass"
     );
 }
 
