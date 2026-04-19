@@ -585,7 +585,9 @@ fn bring_up_admin_and_identify() -> Result<(), &'static str> {
     // Identify Namespace for the selected NSID.
     let ident_ns_buf = {
         let drv = DRIVER.lock();
-        let d = drv.as_ref().ok_or("driver gone before identify namespace")?;
+        let d = drv
+            .as_ref()
+            .ok_or("driver gone before identify namespace")?;
         DmaBuffer::<[u8]>::allocate(&d.pci, 4096)
             .map_err(|_| "identify namespace DMA alloc failed")?
     };

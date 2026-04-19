@@ -73,6 +73,7 @@ use crate::pci::PciDeviceHandle;
 
 /// DMA allocation failure reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DmaError {
     /// The requested size or count is zero.
     ZeroSize,
@@ -373,7 +374,8 @@ impl<T: ?Sized> Drop for DmaBuffer<T> {
         //    skips the unmap path.
         if self.mapping_len != 0
             && let Some(ctx) = self.domain_ctx
-            && let Err(e) = registry::unmap(ctx.unit_index, ctx.domain, Iova(self.bus), self.mapping_len)
+            && let Err(e) =
+                registry::unmap(ctx.unit_index, ctx.domain, Iova(self.bus), self.mapping_len)
         {
             // Drop runs outside any error path — log and continue so we
             // at least return the physical frames to the allocator.
