@@ -290,13 +290,20 @@ if anything is wrong.
 
 ## Differences From Later Hardware Work
 
-- **Ring-0 placement is deliberate.** Phase 55 places NVMe and e1000 in
-  ring 0. Later phases will extract them into supervised ring-3 services
-  using the same pattern Phase 54 used for `vfs_server` and `net_server`.
+- **Ring-0 placement is deliberate and bounded.** Phase 55 places NVMe
+  and e1000 in ring 0 as a staged bring-up trade-off: get the hardware
+  paths working under kernel supervision before moving the trust boundary.
   The hardware-access layer is designed so its contracts are callable from
   a future userspace driver host (BAR mapping returns a handle, DMA
   allocation returns a buffer with a physical address, IRQ installation
   takes a handler) rather than being baked into kernel-only call sites.
+  That extraction is completed in
+  [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md),
+  which adds the `device_host` kernel subsystem, the four device-host
+  syscalls (`sys_device_claim`, `sys_device_bar_map`,
+  `sys_device_dma_alloc`, `sys_device_irq_subscribe`), and supervised
+  ring-3 `nvme_drv` / `e1000_drv` services built on
+  `userspace/lib/driver_runtime/`.
 - **Narrow device coverage.** Phase 55 does not attempt broad NIC or
   storage coverage. The e1000e family (82574, 82576) is explicitly **out**
   of scope; so are AHCI, xHCI, Realtek NICs, HDA, and GPU/audio hardware.
@@ -380,9 +387,9 @@ future phase can revisit them as scope expands.
 - Wi-Fi, GPU, and USB peripheral matrices
 - IOMMU-aware DMA isolation (VT-d / AMD-Vi) — delivered by
   [Phase 55a — IOMMU Substrate](./55a-iommu-substrate.md)
-- Ring-3 extraction of the NVMe and e1000 drivers following the Phase 54
-  `vfs_server` / `net_server` pattern — tracked as
-  [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md)
+- **Completed in Phase 55b:** Ring-3 extraction of the NVMe and e1000
+  drivers following the Phase 54 `vfs_server` / `net_server` pattern —
+  delivered by [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md)
 - Hardware-acceleration features not needed for the reference targets
 - e1000e family (82574, 82576, etc.), AHCI, xHCI, Realtek, HDA
 - PCIe AER, D3cold power management, hot-plug
