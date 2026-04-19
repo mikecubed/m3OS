@@ -1879,6 +1879,102 @@ mod tests {
         serial_println!("device_host B.4 integration test passed");
     }
 
+    // -- Track B.4b — caller-provided NotifId path ----------------------------
+
+    /// Track B.4b: the caller-provided notification path.
+    ///
+    /// The test pre-allocates a `Notification`, passes it to the synthetic
+    /// IRQ bind helper (simulating what `sys_device_irq_subscribe` does when
+    /// `notification_arg != SENTINEL_NEW`), verifies the ISR shim delivers
+    /// to the correct bit, and confirms that the process-exit teardown does
+    /// NOT free the caller-owned notification slot (pool count unchanged after
+    /// the binding is torn down).
+    #[test_case]
+    fn device_host_irq_subscribe_caller_provided_notif() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_release_for_pid,
+            test_synthetic_irq_subscribe_and_signal_with_existing_notif, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("device_host B.4b test skipped: no free PCI device in QEMU");
+            return;
+        };
+
+        const PID_E: crate::process::Pid = 0xC0FF_EE05;
+        let _ = test_release_for_pid(PID_E);
+
+        match test_try_claim_for_pid(PID_E, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "device_host B.4b test skipped: BDF {:02x}:{:02x}.{} already claimed",
+                    key.bus,
+                    key.dev,
+                    key.func,
+                );
+                return;
+            }
+            Err(e) => panic!("B.4b claim failed: {:?}", e),
+        }
+
+        // Pre-allocate a notification the "caller" owns.
+        let caller_notif = crate::ipc::notification::try_create()
+            .expect("notification pool must have a free slot");
+        let pool_before = crate::ipc::notification::allocated_count();
+
+        // Bind bit 5 to vector offset 2 using the caller-provided notification.
+        let pending = match test_synthetic_irq_subscribe_and_signal_with_existing_notif(
+            PID_E,
+            key,
+            caller_notif,
+            5,
+            2,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                crate::ipc::notification::release(caller_notif);
+                let _ = test_release_for_pid(PID_E);
+                panic!("B.4b synthetic bind/signal (caller-notif) failed: {:?}", e);
+            }
+        };
+
+        assert_eq!(
+            pending,
+            1u64 << 5,
+            "ISR shim must have set exactly bit 5 (got {:#x})",
+            pending,
+        );
+
+        // The notification must still be allocated — the helper did NOT release it.
+        let pool_after_unbind = crate::ipc::notification::allocated_count();
+        assert_eq!(
+            pool_after_unbind, pool_before,
+            "caller-owned notification must not be freed on IRQ unbind \
+             (before={}, after={})",
+            pool_before, pool_after_unbind,
+        );
+
+        // Cleanup: release the claim and then manually free the notification
+        // (simulating the caller's own cap table teardown).
+        let _ = test_release_for_pid(PID_E);
+
+        // After release_for_pid on a caller-owned notif, the pool count must
+        // still be the same (the process-exit path must not have freed it).
+        let pool_after_exit = crate::ipc::notification::allocated_count();
+        assert_eq!(
+            pool_after_exit, pool_before,
+            "caller-owned notification must not be freed by process-exit sweep \
+             (before={}, after={})",
+            pool_before, pool_after_exit,
+        );
+
+        // Now the caller explicitly frees it (cap table cleared).
+        crate::ipc::notification::release(caller_notif);
+
+        serial_println!("device_host B.4b caller-provided notif test passed");
+    }
+
     // -- Track F.3 — Cross-device negative tests ------------------------------
     //
     // These four tests prove the central isolation invariant: a driver process
