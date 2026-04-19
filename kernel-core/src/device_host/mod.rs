@@ -8,6 +8,7 @@
 // The module is `no_std` + `alloc`-only so it compiles for the kernel and is
 // still testable on the host via `cargo test -p kernel-core`.
 
+pub mod syscalls;
 pub mod types;
 
 pub use types::{
