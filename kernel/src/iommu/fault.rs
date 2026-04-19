@@ -21,8 +21,23 @@
 //! beyond the `log` crate backend (which the serial subsystem makes
 //! IRQ-safe). Keep new code in this file to the same standard.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use kernel_core::iommu::contract::{FaultHandlerFn, FaultRecord};
 use spin::Mutex;
+
+/// Monotonic count of IOMMU faults the kernel has observed since boot.
+///
+/// Incremented once per call to [`log_fault_event`] — so every fault
+/// delivered through the shared dispatch path bumps the counter, whether
+/// or not a user handler is installed. Diagnostic and test code reads
+/// this via [`fault_count`] to verify the fault-delivery path is alive
+/// without having to parse serial logs.
+///
+/// `Relaxed` ordering is sufficient: this is a single-writer-per-fault
+/// observable that the test code reads with no cross-thread
+/// synchronization requirements.
+static FAULT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Shared slot for the user-supplied fault callback. Held in a `Mutex`
 /// so installers serialize against one another; the IRQ path grabs a
@@ -64,6 +79,7 @@ pub fn default_handler(_record: &FaultRecord) {
 /// [iommu] subsystem=iommu vendor=vtd requester_bdf=0x0100 iova=0xdeadbeef fault_reason=0x0005
 /// ```
 pub fn log_fault_event(vendor: &str, requester_bdf: u16, iova: u64, fault_reason: u16) {
+    FAULT_COUNTER.fetch_add(1, Ordering::Relaxed);
     log::warn!(
         "[iommu] subsystem=iommu vendor={} requester_bdf=0x{:04x} iova={:#x} fault_reason={:#x}",
         vendor,
@@ -71,6 +87,20 @@ pub fn log_fault_event(vendor: &str, requester_bdf: u16, iova: u64, fault_reason
         iova,
         fault_reason
     );
+}
+
+/// Monotonic IOMMU-fault count since boot.
+///
+/// Read by the F.3 fault-delivery test and by diagnostic tooling. Does
+/// not distinguish VT-d from AMD-Vi and does not preserve per-BDF
+/// history — it is strictly a "has any fault been logged?" observable.
+///
+/// Marked `#[allow(dead_code)]` because the only in-tree caller today
+/// is `#[cfg(test)]` F.3 and a future diagnostic command will surface
+/// the value through `meminfo` / `dmesg`.
+#[allow(dead_code)]
+pub fn fault_count() -> u64 {
+    FAULT_COUNTER.load(Ordering::Relaxed)
 }
 
 /// Deliver one fault record through the log path and the installed
