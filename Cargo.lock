@@ -451,6 +451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver_runtime"
+version = "0.55.2"
+dependencies = [
+ "kernel-core",
+ "spin",
+ "syscall-lib",
+]
+
+[[package]]
 name = "echo-args"
 version = "0.1.0"
 dependencies = [

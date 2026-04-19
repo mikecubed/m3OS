@@ -54,6 +54,8 @@ members = [
     "userspace/vfs_server",
     "userspace/fat_server",
     "userspace/net_server",
+    # Phase 55b Track C.1 — ring-3 driver runtime library
+    "userspace/lib/driver_runtime",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
