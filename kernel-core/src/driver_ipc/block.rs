@@ -1,52 +1,142 @@
 //! Block-driver IPC protocol schema — Phase 55b Track A.2.
 //!
-//! TDD red-phase stub: types and function shapes exist so the test module
-//! compiles; encoding is deliberately wrong so assertions fail. The green
-//! commit replaces `encode_*` / `decode_*` with the real implementation.
+//! Single source of truth for the block-driver protocol spoken between the
+//! kernel-side `RemoteBlockDevice` facade (Phase 55b Track D.4) and the
+//! userspace NVMe driver process (Phase 55b Tracks D.2 / D.3). Declaring the
+//! schema in `kernel-core` makes it host-testable and guarantees both sides
+//! compile against the same message layout — divergence becomes a compile
+//! error rather than a runtime corruption bug.
+//!
+//! Layout is packed little-endian. Bulk payload data (write data on the
+//! request side, read data on the reply side) does not appear inline; it
+//! travels through a separate grant capability referenced by a `u32`
+//! payload-grant handle carried alongside the header. This schema pins the
+//! handle's byte offset so the encode and decode halves stay in lock-step
+//! across the kernel-ring and userspace-ring implementations.
 
 #![allow(clippy::needless_range_loop)]
 
 // ------------------------------------------------------------------------
-// Message-label constants — shapes only; values are deliberately wrong in
-// the red stub so the pinning tests fail until the green commit lands.
+// Message-label constants
 // ------------------------------------------------------------------------
 
-pub const BLK_READ: u16 = 0;
-pub const BLK_WRITE: u16 = 0;
-pub const BLK_STATUS: u16 = 0;
+/// IPC message label for a block read request.
+///
+/// Reserved from the label range kept clear by the Phase 54 VFS protocol
+/// block so the `0x5500`-range stays collision-free for Phase 55b drivers.
+pub const BLK_READ: u16 = 0x5501;
 
-pub const MAX_SECTORS_PER_REQUEST: u32 = 0;
+/// IPC message label for a block write request.
+pub const BLK_WRITE: u16 = 0x5502;
 
+/// IPC message label for a block status / reply envelope.
+pub const BLK_STATUS: u16 = 0x5503;
+
+/// Hard upper bound on the number of sectors a single request may carry.
+///
+/// The bound is enforced at the `RemoteBlockDevice` facade (Phase 55b Track
+/// D.4), *not* inside the driver process — a compliant driver must still
+/// reject an oversized request, but the kernel-side facade is the first
+/// line of defence. Pinned here so every participant agrees on the same
+/// number.
+pub const MAX_SECTORS_PER_REQUEST: u32 = 256;
+
+/// Serialized size of a [`BlkRequestHeader`] plus payload-grant handle.
+///
+/// Layout (packed little-endian):
+///
+/// - `[0..2]`   `kind: u16`
+/// - `[2..10]`  `cmd_id: u64`
+/// - `[10..18]` `lba: u64`
+/// - `[18..22]` `sector_count: u32`
+/// - `[22..26]` `flags: u32`
+/// - `[26..30]` `payload_grant: u32` (IPC grant handle; `0` for no payload)
+///
+/// The grant handle rides with the header so the receiver can resolve it in
+/// the same frame it pulls the header out of. Higher-level plumbing (the
+/// kernel IPC layer) decides how a `u32` handle maps back to a
+/// `Capability::Grant`; this schema is only concerned with where in the
+/// payload byte-stream the handle sits.
 pub const BLK_REQUEST_HEADER_SIZE: usize = 30;
+
+/// Serialized size of a [`BlkReplyHeader`] plus payload-grant handle.
+///
+/// Layout (packed little-endian):
+///
+/// - `[0..8]`   `cmd_id: u64`
+/// - `[8]`      `status: u8`  (see [`BlockDriverError::to_byte`])
+/// - `[9..12]`  reserved, must be zero
+/// - `[12..16]` `bytes: u32`
+/// - `[16..20]` `payload_grant: u32` (IPC grant handle carrying the read
+///   data; `0` for write replies or error replies with no data)
 pub const BLK_REPLY_HEADER_SIZE: usize = 20;
 
 // ------------------------------------------------------------------------
 // BlockDriverError
 // ------------------------------------------------------------------------
 
+/// Error kinds emitted by the block-driver IPC path.
+///
+/// Variants are *data*, never strings — both the kernel-side
+/// `RemoteBlockDevice` and the userspace NVMe driver pattern-match on them
+/// without any allocation. `Ok` is included as the success discriminant so
+/// [`BlkReplyHeader::status`] can carry any outcome in a single byte.
+///
+/// `#[non_exhaustive]` lets later phases add variants without forcing
+/// downstream `match` sites to be exhaustive; the defining crate still
+/// exhaustively matches every arm (see unit tests).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum BlockDriverError {
+    /// The operation completed successfully.
     Ok,
+    /// Underlying media / transport reported an I/O error.
     IoError,
+    /// `lba + sector_count` exceeds the device's logical block count, or
+    /// `lba` is otherwise outside the addressable range.
     InvalidLba,
+    /// The target device has been removed or is no longer claimed.
     DeviceAbsent,
+    /// The driver process is still servicing a previous request and cannot
+    /// accept another one right now.
     Busy,
+    /// The driver process crashed and the service manager is bringing a
+    /// fresh instance up — the caller should retry within
+    /// `DRIVER_RESTART_TIMEOUT_MS`.
     DriverRestarting,
+    /// The request header was malformed (bad kind, oversized sector count,
+    /// missing grant, etc.).
     InvalidRequest,
 }
 
 impl BlockDriverError {
+    /// Stable single-byte encoding used on the wire.
     pub const fn to_byte(self) -> u8 {
-        // Red stub: all variants collapse to zero so the byte round-trip
-        // test fails.
-        let _ = self;
-        0
+        match self {
+            BlockDriverError::Ok => 0,
+            BlockDriverError::IoError => 1,
+            BlockDriverError::InvalidLba => 2,
+            BlockDriverError::DeviceAbsent => 3,
+            BlockDriverError::Busy => 4,
+            BlockDriverError::DriverRestarting => 5,
+            BlockDriverError::InvalidRequest => 6,
+        }
     }
 
+    /// Inverse of [`Self::to_byte`]; returns `None` for unknown
+    /// discriminants so malformed payloads produce a decode error rather
+    /// than a silent substitution.
     pub const fn from_byte(b: u8) -> Option<Self> {
-        let _ = b;
-        None
+        match b {
+            0 => Some(BlockDriverError::Ok),
+            1 => Some(BlockDriverError::IoError),
+            2 => Some(BlockDriverError::InvalidLba),
+            3 => Some(BlockDriverError::DeviceAbsent),
+            4 => Some(BlockDriverError::Busy),
+            5 => Some(BlockDriverError::DriverRestarting),
+            6 => Some(BlockDriverError::InvalidRequest),
+            _ => None,
+        }
     }
 }
 
@@ -54,6 +144,15 @@ impl BlockDriverError {
 // BlkRequestHeader / BlkReplyHeader
 // ------------------------------------------------------------------------
 
+/// Request envelope sent from `RemoteBlockDevice` (kernel) to the driver
+/// process.
+///
+/// `kind` holds one of [`BLK_READ`] / [`BLK_WRITE`] / [`BLK_STATUS`]. The
+/// bulk payload — write data on the request side — rides in a separate IPC
+/// grant referenced by a `payload_grant` handle written alongside the
+/// header (see [`BLK_REQUEST_HEADER_SIZE`] for the exact byte offsets).
+/// The kernel-side facade is responsible for rejecting any request whose
+/// `sector_count` exceeds [`MAX_SECTORS_PER_REQUEST`].
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlkRequestHeader {
@@ -64,6 +163,14 @@ pub struct BlkRequestHeader {
     pub flags: u32,
 }
 
+/// Reply envelope returned from the driver process to `RemoteBlockDevice`.
+///
+/// `cmd_id` echoes the request's command id so pipelined requests can be
+/// matched. `status` carries a [`BlockDriverError`] — on success
+/// ([`BlockDriverError::Ok`]) the `bytes` field reports the number of bytes
+/// actually transferred and, for read replies, the `payload_grant` handle
+/// written alongside the header references a grant carrying the bulk read
+/// data (see [`BLK_REPLY_HEADER_SIZE`] for byte offsets).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlkReplyHeader {
@@ -76,46 +183,175 @@ pub struct BlkReplyHeader {
 // Decode errors
 // ------------------------------------------------------------------------
 
+/// Reasons a [`decode_blk_request`] / [`decode_blk_reply`] call can fail.
+///
+/// Variants are data, not strings, and `#[non_exhaustive]` so later phases
+/// may extend the taxonomy without breaking downstream match exhaustiveness.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum DecodeError {
+    /// Input slice was shorter than the minimum header length.
     Truncated,
+    /// A reserved field was non-zero (payload was crafted against a wire
+    /// format this build does not understand).
     ReservedNonZero,
+    /// The `kind` field did not match any known label.
     UnknownKind,
+    /// The `status` byte did not map to any [`BlockDriverError`] variant.
     UnknownStatus,
 }
 
 // ------------------------------------------------------------------------
-// Encode / decode helpers — red stub: always-zero output, always-Truncated
-// decode. Green commit replaces these with the real encoding.
+// Encode / decode helpers
 // ------------------------------------------------------------------------
 
+/// Encode a [`BlkRequestHeader`] together with the IPC grant handle that
+/// carries the bulk write payload (pass `0` for read requests, which have
+/// no inline payload). Returns the fixed-width byte stamp the IPC layer
+/// will put on the wire.
 pub const fn encode_blk_request(
-    _header: BlkRequestHeader,
-    _payload_grant: u32,
+    header: BlkRequestHeader,
+    payload_grant: u32,
 ) -> [u8; BLK_REQUEST_HEADER_SIZE] {
-    [0u8; BLK_REQUEST_HEADER_SIZE]
+    let mut out = [0u8; BLK_REQUEST_HEADER_SIZE];
+    let kind = header.kind.to_le_bytes();
+    out[0] = kind[0];
+    out[1] = kind[1];
+    let cmd = header.cmd_id.to_le_bytes();
+    let mut i = 0;
+    while i < 8 {
+        out[2 + i] = cmd[i];
+        i += 1;
+    }
+    let lba = header.lba.to_le_bytes();
+    let mut i = 0;
+    while i < 8 {
+        out[10 + i] = lba[i];
+        i += 1;
+    }
+    let sc = header.sector_count.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        out[18 + i] = sc[i];
+        i += 1;
+    }
+    let fl = header.flags.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        out[22 + i] = fl[i];
+        i += 1;
+    }
+    let pg = payload_grant.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        out[26 + i] = pg[i];
+        i += 1;
+    }
+    out
 }
 
-pub fn decode_blk_request(_bytes: &[u8]) -> Result<(BlkRequestHeader, u32), DecodeError> {
-    Err(DecodeError::Truncated)
+/// Decode a [`BlkRequestHeader`] out of an on-the-wire byte slice. Returns
+/// the decoded header plus the trailing `payload_grant` handle on success.
+///
+/// Rejects slices shorter than [`BLK_REQUEST_HEADER_SIZE`] and rejects any
+/// `kind` value that does not match one of the three documented labels —
+/// both paths surface as `Err(DecodeError)` rather than a panic so the
+/// caller can treat a malformed peer as a protocol error.
+pub fn decode_blk_request(bytes: &[u8]) -> Result<(BlkRequestHeader, u32), DecodeError> {
+    if bytes.len() < BLK_REQUEST_HEADER_SIZE {
+        return Err(DecodeError::Truncated);
+    }
+    let kind = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if kind != BLK_READ && kind != BLK_WRITE && kind != BLK_STATUS {
+        return Err(DecodeError::UnknownKind);
+    }
+    let cmd_id = u64::from_le_bytes([
+        bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+    ]);
+    let lba = u64::from_le_bytes([
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+    ]);
+    let sector_count = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
+    let flags = u32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]);
+    let payload_grant = u32::from_le_bytes([bytes[26], bytes[27], bytes[28], bytes[29]]);
+    Ok((
+        BlkRequestHeader {
+            kind,
+            cmd_id,
+            lba,
+            sector_count,
+            flags,
+        },
+        payload_grant,
+    ))
 }
 
+/// Encode a [`BlkReplyHeader`] plus the grant handle carrying any bulk read
+/// payload. Write replies and error replies pass `0` for `payload_grant`.
 pub const fn encode_blk_reply(
-    _header: BlkReplyHeader,
-    _payload_grant: u32,
+    header: BlkReplyHeader,
+    payload_grant: u32,
 ) -> [u8; BLK_REPLY_HEADER_SIZE] {
-    [0u8; BLK_REPLY_HEADER_SIZE]
+    let mut out = [0u8; BLK_REPLY_HEADER_SIZE];
+    let cmd = header.cmd_id.to_le_bytes();
+    let mut i = 0;
+    while i < 8 {
+        out[i] = cmd[i];
+        i += 1;
+    }
+    out[8] = header.status.to_byte();
+    // out[9..12] are reserved and remain zero.
+    let b = header.bytes.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        out[12 + i] = b[i];
+        i += 1;
+    }
+    let pg = payload_grant.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        out[16 + i] = pg[i];
+        i += 1;
+    }
+    out
 }
 
-pub fn decode_blk_reply(_bytes: &[u8]) -> Result<(BlkReplyHeader, u32), DecodeError> {
-    Err(DecodeError::Truncated)
+/// Decode a [`BlkReplyHeader`] out of an on-the-wire byte slice. Returns
+/// the decoded header plus the trailing `payload_grant` handle on success.
+///
+/// Rejects slices shorter than [`BLK_REPLY_HEADER_SIZE`], rejects non-zero
+/// reserved bytes, and rejects unknown status discriminants — all three
+/// paths surface as `Err(DecodeError)` without panicking.
+pub fn decode_blk_reply(bytes: &[u8]) -> Result<(BlkReplyHeader, u32), DecodeError> {
+    if bytes.len() < BLK_REPLY_HEADER_SIZE {
+        return Err(DecodeError::Truncated);
+    }
+    let cmd_id = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    let status = match BlockDriverError::from_byte(bytes[8]) {
+        Some(s) => s,
+        None => return Err(DecodeError::UnknownStatus),
+    };
+    if bytes[9] != 0 || bytes[10] != 0 || bytes[11] != 0 {
+        return Err(DecodeError::ReservedNonZero);
+    }
+    let b = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let payload_grant = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    Ok((
+        BlkReplyHeader {
+            cmd_id,
+            status,
+            bytes: b,
+        },
+        payload_grant,
+    ))
 }
 
 // ------------------------------------------------------------------------
-// Tests — authoritative for Phase 55b Track A.2. These are the Red-phase
-// assertions; they exercise every Acceptance bullet. They fail against the
-// stub above and pass once the green commit lands.
+// Tests — authoritative for Phase 55b Track A.2. Introduced in the Red
+// commit; identical here to demonstrate the Green implementation satisfies
+// every Acceptance bullet without the test code being tweaked.
 // ------------------------------------------------------------------------
 
 #[cfg(test)]
