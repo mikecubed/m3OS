@@ -4402,18 +4402,19 @@ fn parse_device_smoke_args(args: &[String]) -> Result<DeviceSmokeArgs, String> {
 
 /// Expect-style smoke script for `--device nvme`.
 ///
-/// Waits for the kernel to finish early boot, then asserts that init emits
-/// `init: driver.registered name=nvme_driver` — the structured log line that
-/// the service manager emits when it loads the nvme_driver service-config.
-/// The service registration event fires during init's config-load phase
-/// (before the driver process even spawns) so the pattern appears early in
-/// the boot log.
+/// Phase 55b F.4b — full data-path round-trip:
 ///
-/// The script does *not* attempt an interactive LBA-0 round-trip over serial
-/// (that would require a guest-side tool); the `driver.registered` line is
-/// sufficient to prove the Phase 55b ring-3 nvme_driver service config was
-/// loaded and the driver will be spawned.  A full I/O round-trip is covered
-/// by `cargo xtask test --device nvme` via the QEMU ISA-debug-exit harness.
+/// 1. Waits for the kernel first-message.
+/// 2. Waits for init to register the nvme_driver service config.
+/// 3. Waits for `NVME_SMOKE:rw:PASS` — the sentinel emitted by nvme_driver
+///    itself after a successful 512 B write+read round-trip at LBA 0.  This
+///    exercises the full DMA / PRP / doorbell / completion chain through the
+///    ring-3 driver, not just the service-config loading step.
+///
+/// The self-test runs inside the driver before the IPC endpoint is
+/// registered, so no concurrent client can race with the pattern on LBA 0.
+/// A timeout of 120 s covers the bring-up state machine + Identify + I/O
+/// queue creation + the round-trip itself on a TCG QEMU instance.
 fn device_smoke_script_nvme() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -4426,19 +4427,30 @@ fn device_smoke_script_nvme() -> Vec<SmokeStep> {
             timeout_secs: 60,
             label: "wait for nvme_driver service-config registration in init",
         },
+        SmokeStep::Wait {
+            pattern: "NVME_SMOKE:rw:PASS",
+            timeout_secs: 120,
+            label: "wait for nvme_driver 512 B LBA-0 round-trip self-test to pass",
+        },
     ]
 }
 
 /// Expect-style smoke script for `--device e1000`.
 ///
-/// Same structure as `device_smoke_script_nvme` but targets the e1000 driver
-/// service.  The `init: driver.registered name=e1000_driver` line appears in
-/// the serial log once init loads the e1000_driver service-config.
+/// Phase 55b F.4b — link-state confirmation + honest ICMP/TCP skip:
 ///
-/// ICMP echo and TCP connect probes are documented as deferred to
-/// `cargo xtask test --device e1000` because they require the guest network
-/// stack to be fully up, which adds significant timing sensitivity unsuitable
-/// for a boot-log smoke check.
+/// 1. Waits for the kernel first-message.
+/// 2. Waits for init to register the e1000_driver service config.
+/// 3. Waits for `E1000_SMOKE:link:PASS` — emitted by e1000_driver after
+///    bring-up confirms link state (up or transitioning).
+///
+/// ICMP echo and TCP connect are deferred: the full TX/RX server loop that
+/// would send and receive Ethernet frames lands in Track E.3; until that
+/// track completes the driver exits after bring-up and emits honest-skip
+/// sentinels (`E1000_SMOKE:icmp:SKIP`, `E1000_SMOKE:tcp:SKIP`).  The skip
+/// markers are present in the driver source so the smoke harness can grep
+/// for them but this script does not block on them — a wait for a
+/// per-boot SKIP sentinel would just race with the bring-up log.
 fn device_smoke_script_e1000() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -4450,6 +4462,11 @@ fn device_smoke_script_e1000() -> Vec<SmokeStep> {
             pattern: "init: driver.registered name=e1000_driver",
             timeout_secs: 60,
             label: "wait for e1000_driver service-config registration in init",
+        },
+        SmokeStep::Wait {
+            pattern: "E1000_SMOKE:link:PASS",
+            timeout_secs: 90,
+            label: "wait for e1000_driver link-state confirmation at bring-up",
         },
     ]
 }
@@ -8931,6 +8948,94 @@ mod tests {
         assert!(
             !args.iter().any(|a| a == "e1000,netdev=net0"),
             "default DeviceSet must use virtio-net, not e1000"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.4b — full data-path round-trip assertions
+    //
+    // TDD red: these tests fail until the implementation emits the right
+    // markers in the production sources and smoke scripts.
+    // -----------------------------------------------------------------------
+
+    /// `device_smoke_script_nvme` must contain a Wait step for
+    /// `NVME_SMOKE:rw:PASS` — the sentinel the nvme_driver itself prints
+    /// after a successful 512 B write+read round-trip at LBA 0.
+    #[test]
+    fn nvme_smoke_script_asserts_rw_round_trip() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        let fn_start = prod
+            .find("fn device_smoke_script_nvme")
+            .expect("device_smoke_script_nvme must exist");
+        // Find the closing brace of that function's returned Vec block.
+        // We look for the sentinel within a liberal window after the
+        // function start instead of parsing braces.
+        let fn_window = &prod[fn_start..];
+        assert!(
+            fn_window.contains("NVME_SMOKE:rw:PASS"),
+            "device_smoke_script_nvme() must include a Wait step for \
+             `NVME_SMOKE:rw:PASS` — printed by nvme_driver after a \
+             successful 512 B round-trip at LBA 0"
+        );
+    }
+
+    /// The nvme_driver source must contain the `NVME_SMOKE:rw:PASS`
+    /// sentinel string it is expected to emit after a successful
+    /// 512 B write+read round-trip, and a `NVME_SMOKE:rw:FAIL` marker
+    /// for the failure path (no silent drop on failure).
+    #[test]
+    fn nvme_driver_source_emits_rw_round_trip_sentinels() {
+        let source = workspace_file("userspace/drivers/nvme/src/main.rs");
+        assert!(
+            source.contains("NVME_SMOKE:rw:PASS"),
+            "nvme_driver main.rs must emit `NVME_SMOKE:rw:PASS` after a \
+             successful 512 B write+read round-trip at LBA 0"
+        );
+        assert!(
+            source.contains("NVME_SMOKE:rw:FAIL"),
+            "nvme_driver main.rs must emit `NVME_SMOKE:rw:FAIL` on failure \
+             so the smoke harness does not silently miss a broken round-trip"
+        );
+    }
+
+    /// `device_smoke_script_e1000` must contain a Wait step for
+    /// `E1000_SMOKE:link:PASS` — the sentinel the e1000_driver prints
+    /// when initial bring-up reports link up.
+    #[test]
+    fn e1000_smoke_script_asserts_link_pass() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        let fn_start = prod
+            .find("fn device_smoke_script_e1000")
+            .expect("device_smoke_script_e1000 must exist");
+        let fn_window = &prod[fn_start..];
+        assert!(
+            fn_window.contains("E1000_SMOKE:link:PASS"),
+            "device_smoke_script_e1000() must include a Wait step for \
+             `E1000_SMOKE:link:PASS` — printed by e1000_driver after \
+             link-up is confirmed at bring-up"
+        );
+    }
+
+    /// The e1000_driver source must contain the `E1000_SMOKE:link:PASS`
+    /// sentinel it is expected to emit when link is up after bring-up,
+    /// plus an honest-skip sentinel for ICMP (deferred until E.3).
+    #[test]
+    fn e1000_driver_source_emits_link_and_icmp_sentinels() {
+        let source = workspace_file("userspace/drivers/e1000/src/main.rs");
+        assert!(
+            source.contains("E1000_SMOKE:link:PASS"),
+            "e1000_driver main.rs must emit `E1000_SMOKE:link:PASS` when \
+             initial link-up is confirmed at bring-up"
+        );
+        assert!(
+            source.contains("E1000_SMOKE:icmp:SKIP"),
+            "e1000_driver main.rs must emit `E1000_SMOKE:icmp:SKIP` \
+             (honest-skip with reason) until the full TX/RX server loop \
+             lands in Track E.3"
         );
     }
 }

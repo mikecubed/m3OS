@@ -459,11 +459,22 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
         }
     }
 
-    // Step 5: create and register the IPC endpoint.
+    // Step 5: Phase 55b F.4b — 512 B LBA-0 round-trip self-test.
+    // Executes before the IPC endpoint is exposed so no concurrent
+    // client can race with the self-test pattern on LBA 0.
+    nvme_self_test(
+        &ctx.mmio,
+        &mut io_queue,
+        &ctx.device,
+        ctx.nsid,
+        ctx.sector_bytes,
+    );
+
+    // Step 6: create and register the IPC endpoint.
     let endpoint = create_service_endpoint(SERVICE_NAME)?;
     syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: service registered\n");
 
-    // Step 6: enter the block-server loop.
+    // Step 7: enter the block-server loop.
     let server = BlockServer::new(endpoint);
     loop {
         let result = server.handle_next(|req| {
@@ -533,6 +544,97 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
             return Ok(());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b F.4b — 512 B LBA-0 round-trip self-test.
+// ---------------------------------------------------------------------------
+
+/// Sentinel byte repeated across the 512-byte self-test sector.
+///
+/// Chosen to be obviously non-zero so a zero-fill (uninitialized DMA
+/// buffer or device returning zeros) is distinguishable from a real
+/// round-trip. `0xA5` is the classic alternating-bit pattern.
+#[cfg(not(test))]
+const SELF_TEST_SENTINEL: u8 = 0xA5;
+
+/// Issue a 512-byte write to LBA 0, then read it back, and verify the
+/// sentinel pattern.  Prints `NVME_SMOKE:rw:PASS` on success or
+/// `NVME_SMOKE:rw:FAIL` on any error (allocation, I/O, or mismatch).
+///
+/// Called from [`run_io_server`] after the I/O queue is active and
+/// subscribed but before the IPC endpoint is registered, so no
+/// concurrent client can race with the pattern on LBA 0.
+///
+/// Design notes:
+/// - Uses [`handle_write`] and [`handle_read`] directly (the same
+///   paths the IPC server loop exercises) to exercise the full DMA /
+///   PRP / doorbell / completion chain in-band.
+/// - LBA 0 is used deliberately: it is always present and the self-test
+///   pattern is intentionally overwritten immediately afterward (this is
+///   a raw smoke, not a data-preservation test).
+/// - `NVME_SMOKE:rw:FAIL` is emitted on any sub-step failure so the
+///   smoke harness never silently misses a broken round-trip.
+#[cfg(not(test))]
+fn nvme_self_test(
+    mmio: &Mmio<NvmeRegsTag>,
+    queue: &mut IoQueuePair,
+    device: &DeviceHandle,
+    nsid: u32,
+    sector_bytes: u32,
+) {
+    use kernel_core::driver_ipc::block::{BLK_READ, BLK_WRITE, BlkRequestHeader, BlockDriverError};
+
+    // Build a 512-byte write buffer filled with the sentinel pattern.
+    let mut write_data = alloc::vec![SELF_TEST_SENTINEL; 512];
+
+    let write_hdr = BlkRequestHeader {
+        kind: BLK_WRITE,
+        cmd_id: 0xF4B1,
+        lba: 0,
+        sector_count: 1,
+        flags: 0,
+    };
+    let write_reply = handle_write(
+        mmio,
+        queue,
+        device,
+        nsid,
+        sector_bytes,
+        &write_hdr,
+        &write_data,
+    );
+    if write_reply.status != BlockDriverError::Ok {
+        syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:FAIL write-error\n");
+        return;
+    }
+
+    // Overwrite the local buffer so we know the read actually fetched
+    // device data, not a residual from the write buffer.
+    for b in write_data.iter_mut() {
+        *b = 0;
+    }
+
+    let read_hdr = BlkRequestHeader {
+        kind: BLK_READ,
+        cmd_id: 0xF4B2,
+        lba: 0,
+        sector_count: 1,
+        flags: 0,
+    };
+    let (read_reply, bulk) = handle_read(mmio, queue, device, nsid, sector_bytes, &read_hdr);
+    if read_reply.status != BlockDriverError::Ok {
+        syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:FAIL read-error\n");
+        return;
+    }
+
+    // Verify every returned byte matches the sentinel.
+    if bulk.len() < 512 || bulk[..512].iter().any(|&b| b != SELF_TEST_SENTINEL) {
+        syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:FAIL pattern-mismatch\n");
+        return;
+    }
+
+    syscall_lib::write_str(STDOUT_FILENO, "NVME_SMOKE:rw:PASS\n");
 }
 
 /// Create an IPC endpoint and register it under `name` with the
