@@ -195,6 +195,9 @@ static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
 // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
 // Exposed under /bin so the QEMU regression can launch it from the shell.
 static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
+// Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+// Exposed under /bin so the QEMU regression can launch it from the shell.
+static MAX_RESTART_SMOKE_ELF: &[u8] = generated_initrd_asset!("max-restart-smoke");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -538,6 +541,13 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
         "nvme-crash-smoke",
         RamdiskNode::File {
             content: NVME_CRASH_SMOKE_ELF,
+        },
+    ),
+    // Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+    (
+        "max-restart-smoke",
+        RamdiskNode::File {
+            content: MAX_RESTART_SMOKE_ELF,
         },
     ),
 ];

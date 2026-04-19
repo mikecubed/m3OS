@@ -311,6 +311,9 @@ fn build_userspace_bins() {
         // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
         // client. No alloc dependency — syscall_lib only.
         ("nvme-crash-smoke", "nvme-crash-smoke", false),
+        // Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+        // No alloc dependency — syscall_lib only.
+        ("max-restart-smoke", "max-restart-smoke", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -6701,6 +6704,31 @@ fn regression_tests() -> Vec<RegressionTest> {
         });
     }
 
+    // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
+    //
+    // Drives `nvme_driver` to crash 6 times in quick succession (max_restart=5
+    // configured in the service conf), then asserts that init transitions the
+    // service to `permanently-stopped` in `/run/services.status`.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE (same gate as driver-restart-crash)
+    // because it also requires --device nvme and QEMU TCG timing.
+    // Use `--test max-restart-exceeded` to run it directly:
+    //   M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test max-restart-exceeded
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "max-restart-exceeded",
+            description: "Phase 55b F.3d-1: max-restart-smoke — 6 kills → service \
+                 permanently-stopped (max_restart=5 exceeded)",
+            guest_steps: max_restart_exceeded_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
+        });
+    }
+
     tests
 }
 
@@ -7017,6 +7045,71 @@ fn driver_restart_crash_steps() -> Vec<SmokeStep> {
         pattern: "# ",
         timeout_secs: 15,
         label: "guest/crash-smoke: shell prompt after smoke",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3d-1 max-restart-exceeded regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// `nvme_driver` service is alive before the smoke binary is launched.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for nvme_driver to finish bring-up (NVME_SMOKE:rw:PASS).
+///   3. Launch `/bin/max-restart-smoke`.
+///   4. Confirm each kill is delivered (kills 1–6).
+///   5. Confirm kills 1–5 each result in a restart (MAX_RESTART_SMOKE:kill:N:restarted).
+///   6. Confirm `MAX_RESTART_SMOKE:PASS` appears (nvme_driver permanently-stopped).
+fn max_restart_exceeded_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Wait for nvme_driver to finish full bring-up.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_SMOKE:rw:PASS",
+        timeout_secs: 120,
+        label: "guest/max-restart: wait for nvme self-test PASS",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the max-restart smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/max-restart-smoke\n",
+        label: "guest/max-restart: launch max-restart-smoke",
+    });
+
+    // Precondition — driver confirmed running.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:precondition:OK",
+        timeout_secs: 15,
+        label: "guest/max-restart: precondition nvme_driver running",
+    });
+
+    // Kills 1–5 deliver and restart.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:kill:5:restarted",
+        timeout_secs: 60,
+        label: "guest/max-restart: kills 1-5 each restarted",
+    });
+
+    // Kill 6 delivered.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:kill:6:delivered",
+        timeout_secs: 15,
+        label: "guest/max-restart: kill 6 delivered",
+    });
+
+    // Overall PASS — permanently-stopped observed.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:PASS",
+        timeout_secs: 20,
+        label: "guest/max-restart: PASS (permanently-stopped confirmed)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/max-restart: shell prompt after smoke",
     });
 
     steps
