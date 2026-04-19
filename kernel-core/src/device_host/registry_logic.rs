@@ -87,23 +87,34 @@ impl DeviceHostRegistryCore {
     /// `key` is already claimed by *any* process (including `pid` itself —
     /// double-claim is rejected so a buggy driver cannot burn through the
     /// claim count).
-    pub fn try_claim(&mut self, _pid: RegistryPid, _key: DeviceCapKey) -> Result<(), RegistryError> {
-        // RED stub — green commit implements the real body.
-        Err(RegistryError::AlreadyClaimed)
+    ///
+    /// The kernel-side wrapper holds a `spin::Mutex` across this call plus
+    /// the downstream PCI `claim_specific` handoff so the (registry, PCI)
+    /// pair updates atomically from the scheduler's view.
+    pub fn try_claim(&mut self, pid: RegistryPid, key: DeviceCapKey) -> Result<(), RegistryError> {
+        if self.entries.iter().any(|e| e.key == key) {
+            return Err(RegistryError::AlreadyClaimed);
+        }
+        self.entries.push(ClaimEntry { pid, key });
+        Ok(())
     }
 
     /// Release the claim on `key` held by `pid`.
     ///
     /// Returns `Ok(())` if the entry was present and removed, or
-    /// `Err(RegistryError::NotClaimed)` if no entry matches either the BDF
-    /// or the PID.
-    pub fn release(
-        &mut self,
-        _pid: RegistryPid,
-        _key: DeviceCapKey,
-    ) -> Result<(), RegistryError> {
-        // RED stub.
-        Err(RegistryError::NotClaimed)
+    /// `Err(RegistryError::NotClaimed)` if no entry matches the BDF,
+    /// or `Err(RegistryError::WrongOwner)` if an entry exists but under
+    /// a different PID.
+    pub fn release(&mut self, pid: RegistryPid, key: DeviceCapKey) -> Result<(), RegistryError> {
+        let pos = self.entries.iter().position(|e| e.key == key);
+        match pos {
+            None => Err(RegistryError::NotClaimed),
+            Some(i) if self.entries[i].pid != pid => Err(RegistryError::WrongOwner),
+            Some(i) => {
+                self.entries.swap_remove(i);
+                Ok(())
+            }
+        }
     }
 
     /// Release every claim owned by `pid`.
@@ -111,15 +122,22 @@ impl DeviceHostRegistryCore {
     /// Called from the process-exit path so a driver crash or kill
     /// automatically frees the devices for the supervisor restart to re-claim.
     /// Returns the list of freed keys so the caller can log the release.
-    pub fn release_for_pid(&mut self, _pid: RegistryPid) -> Vec<DeviceCapKey> {
-        // RED stub.
-        Vec::new()
+    pub fn release_for_pid(&mut self, pid: RegistryPid) -> Vec<DeviceCapKey> {
+        let mut freed = Vec::new();
+        self.entries.retain(|e| {
+            if e.pid == pid {
+                freed.push(e.key);
+                false
+            } else {
+                true
+            }
+        });
+        freed
     }
 
     /// Return the current owner of `key`, if any.
-    pub fn owner_of(&self, _key: DeviceCapKey) -> Option<RegistryPid> {
-        // RED stub.
-        None
+    pub fn owner_of(&self, key: DeviceCapKey) -> Option<RegistryPid> {
+        self.entries.iter().find(|e| e.key == key).map(|e| e.pid)
     }
 
     /// Number of active claim entries.
@@ -203,10 +221,7 @@ mod tests {
     #[test]
     fn release_of_unclaimed_bdf_returns_not_claimed() {
         let mut reg = DeviceHostRegistryCore::new();
-        assert_eq!(
-            reg.release(100, BDF_A),
-            Err(RegistryError::NotClaimed),
-        );
+        assert_eq!(reg.release(100, BDF_A), Err(RegistryError::NotClaimed),);
     }
 
     #[test]
@@ -215,7 +230,9 @@ mod tests {
         reg.try_claim(100, BDF_A).expect("claim");
         // A non-owner cannot release someone else's claim; the owner's
         // claim must remain intact.
-        let err = reg.release(200, BDF_A).expect_err("non-owner release fails");
+        let err = reg
+            .release(200, BDF_A)
+            .expect_err("non-owner release fails");
         assert!(matches!(
             err,
             RegistryError::WrongOwner | RegistryError::NotClaimed
@@ -237,10 +254,7 @@ mod tests {
         // Second release of the same (pid, key) must be a typed error —
         // not a panic, not UB. B.1 acceptance: "releasing a
         // Capability::Device twice returns -EBADF, not panic".
-        assert_eq!(
-            reg.release(100, BDF_A),
-            Err(RegistryError::NotClaimed),
-        );
+        assert_eq!(reg.release(100, BDF_A), Err(RegistryError::NotClaimed),);
     }
 
     // ---- release_for_pid (process exit path) --------------------------

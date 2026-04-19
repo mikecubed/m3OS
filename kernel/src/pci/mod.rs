@@ -404,6 +404,41 @@ impl PciDeviceHandle {
         allocate_msi_vectors(&self.dev, count)
     }
 
+    /// Pure-data identifier for the device this handle owns.
+    ///
+    /// Phase 55b Track B.1 shim: the device-host syscall path uses this to
+    /// key entries in `DeviceHostRegistry` and to stamp the `Capability::Device`
+    /// it hands back to the driver. Callers that only need the BDF do not
+    /// need the full [`PciDeviceHandle`].
+    pub fn device_cap_key(&self) -> kernel_core::device_host::DeviceCapKey {
+        kernel_core::device_host::DeviceCapKey::new(
+            0,
+            self.dev.bus,
+            self.dev.device,
+            self.dev.function,
+        )
+    }
+
+    /// Consume this handle and turn it into the inert
+    /// `Capability::Device` carried in the driver's capability table.
+    ///
+    /// Phase 55b Track B.1: the syscall dispatcher stores the returned
+    /// handle in `DeviceHostRegistry` (keyed by PID + `DeviceCapKey`) so the
+    /// claim, its IOMMU domain, and its PCI-registry slot all stay alive
+    /// for the life of the driver process. The returned `Capability::Device`
+    /// is what the driver receives via `CapabilityTable::insert`.
+    ///
+    /// The name intentionally echoes the B.1 task-doc symbol
+    /// (`PciDeviceHandle::into_capability`) even though the signature is
+    /// split across this method and the registry's `insert_claim` — the
+    /// registry needs to keep `self` alive, so the method returns the
+    /// pair rather than consuming the handle.
+    pub fn as_capability(&self) -> kernel_core::ipc::Capability {
+        kernel_core::ipc::Capability::Device {
+            key: self.device_cap_key(),
+        }
+    }
+
     /// Snapshot of the IOMMU domain attached to this handle, if any.
     ///
     /// Returned as an `Option` because `claim_specific` may be called
@@ -601,6 +636,36 @@ pub fn claim_specific(dev: PciDevice, driver: &'static str) -> Result<PciDeviceH
         domain,
         domain_unit_index,
     })
+}
+
+/// Claim a PCI function by segment / bus / device / function.
+///
+/// Phase 55b Track B.1: the device-host syscall dispatcher (`sys_device_claim`)
+/// uses this to bind a ring-3 driver process to a specific BDF. Returns
+/// [`ClaimError::NotFound`] when no enumerated device matches, or
+/// [`ClaimError::AlreadyClaimed`] when an in-kernel driver or another
+/// ring-3 driver already holds the slot.
+///
+/// `segment` is currently required to be zero — multi-segment PCIe is a
+/// future extension; any non-zero segment returns `NotFound`.
+pub fn claim_pci_device_by_bdf(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    driver: &'static str,
+) -> Result<PciDeviceHandle, ClaimError> {
+    if segment != 0 {
+        return Err(ClaimError::NotFound);
+    }
+    let mut idx = 0;
+    while let Some(dev) = pci_device(idx) {
+        if dev.bus == bus && dev.device == device && dev.function == function {
+            return claim_specific(dev, driver);
+        }
+        idx += 1;
+    }
+    Err(ClaimError::NotFound)
 }
 
 /// Look up the IOMMU unit for `dev`, request a domain, and pre-map any
