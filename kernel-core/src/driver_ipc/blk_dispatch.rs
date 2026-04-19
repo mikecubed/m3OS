@@ -506,9 +506,9 @@ mod tests {
     #[test]
     fn check_restart_wait_ready_when_driver_is_ready() {
         let outcome = BlockDispatchState::check_restart_wait(
-            100,   // now_ms
-            1100,  // deadline_ms (budget not yet expired)
-            true,  // is_ready
+            100,  // now_ms
+            1100, // deadline_ms (budget not yet expired)
+            true, // is_ready
         );
         assert_eq!(
             outcome,
@@ -536,8 +536,8 @@ mod tests {
     #[test]
     fn check_restart_wait_waiting_when_within_budget() {
         let outcome = BlockDispatchState::check_restart_wait(
-            200,  // now_ms — well inside the budget
-            1200, // deadline_ms
+            200,   // now_ms — well inside the budget
+            1200,  // deadline_ms
             false, // is_ready — driver still absent
         );
         assert_eq!(
@@ -615,10 +615,7 @@ mod tests {
                 WaitOutcome::Waiting => {
                     now += 100; // advance 100 ms per mock yield
                     iterations += 1;
-                    assert!(
-                        iterations < 50,
-                        "loop must terminate after budget expires"
-                    );
+                    assert!(iterations < 50, "loop must terminate after budget expires");
                 }
             }
         }

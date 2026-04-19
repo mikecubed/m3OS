@@ -8,15 +8,22 @@
 //! `kernel_core::driver_ipc::blk_dispatch` (host-testable). This module
 //! holds only the IPC-wiring glue that requires kernel primitives.
 //!
-//! **Restart semantics:** IPC failure marks the driver mid-restart; one
-//! `driver.absent` warn is logged; subsequent calls return `Err(0xFF)` until
-//! the driver re-registers via [`mark_driver_ready`].
+//! **Restart semantics (D.4):** When an IPC call fails or the driver is found
+//! mid-restart, the facade enters a bounded timed-wait loop:
+//!   - Uses `tick_count()` (1 tick = 1 ms, 1000 Hz BSP timer) as the
+//!     monotonic clock source. The budget is `BlockDispatchState::restart_deadline_ms`
+//!     (default: `DRIVER_RESTART_TIMEOUT_MS = 1000 ms`, see A.1).
+//!   - Yields via `scheduler::yield_now()` between poll iterations so other
+//!     tasks can run while the facade waits. The lock is NOT held across yields.
+//!   - When `is_restarting()` clears (driver re-registered) within the budget,
+//!     the IPC call is retried **once** and its result propagated to the caller.
+//!   - When the budget expires without recovery, returns `Err(0xFF)` (EIO).
 //!
 //! **Grant single-use (Phase 50):** `GrantIdTracker` rejects replay of any
 //! write-payload grant handle before the IPC call is attempted.
 
 use kernel_core::driver_ipc::blk_dispatch::{
-    BlockDispatchState, GrantIdTracker, RemoteDeviceError,
+    BlockDispatchState, GrantIdTracker, RemoteDeviceError, WaitOutcome,
 };
 use kernel_core::driver_ipc::block::{
     BLK_READ, BLK_REPLY_HEADER_SIZE, BLK_REQUEST_HEADER_SIZE, BLK_WRITE, BlkRequestHeader,
@@ -92,10 +99,38 @@ pub fn mark_driver_ready(endpoint_name: &str, device_name: &str) -> Result<(), (
 // ---------------------------------------------------------------------------
 
 /// Forward a read to the ring-3 NVMe driver via IPC.
+///
+/// If the driver is mid-restart at call time, blocks up to
+/// `DRIVER_RESTART_TIMEOUT_MS` for recovery before attempting IPC. On IPC
+/// failure, marks the driver mid-restart, waits, and retries the IPC call
+/// once if the driver re-registers within the budget. Returns `Err(0xFF)` on
+/// timeout.
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
     if count > MAX_SECTORS_PER_REQUEST as usize {
         return Err(0xFF);
     }
+    // If the driver is already mid-restart on entry, wait for it first.
+    if REMOTE_BLOCK.lock().state.is_restarting() {
+        match wait_for_driver_restart() {
+            WaitOutcome::Ready => {}
+            WaitOutcome::TimedOut | WaitOutcome::Waiting => return Err(0xFF),
+        }
+    }
+    // Attempt the IPC call; on failure wait + retry once.
+    match do_read_ipc(start_sector, count, buf) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            on_ipc_error();
+            match wait_for_driver_restart() {
+                WaitOutcome::Ready => do_read_ipc(start_sector, count, buf),
+                WaitOutcome::TimedOut | WaitOutcome::Waiting => Err(0xFF),
+            }
+        }
+    }
+}
+
+/// Inner IPC call for reads — no restart logic.
+fn do_read_ipc(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
     let (ep, task) = endpoint_and_task()?;
     let hdr = BlkRequestHeader {
         kind: BLK_READ,
@@ -111,7 +146,6 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     msg.data[1] = BLK_REQUEST_HEADER_SIZE as u64;
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
-        on_ipc_error();
         return Err(0xFF);
     }
     let bulk = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
@@ -130,6 +164,12 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 ///
 /// `payload_grant` is the Phase 50 single-use IPC grant handle carrying the
 /// write data (pass `0` for the inline-bulk legacy path).
+///
+/// If the driver is mid-restart at call time, blocks up to
+/// `DRIVER_RESTART_TIMEOUT_MS` for recovery before attempting IPC. On IPC
+/// failure, marks the driver mid-restart, waits, and retries the IPC call
+/// once if the driver re-registers within the budget. Returns `Err(0xFF)` on
+/// timeout.
 pub fn write_sectors(
     start_sector: u64,
     count: usize,
@@ -154,6 +194,28 @@ pub fn write_sectors(
             Err(_) => return Err(0xFF),
         }
     }
+    // If the driver is already mid-restart on entry, wait for it first.
+    if REMOTE_BLOCK.lock().state.is_restarting() {
+        match wait_for_driver_restart() {
+            WaitOutcome::Ready => {}
+            WaitOutcome::TimedOut | WaitOutcome::Waiting => return Err(0xFF),
+        }
+    }
+    // Attempt the IPC call; on failure wait + retry once.
+    match do_write_ipc(start_sector, count, buf, payload_grant) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            on_ipc_error();
+            match wait_for_driver_restart() {
+                WaitOutcome::Ready => do_write_ipc(start_sector, count, buf, payload_grant),
+                WaitOutcome::TimedOut | WaitOutcome::Waiting => Err(0xFF),
+            }
+        }
+    }
+}
+
+/// Inner IPC call for writes — no restart logic.
+fn do_write_ipc(start_sector: u64, count: usize, buf: &[u8], payload_grant: u32) -> Result<(), u8> {
     let (ep, task) = endpoint_and_task()?;
     let hdr = BlkRequestHeader {
         kind: BLK_WRITE,
@@ -171,7 +233,6 @@ pub fn write_sectors(
     msg.data[0] = start_sector;
     let reply = endpoint::call_msg(task, ep, msg);
     if reply.label == u64::MAX {
-        on_ipc_error();
         return Err(0xFF);
     }
     let bulk_r = scheduler::take_bulk_data(task).ok_or(0xFFu8)?;
@@ -204,5 +265,49 @@ fn on_ipc_error() {
             "[blk::remote] driver '{}' unreachable — marking mid-restart",
             g.state.device_name().unwrap_or("<unknown>")
         );
+    }
+}
+
+/// Block up to `DRIVER_RESTART_TIMEOUT_MS` for the driver to re-register.
+///
+/// Called when the driver is found mid-restart (either because `is_registered()`
+/// was false, or because an IPC call returned a failure sentinel). The function
+/// polls `is_restarting()` at each scheduler yield until either:
+///
+/// - The flag clears → returns `WaitOutcome::Ready` (caller should retry IPC).
+/// - The budget expires → returns `WaitOutcome::TimedOut` (caller returns EIO).
+///
+/// **Lock discipline:** the `REMOTE_BLOCK` mutex is acquired only for a brief
+/// snapshot on each iteration and is released before `yield_now()`. This
+/// prevents priority inversion and satisfies the documented lock-ordering rule
+/// (no locks held across a yield point).
+///
+/// **Clock source:** `tick_count()` from `arch::x86_64::interrupts` gives a
+/// monotonically increasing u64 at 1 tick per millisecond (1000 Hz BSP timer).
+/// The restart-deadline budget is read once at the start of the wait from
+/// `state.restart_deadline_ms` (defaults to `DRIVER_RESTART_TIMEOUT_MS`).
+fn wait_for_driver_restart() -> WaitOutcome {
+    // Snapshot the restart budget without holding the lock across yields.
+    let budget_ms = {
+        let g = REMOTE_BLOCK.lock();
+        g.state.restart_deadline_ms as u64
+    };
+    let start_tick = crate::arch::x86_64::interrupts::tick_count();
+    let deadline_tick = start_tick.saturating_add(budget_ms);
+
+    loop {
+        let now_tick = crate::arch::x86_64::interrupts::tick_count();
+        let is_ready = {
+            let g = REMOTE_BLOCK.lock();
+            !g.state.is_restarting()
+        };
+        match BlockDispatchState::check_restart_wait(now_tick, deadline_tick, is_ready) {
+            WaitOutcome::Ready => return WaitOutcome::Ready,
+            WaitOutcome::TimedOut => return WaitOutcome::TimedOut,
+            // Within budget, driver still absent: yield and retry.
+            WaitOutcome::Waiting => {
+                scheduler::yield_now();
+            }
+        }
     }
 }
