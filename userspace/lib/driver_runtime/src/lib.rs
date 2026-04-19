@@ -61,6 +61,13 @@ pub mod ipc;
 pub mod irq;
 pub mod mmio;
 
+/// Re-export of the authoritative `DriverRuntimeError` defined in
+/// `kernel-core`. Every public fallible method in this crate returns
+/// `Result<T, DriverRuntimeError>` — including the C.4 IPC client
+/// helpers and the C.2 / C.3 safe wrappers. Consumers pattern-match
+/// at this level without pulling in `kernel-core::driver_runtime`.
+pub use kernel_core::driver_runtime::contract::DriverRuntimeError;
+
 #[cfg(test)]
 mod tests {
     //! C.1 green smoke tests.
