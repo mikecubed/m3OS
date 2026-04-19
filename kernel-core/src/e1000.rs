@@ -3,10 +3,14 @@
 //!
 //! Placed in `kernel-core` so the layouts can be exercised from host-side
 //! tests (`cargo test -p kernel-core --target x86_64-unknown-linux-gnu`) that
-//! do not have MMIO, DMA, or a scheduler.  The kernel-side driver in
-//! `kernel/src/net/e1000.rs` imports the `E1000Regs`, `E1000RxDesc`,
-//! `E1000TxDesc`, and the `ctrl`/`rctl`/`tctl`/`cmd`/`status` flag modules
-//! defined here and does not redefine the wire formats.
+//! do not have MMIO, DMA, or a scheduler.
+//!
+//! **Phase 55b E.5 — consumer update:** The in-kernel driver
+//! `kernel/src/net/e1000.rs` was deleted. This module is now consumed
+//! exclusively by `userspace/drivers/e1000` (the ring-3 e1000 driver process)
+//! which imports `E1000Regs`, `E1000RxDesc`, `E1000TxDesc`, and the
+//! `ctrl`/`rctl`/`tctl`/`cmd`/`status` flag modules defined here and does
+//! not redefine the wire formats.
 //!
 //! All values come from the Intel 8254x Family of Gigabit Ethernet Controllers
 //! Software Developer's Manual (rev 1.9), §13 "Programmer's Reference" — the

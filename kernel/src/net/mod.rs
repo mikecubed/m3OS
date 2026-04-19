@@ -9,7 +9,6 @@ pub mod arp;
 pub mod config;
 #[allow(dead_code)]
 pub mod dispatch;
-pub mod e1000;
 pub mod ethernet;
 pub mod icmp;
 pub mod ipv4;
@@ -19,7 +18,7 @@ pub mod udp;
 pub mod unix;
 pub mod virtio_net;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
 
 // ===========================================================================
 // Unified NIC wake flag — used by the network task's park/unpark.
@@ -27,11 +26,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared signal for `block_current_unless_woken` in the network task.
 ///
-/// Both NIC ISRs (`virtio_net::virtio_net_irq_handler`,
-/// `e1000::e1000_interrupt_handler`) set this in addition to their
-/// driver-specific progress flag. The network task parks exclusively on this
-/// flag so a wake from either driver reliably unblocks it — fixing the race
-/// where only one driver's flag was observed at park time.
+/// The virtio-net ISR (`virtio_net::virtio_net_irq_handler`) sets this in
+/// addition to its driver-specific progress flag. The ring-3 e1000 driver
+/// (`userspace/drivers/e1000`) delivers RX frames via `RemoteNic::inject_rx_frame`
+/// which also sets this flag. The network task parks exclusively on this flag
+/// so a wake from any driver reliably unblocks it.
 pub static NIC_WOKEN: AtomicBool = AtomicBool::new(false);
 
 // ===========================================================================
@@ -55,32 +54,24 @@ pub enum NetError {
 
 /// Send a raw Ethernet frame through whichever NIC driver is initialized.
 ///
-/// Dispatch priority (Phase 55b E.4):
+/// Dispatch priority (Phase 55b E.5):
 /// 1. `RemoteNic` — ring-3 e1000 driver via IPC, when registered.
-/// 2. In-kernel e1000 — when `E1000_READY` is set (Phase 55 in-kernel driver).
-/// 3. VirtIO-net — fallback for QEMU's default `virtio-net-pci` configuration.
+///    (See `kernel/src/net/remote.rs` for the `RemoteNic` facade; the
+///    device-specific e1000 code now lives entirely in
+///    `userspace/drivers/e1000`.)
+/// 2. VirtIO-net — fallback for QEMU's default `virtio-net-pci` configuration.
 ///
 /// The upper stack (`arp.rs`, `ipv4.rs`) routes all transmits through this
 /// entry point so switching between drivers at runtime requires no upper-layer
 /// change. Errors are logged and swallowed to preserve the existing `fn(_) -> ()`
 /// surface; callers that need the error may call the driver directly.
 pub fn send_frame(frame: &[u8]) {
-    // Phase 55b E.4: RemoteNic has highest priority when a ring-3 driver is
-    // registered — matches the "RemoteNic first" acceptance criterion.
+    // RemoteNic has highest priority when the ring-3 e1000 driver is registered.
     if remote::RemoteNic::is_registered() {
         match remote::RemoteNic::send_frame(frame) {
             Ok(()) => {}
             Err(e) => {
                 log::debug!("[net] remote_nic send_frame failed: {:?}", e);
-            }
-        }
-        return;
-    }
-    if e1000::E1000_READY.load(Ordering::Acquire) {
-        match e1000::e1000_transmit(frame) {
-            Ok(()) => {}
-            Err(e) => {
-                log::debug!("[net] e1000 send_frame failed: {:?}", e);
             }
         }
         return;
@@ -91,13 +82,12 @@ pub fn send_frame(frame: &[u8]) {
 /// Returns the MAC address of whichever NIC driver initialized first — used
 /// by `arp` / `ipv4` to stamp outgoing frames.
 ///
-/// Priority mirrors [`send_frame`]: RemoteNic > in-kernel e1000 > VirtIO-net.
+/// Priority mirrors [`send_frame`]: RemoteNic (ring-3 e1000 via IPC) > VirtIO-net.
+/// The in-kernel e1000 driver was removed in Phase 55b E.5; device-specific
+/// e1000 code now lives entirely in `userspace/drivers/e1000`.
 #[allow(dead_code)]
 pub fn mac_address() -> Option<kernel_core::types::MacAddr> {
     if let Some(m) = remote::RemoteNic::mac_address() {
-        return Some(m);
-    }
-    if let Some(m) = e1000::mac_address() {
         return Some(m);
     }
     virtio_net::mac_address()

@@ -310,10 +310,11 @@ pub enum ClaimError {
 ///    still live, and never hand a buffer to a pool that outlives the
 ///    claim.
 ///
-/// The in-tree drivers (NVMe, e1000, virtio-blk, virtio-net) satisfy
-/// this by keeping both the handle and the rings on the same driver
-/// struct — Drop ordering on struct fields tears buffers down before
-/// the handle, which destroys the domain. Future lifetime-parameterised
+/// The in-kernel drivers (NVMe, virtio-blk, virtio-net) satisfy this by
+/// keeping both the handle and the rings on the same driver struct — Drop
+/// ordering on struct fields tears buffers down before the handle, which
+/// destroys the domain. The ring-3 e1000 driver (`userspace/drivers/e1000`)
+/// owns its own `PciDeviceHandle` in userspace. Future lifetime-parameterised
 /// or refcount-based API work (tracked as follow-up) would turn this
 /// requirement into a compile-time guarantee.
 pub struct PciDeviceHandle {
@@ -1248,11 +1249,12 @@ pub const MSI_VECTOR_BASE: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECT
 /// would hand out e.g. `0x90`, `register_device_irq` would return "vector
 /// out of device IRQ range", and driver init would fail late.
 ///
-/// 16 vectors is comfortably enough for Phase 55: NVMe needs 1 admin + 1
-/// I/O = 2, e1000 needs 1, VirtIO-blk needs 1, VirtIO-net needs 1 — total 5
-/// vectors. If that ever tightens, grow the stub bank in
-/// `arch::x86_64::interrupts` first; `MSI_VECTOR_TOP` will follow
-/// automatically.
+/// 16 vectors is comfortably enough for Phase 55b: NVMe needs 1 admin + 1
+/// I/O = 2, VirtIO-blk needs 1, VirtIO-net needs 1 — total 4 in-kernel
+/// vectors. The ring-3 e1000 driver (`userspace/drivers/e1000`) claims its
+/// own MSI vector in userspace via `sys_device_irq_subscribe`. If that ever
+/// tightens, grow the stub bank in `arch::x86_64::interrupts` first;
+/// `MSI_VECTOR_TOP` will follow automatically.
 #[allow(dead_code)]
 pub const MSI_VECTOR_TOP: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE
     + crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_COUNT;

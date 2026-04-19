@@ -153,13 +153,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // available, init_bsp_per_core() falls back to single-core BSP-only mode.
     smp::init_bsp_per_core();
 
-    // Phase 16: Initialize NIC drivers.  Phase 55 Track E adds the Intel
-    // 82540EM (e1000) driver alongside virtio-net; both register with the
-    // PCI driver framework so `probe_all_drivers` binds whichever device
-    // QEMU (or real hardware) exposes.  Ordering: register e1000 before
-    // virtio-net so a single probe pass covers both without a second
-    // `probe_all_drivers()` call.
-    net::e1000::register();
+    // Phase 16: Initialize NIC drivers.  Phase 55b E.5: the in-kernel e1000
+    // driver has been deleted; device-specific 82540EM code now lives in
+    // `userspace/drivers/e1000`. The kernel registers only virtio-net here;
+    // the ring-3 e1000 driver registers its `RemoteNic` facade via IPC on
+    // startup.
     net::virtio_net::init();
 
     // Trigger a breakpoint to verify the IDT is working (P3-T007).
@@ -225,12 +223,11 @@ fn init_task() -> ! {
     task::spawn(console_server_task, "console");
     // Phase 52: kbd_server_task removed — userspace kbd_server handles IRQ1.
 
-    // Spawn Phase 16 network processing task.  Either virtio-net (legacy)
-    // or e1000 (Phase 55 Track E) being ready is enough to justify the
-    // task; it drains whichever driver's IRQ flag is set.
-    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire)
-        || net::e1000::E1000_READY.load(core::sync::atomic::Ordering::Acquire)
-    {
+    // Spawn Phase 16 network processing task.  VirtIO-net ready is enough to
+    // justify the task; the ring-3 e1000 driver (`userspace/drivers/e1000`)
+    // delivers RX frames via RemoteNic IPC and does not require the task to
+    // spin on a kernel-side IRQ flag.
+    if net::virtio_net::VIRTIO_NET_READY.load(core::sync::atomic::Ordering::Acquire) {
         task::spawn(net_task, "net");
     }
 
@@ -548,41 +545,37 @@ fn serial_echo(s: &str) {
 
 /// Background task that processes incoming network frames.
 ///
-/// Phase 55 C.5: the virtio-net driver installs its RX IRQ through the HAL
+/// Phase 55b E.5: the virtio-net driver installs its RX IRQ through the HAL
 /// (`install_msi_irq` / `install_intx_irq`); the ISR sets
-/// [`net::virtio_net::NET_IRQ_WOKEN`] and wakes this task. Between IRQs the
-/// task parks via [`task::scheduler::block_current_unless_woken`]; on wake
-/// it drains all pending frames through the network dispatch stack.
+/// [`net::virtio_net::NET_IRQ_WOKEN`] and wakes this task. The ring-3 e1000
+/// driver (`userspace/drivers/e1000`) delivers frames via `RemoteNic::inject_rx_frame`
+/// which also sets [`net::NIC_WOKEN`]. Between IRQs the task parks via
+/// [`task::scheduler::block_current_unless_woken`]; on wake it drains all
+/// pending frames through the network dispatch stack.
 fn net_task() -> ! {
-    // Register this task's id with every NIC driver that can wake us.  Both
-    // virtio-net (legacy path) and e1000 (Phase 55 Track E) point their
-    // ISRs at this task id via `wake_task`.
+    // Register this task's id with the virtio-net ISR so it can wake us.
+    // The ring-3 e1000 driver wakes the task via RemoteNic IPC — no kernel
+    // task-id registration is needed for it.
     if let Some(id) = task::scheduler::current_task_id() {
         net::virtio_net::set_net_task_id(id);
-        net::e1000::set_net_task_id(id);
     }
     log::info!("[net] network processing task started");
 
     loop {
         // Clear the unified wake flag up front so any edge set between now
-        // and park is still observable. Driver-specific flags remain the
-        // "this driver has pending work" signals consumed by the drain loop.
+        // and park is still observable.
         net::NIC_WOKEN.store(false, core::sync::atomic::Ordering::Release);
         let mut any =
             net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
-        any |= net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         while any {
-            // Handle a fresh link-up edge before draining so the first RX
-            // packet off a new link doesn't contend with a stale TX ring.
-            net::e1000::drain_link_up_edge();
             net::dispatch::process_rx();
-            any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire)
-                | net::e1000::E1000_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+            any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
         }
-        // Park on the unified flag: either NIC's ISR sets it so a wake from
-        // either driver reliably unblocks the task. If an IRQ fires between
-        // the drain-loop exit and the park, `block_current_unless_woken`
-        // observes `NIC_WOKEN` set and returns immediately without sleeping.
+        // Park on the unified flag: the virtio-net ISR and RemoteNic both set
+        // it, so a wake from either path reliably unblocks the task. If an IRQ
+        // fires between the drain-loop exit and the park,
+        // `block_current_unless_woken` observes `NIC_WOKEN` set and returns
+        // immediately without sleeping.
         task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
 }
