@@ -10,9 +10,10 @@
 //!
 //! Scope is deliberately narrow — the mock tracks:
 //!
-//! - live device claims in a `BTreeMap<DeviceCapKey, ClaimState>` so the
+//! - live device claims in a `HashMap<DeviceCapKey, ClaimState>` so the
 //!   contract suite can verify `claim`/`release` pair up and second-claim
-//!   returns `AlreadyClaimed`.
+//!   returns `AlreadyClaimed`. (`DeviceCapKey` does not implement `Ord`
+//!   — it is a bag of `u8`/`u16` fields, not an ordering target.)
 //! - MMIO windows as plain `Vec<u8>` scratch backing so `read_*` observes
 //!   the value written by `write_*` at the same offset (the only
 //!   observable behavior the contract cares about).
@@ -34,6 +35,7 @@ use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use std::collections::HashMap;
 
 use kernel_core::device_host::{DeviceCapKey, DeviceHostError, DmaHandle, MmioWindowDescriptor};
 use kernel_core::driver_runtime::contract::{
@@ -49,14 +51,14 @@ use kernel_core::driver_runtime::contract::{
 /// second `release` returns `DriverRuntimeError::from(DeviceHostError::
 /// NotClaimed)`.
 #[derive(Debug)]
-struct ClaimState {
+pub struct ClaimState {
     released: bool,
 }
 
 /// Per-MMIO-window scratch buffer. `Vec<u8>` is plenty — the contract
 /// only requires read-after-write observability at the same offset.
 #[derive(Debug)]
-struct MmioState {
+pub struct MmioState {
     key: DeviceCapKey,
     bar_index: u8,
     bytes: Vec<u8>,
@@ -64,9 +66,11 @@ struct MmioState {
 
 /// Per-DMA-allocation record.
 #[derive(Debug)]
-struct DmaState {
+pub struct DmaState {
+    #[allow(dead_code)]
     key: DeviceCapKey,
     released: bool,
+    #[allow(dead_code)]
     handle: DmaHandle,
 }
 
@@ -74,7 +78,7 @@ struct DmaState {
 /// interrupts; `ack_count` is the number of `ack`s observed. The contract
 /// suite uses `deliver` below to simulate the kernel delivering an IRQ.
 #[derive(Debug)]
-struct IrqState {
+pub struct IrqState {
     key: DeviceCapKey,
     vector_hint: Option<u8>,
     pending: VecDeque<()>,
@@ -96,7 +100,7 @@ pub struct DmaAllocParams {
 /// Track C wrappers' Drop-releases-handle behavior.
 #[derive(Debug)]
 pub struct MockBackendState {
-    pub claims: BTreeMap<DeviceCapKey, ClaimState>,
+    pub claims: HashMap<DeviceCapKey, ClaimState>,
     pub mmio_windows: BTreeMap<u64, MmioState>,
     pub dma_buffers: BTreeMap<u64, DmaState>,
     pub irqs: BTreeMap<u64, IrqState>,
@@ -131,7 +135,7 @@ pub struct MockBackendState {
 impl MockBackendState {
     fn new() -> Self {
         Self {
-            claims: BTreeMap::new(),
+            claims: HashMap::new(),
             mmio_windows: BTreeMap::new(),
             dma_buffers: BTreeMap::new(),
             irqs: BTreeMap::new(),
@@ -265,14 +269,14 @@ impl MockHandle {
     }
 }
 
-/// Backend MMIO window handle. Holds an `Rc<RefCell<...>>` so the
-/// read/write implementations can access the scratch buffer without
-/// lifetimes.
+/// Backend MMIO window handle. `read_*` / `write_*` on [`MmioContract`]
+/// look up the scratch buffer via `id` against the backend's shared
+/// state — the window itself does not need a back-reference because the
+/// trait method already takes `&self` / `&mut self` on the backend.
 #[derive(Clone, Debug)]
 pub struct MockMmioWindow {
     id: u64,
     descriptor: MmioWindowDescriptor,
-    state: Rc<RefCell<MockBackendState>>,
 }
 
 impl MockMmioWindow {
@@ -328,6 +332,7 @@ pub struct MockIrqNotif {
 impl MockIrqNotif {
     /// Opaque subscription identifier — surfaced so the contract suite
     /// can assert uniqueness across subscriptions.
+    #[allow(dead_code)]
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -444,11 +449,7 @@ impl MmioContract for MockBackend {
                 bytes: vec![0u8; descriptor.len],
             },
         );
-        Ok(MockMmioWindow {
-            id,
-            descriptor,
-            state: self.state.clone(),
-        })
+        Ok(MockMmioWindow { id, descriptor })
     }
 
     fn read_u8(&self, window: &Self::MmioWindow, offset: usize) -> u8 {
@@ -666,7 +667,11 @@ impl MockBackend {
     /// Device key behind an MMIO window, for assertions that a window
     /// was issued from a specific claim.
     pub fn mmio_device(&self, window: &MockMmioWindow) -> Option<DeviceCapKey> {
-        self.state.borrow().mmio_windows.get(&window.id).map(|w| w.key)
+        self.state
+            .borrow()
+            .mmio_windows
+            .get(&window.id)
+            .map(|w| w.key)
     }
 
     /// BAR index a window was mapped for, for assertions that the value
@@ -681,8 +686,13 @@ impl MockBackend {
 
     /// Device key behind a DMA buffer (live or released), so tests can
     /// assert cross-wiring with the originating claim.
+    #[allow(dead_code)]
     pub fn dma_device(&self, buffer: &MockDmaBuffer) -> Option<DeviceCapKey> {
-        self.state.borrow().dma_buffers.get(&buffer.id).map(|s| s.key)
+        self.state
+            .borrow()
+            .dma_buffers
+            .get(&buffer.id)
+            .map(|s| s.key)
     }
 
     /// Device key behind an IRQ subscription.
@@ -692,6 +702,10 @@ impl MockBackend {
 
     /// Vector hint an IRQ subscription recorded at `subscribe` time.
     pub fn irq_vector_hint(&self, notif: &MockIrqNotif) -> Option<Option<u8>> {
-        self.state.borrow().irqs.get(&notif.id).map(|s| s.vector_hint)
+        self.state
+            .borrow()
+            .irqs
+            .get(&notif.id)
+            .map(|s| s.vector_hint)
     }
 }

@@ -117,7 +117,9 @@ fn mmio_map_after_release_returns_not_claimed() {
     let h = b.claim(k).unwrap();
     let h_dup = h.clone();
     b.release(h).unwrap();
-    let err = b.map(&h_dup, 0).expect_err("must fail against released handle");
+    let err = b
+        .map(&h_dup, 0)
+        .expect_err("must fail against released handle");
     assert_eq!(err, DriverRuntimeError::from(DeviceHostError::NotClaimed));
 }
 
@@ -204,7 +206,10 @@ fn dma_allocate_injected_iova_exhausted_surfaces_error() {
     let h = b.claim(k).unwrap();
     b.state().borrow_mut().inject_iova_exhausted = true;
     let err = b.allocate(&h, 4096, 4096).expect_err("injected error");
-    assert_eq!(err, DriverRuntimeError::from(DeviceHostError::IovaExhausted));
+    assert_eq!(
+        err,
+        DriverRuntimeError::from(DeviceHostError::IovaExhausted)
+    );
     b.release(h).unwrap();
 }
 
@@ -270,7 +275,10 @@ fn irq_subscribe_injected_unavailable_surfaces_error() {
     let h = b.claim(k).unwrap();
     b.state().borrow_mut().inject_irq_unavailable = true;
     let err = b.subscribe(&h, None).expect_err("injected error");
-    assert_eq!(err, DriverRuntimeError::from(DeviceHostError::IrqUnavailable));
+    assert_eq!(
+        err,
+        DriverRuntimeError::from(DeviceHostError::IrqUnavailable)
+    );
     b.release(h).unwrap();
 }
 
