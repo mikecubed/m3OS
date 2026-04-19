@@ -34,6 +34,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod init;
+pub mod io;
 
 #[cfg(not(test))]
 use core::alloc::Layout;
