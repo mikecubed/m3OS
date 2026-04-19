@@ -43,6 +43,7 @@
 pub mod amd;
 pub mod fault;
 pub mod intel;
+pub mod registry;
 
 use alloc::vec::Vec;
 use spin::Once;
@@ -150,6 +151,18 @@ pub fn reserved_regions_from_units() -> &'static ReservedRegionSet {
     reserved_regions()
 }
 
+/// `true` when a real (hardware-translating) IOMMU unit is active on the
+/// platform. Returns `false` when only the identity-map fallback is
+/// installed, or when [`init`] has not yet run.
+///
+/// Exposed so diagnostic code (meminfo, boot banner) can surface
+/// `iommu.active = false` without having to inspect the registry
+/// directly.
+#[allow(dead_code)]
+pub fn active() -> bool {
+    registry::translating()
+}
+
 /// Initialize the kernel-side IOMMU subsystem. Call once after
 /// `acpi::init` has returned so that DMAR / IVRS tables are available.
 ///
@@ -158,10 +171,19 @@ pub fn reserved_regions_from_units() -> &'static ReservedRegionSet {
 /// - [`device_to_unit`] routes BDFs to unit indices.
 /// - [`reserved_regions`] returns a stable set of firmware-reserved
 ///   ranges.
+/// - [`registry`] holds either the discovered vendor units or a single
+///   [`kernel_core::iommu::identity::IdentityUnit`] fallback. In the
+///   fallback path a single structured `iommu.fallback.identity`
+///   log event records the reason.
 ///
-/// Later tracks will extend this with hardware bring-up and per-device
-/// domain creation; Track B stops at the discovery + map construction
-/// boundary.
+/// Phase 55a Track B landed this function as "build the device map";
+/// Track E extends it with the registry install + identity fallback so
+/// every `claim_pci_device` has a unit to create a domain on. Vendor
+/// bring-up (calling `VtdUnit::bring_up` / `AmdViUnit::bring_up`) still
+/// lands on a later commit once the MSI-vector routing and MMIO
+/// mapping prerequisites are in place; for now, devices on IOMMU
+/// platforms fall back to identity mapping until that commit lands and
+/// IOMMU hardware is wired up end-to-end.
 pub fn init() {
     // Force the Once cells; ignore the returned slice / set — callers use
     // the public accessors above.
@@ -173,8 +195,24 @@ pub fn init() {
 
     if descs.is_empty() {
         log::info!("[iommu] init: no IOMMU units discovered");
+        registry::install_identity_fallback();
+        registry::log_identity_fallback(registry::IdentityFallbackReason::NoDmarOrIvrs);
     } else {
         log::info!("[iommu] init: {} IOMMU unit(s) discovered", descs.len());
+        // Vendor MMIO bring-up (actually calling `VtdUnit::bring_up` or
+        // `AmdViUnit::bring_up`) is not part of Track E — a follow-up
+        // commit wires MSI-vector fault routing and the final enable
+        // sequence. Until that lands, Track E registers identity fallback
+        // so every `claim_pci_device` still gets a working domain. Logging
+        // discriminates between "no ACPI table at all" and "ACPI reports
+        // vendor hardware but we haven't turned it on yet" so operators
+        // can tell the two apart.
+        registry::install_identity_fallback();
+        let reason = match descs[0].vendor {
+            IommuVendor::Vtd => registry::IdentityFallbackReason::VtdInitFailed,
+            IommuVendor::AmdVi => registry::IdentityFallbackReason::AmdViInitFailed,
+        };
+        registry::log_identity_fallback(reason);
     }
 }
 
