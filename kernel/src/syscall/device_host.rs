@@ -995,13 +995,36 @@ pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
 // ---------------------------------------------------------------------------
 //
 // Signature per task-doc B.4:
-//   sys_device_irq_subscribe(dev_cap, vector_hint, notification_index) -> isize
+//   sys_device_irq_subscribe(dev_cap, bit_index, notification_arg) -> isize
 //
-// `notification_index` is the bit index in the caller's notification word the
-// IRQ should set. The `vector_hint` is advisory — the kernel's MSI / MSI-X
-// allocator makes the final decision. `SENTINEL_NEW` on the notification
-// handle asks the kernel to allocate a fresh notification object instead of
-// binding into an existing one.
+// ## Argument encoding (B.4b dual-mode)
+//
+// The original task-doc B.4 signature was:
+//   sys_device_irq_subscribe(dev_cap, vector_hint, notification_index)
+// where `vector_hint` was purely advisory and `notification_index` was the
+// bit index.
+//
+// B.4b repurposes these two arguments as follows:
+//
+//   arg2 (`bit_index`): the zero-based bit within the 64-bit notification
+//       word the ISR should `fetch_or` on delivery.  Range: 0..=63.
+//       A value ≥ 64 returns `-EINVAL` unconditionally.
+//
+//   arg3 (`notification_arg`): selects which Notification to bind:
+//       • `NOTIFICATION_SENTINEL_NEW` (`u32::MAX`) — allocate a fresh
+//         `Notification` object; the kernel owns it and frees it on process
+//         exit.
+//       • Any other value — treat as a `CapHandle` into the caller's
+//         capability table.  The slot must hold `Capability::Notification`.
+//         The caller retains ownership; process exit only unbinds the vector
+//         and does NOT release the underlying notification slot.
+//
+// Rationale for the two-argument split (vs encoding both into one word):
+// `bit_index` needs 6 bits (0-63) and CapHandle needs up to 32 bits for
+// tables that grow beyond 64 slots.  Keeping them in separate arguments
+// avoids a confusing bit-pack and makes each argument's range immediately
+// legible at call sites.  `vector_hint` was previously unused (leading
+// underscore) so the rename is a non-breaking semantic reuse.
 //
 // Lock ordering (extends B.1's):
 //   1. `crate::task::scheduler::SCHEDULER`  — per-process capability table
@@ -1016,29 +1039,28 @@ pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
 // (see `device_irq_notification_shim` — reads only `AtomicU8` mirrors and
 // calls `notification::signal_irq_bit` which is ISR-safe by construction).
 
-/// `notification_index` encoding — the caller passes this as the `notif`
-/// argument to request a freshly allocated notification. Any other value
-/// is interpreted as an existing capability handle on the caller's table.
-///
-/// (Kernel-internal callers and the test harness pass `SENTINEL_NEW`; the
-/// userspace driver_runtime wrapper — Track C — will forward the caller's
-/// notification capability handle instead when it exists.)
+/// `notification_arg` sentinel — caller passes this value to request that the
+/// kernel allocate a fresh `Notification` on its behalf. Any other value is
+/// treated as a `CapHandle` pointing to an existing `Capability::Notification`
+/// in the caller's capability table.
 pub const NOTIFICATION_SENTINEL_NEW: u32 = u32::MAX;
 
 /// Negative errno `-ENFILE` (23) — per-driver IRQ cap exceeded.
 const NEG_ENFILE: isize = -23;
 
-/// B.4 — `sys_device_irq_subscribe(dev_cap, vector_hint, notification_index) -> isize`.
+/// B.4 — `sys_device_irq_subscribe(dev_cap, bit_index, notification_arg) -> isize`.
 ///
 /// Binds a device IRQ (MSI / MSI-X / INTx) to a `Notification` bit. On
 /// success, installs a `Capability::DeviceIrq { device, notif }` in the
 /// caller's capability table and returns its handle as a non-negative
 /// `isize`.
 ///
-/// `vector_hint` is advisory — the kernel's MSI allocator decides the
-/// final IDT vector. `notification_index` is the bit the ISR will set;
-/// it must be < 64 (notification word is `u64`).
-pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_index: u32) -> isize {
+/// `bit_index` (arg2, repurposed from `vector_hint`) is the bit the ISR
+/// will set; it must be < 64.  `notification_arg` (arg3) is either
+/// `NOTIFICATION_SENTINEL_NEW` to allocate a fresh `Notification`, or a
+/// `CapHandle` to an existing `Capability::Notification` the caller already
+/// holds.  See the module-level B.4b encoding comment for full details.
+pub fn sys_device_irq_subscribe(dev_cap: u32, bit_index_arg: u32, notification_arg: u32) -> isize {
     // ---- Caller identity ----------------------------------------------------
 
     let pid = crate::process::current_pid();
@@ -1052,15 +1074,14 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_in
 
     // ---- Argument validation ------------------------------------------------
 
-    // `notification_index` is the *bit* within the notification word the ISR
-    // should set; the word is 64 bits wide. `>= 64` is an immediate EINVAL
-    // rather than a silently-clamped or -wrapped bit.
-    if notification_index >= 64 {
+    // `bit_index_arg` (arg2) is the bit within the 64-bit notification word
+    // the ISR should set. Range 0..=63; anything ≥ 64 is EINVAL.
+    if bit_index_arg >= 64 {
         return NEG_EINVAL;
     }
-    let bit_index = notification_index as u8;
+    let bit_index = bit_index_arg as u8;
 
-    // ---- Capability validation ---------------------------------------------
+    // ---- Capability validation — device cap ---------------------------------
 
     let cap = match scheduler::task_cap(task_id, dev_cap) {
         Ok(c) => c,
@@ -1086,29 +1107,29 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_in
         }
     }
 
-    // ---- Allocate a notification object ------------------------------------
+    // ---- Resolve notification object (fresh or existing) -------------------
     //
-    // B.4 acceptance: "notif points at the caller's existing Notification
-    // object (or a freshly allocated one if the caller passes
-    // SENTINEL_NEW)". The sentinel keeps B.4 self-contained — wiring to
-    // userspace-provided notifications lands in Track C along with
-    // `IrqNotification`.
+    // B.4b acceptance: "notif points at the caller's existing Notification
+    // object (or a freshly allocated one if the caller passes SENTINEL_NEW)".
+    //
+    // `kernel_owns_notif` tracks whether we allocated the slot here so the
+    // process-exit teardown knows whether to call `notification::release`
+    // (kernel-owned) or merely unbind the vector (caller-owned).
 
-    let notif = if notification_index == NOTIFICATION_SENTINEL_NEW {
-        // SENTINEL_NEW via notification_index collides with the bit-index
-        // validation above (64 > anything), so only this explicit check
-        // reaches here — kept for future shape parity. In current B.4 we
-        // always allocate a fresh notification. Driver_runtime (Track C)
-        // will plumb an existing NotifId through a separate syscall arg
-        // once the userspace side lands.
-        match crate::ipc::notification::try_create() {
+    let (notif, kernel_owns_notif) = if notification_arg == NOTIFICATION_SENTINEL_NEW {
+        // Fresh-allocation path: the kernel owns the notification slot.
+        let id = match crate::ipc::notification::try_create() {
             Some(id) => id,
             None => return NEG_ENOMEM,
-        }
+        };
+        (id, true)
     } else {
-        match crate::ipc::notification::try_create() {
-            Some(id) => id,
-            None => return NEG_ENOMEM,
+        // Caller-provided path: resolve the CapHandle and extract the NotifId.
+        let cap_handle = notification_arg;
+        match scheduler::task_cap(task_id, cap_handle) {
+            Ok(Capability::Notification(notif_id)) => (notif_id, false),
+            Ok(_) => return NEG_EBADF,  // wrong cap type
+            Err(_) => return NEG_EBADF, // invalid handle
         }
     };
 
@@ -1117,7 +1138,10 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_in
     let vector = match allocate_device_vector(key) {
         Ok(v) => v,
         Err(e) => {
-            crate::ipc::notification::free(notif);
+            // On fresh-allocation unwind, free the slot we just took.
+            if kernel_owns_notif {
+                crate::ipc::notification::free(notif);
+            }
             return match e {
                 VectorAllocError::NoDevice => NEG_ENODEV,
                 VectorAllocError::Unavailable => NEG_EINVAL,
@@ -1127,8 +1151,11 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_in
 
     // ---- Install binding (registry + ISR mirror + dispatch table) ----------
 
-    if let Err(e) = bind_irq_vector(pid, key, vector, notif, bit_index) {
-        crate::ipc::notification::free(notif);
+    if let Err(e) = bind_irq_vector(pid, key, vector, notif, bit_index, kernel_owns_notif) {
+        // On fresh-allocation unwind, free the slot we just took.
+        if kernel_owns_notif {
+            crate::ipc::notification::free(notif);
+        }
         // Best-effort hardware rollback: reclaim_vector turns the vector
         // back into a free slot in MSI_POOL. Silent failure here is safe —
         // the vector stays reserved but no ISR is wired (slow-leak only
@@ -1155,7 +1182,10 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, _vector_hint: u32, notification_in
             // Unwind every step in reverse.
             let _ = unbind_irq_vector(vector);
             reclaim_device_vector(vector);
-            crate::ipc::notification::release(notif);
+            // Only release the notification slot when the kernel allocated it.
+            if kernel_owns_notif {
+                crate::ipc::notification::release(notif);
+            }
             return NEG_ENOMEM;
         }
     };
@@ -1232,12 +1262,17 @@ fn reclaim_device_vector(_vector: u8) {
 }
 
 /// Atomically install the binding in the registry + ISR mirror + IDT dispatch.
+///
+/// `kernel_owns_notif` is forwarded into `IrqBinding` so the process-exit
+/// sweep can decide whether to call `notification::release` (kernel-owned)
+/// or only unbind the vector (caller-owned).
 fn bind_irq_vector(
     pid: Pid,
     key: DeviceCapKey,
     vector: u8,
     notif: NotifId,
     bit_index: u8,
+    kernel_owns_notif: bool,
 ) -> Result<(), IrqRegistryError> {
     let offset = match vector_to_offset(vector) {
         Some(o) => o,
@@ -1250,6 +1285,7 @@ fn bind_irq_vector(
         vector,
         notif_id: notif.0,
         bit_index,
+        kernel_owns_notif,
     };
 
     // Registry write under mutex.
@@ -1299,6 +1335,12 @@ fn unbind_irq_vector(vector: u8) -> Option<IrqBinding> {
 /// Called from [`release_claims_for_pid`] so the full teardown is a
 /// single deterministic pass: IRQ bindings first (so the ISR shim is a
 /// no-op before the notification is freed), then the claim itself.
+///
+/// For each binding, the ISR shim is cleared and the IDT entry is removed
+/// unconditionally. The notification slot is released **only** when
+/// `binding.kernel_owns_notif` is true — caller-owned notifications are
+/// not freed here because the caller's `Capability::Notification` cap
+/// remains valid and the owning process may still be using it.
 fn release_irq_bindings_for_pid(pid: Pid) -> usize {
     let freed = {
         let mut reg = IRQ_BINDING_REGISTRY.lock();
@@ -1310,7 +1352,11 @@ fn release_irq_bindings_for_pid(pid: Pid) -> usize {
         };
         clear_shim_binding(offset);
         crate::arch::x86_64::interrupts::unregister_device_irq(binding.vector);
-        crate::ipc::notification::release(NotifId(binding.notif_id));
+        // Only reclaim the notification slot when the kernel allocated it.
+        // Caller-owned notifications outlive the IRQ subscription.
+        if binding.kernel_owns_notif {
+            crate::ipc::notification::release(NotifId(binding.notif_id));
+        }
         // Vector stays reserved in MSI_POOL; see `reclaim_device_vector`.
     }
     freed.len()
@@ -2159,7 +2205,8 @@ pub(crate) fn test_synthetic_irq_subscribe_and_signal(
     let vector = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + vector_offset;
 
     // Install the binding in the IRQ registry and the ISR dispatch table.
-    match install_irq_binding(pid, key, vector, notif, bit_index) {
+    // The notification was allocated above by this helper → kernel_owns_notif = true.
+    match install_irq_binding(pid, key, vector, notif, bit_index, true) {
         Ok(()) => {}
         Err(_) => {
             crate::ipc::notification::free(notif);
@@ -2193,12 +2240,67 @@ fn install_irq_binding(
     vector: u8,
     notif: NotifId,
     bit_index: u8,
+    kernel_owns_notif: bool,
 ) -> Result<(), IrqRegistryError> {
-    bind_irq_vector(pid, key, vector, notif, bit_index)
+    bind_irq_vector(pid, key, vector, notif, bit_index, kernel_owns_notif)
 }
 
 /// Counterpart of [`install_irq_binding`] for the test-only path.
 #[cfg(test)]
 fn uninstall_irq_binding(vector: u8) -> Option<IrqBinding> {
     unbind_irq_vector(vector)
+}
+
+/// Synthetically bind a device IRQ to a **caller-provided** `NotifId`,
+/// deliver one signal through the ISR shim, and return the pending bits.
+///
+/// This exercises the B.4b path where the caller passes an existing
+/// `Capability::Notification` handle instead of `SENTINEL_NEW`.  The
+/// `notif` parameter represents the pre-existing notification the caller
+/// already owns — in production this is resolved from the cap table by
+/// `sys_device_irq_subscribe`; here we accept it directly so the test can
+/// control the full lifecycle.
+///
+/// Key invariant checked: after `uninstall_irq_binding` the `notif` slot
+/// must **not** have been released (the caller still owns it).  The caller
+/// verifies this by checking that the notification pool count is unchanged.
+#[cfg(test)]
+pub(crate) fn test_synthetic_irq_subscribe_and_signal_with_existing_notif(
+    pid: Pid,
+    key: DeviceCapKey,
+    notif: NotifId,
+    bit_index: u8,
+    vector_offset: u8,
+) -> Result<u64, TestIrqError> {
+    let notif_idx = notif.0;
+    let vector = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + vector_offset;
+
+    // Bind with kernel_owns_notif = false — the caller owns this notification.
+    match install_irq_binding(pid, key, vector, notif, bit_index, false) {
+        Ok(()) => {}
+        Err(_) => {
+            return Err(TestIrqError::BindFailed);
+        }
+    }
+
+    // Drive the synthetic ISR path through the registered handler.
+    crate::arch::x86_64::interrupts::dispatch_device_irq_for_test(vector);
+
+    // Inspect the resulting pending bits.
+    let bits = crate::ipc::notification::test_peek_pending(notif_idx);
+
+    // Tear the binding down — must NOT release `notif` (caller owns it).
+    let removed = uninstall_irq_binding(vector);
+    // Verify the binding's flag survived the round-trip.
+    if let Some(b) = removed {
+        if b.kernel_owns_notif {
+            // This would be a bug in the implementation — panic in test context.
+            panic!(
+                "B.4b: removed binding for caller-owned notif has kernel_owns_notif=true (vector={:#x})",
+                vector
+            );
+        }
+    }
+
+    Ok(bits)
 }
