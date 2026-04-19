@@ -18,7 +18,7 @@ fn disk_usage_bytes(st: &Stat) -> u64 {
 }
 
 fn write_human_size(size: u64) {
-    const SUFFIXES: [u8; 5] = [b'B', b'K', b'M', b'G', b'T'];
+    const SUFFIXES: [u8; 5] = *b"BKMGT";
     let mut suffix = 0usize;
     let mut whole = size;
     let mut rem = 0u64;
