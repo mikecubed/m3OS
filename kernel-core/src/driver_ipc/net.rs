@@ -1,39 +1,67 @@
-//! Net-driver IPC protocol schema — Phase 55b Track A.3 (red commit).
+//! Net-driver IPC protocol schema — Phase 55b Track A.3.
 //!
-//! This is the failing-test commit. Stubs below compile but produce wrong
-//! answers; the matching green commit replaces them with the real encoder /
-//! decoder implementation.
+//! The schema is the single source of truth for the IPC seam between the
+//! kernel net stack (`RemoteNic` facade, Track E.4) and the userspace e1000
+//! driver (Track E). The driver forwards `send_frame` requests over the
+//! `NET_SEND_FRAME` label, received frames flow back to the kernel through
+//! `NET_RX_FRAME` notifications, and PHY link transitions propagate as
+//! typed `NET_LINK_STATE` events so TCP retransmit logic can react to a
+//! link-down without polling.
+//!
+//! Ethernet-frame payloads themselves ride a bulk-memory grant, not the IPC
+//! register payload — only the [`NetFrameHeader`] (8 bytes) and the
+//! [`NetLinkEvent`] body (11 bytes, excluding the 2-byte kind prefix) need
+//! a stable wire encoding, which is what this module provides.
+//!
+//! The module is `no_std` + `alloc`-only; every decoder returns a typed
+//! [`NetDriverError`] rather than panicking on malformed input.
 
-#![allow(dead_code, unused_variables)]
-
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Message label for a driver-process-initiated frame send.
 pub const NET_SEND_FRAME: u16 = 0x5511;
 
-/// Message label for the RX notification a driver sends the kernel net stack.
+/// Message label for the RX notification the driver sends the kernel net
+/// stack once a received frame has been staged into a bulk-memory grant.
 pub const NET_RX_FRAME: u16 = 0x5512;
 
 /// Message label for a link-state change event.
 pub const NET_LINK_STATE: u16 = 0x5513;
 
 /// Maximum permitted Ethernet frame length (in bytes) carried on the driver
-/// IPC seam — a standard 1518-byte Ethernet frame plus a 4-byte VLAN tag.
+/// IPC seam — a standard 1518-byte Ethernet frame plus a 4-byte 802.1Q VLAN
+/// tag. Frames longer than this bound decode to
+/// [`NetDriverError::InvalidFrame`]; drivers are expected to drop oversize
+/// frames at ingress rather than forward them.
 pub const MAX_FRAME_BYTES: u16 = 1522;
 
 /// Serialized size of a [`NetFrameHeader`] in bytes.
+///
+/// Layout (little-endian):
+///
+/// - `[0..2]` — `kind: u16` (label)
+/// - `[2..4]` — `frame_len: u16`
+/// - `[4..8]` — `flags: u32`
 pub const NET_FRAME_HEADER_SIZE: usize = 8;
 
-/// Serialized size of a [`NetLinkEvent`] payload (the kind label prefix is
-/// encoded alongside it by [`encode_net_link_event`], this constant covers the
-/// body only).
+/// Serialized size of the [`NetLinkEvent`] **body**, i.e. everything after
+/// the 2-byte kind prefix that [`encode_net_link_event`] prepends.
+///
+/// Breakdown: 1 byte `up` + 6 bytes `mac` + 4 bytes `speed_mbps` = 11 bytes.
 pub const NET_LINK_EVENT_BODY_SIZE: usize = 11;
+
+/// Serialized size of a full link-event payload (kind prefix + body).
+pub const NET_LINK_EVENT_SIZE: usize = 2 + NET_LINK_EVENT_BODY_SIZE;
 
 /// Header that precedes an Ethernet frame payload on the driver IPC seam.
 ///
 /// The payload itself travels as a bulk-memory grant, not in-line in the IPC
 /// register payload — the header carries just enough metadata for the kernel
 /// net stack (or the driver, for RX) to validate and dispatch the frame.
+///
+/// `kind` must equal [`NET_SEND_FRAME`] on the TX path or [`NET_RX_FRAME`]
+/// on the RX path; decoders enforce this to prevent crossed messages.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NetFrameHeader {
@@ -44,6 +72,12 @@ pub struct NetFrameHeader {
 
 /// Link-state event emitted by the driver when the PHY transitions up / down
 /// or renegotiates speed.
+///
+/// `mac` is included so the kernel net stack does not have to round-trip a
+/// separate query on every bring-up. `speed_mbps == 0` when `up == false` is
+/// not enforced in the encoding (a flapping link can legitimately report
+/// zero speed during renegotiation), but the consumer is expected to treat
+/// a `0` speed on a `up == true` event as a driver bug.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NetLinkEvent {
@@ -53,6 +87,14 @@ pub struct NetLinkEvent {
 }
 
 /// Error kinds emitted by the net-driver IPC path.
+///
+/// Variants are *data* (not strings) so both the kernel-side `RemoteNic`
+/// facade and the userspace driver can pattern-match on them without string
+/// parsing. `Ok` is included for parity with the sentinel return value the
+/// real IPC syscalls emit on success.
+///
+/// `#[non_exhaustive]` so follow-up tracks may add variants without forcing
+/// downstream crates into an exhaustive match.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum NetDriverError {
@@ -65,31 +107,124 @@ pub enum NetDriverError {
 }
 
 // ---------------------------------------------------------------------------
-// Red stubs — deliberately wrong so tests fail until the green commit lands.
+// NetFrameHeader encoding — private helpers shared by send and rx paths.
 // ---------------------------------------------------------------------------
 
-pub fn encode_net_send(_header: NetFrameHeader) -> Vec<u8> {
-    Vec::new()
+fn encode_header_with_kind(kind: u16, header: NetFrameHeader) -> Vec<u8> {
+    let mut out = vec![0u8; NET_FRAME_HEADER_SIZE];
+    // Overwrite `kind` with the declared label; the caller is always the
+    // authoritative side for which direction this header belongs to.
+    out[0..2].copy_from_slice(&kind.to_le_bytes());
+    out[2..4].copy_from_slice(&header.frame_len.to_le_bytes());
+    out[4..8].copy_from_slice(&header.flags.to_le_bytes());
+    out
 }
 
-pub fn decode_net_send(_bytes: &[u8]) -> Result<NetFrameHeader, NetDriverError> {
-    Err(NetDriverError::DeviceAbsent)
+fn decode_header_with_kind(
+    expected_kind: u16,
+    bytes: &[u8],
+) -> Result<NetFrameHeader, NetDriverError> {
+    if bytes.len() < NET_FRAME_HEADER_SIZE {
+        return Err(NetDriverError::InvalidFrame);
+    }
+    let kind = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if kind != expected_kind {
+        return Err(NetDriverError::InvalidFrame);
+    }
+    let frame_len = u16::from_le_bytes([bytes[2], bytes[3]]);
+    if frame_len > MAX_FRAME_BYTES {
+        return Err(NetDriverError::InvalidFrame);
+    }
+    let flags = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    Ok(NetFrameHeader {
+        kind,
+        frame_len,
+        flags,
+    })
 }
 
-pub fn encode_net_rx_notify(_header: NetFrameHeader) -> Vec<u8> {
-    Vec::new()
+// ---------------------------------------------------------------------------
+// Public encode / decode — TX path.
+// ---------------------------------------------------------------------------
+
+/// Encode a [`NetFrameHeader`] for the TX (`NET_SEND_FRAME`) path.
+///
+/// The encoder always stamps `kind = NET_SEND_FRAME` regardless of what the
+/// caller supplied, so a zeroed header is still a valid send request. The
+/// matching [`decode_net_send`] enforces that the wire bytes carry that
+/// label.
+pub fn encode_net_send(header: NetFrameHeader) -> Vec<u8> {
+    encode_header_with_kind(NET_SEND_FRAME, header)
 }
 
-pub fn decode_net_rx_notify(_bytes: &[u8]) -> Result<NetFrameHeader, NetDriverError> {
-    Err(NetDriverError::DeviceAbsent)
+/// Decode a wire-format TX header. Returns [`NetDriverError::InvalidFrame`]
+/// if the payload is truncated, carries the wrong label, or declares a
+/// `frame_len` above [`MAX_FRAME_BYTES`].
+pub fn decode_net_send(bytes: &[u8]) -> Result<NetFrameHeader, NetDriverError> {
+    decode_header_with_kind(NET_SEND_FRAME, bytes)
 }
 
-pub fn encode_net_link_event(_event: NetLinkEvent) -> Vec<u8> {
-    Vec::new()
+// ---------------------------------------------------------------------------
+// Public encode / decode — RX path.
+// ---------------------------------------------------------------------------
+
+/// Encode a [`NetFrameHeader`] for the RX (`NET_RX_FRAME`) notification path.
+pub fn encode_net_rx_notify(header: NetFrameHeader) -> Vec<u8> {
+    encode_header_with_kind(NET_RX_FRAME, header)
 }
 
-pub fn decode_net_link_event(_bytes: &[u8]) -> Result<NetLinkEvent, NetDriverError> {
-    Err(NetDriverError::DeviceAbsent)
+/// Decode a wire-format RX header. Returns [`NetDriverError::InvalidFrame`]
+/// if the payload is truncated, carries the wrong label, or declares a
+/// `frame_len` above [`MAX_FRAME_BYTES`].
+pub fn decode_net_rx_notify(bytes: &[u8]) -> Result<NetFrameHeader, NetDriverError> {
+    decode_header_with_kind(NET_RX_FRAME, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Public encode / decode — link-state path.
+// ---------------------------------------------------------------------------
+
+/// Encode a link-state event as `NET_LINK_STATE` payload.
+///
+/// Layout (little-endian):
+///
+/// - `[0..2]` — kind = [`NET_LINK_STATE`]
+/// - `[2]` — `up` (0 or 1)
+/// - `[3..9]` — `mac[6]`
+/// - `[9..13]` — `speed_mbps: u32`
+pub fn encode_net_link_event(event: NetLinkEvent) -> Vec<u8> {
+    let mut out = vec![0u8; NET_LINK_EVENT_SIZE];
+    out[0..2].copy_from_slice(&NET_LINK_STATE.to_le_bytes());
+    out[2] = u8::from(event.up);
+    out[3..9].copy_from_slice(&event.mac);
+    out[9..13].copy_from_slice(&event.speed_mbps.to_le_bytes());
+    out
+}
+
+/// Decode a wire-format link-state event. Returns
+/// [`NetDriverError::InvalidFrame`] if the payload is truncated, carries the
+/// wrong label, or the `up` byte is anything other than 0 or 1.
+pub fn decode_net_link_event(bytes: &[u8]) -> Result<NetLinkEvent, NetDriverError> {
+    if bytes.len() < NET_LINK_EVENT_SIZE {
+        return Err(NetDriverError::InvalidFrame);
+    }
+    let kind = u16::from_le_bytes([bytes[0], bytes[1]]);
+    if kind != NET_LINK_STATE {
+        return Err(NetDriverError::InvalidFrame);
+    }
+    let up = match bytes[2] {
+        0 => false,
+        1 => true,
+        _ => return Err(NetDriverError::InvalidFrame),
+    };
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&bytes[3..9]);
+    let speed_mbps = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+    Ok(NetLinkEvent {
+        up,
+        mac,
+        speed_mbps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +491,13 @@ mod tests {
         (
             any::<bool>(),
             any::<[u8; 6]>(),
-            prop_oneof![Just(0u32), Just(10u32), Just(100u32), Just(1000u32), Just(10_000u32)],
+            prop_oneof![
+                Just(0u32),
+                Just(10u32),
+                Just(100u32),
+                Just(1000u32),
+                Just(10_000u32)
+            ],
         )
             .prop_map(|(up, mac, speed_mbps)| NetLinkEvent {
                 up,
