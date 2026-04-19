@@ -7,5 +7,8 @@
 //! the schemas from here, so divergence is a compile error rather than a
 //! runtime corruption bug.
 
+pub mod blk_dispatch;
 pub mod block;
 pub mod net;
+
+pub use blk_dispatch::{BlockDispatchState, GrantIdTracker, RemoteDeviceError};
