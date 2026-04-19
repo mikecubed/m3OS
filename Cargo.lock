@@ -460,6 +460,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "e1000_driver"
+version = "0.55.2"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "echo-args"
 version = "0.1.0"
 dependencies = [

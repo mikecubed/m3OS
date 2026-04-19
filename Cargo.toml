@@ -56,8 +56,9 @@ members = [
     "userspace/net_server",
     # Phase 55b Track C.1 — ring-3 driver runtime library
     "userspace/lib/driver_runtime",
-    # Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+    # Phase 55b Tracks D.1 / E.1 — ring-3 driver scaffolds
     "userspace/drivers/nvme",
+    "userspace/drivers/e1000",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

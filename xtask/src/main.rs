@@ -295,10 +295,11 @@ fn build_userspace_bins() {
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
-        // Phase 55b D.1: ring-3 NVMe driver scaffold. `needs_alloc = true`
-        // for `driver_runtime` + `kernel-core` dependencies; real bring-up
-        // lands in D.2.
+        // Phase 55b Tracks D.1 / E.1: ring-3 device driver scaffolds
+        // (`needs_alloc = true` for driver_runtime + kernel-core deps).
+        // Real bring-up lands in D.2/D.3 and E.2/E.3.
         ("nvme_driver", "nvme_driver", true),
+        ("e1000_driver", "e1000_driver", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
