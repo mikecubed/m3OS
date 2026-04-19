@@ -57,7 +57,7 @@ use kernel_core::device_host::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DeviceHostRegistryCore, RegistryError,
 };
 use kernel_core::driver_ipc::block::{BlkReplyHeader, BlockDriverError, encode_blk_reply};
-use kernel_core::driver_ipc::net::NetDriverError;
+use kernel_core::driver_ipc::net::{NetDriverError, net_error_to_neg_errno};
 use kernel_core::driver_ipc::{BlockDispatchState, RemoteDeviceError};
 use kernel_core::service::{
     ExitClassification, RestartPolicy, ServiceState, classify_exit, should_restart,
@@ -353,6 +353,67 @@ fn net_driver_error_driver_restarting_is_distinct() {
     // assert NetDriverError::DriverRestarting".
     assert_ne!(NetDriverError::DriverRestarting, NetDriverError::Ok);
     assert_ne!(NetDriverError::DriverRestarting, NetDriverError::LinkDown);
+}
+
+// ---------------------------------------------------------------------------
+// 8b. NetDriverError wire byte and net_error_to_neg_errno mapping
+//     (Phase 55b Track F.3d-3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn net_driver_error_to_byte_mapping() {
+    // Discriminant bytes must be stable — they cross the IPC seam.
+    assert_eq!(NetDriverError::Ok.to_byte(), 0);
+    assert_eq!(NetDriverError::LinkDown.to_byte(), 1);
+    assert_eq!(NetDriverError::RingFull.to_byte(), 2);
+    assert_eq!(NetDriverError::DeviceAbsent.to_byte(), 3);
+    assert_eq!(NetDriverError::DriverRestarting.to_byte(), 4);
+    assert_eq!(NetDriverError::InvalidFrame.to_byte(), 5);
+}
+
+#[test]
+fn net_error_to_neg_errno_driver_restarting_is_eagain() {
+    // DriverRestarting (byte 4) must map to NEG_EAGAIN (-11) so callers
+    // can distinguish restart from a hard I/O error (Phase 55b F.3d-3).
+    let byte = NetDriverError::DriverRestarting.to_byte();
+    assert_eq!(
+        net_error_to_neg_errno(byte),
+        -11,
+        "DriverRestarting (byte {byte}) must map to NEG_EAGAIN (-11)"
+    );
+}
+
+#[test]
+fn net_error_to_neg_errno_ring_full_is_eagain() {
+    // RingFull (byte 2) is also retriable — must map to NEG_EAGAIN.
+    let byte = NetDriverError::RingFull.to_byte();
+    assert_eq!(
+        net_error_to_neg_errno(byte),
+        -11,
+        "RingFull (byte {byte}) must map to NEG_EAGAIN (-11)"
+    );
+}
+
+#[test]
+fn net_error_to_neg_errno_ok_is_zero() {
+    assert_eq!(net_error_to_neg_errno(NetDriverError::Ok.to_byte()), 0);
+}
+
+#[test]
+fn net_error_to_neg_errno_hard_errors_are_eio() {
+    // LinkDown, DeviceAbsent, InvalidFrame — non-retriable, map to NEG_EIO.
+    for &variant in &[
+        NetDriverError::LinkDown,
+        NetDriverError::DeviceAbsent,
+        NetDriverError::InvalidFrame,
+    ] {
+        let byte = variant.to_byte();
+        assert_eq!(
+            net_error_to_neg_errno(byte),
+            -5,
+            "{variant:?} (byte {byte}) must map to NEG_EIO (-5)"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

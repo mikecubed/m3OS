@@ -106,6 +106,47 @@ pub enum NetDriverError {
     InvalidFrame,
 }
 
+impl NetDriverError {
+    /// Encode the error as a single discriminant byte for IPC wire transport.
+    ///
+    /// | Variant          | Byte |
+    /// |------------------|------|
+    /// | `Ok`             | 0    |
+    /// | `LinkDown`       | 1    |
+    /// | `RingFull`       | 2    |
+    /// | `DeviceAbsent`   | 3    |
+    /// | `DriverRestarting` | 4  |
+    /// | `InvalidFrame`   | 5    |
+    pub const fn to_byte(self) -> u8 {
+        match self {
+            NetDriverError::Ok => 0,
+            NetDriverError::LinkDown => 1,
+            NetDriverError::RingFull => 2,
+            NetDriverError::DeviceAbsent => 3,
+            NetDriverError::DriverRestarting => 4,
+            NetDriverError::InvalidFrame => 5,
+        }
+    }
+}
+
+/// Map a `NetDriverError` byte to a negated POSIX errno for syscall returns.
+///
+/// | Error byte | Errno | Rationale |
+/// |------------|-------|-----------|
+/// | `Ok` (0)   | 0     | success   |
+/// | `DriverRestarting` (4) | `NEG_EAGAIN` (-11) | caller should retry |
+/// | `RingFull` (2)         | `NEG_EAGAIN` (-11) | caller should retry |
+/// | everything else        | `NEG_EIO`   (-5)   | hard error |
+///
+/// Phase 55b Track F.3d-3 — mirrors `block_error_to_neg_errno` for the net path.
+pub const fn net_error_to_neg_errno(error_byte: u8) -> i64 {
+    match error_byte {
+        0 => 0,       // Ok
+        2 | 4 => -11, // RingFull | DriverRestarting → NEG_EAGAIN
+        _ => -5,      // everything else → NEG_EIO
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NetFrameHeader encoding — private helpers shared by send and rx paths.
 // ---------------------------------------------------------------------------
