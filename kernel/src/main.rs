@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 55b Track B.4 — IRQ-subscribe + notification bridging (RED)
+    // Phase 55b Track B.4 — IRQ-subscribe + notification bridging
     // -----------------------------------------------------------------------
 
     /// Track B.4: a synthetic device IRQ delivered through the device-IRQ
@@ -1358,9 +1358,6 @@ mod tests {
     /// `allocate_msi_vectors` → IDT stub → `device_irq_notification_shim`;
     /// the test substitutes `dispatch_device_irq_for_test` for the IDT stub
     /// step and asserts identical side effects on the notification word.
-    ///
-    /// RED commit: the helper returns `Err(TestIrqError::NotImplemented)`
-    /// so this test fails. The GREEN commit wires the synthetic bridge.
     #[test_case]
     fn device_host_irq_subscribe_signals_notification_bit() {
         use crate::syscall::device_host::{
