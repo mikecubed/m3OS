@@ -6772,6 +6772,13 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
         // effective identity so it can verify passwords via /etc/shadow and
         // then perform the authenticated credential transition.
         ("/bin/su", true) => Some((0, 0)),
+        // Phase 55b Track F.3c: nvme-crash-smoke must run with euid=200 so
+        // sys_block_read admits it through the privilege gate. Without this,
+        // the binary would be rejected before ever reaching the errno mapping.
+        // Only granted when the kernel is NOT in hardened mode (the whitelist
+        // in BLOCK_READ_ALLOWED is also cfg-gated on !hardened).
+        #[cfg(not(feature = "hardened"))]
+        ("/bin/nvme-crash-smoke", _) => Some((200, 200)),
         _ => None,
     }
 }
@@ -8961,24 +8968,57 @@ fn serial_echo_bytes(bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// Allowed caller binaries for raw block reads.
+///
+/// In production (`hardened` feature), only supervised storage servers
+/// may call `sys_block_read`. Without `hardened`, the integration test
+/// binary `/bin/nvme-crash-smoke` is also permitted so it can observe
+/// `EAGAIN` from the kernel facade's `DriverRestarting` path — a
+/// behaviour that is only visible through `RemoteBlockDevice`, not through
+/// the direct IPC channel the smoke binary normally uses.
 const STORAGE_SERVICE_UID: u32 = 200;
+#[cfg(not(feature = "hardened"))]
+const BLOCK_READ_ALLOWED: &[&str] = &[
+    "/bin/vfs_server",
+    "/bin/fat_server",
+    "/bin/nvme-crash-smoke",
+];
+#[cfg(feature = "hardened")]
 const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
 
 /// Read raw disk sectors into a userspace buffer.
 ///
-/// Args:
+/// # Arguments
 ///   - `start_sector`: absolute LBA of the first sector
 ///   - `count`: number of 512-byte sectors to read
 ///   - `buf_ptr`: userspace destination address
 ///   - `buf_len`: size of the destination buffer in bytes
 ///
-/// Returns 0 on success, or a negative errno on error.
+/// # Returns
+///
+/// Returns 0 on success, or a negative errno on error:
+///
+/// | `BlockDriverError` | byte | errno returned     |
+/// |---|---|---|
+/// | `Ok`               | 0    | 0 (success)        |
+/// | `IoError`          | 1    | `NEG_EIO` (-5)     |
+/// | `InvalidLba`       | 2    | `NEG_EIO` (-5)     |
+/// | `DeviceAbsent`     | 3    | `NEG_EIO` (-5)     |
+/// | `Busy`             | 4    | `NEG_EAGAIN` (-11) |
+/// | `DriverRestarting` | 5    | `NEG_EAGAIN` (-11) |
+/// | `InvalidRequest`   | 6    | `NEG_EIO` (-5)     |
+///
+/// `Busy` and `DriverRestarting` map to `EAGAIN` so callers can distinguish
+/// a temporary driver restart from a permanent I/O failure. The mapping is
+/// the single source of truth in
+/// `kernel_core::driver_ipc::block::block_error_to_neg_errno`
+/// (tested in `kernel-core/src/driver_ipc/block.rs`, Phase 55b Track F.3c).
+///
 /// Capped at 128 sectors (64 KiB) per call for safety.
 ///
 /// Only supervised storage services may call this syscall. The kernel requires
-/// both a dedicated service euid and an expected service binary path so
-/// ordinary users cannot gain raw-disk access by directly exec'ing a public
-/// `/bin/*_server` binary.
+/// both a dedicated service euid (`STORAGE_SERVICE_UID = 200`) and an expected
+/// service binary path so ordinary users cannot gain raw-disk access by
+/// directly exec'ing a public `/bin/*_server` binary.
 fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     // Restrict to supervised storage services.
     {
@@ -9015,7 +9055,12 @@ fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> 
             }
             0
         }
-        Err(_) => NEG_EIO,
+        // Propagate the driver error byte through the documented errno mapping.
+        // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
+        // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
+        Err(error_byte) => {
+            kernel_core::driver_ipc::block::block_error_to_neg_errno(error_byte) as u64
+        }
     }
 }
 
