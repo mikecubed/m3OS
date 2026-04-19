@@ -1095,6 +1095,20 @@ fn dispatch_device_irq(vector: u8) {
     }
 }
 
+/// Test-only entry point into the device-IRQ dispatcher.
+///
+/// The Phase 55b Track B.4 `#[test_case]` harness needs to drive the exact
+/// ISR shim the hardware will invoke without programming an MSI capability
+/// (which is impossible from the `test_main` runner's PID). This re-exports
+/// [`dispatch_device_irq`] under a test-only name so the unit test can
+/// deliver a synthetic IRQ and observe the same `notification::signal_irq_bit`
+/// side effect. The function is `#[cfg(test)]`-gated so it does not ship in
+/// release builds.
+#[cfg(test)]
+pub fn dispatch_device_irq_for_test(vector: u8) {
+    dispatch_device_irq(vector);
+}
+
 // Stubs — one per vector slot. The IDT requires a real
 // `extern "x86-interrupt"` function at each vector; we cannot generate them
 // at runtime. Each stub thunks to `dispatch_device_irq` with a compile-time

@@ -9,6 +9,7 @@
 // still testable on the host via `cargo test -p kernel-core`.
 
 pub mod dma_logic;
+pub mod irq_logic;
 pub mod mmio_bounds;
 pub mod registry_logic;
 pub mod syscalls;
@@ -17,6 +18,9 @@ pub mod types;
 pub use dma_logic::{
     DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
     validate_size_align,
+};
+pub use irq_logic::{
+    IrqBinding, IrqBindingRegistryCore, IrqRegistryError, MAX_IRQ_SUBSCRIPTIONS_PER_PID,
 };
 pub use mmio_bounds::{
     MAX_MMIO_BAR_BYTES, MmioBoundsError, bar_page_count, build_mmio_window, cache_mode_for_bar,

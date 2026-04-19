@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 55b Tracks B.2 and B.3 — sys_device_mmio_map / sys_device_dma_alloc
+    // Phase 55b Tracks B.2 / B.3 / B.4 — device-host syscall integration tests
     // -----------------------------------------------------------------------
 
     /// Pick a free PCI BDF for the test. Returns `None` when no free device
@@ -1824,5 +1824,65 @@ mod tests {
 
         let _ = test_release_for_pid(PID);
         serial_println!("device_host B.3 on-exit cleanup integration test passed");
+    }
+
+    // -- Track B.4 — sys_device_irq_subscribe integration test ---------------
+
+    /// Track B.4: a synthetic device IRQ delivered through the device-IRQ
+    /// dispatch table (the same path a real MSI vector would take) sets the
+    /// requested bit atomically on the bound notification. `release_for_pid`
+    /// tears the binding down so the vector is reusable.
+    #[test_case]
+    fn device_host_irq_subscribe_signals_notification_bit() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_release_for_pid, test_synthetic_irq_subscribe_and_signal,
+            test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("device_host B.4 test skipped: no free PCI device in QEMU");
+            return;
+        };
+
+        const PID_D: crate::process::Pid = 0xC0FF_EE04;
+        let _ = test_release_for_pid(PID_D);
+
+        match test_try_claim_for_pid(PID_D, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "device_host B.4 test skipped: BDF {:02x}:{:02x}.{} already claimed",
+                    key.bus,
+                    key.dev,
+                    key.func,
+                );
+                return;
+            }
+            Err(e) => panic!("B.4 claim failed: {:?}", e),
+        }
+
+        // Bind bit 3 to vector offset 0.
+        let pending = match test_synthetic_irq_subscribe_and_signal(PID_D, key, 3, 0) {
+            Ok(p) => p,
+            Err(e) => panic!("B.4 synthetic bind/signal failed: {:?}", e),
+        };
+        assert_eq!(
+            pending,
+            1u64 << 3,
+            "ISR shim must have set exactly bit 3 on the bound notification (got {:#x})",
+            pending,
+        );
+
+        // Re-arm with a different bit/vector.
+        let pending_bit7 = match test_synthetic_irq_subscribe_and_signal(PID_D, key, 7, 1) {
+            Ok(p) => p,
+            Err(e) => panic!("B.4 second synthetic bind failed: {:?}", e),
+        };
+        assert_eq!(pending_bit7, 1u64 << 7);
+
+        let freed = test_release_for_pid(PID_D);
+        assert_eq!(freed, 1, "exactly one claim freed on exit");
+
+        serial_println!("device_host B.4 integration test passed");
     }
 }
