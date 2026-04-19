@@ -308,6 +308,9 @@ fn build_userspace_bins() {
         // Real bring-up lands in D.2/D.3 and E.2/E.3.
         ("nvme_driver", "nvme_driver", true),
         ("e1000_driver", "e1000_driver", true),
+        // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
+        // client. No alloc dependency — syscall_lib only.
+        ("nvme-crash-smoke", "nvme-crash-smoke", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -6668,6 +6671,36 @@ fn regression_tests() -> Vec<RegressionTest> {
         });
     }
 
+    // Phase 55b Track F.3b: end-to-end NVMe crash smoke.
+    //
+    // Runs the `nvme-crash-smoke` guest binary which:
+    //   1. Sends a BLK_READ to the `nvme.block` IPC endpoint.
+    //   2. Forks a child that runs `service kill nvme_driver`.
+    //   3. Issues another BLK_READ mid-kill to catch the transport error.
+    //   4. Polls /run/services.status until nvme_driver shows `running`.
+    //   5. Retries the BLK_READ and expects success.
+    //   6. Emits `NVME_CRASH_SMOKE:PASS` on success.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE because it requires --device nvme
+    // and its timing depends on QEMU TCG speed; under CI the broader
+    // `driver-restart-guest` regression already exercises the restart cycle.
+    // This gate is a separate env-var so the two regressions can be run
+    // independently.
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "driver-restart-crash",
+            description: "Phase 55b F.3b: nvme-crash-smoke — kill mid-I/O → transport error → \
+                 restart → retry success",
+            guest_steps: driver_restart_crash_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
+        });
+    }
+
     tests
 }
 
@@ -6916,6 +6949,74 @@ fn driver_restart_guest_steps() -> Vec<SmokeStep> {
         pattern: "# ",
         timeout_secs: 15,
         label: "guest/driver-restart: final prompt",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3b driver-restart-crash regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// `nvme_driver` service is alive and its `nvme.block` IPC endpoint is
+/// reachable before the smoke binary is launched.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for nvme_driver to finish bring-up (NVME_SMOKE:rw:PASS).
+///   3. Launch `/bin/nvme-crash-smoke`.
+///   4. Confirm `NVME_CRASH_SMOKE:kill-delivered` appears (kill raced with I/O).
+///   5. Confirm `NVME_CRASH_SMOKE:restart-confirmed` appears (driver back up).
+///   6. Confirm `NVME_CRASH_SMOKE:PASS` appears (post-restart read succeeded).
+fn driver_restart_crash_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Let nvme_driver finish full bring-up (NVME_SMOKE:rw:PASS is emitted
+    // before the IPC endpoint is registered, so once it appears the endpoint
+    // is open for business).
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_SMOKE:rw:PASS",
+        timeout_secs: 120,
+        label: "guest/crash-smoke: wait for nvme self-test PASS",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/nvme-crash-smoke\n",
+        label: "guest/crash-smoke: launch nvme-crash-smoke",
+    });
+
+    // Step 3 — pre-crash read must succeed.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:pre-crash-read:OK",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: pre-crash read OK",
+    });
+
+    // Step 4 — SIGKILL delivered (transport error or reply-before-kill logged).
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:kill-delivered",
+        timeout_secs: 20,
+        label: "guest/crash-smoke: SIGKILL delivered to nvme_driver",
+    });
+
+    // Step 5 — driver restarted.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:restart-confirmed",
+        timeout_secs: 30,
+        label: "guest/crash-smoke: driver restart confirmed",
+    });
+
+    // Step 6 — post-restart read and overall PASS.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: shell prompt after smoke",
     });
 
     steps

@@ -27,11 +27,15 @@
 //!   (or synthesising a driver that deliberately calls with a stolen handle).
 //! - Observing the kernel's errno return across the process boundary.
 //!
-//! **That harness does not exist yet.** The supervised-restart scaffolding from
-//! Track F.2 (`driver_restart_regression`) brings the process-lifecycle piece;
-//! injecting a *wrong* capability from userspace requires a dedicated
-//! "negative-path driver" binary that can be composed with the F.2 harness.
-//! That work is deferred to a future phase, tracked as:
+//! **Phase 55b F.3b progress:** Track F.3b delivered `userspace/nvme-crash-smoke/`
+//! which exercises the crash-and-restart lifecycle from the guest side (kill →
+//! IPC transport failure → restart → retry success). The cross-process capability
+//! injection scenario is a different and harder problem — it requires a "negative-
+//! path driver" binary that deliberately passes a wrong `CapHandle` in a syscall
+//! and a harness that can correlate the kernel's errno return to the injected
+//! value. That harness still does not exist.
+//!
+//! The stubs below remain deferred to phase-55c:
 //!
 //! > TODO(phase-55c): end-to-end cross-device negative path — spawn both
 //! > drivers, use wrong cap handle, assert `-EBADF` at the syscall return.
@@ -58,11 +62,13 @@
 /// Requires end-to-end supervised spawn + cross-process handle injection
 /// harness. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "requires end-to-end driver spawn harness (TODO phase-55c)"]
+#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (lifecycle smoke); \
+            cross-device negative-path requires supervised spawn + CapHandle \
+            injection harness. Covered at kernel level by cross_device_mmio_denied."]
 fn cross_device_mmio_denied_end_to_end() {
     // Covered at the kernel registry level by `cross_device_mmio_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
-    todo!("end-to-end cross-device MMIO denial: needs supervised spawn harness")
+    todo!("end-to-end cross-device MMIO denial: needs supervised spawn + cap-injection harness")
 }
 
 /// Placeholder — end-to-end cross-device DMA denial test.
@@ -79,11 +85,13 @@ fn cross_device_mmio_denied_end_to_end() {
 /// Requires end-to-end supervised spawn + cross-process handle injection
 /// harness. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "requires end-to-end driver spawn harness (TODO phase-55c)"]
+#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (lifecycle smoke); \
+            cross-device DMA negative-path requires supervised spawn + CapHandle \
+            injection harness. Covered at kernel level by cross_device_dma_denied."]
 fn cross_device_dma_denied_end_to_end() {
     // Covered at the kernel registry level by `cross_device_dma_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
-    todo!("end-to-end cross-device DMA denial: needs supervised spawn harness")
+    todo!("end-to-end cross-device DMA denial: needs supervised spawn + cap-injection harness")
 }
 
 /// Placeholder — end-to-end forged CapHandle denial test.
@@ -99,7 +107,9 @@ fn cross_device_dma_denied_end_to_end() {
 /// Requires a "negative-path driver" binary capable of deliberate wrong-handle
 /// syscalls. Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "requires negative-path driver binary (TODO phase-55c)"]
+#[ignore = "phase-55c deferred: requires negative-path driver binary that \
+            deliberately passes a forged CapHandle in a device-host syscall. \
+            Covered at kernel level by capability_forge_denied."]
 fn capability_forge_denied_end_to_end() {
     // Covered at the kernel registry level by `capability_forge_denied`
     // in kernel/src/main.rs. See module-level doc for gap analysis.
@@ -121,10 +131,14 @@ fn capability_forge_denied_end_to_end() {
 /// integer across the kill/restart boundary for the negative assertion.
 /// Tracked as TODO(phase-55c).
 #[test]
-#[ignore = "requires F.2 supervised restart harness (TODO phase-55c)"]
+#[ignore = "phase-55c deferred: F.3b landed nvme-crash-smoke (kill → restart → \
+            retry lifecycle); asserting pre-crash CapHandle values are rejected \
+            by the restarted process requires cap-handle injection across the \
+            kill/restart boundary — no harness for that yet. \
+            Covered at kernel level by post_crash_handles_invalid_in_restarted_process."]
 fn post_crash_handles_invalid_end_to_end() {
     // Covered at the kernel registry level by
     // `post_crash_handles_invalid_in_restarted_process` in kernel/src/main.rs.
     // See module-level doc for gap analysis.
-    todo!("end-to-end post-crash handle invalidation: needs F.2 restart harness")
+    todo!("end-to-end post-crash handle invalidation: needs cap-handle injection harness")
 }

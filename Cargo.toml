@@ -59,6 +59,8 @@ members = [
     # Phase 55b Tracks D.1 / E.1 — ring-3 driver scaffolds
     "userspace/drivers/nvme",
     "userspace/drivers/e1000",
+    # Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke client
+    "userspace/nvme-crash-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

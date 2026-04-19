@@ -1057,6 +1057,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvme-crash-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
 name = "nvme_driver"
 version = "0.55.2"
 dependencies = [
