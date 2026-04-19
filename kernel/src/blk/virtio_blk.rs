@@ -162,7 +162,7 @@ impl Virtqueue {
         part1 + part2
     }
 
-    fn init(port: PortRegion, queue_index: u16) -> Option<Self> {
+    fn init(handle: &pci::PciDeviceHandle, port: PortRegion, queue_index: u16) -> Option<Self> {
         port.write_reg::<u16>(VIRTIO_QUEUE_SELECT, queue_index);
         let queue_size = port.read_reg::<u16>(VIRTIO_QUEUE_SIZE);
         if queue_size < 3 {
@@ -184,8 +184,8 @@ impl Virtqueue {
         }
 
         let alloc_size = Self::calc_size(queue_size);
-        let ring = DmaBuffer::<[u8]>::new_bytes(alloc_size, 4096).ok()?;
-        let phys_base = ring.physical_address().as_u64();
+        let ring = DmaBuffer::<[u8]>::allocate(handle, alloc_size).ok()?;
+        let phys_base = ring.bus_address();
         let virt_base = ring.as_ptr() as usize;
 
         let n = queue_size as usize;
@@ -674,7 +674,7 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         log::info!("[virtio-blk] legacy device (no FEATURES_OK) — continuing");
     }
 
-    let request_queue = match Virtqueue::init(port, 0) {
+    let request_queue = match Virtqueue::init(&handle, port, 0) {
         Some(q) => q,
         None => {
             return DriverProbeResult::Failed("failed to initialize request queue");
@@ -693,18 +693,18 @@ fn probe(handle: pci::PciDeviceHandle) -> DriverProbeResult {
         (capacity_sectors * SECTOR_SIZE as u64) / (1024 * 1024)
     );
 
-    let scratch = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+    let scratch = match DmaBuffer::<[u8]>::allocate(&handle, 4096) {
         Ok(b) => b,
         Err(_) => return DriverProbeResult::Failed("scratch DMA alloc failed"),
     };
-    let scratch_phys = scratch.physical_address().as_u64();
+    let scratch_phys = scratch.bus_address();
     let scratch_virt = scratch.as_ptr() as *mut u8;
 
-    let dma = match DmaBuffer::<[u8]>::new_bytes(4096, 4096) {
+    let dma = match DmaBuffer::<[u8]>::allocate(&handle, 4096) {
         Ok(b) => b,
         Err(_) => return DriverProbeResult::Failed("data DMA alloc failed"),
     };
-    let dma_phys = dma.physical_address().as_u64();
+    let dma_phys = dma.bus_address();
     let dma_virt = dma.as_ptr() as *mut u8;
 
     // Install the completion IRQ handler (C.3). Prefer MSI, fall back to
