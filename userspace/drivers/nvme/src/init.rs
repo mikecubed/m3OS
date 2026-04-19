@@ -1,47 +1,94 @@
-//! NVMe controller bring-up — Phase 55b Track D.2 (Red commit).
+//! NVMe controller bring-up — Phase 55b Track D.2.
 //!
-//! Track D.2 red. Declares the pure-logic state-machine surface the
-//! driver loop will consume (`BringUpStateMachine`, `BringUpState`,
-//! `BringUpAction`, `BringUpError`) and pins the behavior the green
-//! commit must land. The stub here deliberately does *nothing* on
-//! every transition so the host-testable tests below land red.
+//! This module ports the Phase 55 in-kernel controller bring-up
+//! sequence (originally `kernel/src/blk/nvme.rs`) to the ring-3
+//! `driver_runtime` HAL. Register layouts (`kernel_core::nvme::*`) stay;
+//! the MMIO and DMA access wrappers move from `crate::pci::bar::MmioRegion`
+//! / `crate::mm::dma::DmaBuffer` to [`driver_runtime::Mmio`] and
+//! [`driver_runtime::DmaBuffer`].
 //!
-//! The register layouts (`kernel_core::nvme::*`) stay; the MMIO and
-//! DMA access wrappers move from `crate::pci::bar::MmioRegion` /
-//! `crate::mm::dma::DmaBuffer` to [`driver_runtime::Mmio`] and
-//! [`driver_runtime::DmaBuffer`] once the green commit lands.
+//! # Pure reset state machine
+//!
+//! The reset / enable / Identify sequence is a small finite automaton
+//! that does not depend on real MMIO or DMA. Extracting it as
+//! [`BringUpStateMachine`] gives D.2 a host-testable surface: tests feed
+//! synthetic `CAP` / `CSTS` reads and assert the machine advances
+//! through the states the NVMe spec requires. The real driver layers
+//! MMIO I/O on top — every [`BringUpAction`] produced by the machine
+//! turns into one of `Mmio::write_reg` / `Mmio::read_reg` /
+//! `DmaBuffer::allocate` / a polled wait loop that reads `CSTS.RDY`.
+//!
+//! # State invariants
+//!
+//! - Start: [`BringUpState::ResetDisable`]. First action is to clear
+//!   `CC.EN` if the firmware left it set.
+//! - Terminal success: [`BringUpState::Identified`]. Controller is
+//!   enabled, admin SQ/CQ are programmed, and Identify Controller +
+//!   Identify Namespace have completed.
+//! - Terminal failure: [`BringUpState::Failed`] carrying a
+//!   [`BringUpError`]. The driver surfaces this to waiting IPC clients
+//!   as [`kernel_core::driver_ipc::block::BlockDriverError::IoError`].
+//!
+//! The state machine never panics. Unexpected inputs (for example,
+//! `observe_csts` called outside a wait state) are ignored so the
+//! driver loop cannot accidentally advance the machine.
 
 use core::fmt;
 
 use kernel_core::nvme as knvme;
 
-/// NVMe memory page size assumed for PRP arithmetic (matches Phase 55
-/// D.1 `kernel/src/blk/nvme.rs::NVME_PAGE_BYTES`).
+// ---------------------------------------------------------------------------
+// Queue sizing constants — mirror Phase 55 D.1 `kernel/src/blk/nvme.rs`.
+// ---------------------------------------------------------------------------
+
+/// NVMe memory page size assumed for PRP arithmetic. NVMe §4.3 allows
+/// `2^(12 + CAP.MPSMIN)` pages; every target we care about reports
+/// `MPSMIN == 0`, so 4 KiB is the correct value. Keeping the constant
+/// in one place guarantees the PRP math and the DMA buffer sizes never
+/// drift.
 pub const NVME_PAGE_BYTES: usize = 4096;
 
-/// Admin queue depth (mirrors Phase 55 D.1 `ADMIN_QUEUE_ENTRIES`).
+/// Admin queue depth. 64 is well above the 2-3 commands admin bring-up
+/// ever has in flight and stays far below every `CAP.MQES` we expect
+/// on real controllers.
 pub const ADMIN_QUEUE_DEPTH: usize = 64;
 
-/// Safety margin on top of `CAP.TO * 500 ms` before the wait loop
-/// treats the controller as wedged.
+/// Safety margin on top of `CAP.TO * 500 ms` before the reset / enable
+/// wait treats the controller as wedged. Matches Phase 55 D.1's
+/// `RESET_SAFETY_MARGIN_TICKS`.
 pub const RESET_SAFETY_MARGIN_MS: u64 = 1_000;
 
 // ---------------------------------------------------------------------------
 // BringUpError
 // ---------------------------------------------------------------------------
 
-/// Reason a controller bring-up attempt failed. Every variant is data;
-/// no variant triggers a panic path. The driver collapses these to
-/// [`kernel_core::driver_ipc::block::BlockDriverError::IoError`] when
-/// replying to IPC clients.
+/// Reason a controller bring-up attempt failed.
+///
+/// Each variant is data — the driver surfaces it to IPC clients as
+/// `BlockDriverError::IoError` and logs the specific variant for
+/// post-mortem. No variant ever triggers a panic path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BringUpError {
+    /// Controller did not advertise the NVM command set (`CAP.CSS`
+    /// bit 37 was clear). A future phase may add NVMe-MI support.
     NvmNotAdvertised,
+    /// `CSTS.RDY` did not clear after clearing `CC.EN` within the
+    /// `CAP.TO` + safety-margin budget.
     ResetTimeout,
+    /// `CSTS.RDY` did not set after writing `CC.EN=1` within the
+    /// budget.
     EnableTimeout,
+    /// `CSTS.CFS` was observed during bring-up. The controller needs
+    /// a full subsystem reset before it is usable again.
     ControllerFatal,
+    /// An admin command (Identify Controller / Identify Namespace /
+    /// Create I/O queue) failed with non-zero status, or timed out.
     AdminCommandFailed,
+    /// BAR0 is smaller than the doorbell range requires; bring-up
+    /// aborted before any MMIO programming.
     BarTooSmall,
+    /// `CAP.MQES + 1` was smaller than 2, leaving no room for the
+    /// admin queue.
     QueueTooShallow,
 }
 
@@ -63,107 +110,282 @@ impl fmt::Display for BringUpError {
 // BringUpState / BringUpAction
 // ---------------------------------------------------------------------------
 
+/// State within the controller bring-up sequence. Ordering mirrors the
+/// NVMe §3.5.1 "Controller Initialization" sequence with the Identify
+/// post-conditions appended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BringUpState {
+    /// Initial state. Driver must clear `CC.EN` if set.
     ResetDisable,
+    /// Waiting for `CSTS.RDY` to clear after `CC.EN = 0`.
     ResetWait,
+    /// Controller is disabled. Next: allocate admin SQ/CQ, program
+    /// `AQA`, `ASQ`, `ACQ`.
     ProgramAdminQueue,
+    /// Admin registers programmed. Next: write `CC` with `EN = 1`.
     EnableController,
+    /// Waiting for `CSTS.RDY` to set after `CC.EN = 1`.
     EnableWait,
+    /// Controller enabled. Next: Identify Controller (CNS=0x01).
     IdentifyController,
+    /// Identify Controller done. Next: Identify Namespace (CNS=0x00).
     IdentifyNamespace,
+    /// Bring-up complete. I/O queue pair setup is Track D.3.
     Identified,
+    /// Terminal failure.
     Failed(BringUpError),
 }
 
+/// External action the driver must carry out for the current state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BringUpAction {
+    /// Write `CC & !CC_EN` to clear the enable bit.
     WriteCcDisable,
+    /// Poll `CSTS` until `CSTS.RDY == 0` or the budget expires.
     AwaitCstsReset,
+    /// Allocate admin SQ / CQ and program `AQA`, `ASQ`, `ACQ`.
     ProgramAdminRegisters,
+    /// Write `CC` with `EN = 1` and correct IOSQES / IOCQES.
     WriteCcEnable,
+    /// Poll `CSTS` until `CSTS.RDY == 1` or the budget expires.
     AwaitCstsReady,
+    /// Submit Identify Controller (CNS=0x01).
     SubmitIdentifyController,
+    /// Submit Identify Namespace (CNS=0x00) for the selected NSID.
     SubmitIdentifyNamespace,
+    /// No further action — bring-up is in a terminal state.
     Idle,
 }
 
 // ---------------------------------------------------------------------------
-// BringUpStateMachine — Red stub. Every transition is a no-op so tests
-// below fail. The green commit replaces each method body with the
-// logic documented on the state variants.
+// BringUpStateMachine — pure-logic controller bring-up driver.
 // ---------------------------------------------------------------------------
 
+/// Pure-logic controller bring-up driver.
+///
+/// Construct with [`BringUpStateMachine::new`]; feed register-read
+/// events via the `observe_*` methods; call
+/// [`BringUpStateMachine::next_action`] to learn what to do. The
+/// machine does not issue MMIO / DMA itself — the driver loop carries
+/// out each [`BringUpAction`] and reports the resulting observation
+/// back.
 #[derive(Clone, Debug)]
 pub struct BringUpStateMachine {
-    #[allow(dead_code)]
+    state: BringUpState,
+    reset_budget_ms: u64,
     cap: knvme::NvmeCap,
 }
 
 impl BringUpStateMachine {
-    pub fn new(_cap: knvme::NvmeCap) -> Result<Self, BringUpError> {
-        // Red stub: always succeed so tests that exercise the failure
-        // paths catch the missing validation.
-        Err(BringUpError::AdminCommandFailed)
+    /// Build a bring-up state machine from the controller's `CAP`
+    /// register value.
+    pub fn new(cap: knvme::NvmeCap) -> Result<Self, BringUpError> {
+        if !cap.css_nvme() {
+            return Err(BringUpError::NvmNotAdvertised);
+        }
+        if cap.mqes() < 2 {
+            return Err(BringUpError::QueueTooShallow);
+        }
+        Ok(Self {
+            state: BringUpState::ResetDisable,
+            reset_budget_ms: reset_budget_ms(cap.timeout_500ms_units()),
+            cap,
+        })
     }
 
+    /// Current state. Used by the driver loop to decide which action
+    /// to issue and by tests to assert transitions.
     pub fn state(&self) -> BringUpState {
-        BringUpState::ResetDisable
+        self.state
     }
 
+    /// Polling budget in milliseconds — the driver's wait loop uses
+    /// this to bound `AwaitCstsReset` / `AwaitCstsReady` waits.
     pub fn reset_budget_ms(&self) -> u64 {
-        0
+        self.reset_budget_ms
     }
 
+    /// `CAP.MQES + 1` — upper bound on queue entries the hardware
+    /// accepts. The driver clamps its configured `ADMIN_QUEUE_DEPTH`
+    /// against this.
     pub fn max_queue_entries(&self) -> u16 {
-        0
+        self.cap.mqes()
     }
 
+    /// Doorbell stride in bytes, encoded as `4 << CAP.DSTRD`.
     pub fn doorbell_stride_bytes(&self) -> usize {
-        0
+        self.cap.doorbell_stride()
     }
 
+    /// Action the driver should perform next, given the current
+    /// state.
     pub fn next_action(&self) -> BringUpAction {
-        BringUpAction::Idle
+        match self.state {
+            BringUpState::ResetDisable => BringUpAction::WriteCcDisable,
+            BringUpState::ResetWait => BringUpAction::AwaitCstsReset,
+            BringUpState::ProgramAdminQueue => BringUpAction::ProgramAdminRegisters,
+            BringUpState::EnableController => BringUpAction::WriteCcEnable,
+            BringUpState::EnableWait => BringUpAction::AwaitCstsReady,
+            BringUpState::IdentifyController => BringUpAction::SubmitIdentifyController,
+            BringUpState::IdentifyNamespace => BringUpAction::SubmitIdentifyNamespace,
+            BringUpState::Identified | BringUpState::Failed(_) => BringUpAction::Idle,
+        }
     }
 
-    pub fn notify_cc_disabled(&mut self) {}
-    pub fn observe_csts(&mut self, _csts: u32) {}
-    pub fn timeout(&mut self) {}
-    pub fn notify_admin_programmed(&mut self) {}
-    pub fn notify_cc_enabled(&mut self) {}
-    pub fn notify_identify_controller(&mut self, _status_code: u16) {}
-    pub fn notify_identify_namespace(&mut self, _status_code: u16) {}
+    /// Notify the machine that the driver has written `CC` with
+    /// `EN = 0`. Transitions `ResetDisable` → `ResetWait`.
+    pub fn notify_cc_disabled(&mut self) {
+        if matches!(self.state, BringUpState::ResetDisable) {
+            self.state = BringUpState::ResetWait;
+        }
+    }
+
+    /// Feed a `CSTS` observation. Handles both `ResetWait` (clear bit
+    /// advances) and `EnableWait` (set bit advances). `CSTS.CFS`
+    /// short-circuits to [`BringUpError::ControllerFatal`].
+    pub fn observe_csts(&mut self, csts: u32) {
+        match self.state {
+            BringUpState::ResetWait => {
+                if csts & knvme::CSTS_CFS != 0 {
+                    self.state = BringUpState::Failed(BringUpError::ControllerFatal);
+                } else if csts & knvme::CSTS_RDY == 0 {
+                    self.state = BringUpState::ProgramAdminQueue;
+                }
+            }
+            BringUpState::EnableWait => {
+                if csts & knvme::CSTS_CFS != 0 {
+                    self.state = BringUpState::Failed(BringUpError::ControllerFatal);
+                } else if csts & knvme::CSTS_RDY != 0 {
+                    self.state = BringUpState::IdentifyController;
+                }
+            }
+            _ => {
+                // Observations outside a wait state are ignored so
+                // the driver cannot accidentally advance the machine
+                // with a stale read.
+            }
+        }
+    }
+
+    /// Signal that the `AwaitCstsReset` / `AwaitCstsReady` budget
+    /// expired without observing the expected bit transition.
+    pub fn timeout(&mut self) {
+        match self.state {
+            BringUpState::ResetWait => {
+                self.state = BringUpState::Failed(BringUpError::ResetTimeout);
+            }
+            BringUpState::EnableWait => {
+                self.state = BringUpState::Failed(BringUpError::EnableTimeout);
+            }
+            _ => {}
+        }
+    }
+
+    /// Notify the machine that `AQA`/`ASQ`/`ACQ` have been programmed
+    /// and the admin SQ / CQ are ready.
+    pub fn notify_admin_programmed(&mut self) {
+        if matches!(self.state, BringUpState::ProgramAdminQueue) {
+            self.state = BringUpState::EnableController;
+        }
+    }
+
+    /// Notify the machine that `CC` was written with `EN = 1`.
+    pub fn notify_cc_enabled(&mut self) {
+        if matches!(self.state, BringUpState::EnableController) {
+            self.state = BringUpState::EnableWait;
+        }
+    }
+
+    /// Report the outcome of the Identify Controller admin command.
+    /// `status_code == 0` advances to
+    /// [`BringUpState::IdentifyNamespace`]; any non-zero status lands
+    /// in [`BringUpError::AdminCommandFailed`].
+    pub fn notify_identify_controller(&mut self, status_code: u16) {
+        if matches!(self.state, BringUpState::IdentifyController) {
+            if status_code == 0 {
+                self.state = BringUpState::IdentifyNamespace;
+            } else {
+                self.state = BringUpState::Failed(BringUpError::AdminCommandFailed);
+            }
+        }
+    }
+
+    /// Report the outcome of the Identify Namespace admin command.
+    /// `status_code == 0` finishes bring-up.
+    pub fn notify_identify_namespace(&mut self, status_code: u16) {
+        if matches!(self.state, BringUpState::IdentifyNamespace) {
+            if status_code == 0 {
+                self.state = BringUpState::Identified;
+            } else {
+                self.state = BringUpState::Failed(BringUpError::AdminCommandFailed);
+            }
+        }
+    }
+
+    /// True when the machine has observed the Identify Namespace
+    /// success transition.
     pub fn is_complete(&self) -> bool {
-        false
+        matches!(self.state, BringUpState::Identified)
     }
+
+    /// True when the machine is in any terminal state (success or
+    /// failure). Driver loop exits on this.
     pub fn is_terminal(&self) -> bool {
-        false
+        matches!(
+            self.state,
+            BringUpState::Identified | BringUpState::Failed(_)
+        )
     }
+
+    /// Error variant when in a terminal failure state. `None`
+    /// otherwise.
     pub fn error(&self) -> Option<BringUpError> {
-        None
+        match self.state {
+            BringUpState::Failed(e) => Some(e),
+            _ => None,
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers — Red stubs.
+// Encoders — byte-for-byte matches with Phase 55 D.1.
 // ---------------------------------------------------------------------------
 
-pub fn reset_budget_ms(_to_500ms_units: u8) -> u64 {
-    0
+/// Compute the reset / enable polling window in milliseconds from
+/// `CAP.TO` (in 500-ms units). Mirrors the Phase 55 D.1 helper but
+/// returns milliseconds directly so the userspace driver can feed it
+/// into its own bounded-wait loop.
+pub fn reset_budget_ms(to_500ms_units: u8) -> u64 {
+    let units = to_500ms_units.max(1) as u64;
+    units
+        .saturating_mul(500)
+        .saturating_add(RESET_SAFETY_MARGIN_MS)
 }
 
-pub fn encode_aqa(_entries: u16) -> u32 {
-    0
+/// Encode `AQA` from the admin queue depth. `ASQS` (bits 11:0) and
+/// `ACQS` (bits 27:16) both hold `entries - 1` per NVMe §3.1.9.
+pub fn encode_aqa(entries: u16) -> u32 {
+    let qsize = entries.saturating_sub(1) as u32;
+    (qsize & 0x0FFF) | ((qsize & 0x0FFF) << 16)
 }
 
+/// Value to write into `CC` when enabling the controller. `IOSQES = 6`
+/// (64-byte SQ entries), `IOCQES = 4` (16-byte CQ entries), `MPS = 0`
+/// (4 KiB), `AMS = 0`, `CSS = 0` (NVM), `SHN = 0`, `EN = 1`. Exactly
+/// the bits Phase 55 D.1's `enable_controller` writes.
 pub fn encode_cc_enable() -> u32 {
-    0
+    (6u32 << knvme::CC_IOSQES_SHIFT)
+        | (4u32 << knvme::CC_IOCQES_SHIFT)
+        | (0u32 << knvme::CC_MPS_SHIFT)
+        | (0u32 << knvme::CC_AMS_SHIFT)
+        | (0u32 << knvme::CC_CSS_SHIFT)
+        | (0u32 << knvme::CC_SHN_SHIFT)
+        | knvme::CC_EN
 }
 
 // ---------------------------------------------------------------------------
-// Tests — red. Every test here must land green after the D.2
-// implementation commit.
+// Tests — D.2 acceptance. Every test here pins a spec-level behavior
+// the driver loop depends on.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
