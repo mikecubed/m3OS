@@ -273,6 +273,41 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 55b Track B.2 / B.3 / B.4 — stub dispatch targets
+// ---------------------------------------------------------------------------
+//
+// Stubs that return `-ENOSYS` until the corresponding track lands. Each
+// track replaces only its own function body; the dispatch arms in
+// `arch/x86_64/syscall/mod.rs` already route to these names so a track
+// never has to touch the arch dispatcher.
+
+const NEG_ENOSYS: isize = -38;
+
+/// B.2 — `sys_device_mmio_map` stub. Replaced by Track B.2.
+#[allow(unused_variables)]
+pub fn sys_device_mmio_map(dev_cap: u32, bar_index: u8) -> isize {
+    NEG_ENOSYS
+}
+
+/// B.3 — `sys_device_dma_alloc` stub. Replaced by Track B.3.
+#[allow(unused_variables)]
+pub fn sys_device_dma_alloc(dev_cap: u32, size: usize, align: usize) -> isize {
+    NEG_ENOSYS
+}
+
+/// B.3 — `sys_device_dma_handle_info` stub. Replaced by Track B.3.
+#[allow(unused_variables)]
+pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
+    NEG_ENOSYS
+}
+
+/// B.4 — `sys_device_irq_subscribe` stub. Replaced by Track B.4.
+#[allow(unused_variables)]
+pub fn sys_device_irq_subscribe(dev_cap: u32, vector_hint: u32, notification_index: u32) -> isize {
+    NEG_ENOSYS
+}
+
+// ---------------------------------------------------------------------------
 // Process-exit hook
 // ---------------------------------------------------------------------------
 

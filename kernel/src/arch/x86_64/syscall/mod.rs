@@ -1593,13 +1593,31 @@ pub extern "C" fn syscall_handler(
                 result as u64
             }
         }
-        // B.2–B.4 reservations — dispatched to -ENOSYS until their tracks land.
-        // Keeping the arms explicit (rather than falling through to the
-        // catch-all) documents the block and prevents accidental reuse.
-        SYS_DEVICE_MMIO_MAP
-        | SYS_DEVICE_DMA_ALLOC
-        | SYS_DEVICE_DMA_HANDLE_INFO
-        | SYS_DEVICE_IRQ_SUBSCRIBE => NEG_ENOSYS,
+        SYS_DEVICE_MMIO_MAP => {
+            // Signature: sys_device_mmio_map(dev_cap: CapHandle, bar_index: u8) -> isize
+            crate::syscall::device_host::sys_device_mmio_map(arg0 as u32, arg1 as u8) as u64
+        }
+        SYS_DEVICE_DMA_ALLOC => {
+            // Signature: sys_device_dma_alloc(dev_cap: CapHandle, size: usize, align: usize) -> isize
+            crate::syscall::device_host::sys_device_dma_alloc(
+                arg0 as u32,
+                arg1 as usize,
+                arg2 as usize,
+            ) as u64
+        }
+        SYS_DEVICE_DMA_HANDLE_INFO => {
+            // Signature: sys_device_dma_handle_info(dma_cap: CapHandle, out: *mut DmaHandle) -> isize
+            crate::syscall::device_host::sys_device_dma_handle_info(arg0 as u32, arg1 as usize)
+                as u64
+        }
+        SYS_DEVICE_IRQ_SUBSCRIBE => {
+            // Signature: sys_device_irq_subscribe(dev_cap: CapHandle, vector_hint: u32, notification_index: u32) -> isize
+            crate::syscall::device_host::sys_device_irq_subscribe(
+                arg0 as u32,
+                arg1 as u32,
+                arg2 as u32,
+            ) as u64
+        }
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
             NEG_ENOSYS
