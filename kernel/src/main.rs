@@ -1878,4 +1878,296 @@ mod tests {
 
         serial_println!("device_host B.4 integration test passed");
     }
+
+    // -- Track F.3 — Cross-device negative tests ------------------------------
+    //
+    // These four tests prove the central isolation invariant: a driver process
+    // cannot access a BAR or DMA region belonging to a device it did not claim,
+    // and forged / stale CapHandle values are rejected unconditionally.
+    //
+    // Tests 1, 2, 3 operate entirely through the test-harness helpers already
+    // used by B.2 / B.3 (no live ring-3 process needed). Test 4 simulates
+    // the post-crash handle-invalidation lifecycle using `test_release_for_pid`
+    // + `test_try_claim_for_pid` as the stand-in for the supervisor kill+restart
+    // cycle (the real end-to-end path is covered by F.2's process-restart
+    // regression; we validate the handle-space invariant here at the registry
+    // level).
+
+    /// F.3 Test 1: cross-device MMIO denied.
+    ///
+    /// Simulates an NVMe driver (PID_NVME) holding a valid `Capability::Device`
+    /// for its own BDF, then attempting to record an MMIO entry against a
+    /// *different* BDF (which it has not claimed). The registry must reject
+    /// this with `NotClaimed` — the same error the syscall boundary returns as
+    /// `-EBADF` to the caller. No MMIO mapping is installed.
+    #[test_case]
+    fn cross_device_mmio_denied() {
+        use crate::syscall::device_host::{
+            TestClaimError, TestMmioError, test_mmio_count_for_pid, test_record_mmio,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        // Use a real PCI device for the NVMe driver's legitimate claim.
+        let Some(nvme_key) = pick_free_pci_bdf() else {
+            serial_println!("F.3 Test 1 skipped: no free PCI device for NVMe driver");
+            return;
+        };
+
+        // e1000 BDF: fabricate a key the NVMe driver does NOT own.
+        // We use a sentinel that is guaranteed to differ from nvme_key.
+        let e1000_key = DeviceCapKey::new(0, 0xFE, 0x1F, 6);
+
+        const PID_NVME: crate::process::Pid = 0xF3_0001;
+        let _ = test_release_for_pid(PID_NVME);
+
+        match test_try_claim_for_pid(PID_NVME, nvme_key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!("F.3 Test 1 skipped: nvme BDF busy");
+                return;
+            }
+            Err(e) => panic!("F.3 Test 1 claim failed: {:?}", e),
+        }
+
+        // NVMe driver attempts to record an MMIO mapping against the e1000 BDF.
+        let mmio_before = test_mmio_count_for_pid(PID_NVME);
+        let result = test_record_mmio(PID_NVME, e1000_key, 0, 0x1000, 0xdead_4000);
+        assert_eq!(
+            result,
+            Err(TestMmioError::NotClaimed),
+            "F.3 Test 1: cross-device MMIO must be rejected with NotClaimed (-EBADF)",
+        );
+        assert_eq!(
+            test_mmio_count_for_pid(PID_NVME),
+            mmio_before,
+            "F.3 Test 1: no MMIO entry installed after rejected cross-device attempt",
+        );
+
+        let _ = test_release_for_pid(PID_NVME);
+        serial_println!("device_host F.3 Test 1 (cross_device_mmio_denied) passed");
+    }
+
+    /// F.3 Test 2: cross-device DMA denied.
+    ///
+    /// Simulates an NVMe driver (PID_NVME) attempting to allocate DMA against a
+    /// BDF it has *not* claimed (the e1000's sentinel key). The DMA registry
+    /// must reject this with `NoDevice` (the typed analogue of `-EBADF`). The
+    /// driver's own claimed device is untouched; no allocation is recorded.
+    ///
+    /// IOMMU note: when the platform exposes an active IOMMU the `NoDevice`
+    /// rejection happens before any IOMMU domain lookup, so the e1000's domain
+    /// is never consulted. In identity-fallback mode the same registry check
+    /// fires — the IOMMU layer is transparent to this test. Both paths return
+    /// the same typed error.
+    #[test_case]
+    fn cross_device_dma_denied() {
+        use crate::syscall::device_host::{
+            TestClaimError, TestDmaError, test_dma_alloc_for_pid, test_dma_count,
+            test_dma_release_for_pid, test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        let Some(nvme_key) = pick_free_pci_bdf() else {
+            serial_println!("F.3 Test 2 skipped: no free PCI device for NVMe driver");
+            return;
+        };
+
+        // Sentinel BDF for the unclaimed "e1000" device.
+        let e1000_key = DeviceCapKey::new(0, 0xFE, 0x1F, 5);
+
+        const PID_NVME: crate::process::Pid = 0xF3_0002;
+        let _ = test_release_for_pid(PID_NVME);
+        let _ = test_dma_release_for_pid(PID_NVME);
+
+        match test_try_claim_for_pid(PID_NVME, nvme_key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!("F.3 Test 2 skipped: nvme BDF busy");
+                return;
+            }
+            Err(e) => panic!("F.3 Test 2 claim failed: {:?}", e),
+        }
+
+        let count_before = test_dma_count();
+
+        // NVMe driver attempts DMA against e1000's unclaimed BDF.
+        let result = test_dma_alloc_for_pid(PID_NVME, e1000_key, 4096, 4096);
+        assert_eq!(
+            result,
+            Err(TestDmaError::NoDevice),
+            "F.3 Test 2: DMA against unclaimed BDF must return NoDevice (-EBADF)",
+        );
+        assert_eq!(
+            test_dma_count(),
+            count_before,
+            "F.3 Test 2: no DMA entry recorded after cross-device rejection",
+        );
+
+        let _ = test_dma_release_for_pid(PID_NVME);
+        let _ = test_release_for_pid(PID_NVME);
+        serial_println!("device_host F.3 Test 2 (cross_device_dma_denied) passed");
+    }
+
+    /// F.3 Test 3: forged CapHandle denied.
+    ///
+    /// A driver fabricates an arbitrary `CapHandle` value it never received from
+    /// the kernel. Any device-host operation that validates ownership against the
+    /// claim registry must reject it. We exercise this at the registry level by
+    /// calling `test_record_mmio` and `test_dma_alloc_for_pid` under a PID that
+    /// has no claim at all (never registered), passing plausible-looking BDF
+    /// and handle values. Both operations must return the typed `NotClaimed` /
+    /// `NoDevice` error with no side-effects.
+    #[test_case]
+    fn capability_forge_denied() {
+        use crate::syscall::device_host::{
+            TestDmaError, TestMmioError, test_dma_alloc_for_pid, test_dma_count,
+            test_mmio_count_for_pid, test_record_mmio, test_release_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        // This PID has never claimed anything — simulates a driver that
+        // fabricated a CapHandle out of thin air.
+        const PID_FORGER: crate::process::Pid = 0xF3_0003;
+        let _ = test_release_for_pid(PID_FORGER);
+
+        // Use two arbitrary BDF keys the forger never claimed.
+        let forge_key_a = DeviceCapKey::new(0, 0xFE, 0x1F, 4);
+        let forge_key_b = DeviceCapKey::new(0, 0xFE, 0x1F, 3);
+
+        let mmio_before = test_mmio_count_for_pid(PID_FORGER);
+        let dma_before = test_dma_count();
+
+        // Attempt forged MMIO record.
+        let mmio_result = test_record_mmio(PID_FORGER, forge_key_a, 0, 0x2000, 0xcafe_0000);
+        assert_eq!(
+            mmio_result,
+            Err(TestMmioError::NotClaimed),
+            "F.3 Test 3: forged MMIO cap must be rejected with NotClaimed (-EBADF)",
+        );
+
+        // Attempt forged DMA alloc.
+        let dma_result = test_dma_alloc_for_pid(PID_FORGER, forge_key_b, 4096, 4096);
+        assert_eq!(
+            dma_result,
+            Err(TestDmaError::NoDevice),
+            "F.3 Test 3: forged DMA cap must be rejected with NoDevice (-EBADF)",
+        );
+
+        // Verify no side-effects.
+        assert_eq!(
+            test_mmio_count_for_pid(PID_FORGER),
+            mmio_before,
+            "F.3 Test 3: MMIO count unchanged after forged MMIO attempt",
+        );
+        assert_eq!(
+            test_dma_count(),
+            dma_before,
+            "F.3 Test 3: DMA count unchanged after forged DMA attempt",
+        );
+
+        serial_println!("device_host F.3 Test 3 (capability_forge_denied) passed");
+    }
+
+    /// F.3 Test 4: post-crash CapHandle values are invalid in the restarted
+    /// process.
+    ///
+    /// Simulates the driver supervisor kill-and-restart lifecycle at the
+    /// registry level:
+    ///
+    /// 1. Phase A (pre-crash): PID_PRE claims a BDF, records MMIO and DMA
+    ///    entries, and captures the registry state.
+    /// 2. Crash simulation: `test_release_for_pid(PID_PRE)` tears down all
+    ///    claim, MMIO, and DMA state — exactly what the kernel does on process
+    ///    exit (Phase 55b Track B.1 / B.2 / B.3 cleanup cascade).
+    /// 3. Phase B (post-crash): a new PID (PID_POST, simulating the restarted
+    ///    driver) claims the same BDF and receives fresh allocations. The handle
+    ///    IDs from Phase A must not be visible to PID_POST.
+    ///
+    /// This validates the "handle-space is per-PID and non-transferable"
+    /// invariant required by F.3 Acceptance item 4.
+    #[test_case]
+    fn post_crash_handles_invalid_in_restarted_process() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_dma_alloc_for_pid, test_dma_handle_info, test_dma_release_for_pid,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("F.3 Test 4 skipped: no free PCI device");
+            return;
+        };
+
+        // --- Phase A: pre-crash driver ---
+        const PID_PRE: crate::process::Pid = 0xF3_0004;
+        let _ = test_release_for_pid(PID_PRE);
+        let _ = test_dma_release_for_pid(PID_PRE);
+
+        match test_try_claim_for_pid(PID_PRE, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!("F.3 Test 4 skipped: BDF busy");
+                return;
+            }
+            Err(e) => panic!("F.3 Test 4 pre-crash claim failed: {:?}", e),
+        }
+
+        let pre_snap = test_dma_alloc_for_pid(PID_PRE, key, 4096, 4096)
+            .expect("F.3 Test 4: pre-crash DMA alloc must succeed");
+        let pre_crash_id = pre_snap.id;
+
+        // Pre-crash handle is visible to PID_PRE.
+        assert!(
+            test_dma_handle_info(PID_PRE, pre_crash_id).is_some(),
+            "F.3 Test 4: pre-crash handle must be visible before crash",
+        );
+
+        // --- Crash simulation: supervisor calls release_for_pid ---
+        let _ = test_dma_release_for_pid(PID_PRE);
+        let released = test_release_for_pid(PID_PRE);
+        assert_eq!(
+            released, 1,
+            "F.3 Test 4: exactly one claim must be freed on crash"
+        );
+
+        // Pre-crash handle is now gone even for PID_PRE.
+        assert!(
+            test_dma_handle_info(PID_PRE, pre_crash_id).is_none(),
+            "F.3 Test 4: pre-crash handle must be invisible after crash teardown",
+        );
+
+        // --- Phase B: restarted driver with a fresh PID ---
+        const PID_POST: crate::process::Pid = 0xF3_0005;
+        let _ = test_release_for_pid(PID_POST);
+        let _ = test_dma_release_for_pid(PID_POST);
+
+        match test_try_claim_for_pid(PID_POST, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                panic!("F.3 Test 4: restarted driver must be able to re-claim BDF")
+            }
+            Err(e) => panic!("F.3 Test 4 post-crash claim failed: {:?}", e),
+        }
+
+        let post_snap = test_dma_alloc_for_pid(PID_POST, key, 4096, 4096)
+            .expect("F.3 Test 4: post-crash DMA alloc must succeed");
+
+        // The restarted driver must NOT see the pre-crash handle ID.
+        assert!(
+            test_dma_handle_info(PID_POST, pre_crash_id).is_none(),
+            "F.3 Test 4: pre-crash CapHandle ID must be opaque to the restarted process",
+        );
+
+        // The restarted driver sees its own fresh allocation.
+        assert!(
+            test_dma_handle_info(PID_POST, post_snap.id).is_some(),
+            "F.3 Test 4: restarted driver must see its own fresh allocation",
+        );
+
+        let _ = test_dma_release_for_pid(PID_POST);
+        let _ = test_release_for_pid(PID_POST);
+        serial_println!(
+            "device_host F.3 Test 4 (post_crash_handles_invalid_in_restarted_process) passed"
+        );
+    }
 }
