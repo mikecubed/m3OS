@@ -394,3 +394,61 @@ pub(crate) fn test_owner_of(key: DeviceCapKey) -> Option<Pid> {
     let reg = DEVICE_HOST_REGISTRY.lock();
     reg.core.owner_of(key)
 }
+
+// ---------------------------------------------------------------------------
+// Track B.2 test-only stubs (filled in by B.2 green commit)
+// ---------------------------------------------------------------------------
+//
+// These are the RED-commit placeholders: the symbols must exist so the test
+// module in `main.rs` compiles, but they deliberately fail the assertions so
+// the RED commit is test-failing rather than test-skipping. The B.2 green
+// commit replaces both the visible state (`MMIO_REGISTRY`) and these helpers
+// with real implementations.
+
+/// Per-device MMIO-capability slot cap — task doc B.2 "Resource bounds".
+///
+/// 32 is the initial cap named in the task list; raising it requires an
+/// audited review of per-driver memory pressure.
+#[allow(dead_code)]
+pub const MAX_MMIO_PER_DEVICE: usize = 32;
+
+/// Test-only error surface mirroring the typed errors that the B.2 green
+/// commit's `mmio_registry_insert` returns.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestMmioError {
+    /// No `Capability::Device` entry recorded for this `(pid, key)` pair —
+    /// tests the B.2 negative cross-device path.
+    NotClaimed,
+    /// Adding this entry would exceed [`MAX_MMIO_PER_DEVICE`].
+    CapacityExceeded,
+    /// A duplicate entry already exists at the same `(pid, key, bar_index,
+    /// user_va)` tuple.
+    #[allow(dead_code)]
+    Duplicate,
+}
+
+/// RED-stub for `sys_device_mmio_map`'s registry insertion. The GREEN commit
+/// replaces this body with real logic backed by an `MmioRegistry`.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub(crate) fn test_record_mmio(
+    pid: Pid,
+    key: DeviceCapKey,
+    bar_index: u8,
+    len: usize,
+    user_va: u64,
+) -> Result<(), TestMmioError> {
+    // RED: always succeed; the test assertions for cascade cleanup and
+    // CapacityExceeded will fail so the red build reports the unimplemented
+    // state.
+    Ok(())
+}
+
+/// RED-stub for reading per-pid MMIO entry count. Always returns 0 so the
+/// cascade / capacity tests fail at assertion time in the RED commit.
+#[cfg(test)]
+#[allow(unused_variables)]
+pub(crate) fn test_mmio_count_for_pid(pid: Pid) -> usize {
+    0
+}

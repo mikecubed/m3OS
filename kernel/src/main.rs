@@ -1341,4 +1341,212 @@ mod tests {
 
         serial_println!("device_host B.1 integration test passed");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b Track B.2 — sys_device_mmio_map integration tests
+    // -----------------------------------------------------------------------
+    //
+    // Track B.2 pins two boundary invariants that cannot be captured by the
+    // kernel-core unit tests alone:
+    //
+    //   1. The kernel-side `MmioRegistry` must be cleared in lockstep with
+    //      the parent `DeviceHostRegistry` — dropping a `Capability::Device`
+    //      must implicitly drop every derived `Capability::Mmio` (the
+    //      "cleanup cascade" named in the task doc).
+    //   2. The per-driver MMIO-slot cap (32) must reject a 33rd map without
+    //      corrupting state.
+    //
+    // The integration tests below drive the kernel-side registry through a
+    // pair of `test_*` helpers that bypass the capability-table insertion
+    // (which needs a real task) but exercise the same lock-ordered state
+    // machine as the syscall path. The pure bounds-check math is covered by
+    // `kernel_core::device_host::mmio_bounds::tests`.
+
+    /// Track B.2: recording an MMIO mapping under a claimed device, then
+    /// calling `test_release_for_pid`, must clear both the claim slot and
+    /// the MMIO registry entries it owned.
+    #[test_case]
+    fn device_host_mmio_release_cascades_to_mmio_entries() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_mmio_count_for_pid, test_owner_of, test_record_mmio,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        crate::pci::init();
+
+        let mut key: Option<DeviceCapKey> = None;
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if test_owner_of(k).is_none() {
+                key = Some(k);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(key) = key else {
+            serial_println!("device_host B.2 cascade test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE10;
+        let _ = test_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "device_host B.2 cascade test skipped: BDF already in use by kernel driver"
+                );
+                return;
+            }
+            Err(e) => panic!("claim failed: {:?}", e),
+        }
+
+        // Record two MMIO entries under the same device — mimics a driver
+        // that maps BAR0 and BAR2. Neither needs a real page table for the
+        // cascade assertion.
+        test_record_mmio(PID, key, 0, 0x1000, 0xdead_0000).expect("BAR0 mmio recorded");
+        test_record_mmio(PID, key, 2, 0x2000, 0xdead_2000).expect("BAR2 mmio recorded");
+        assert_eq!(
+            test_mmio_count_for_pid(PID),
+            2,
+            "two MMIO entries should be present after recording"
+        );
+
+        // Release the claim — cleanup cascade must wipe both MMIO entries.
+        let freed = test_release_for_pid(PID);
+        assert_eq!(freed, 1, "expected 1 claim released");
+        assert_eq!(
+            test_mmio_count_for_pid(PID),
+            0,
+            "MMIO entries must be cleared by the cascade",
+        );
+        assert_eq!(test_owner_of(key), None);
+
+        serial_println!("device_host B.2 cascade test passed");
+    }
+
+    /// Track B.2: the 33rd MMIO-map request against a single device-cap
+    /// returns `CapacityExceeded` without corrupting the registry.
+    #[test_case]
+    fn device_host_mmio_capacity_cap_is_enforced() {
+        use crate::syscall::device_host::{
+            MAX_MMIO_PER_DEVICE, TestClaimError, TestMmioError, test_mmio_count_for_pid,
+            test_owner_of, test_record_mmio, test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        crate::pci::init();
+
+        let mut key: Option<DeviceCapKey> = None;
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if test_owner_of(k).is_none() {
+                key = Some(k);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(key) = key else {
+            serial_println!("device_host B.2 capacity test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE11;
+        let _ = test_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "device_host B.2 capacity test skipped: BDF already in use by kernel driver"
+                );
+                return;
+            }
+            Err(e) => panic!("claim failed: {:?}", e),
+        }
+
+        // Fill the per-device MMIO slot cap. BAR indices wrap 0..6 to stay
+        // valid — the registry key is (pid, key, bar_index, user_va), so
+        // the synthetic `user_va` values keep entries distinct.
+        for i in 0..MAX_MMIO_PER_DEVICE {
+            let bar_index = (i % 6) as u8;
+            let user_va = 0xdead_0000 + (i as u64) * 0x1000;
+            test_record_mmio(PID, key, bar_index, 0x1000, user_va)
+                .unwrap_or_else(|e| panic!("record {i} failed: {:?}", e));
+        }
+        assert_eq!(test_mmio_count_for_pid(PID), MAX_MMIO_PER_DEVICE);
+
+        // One more should be rejected with CapacityExceeded.
+        let one_over = test_record_mmio(PID, key, 0, 0x1000, 0xbeef_0000);
+        assert_eq!(one_over, Err(TestMmioError::CapacityExceeded));
+        // Registry unchanged.
+        assert_eq!(test_mmio_count_for_pid(PID), MAX_MMIO_PER_DEVICE);
+
+        let freed = test_release_for_pid(PID);
+        assert_eq!(freed, 1);
+        assert_eq!(test_mmio_count_for_pid(PID), 0);
+
+        serial_println!("device_host B.2 capacity test passed");
+    }
+
+    /// Track B.2: MMIO entry recorded against a device not claimed by the
+    /// caller returns a `NotClaimed` error. This is the registry-level
+    /// analogue of the cross-device negative test in F.3.
+    #[test_case]
+    fn device_host_mmio_record_without_claim_fails() {
+        use crate::syscall::device_host::{TestMmioError, test_record_mmio, test_release_for_pid};
+        use kernel_core::device_host::DeviceCapKey;
+
+        // Use a deliberately-bogus BDF that no real PCI device should occupy
+        // (b:d.f = FF:1F.7 on segment 0xFFFF).
+        let key = DeviceCapKey::new(0xFFFF, 0xFF, 0x1F, 7);
+
+        const PID: crate::process::Pid = 0xC0FF_EE12;
+        let _ = test_release_for_pid(PID);
+
+        let err = test_record_mmio(PID, key, 0, 0x1000, 0xdead_3000);
+        assert_eq!(
+            err,
+            Err(TestMmioError::NotClaimed),
+            "recording MMIO without a prior claim must fail with NotClaimed",
+        );
+
+        serial_println!("device_host B.2 no-claim test passed");
+    }
+
+    /// Track B.2: pure-logic bounds checks are host-tested in `kernel-core`,
+    /// but this smoke test asserts the re-export surface is reachable from
+    /// the kernel crate so downstream drivers see the same API.
+    #[test_case]
+    fn device_host_mmio_bounds_helpers_reachable_from_kernel() {
+        use kernel_core::device_host::{
+            MAX_MMIO_BAR_BYTES, MmioBoundsError, MmioCacheMode, build_mmio_window,
+            cache_mode_for_bar, validate_mmio_bar_size,
+        };
+
+        assert_eq!(
+            validate_mmio_bar_size(6, 0x1000),
+            Err(MmioBoundsError::BarIndexOutOfRange)
+        );
+        assert_eq!(
+            validate_mmio_bar_size(0, 0),
+            Err(MmioBoundsError::ZeroSizedBar)
+        );
+        assert_eq!(
+            validate_mmio_bar_size(0, MAX_MMIO_BAR_BYTES + 1),
+            Err(MmioBoundsError::BarTooLarge),
+        );
+        assert_eq!(cache_mode_for_bar(true), MmioCacheMode::WriteCombining);
+        assert_eq!(cache_mode_for_bar(false), MmioCacheMode::Uncacheable);
+
+        let desc = build_mmio_window(0, 0xfebf_0000, 0x1000, false).expect("valid BAR");
+        assert_eq!(desc.len, 0x1000);
+        assert_eq!(desc.cache_mode, MmioCacheMode::Uncacheable);
+
+        serial_println!("device_host B.2 bounds-reexport test passed");
+    }
 }
