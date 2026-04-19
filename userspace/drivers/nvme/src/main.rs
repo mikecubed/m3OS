@@ -1,30 +1,41 @@
-//! Ring-3 NVMe driver — Phase 55b Tracks D.1 (scaffold) and D.2 (bring-up).
+//! Ring-3 NVMe driver — Phase 55b Tracks D.1 (scaffold), D.2 (bring-up),
+//! and D.3 (I/O queue pair + block IPC path).
 //!
 //! Phase 55b moves the NVMe driver from ring 0 (`kernel/src/blk/nvme.rs`)
 //! into this userspace crate. Track D.1 landed the crate shell and the
 //! four-place userspace-binary wiring (workspace member, xtask bins,
-//! ramdisk embedding, future service config). Track D.2 — this commit —
-//! ports the controller bring-up path to [`driver_runtime`]:
-//! register programming runs through [`driver_runtime::Mmio`], DMA
-//! allocations run through [`driver_runtime::DmaBuffer`], and the
-//! reset / enable / Identify sequence drives
-//! [`init::BringUpStateMachine`] so every transition is host-testable.
-//!
-//! Track D.3 wires the I/O queue pair, MSI-X, and the block IPC path.
+//! ramdisk embedding, future service config). Track D.2 ported the
+//! controller bring-up path to [`driver_runtime`]. Track D.3 — this
+//! layer — adds the I/O queue pair (Create I/O CQ / Create I/O SQ admin
+//! commands, MSI-X IRQ subscription, per-request PRP construction) and
+//! the `BlockServer::handle_next` loop that serialises IPC requests
+//! over the I/O queue.
 //!
 //! # Module layout
 //!
 //! | Module | Purpose |
 //! |---|---|
 //! | [`init`] | Pure bring-up state machine + CC / AQA encoders (host-testable) |
+//! | [`io`]   | PRP construction, Create I/O CQ / SQ encoders, Read / Write encoders, completion phase-bit drain (host-testable), plus the `IoQueuePair` wrapper and `handle_read` / `handle_write` glue (non-test) |
 //!
-//! # Exit behavior
+//! # Run-time flow
 //!
-//! D.2's `program_main` drives controller bring-up to completion and
-//! then returns zero. Returning rather than blocking forever is
-//! deliberate: Track D.3 lands the `BlockServer::handle_next` loop, so
-//! D.2's clean-exit path lets F.2's crash-and-restart regression land
-//! on a predictable exit code first.
+//! 1. `program_main` calls `bring_up_controller` to drive the Phase 55b
+//!    D.2 state machine to `Identified`. On success the function
+//!    returns a [`BringUpContext`] bundling the claimed `DeviceHandle`,
+//!    BAR0 `Mmio`, admin queue, and namespace metadata.
+//! 2. `run_io_server` allocates the I/O SQ / CQ / PRP-list DMA pages,
+//!    submits Create I/O CQ and Create I/O SQ admin commands, and
+//!    subscribes the MSI-X vector via
+//!    [`IrqNotification::subscribe`] (best-effort — a subscription
+//!    failure falls back to a polled-completion path).
+//! 3. The process creates a Phase 50 endpoint, registers it as
+//!    [`SERVICE_NAME`] with the IPC registry, and enters the
+//!    `BlockServer::handle_next` dispatch loop. Each request is
+//!    routed to `handle_read`, `handle_write`, or `BLK_STATUS`.
+//!
+//! On unrecoverable error the process exits non-zero so the Phase 46 /
+//! 51 service manager's restart path observes the failure.
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), feature(alloc_error_handler))]
@@ -40,9 +51,15 @@ pub mod io;
 use core::alloc::Layout;
 
 #[cfg(not(test))]
-use driver_runtime::{DeviceCapKey, DeviceHandle, DmaBuffer, DriverRuntimeError, Mmio};
+use driver_runtime::ipc::EndpointCap;
 #[cfg(not(test))]
-use kernel_core::driver_ipc::block::BlockDriverError;
+use driver_runtime::ipc::block::{BlkReply, BlockServer};
+#[cfg(not(test))]
+use driver_runtime::{
+    DeviceCapKey, DeviceHandle, DmaBuffer, DriverRuntimeError, IrqNotification, Mmio,
+};
+#[cfg(not(test))]
+use kernel_core::driver_ipc::block::{BLK_READ, BLK_STATUS, BLK_WRITE, BlockDriverError};
 #[cfg(not(test))]
 use kernel_core::nvme as knvme;
 #[cfg(not(test))]
@@ -54,6 +71,11 @@ use syscall_lib::heap::BrkAllocator;
 use crate::init::{
     ADMIN_QUEUE_DEPTH, BringUpAction, BringUpError, BringUpState, BringUpStateMachine,
     NVME_PAGE_BYTES, encode_aqa, encode_cc_enable,
+};
+#[cfg(not(test))]
+use crate::io::{
+    IO_QUEUE_ID, IoQueuePair, build_create_io_cq_command, build_create_io_sq_command, handle_read,
+    handle_write,
 };
 
 #[cfg(not(test))]
@@ -117,6 +139,23 @@ const MMIO_SPIN_BUDGET: u64 = 8_000_000;
 #[cfg(not(test))]
 pub struct NvmeRegsTag;
 
+/// Thin newtype wrapping [`DeviceHandle`] so this crate (not
+/// `driver_runtime`) can provide the
+/// `driver_runtime::irq::DeviceCapHandle` impl that
+/// [`IrqNotification::subscribe`] requires. The orphan rule blocks a
+/// direct impl on `DeviceHandle`; wrapping in a local struct is the
+/// standard escape hatch and carries no runtime overhead (the
+/// wrapper is `#[repr(transparent)]` around a borrow).
+#[cfg(not(test))]
+struct DeviceCap<'a>(&'a DeviceHandle);
+
+#[cfg(not(test))]
+impl driver_runtime::irq::DeviceCapHandle for DeviceCap<'_> {
+    fn cap_handle(&self) -> u32 {
+        self.0.cap()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error surface.
 // ---------------------------------------------------------------------------
@@ -168,16 +207,36 @@ impl From<InitError> for BlockDriverError {
 // program_main
 // ---------------------------------------------------------------------------
 
+/// Service name the D.4 `RemoteBlockDevice` kernel facade looks up to
+/// route block requests at this driver. Landing the registration
+/// string here in one place keeps D.4's lookup side and F.1's service
+/// manifest referring to the same constant.
+#[cfg(not(test))]
+pub const SERVICE_NAME: &str = "nvme.block";
+
+/// Default sector size assumed when Identify Namespace parsing has
+/// not yet populated a real value. NVMe QEMU devices and every
+/// real-world target we ship against default to 512 B; the value is
+/// refined during D.3 bring-up as Identify Namespace succeeds.
+#[cfg(not(test))]
+pub const DEFAULT_SECTOR_BYTES: u32 = 512;
+
+/// Default namespace ID the driver services. Matches the kernel-side
+/// Phase 55 driver's choice (`nsid = 1`).
+#[cfg(not(test))]
+pub const DEFAULT_NSID: u32 = 1;
+
 /// Claim the sentinel NVMe BDF, map BAR0, run controller bring-up, and
-/// return. Track D.3 extends this to enter a `BlockServer` loop.
+/// then enter the block-IPC server loop. The process exits only when
+/// bring-up fails or the IPC loop reports an unrecoverable error.
 #[cfg(not(test))]
 fn program_main(_args: &[&str]) -> i32 {
     syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: spawned\n");
 
-    match bring_up_controller() {
-        Ok(()) => {
+    let ctx = match bring_up_controller() {
+        Ok(ctx) => {
             syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: bring-up complete\n");
-            0
+            ctx
         }
         Err(e) => {
             // Log the specific variant so the reader can correlate.
@@ -185,13 +244,39 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: bring-up failed\n");
             // Exit non-zero so the service manager's restart path
             // (Phase 46 / 51) observes the failure.
-            1
+            return 1;
+        }
+    };
+
+    match run_io_server(ctx) {
+        Ok(()) => 0,
+        Err(_) => {
+            syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io-server exited\n");
+            2
         }
     }
 }
 
+/// Bring-up outcome the I/O server consumes. Kept internal to the
+/// binary — callers outside `main.rs` never construct or observe one.
 #[cfg(not(test))]
-fn bring_up_controller() -> Result<(), InitError> {
+struct BringUpContext {
+    device: DeviceHandle,
+    mmio: Mmio<NvmeRegsTag>,
+    admin: AdminQueue,
+    doorbell_stride: usize,
+    /// Namespace identifier the driver services (Phase 55b D.3 ships
+    /// NSID = 1; future phases walk the active-namespace list).
+    nsid: u32,
+    /// Logical block size in bytes. D.2 logs the Identify Namespace
+    /// buffer; a future refactor will parse LBAF0.LBADS to refine this
+    /// from [`DEFAULT_SECTOR_BYTES`]. For Phase 55b's in-QEMU smoke the
+    /// default is correct.
+    sector_bytes: u32,
+}
+
+#[cfg(not(test))]
+fn bring_up_controller() -> Result<BringUpContext, InitError> {
     // Step 1: claim the device capability.
     let device = DeviceHandle::claim(SENTINEL_BDF)?;
     syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: claimed BDF\n");
@@ -288,8 +373,9 @@ fn bring_up_controller() -> Result<(), InitError> {
     }
 
     // Keep the identify buffers alive for the full bring-up — D.3
-    // extends this to record the model / serial / capacity into a
-    // persistent controller struct.
+    // will parse them for NSID sector size in a follow-up; for now
+    // the `BringUpContext` reports [`DEFAULT_SECTOR_BYTES`] which
+    // matches every QEMU target we care about.
     let _ = (ident_controller, ident_namespace);
 
     if let Some(err) = sm.error() {
@@ -301,7 +387,230 @@ fn bring_up_controller() -> Result<(), InitError> {
         // collapses to IoError.
         return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
     }
-    Ok(())
+    let doorbell_stride = sm.doorbell_stride_bytes();
+    let admin = match admin {
+        Some(q) => q,
+        None => return Err(InitError::BringUp(BringUpError::AdminCommandFailed)),
+    };
+    Ok(BringUpContext {
+        device,
+        mmio,
+        admin,
+        doorbell_stride,
+        nsid: DEFAULT_NSID,
+        sector_bytes: DEFAULT_SECTOR_BYTES,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// I/O server — Create I/O CQ/SQ, subscribe IRQ, run BlockServer loop.
+// ---------------------------------------------------------------------------
+
+/// Wire up the I/O queue pair, issue the Create I/O CQ / Create I/O SQ
+/// admin commands, subscribe the MSI-X vector, create the IPC
+/// endpoint, and enter the `BlockServer::handle_next` loop.
+///
+/// Every error path collapses to an `InitError` that
+/// `program_main` turns into a non-zero exit — the service manager's
+/// restart path (Phase 46 / 51) observes the failure and brings the
+/// driver back up.
+#[cfg(not(test))]
+fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
+    // Step 1: allocate I/O SQ / CQ / PRP-list DMA pages.
+    let mut io_queue = IoQueuePair::allocate(&ctx.device, ctx.doorbell_stride)?;
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io queue allocated\n");
+
+    // Step 2: Create I/O CQ (admin 0x05). Must run before Create I/O SQ
+    // so the SQ has a CQ to target.
+    let entries = io_queue.bookkeeping.entries();
+    {
+        let cmd = build_create_io_cq_command(0, IO_QUEUE_ID, entries, io_queue.cq_iova(), 0);
+        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
+        if status != 0 {
+            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io cq created\n");
+
+    // Step 3: Create I/O SQ (admin 0x01).
+    {
+        let cmd =
+            build_create_io_sq_command(0, IO_QUEUE_ID, entries, io_queue.sq_iova(), IO_QUEUE_ID);
+        let status = submit_admin_command(&ctx.mmio, &mut ctx.admin, ctx.doorbell_stride, cmd);
+        if status != 0 {
+            return Err(InitError::BringUp(BringUpError::AdminCommandFailed));
+        }
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: io sq created\n");
+
+    // Step 4: subscribe the MSI-X vector on a best-effort basis. A
+    // subscription failure is logged but the driver continues on the
+    // polled fallback in `IoQueuePair::wait_completion`.
+    match IrqNotification::subscribe(&DeviceCap(&ctx.device), None) {
+        Ok(irq) => {
+            syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: msi-x subscribed\n");
+            io_queue.set_irq(irq);
+        }
+        Err(_) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "nvme_driver: msi-x subscribe failed — polled fallback\n",
+            );
+        }
+    }
+
+    // Step 5: create and register the IPC endpoint.
+    let endpoint = create_service_endpoint(SERVICE_NAME)?;
+    syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: service registered\n");
+
+    // Step 6: enter the block-server loop.
+    let server = BlockServer::new(endpoint);
+    loop {
+        let result = server.handle_next(|req| {
+            match req.header.kind {
+                BLK_READ => {
+                    let (header, bulk) = handle_read(
+                        &ctx.mmio,
+                        &mut io_queue,
+                        &ctx.device,
+                        ctx.nsid,
+                        ctx.sector_bytes,
+                        &req.header,
+                    );
+                    BlkReply {
+                        header,
+                        payload_grant: 0,
+                        bulk,
+                    }
+                }
+                BLK_WRITE => {
+                    let header = handle_write(
+                        &ctx.mmio,
+                        &mut io_queue,
+                        &ctx.device,
+                        ctx.nsid,
+                        ctx.sector_bytes,
+                        &req.header,
+                        &req.bulk,
+                    );
+                    BlkReply {
+                        header,
+                        payload_grant: 0,
+                        bulk: alloc::vec::Vec::new(),
+                    }
+                }
+                BLK_STATUS => {
+                    // BLK_STATUS is a cheap health-check; reply Ok with no bulk.
+                    BlkReply {
+                        header: kernel_core::driver_ipc::block::BlkReplyHeader {
+                            cmd_id: req.header.cmd_id,
+                            status: BlockDriverError::Ok,
+                            bytes: 0,
+                        },
+                        payload_grant: 0,
+                        bulk: alloc::vec::Vec::new(),
+                    }
+                }
+                _ => BlkReply {
+                    header: kernel_core::driver_ipc::block::BlkReplyHeader {
+                        cmd_id: req.header.cmd_id,
+                        status: BlockDriverError::InvalidRequest,
+                        bytes: 0,
+                    },
+                    payload_grant: 0,
+                    bulk: alloc::vec::Vec::new(),
+                },
+            }
+        });
+        if let Err(e) = result {
+            // A single recv / reply failure is not fatal — the next
+            // iteration re-enters `handle_next`. But if the error
+            // repeats we exit so the service manager restarts the
+            // driver; Phase 50's IPC surface does not distinguish
+            // transient from fatal today.
+            syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: handle_next error\n");
+            let _ = e;
+            return Ok(());
+        }
+    }
+}
+
+/// Create an IPC endpoint and register it under `name` with the
+/// service registry. Returns a typed [`EndpointCap`] so the
+/// `BlockServer` builder receives the wrapper type directly.
+#[cfg(not(test))]
+fn create_service_endpoint(name: &str) -> Result<EndpointCap, InitError> {
+    let ep = syscall_lib::create_endpoint();
+    if ep == u64::MAX {
+        return Err(InitError::Runtime(DriverRuntimeError::Device(
+            kernel_core::device_host::DeviceHostError::Internal,
+        )));
+    }
+    let ep_u32 = (ep & u32::MAX as u64) as u32;
+    let rc = syscall_lib::ipc_register_service(ep_u32, name);
+    if rc == u64::MAX {
+        return Err(InitError::Runtime(DriverRuntimeError::Device(
+            kernel_core::device_host::DeviceHostError::Internal,
+        )));
+    }
+    Ok(EndpointCap::new(ep_u32))
+}
+
+/// Submit one admin command, ring the admin SQ doorbell, poll the
+/// admin CQ for the matching CID, and return the 15-bit status code.
+///
+/// Thin wrapper over the D.2 `submit_identify` pattern — exists as a
+/// separate helper because D.3 issues the two Create I/O Queue
+/// commands *after* Identify, and we want the admin-queue bookkeeping
+/// (next_cid / sq_tail / cq_head / phase) to remain owned by a single
+/// function family.
+#[cfg(not(test))]
+fn submit_admin_command(
+    mmio: &Mmio<NvmeRegsTag>,
+    admin: &mut AdminQueue,
+    doorbell_stride: usize,
+    mut cmd: knvme::NvmeCommand,
+) -> u16 {
+    let cid = admin.next_cid % admin.entries;
+    // Re-stamp the command's CID so callers building the command with
+    // `cid = 0` don't need to know the current admin bookkeeping.
+    cmd.cdw0 = (cmd.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+
+    // SAFETY: sq_entry_ptr returns a pointer inside the DMA region;
+    // no concurrent writer (admin bring-up is strictly sequential).
+    unsafe {
+        core::ptr::write_volatile(admin.sq_entry_ptr(admin.sq_tail as usize), cmd);
+    }
+    admin.sq_tail = (admin.sq_tail + 1) % admin.entries;
+    admin.next_cid = admin.next_cid.wrapping_add(1);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+
+    let sq_doorbell = knvme::NvmeRegs::doorbell_offset(0, false, doorbell_stride);
+    mmio.write_reg::<u32>(sq_doorbell, admin.sq_tail as u32);
+
+    let mut i: u64 = 0;
+    loop {
+        // SAFETY: cq_entry_ptr is within the DMA allocation.
+        let entry = unsafe { core::ptr::read_volatile(admin.cq_entry_ptr(admin.cq_head as usize)) };
+        let phase = knvme::completion_phase(&entry);
+        if phase == admin.phase && entry.cid == cid {
+            let status = knvme::completion_status_code(&entry);
+            admin.cq_head = (admin.cq_head + 1) % admin.entries;
+            if admin.cq_head == 0 {
+                admin.phase = !admin.phase;
+            }
+            let cq_doorbell = knvme::NvmeRegs::doorbell_offset(0, true, doorbell_stride);
+            mmio.write_reg::<u32>(cq_doorbell, admin.cq_head as u32);
+            return status;
+        }
+        if i >= MMIO_SPIN_BUDGET {
+            // Synthetic non-zero status so the caller treats it as an
+            // admin-command failure.
+            return 0x7FFF;
+        }
+        core::hint::spin_loop();
+        i += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
