@@ -6237,6 +6237,52 @@ fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
     })
 }
 
+/// A host-only regression test: runs entirely on the build host via
+/// `cargo test`, no QEMU required.
+///
+/// Introduced in Phase 55b Track F.2 to wire pure-logic state-machine
+/// tests into `cargo xtask regression --test driver-restart`.
+struct HostRegressionTest {
+    name: &'static str,
+    #[allow(dead_code)]
+    description: &'static str,
+    /// `cargo test -p <pkg>` target package.
+    package: &'static str,
+    /// `--test <name>` integration-test target inside the package.
+    test_target: &'static str,
+    /// Target triple to pass (`--target`). `None` → native.
+    target: Option<&'static str>,
+}
+
+/// Return the list of registered host-only regression tests.
+fn host_regression_tests() -> Vec<HostRegressionTest> {
+    vec![HostRegressionTest {
+        name: "driver-restart",
+        description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
+        package: "kernel-core",
+        test_target: "driver_restart",
+        target: Some("x86_64-unknown-linux-gnu"),
+    }]
+}
+
+/// Run a host-only regression test. Returns `Ok(())` on success or
+/// `Err(exit_status_code)` if the process exits non-zero.
+fn run_host_regression_test(t: &HostRegressionTest) -> Result<(), i32> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("test");
+    cmd.args(["-p", t.package]);
+    if let Some(triple) = t.target {
+        cmd.args(["--target", triple]);
+    }
+    cmd.args(["--test", t.test_target]);
+    let status = cmd.status().expect("cargo test failed to start");
+    if status.success() {
+        Ok(())
+    } else {
+        Err(status.code().unwrap_or(1))
+    }
+}
+
 /// A registered regression test with QEMU configuration and pass/fail patterns.
 struct RegressionTest {
     name: &'static str,
@@ -6823,21 +6869,39 @@ fn boot_and_login_steps() -> Vec<SmokeStep> {
 }
 
 fn cmd_regression(args: &RegressionArgs) {
+    // ---- Host-only regression tests (no QEMU required) ----
+    // Checked first so `--test driver-restart` returns immediately without
+    // building the kernel or pulling OVMF.
+    let all_host_tests = host_regression_tests();
+    if let Some(name) = &args.test_name {
+        if let Some(t) = all_host_tests.iter().find(|t| t.name == *name) {
+            println!("regression: running host-only test '{}'", t.name);
+            match run_host_regression_test(t) {
+                Ok(()) => {
+                    println!("\nregression: 1 passed, 0 failed");
+                    return;
+                }
+                Err(code) => {
+                    eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    // ---- QEMU-based regression tests ----
     let all_tests = regression_tests();
     let tests_to_run: Vec<&RegressionTest> = if let Some(name) = &args.test_name {
         let found = all_tests.iter().find(|t| t.name == name);
         match found {
             Some(t) => vec![t],
             None => {
+                // Report both QEMU and host test names in the error.
+                let qemu_names: Vec<_> = all_tests.iter().map(|t| t.name).collect();
+                let host_names: Vec<_> = all_host_tests.iter().map(|t| t.name).collect();
                 eprintln!("Unknown regression test: {name}");
-                eprintln!(
-                    "Available: {}",
-                    all_tests
-                        .iter()
-                        .map(|t| t.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                eprintln!("  QEMU tests: {}", qemu_names.join(", "));
+                eprintln!("  Host tests: {}", host_names.join(", "));
                 std::process::exit(1);
             }
         }
