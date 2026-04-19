@@ -61,6 +61,8 @@ members = [
     "userspace/drivers/e1000",
     # Phase 55b Track F.3b — NVMe crash-and-restart end-to-end smoke client
     "userspace/nvme-crash-smoke",
+    # Phase 55b Track F.3d-1 — max_restart 6-kill loop + permanently-stopped
+    "userspace/max-restart-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only
