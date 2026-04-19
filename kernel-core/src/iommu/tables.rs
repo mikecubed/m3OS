@@ -70,6 +70,15 @@ const IVHD_TYPE_10H: u8 = 0x10;
 const IVHD_TYPE_11H: u8 = 0x11;
 const IVHD_TYPE_40H: u8 = 0x40;
 
+// IVMD (I/O Virtualization Memory Definition) sub-table type codes.
+const IVMD_TYPE_ALL: u8 = 0x20;
+const IVMD_TYPE_SELECT: u8 = 0x21;
+const IVMD_TYPE_RANGE: u8 = 0x22;
+
+/// Fixed header length of an IVMD sub-table in bytes. Every IVMD shares
+/// the same 32-byte prefix before its optional vendor-specific tail.
+pub const IVMD_FIXED_LEN: usize = 32;
+
 // IVHD device-entry type codes.
 const IVHD_ENTRY_SELECT: u8 = 2;
 const IVHD_ENTRY_START_RANGE: u8 = 3;
@@ -255,6 +264,48 @@ pub struct IvhdBlock {
     pub device_entries: Vec<IvhdDeviceEntry>,
 }
 
+/// Which device(s) an IVMD sub-table applies to.
+///
+/// Per AMD IOMMU spec §5.2.2, a memory definition may scope to every
+/// device on the platform ([`IvmdKind::All`]), a single 16-bit BDF
+/// ([`IvmdKind::Select`]), or an inclusive range of BDFs
+/// ([`IvmdKind::Range`]). The discriminator comes from the IVMD `type`
+/// byte (0x20 / 0x21 / 0x22).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IvmdKind {
+    /// Type 0x20 — applies to every device. `device_id` / `aux_data` ignored.
+    All,
+    /// Type 0x21 — applies to exactly one device identified by its BDF.
+    Select { device_id: u16 },
+    /// Type 0x22 — applies to every device whose BDF lies in the inclusive
+    /// range `start_device_id..=end_device_id`.
+    Range {
+        start_device_id: u16,
+        end_device_id: u16,
+    },
+}
+
+/// A single IVMD sub-table entry — a firmware-declared memory range that
+/// must be identity-mapped in every domain owned by the matching devices.
+///
+/// The raw `flags` byte is preserved verbatim. Bit 0 marks a required
+/// unity map; bit 3 marks an exclusion range. For Phase 55a reserved-
+/// region extraction every IVMD, regardless of flag bits, is treated as
+/// a firmware-owned region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IvrsMemDefinition {
+    /// Which device scope the range applies to.
+    pub kind: IvmdKind,
+    /// Raw flags byte straight from the IVMD header. Bit 0 = Unity,
+    /// bit 1 = IR (interrupt remapping exclusion), bit 2 = IW
+    /// (exclusion), bit 3 = exclusion range. Unknown bits are preserved.
+    pub flags: u8,
+    /// Physical start address of the unity range.
+    pub start_addr: u64,
+    /// Length of the unity range in bytes.
+    pub length: u64,
+}
+
 /// Container returned by [`decode_ivrs`] holding the IVRS header and
 /// every IVHD block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -263,6 +314,8 @@ pub struct IvrsTables {
     pub header: Option<IvrsHeader>,
     /// IVHD blocks in table order.
     pub ivhd_blocks: Vec<IvhdBlock>,
+    /// IVMD sub-tables in table order — firmware-declared unity maps.
+    pub ivmds: Vec<IvrsMemDefinition>,
     /// Count of blocks whose `type` byte the decoder did not recognize.
     pub unknown_blocks: u32,
 }
@@ -402,6 +455,9 @@ pub fn decode_ivrs(bytes: &[u8]) -> Result<IvrsTables, IvrsParseError> {
         match block_type {
             IVHD_TYPE_10H | IVHD_TYPE_11H | IVHD_TYPE_40H => {
                 tables.ivhd_blocks.push(parse_ivhd_block(block_bytes)?);
+            }
+            IVMD_TYPE_ALL | IVMD_TYPE_SELECT | IVMD_TYPE_RANGE => {
+                tables.ivmds.push(parse_ivmd(block_bytes)?);
             }
             _ => tables.unknown_blocks = tables.unknown_blocks.saturating_add(1),
         }
@@ -751,6 +807,60 @@ fn parse_ivhd_device_entries(mut bytes: &[u8]) -> Result<Vec<IvhdDeviceEntry>, I
     Ok(out)
 }
 
+/// Parse a single IVMD sub-table (types 0x20 / 0x21 / 0x22). `bytes`
+/// covers the whole sub-table starting at the type byte.
+///
+/// AMD IOMMU spec §5.2.2 defines the 32-byte fixed header:
+///
+/// ```text
+/// offset 0  type (1)
+/// offset 1  flags (1)
+/// offset 2  length (2)
+/// offset 4  device_id (2)
+/// offset 6  aux_data (2)
+/// offset 8  reserved (8)
+/// offset 16 start_addr (8)
+/// offset 24 length (8)
+/// ```
+///
+/// Anything past offset 32 is vendor-specific padding and is ignored —
+/// the outer cursor walk honors the block's declared length for the
+/// advance, so callers see the full region regardless.
+fn parse_ivmd(bytes: &[u8]) -> Result<IvrsMemDefinition, IvrsParseError> {
+    if bytes.len() < IVMD_FIXED_LEN {
+        return Err(IvrsParseError::TruncatedSubTable);
+    }
+    let ivmd_type = bytes[0];
+    let flags = bytes[1];
+    // bytes[2..4] = length (already validated by the caller).
+    let device_id = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let aux_data = u16::from_le_bytes([bytes[6], bytes[7]]);
+    // bytes[8..16] = reserved.
+    let start_addr = u64::from_le_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    let length = u64::from_le_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
+    let kind = match ivmd_type {
+        IVMD_TYPE_ALL => IvmdKind::All,
+        IVMD_TYPE_SELECT => IvmdKind::Select { device_id },
+        IVMD_TYPE_RANGE => IvmdKind::Range {
+            start_device_id: device_id,
+            end_device_id: aux_data,
+        },
+        // Caller only dispatches known types here; defensive fallback
+        // surfaces a spec violation rather than silently ignoring it.
+        _ => return Err(IvrsParseError::TruncatedSubTable),
+    };
+    Ok(IvrsMemDefinition {
+        kind,
+        flags,
+        start_addr,
+        length,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -936,6 +1046,30 @@ mod tests {
         out.push(0);
         push_u16(out, alias);
         out.push(0);
+    }
+
+    /// Build a spec-shaped IVMD sub-table:
+    ///   type(1) + flags(1) + length(2) + device_id(2) + aux_data(2)
+    ///   + reserved(8) + start_addr(8) + length(8)  = 32 bytes.
+    fn make_ivmd(
+        ivmd_type: u8,
+        flags: u8,
+        device_id: u16,
+        aux_data: u16,
+        start_addr: u64,
+        length: u64,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(IVMD_FIXED_LEN);
+        out.push(ivmd_type);
+        out.push(flags);
+        push_u16(&mut out, IVMD_FIXED_LEN as u16);
+        push_u16(&mut out, device_id);
+        push_u16(&mut out, aux_data);
+        out.extend_from_slice(&[0u8; 8]);
+        push_u64(&mut out, start_addr);
+        push_u64(&mut out, length);
+        debug_assert_eq!(out.len(), IVMD_FIXED_LEN);
+        out
     }
 
     // -----------------------------------------------------------------
@@ -1263,8 +1397,10 @@ mod tests {
     #[test]
     fn ivrs_unknown_block_is_counted() {
         let mut bytes = make_ivrs_prefix(1, 0);
+        // Use 0x50 — neither an IVHD nor an IVMD type — so the decoder
+        // treats it as an unknown block.
         let mut unknown = Vec::new();
-        unknown.push(0x20);
+        unknown.push(0x50);
         unknown.push(0);
         push_u16(&mut unknown, 8);
         unknown.extend_from_slice(&[0u8; 4]);
@@ -1273,6 +1409,7 @@ mod tests {
         let tables = decode_ivrs(&bytes).unwrap();
         assert_eq!(tables.unknown_blocks, 1);
         assert!(tables.ivhd_blocks.is_empty());
+        assert!(tables.ivmds.is_empty());
     }
 
     #[test]
@@ -1333,6 +1470,153 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // IVMD unit tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ivmd_decode_type_all_ignores_device_fields() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        let ivmd = make_ivmd(IVMD_TYPE_ALL, 0x01, 0xFFFF, 0xFFFF, 0xC000_0000, 0x1000);
+        bytes.extend_from_slice(&ivmd);
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).expect("IVMD_ALL decodes");
+        assert_eq!(tables.ivmds.len(), 1);
+        assert!(tables.ivhd_blocks.is_empty());
+        let entry = &tables.ivmds[0];
+        assert_eq!(entry.kind, IvmdKind::All);
+        assert_eq!(entry.flags, 0x01);
+        assert_eq!(entry.start_addr, 0xC000_0000);
+        assert_eq!(entry.length, 0x1000);
+    }
+
+    #[test]
+    fn ivmd_decode_type_select_captures_device_id() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        let ivmd = make_ivmd(IVMD_TYPE_SELECT, 0x09, 0x0134, 0, 0xFEE0_0000, 0x0010_0000);
+        bytes.extend_from_slice(&ivmd);
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).unwrap();
+        assert_eq!(tables.ivmds.len(), 1);
+        let entry = &tables.ivmds[0];
+        assert_eq!(entry.kind, IvmdKind::Select { device_id: 0x0134 });
+        assert_eq!(entry.flags, 0x09);
+        assert_eq!(entry.start_addr, 0xFEE0_0000);
+        assert_eq!(entry.length, 0x0010_0000);
+    }
+
+    #[test]
+    fn ivmd_decode_type_range_captures_device_range() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        let ivmd = make_ivmd(IVMD_TYPE_RANGE, 0x00, 0x0100, 0x01FF, 0xD000_0000, 0x4000);
+        bytes.extend_from_slice(&ivmd);
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).unwrap();
+        assert_eq!(tables.ivmds.len(), 1);
+        let entry = &tables.ivmds[0];
+        assert_eq!(
+            entry.kind,
+            IvmdKind::Range {
+                start_device_id: 0x0100,
+                end_device_id: 0x01FF,
+            }
+        );
+        assert_eq!(entry.start_addr, 0xD000_0000);
+        assert_eq!(entry.length, 0x4000);
+    }
+
+    #[test]
+    fn ivmd_coexists_with_ivhd_blocks() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        // First: an IVHD 10h block with a Select entry.
+        let mut entries = Vec::new();
+        push_ivhd_short(&mut entries, IVHD_ENTRY_SELECT, 0x0018, 0);
+        let block = make_ivhd(
+            IVHD_TYPE_10H,
+            0x40,
+            0x0018,
+            0x40,
+            0xFEB8_0000,
+            0,
+            0,
+            0,
+            &entries,
+        );
+        bytes.extend_from_slice(&block);
+        // Then: an IVMD SELECT entry.
+        let ivmd = make_ivmd(IVMD_TYPE_SELECT, 0x01, 0x0020, 0, 0xE000_0000, 0x2000);
+        bytes.extend_from_slice(&ivmd);
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).expect("mixed IVHD + IVMD decodes");
+        assert_eq!(tables.ivhd_blocks.len(), 1);
+        assert_eq!(tables.ivmds.len(), 1);
+        assert_eq!(tables.unknown_blocks, 0);
+        assert_eq!(tables.ivmds[0].start_addr, 0xE000_0000);
+    }
+
+    #[test]
+    fn ivmd_truncated_length_returns_error() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        // Declared length 16 is smaller than the 32-byte fixed IVMD header.
+        bytes.push(IVMD_TYPE_ALL);
+        bytes.push(0);
+        push_u16(&mut bytes, 16);
+        // Pad out to 16 bytes so the cursor walk doesn't bail on buffer overrun.
+        bytes.extend_from_slice(&[0u8; 12]);
+        finalize_table(&mut bytes);
+        assert_eq!(
+            decode_ivrs(&bytes).unwrap_err(),
+            IvrsParseError::TruncatedSubTable
+        );
+    }
+
+    #[test]
+    fn ivmd_unknown_flag_bits_are_preserved() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        // All flag bits set — decoder must surface the raw byte verbatim
+        // rather than masking it to known bits.
+        let ivmd = make_ivmd(IVMD_TYPE_ALL, 0xFF, 0, 0, 0x1000, 0x2000);
+        bytes.extend_from_slice(&ivmd);
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).unwrap();
+        assert_eq!(tables.ivmds.len(), 1);
+        assert_eq!(tables.ivmds[0].flags, 0xFF);
+    }
+
+    #[test]
+    fn ivmd_multiple_entries_are_returned_in_order() {
+        let mut bytes = make_ivrs_prefix(1, 0);
+        bytes.extend_from_slice(&make_ivmd(IVMD_TYPE_ALL, 0x01, 0, 0, 0x1000, 0x1000));
+        bytes.extend_from_slice(&make_ivmd(
+            IVMD_TYPE_SELECT,
+            0x01,
+            0x0030,
+            0,
+            0x2000,
+            0x1000,
+        ));
+        bytes.extend_from_slice(&make_ivmd(
+            IVMD_TYPE_RANGE,
+            0x01,
+            0x0100,
+            0x01FF,
+            0x3000,
+            0x1000,
+        ));
+        finalize_table(&mut bytes);
+        let tables = decode_ivrs(&bytes).unwrap();
+        assert_eq!(tables.ivmds.len(), 3);
+        assert_eq!(tables.ivmds[0].kind, IvmdKind::All);
+        assert_eq!(tables.ivmds[1].kind, IvmdKind::Select { device_id: 0x0030 });
+        assert_eq!(
+            tables.ivmds[2].kind,
+            IvmdKind::Range {
+                start_device_id: 0x0100,
+                end_device_id: 0x01FF,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Property tests — no panics, bounded output on arbitrary inputs.
     // -----------------------------------------------------------------
 
@@ -1358,8 +1642,62 @@ mod tests {
             let result = decode_ivrs(&bytes);
             if let Ok(tables) = result {
                 let max_items = bytes.len() / 4 + 1;
-                prop_assert!(tables.ivhd_blocks.len() + tables.unknown_blocks as usize <= max_items);
+                let total = tables.ivhd_blocks.len()
+                    + tables.ivmds.len()
+                    + tables.unknown_blocks as usize;
+                prop_assert!(total <= max_items);
             }
+        }
+
+        /// Spot-check: inputs that explicitly seed IVMD-shaped bytes into
+        /// random prefixes must not panic or consume unbounded resources.
+        /// We prepend a small random prefix, then append a well-formed
+        /// IVRS table carrying a random mix of IVHD and IVMD sub-tables.
+        #[test]
+        fn decode_ivrs_handles_mixed_ivhd_ivmd_blobs(
+            prefix in proptest::collection::vec(any::<u8>(), 0..32),
+            ivmd_count in 0usize..4,
+            ivhd_count in 0usize..3,
+        ) {
+            let mut bytes = make_ivrs_prefix(1, 0);
+            for i in 0..ivhd_count {
+                let block = make_ivhd(
+                    IVHD_TYPE_10H,
+                    0,
+                    0,
+                    0,
+                    0xFEB8_0000 + (i as u64) * 0x1000,
+                    0,
+                    0,
+                    0,
+                    &[],
+                );
+                bytes.extend_from_slice(&block);
+            }
+            for i in 0..ivmd_count {
+                let ty = match i % 3 {
+                    0 => IVMD_TYPE_ALL,
+                    1 => IVMD_TYPE_SELECT,
+                    _ => IVMD_TYPE_RANGE,
+                };
+                bytes.extend_from_slice(&make_ivmd(
+                    ty,
+                    (i as u8) & 0x0F,
+                    i as u16,
+                    (i as u16).wrapping_add(1),
+                    (i as u64) * 0x1000,
+                    0x1000,
+                ));
+            }
+            finalize_table(&mut bytes);
+            let tables = decode_ivrs(&bytes).expect("well-formed mixed blob decodes");
+            prop_assert_eq!(tables.ivhd_blocks.len(), ivhd_count);
+            prop_assert_eq!(tables.ivmds.len(), ivmd_count);
+
+            // Also: random prefix + garbage must never panic.
+            let mut garbage = prefix.clone();
+            garbage.extend_from_slice(&bytes);
+            let _ = decode_ivrs(&garbage);
         }
     }
 }
