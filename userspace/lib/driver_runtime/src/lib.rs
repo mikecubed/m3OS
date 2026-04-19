@@ -60,6 +60,14 @@ pub mod dma;
 pub mod ipc;
 pub mod irq;
 pub mod mmio;
+pub mod syscall_backend;
+
+// Track C.2 top-level re-exports — drivers import these directly rather
+// than drilling through the module names.
+pub use device::{DeviceCapKey, DeviceHandle};
+pub use dma::{DmaBuffer, DmaHandle};
+pub use mmio::{Mmio, MmioCacheMode, MmioWindowDescriptor};
+pub use syscall_backend::SyscallBackend;
 
 #[cfg(test)]
 mod tests {
