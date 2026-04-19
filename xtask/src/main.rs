@@ -4737,6 +4737,14 @@ fn populate_ext2_files(
     // Phase 54 Track C: UDP network service.
     let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
 
+    // Phase 55b F.1: ring-3 driver process service configs.
+    // No `depends=` line — the IOMMU substrate (Phase 55a) is kernel-internal
+    // init, not a supervised service.  restart=on-failure with max_restart=5
+    // provides supervised crash recovery without infinite loops.
+    let nvme_driver_conf =
+        "name=nvme_driver\ncommand=/drivers/nvme\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let e1000_driver_conf = "name=e1000_driver\ncommand=/drivers/e1000\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -4755,6 +4763,8 @@ fn populate_ext2_files(
     let fat_server_conf_tmp = output_dir.join("_tmp_fat_server_conf");
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
+    let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
+    let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -4770,6 +4780,8 @@ fn populate_ext2_files(
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
+    fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
+    fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -4984,6 +4996,14 @@ fn populate_ext2_files(
          sif etc/services.d/net_server.conf mode 0x81A4\n\
          sif etc/services.d/net_server.conf uid 0\n\
          sif etc/services.d/net_server.conf gid 0\n\
+         write \"{nvme_driver_conf}\" etc/services.d/nvme_driver.conf\n\
+         sif etc/services.d/nvme_driver.conf mode 0x81A4\n\
+         sif etc/services.d/nvme_driver.conf uid 0\n\
+         sif etc/services.d/nvme_driver.conf gid 0\n\
+         write \"{e1000_driver_conf}\" etc/services.d/e1000_driver.conf\n\
+         sif etc/services.d/e1000_driver.conf mode 0x81A4\n\
+         sif etc/services.d/e1000_driver.conf uid 0\n\
+         sif etc/services.d/e1000_driver.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -5004,6 +5024,8 @@ fn populate_ext2_files(
         fat_server_conf = fat_server_conf_tmp.display(),
         vfs_server_conf = vfs_server_conf_tmp.display(),
         net_server_conf = net_server_conf_tmp.display(),
+        nvme_driver_conf = nvme_driver_conf_tmp.display(),
+        e1000_driver_conf = e1000_driver_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -8369,6 +8391,104 @@ mod tests {
         assert!(
             source.contains("DRIVERS_ENTRIES") || source.contains("/drivers"),
             "ramdisk must expose a /drivers directory containing nvme"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.1 — service-manager registration for nvme_driver + e1000_driver
+    // -----------------------------------------------------------------------
+
+    /// Assert that nvme_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.  We look for the conf content string *before*
+    /// the tests module boundary so the test cannot be satisfied by the
+    /// assertion strings themselves.
+    #[test]
+    fn nvme_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        // The marker that delimits where production code ends and tests begin.
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=nvme_driver"),
+            "populate_ext2_files must embed a conf string containing `name=nvme_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/nvme"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/nvme`"
+        );
+        // Find the conf literal and verify no depends= key is present.
+        let start = prod
+            .find("name=nvme_driver")
+            .expect("name=nvme_driver not found");
+        // Find closing delimiter of the string literal (the next `"` after start).
+        let end = prod[start..]
+            .find('"')
+            .map(|i| start + i)
+            .unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "nvme_driver.conf must NOT contain a depends= line (IOMMU substrate is kernel-internal)"
+        );
+        assert!(
+            prod.contains("restart=on-failure"),
+            "nvme_driver.conf must contain `restart=on-failure`"
+        );
+        assert!(
+            prod.contains("max_restart=5"),
+            "nvme_driver.conf must contain `max_restart=5`"
+        );
+    }
+
+    /// Assert that e1000_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.
+    #[test]
+    fn e1000_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=e1000_driver"),
+            "populate_ext2_files must embed a conf string containing `name=e1000_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/e1000"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/e1000`"
+        );
+        let start = prod
+            .find("name=e1000_driver")
+            .expect("name=e1000_driver not found");
+        let end = prod[start..]
+            .find('"')
+            .map(|i| start + i)
+            .unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "e1000_driver.conf must NOT contain a depends= line"
+        );
+    }
+
+    /// Assert that both driver service names appear in init's KNOWN_CONFIGS list.
+    #[test]
+    fn driver_confs_in_init_known_configs() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("nvme_driver.conf"),
+            "init KNOWN_CONFIGS must include nvme_driver.conf"
+        );
+        assert!(
+            source.contains("e1000_driver.conf"),
+            "init KNOWN_CONFIGS must include e1000_driver.conf"
+        );
+    }
+
+    /// Assert that init emits a driver.registered structured event when a
+    /// driver service config is loaded.
+    #[test]
+    fn init_emits_driver_registered_event() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("driver.registered"),
+            "init must emit a structured `driver.registered` log event when a driver service is loaded"
         );
     }
 }

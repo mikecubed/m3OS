@@ -72,6 +72,9 @@ const KNOWN_CONFIGS: &[&[u8]] = &[
     b"/etc/services.d/dhcpd.conf\0",
     b"/etc/services.d/ntpd.conf\0",
     b"/etc/services.d/ftpd.conf\0",
+    // Phase 55b F.1: ring-3 driver process configs.
+    b"/etc/services.d/nvme_driver.conf\0",
+    b"/etc/services.d/e1000_driver.conf\0",
 ];
 
 // ---------------------------------------------------------------------------
@@ -196,6 +199,20 @@ impl<const N: usize> FixedStr<N> {
 
     fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    fn starts_with(&self, prefix: &[u8]) -> bool {
+        if self.len < prefix.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < prefix.len() {
+            if self.data[i] != prefix[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Write into a buffer with null terminator, return total length including null.
@@ -891,8 +908,24 @@ impl ServiceManager {
                         write_str(STDOUT_FILENO, "init: loaded service '");
                         write(STDOUT_FILENO, svc.name.as_bytes());
                         write_str(STDOUT_FILENO, "'\n");
+                        // Phase 55b F.1: emit structured driver.registered event
+                        // for any service whose binary lives under /drivers/.
+                        let is_driver = svc.command.starts_with(b"/drivers/");
                         self.services[self.count] = svc;
                         self.count += 1;
+                        if is_driver {
+                            let idx = self.count - 1;
+                            write_str(STDOUT_FILENO, "init: driver.registered name=");
+                            write(STDOUT_FILENO, self.services[idx].name.as_bytes());
+                            write_str(STDOUT_FILENO, " command=");
+                            write(STDOUT_FILENO, self.services[idx].command.as_bytes());
+                            write_str(STDOUT_FILENO, "\n");
+                            self.syslog_service_event(
+                                SEV_INFO,
+                                b"driver.registered",
+                                self.services[idx].name.as_bytes(),
+                            );
+                        }
                     }
                     None => {
                         write_str(STDOUT_FILENO, "init: warning: malformed service file ");
