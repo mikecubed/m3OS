@@ -406,98 +406,111 @@ fn device_host_error_not_claimed_surfaces_from_registry_error() {
 // QEMU-heavy stubs (require SIGKILL API + BlockDriverError client observation)
 // ---------------------------------------------------------------------------
 
-/// FIXME(F.3b → phase-55c-write-path): Spawn the NVMe driver process, issue a
-/// write mid-restart, and assert the outstanding write returns
-/// `BlockDriverError::DriverRestarting` within `DRIVER_RESTART_TIMEOUT_MS`.
+/// Phase 55b Track F.3c progress: privilege gate resolved.
 ///
-/// **Phase 55b F.2b progress:** both F.2b blockers are now resolved:
-///   - `service kill <name>` is wired in `userspace/coreutils-rs/src/service.rs`:
-///     reads PID from `/run/services.status` and calls kill(2) with SIGKILL.
-///   - `kernel/src/blk/remote.rs` now returns `BlockDriverError::DriverRestarting`
-///     (wire byte 5) instead of generic 0xFF when the IPC endpoint closes mid-call.
-///   - `cargo xtask regression --test driver-restart-guest` (Phase 55b F.2b, gated
-///     behind M3OS_ENABLE_DRIVER_RESTART_REGRESSION) drives: boot → `service status
-///     nvme_driver` → `service kill nvme_driver` → observe restart log line → re-query
-///     status. Requires `--device nvme` (enforced via `RegressionTest::devices`).
-///
-/// **Phase 55b F.3b progress:** `userspace/nvme-crash-smoke/src/main.rs` is now
-///   the guest-side I/O-client binary. It speaks the block IPC protocol directly
-///   to the `nvme.block` endpoint, forks a child to kill the driver mid-call,
-///   and confirms the IPC transport failure + successful post-restart retry.
+/// **F.3b progress:** `userspace/nvme-crash-smoke/src/main.rs` is the guest-side
+///   I/O-client binary. It speaks the block IPC protocol directly to the
+///   `nvme.block` endpoint, forks a child to kill the driver mid-call, and
+///   confirms the IPC transport failure + successful post-restart retry.
 ///   The QEMU regression `driver-restart-crash` (gated behind
-///   M3OS_ENABLE_CRASH_SMOKE) exercises the full end-to-end path.
+///   `M3OS_ENABLE_CRASH_SMOKE`) exercises the full end-to-end path.
 ///
-/// Still blocked on (phase-55c write-path):
-///   Observing `BlockDriverError::DriverRestarting` (byte 5) from the _kernel
-///   facade_ requires an ordinary guest binary to have storage-server privileges
-///   (euid = 200, exec_path ∈ {/bin/vfs_server, /bin/fat_server}). The
-///   nvme-crash-smoke binary observes the raw IPC transport failure (u64::MAX)
-///   instead. The byte-5 assertion from the kernel facade path requires
-///   either a privilege relaxation or a new test-only syscall: deferred to
-///   phase-55c.
+/// **F.3c progress (resolves the F.3b privilege blocker):**
+///   - `block_error_to_neg_errno` in `kernel-core/src/driver_ipc/block.rs` maps
+///     `DriverRestarting` (byte 5) → `NEG_EAGAIN` (-11) and `Busy` (byte 4) →
+///     `NEG_EAGAIN` (-11). All other errors map to `NEG_EIO` (-5).
+///   - `sys_block_read` now calls `block_error_to_neg_errno` instead of
+///     `Err(_) => NEG_EIO`, so callers can distinguish restart from hard failure.
+///   - `privileged_exec_credentials("/bin/nvme-crash-smoke", _)` grants euid=200
+///     at exec time (cfg-gated on `!hardened`).
+///   - `BLOCK_READ_ALLOWED` (non-hardened) now includes `/bin/nvme-crash-smoke`.
+///   - `nvme-crash-smoke` step 3.5 calls `sys_block_read` during the crash window
+///     and asserts the return is either `0` (driver back already) or
+///     `NEG_EAGAIN` (-11) (DriverRestarting propagated). It fails if it sees
+///     `NEG_EIO` (-5) which would indicate the old errno-collapse is in effect.
+///
+/// Remaining blocker (phase-55c write-path):
+///   This specific stub tests a *write* mid-crash (not a read). The F.3c binary
+///   exercises `sys_block_read` (read path). A write-path variant would need
+///   `sys_block_write`, which does not yet exist as a kernel syscall — reads go
+///   through `sys_block_read` but writes are issued directly through the IPC
+///   protocol by vfs_server/fat_server. A `sys_block_write` syscall would need
+///   to be added to expose the write path to integration tests.
+///   Additionally, this is a QEMU-only test — it cannot run as a host unit test.
 #[test]
-#[ignore = "phase-55c write-path deferred: F.3b landed nvme-crash-smoke (IPC transport \
-            failure visible from guest); kernel facade DriverRestarting byte (5) \
-            requires storage-server privilege or a new test syscall. \
-            See driver-restart-crash QEMU regression (M3OS_ENABLE_CRASH_SMOKE)."]
+#[ignore = "phase-55c write-path deferred: F.3c resolved the privilege gate (nvme-crash-smoke \
+            now has euid=200, EAGAIN propagation wired); remaining blocker is sys_block_write \
+            syscall (does not exist yet) needed to test the write mid-crash path. \
+            Read-path EAGAIN observation is exercised by driver-restart-crash QEMU regression \
+            (M3OS_ENABLE_CRASH_SMOKE). This test is also QEMU-only."]
 fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
     // Test body intentionally empty — the ignore attribute is the artifact.
     // When this guard is lifted the body will:
     //   1. boot guest with --device nvme
-    //   2. launch guest I/O-client via storage-server privilege or test syscall
+    //   2. launch nvme-crash-smoke with storage-server euid (already wired in F.3c)
     //   3. race: `service kill nvme_driver` while write is in flight
-    //   4. assert client receives DriverRestarting (byte 5) within DRIVER_RESTART_TIMEOUT_MS
+    //   4. assert sys_block_read (or future sys_block_write) returns EAGAIN (-11)
+    //      within DRIVER_RESTART_TIMEOUT_MS (not NEG_EIO, which would be wrong)
     //   5. assert service logs driver.restart + driver.restarted
-    //   6. assert subsequent write to LBA 0 succeeds
+    //   6. assert subsequent read/write to LBA 0 succeeds
     //   7. assert no partial-write corruption (compare LBA 0 before and after)
 }
 
-/// FIXME(phase-55c e1000): Analogous e1000 regression test.
+/// Phase 55b Track F.3c status: e1000 path unchanged from F.3b.
 ///
-/// **Phase 55b F.2b progress:** `service kill e1000_driver` is now available
-/// from the guest shell (same `service kill` subcommand). The `RemoteNic`
-/// error-surfacing path (`NetDriverError::DriverRestarting`) needs the same
-/// treatment as the block path.
+/// **F.2b progress:** `service kill e1000_driver` is available from the guest
+///   shell (same `service kill` subcommand). The `RemoteNic` error-surfacing
+///   path (`NetDriverError::DriverRestarting`) needs the same errno-propagation
+///   treatment as the block path.
 ///
-/// **Phase 55b F.3b progress:** F.3b delivered the NVMe crash-smoke binary
-///   (`userspace/nvme-crash-smoke/`) and the `driver-restart-crash` QEMU
-///   regression. The analogous e1000 path requires a guest net I/O-client
-///   binary speaking the `e1000.net` IPC protocol and the `RemoteNic` facade
-///   surfacing `NetDriverError::DriverRestarting` on endpoint closure — neither
-///   exists yet.
+/// **F.3b progress:** F.3b delivered the NVMe crash-smoke binary and the
+///   `driver-restart-crash` QEMU regression. The analogous e1000 path
+///   requires a guest net I/O-client binary speaking the `e1000.net` IPC
+///   protocol and the `RemoteNic` facade surfacing `NetDriverError::DriverRestarting`
+///   on endpoint closure — neither exists yet.
 ///
-/// Still blocked on (phase-55c e1000):
-///   - `RemoteNic` kernel facade net-side DriverRestarting surfacing.
-///   - A guest net I/O-client binary analogous to nvme-crash-smoke.
-///   - ICMP echo or TCP connect path to verify post-restart connectivity.
+/// **F.3c status:** F.3c resolved the block-path privilege gate and EAGAIN
+///   propagation. The e1000 path remains blocked on:
+///   1. A `sys_net_send` / `sys_net_recv` syscall for the net facade path
+///      (analogous to `sys_block_read`), OR a guest net I/O-client binary
+///      speaking `e1000.net` IPC directly.
+///   2. `RemoteNic::send` / `recv` surfacing `NetDriverError::DriverRestarting`
+///      (byte 5) as `NEG_EAGAIN` — net-side `block_error_to_neg_errno`
+///      equivalent not yet written.
+///   3. ICMP echo or TCP connect path to verify post-restart connectivity.
+///   This test is also QEMU-only.
 #[test]
-#[ignore = "phase-55c e1000 deferred: F.3b covered NVMe; e1000 still needs \
-            RemoteNic DriverRestarting surfacing + guest net I/O-client binary."]
+#[ignore = "phase-55c e1000 deferred: F.3c resolved the NVMe privilege gate; e1000 still \
+            needs: (1) guest net I/O-client binary speaking e1000.net IPC, \
+            (2) RemoteNic::send/recv EAGAIN surfacing (net_error_to_neg_errno), \
+            (3) ICMP/TCP post-restart connectivity check. QEMU-only test."]
 fn qemu_e1000_kill_mid_send_returns_driver_restarting_then_icmp_echo_succeeds() {
-    // intentionally empty — see FIXME above
+    // intentionally empty — see doc comment above for specific blockers
 }
 
-/// FIXME(phase-55c max-restart): max_restart=5 enforcement in the running guest.
+/// Phase 55b Track F.3c status: max-restart path unchanged from F.3b.
 ///
-/// **Phase 55b F.2b progress:** `service kill <name>` is now available in the
-/// guest shell.
+/// **F.2b progress:** `service kill <name>` is available in the guest shell.
 ///
-/// **Phase 55b F.3b progress:** F.3b's `nvme-crash-smoke` binary kills the
-///   driver once and confirms the restart. Scripting 6 kills in sequence within
-///   the QEMU regression timeout budget (each kill → restart cycle takes ~1 s)
-///   is feasible but requires the binary to loop and count restarts, which is a
-///   phase-55c item. The pure-logic analogue
-///   (`max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped`)
+/// **F.3b progress:** F.3b's `nvme-crash-smoke` binary kills the driver once
+///   and confirms the restart. Scripting 6 kills in sequence within the QEMU
+///   regression timeout budget (each kill → restart cycle takes ~1 s) is
+///   feasible but requires the binary to loop and count restarts. The pure-logic
+///   analogue (`max_restart_enforcement_sixth_crash_transitions_to_permanently_stopped`)
 ///   already passes.
 ///
-/// Still blocked on (phase-55c max-restart):
-///   A scripted kill-loop in the guest binary that drives restart_count past
-///   max_restart within the QEMU regression timeout budget (6 × ~1 s = ~6 s,
-///   well within 180 s) and asserts `service status nvme_driver` returns
-///   `permanently-stopped` on the 6th crash.
+/// **F.3c status:** F.3c updated `nvme-crash-smoke` to exercise the `sys_block_read`
+///   EAGAIN path during the crash window (step 3.5). The max-restart loop (6 kills)
+///   is still a separate work item. Remaining blocker:
+///   A scripted kill-loop in the guest binary that drives `restart_count` past
+///   `max_restart` (5) within the QEMU regression timeout budget (6 × ~1 s ≈ 6 s,
+///   well within 180 s), then reads `/run/services.status` and asserts the line
+///   for `nvme_driver` contains `permanently-stopped`.
+///   This test is also QEMU-only.
 #[test]
-#[ignore = "phase-55c max-restart deferred: F.3b kills once; 6-kill loop + \
-            permanently-stopped assertion needs a looping guest binary variant."]
+#[ignore = "phase-55c max-restart deferred: F.3c wired EAGAIN observation in single-kill \
+            path; 6-kill loop + permanently-stopped assertion in the guest binary requires \
+            a looping variant of nvme-crash-smoke (not yet built). QEMU-only test."]
 fn qemu_max_restart_exceeded_service_status_returns_failed() {
-    // intentionally empty — see FIXME above
+    // intentionally empty — see doc comment above for specific blocker
 }

@@ -349,6 +349,43 @@ pub fn decode_blk_reply(bytes: &[u8]) -> Result<(BlkReplyHeader, u32), DecodeErr
 }
 
 // ------------------------------------------------------------------------
+// Errno-mapping — Phase 55b Track F.3c
+// ------------------------------------------------------------------------
+
+/// Map a `BlockDriverError` wire byte to a negated Linux errno value for use
+/// as the return value of `sys_block_read`.
+///
+/// # Mapping table
+///
+/// | `BlockDriverError` | byte | `sys_block_read` return |
+/// |---|---|---|
+/// | `Ok`              | 0 | 0 (success; handled by the Ok arm, never passed here) |
+/// | `IoError`         | 1 | `NEG_EIO` (-5) |
+/// | `InvalidLba`      | 2 | `NEG_EIO` (-5) |
+/// | `DeviceAbsent`    | 3 | `NEG_EIO` (-5) |
+/// | `Busy`            | 4 | `NEG_EAGAIN` (-11) |
+/// | `DriverRestarting`| 5 | `NEG_EAGAIN` (-11) |
+/// | `InvalidRequest`  | 6 | `NEG_EIO` (-5) |
+/// | unknown byte      | ≥7 | `NEG_EIO` (-5) |
+///
+/// `Busy` (4) and `DriverRestarting` (5) both map to `EAGAIN` because the
+/// caller can meaningfully retry after a short wait: the driver will either
+/// become free (`Busy`) or come back online (`DriverRestarting`). Every other
+/// error is a hard I/O failure and maps to `EIO`.
+///
+/// The `i64` return type matches the kernel's syscall return convention
+/// (negated errno) so the value can be cast directly to `u64` at the call
+/// site without an extra negate step.
+pub const fn block_error_to_neg_errno(error_byte: u8) -> i64 {
+    match error_byte {
+        // Busy (4) and DriverRestarting (5) → EAGAIN: caller can retry.
+        4 | 5 => -11, // NEG_EAGAIN
+        // All other non-Ok errors → EIO: hard failure.
+        _ => -5, // NEG_EIO
+    }
+}
+
+// ------------------------------------------------------------------------
 // Tests — authoritative for Phase 55b Track A.2. Introduced in the Red
 // commit; identical here to demonstrate the Green implementation satisfies
 // every Acceptance bullet without the test code being tweaked.
@@ -358,6 +395,64 @@ pub fn decode_blk_reply(bytes: &[u8]) -> Result<(BlkReplyHeader, u32), DecodeErr
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    // ---- block_error_to_neg_errno mapping (Phase 55b Track F.3c) ---------
+
+    /// `DriverRestarting` (byte 5) must map to `NEG_EAGAIN` (-11) so that
+    /// storage-service callers can distinguish a temporary driver restart from
+    /// a hard I/O failure.
+    #[test]
+    fn driver_restarting_byte_maps_to_neg_eagain() {
+        let byte = BlockDriverError::DriverRestarting.to_byte();
+        assert_eq!(byte, 5);
+        assert_eq!(
+            block_error_to_neg_errno(byte),
+            -11,
+            "DriverRestarting (byte 5) must map to NEG_EAGAIN (-11)"
+        );
+    }
+
+    /// `Busy` (byte 4) must also map to `NEG_EAGAIN` (-11) — caller can retry.
+    #[test]
+    fn busy_byte_maps_to_neg_eagain() {
+        let byte = BlockDriverError::Busy.to_byte();
+        assert_eq!(byte, 4);
+        assert_eq!(
+            block_error_to_neg_errno(byte),
+            -11,
+            "Busy (byte 4) must map to NEG_EAGAIN (-11)"
+        );
+    }
+
+    /// Every non-retriable error byte must map to `NEG_EIO` (-5).
+    #[test]
+    fn non_retriable_errors_map_to_neg_eio() {
+        for (variant, byte) in [
+            (BlockDriverError::IoError, 1u8),
+            (BlockDriverError::InvalidLba, 2),
+            (BlockDriverError::DeviceAbsent, 3),
+            (BlockDriverError::InvalidRequest, 6),
+        ] {
+            assert_eq!(variant.to_byte(), byte);
+            assert_eq!(
+                block_error_to_neg_errno(byte),
+                -5,
+                "{variant:?} (byte {byte}) must map to NEG_EIO (-5)"
+            );
+        }
+    }
+
+    /// Unknown bytes (≥ 7) must also map to `NEG_EIO` rather than panicking.
+    #[test]
+    fn unknown_byte_maps_to_neg_eio() {
+        for byte in [7u8, 0x0F, 0x7F, 0xFF] {
+            assert_eq!(
+                block_error_to_neg_errno(byte),
+                -5,
+                "unknown byte {byte:#04x} must map to NEG_EIO (-5)"
+            );
+        }
+    }
 
     // ---- Message labels --------------------------------------------------
 
@@ -610,6 +705,15 @@ mod tests {
             payload in proptest::collection::vec(any::<u8>(), 0..64),
         ) {
             let _ = decode_blk_reply(&payload);
+        }
+
+        /// For every possible `BlockDriverError` byte, `block_error_to_neg_errno`
+        /// never panics and returns either NEG_EIO (-5) or NEG_EAGAIN (-11).
+        #[test]
+        fn prop_block_error_to_neg_errno_never_panics(byte in any::<u8>()) {
+            let v = block_error_to_neg_errno(byte);
+            prop_assert!(v == -5 || v == -11,
+                "expected -5 (EIO) or -11 (EAGAIN), got {v}");
         }
 
         /// Truncated valid-looking payloads decode to `Err(DecodeError)` and
