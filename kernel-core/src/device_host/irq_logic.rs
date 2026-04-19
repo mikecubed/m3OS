@@ -60,6 +60,11 @@ pub struct IrqBinding {
     pub notif_id: u8,
     /// Bit within the notification word the ISR `fetch_or`s on delivery.
     pub bit_index: u8,
+    /// Whether the kernel allocated this `Notification` on behalf of the caller
+    /// (true → `notification::release` on process exit; false → the caller owns
+    /// the `Notification` and the exit path must only unbind the vector, leaving
+    /// the caller's cap intact).
+    pub kernel_owns_notif: bool,
 }
 
 /// Pure-logic IRQ binding registry.
@@ -167,6 +172,7 @@ mod tests {
             vector,
             notif_id: 1,
             bit_index: 0,
+            kernel_owns_notif: true, // default to kernel-owned for existing tests
         }
     }
 
@@ -260,6 +266,7 @@ mod tests {
             vector: 0x6a,
             notif_id: 5,
             bit_index: 7,
+            kernel_owns_notif: true,
         };
         reg.try_bind(b).unwrap();
         assert_eq!(reg.get_by_vector(0x6a), Some(b));
@@ -270,5 +277,111 @@ mod tests {
     fn max_subscriptions_constant_is_eight() {
         // Pin the value — changing this is a task-doc-level decision.
         assert_eq!(MAX_IRQ_SUBSCRIPTIONS_PER_PID, 8);
+    }
+
+    // -- B.4b: caller-provided NotifId path -----------------------------------
+
+    /// A binding with `kernel_owns_notif = false` records the flag and is
+    /// returned by `get_by_vector` / `release_for_pid` with the flag intact.
+    /// The kernel-side teardown uses this to decide whether to call
+    /// `notification::release` (only when `kernel_owns_notif` is true).
+    #[test]
+    fn caller_owned_notif_flag_round_trips_through_registry() {
+        let mut reg = IrqBindingRegistryCore::new();
+        let b = IrqBinding {
+            pid: 100,
+            key: KEY_A,
+            vector: 0x6a,
+            notif_id: 3,
+            bit_index: 5,
+            kernel_owns_notif: false, // caller owns the notification
+        };
+        reg.try_bind(b).unwrap();
+        let retrieved = reg.get_by_vector(0x6a).expect("just inserted");
+        assert!(
+            !retrieved.kernel_owns_notif,
+            "flag must survive the registry round-trip"
+        );
+    }
+
+    /// A binding with `kernel_owns_notif = true` is likewise preserved.
+    #[test]
+    fn kernel_owned_notif_flag_round_trips_through_registry() {
+        let mut reg = IrqBindingRegistryCore::new();
+        let b = IrqBinding {
+            pid: 100,
+            key: KEY_A,
+            vector: 0x6b,
+            notif_id: 4,
+            bit_index: 2,
+            kernel_owns_notif: true, // kernel allocated the notification
+        };
+        reg.try_bind(b).unwrap();
+        let retrieved = reg.get_by_vector(0x6b).expect("just inserted");
+        assert!(
+            retrieved.kernel_owns_notif,
+            "flag must survive the registry round-trip"
+        );
+    }
+
+    /// `release_for_pid` preserves the `kernel_owns_notif` flag in its output
+    /// so the teardown caller can inspect it without re-querying the (now
+    /// empty) registry.
+    #[test]
+    fn release_for_pid_preserves_kernel_owns_notif_flag() {
+        let mut reg = IrqBindingRegistryCore::new();
+        // One kernel-owned, one caller-owned.
+        let kernel_owned = IrqBinding {
+            pid: 100,
+            key: KEY_A,
+            vector: 0x60,
+            notif_id: 1,
+            bit_index: 0,
+            kernel_owns_notif: true,
+        };
+        let caller_owned = IrqBinding {
+            pid: 100,
+            key: KEY_A,
+            vector: 0x61,
+            notif_id: 2,
+            bit_index: 1,
+            kernel_owns_notif: false,
+        };
+        reg.try_bind(kernel_owned).unwrap();
+        reg.try_bind(caller_owned).unwrap();
+
+        let freed = reg.release_for_pid(100);
+        assert_eq!(freed.len(), 2);
+
+        let k = freed
+            .iter()
+            .find(|b| b.vector == 0x60)
+            .expect("kernel-owned binding");
+        let c = freed
+            .iter()
+            .find(|b| b.vector == 0x61)
+            .expect("caller-owned binding");
+        assert!(k.kernel_owns_notif, "kernel-owned binding must carry true");
+        assert!(
+            !c.kernel_owns_notif,
+            "caller-owned binding must carry false"
+        );
+    }
+
+    /// `release_vector` used in unwind paths also preserves the flag.
+    #[test]
+    fn release_vector_preserves_kernel_owns_notif_flag() {
+        let mut reg = IrqBindingRegistryCore::new();
+        let b = IrqBinding {
+            pid: 100,
+            key: KEY_A,
+            vector: 0x62,
+            notif_id: 5,
+            bit_index: 3,
+            kernel_owns_notif: false,
+        };
+        reg.try_bind(b).unwrap();
+        let removed = reg.release_vector(0x62).unwrap();
+        assert!(!removed.kernel_owns_notif);
     }
 }
