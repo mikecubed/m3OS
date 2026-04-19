@@ -1343,24 +1343,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 55b Track B.2 — sys_device_mmio_map integration tests
+    // Phase 55b Tracks B.2 and B.3 — sys_device_mmio_map / sys_device_dma_alloc
     // -----------------------------------------------------------------------
-    //
-    // Track B.2 pins two boundary invariants that cannot be captured by the
-    // kernel-core unit tests alone:
-    //
-    //   1. The kernel-side `MmioRegistry` must be cleared in lockstep with
-    //      the parent `DeviceHostRegistry` — dropping a `Capability::Device`
-    //      must implicitly drop every derived `Capability::Mmio` (the
-    //      "cleanup cascade" named in the task doc).
-    //   2. The per-driver MMIO-slot cap (32) must reject a 33rd map without
-    //      corrupting state.
-    //
-    // The integration tests below drive the kernel-side registry through a
-    // pair of `test_*` helpers that bypass the capability-table insertion
-    // (which needs a real task) but exercise the same lock-ordered state
-    // machine as the syscall path. The pure bounds-check math is covered by
-    // `kernel_core::device_host::mmio_bounds::tests`.
+
+    /// Pick a free PCI BDF for the test. Returns `None` when no free device
+    /// is available (test is skipped in that case).
+    #[cfg(test)]
+    fn pick_free_pci_bdf() -> Option<kernel_core::device_host::DeviceCapKey> {
+        use crate::syscall::device_host::test_owner_of;
+        use kernel_core::device_host::DeviceCapKey;
+        crate::pci::init();
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if test_owner_of(k).is_none() {
+                return Some(k);
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    // -- Track B.2 — sys_device_mmio_map integration tests -------------------
 
     /// Track B.2: recording an MMIO mapping under a claimed device, then
     /// calling `test_release_for_pid`, must clear both the claim slot and
@@ -1371,21 +1375,8 @@ mod tests {
             TestClaimError, test_mmio_count_for_pid, test_owner_of, test_record_mmio,
             test_release_for_pid, test_try_claim_for_pid,
         };
-        use kernel_core::device_host::DeviceCapKey;
 
-        crate::pci::init();
-
-        let mut key: Option<DeviceCapKey> = None;
-        let mut idx = 0;
-        while let Some(dev) = crate::pci::pci_device(idx) {
-            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
-            if test_owner_of(k).is_none() {
-                key = Some(k);
-                break;
-            }
-            idx += 1;
-        }
-        let Some(key) = key else {
+        let Some(key) = pick_free_pci_bdf() else {
             serial_println!("device_host B.2 cascade test skipped: no free PCI device");
             return;
         };
@@ -1434,23 +1425,10 @@ mod tests {
     fn device_host_mmio_capacity_cap_is_enforced() {
         use crate::syscall::device_host::{
             MAX_MMIO_PER_DEVICE, TestClaimError, TestMmioError, test_mmio_count_for_pid,
-            test_owner_of, test_record_mmio, test_release_for_pid, test_try_claim_for_pid,
+            test_record_mmio, test_release_for_pid, test_try_claim_for_pid,
         };
-        use kernel_core::device_host::DeviceCapKey;
 
-        crate::pci::init();
-
-        let mut key: Option<DeviceCapKey> = None;
-        let mut idx = 0;
-        while let Some(dev) = crate::pci::pci_device(idx) {
-            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
-            if test_owner_of(k).is_none() {
-                key = Some(k);
-                break;
-            }
-            idx += 1;
-        }
-        let Some(key) = key else {
+        let Some(key) = pick_free_pci_bdf() else {
             serial_println!("device_host B.2 capacity test skipped: no free PCI device");
             return;
         };
@@ -1548,5 +1526,303 @@ mod tests {
         assert_eq!(desc.cache_mode, MmioCacheMode::Uncacheable);
 
         serial_println!("device_host B.2 bounds-reexport test passed");
+    }
+
+    // -- Track B.3 — sys_device_dma_alloc integration tests ------------------
+
+    /// B.3: sys_device_dma_alloc returns a (user_va, iova, len) handle whose
+    /// views of the backing frame are consistent — write via user_va, read
+    /// via iova-equivalent kernel view, get the same byte.
+    #[test_case]
+    fn device_host_dma_alloc_yields_consistent_user_and_iova_views() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_dma_alloc_for_pid, test_dma_count, test_dma_release_for_pid,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("B.3 dma_alloc test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE40;
+        let _ = test_release_for_pid(PID);
+        let _ = test_dma_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => {
+                serial_println!(
+                    "B.3 dma_alloc test skipped: BDF {:02x}:{:02x}.{} busy",
+                    key.bus,
+                    key.dev,
+                    key.func,
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected claim error: {:?}", e),
+        }
+
+        let before = test_dma_count();
+        let snap = test_dma_alloc_for_pid(PID, key, 4096, 4096)
+            .expect("dma_alloc must succeed for a claimed device");
+        assert_eq!(snap.len, 4096, "len must be rounded to the request");
+        assert_ne!(snap.iova, 0, "iova must be non-zero");
+        assert_ne!(snap.user_va, 0, "user_va must be non-zero");
+        assert_eq!(
+            test_dma_count(),
+            before + 1,
+            "registry must record the new allocation"
+        );
+
+        let sentinel: u8 = 0xA5;
+        unsafe {
+            core::ptr::write_volatile(snap.user_va as *mut u8, sentinel);
+        }
+
+        let kvirt_of_iova = (crate::mm::phys_offset() + snap.iova) as *const u8;
+        let read_back = unsafe { core::ptr::read_volatile(kvirt_of_iova) };
+        assert_eq!(
+            read_back, sentinel,
+            "user VA and IOVA must alias the same frame",
+        );
+
+        let flip: u8 = 0x5A;
+        unsafe {
+            core::ptr::write_volatile(kvirt_of_iova as *mut u8, flip);
+        }
+        let read_back_user = unsafe { core::ptr::read_volatile(snap.user_va as *const u8) };
+        assert_eq!(
+            read_back_user, flip,
+            "IOVA-view write must be visible through user VA",
+        );
+
+        let freed = test_dma_release_for_pid(PID);
+        assert_eq!(freed, 1, "release must free exactly one allocation");
+        let _ = test_release_for_pid(PID);
+        serial_println!("device_host B.3 dma_alloc integration test passed");
+    }
+
+    /// B.3: handle-info returns the registered `(user_va, iova, len)` triple
+    /// verbatim.
+    #[test_case]
+    fn device_host_dma_handle_info_returns_registered_triple() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_dma_alloc_for_pid, test_dma_handle_info, test_dma_release_for_pid,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("B.3 handle_info test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE41;
+        let _ = test_release_for_pid(PID);
+        let _ = test_dma_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => return,
+            Err(e) => panic!("claim failed: {:?}", e),
+        }
+
+        let alloc_snap = test_dma_alloc_for_pid(PID, key, 8192, 0).expect("dma_alloc must succeed");
+        let info_snap = test_dma_handle_info(PID, alloc_snap.id)
+            .expect("handle_info must find the live allocation");
+        assert_eq!(alloc_snap, info_snap);
+
+        const OTHER: crate::process::Pid = 0xC0FF_EE42;
+        assert!(test_dma_handle_info(OTHER, alloc_snap.id).is_none());
+
+        let _ = test_dma_release_for_pid(PID);
+        let _ = test_release_for_pid(PID);
+        serial_println!("device_host B.3 handle_info integration test passed");
+    }
+
+    /// B.3: dma_alloc against a non-claimed BDF returns NoDevice.
+    #[test_case]
+    fn device_host_dma_alloc_rejects_unclaimed_device() {
+        use crate::syscall::device_host::{TestDmaError, test_dma_alloc_for_pid};
+        use kernel_core::device_host::DeviceCapKey;
+
+        let key = DeviceCapKey::new(0, 0xFF, 0x1F, 7);
+        const PID: crate::process::Pid = 0xC0FF_EE43;
+        let err = test_dma_alloc_for_pid(PID, key, 4096, 4096)
+            .expect_err("alloc must fail without a prior claim");
+        assert_eq!(err, TestDmaError::NoDevice);
+    }
+
+    /// B.3: allocation-rollback discipline — bad size returns InvalidArg and
+    /// leaves no state in the registry.
+    #[test_case]
+    fn device_host_dma_alloc_rollback_on_validation_error() {
+        use crate::syscall::device_host::{
+            TestClaimError, TestDmaError, test_dma_alloc_for_pid, test_dma_count,
+            test_dma_release_for_pid, test_release_for_pid, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("B.3 rollback test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE44;
+        let _ = test_release_for_pid(PID);
+        let _ = test_dma_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => return,
+            Err(e) => panic!("claim failed: {:?}", e),
+        }
+
+        let before_count = test_dma_count();
+        let before_frames = crate::mm::frame_allocator::available_count();
+
+        assert_eq!(
+            test_dma_alloc_for_pid(PID, key, 0, 4096),
+            Err(TestDmaError::InvalidArg)
+        );
+        assert_eq!(
+            test_dma_alloc_for_pid(PID, key, 4096, 3),
+            Err(TestDmaError::InvalidArg)
+        );
+        assert_eq!(
+            test_dma_alloc_for_pid(PID, key, 4096, 8192),
+            Err(TestDmaError::InvalidArg)
+        );
+
+        assert_eq!(test_dma_count(), before_count, "no registry entries added");
+        crate::mm::frame_allocator::drain_per_cpu_caches();
+        let after_frames = crate::mm::frame_allocator::available_count();
+        assert_eq!(
+            after_frames, before_frames,
+            "no frames leaked on validation error (before={} after={})",
+            before_frames, after_frames,
+        );
+
+        let _ = test_release_for_pid(PID);
+        serial_println!("device_host B.3 rollback integration test passed");
+    }
+
+    /// B.3: cross-device negative — two distinct BDFs each get their own
+    /// DMA allocation; a driver cannot introspect another driver's handle.
+    #[test_case]
+    fn device_host_dma_alloc_cross_device_is_independent() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_dma_alloc_for_pid, test_dma_handle_info, test_dma_release_for_pid,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+        use kernel_core::device_host::DeviceCapKey;
+
+        crate::pci::init();
+        let mut keys: alloc::vec::Vec<DeviceCapKey> = alloc::vec::Vec::new();
+        let mut idx = 0;
+        while let Some(dev) = crate::pci::pci_device(idx) {
+            let k = DeviceCapKey::new(0, dev.bus, dev.device, dev.function);
+            if crate::syscall::device_host::test_owner_of(k).is_none() {
+                keys.push(k);
+                if keys.len() == 2 {
+                    break;
+                }
+            }
+            idx += 1;
+        }
+        if keys.len() < 2 {
+            serial_println!("B.3 cross-device test skipped: <2 free PCI devices");
+            return;
+        }
+        let key_a = keys[0];
+        let key_b = keys[1];
+
+        const PID_A: crate::process::Pid = 0xC0FF_EE50;
+        const PID_B: crate::process::Pid = 0xC0FF_EE51;
+        let _ = test_release_for_pid(PID_A);
+        let _ = test_release_for_pid(PID_B);
+        let _ = test_dma_release_for_pid(PID_A);
+        let _ = test_dma_release_for_pid(PID_B);
+
+        if test_try_claim_for_pid(PID_A, key_a).is_err() {
+            return;
+        }
+        if test_try_claim_for_pid(PID_B, key_b).is_err() {
+            let _ = test_release_for_pid(PID_A);
+            return;
+        }
+
+        let snap_a =
+            test_dma_alloc_for_pid(PID_A, key_a, 4096, 4096).expect("PID_A dma_alloc on key_a");
+        let snap_b =
+            test_dma_alloc_for_pid(PID_B, key_b, 4096, 4096).expect("PID_B dma_alloc on key_b");
+
+        assert_ne!(snap_a.id, snap_b.id);
+
+        assert!(
+            test_dma_handle_info(PID_A, snap_b.id).is_none(),
+            "PID_A must not observe PID_B's allocation"
+        );
+        assert!(
+            test_dma_handle_info(PID_B, snap_a.id).is_none(),
+            "PID_B must not observe PID_A's allocation"
+        );
+
+        assert!(test_dma_handle_info(PID_A, snap_a.id).is_some());
+        assert!(test_dma_handle_info(PID_B, snap_b.id).is_some());
+
+        let _ = test_dma_release_for_pid(PID_A);
+        let _ = test_dma_release_for_pid(PID_B);
+        let _ = test_release_for_pid(PID_A);
+        let _ = test_release_for_pid(PID_B);
+        serial_println!("device_host B.3 cross-device test passed");
+    }
+
+    /// B.3: process-exit cleanup — every live DMA entry owned by the exiting
+    /// PID is freed (registry entry gone, frames returned to buddy).
+    #[test_case]
+    fn device_host_dma_release_on_exit_is_clean() {
+        use crate::syscall::device_host::{
+            TestClaimError, test_dma_alloc_for_pid, test_dma_count, test_dma_release_for_pid,
+            test_release_for_pid, test_try_claim_for_pid,
+        };
+
+        let Some(key) = pick_free_pci_bdf() else {
+            serial_println!("B.3 on-exit cleanup test skipped: no free PCI device");
+            return;
+        };
+
+        const PID: crate::process::Pid = 0xC0FF_EE60;
+        let _ = test_release_for_pid(PID);
+        let _ = test_dma_release_for_pid(PID);
+
+        match test_try_claim_for_pid(PID, key) {
+            Ok(()) => {}
+            Err(TestClaimError::Busy) => return,
+            Err(e) => panic!("claim failed: {:?}", e),
+        }
+
+        crate::mm::frame_allocator::drain_per_cpu_caches();
+        let frames_before = crate::mm::frame_allocator::available_count();
+
+        let _ = test_dma_alloc_for_pid(PID, key, 4096, 4096).expect("alloc 1");
+        let _ = test_dma_alloc_for_pid(PID, key, 8192, 4096).expect("alloc 2");
+        let _ = test_dma_alloc_for_pid(PID, key, 4096, 4096).expect("alloc 3");
+        assert_eq!(test_dma_count(), 3, "three live allocations");
+
+        let freed = test_dma_release_for_pid(PID);
+        assert_eq!(freed, 3, "release_for_pid freed all allocations");
+        assert_eq!(test_dma_count(), 0, "registry empty after release");
+
+        crate::mm::frame_allocator::drain_per_cpu_caches();
+        let frames_after = crate::mm::frame_allocator::available_count();
+        assert_eq!(
+            frames_after, frames_before,
+            "all DMA frames must be returned to the buddy allocator \
+             (before={} after={})",
+            frames_before, frames_after,
+        );
+
+        let _ = test_release_for_pid(PID);
+        serial_println!("device_host B.3 on-exit cleanup integration test passed");
     }
 }

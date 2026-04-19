@@ -481,6 +481,8 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
 // never has to touch the arch dispatcher.
 
 const NEG_ENOSYS: isize = -38;
+/// Negative errno `-EIO` (5) — IOMMU map/unmap hardware fault.
+const NEG_EIO: isize = -5;
 
 // ---------------------------------------------------------------------------
 // sys_device_mmio_map (Phase 55b Track B.2)
@@ -710,22 +712,584 @@ fn snapshot_address_space(pid: Pid) -> Option<Arc<AddressSpace>> {
     table.find(pid).and_then(|p| p.addr_space.as_ref().cloned())
 }
 
-/// B.3 — `sys_device_dma_alloc` stub. Replaced by Track B.3.
-#[allow(unused_variables)]
+/// B.3 — `sys_device_dma_alloc(dev_cap, size, align) -> isize`.
+///
+/// Strict allocation order per acceptance:
+///   1. Validate the `Capability::Device` handle and resolve the target BDF.
+///   2. Allocate a `DmaBuffer` (buddy alloc + IOMMU `map`) against the
+///      claimed device's domain. `DmaBuffer::allocate` already enforces
+///      rollback at this layer: on IOMMU failure it frees the frames.
+///   3. Install the user-side page-table mapping (or kernel-virt view in
+///      the test / no-AS path).
+///   4. Record the allocation in `DMA_REGISTRY` so `handle_info` and
+///      process-exit cleanup find it.
+///   5. Insert `Capability::Dma` into the caller's cap table.
+///
+/// Any failure rolls back every earlier step without leaking frames,
+/// IOMMU entries, or user mappings.
 pub fn sys_device_dma_alloc(dev_cap: u32, size: usize, align: usize) -> isize {
-    NEG_ENOSYS
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+
+    // Capability validation. A non-Device handle returns -EBADF per B.3.
+    let key = match scheduler::task_cap(task_id, dev_cap) {
+        Ok(Capability::Device { key }) => key,
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    match alloc_dma_for_pid_impl(pid, key, size, align) {
+        Ok(entry) => {
+            let cap = Capability::Dma {
+                device: key,
+                iova: entry.iova,
+                len: entry.len,
+            };
+            match scheduler::insert_cap(task_id, cap) {
+                Ok(cap_handle) => {
+                    log::info!(
+                        "device_host.dma_alloc pid={} bdf={:04x}:{:02x}:{:02x}.{} \
+                         size={} iova={:#x} user_va={:#x} cap_handle={}",
+                        pid,
+                        key.segment,
+                        key.bus,
+                        key.dev,
+                        key.func,
+                        entry.len,
+                        entry.iova,
+                        entry.user_va,
+                        cap_handle,
+                    );
+                    isize::try_from(cap_handle).unwrap_or(isize::MAX)
+                }
+                Err(_) => {
+                    // Roll back the allocation — the caller never
+                    // received the capability so the backing storage
+                    // would be unreferenced.
+                    let _ = remove_dma_entry_by_id(pid, entry.id);
+                    NEG_ENOMEM
+                }
+            }
+        }
+        Err(e) => map_alloc_error(e),
+    }
 }
 
-/// B.3 — `sys_device_dma_handle_info` stub. Replaced by Track B.3.
-#[allow(unused_variables)]
+/// B.3 — `sys_device_dma_handle_info(dma_cap, out_user_ptr) -> isize`.
+///
+/// Reads the `(user_va, iova, len)` triple for the given DMA capability
+/// into a caller-provided buffer. Non-`Capability::Dma` handles surface as
+/// `-EBADF`. The registry's `(pid, device, iova, len)` is cross-validated
+/// against the capability so a racing teardown between cap lookup and
+/// record lookup returns `-EBADF` rather than a stale triple.
 pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
-    NEG_ENOSYS
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return NEG_ESRCH;
+    }
+    let task_id = match scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_ESRCH,
+    };
+
+    let (cap_device, cap_iova, cap_len) = match scheduler::task_cap(task_id, dma_cap) {
+        Ok(Capability::Dma { device, iova, len }) => (device, iova, len),
+        Ok(_) => return NEG_EBADF,
+        Err(_) => return NEG_EBADF,
+    };
+
+    let handle = {
+        let reg = DMA_REGISTRY.lock();
+        let entries = reg.core.entries_for_pid(pid);
+        entries
+            .iter()
+            .find(|e| e.device == cap_device && e.iova == cap_iova && e.len == cap_len)
+            .map(|e| e.as_handle())
+    };
+    let handle = match handle {
+        Some(h) => h,
+        None => return NEG_EBADF,
+    };
+
+    let bytes = dma_handle_to_bytes(&handle);
+    // Try to copy into the caller's buffer. For the ring-3 path this uses
+    // the user-AS copy-out primitive; for the test / no-AS path the
+    // out_user_ptr may be a kernel-virt address (tests do not call this
+    // syscall entry directly — they use `test_dma_handle_info`).
+    match copy_dma_handle_out(out_user_ptr, &bytes) {
+        Ok(()) => 0,
+        Err(_) => NEG_EFAULT,
+    }
 }
 
 /// B.4 — `sys_device_irq_subscribe` stub. Replaced by Track B.4.
 #[allow(unused_variables)]
 pub fn sys_device_irq_subscribe(dev_cap: u32, vector_hint: u32, notification_index: u32) -> isize {
     NEG_ENOSYS
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track B.3 — DMA allocation machinery
+// ---------------------------------------------------------------------------
+
+/// Error surface from the internal allocation path. Mapped to a negative
+/// errno at the syscall boundary and to [`TestDmaError`] at the test
+/// boundary. Each variant names a distinct, observable condition — callers
+/// pattern-match rather than parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum DmaAllocError {
+    /// No claim recorded under `(pid, key)` — the caller's
+    /// `Capability::Device` was never issued or was released.
+    NoDevice,
+    /// Validation (zero size, bad align, oversized request) rejected the
+    /// request.
+    InvalidArg,
+    /// Buddy allocator out of contiguous memory at the requested order.
+    OutOfMemory,
+    /// IOMMU `map` call failed (domain out of IOVA, hardware fault).
+    IommuFault,
+    /// Per-driver DMA slot cap would be exceeded. Reserved for a future
+    /// rate-limit; unused in B.3.
+    CapExhausted,
+    /// Invariant violation — a genuine bug. Mapped to `-EIO` at the
+    /// syscall boundary so the driver sees a generic failure rather than
+    /// an unexpected errno.
+    Internal,
+}
+
+fn map_alloc_error(e: DmaAllocError) -> isize {
+    match e {
+        DmaAllocError::NoDevice => NEG_EBADF,
+        DmaAllocError::InvalidArg => NEG_EINVAL,
+        DmaAllocError::OutOfMemory => NEG_ENOMEM,
+        DmaAllocError::IommuFault => NEG_EIO,
+        DmaAllocError::CapExhausted => NEG_ENOMEM,
+        DmaAllocError::Internal => NEG_EIO,
+    }
+}
+
+/// One live DMA allocation slot. Owns:
+///   - the `DmaBuffer<[u8]>` (physical frames + IOMMU mapping); `Drop`
+///     returns both to their allocators.
+///   - a `UserUnmapCtx` when the user-AS mapping was installed in a real
+///     process (the test / kernel-context path stores `None` because it
+///     aliases the kernel-virt phys_offset window).
+///
+/// Drop order (tighter than field order): user-AS unmap first so the
+/// driver cannot observe a translation to a freed frame, then the
+/// `DmaBuffer` drop unmaps IOVA and returns frames.
+#[allow(dead_code)]
+struct DmaSlot {
+    id: kernel_core::device_host::DmaAllocId,
+    buffer: Option<crate::mm::dma::DmaBuffer<[u8]>>,
+    user_unmap: Option<UserUnmapCtx>,
+}
+
+/// Context the Drop path needs to tear down a user-side mapping.
+struct UserUnmapCtx {
+    cr3_phys: u64,
+    user_va: u64,
+    pages: usize,
+}
+
+impl Drop for DmaSlot {
+    fn drop(&mut self) {
+        // 1. User-AS unmap (only when a real process AS was mapped).
+        if let Some(ctx) = self.user_unmap.take() {
+            unmap_user_pages(ctx.cr3_phys, ctx.user_va, ctx.pages);
+        }
+        // 2. DmaBuffer drop: unmaps IOVA (flushes IOMMU TLB) + frees frames.
+        drop(self.buffer.take());
+    }
+}
+
+/// Kernel-side DMA registry. Pairs the pure-logic registry with live
+/// `DmaSlot` storage keyed by the same `DmaAllocId`.
+struct DmaRegistry {
+    core: kernel_core::device_host::DmaAllocationRegistryCore,
+    slots: alloc::collections::BTreeMap<kernel_core::device_host::DmaAllocId, DmaSlot>,
+}
+
+impl DmaRegistry {
+    const fn new() -> Self {
+        Self {
+            core: kernel_core::device_host::DmaAllocationRegistryCore::new(),
+            slots: alloc::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Lock ordering for the DMA registry, relative to the B.1 chain:
+///
+/// 1. `crate::task::scheduler::SCHEDULER` — per-process capability tables
+/// 2. `DEVICE_HOST_REGISTRY` — device claims (B.1)
+/// 3. `DMA_REGISTRY` — live DMA allocations (this, B.3)
+/// 4. `crate::pci::PCI_DEVICE_REGISTRY`
+/// 5. `crate::iommu::registry::*`
+/// 6. Buddy allocator
+///
+/// The B.3 allocation path holds `DEVICE_HOST_REGISTRY` across the
+/// `DmaBuffer::allocate` call (which walks 5 + 6) so a concurrent
+/// `release_claims_for_pid` cannot race the handle reference. No lock is
+/// held across `log::*!` writes.
+static DMA_REGISTRY: Mutex<DmaRegistry> = Mutex::new(DmaRegistry::new());
+
+/// Records the domains for which the `device_host.dma_alloc.identity`
+/// event has already been emitted. Once per device, per boot, not per
+/// allocation.
+static IDENTITY_FALLBACK_LOGGED: Mutex<Vec<DeviceCapKey>> = Mutex::new(Vec::new());
+
+/// Internal allocation path shared between the syscall entry and the test
+/// helpers. Runs the four-step allocation order; rolls back cleanly on
+/// every failure arm.
+fn alloc_dma_for_pid_impl(
+    pid: Pid,
+    key: DeviceCapKey,
+    size: usize,
+    align: usize,
+) -> Result<kernel_core::device_host::DmaAllocEntry, DmaAllocError> {
+    // Step 0: validate size / alignment BEFORE taking any lock or
+    // allocating any resource. A rejection here does not leak anything.
+    let rounded = kernel_core::device_host::validate_size_align(size, align).map_err(|e| {
+        use kernel_core::device_host::DmaRegistryError as E;
+        match e {
+            E::ZeroLen | E::AlignmentNotPowerOfTwo | E::AlignmentTooLarge | E::SizeOverflow => {
+                DmaAllocError::InvalidArg
+            }
+            _ => DmaAllocError::Internal,
+        }
+    })?;
+
+    // Steps 1-3 (IOVA reserve + phys frames + IOMMU map) under the
+    // device-host lock so the PciDeviceHandle reference stays valid. The
+    // kernel-side `DmaBuffer::allocate` already rolls back frames if
+    // IOMMU install fails, per Phase 55a E.2 — we only need to roll back
+    // the reservation bookkeeping on subsequent failures below.
+    let (phys, iova, buffer) = {
+        let reg = DEVICE_HOST_REGISTRY.lock();
+        let slot_idx = reg
+            .slots
+            .iter()
+            .position(|s| s.pid == pid && s.key == key)
+            .ok_or(DmaAllocError::NoDevice)?;
+        let handle = &reg.slots[slot_idx].handle;
+        let buf = crate::mm::dma::DmaBuffer::<[u8]>::allocate(handle, rounded)
+            .map_err(map_dma_error_to_alloc_error)?;
+        let phys = buf.physical_address().as_u64();
+        let iova = buf.bus_address();
+        (phys, iova, buf)
+    };
+    let ident_fallback = iova == phys;
+
+    // Step 4: user-AS mapping. On failure the `buffer` drop unwinds the
+    // IOMMU install and frees the frames.
+    let (user_va, user_unmap) = match install_user_mapping(pid, phys, rounded) {
+        Ok(pair) => pair,
+        Err(()) => {
+            // Roll back IOMMU + frames via DmaBuffer drop.
+            drop(buffer);
+            return Err(DmaAllocError::Internal);
+        }
+    };
+
+    // Step 5: commit the record. Using the DMA registry lock (held
+    // separately from the device-host lock) preserves the documented
+    // lock ordering (2 → 3).
+    let id = {
+        let mut reg = DMA_REGISTRY.lock();
+        let id = reg.core.insert(pid, key, user_va, iova, rounded);
+        reg.slots.insert(
+            id,
+            DmaSlot {
+                id,
+                buffer: Some(buffer),
+                user_unmap,
+            },
+        );
+        id
+    };
+
+    // Identity-fallback structured event — once per device domain.
+    if ident_fallback {
+        let mut seen = IDENTITY_FALLBACK_LOGGED.lock();
+        if !seen.contains(&key) {
+            seen.push(key);
+            drop(seen);
+            log::info!(
+                "device_host.dma_alloc.identity bdf={:04x}:{:02x}:{:02x}.{} iova={:#x} len={}",
+                key.segment,
+                key.bus,
+                key.dev,
+                key.func,
+                iova,
+                rounded,
+            );
+        }
+    }
+
+    Ok(kernel_core::device_host::DmaAllocEntry {
+        id,
+        pid,
+        device: key,
+        user_va,
+        iova,
+        len: rounded,
+    })
+}
+
+/// Install a user-side read/write mapping for the given physical run into
+/// the caller's current address space.
+///
+/// Returns `(user_va, Some(ctx))` when the mapping landed in a real
+/// process AS. Returns `(kernel_virt, None)` when the caller has no
+/// process AS (kernel test runner task) — the kernel-virt view through
+/// `phys_offset` is readable/writable and the B.3 same-byte invariant
+/// holds because the kernel-virt view and the IOVA resolve to the same
+/// physical frame.
+///
+/// Rolls back on any per-page mapping failure: already-mapped pages are
+/// unmapped in reverse order, the VA reservation is returned to
+/// `mmap_next`.
+fn install_user_mapping(
+    pid: Pid,
+    phys: u64,
+    len: usize,
+) -> Result<(usize, Option<UserUnmapCtx>), ()> {
+    let pages = len.div_ceil(4096);
+    let Some((cr3_phys, base)) = reserve_user_va_for_pid(pid, pages) else {
+        // Kernel-virt fallback — the phys-offset window is always mapped
+        // and gives us a readable/writable view on the same frames.
+        let kvirt = (crate::mm::phys_offset() + phys) as usize;
+        return Ok((kvirt, None));
+    };
+
+    use x86_64::VirtAddr;
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
+
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(cr3_phys))
+    {
+        Ok(f) => f,
+        Err(_) => {
+            release_user_va_reservation(pid, base, pages);
+            return Err(());
+        }
+    };
+
+    let pt_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    // SAFETY: cr3_frame names the caller's PML4. No other OffsetPageTable
+    // over the same frame is alive on this core.
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+    let mut alloc = crate::mm::paging::GlobalFrameAlloc;
+    let mut mapped: Vec<u64> = Vec::new();
+    for i in 0..pages {
+        let p = phys + (i as u64) * 4096;
+        let frame = match PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(p)) {
+            Ok(f) => f,
+            Err(_) => {
+                // Roll back already-mapped pages.
+                for va in mapped.iter().rev() {
+                    let pg: Page<Size4KiB> = Page::containing_address(VirtAddr::new(*va));
+                    if let Ok((_f, flush)) = mapper.unmap(pg) {
+                        flush.flush();
+                    }
+                }
+                release_user_va_reservation(pid, base, pages);
+                return Err(());
+            }
+        };
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(base + (i as u64) * 4096));
+        match unsafe { mapper.map_to(page, frame, pt_flags, &mut alloc) } {
+            Ok(flush) => {
+                flush.flush();
+                mapped.push(page.start_address().as_u64());
+            }
+            Err(_) => {
+                for va in mapped.iter().rev() {
+                    let pg: Page<Size4KiB> = Page::containing_address(VirtAddr::new(*va));
+                    if let Ok((_f, flush)) = mapper.unmap(pg) {
+                        flush.flush();
+                    }
+                }
+                release_user_va_reservation(pid, base, pages);
+                return Err(());
+            }
+        }
+    }
+
+    Ok((
+        base as usize,
+        Some(UserUnmapCtx {
+            cr3_phys,
+            user_va: base,
+            pages,
+        }),
+    ))
+}
+
+/// Attempt to reserve `pages` contiguous pages of user VA from the
+/// process's `mmap_next` bump pointer. Returns `None` when the process
+/// has no address space (e.g. the kernel test runner).
+fn reserve_user_va_for_pid(pid: Pid, pages: usize) -> Option<(u64, u64)> {
+    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+    const ANON_MMAP_BASE: u64 = 0x0000_0000_2000_0000;
+    let bytes = (pages as u64).checked_mul(4096)?;
+    let cr3: u64 = {
+        let table = crate::process::PROCESS_TABLE.lock();
+        table
+            .find(pid)
+            .and_then(|p| p.addr_space.as_ref().map(|a| a.pml4_phys().as_u64()))?
+    };
+    let base = crate::process::with_shared_mm_mut(pid, |_brk, mmap_next, _vmas| {
+        let current = if *mmap_next == 0 {
+            ANON_MMAP_BASE
+        } else {
+            *mmap_next
+        };
+        let end = current
+            .checked_add(bytes)
+            .filter(|v| *v <= USER_SPACE_END)?;
+        *mmap_next = end;
+        Some(current)
+    })??;
+    Some((cr3, base))
+}
+
+/// Roll back a user VA reservation. Only returns the VA to `mmap_next`
+/// when the reservation is still the tail — subsequent allocations may
+/// have bumped past it. That is acceptable: the VA window is 128 TiB and
+/// drivers do not churn allocations.
+fn release_user_va_reservation(pid: Pid, base: u64, pages: usize) {
+    let bytes = (pages as u64) * 4096;
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk, mmap_next, _vmas| {
+        if *mmap_next == base + bytes {
+            *mmap_next = base;
+        }
+    });
+}
+
+/// Tear down a user-side mapping installed by [`install_user_mapping`].
+fn unmap_user_pages(cr3_phys: u64, base: u64, pages: usize) {
+    use x86_64::VirtAddr;
+    use x86_64::structures::paging::{Mapper, Page, PhysFrame, Size4KiB};
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(cr3_phys))
+    {
+        Ok(f) => f,
+        Err(_) => {
+            log::warn!(
+                "[device-host] dma unmap skipped: cr3 not aligned ({:#x})",
+                cr3_phys
+            );
+            return;
+        }
+    };
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+    for i in 0..pages {
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(base + (i as u64) * 4096));
+        if let Ok((_f, flush)) = mapper.unmap(page) {
+            flush.flush();
+        }
+    }
+}
+
+fn map_dma_error_to_alloc_error(e: crate::mm::dma::DmaError) -> DmaAllocError {
+    use crate::mm::dma::DmaError;
+    match e {
+        DmaError::ZeroSize
+        | DmaError::SizeOverflow
+        | DmaError::UnsupportedAlignment
+        | DmaError::InvalidSize => DmaAllocError::InvalidArg,
+        DmaError::OutOfMemory => DmaAllocError::OutOfMemory,
+        DmaError::IovaExhausted | DmaError::DomainHardwareFault => DmaAllocError::IommuFault,
+        DmaError::NoDomainAttached => DmaAllocError::NoDevice,
+    }
+}
+
+/// Remove a single DMA slot by id, owned by `pid`. Used on the
+/// cap-table-install rollback path and by the test helpers.
+fn remove_dma_entry_by_id(pid: Pid, id: kernel_core::device_host::DmaAllocId) -> bool {
+    let slot = {
+        let mut reg = DMA_REGISTRY.lock();
+        if reg.core.remove_owned(id, pid).is_err() {
+            return false;
+        }
+        reg.slots.remove(&id)
+    };
+    drop(slot);
+    true
+}
+
+/// Release every DMA allocation owned by `pid`.
+///
+/// Called from `do_full_process_exit` so a driver crash or kill
+/// automatically frees its DMA state. Safe for a PID that holds no
+/// allocations.
+pub fn release_dma_for_pid(pid: Pid) -> usize {
+    let drained_slots = {
+        let mut reg = DMA_REGISTRY.lock();
+        let drained = reg.core.drain_pid(pid);
+        let mut slots: Vec<DmaSlot> = Vec::with_capacity(drained.len());
+        for entry in &drained {
+            if let Some(slot) = reg.slots.remove(&entry.id) {
+                slots.push(slot);
+            }
+        }
+        slots
+    };
+    let count = drained_slots.len();
+    drop(drained_slots);
+    if count > 0 {
+        log::info!("device_host.dma_release pid={} freed={}", pid, count);
+    }
+    count
+}
+
+fn dma_handle_to_bytes(h: &kernel_core::device_host::DmaHandle) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    out[0..8].copy_from_slice(&(h.user_va as u64).to_le_bytes());
+    out[8..16].copy_from_slice(&h.iova.to_le_bytes());
+    out[16..24].copy_from_slice(&(h.len as u64).to_le_bytes());
+    out
+}
+
+/// Copy the 24-byte DmaHandle representation into the caller-provided
+/// buffer. Uses the user-AS copy-out path when the caller has an address
+/// space; falls through to a direct kernel-virt write for the no-AS test
+/// path.
+fn copy_dma_handle_out(dst: usize, bytes: &[u8; 24]) -> Result<(), ()> {
+    let dst_u64 = dst as u64;
+    // Validate that the target range lies in canonical user space. If it
+    // does not, treat the pointer as a kernel-virt write (tests use this
+    // path; real syscalls would reject this with EFAULT through the
+    // upstream validator).
+    if dst_u64 < 0x0000_8000_0000_0000 {
+        // User-space address. Walk the caller's page tables to copy.
+        // `copy_from_kernel` validates the range and copies through the
+        // phys-offset window.
+        let out = crate::mm::user_mem::UserSliceWo::new(dst_u64, bytes.len()).map_err(|_| ())?;
+        out.copy_from_kernel(bytes)?;
+        Ok(())
+    } else {
+        // Kernel-virt address (test path).
+        // SAFETY: dst is a kernel-virt address inside the phys-offset
+        // window; caller guarantees the 24 bytes are writable.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -946,4 +1510,99 @@ pub(crate) fn test_record_mmio(
 pub(crate) fn test_mmio_count_for_pid(pid: Pid) -> usize {
     let mmio = MMIO_REGISTRY.lock();
     mmio.count_for_pid(pid)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track B.3 — test-only helpers for the DMA-alloc path
+// ---------------------------------------------------------------------------
+//
+// These mirror the `test_try_claim_for_pid` / `test_release_for_pid` surface
+// introduced by B.1. They drive `sys_device_dma_alloc` / `sys_device_dma_handle_info`
+// without going through the capability table, because the kernel test runner
+// task does not have a user address space or a Capability::Device installed.
+// The real ring-3 path is exercised by Track D.1's NVMe integration test.
+
+/// Error surface exposed to kernel tests. Not `#[non_exhaustive]` because
+/// tests want exhaustive matches.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestDmaError {
+    /// `pid` does not own a claim on `key`.
+    NoDevice,
+    /// Size / alignment validation rejected the request.
+    InvalidArg,
+    /// Buddy allocator out of memory.
+    OutOfMemory,
+    /// IOMMU map failed.
+    IommuFault,
+    /// Any other invariant violation (a bug, not a caller-visible condition).
+    Internal,
+}
+
+/// Snapshot of a live DMA allocation. Mirrors `DmaHandle` with the id so the
+/// test can look the entry up again later.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestDmaSnapshot {
+    pub id: u64,
+    pub user_va: usize,
+    pub iova: u64,
+    pub len: usize,
+}
+
+/// Drive the B.3 allocation path for `pid`, assuming the caller already
+/// claimed `key` via `test_try_claim_for_pid`. Returns the snapshot on
+/// success, the typed error on failure.
+#[cfg(test)]
+pub(crate) fn test_dma_alloc_for_pid(
+    pid: Pid,
+    key: DeviceCapKey,
+    size: usize,
+    align: usize,
+) -> Result<TestDmaSnapshot, TestDmaError> {
+    alloc_dma_for_pid_impl(pid, key, size, align)
+        .map(|entry| TestDmaSnapshot {
+            id: entry.id.0,
+            user_va: entry.user_va,
+            iova: entry.iova,
+            len: entry.len,
+        })
+        .map_err(|e| match e {
+            DmaAllocError::NoDevice => TestDmaError::NoDevice,
+            DmaAllocError::InvalidArg => TestDmaError::InvalidArg,
+            DmaAllocError::OutOfMemory => TestDmaError::OutOfMemory,
+            DmaAllocError::IommuFault => TestDmaError::IommuFault,
+            DmaAllocError::Internal => TestDmaError::Internal,
+            DmaAllocError::CapExhausted => TestDmaError::Internal,
+        })
+}
+
+/// Look up a live allocation by `(pid, id)` — the test-harness equivalent of
+/// `sys_device_dma_handle_info`.
+#[cfg(test)]
+pub(crate) fn test_dma_handle_info(pid: Pid, id: u64) -> Option<TestDmaSnapshot> {
+    let reg = DMA_REGISTRY.lock();
+    let entry = reg
+        .core
+        .get_owned(kernel_core::device_host::DmaAllocId(id), pid)
+        .ok()?;
+    Some(TestDmaSnapshot {
+        id: entry.id.0,
+        user_va: entry.user_va,
+        iova: entry.iova,
+        len: entry.len,
+    })
+}
+
+/// Drop every live DMA allocation for `pid`. Returns the number of slots
+/// freed. Mirrors what `release_dma_for_pid` does in the process-exit path.
+#[cfg(test)]
+pub(crate) fn test_dma_release_for_pid(pid: Pid) -> usize {
+    release_dma_for_pid(pid)
+}
+
+/// Count live DMA allocations (diagnostic).
+#[cfg(test)]
+pub(crate) fn test_dma_count() -> usize {
+    DMA_REGISTRY.lock().core.len()
 }

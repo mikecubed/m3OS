@@ -8,11 +8,16 @@
 // The module is `no_std` + `alloc`-only so it compiles for the kernel and is
 // still testable on the host via `cargo test -p kernel-core`.
 
+pub mod dma_logic;
 pub mod mmio_bounds;
 pub mod registry_logic;
 pub mod syscalls;
 pub mod types;
 
+pub use dma_logic::{
+    DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
+    validate_size_align,
+};
 pub use mmio_bounds::{
     MAX_MMIO_BAR_BYTES, MmioBoundsError, bar_page_count, build_mmio_window, cache_mode_for_bar,
     validate_mmio_bar_size,
