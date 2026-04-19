@@ -285,8 +285,8 @@ mod tests {
     use super::super::device_map::IommuVendor;
     use super::super::regions::RegionFlags;
     use super::super::tables::{
-        DeviceScope, DmaRemappingUnit, DmarTables, IvhdBlock, IvhdDeviceEntry, IvrsTables,
-        ReservedMemoryRegion,
+        DeviceScope, DmaRemappingUnit, DmarTables, IvhdBlock, IvhdDeviceEntry, IvmdKind,
+        IvrsMemDefinition, IvrsTables, ReservedMemoryRegion,
     };
     use super::*;
     use alloc::vec;
@@ -529,13 +529,128 @@ mod tests {
         assert_eq!(summaries.len(), 1);
     }
 
+    fn make_ivmd(kind: IvmdKind, flags: u8, start: u64, length: u64) -> IvrsMemDefinition {
+        IvrsMemDefinition {
+            kind,
+            flags,
+            start_addr: start,
+            length,
+        }
+    }
+
     #[test]
-    fn reserved_regions_from_ivrs_is_noop_stub() {
+    fn reserved_regions_from_ivrs_with_no_ivmds_is_empty() {
         let mut ivrs = IvrsTables::default();
         ivrs.ivhd_blocks
             .push(make_ivhd(0x10, 0xf000_0000, 0, vec![]));
         let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
         assert!(set.is_empty());
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn single_ivmd_becomes_reserved_region() {
+        let mut ivrs = IvrsTables::default();
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0xC000_0000, 0x0010_0000));
+        let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
+        assert_eq!(set.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        let r = set.iter().next().unwrap();
+        assert_eq!(r.start, 0xC000_0000);
+        assert_eq!(r.len, 0x0010_0000);
+        // IVMDs must be flagged as firmware-owned and writable.
+        assert!(r.flags.bits() & RegionFlags::FIRMWARE_OWNED.bits() != 0);
+        assert!(r.flags.bits() & RegionFlags::WRITABLE.bits() != 0);
+
+        assert_eq!(summaries[0].source_table, ReservedRegionSource::IvrsIvmd);
+        assert_eq!(summaries[0].source_index, 0);
+        assert_eq!(summaries[0].start, 0xC000_0000);
+        assert_eq!(summaries[0].len, 0x0010_0000);
+    }
+
+    #[test]
+    fn two_overlapping_ivmds_merge_into_one_region() {
+        let mut ivrs = IvrsTables::default();
+        // [0x1000..0x3000) and [0x2000..0x4000) overlap → merge to [0x1000..0x4000).
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0x1000, 0x2000));
+        ivrs.ivmds.push(make_ivmd(
+            IvmdKind::Select { device_id: 0x0018 },
+            0x01,
+            0x2000,
+            0x2000,
+        ));
+        let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
+        assert_eq!(set.len(), 1);
+        // Both summaries must still be emitted so logging sees every IVMD.
+        assert_eq!(summaries.len(), 2);
+        let r = set.iter().next().unwrap();
+        assert_eq!(r.start, 0x1000);
+        assert_eq!(r.len, 0x3000);
+    }
+
+    #[test]
+    fn zero_length_ivmd_is_skipped() {
+        let mut ivrs = IvrsTables::default();
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0x1000, 0));
+        let (set, summaries) = reserved_regions_from_ivrs(&ivrs);
+        assert!(set.is_empty());
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn ivmd_summary_carries_source_index_for_each_entry() {
+        let mut ivrs = IvrsTables::default();
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0x1000, 0x1000));
+        ivrs.ivmds.push(make_ivmd(
+            IvmdKind::Range {
+                start_device_id: 0x0100,
+                end_device_id: 0x01FF,
+            },
+            0x01,
+            0x3000,
+            0x1000,
+        ));
+        let (_set, summaries) = reserved_regions_from_ivrs(&ivrs);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].source_index, 0);
+        assert_eq!(summaries[1].source_index, 1);
+        assert!(matches!(
+            summaries[0].source_table,
+            ReservedRegionSource::IvrsIvmd
+        ));
+        assert!(matches!(
+            summaries[1].source_table,
+            ReservedRegionSource::IvrsIvmd
+        ));
+    }
+
+    #[test]
+    fn reserved_regions_from_tables_handles_ivrs_only() {
+        let mut ivrs = IvrsTables::default();
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0xD000_0000, 0x4000));
+        let (set, summaries) = reserved_regions_from_tables(None, Some(&ivrs));
+        assert_eq!(set.len(), 1);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].source_table, ReservedRegionSource::IvrsIvmd);
+    }
+
+    #[test]
+    fn reserved_regions_from_tables_merges_dmar_and_ivrs() {
+        let mut dmar = DmarTables::default();
+        dmar.rmrrs.push(make_rmrr(0, 0x1000, 0x1FFF));
+        let mut ivrs = IvrsTables::default();
+        ivrs.ivmds
+            .push(make_ivmd(IvmdKind::All, 0x01, 0x1_0000, 0x1000));
+        let (set, summaries) = reserved_regions_from_tables(Some(&dmar), Some(&ivrs));
+        // Two disjoint regions, one from each table.
+        assert_eq!(set.len(), 2);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].source_table, ReservedRegionSource::DmarRmrr);
+        assert_eq!(summaries[1].source_table, ReservedRegionSource::IvrsIvmd);
     }
 }
