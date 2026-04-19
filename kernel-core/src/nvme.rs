@@ -17,9 +17,11 @@
 //! * Opcode constants for admin (`OP_IDENTIFY`, `OP_CREATE_IO_CQ`,
 //!   `OP_CREATE_IO_SQ`) and I/O (`OP_IO_READ`, `OP_IO_WRITE`) commands.
 //!
-//! Nothing in this module touches MMIO or DMA; the kernel-side driver in
-//! `kernel/src/blk/nvme.rs` wraps these definitions with register pokes and
-//! `DmaBuffer` allocations.
+//! Nothing in this module touches MMIO or DMA.  As of Phase 55b (Track D.5)
+//! the in-kernel NVMe driver (`kernel/src/blk/nvme.rs`) has been deleted; the
+//! sole consumer of these definitions is now `userspace/drivers/nvme/` (the
+//! ring-3 driver host process).  Do **not** delete this module — it is a
+//! compile-time dependency of the userspace crate.
 //!
 //! Host-testable via `cargo test -p kernel-core --target
 //! x86_64-unknown-linux-gnu nvme::` — see the test module at the bottom.
