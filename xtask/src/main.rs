@@ -295,6 +295,10 @@ fn build_userspace_bins() {
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 55b D.1: ring-3 NVMe driver scaffold. `needs_alloc = true`
+        // for `driver_runtime` + `kernel-core` dependencies; real bring-up
+        // lands in D.2.
+        ("nvme_driver", "nvme_driver", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1823,6 +1827,8 @@ fn cmd_check() {
         "coreutils-rs",
         // Phase 55b Track C.1 — ring-3 driver runtime library
         "driver_runtime",
+        // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+        "nvme_driver",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -8301,5 +8307,67 @@ mod tests {
 
         assert_eq!(serial, "login: Password:");
         assert_eq!(history, "login: Password:");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 55b Track D.1 — nvme_driver ramdisk wiring.
+    //
+    // These tests encode the AGENTS.md "four places for a new userspace
+    // binary" rule specifically for the D.1 nvme_driver scaffold:
+    //
+    //   1. workspace member (`Cargo.toml`)
+    //   2. xtask build pipeline (the `bins` array in this file)
+    //   3. ramdisk embedding (`kernel/src/fs/ramdisk.rs`)
+    //   4. service config — deferred to F.1
+    //
+    // Place 2 is static text inside `build_userspace_bins`, and Place 3
+    // is a `BIN_ENTRIES` tuple keyed by `"/drivers/nvme"` in the kernel
+    // ramdisk source. The tests below read both source files from the
+    // workspace and assert the nvme_driver strings are present. This
+    // catches the most common D.1 regression — a ramdisk entry silently
+    // dropped during a refactor — without requiring a full QEMU boot.
+
+    fn workspace_file(relative: &str) -> String {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir)
+            .parent()
+            .expect("xtask/ lives under the workspace root")
+            .join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn nvme_driver_registered_in_xtask_bins_array() {
+        // Phase 55b D.1 — `build_userspace_bins` must build nvme_driver
+        // so the generated ELF lands in `target/generated-initrd/` for
+        // ramdisk embedding. `needs_alloc = true` because the crate
+        // depends on `driver_runtime` and `kernel-core`.
+        let source = workspace_file("xtask/src/main.rs");
+        assert!(
+            source.contains("(\"nvme_driver\", \"nvme_driver\", true)"),
+            "xtask `bins` array must include nvme_driver with needs_alloc = true"
+        );
+    }
+
+    #[test]
+    fn nvme_driver_embedded_in_ramdisk_under_drivers_path() {
+        // Phase 55b D.1 — the ramdisk must expose the compiled ELF at
+        // `/drivers/nvme` so init can `execve` it from the standard
+        // driver path. Track F.1 wires the service config that spawns
+        // it; this test pins the ramdisk half of that contract.
+        let source = workspace_file("kernel/src/fs/ramdisk.rs");
+        assert!(
+            source.contains("generated_initrd_asset!(\"nvme_driver\")"),
+            "ramdisk must `include_bytes!` the nvme_driver ELF"
+        );
+        assert!(
+            source.contains("\"nvme\""),
+            "ramdisk must register nvme under a /drivers/ BIN_ENTRIES tuple"
+        );
+        assert!(
+            source.contains("DRIVERS_ENTRIES") || source.contains("/drivers"),
+            "ramdisk must expose a /drivers directory containing nvme"
+        );
     }
 }

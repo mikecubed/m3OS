@@ -1048,6 +1048,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvme_driver"
+version = "0.55.2"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
