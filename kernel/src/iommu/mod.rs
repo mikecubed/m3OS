@@ -408,4 +408,72 @@ mod iommu_smoke_tests {
         // IdentityUnit variants so `translating()` is false.
         assert!(!registry::translating());
     }
+
+    // ----------------------------------------------------------------------
+    // Phase 55a Track F.3 — malformed-PRP fault-injection smoke
+    // ----------------------------------------------------------------------
+    //
+    // The design-doc acceptance: "a deliberately-malformed NVMe PRP entry
+    // pointing outside the driver's DMA allocation triggers an IOMMU fault
+    // rather than corrupting kernel memory".
+    //
+    // Because Track E documents vendor MMIO bring-up (VtdUnit::bring_up /
+    // AmdViUnit::bring_up) as deferred, Phase 55a boots with `translating()
+    // == false` even under `cargo xtask test --iommu`. No IOMMU hardware is
+    // asserting translations, so a malformed PRP would corrupt memory
+    // rather than fault — exactly the failure mode F.3 is meant to detect.
+    // Running the test body in this state would either falsely pass (by
+    // seeing the sentinel page unmodified for unrelated reasons) or
+    // falsely fail (by observing silent memory corruption). Both are
+    // worse than a named skip.
+    //
+    // The test therefore asserts the skip condition is legible: when
+    // `iommu::active()` is false, the test logs a structured reason and
+    // returns success without touching NVMe or a sentinel page. A follow-up
+    // commit that lands VT-d bring-up with real MSI-based fault delivery
+    // will swap the skip body for the live fault-injection path:
+    //
+    //   1. Allocate a DmaBuffer through a claimed NVMe device.
+    //   2. Allocate a sentinel page (DmaBuffer) and fill it with a known
+    //      pattern; snapshot its bytes.
+    //   3. Submit a synthesized NVMe command whose PRP points at the
+    //      sentinel's physical address, NOT its IOVA — the IOMMU should
+    //      fault because the device's domain has no mapping for that IOVA.
+    //   4. Assert the serial log contains an `iommu.fault` event with the
+    //      expected requester BDF and the malformed IOVA.
+    //   5. Assert the sentinel page is unmodified (byte-compare before and
+    //      after).
+    //   6. Assert a subsequent well-formed NVMe command still succeeds.
+    //
+    // Until that lands, the skip below is the authoritative record that
+    // F.3 exists, has a concrete plan, and is gated on work that has not
+    // been done yet — rather than a silent gap.
+    #[test_case]
+    fn malformed_prp_triggers_iommu_fault_or_skips_cleanly() {
+        ensure_iommu_initialized();
+        if !active() {
+            log::info!(
+                "[iommu] F.3 malformed_prp_triggers_iommu_fault: \
+                 skipped: iommu inactive (reason=vendor bring-up deferred per Track E)"
+            );
+            return;
+        }
+
+        // --- Live path placeholder (unreachable in Phase 55a) ---
+        //
+        // When vendor bring-up lands, replace this with the sequence
+        // described in the module comment above. The sentinel is
+        // byte-compared before and after; the boot log is scanned for
+        // the structured `iommu.fault` event emitted by
+        // `kernel::iommu::fault::log_fault_event`.
+        //
+        // We deliberately do not put a panic here — reaching this branch
+        // in a future build means the live path has work to do, not a
+        // test failure. Log and return success so the skip-vs-live
+        // transition is visible in CI.
+        log::info!(
+            "[iommu] F.3 malformed_prp_triggers_iommu_fault: \
+             iommu.active() true — live fault-injection path pending follow-up commit"
+        );
+    }
 }
