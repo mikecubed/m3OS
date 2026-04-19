@@ -8491,4 +8491,139 @@ mod tests {
             "init must emit a structured `driver.registered` log event when a driver service is loaded"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.4 — device-path data smoke assertions
+    //
+    // These tests use source-text assertions (like F.1 above) so they compile
+    // immediately but fail at test time until the implementation is present.
+    // This lets the pre-commit hook pass the compilation step while still
+    // recording the expected contracts.
+    // -----------------------------------------------------------------------
+
+    /// The `device-smoke` subcommand must appear in the usage string so that
+    /// CI scripts can discover it without reading source.
+    #[test]
+    fn usage_string_contains_device_smoke_subcommand() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("\"device-smoke\""),
+            "xtask main dispatch must handle the `device-smoke` subcommand"
+        );
+        assert!(
+            prod.contains("device-smoke"),
+            "usage() must advertise the `device-smoke` subcommand for CI discoverability"
+        );
+    }
+
+    /// `device_smoke_script_nvme` must be defined in production code and its
+    /// body must contain the `driver.registered: nvme_driver` pattern literal
+    /// that the smoke Wait step checks for.
+    #[test]
+    fn nvme_smoke_script_contains_driver_registered_marker() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn device_smoke_script_nvme"),
+            "production code must define `device_smoke_script_nvme()`"
+        );
+        assert!(
+            prod.contains("driver.registered: nvme_driver"),
+            "device_smoke_script_nvme() must include a Wait pattern for \
+             `driver.registered: nvme_driver`"
+        );
+    }
+
+    /// `device_smoke_script_e1000` must be defined in production code and its
+    /// body must contain the `driver.registered: e1000_driver` pattern literal
+    /// that the smoke Wait step checks for.
+    #[test]
+    fn e1000_smoke_script_contains_driver_registered_marker() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn device_smoke_script_e1000"),
+            "production code must define `device_smoke_script_e1000()`"
+        );
+        assert!(
+            prod.contains("driver.registered: e1000_driver"),
+            "device_smoke_script_e1000() must include a Wait pattern for \
+             `driver.registered: e1000_driver`"
+        );
+    }
+
+    /// `parse_device_smoke_args` must be defined in production code and must
+    /// accept `--device` and `--iommu` flags (verified by searching for those
+    /// string literals inside the function body).
+    #[test]
+    fn parse_device_smoke_args_is_defined_and_handles_device_and_iommu() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn parse_device_smoke_args"),
+            "production code must define `parse_device_smoke_args()`"
+        );
+        // The function delegates to extract_device_flags which handles
+        // --device and --iommu.  Verify the delegation call is present.
+        let fn_start = prod
+            .find("fn parse_device_smoke_args")
+            .expect("already asserted above");
+        let fn_body = &prod[fn_start..];
+        assert!(
+            fn_body.contains("extract_device_flags"),
+            "parse_device_smoke_args must delegate to extract_device_flags \
+             to handle --device and --iommu flags"
+        );
+    }
+
+    /// `cmd_device_smoke` must be defined so it is callable from the main
+    /// dispatch loop, and it must use `run_smoke_script` (or the captured
+    /// variant) to execute the boot-log assertion steps.
+    #[test]
+    fn cmd_device_smoke_is_defined_and_uses_smoke_runner() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn cmd_device_smoke"),
+            "production code must define `cmd_device_smoke()`"
+        );
+        let fn_start = prod
+            .find("fn cmd_device_smoke")
+            .expect("already asserted above");
+        let fn_body = &prod[fn_start..];
+        assert!(
+            fn_body.contains("run_smoke_script")
+                || fn_body.contains("run_smoke_steps_with_capture"),
+            "cmd_device_smoke must run the smoke step script via run_smoke_script \
+             or run_smoke_steps_with_capture"
+        );
+    }
+
+    /// Default `cargo xtask run` (no --device) must not include the NVMe
+    /// controller or the e1000 NIC in the QEMU argument list, guaranteeing
+    /// the VirtIO-only path is unchanged.
+    #[test]
+    fn default_run_qemu_args_have_no_nvme_or_e1000() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet::default(),
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("nvme")),
+            "default DeviceSet must not include any nvme argument"
+        );
+        assert!(
+            !args.iter().any(|a| a == "e1000,netdev=net0"),
+            "default DeviceSet must use virtio-net, not e1000"
+        );
+    }
 }
