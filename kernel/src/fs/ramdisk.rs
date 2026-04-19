@@ -187,6 +187,10 @@ static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
 static NET_SERVER_ELF: &[u8] = generated_initrd_asset!("net_server");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
+// Phase 55b D.1: ring-3 NVMe driver scaffold. Exposed under
+// `/drivers/nvme` so init (F.1) and `execve` can find it at the
+// canonical driver path.
+static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -539,6 +543,17 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
 
 static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
 
+// Phase 55b Track D.1 — hardware driver ELFs. Ring-3 drivers live under
+// `/drivers/<name>` so init's service registration (Track F.1) and any
+// future `execve` call can target a canonical path that is not mixed in
+// with general userspace utilities under `/bin/`.
+static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[(
+    "nvme",
+    RamdiskNode::File {
+        content: NVME_DRIVER_ELF,
+    },
+)];
+
 static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
     (
         "bin",
@@ -556,6 +571,12 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
         "etc",
         RamdiskNode::Dir {
             children: ETC_ENTRIES,
+        },
+    ),
+    (
+        "drivers",
+        RamdiskNode::Dir {
+            children: DRIVERS_ENTRIES,
         },
     ),
 ];

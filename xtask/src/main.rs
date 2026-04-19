@@ -295,6 +295,10 @@ fn build_userspace_bins() {
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 55b D.1: ring-3 NVMe driver scaffold. `needs_alloc = true`
+        // for `driver_runtime` + `kernel-core` dependencies; real bring-up
+        // lands in D.2.
+        ("nvme_driver", "nvme_driver", true),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1823,6 +1827,8 @@ fn cmd_check() {
         "coreutils-rs",
         // Phase 55b Track C.1 — ring-3 driver runtime library
         "driver_runtime",
+        // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+        "nvme_driver",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
