@@ -308,6 +308,74 @@ pub fn sys_device_irq_subscribe(dev_cap: u32, vector_hint: u32, notification_ind
 }
 
 // ---------------------------------------------------------------------------
+// Phase 55b Track B.3 — DMA allocation path (stub, red commit)
+// ---------------------------------------------------------------------------
+//
+// The B.3 green commit replaces the body of `alloc_dma_for_pid_impl` (and
+// grows this section) with the real allocation machinery. For the red
+// commit the stub returns `Internal` so the kernel-side integration tests
+// fail against it — proving the tests actually exercise the path.
+
+/// Error surface from the internal allocation path. Mapped to a negative
+/// errno at the syscall boundary and to [`TestDmaError`] at the test
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum DmaAllocError {
+    /// No claim recorded under `(pid, key)`.
+    NoDevice,
+    /// Validation (zero size, bad align, …) rejected the request.
+    InvalidArg,
+    /// Out of memory on the buddy allocator.
+    OutOfMemory,
+    /// IOMMU map failed.
+    IommuFault,
+    /// Per-driver DMA slot cap would be exceeded.
+    CapExhausted,
+    /// Invariant violation — bug, not a documented caller surface.
+    Internal,
+}
+
+/// Stub of the B.3 allocation path. Returns `Internal` so the kernel-side
+/// tests that drive the path observe a failure — proving the tests hit real
+/// behavior. Replaced by the green commit.
+#[allow(unused_variables, dead_code)]
+fn alloc_dma_for_pid_impl(
+    pid: Pid,
+    key: DeviceCapKey,
+    size: usize,
+    align: usize,
+) -> Result<kernel_core::device_host::DmaAllocEntry, DmaAllocError> {
+    Err(DmaAllocError::Internal)
+}
+
+/// Stub of the per-pid DMA release hook. Red commit returns zero.
+#[allow(unused_variables, dead_code)]
+pub fn release_dma_for_pid(pid: Pid) -> usize {
+    0
+}
+
+/// Placeholder for the live DMA registry. Red commit keeps the structure
+/// empty so the test helpers compile; the green commit wires it to the
+/// real slot map.
+#[allow(dead_code)]
+struct DmaRegistry {
+    core: kernel_core::device_host::DmaAllocationRegistryCore,
+}
+
+#[allow(dead_code)]
+impl DmaRegistry {
+    const fn new() -> Self {
+        Self {
+            core: kernel_core::device_host::DmaAllocationRegistryCore::new(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+static DMA_REGISTRY: Mutex<DmaRegistry> = Mutex::new(DmaRegistry::new());
+
+// ---------------------------------------------------------------------------
 // Process-exit hook
 // ---------------------------------------------------------------------------
 
@@ -393,4 +461,99 @@ pub(crate) fn test_release_for_pid(pid: Pid) -> usize {
 pub(crate) fn test_owner_of(key: DeviceCapKey) -> Option<Pid> {
     let reg = DEVICE_HOST_REGISTRY.lock();
     reg.core.owner_of(key)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track B.3 — test-only helpers for the DMA-alloc path
+// ---------------------------------------------------------------------------
+//
+// These mirror the `test_try_claim_for_pid` / `test_release_for_pid` surface
+// introduced by B.1. They drive `sys_device_dma_alloc` / `sys_device_dma_handle_info`
+// without going through the capability table, because the kernel test runner
+// task does not have a user address space or a Capability::Device installed.
+// The real ring-3 path is exercised by Track D.1's NVMe integration test.
+
+/// Error surface exposed to kernel tests. Not `#[non_exhaustive]` because
+/// tests want exhaustive matches.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestDmaError {
+    /// `pid` does not own a claim on `key`.
+    NoDevice,
+    /// Size / alignment validation rejected the request.
+    InvalidArg,
+    /// Buddy allocator out of memory.
+    OutOfMemory,
+    /// IOMMU map failed.
+    IommuFault,
+    /// Any other invariant violation (a bug, not a caller-visible condition).
+    Internal,
+}
+
+/// Snapshot of a live DMA allocation. Mirrors `DmaHandle` with the id so the
+/// test can look the entry up again later.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TestDmaSnapshot {
+    pub id: u64,
+    pub user_va: usize,
+    pub iova: u64,
+    pub len: usize,
+}
+
+/// Drive the B.3 allocation path for `pid`, assuming the caller already
+/// claimed `key` via `test_try_claim_for_pid`. Returns the snapshot on
+/// success, the typed error on failure.
+#[cfg(test)]
+pub(crate) fn test_dma_alloc_for_pid(
+    pid: Pid,
+    key: DeviceCapKey,
+    size: usize,
+    align: usize,
+) -> Result<TestDmaSnapshot, TestDmaError> {
+    alloc_dma_for_pid_impl(pid, key, size, align)
+        .map(|entry| TestDmaSnapshot {
+            id: entry.id.0,
+            user_va: entry.user_va,
+            iova: entry.iova,
+            len: entry.len,
+        })
+        .map_err(|e| match e {
+            DmaAllocError::NoDevice => TestDmaError::NoDevice,
+            DmaAllocError::InvalidArg => TestDmaError::InvalidArg,
+            DmaAllocError::OutOfMemory => TestDmaError::OutOfMemory,
+            DmaAllocError::IommuFault => TestDmaError::IommuFault,
+            DmaAllocError::Internal => TestDmaError::Internal,
+            DmaAllocError::CapExhausted => TestDmaError::Internal,
+        })
+}
+
+/// Look up a live allocation by `(pid, id)` — the test-harness equivalent of
+/// `sys_device_dma_handle_info`.
+#[cfg(test)]
+pub(crate) fn test_dma_handle_info(pid: Pid, id: u64) -> Option<TestDmaSnapshot> {
+    let reg = DMA_REGISTRY.lock();
+    let entry = reg
+        .core
+        .get_owned(kernel_core::device_host::DmaAllocId(id), pid)
+        .ok()?;
+    Some(TestDmaSnapshot {
+        id: entry.id.0,
+        user_va: entry.user_va,
+        iova: entry.iova,
+        len: entry.len,
+    })
+}
+
+/// Drop every live DMA allocation for `pid`. Returns the number of slots
+/// freed. Mirrors what `release_dma_for_pid` does in the process-exit path.
+#[cfg(test)]
+pub(crate) fn test_dma_release_for_pid(pid: Pid) -> usize {
+    release_dma_for_pid(pid)
+}
+
+/// Count live DMA allocations (diagnostic).
+#[cfg(test)]
+pub(crate) fn test_dma_count() -> usize {
+    DMA_REGISTRY.lock().core.len()
 }

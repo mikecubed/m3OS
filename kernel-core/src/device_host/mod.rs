@@ -8,10 +8,15 @@
 // The module is `no_std` + `alloc`-only so it compiles for the kernel and is
 // still testable on the host via `cargo test -p kernel-core`.
 
+pub mod dma_logic;
 pub mod registry_logic;
 pub mod syscalls;
 pub mod types;
 
+pub use dma_logic::{
+    DMA_MIN_ALIGN, DmaAllocEntry, DmaAllocId, DmaAllocationRegistryCore, DmaRegistryError,
+    validate_size_align,
+};
 pub use registry_logic::{DeviceHostRegistryCore, RegistryError, RegistryPid};
 pub use types::{
     DRIVER_RESTART_TIMEOUT_MS, DeviceCapKey, DeviceHostError, DmaHandle,
