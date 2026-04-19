@@ -63,6 +63,8 @@ members = [
     "userspace/nvme-crash-smoke",
     # Phase 55b Track F.3d-1 — max_restart 6-kill loop + permanently-stopped
     "userspace/max-restart-smoke",
+    # Phase 55b Track F.3d-3 — e1000 crash-and-restart end-to-end smoke client
+    "userspace/e1000-crash-smoke",
 ]
 
 # Exclude xtask and userspace from default build — kernel only

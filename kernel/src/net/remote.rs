@@ -81,6 +81,12 @@ static REMOTE_NIC: Mutex<Option<NicEntry>> = Mutex::new(None);
 /// TX path by `net::send_frame`.
 static REMOTE_NIC_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// Set when an IPC transport failure is detected on `drain_tx_queue`, cleared
+/// on `register`. When this flag is set `send_frame` returns
+/// `NetDriverError::DriverRestarting` instead of queuing the frame, mirroring
+/// the Phase 55b D.4b / F.2b semantics for the block path.
+static RESTART_SUSPECTED: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // RemoteNic public API
 // ---------------------------------------------------------------------------
@@ -108,6 +114,9 @@ impl RemoteNic {
             });
         }
         REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
+        // Clear restart-suspected on successful re-registration so subsequent
+        // send_frame calls are admitted again.
+        RESTART_SUSPECTED.store(false, Ordering::Release);
         log::info!(
             "[remote_nic] registered ring-3 NIC driver: endpoint={:?} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             endpoint,
@@ -149,12 +158,24 @@ impl RemoteNic {
     /// Enqueue a raw Ethernet frame for delivery to the ring-3 driver over IPC.
     ///
     /// Returns [`NetDriverError::DeviceAbsent`] when no driver is registered,
+    /// [`NetDriverError::DriverRestarting`] when an IPC transport failure was
+    /// previously observed (the driver is presumed to be restarting),
     /// [`NetDriverError::InvalidFrame`] when the frame is oversized, and
     /// [`NetDriverError::RingFull`] when the TX queue is at capacity (the
     /// frame is dropped — callers may retry on the next network tick).
+    ///
+    /// Phase 55b Track F.3d-3: mirrors the D.4b / F.2b block-path semantics.
     pub fn send_frame(frame: &[u8]) -> Result<(), NetDriverError> {
         if frame.len() > kernel_core::driver_ipc::net::MAX_FRAME_BYTES as usize {
             return Err(NetDriverError::InvalidFrame);
+        }
+        // If a previous IPC drain detected an endpoint closure, surface
+        // DriverRestarting immediately — the TX queue is cleared on restart.
+        if RESTART_SUSPECTED.load(Ordering::Acquire) {
+            log::warn!(
+                "[remote_nic] send_frame: driver restart suspected, returning DriverRestarting"
+            );
+            return Err(NetDriverError::DriverRestarting);
         }
         let mut slot = REMOTE_NIC.lock();
         let entry = match slot.as_mut() {
@@ -227,11 +248,31 @@ impl RemoteNic {
                 if endpoint::send(task_id, endpoint, msg) {
                     forwarded += 1;
                 } else {
-                    log::warn!("[remote_nic] drain_tx_queue: IPC send failed for frame");
+                    log::warn!(
+                        "[remote_nic] drain_tx_queue: IPC send failed for frame — marking restart-suspected"
+                    );
+                    Self::on_ipc_error();
                 }
             }
         }
         forwarded
+    }
+
+    /// Mark the driver as restart-suspected after an IPC transport failure.
+    ///
+    /// Sets `RESTART_SUSPECTED` so subsequent `send_frame` calls return
+    /// [`NetDriverError::DriverRestarting`] rather than queuing frames into
+    /// the now-unreachable driver endpoint. The flag is cleared by `register`
+    /// when the driver re-registers after restart.
+    ///
+    /// Mirrors `on_ipc_error()` in `kernel/src/blk/remote.rs` (Phase 55b D.4b
+    /// / F.2b). Idempotent — safe to call from `drain_tx_queue` on repeated
+    /// IPC failures.
+    pub fn on_ipc_error() {
+        if !RESTART_SUSPECTED.load(Ordering::Acquire) {
+            RESTART_SUSPECTED.store(true, Ordering::Release);
+            log::warn!("[remote_nic] IPC transport failure — driver presumed restarting");
+        }
     }
 
     /// Inject a single received Ethernet frame into the kernel net stack.
