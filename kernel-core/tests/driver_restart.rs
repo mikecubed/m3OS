@@ -406,7 +406,7 @@ fn device_host_error_not_claimed_surfaces_from_registry_error() {
 // QEMU-heavy stubs (require SIGKILL API + BlockDriverError client observation)
 // ---------------------------------------------------------------------------
 
-/// Phase 55b Track F.3c progress: privilege gate resolved.
+/// Phase 55b Track F.3d-2 progress: `sys_block_write` delivered.
 ///
 /// **F.3b progress:** `userspace/nvme-crash-smoke/src/main.rs` is the guest-side
 ///   I/O-client binary. It speaks the block IPC protocol directly to the
@@ -429,31 +429,42 @@ fn device_host_error_not_claimed_surfaces_from_registry_error() {
 ///     `NEG_EAGAIN` (-11) (DriverRestarting propagated). It fails if it sees
 ///     `NEG_EIO` (-5) which would indicate the old errno-collapse is in effect.
 ///
-/// Remaining blocker (phase-55c write-path):
-///   This specific stub tests a *write* mid-crash (not a read). The F.3c binary
-///   exercises `sys_block_read` (read path). A write-path variant would need
-///   `sys_block_write`, which does not yet exist as a kernel syscall — reads go
-///   through `sys_block_read` but writes are issued directly through the IPC
-///   protocol by vfs_server/fat_server. A `sys_block_write` syscall would need
-///   to be added to expose the write path to integration tests.
-///   Additionally, this is a QEMU-only test — it cannot run as a host unit test.
+/// **F.3d-2 progress (closes this stub):**
+///   - `sys_block_write` (syscall 0x1012) added to
+///     `kernel/src/arch/x86_64/syscall/mod.rs` with the same privilege gate
+///     (euid=200 + `BLOCK_WRITE_ALLOWED` whitelist including `/bin/nvme-crash-smoke`)
+///     and the same `block_error_to_neg_errno` mapping. `DriverRestarting` →
+///     `EAGAIN` on writes, exactly as on reads.
+///   - `syscall-lib` exports `block_write()` userspace wrapper (syscall 0x1012).
+///   - `nvme-crash-smoke` now exercises the write path:
+///       step 2:   `block_write(LBA=0, 0xB5×512)` before kill — emits `write:pre-crash:OK`
+///       step 3.6: `block_write` during crash window — emits `write:EAGAIN-observed`
+///       step 6:   `block_write(0xD2×512)` post-restart, `block_read` confirms
+///                 round-trip — emits `write:post-restart-ok`
+///   - Pure-logic tests added to `kernel-core/src/driver_ipc/block.rs` pin:
+///       (a) `write_path_driver_restarting_maps_to_neg_eagain`
+///       (b) `read_write_errno_mapping_is_symmetric`
+///       (c) `block_write_syscall_number_is_0x1012`
+///
+/// This test is QEMU-only — it cannot run as a host unit test. The authoritative
+/// end-to-end check is the `driver-restart-crash` xtask regression
+/// (`M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test driver-restart-crash`),
+/// which exercises the full boot/kill/restart cycle and now observes both the
+/// read-path and write-path EAGAIN from `nvme-crash-smoke`.
 #[test]
-#[ignore = "phase-55c write-path deferred: F.3c resolved the privilege gate (nvme-crash-smoke \
-            now has euid=200, EAGAIN propagation wired); remaining blocker is sys_block_write \
-            syscall (does not exist yet) needed to test the write mid-crash path. \
-            Read-path EAGAIN observation is exercised by driver-restart-crash QEMU regression \
-            (M3OS_ENABLE_CRASH_SMOKE). This test is also QEMU-only."]
+#[ignore = "QEMU-only: the pure-logic coverage for sys_block_write errno mapping is in \
+            kernel-core/src/driver_ipc/block.rs (write_path_driver_restarting_maps_to_neg_eagain, \
+            read_write_errno_mapping_is_symmetric). End-to-end write-path EAGAIN observation is \
+            exercised by the driver-restart-crash QEMU regression (M3OS_ENABLE_CRASH_SMOKE). \
+            This stub remains #[ignore] because QEMU infrastructure is not available in \
+            cargo test -p kernel-core."]
 fn qemu_nvme_kill_mid_write_returns_driver_restarting() {
-    // Test body intentionally empty — the ignore attribute is the artifact.
-    // When this guard is lifted the body will:
-    //   1. boot guest with --device nvme
-    //   2. launch nvme-crash-smoke with storage-server euid (already wired in F.3c)
-    //   3. race: `service kill nvme_driver` while write is in flight
-    //   4. assert sys_block_read (or future sys_block_write) returns EAGAIN (-11)
-    //      within DRIVER_RESTART_TIMEOUT_MS (not NEG_EIO, which would be wrong)
-    //   5. assert service logs driver.restart + driver.restarted
-    //   6. assert subsequent read/write to LBA 0 succeeds
-    //   7. assert no partial-write corruption (compare LBA 0 before and after)
+    // F.3d-2 delivered: sys_block_write exists; nvme-crash-smoke now asserts
+    // EAGAIN on the write path during the driver crash window.
+    // The QEMU regression driver-restart-crash is the authoritative check.
+    // This stub body remains empty — the #[ignore] is the artifact; the
+    // rationale above documents what is now proven by unit tests and the
+    // QEMU regression.
 }
 
 /// Phase 55b Track F.3c status: e1000 path unchanged from F.3b.

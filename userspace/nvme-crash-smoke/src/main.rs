@@ -50,8 +50,8 @@
 #![no_main]
 
 use syscall_lib::{
-    O_RDONLY, STDOUT_FILENO, block_read, close, execve, exit, fork, nanosleep, open, read, waitpid,
-    write_str,
+    O_RDONLY, STDOUT_FILENO, block_read, block_write, close, execve, exit, fork, nanosleep, open,
+    read, waitpid, write_str,
 };
 
 // Service name the NVMe driver registers its IPC endpoint under (matches
@@ -127,6 +127,19 @@ fn program_main(_args: &[&str]) -> i32 {
         STDOUT_FILENO,
         "NVME_CRASH_SMOKE:pre-crash-sys_block_read:OK\n",
     );
+
+    // F.3d-2: Confirm sys_block_write works before the kill.
+    // Write a 512-byte sector filled with 0xB5 to LBA 0.
+    let write_buf = [0xB5u8; 512];
+    let pre_kw = block_write(0, 1, &write_buf);
+    if pre_kw != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=2 pre-crash sys_block_write failed\n",
+        );
+        return 2;
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:write:pre-crash:OK\n");
 
     // ------------------------------------------------------------------
     // Step 3: Kill the driver in a child process.
@@ -236,6 +249,50 @@ fn program_main(_args: &[&str]) -> i32 {
     }
 
     // ------------------------------------------------------------------
+    // Step 3.6 (F.3d-2): Assert EAGAIN from sys_block_write during crash window.
+    //
+    // The write path must surface DriverRestarting (byte 5) as NEG_EAGAIN (-11)
+    // via the same block_error_to_neg_errno mapping used by sys_block_read.
+    // This is the stub that was #[ignore]'d in driver_restart.rs until
+    // sys_block_write existed.
+    //
+    // Same policy as step 3.5: if the driver restarts quickly, block_write
+    // may return 0 (success) — that is valid. We only fail on anything other
+    // than 0 or EAGAIN.
+    // ------------------------------------------------------------------
+    let mut write_eagain_seen = false;
+    let mut mid_kw_ok = false;
+    for _ in 0u32..5 {
+        let mid_kw = block_write(0, 1, &write_buf);
+        if mid_kw == 0 {
+            // Driver already restarted before we could catch EAGAIN — valid.
+            mid_kw_ok = true;
+            break;
+        }
+        if mid_kw == NEG_EAGAIN {
+            write_eagain_seen = true;
+            write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:write:EAGAIN-observed\n");
+            break;
+        }
+        // Any other error (e.g., NEG_EIO = -5) means errno propagation is wrong.
+        if mid_kw != NEG_EAGAIN && mid_kw != 0 {
+            write_str(
+                STDOUT_FILENO,
+                "NVME_CRASH_SMOKE:FAIL step=3.6 unexpected errno from sys_block_write\n",
+            );
+            return 3;
+        }
+    }
+
+    if !write_eagain_seen && !mid_kw_ok {
+        // Log but do not fail — timing-dependent.
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:write:no-eagain-in-window\n",
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Step 4: Wait for nvme_driver to show "running" again.
     // ------------------------------------------------------------------
     if !wait_for_driver_running("nvme_driver", RESTART_WAIT_SECONDS) {
@@ -284,6 +341,38 @@ fn program_main(_args: &[&str]) -> i32 {
         STDOUT_FILENO,
         "NVME_CRASH_SMOKE:post-restart-sys_block_read:OK\n",
     );
+
+    // F.3d-2: Post-restart write then read — confirm write path is healthy
+    // after the driver has been restarted.
+    let post_write_buf = [0xD2u8; 512];
+    let post_kw = block_write(0, 1, &post_write_buf);
+    if post_kw != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=6 post-restart sys_block_write failed\n",
+        );
+        return 6;
+    }
+    // Read back what we just wrote to confirm the write landed.
+    let mut readback = [0u8; 512];
+    let readback_ret = block_read(0, 1, &mut readback);
+    if readback_ret != 0 {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=6 post-restart readback after write failed\n",
+        );
+        return 6;
+    }
+    // Verify the readback matches what we wrote.
+    let matches = readback.iter().all(|&b| b == 0xD2);
+    if !matches {
+        write_str(
+            STDOUT_FILENO,
+            "NVME_CRASH_SMOKE:FAIL step=6 post-restart write/read mismatch\n",
+        );
+        return 6;
+    }
+    write_str(STDOUT_FILENO, "NVME_CRASH_SMOKE:write:post-restart-ok\n");
 
     // ------------------------------------------------------------------
     // Done.

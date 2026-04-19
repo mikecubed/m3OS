@@ -1204,6 +1204,8 @@ mod syscall_nr {
     pub const PUSH_RAW_INPUT: u64 = 0x1010;
     /// Phase 54: read raw disk sectors from userspace (for ring-3 storage servers).
     pub const BLOCK_READ: u64 = 0x1011;
+    /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
+    pub const BLOCK_WRITE: u64 = 0x1012;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
@@ -1558,6 +1560,7 @@ pub extern "C" fn syscall_handler(
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
+        BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -9055,6 +9058,107 @@ fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> 
             }
             0
         }
+        // Propagate the driver error byte through the documented errno mapping.
+        // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
+        // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
+        Err(error_byte) => {
+            kernel_core::driver_ipc::block::block_error_to_neg_errno(error_byte) as u64
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track F.3d-2: sys_block_write — raw sector writes for ring-3
+// storage servers and integration tests
+// ---------------------------------------------------------------------------
+
+/// Allowed caller binaries for raw block writes.
+///
+/// The write whitelist is intentionally identical to `BLOCK_READ_ALLOWED`:
+/// only supervised storage servers and (in non-hardened builds) the
+/// `nvme-crash-smoke` integration test binary may issue raw disk writes.
+/// The symmetric design means the same privilege gate governs both paths,
+/// simplifying the audit surface.
+#[cfg(not(feature = "hardened"))]
+const BLOCK_WRITE_ALLOWED: &[&str] = &[
+    "/bin/vfs_server",
+    "/bin/fat_server",
+    "/bin/nvme-crash-smoke",
+];
+#[cfg(feature = "hardened")]
+const BLOCK_WRITE_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
+/// Write raw disk sectors from a userspace buffer.
+///
+/// # Arguments
+///   - `start_sector`: absolute LBA of the first sector
+///   - `count`: number of 512-byte sectors to write
+///   - `buf_ptr`: userspace source address
+///   - `buf_len`: size of the source buffer in bytes
+///
+/// # Returns
+///
+/// Returns 0 on success, or a negative errno on error.
+/// The errno mapping is identical to `sys_block_read`:
+///
+/// | `BlockDriverError` | byte | errno returned     |
+/// |---|---|---|
+/// | `Ok`               | 0    | 0 (success)        |
+/// | `IoError`          | 1    | `NEG_EIO` (-5)     |
+/// | `InvalidLba`       | 2    | `NEG_EIO` (-5)     |
+/// | `DeviceAbsent`     | 3    | `NEG_EIO` (-5)     |
+/// | `Busy`             | 4    | `NEG_EAGAIN` (-11) |
+/// | `DriverRestarting` | 5    | `NEG_EAGAIN` (-11) |
+/// | `InvalidRequest`   | 6    | `NEG_EIO` (-5)     |
+///
+/// `DriverRestarting` maps to `EAGAIN` so callers can distinguish a temporary
+/// driver restart from a permanent I/O failure. Single source of truth:
+/// `kernel_core::driver_ipc::block::block_error_to_neg_errno`.
+///
+/// Capped at 128 sectors (64 KiB) per call, matching `sys_block_read`.
+///
+/// Privilege gate is symmetric with `sys_block_read`: euid must equal
+/// `STORAGE_SERVICE_UID` (200) and the exec path must appear in
+/// `BLOCK_WRITE_ALLOWED`. This prevents unprivileged callers from issuing
+/// raw disk writes through the facade.
+fn sys_block_write(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    // Restrict to supervised storage services (symmetric with sys_block_read).
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_WRITE_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+
+    const MAX_SECTORS: usize = 128; // 64 KiB — matches sys_block_read cap
+
+    let count = count as usize;
+    if count == 0 || count > MAX_SECTORS {
+        return NEG_EINVAL;
+    }
+
+    let needed = count * 512;
+    if needed > buf_len as usize {
+        return NEG_EINVAL;
+    }
+
+    // Copy the data from userspace into a kernel-owned buffer before
+    // dispatching to the block layer so we hold no user pointer across
+    // the potential IPC boundary to the ring-3 NVMe driver.
+    let mut kernel_buf = alloc::vec![0u8; needed];
+    if UserSliceRo::new(buf_ptr, needed)
+        .and_then(|s| s.copy_to_kernel(&mut kernel_buf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+
+    match crate::blk::write_sectors(start_sector, count, &kernel_buf) {
+        Ok(()) => 0,
         // Propagate the driver error byte through the documented errno mapping.
         // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
         // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
