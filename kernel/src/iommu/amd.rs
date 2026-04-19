@@ -855,12 +855,16 @@ pub static UNITS: Mutex<Vec<AmdViUnit>> = Mutex::new(Vec::new());
 mod tests {
     use super::*;
 
-    #[test]
+    // The kernel crate is `no_std` and uses the `test_case` framework
+    // (see `crate::test_runner`) rather than libtest's `#[test]`. Using
+    // `#[test_case]` lets these sanity checks run inside the kernel
+    // test harness alongside the rest of the QEMU-driven suite.
+    #[test_case]
     fn device_table_bytes_is_2_mib() {
         assert_eq!(DEVICE_TABLE_BYTES, 2 * 1024 * 1024);
     }
 
-    #[test]
+    #[test_case]
     fn device_table_order_matches_2_mib() {
         assert_eq!(1usize << DEVICE_TABLE_ORDER, 512);
     }

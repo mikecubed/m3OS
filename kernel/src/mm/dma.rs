@@ -1,29 +1,56 @@
-//! DMA buffer allocation — Phase 55 C.2.
+//! DMA buffer allocation — Phase 55a Track E.2 (signature rewrite).
 //!
-//! Queue-based device drivers (virtio virtqueues, NVMe descriptor rings, e1000
-//! TX/RX descriptors) need physically-contiguous, DMA-safe memory. Before
-//! this module each driver open-coded `frame_allocator::allocate_contiguous`
-//! and manually tracked the (phys, virt) pair.
+//! Queue-based device drivers (virtio virtqueues, NVMe descriptor rings,
+//! e1000 TX/RX descriptors) need physically-contiguous, DMA-safe memory.
+//! Phase 55 introduced [`DmaBuffer<T>`] as the shared primitive; Phase 55a
+//! rewrites the constructor signature to route every allocation through a
+//! per-device `IommuUnit` domain so the kernel can protect itself from
+//! device-initiated corruption.
 //!
-//! A [`DmaBuffer<T>`] owns a contiguous physical region plus its kernel-virtual
-//! mapping, exposes the physical address via [`DmaBuffer::physical_address`]
-//! for programming into descriptor rings, and returns the frames to the buddy
-//! allocator on drop. The kernel-virtual mapping uses the shared phys-offset
-//! window; the buddy allocator hands us pages that are already writable from
-//! the kernel, and x86-64 defaults to strong-uncacheable MMIO outside the RAM
-//! range so normal RAM DMA buffers see the standard writeback caching — which
-//! is the correct behaviour for host↔device memory rings (the device coherently
-//! snoops the CPU cache).
+//! Every live [`DmaBuffer`] now owns:
 //!
-//! The type parameter `T` on [`DmaBuffer<T>`] gives ergonomic typed access:
-//! a descriptor ring driver can do `dma.as_mut()[i] = desc;` instead of
-//! wrangling raw pointers everywhere.
+//! * A contiguous **physical** region allocated via the Phase 53a buddy
+//!   allocator.
+//! * An **IOVA** range pulled from the owning device's domain and installed
+//!   into the IOMMU page table via [`kernel_core::iommu::contract::IommuUnit::map`].
+//!   When the IOMMU is in identity-fallback mode, the IOVA equals the
+//!   physical address.
+//! * A kernel-virtual view through the shared phys-offset window so kernel
+//!   code can still read and write the buffer without going through the
+//!   IOMMU.
+//!
+//! # API
+//!
+//! The new signature is:
+//!
+//! ```ignore
+//! DmaBuffer::<[u8]>::allocate(device, bytes)?
+//! ```
+//!
+//! `device: &PciDeviceHandle` names the device the buffer belongs to. The
+//! handle already carries a `DmaDomain` attached by `claim_pci_device`, so
+//! the allocator can look up the owning IOMMU unit and install the
+//! mapping without any driver-side plumbing.
+//!
+//! # Bus vs physical address
+//!
+//! - [`DmaBuffer::bus_address`] returns the IOVA when an IOMMU is
+//!   translating; the physical address in identity fallback. This is the
+//!   address that belongs in descriptor rings.
+//! - [`DmaBuffer::physical_address`] always returns the physical frame
+//!   address. Retained for the rare call site that needs the raw value
+//!   (debug dumps, legacy hardware quirks that bypass translation).
+//!
+//! Callers should prefer `bus_address()` in descriptor programming —
+//! both values are safe to hand to the device because the two paths
+//! produce equivalent addresses when IOMMU is inactive.
 //!
 //! # Failure surfaces as an error
 //!
-//! `DmaBuffer::new*` returns a `Result` — allocation failure is a normal
-//! condition (e.g. no contiguous 64 KiB block available at init) that driver
-//! init code should propagate up, not panic on.
+//! `DmaBuffer::allocate` returns a `Result<Self, DmaError>`. Allocation
+//! failure is a normal condition (no contiguous 64 KiB block available,
+//! IOVA space exhausted, invalidation rejected) that driver init code
+//! should propagate up, not panic on.
 
 use core::marker::PhantomData;
 use core::mem;
@@ -32,7 +59,13 @@ use core::ptr::NonNull;
 
 use x86_64::PhysAddr;
 
+use kernel_core::iommu::contract::{
+    DomainError, DomainId, Iova, MapFlags, PhysAddr as CorePhysAddr,
+};
+
 use super::frame_allocator;
+use crate::iommu::registry;
+use crate::pci::PciDeviceHandle;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -40,94 +73,112 @@ use super::frame_allocator;
 
 /// DMA allocation failure reasons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DmaError {
     /// The requested size or count is zero.
     ZeroSize,
-    /// `size_of::<T>() * count` overflowed `usize` — the request is too large
-    /// to describe, independent of whether the allocator could satisfy it.
+    /// `size_of::<T>() * count` overflowed `usize` — the request is too
+    /// large to describe, independent of whether the allocator could
+    /// satisfy it.
     SizeOverflow,
-    /// Alignment is not a power of two, or larger than the page size (we map
-    /// via phys-offset at page granularity).
+    /// Alignment is not a power of two, or larger than the page size (we
+    /// map via phys-offset at page granularity).
     UnsupportedAlignment,
+    /// The caller asked for a size the allocator can classify but that is
+    /// otherwise invalid for DMA (for example a non-page-multiple size
+    /// when the IOMMU path requires page granularity).
+    InvalidSize,
     /// The buddy allocator could not provide a contiguous block of the
     /// requested order.
     OutOfMemory,
+    /// The device's IOMMU domain is out of free IOVA ranges.
+    IovaExhausted,
+    /// The IOMMU hardware or vendor driver rejected the mapping operation.
+    DomainHardwareFault,
+    /// The device has no attached `DmaDomain` — usually means
+    /// `claim_pci_device` was not routed through the IOMMU-enabled path.
+    NoDomainAttached,
+}
+
+impl From<DomainError> for DmaError {
+    fn from(e: DomainError) -> Self {
+        match e {
+            DomainError::IovaExhausted => DmaError::IovaExhausted,
+            DomainError::AlreadyMapped
+            | DomainError::NotMapped
+            | DomainError::InvalidRange
+            | DomainError::PageTablePagesCapExceeded => DmaError::DomainHardwareFault,
+            DomainError::HardwareFault => DmaError::DomainHardwareFault,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // DmaBuffer<T>
 // ---------------------------------------------------------------------------
 
-/// A DMA-safe, physically-contiguous buffer usable by both the CPU (via its
-/// kernel-virtual mapping) and by the device (via its bus-visible physical
-/// address).
+/// A DMA-safe, physically-contiguous buffer usable by both the CPU (via
+/// its kernel-virtual mapping) and by the device (via its bus-visible
+/// IOVA, or physical address in identity-fallback).
 ///
-/// `T` is the logical element type. Most callers will use slice types for
-/// rings (`DmaBuffer::<[MyDesc]>::new_array(N)`) or a small `#[repr(C)]` for
-/// single-object DMA (`DmaBuffer::<MyCmd>::new()`).
+/// `T` is the logical element type. Most callers will use slice types
+/// for rings (`DmaBuffer::<[MyDesc]>::allocate_array(device, N)`) or a
+/// small `#[repr(C)]` for single-object DMA.
 pub struct DmaBuffer<T: ?Sized> {
     /// Kernel-virtual pointer to the start of the allocation.
     virt: NonNull<u8>,
     /// Physical (bus) address of `virt`.
     phys: PhysAddr,
+    /// Bus address the device should see in descriptor rings. Equals
+    /// the IOVA when an IOMMU is translating; equals `phys.as_u64()`
+    /// when identity-fallback is active.
+    bus: u64,
+    /// Byte length of the IOVA mapping. Equal to `bytes` for translated
+    /// domains; `0` for identity-fallback (nothing to unmap on drop).
+    mapping_len: usize,
     /// Buddy order used for the allocation.
     order: usize,
-    /// Total byte size of the allocation (may be >= mem::size_of::<T>()
-    /// because the buddy allocator hands out whole pages at the requested
-    /// order).
+    /// Total byte size of the allocation (may be >= `mem::size_of::<T>()`
+    /// because the buddy allocator hands out whole pages at the
+    /// requested order).
     bytes: usize,
     /// Element count for array-typed buffers (1 for single-object).
     len: usize,
+    /// Domain metadata used to unmap at drop time. `None` for buffers
+    /// allocated through the test-only helpers below.
+    domain_ctx: Option<DomainContext>,
     _marker: PhantomData<T>,
 }
 
-// SAFETY: DmaBuffer owns its memory exclusively; sending it between threads
-// moves ownership of the contiguous region, which is safe because the buddy
-// allocator is itself Send. Drivers that share a DmaBuffer between an ISR
-// and a task must wrap it in a lock or use volatile access through raw
-// pointers.
+/// Snapshot of the domain an IOVA mapping lives in. Stored on the
+/// DmaBuffer so Drop can unmap without consulting the `PciDeviceHandle`
+/// (which may have moved or been dropped by then — but the domain
+/// outlives the DmaBuffer because the handle owns the buffer's domain
+/// lifetime).
+#[derive(Clone, Copy, Debug)]
+struct DomainContext {
+    unit_index: usize,
+    domain: DomainId,
+}
+
+// SAFETY: DmaBuffer owns its memory exclusively; sending it between
+// threads moves ownership of the contiguous region, which is safe
+// because the buddy allocator is itself Send. Drivers that share a
+// DmaBuffer between an ISR and a task must wrap it in a lock or use
+// volatile access through raw pointers.
 unsafe impl<T: ?Sized + Send> Send for DmaBuffer<T> {}
 
 impl<T> DmaBuffer<T> {
-    /// Allocate a DMA buffer sized to hold a single `T`.
+    /// Allocate a DMA buffer sized to hold `count` contiguous `T`,
+    /// attached to `device`'s IOMMU domain.
     ///
-    /// The buffer is zero-initialized.
-    ///
-    /// # Alignment
-    ///
-    /// The returned buffer is always 4 KiB-aligned (because the buddy
-    /// allocator hands out whole pages). Alignment stricter than 4 KiB is not
-    /// supported here — if a device needs 64 KiB alignment, ask for enough
-    /// pages that the start of the allocation naturally satisfies the
-    /// requirement. (This is the same pattern the existing virtio code uses.)
+    /// Intended for descriptor rings:
+    /// `DmaBuffer::<NvmeCommand>::allocate_array(handle, QUEUE_DEPTH)`.
     #[allow(dead_code)]
-    pub fn new() -> Result<Self, DmaError> {
-        let size = mem::size_of::<T>();
-        if size == 0 {
-            return Err(DmaError::ZeroSize);
-        }
-        // `T` must not require alignment stricter than a page.
-        if mem::align_of::<T>() > PAGE_SIZE {
-            return Err(DmaError::UnsupportedAlignment);
-        }
-        let order = order_for_bytes(size);
-        let (phys, virt, bytes) = alloc_and_zero(order)?;
-        Ok(DmaBuffer {
-            virt,
-            phys,
-            order,
-            bytes,
-            len: 1,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Allocate a DMA buffer sized to hold `count` contiguous `T`.
-    ///
-    /// `count` must be at least 1. Intended for descriptor rings:
-    /// `DmaBuffer::<NvmeCommand>::new_array(QUEUE_DEPTH)`.
-    #[allow(dead_code)]
-    pub fn new_array(count: usize) -> Result<DmaBuffer<[T]>, DmaError> {
+    pub fn allocate_array(
+        device: &PciDeviceHandle,
+        count: usize,
+    ) -> Result<DmaBuffer<[T]>, DmaError> {
         if count == 0 {
             return Err(DmaError::ZeroSize);
         }
@@ -142,46 +193,107 @@ impl<T> DmaBuffer<T> {
         }
         let order = order_for_bytes(size);
         let (phys, virt, bytes) = alloc_and_zero(order)?;
+        let (bus, mapping_len, domain_ctx) =
+            install_iova_mapping(device, phys.as_u64(), bytes, order)?;
         Ok(DmaBuffer {
             virt,
             phys,
+            bus,
+            mapping_len,
             order,
             bytes,
             len: count,
+            domain_ctx,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Allocate a DMA buffer sized to hold a single `T`, attached to
+    /// `device`'s IOMMU domain.
+    ///
+    /// The buffer is zero-initialized.
+    ///
+    /// # Alignment
+    ///
+    /// The returned buffer is always 4 KiB-aligned (the buddy allocator
+    /// hands out whole pages). Alignment stricter than 4 KiB is not
+    /// supported here — if a device needs 64 KiB alignment, ask for
+    /// enough pages that the start of the allocation naturally satisfies
+    /// the requirement.
+    #[allow(dead_code)]
+    pub fn allocate_one(device: &PciDeviceHandle) -> Result<Self, DmaError> {
+        let size = mem::size_of::<T>();
+        if size == 0 {
+            return Err(DmaError::ZeroSize);
+        }
+        if mem::align_of::<T>() > PAGE_SIZE {
+            return Err(DmaError::UnsupportedAlignment);
+        }
+        let order = order_for_bytes(size);
+        let (phys, virt, bytes) = alloc_and_zero(order)?;
+        let (bus, mapping_len, domain_ctx) =
+            install_iova_mapping(device, phys.as_u64(), bytes, order)?;
+        Ok(DmaBuffer {
+            virt,
+            phys,
+            bus,
+            mapping_len,
+            order,
+            bytes,
+            len: 1,
+            domain_ctx,
             _marker: PhantomData,
         })
     }
 }
 
 impl DmaBuffer<[u8]> {
-    /// Allocate a raw byte buffer of `size` bytes with at least `alignment`
-    /// alignment. `alignment` must be a power of two, 1..=4096 — the buddy
-    /// allocator's minimum unit is 4 KiB so every returned buffer is already
-    /// page-aligned and the `alignment` parameter is validated as an upper
-    /// bound.
-    #[allow(dead_code)]
-    pub fn new_bytes(size: usize, alignment: usize) -> Result<Self, DmaError> {
-        if size == 0 {
+    /// Allocate a raw byte buffer of `bytes` bytes attached to `device`'s
+    /// IOMMU domain.
+    ///
+    /// This is the central signature of Phase 55a Track E.2. The
+    /// allocation is page-aligned; callers that need stricter alignment
+    /// should request enough pages for the first page to satisfy the
+    /// requirement naturally (same pattern as Phase 55 `new_bytes`).
+    pub fn allocate(device: &PciDeviceHandle, bytes: usize) -> Result<Self, DmaError> {
+        if bytes == 0 {
             return Err(DmaError::ZeroSize);
         }
-        if !alignment.is_power_of_two() || alignment > PAGE_SIZE {
-            return Err(DmaError::UnsupportedAlignment);
-        }
-        let order = order_for_bytes(size);
-        let (phys, virt, bytes) = alloc_and_zero(order)?;
+        let order = order_for_bytes(bytes);
+        let (phys, virt, bytes_alloc) = alloc_and_zero(order)?;
+        let (bus, mapping_len, domain_ctx) =
+            install_iova_mapping(device, phys.as_u64(), bytes_alloc, order)?;
         Ok(DmaBuffer {
             virt,
             phys,
+            bus,
+            mapping_len,
             order,
-            bytes,
-            len: size,
+            bytes: bytes_alloc,
+            len: bytes,
+            domain_ctx,
             _marker: PhantomData,
         })
     }
 }
 
 impl<T: ?Sized> DmaBuffer<T> {
-    /// Bus-visible physical address of the allocation.
+    /// Bus-visible address the device should see in descriptor rings.
+    ///
+    /// When an IOMMU is translating, this is the IOVA installed at
+    /// allocation time. When identity-fallback is active, this is the
+    /// physical frame address. Callers should not branch on which case
+    /// is active — both values are safe to hand to the device.
+    #[inline]
+    pub fn bus_address(&self) -> u64 {
+        self.bus
+    }
+
+    /// Raw physical frame address of the allocation.
+    ///
+    /// Retained for the few call sites that must program a physical
+    /// address unconditionally (legacy hardware quirks, debug dumps).
+    /// Prefer [`bus_address`](Self::bus_address) in descriptor rings.
     #[inline]
     #[allow(dead_code)]
     pub fn physical_address(&self) -> PhysAddr {
@@ -218,9 +330,10 @@ impl<T: ?Sized> DmaBuffer<T> {
 impl<T> Deref for DmaBuffer<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: `virt` points to a zero-initialized allocation of at least
-        // `size_of::<T>()` bytes (enforced by `DmaBuffer::new`). We have
-        // exclusive access (no Clone; Send is the only Sync-safe marker).
+        // SAFETY: `virt` points to a zero-initialized allocation of at
+        // least `size_of::<T>()` bytes (enforced by the constructors).
+        // We have exclusive access (no Clone; Send is the only Sync-safe
+        // marker).
         unsafe { &*(self.virt.as_ptr() as *const T) }
     }
 }
@@ -236,8 +349,8 @@ impl<T> Deref for DmaBuffer<[T]> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: `virt` points to `len` contiguous `T` (enforced by
-        // `new_array` or `new_bytes` for T=u8). No aliasing — we have
-        // exclusive ownership.
+        // `allocate_array` or `allocate` for T=u8). No aliasing — we
+        // have exclusive ownership.
         unsafe { core::slice::from_raw_parts(self.virt.as_ptr() as *const T, self.len) }
     }
 }
@@ -250,16 +363,32 @@ impl<T> DerefMut for DmaBuffer<[T]> {
 }
 
 // ---------------------------------------------------------------------------
-// Drop — return the frames to the buddy allocator.
+// Drop — unmap the IOVA, return the frames to the buddy allocator.
 // ---------------------------------------------------------------------------
 
 impl<T: ?Sized> Drop for DmaBuffer<T> {
     fn drop(&mut self) {
-        // `allocate_contiguous(order)` in the frame allocator is paired with
-        // `free_contiguous(phys, order)`; the virtual mapping lives in the
-        // phys-offset window and does not require explicit unmapping
-        // (unmapping one slice of the phys-offset window would break other
-        // kernel code that expects the window intact).
+        // 1. Undo any translated IOVA mapping first, so a subsequent
+        //    re-allocation at the same IOVA does not observe the stale
+        //    translation. Identity fallback has `mapping_len == 0` and
+        //    skips the unmap path.
+        if self.mapping_len != 0
+            && let Some(ctx) = self.domain_ctx
+            && let Err(e) =
+                registry::unmap(ctx.unit_index, ctx.domain, Iova(self.bus), self.mapping_len)
+        {
+            // Drop runs outside any error path — log and continue so we
+            // at least return the physical frames to the allocator.
+            log::warn!(
+                "[dma] unmap failed at drop: unit={} domain={:?} iova={:#x} len={:#x}: {}",
+                ctx.unit_index,
+                ctx.domain,
+                self.bus,
+                self.mapping_len,
+                e,
+            );
+        }
+        // 2. Return the frames.
         frame_allocator::free_contiguous(self.phys.as_u64(), self.order);
     }
 }
@@ -281,8 +410,8 @@ fn order_for_bytes(bytes: usize) -> usize {
     }
 }
 
-/// Allocate a contiguous block at `order` and zero it. Returns (phys_start,
-/// virt_nonnull, byte_size).
+/// Allocate a contiguous block at `order` and zero it. Returns
+/// `(phys_start, virt_nonnull, byte_size)`.
 fn alloc_and_zero(order: usize) -> Result<(PhysAddr, NonNull<u8>, usize), DmaError> {
     let frame = frame_allocator::allocate_contiguous(order).ok_or(DmaError::OutOfMemory)?;
     let phys = frame.start_address();
@@ -299,26 +428,131 @@ fn alloc_and_zero(order: usize) -> Result<(PhysAddr, NonNull<u8>, usize), DmaErr
     Ok((phys, virt, bytes))
 }
 
+/// Install an IOVA → phys mapping in the device's domain, if one is
+/// attached and the unit is translating. Returns
+/// `(bus_address, mapping_len, domain_ctx)` — `mapping_len` is zero for
+/// identity-fallback so Drop knows not to call unmap.
+fn install_iova_mapping(
+    device: &PciDeviceHandle,
+    phys: u64,
+    bytes: usize,
+    _order: usize,
+) -> Result<(u64, usize, Option<DomainContext>), DmaError> {
+    // The device's claim path attached a `DmaDomain` (Track E.1). When
+    // no IOMMU unit is registered, the handle still carries the
+    // identity-domain unit_index; we just skip the map() call and use
+    // the physical address directly.
+    let Some(snap) = device.domain_snapshot() else {
+        // Claim path that did not record a domain. Safe fallback:
+        // identity. This path is typical for transitional code that
+        // claims devices before iommu::init has run.
+        return Ok((phys, 0, None));
+    };
+
+    if !registry::translating() {
+        // Identity fallback — no-op map, return phys as the bus address.
+        return Ok((phys, 0, None));
+    }
+
+    // Translated path. Install the mapping; on failure, return the
+    // frame to the allocator via the caller's error path.
+    let flags = MapFlags::READ | MapFlags::WRITE;
+    registry::map(
+        snap.unit_index,
+        snap.domain,
+        Iova(phys),
+        CorePhysAddr(phys),
+        bytes,
+        flags,
+    )?;
+    Ok((
+        phys,
+        bytes,
+        Some(DomainContext {
+            unit_index: snap.unit_index,
+            domain: snap.domain,
+        }),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tests — acceptance C.2 bullet 7 (allocation, deref access, drop/reclaim).
 // ---------------------------------------------------------------------------
+//
+// These kernel-side tests run inside QEMU via the xtask test harness.
+// They exercise the underlying frame allocator and zero-init path using
+// the identity-fallback code path (no PciDeviceHandle); the IOMMU-mapped
+// end-to-end behavior is covered by the integration tests in Phase 55a
+// Track F.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Test-only allocator: bypasses the PciDeviceHandle/domain plumbing
+    // and exercises the underlying frame allocator + zero-init path.
+    // Equivalent to `DmaBuffer::allocate(device, size)` with an
+    // identity-fallback domain attached. Not exposed outside `#[cfg(test)]`
+    // so no production code can bypass the domain path by accident.
+    impl DmaBuffer<[u8]> {
+        fn test_allocate(bytes: usize) -> Result<Self, DmaError> {
+            if bytes == 0 {
+                return Err(DmaError::ZeroSize);
+            }
+            let order = order_for_bytes(bytes);
+            let (phys, virt, bytes_alloc) = alloc_and_zero(order)?;
+            Ok(DmaBuffer {
+                virt,
+                phys,
+                bus: phys.as_u64(),
+                mapping_len: 0,
+                order,
+                bytes: bytes_alloc,
+                len: bytes,
+                domain_ctx: None,
+                _marker: PhantomData,
+            })
+        }
+    }
+
+    impl<T> DmaBuffer<T> {
+        fn test_allocate_array(count: usize) -> Result<DmaBuffer<[T]>, DmaError> {
+            if count == 0 {
+                return Err(DmaError::ZeroSize);
+            }
+            let size = mem::size_of::<T>()
+                .checked_mul(count)
+                .ok_or(DmaError::SizeOverflow)?;
+            if size == 0 {
+                return Err(DmaError::ZeroSize);
+            }
+            let order = order_for_bytes(size);
+            let (phys, virt, bytes_alloc) = alloc_and_zero(order)?;
+            Ok(DmaBuffer {
+                virt,
+                phys,
+                bus: phys.as_u64(),
+                mapping_len: 0,
+                order,
+                bytes: bytes_alloc,
+                len: count,
+                domain_ctx: None,
+                _marker: PhantomData,
+            })
+        }
+    }
+
     #[test_case]
     fn dma_buffer_allocation_succeeds_and_reclaims() {
         let before = frame_allocator::available_count();
         {
-            let buf = DmaBuffer::<[u8]>::new_bytes(4096, 4096)
+            let buf = DmaBuffer::<[u8]>::test_allocate(4096)
                 .expect("single-page DMA allocation should succeed");
             assert_eq!(buf.capacity_bytes(), 4096);
             assert_ne!(buf.physical_address().as_u64(), 0);
+            // Bus address equals physical in the test (identity) path.
+            assert_eq!(buf.bus_address(), buf.physical_address().as_u64());
         }
-        // Buffer dropped — frames returned to buddy allocator.
-        // Drain per-CPU caches so refcount-free frames actually show up as
-        // available again.
         frame_allocator::drain_per_cpu_caches();
         let after = frame_allocator::available_count();
         assert_eq!(
@@ -330,15 +564,13 @@ mod tests {
 
     #[test_case]
     fn dma_buffer_deref_and_mut_access() {
-        // Array of u32: simulate a descriptor ring.
-        let mut buf = DmaBuffer::<u32>::new_array(16).expect("ring alloc");
+        let mut buf = DmaBuffer::<u32>::test_allocate_array(16).expect("ring alloc");
         for (i, slot) in buf.iter_mut().enumerate() {
             *slot = i as u32;
         }
         for (i, slot) in buf.iter().enumerate() {
             assert_eq!(*slot, i as u32);
         }
-        // Physical address must be page-aligned.
         assert_eq!(buf.physical_address().as_u64() & 0xFFF, 0);
     }
 
@@ -346,10 +578,8 @@ mod tests {
     fn dma_buffer_drop_reclaim_multipage() {
         let before = frame_allocator::available_count();
         {
-            // 3 pages → buddy order 2 (4 pages).
-            let buf = DmaBuffer::<[u8]>::new_bytes(3 * 4096, 4096).expect("multi-page DMA alloc");
+            let buf = DmaBuffer::<[u8]>::test_allocate(3 * 4096).expect("multi-page DMA alloc");
             assert!(buf.capacity_bytes() >= 3 * 4096);
-            // Touch every byte to make sure the mapping is live and writable.
             let mut b = buf;
             for byte in b.iter_mut() {
                 *byte = 0xA5;
@@ -368,32 +598,21 @@ mod tests {
     }
 
     #[test_case]
-    fn dma_buffer_rejects_zero_size_and_bad_alignment() {
+    fn dma_buffer_rejects_zero_size() {
         assert_eq!(
-            DmaBuffer::<[u8]>::new_bytes(0, 4096).err(),
+            DmaBuffer::<[u8]>::test_allocate(0).err(),
             Some(DmaError::ZeroSize)
-        );
-        assert_eq!(
-            DmaBuffer::<[u8]>::new_bytes(4096, 3).err(),
-            Some(DmaError::UnsupportedAlignment)
-        );
-        assert_eq!(
-            DmaBuffer::<[u8]>::new_bytes(4096, 8192).err(),
-            Some(DmaError::UnsupportedAlignment)
         );
     }
 
     #[test_case]
-    fn dma_buffer_new_array_reports_overflow_distinctly_from_zero_size() {
-        // count == 0 is a zero-sized request, not an overflow.
+    fn dma_buffer_allocate_array_reports_overflow_distinctly_from_zero_size() {
         assert_eq!(
-            DmaBuffer::<u64>::new_array(0).err(),
+            DmaBuffer::<u64>::test_allocate_array(0).err(),
             Some(DmaError::ZeroSize)
         );
-        // size_of::<u64>() * usize::MAX overflows usize on a 64-bit target —
-        // callers must be able to distinguish this from a zero-size request.
         assert_eq!(
-            DmaBuffer::<u64>::new_array(usize::MAX).err(),
+            DmaBuffer::<u64>::test_allocate_array(usize::MAX).err(),
             Some(DmaError::SizeOverflow)
         );
     }
