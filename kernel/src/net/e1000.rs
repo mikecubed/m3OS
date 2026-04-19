@@ -166,7 +166,7 @@ impl RxDescRing {
     }
 
     /// Slice the descriptor DmaBuffer as `&mut [E1000RxDesc]`.  Length is
-    /// RX_RING_SIZE by construction of `DmaBuffer::new_array`.
+    /// RX_RING_SIZE by construction of `DmaBuffer::allocate_array`.
     fn descs_mut(&mut self) -> &mut [E1000RxDesc] {
         &mut self.descs
     }
