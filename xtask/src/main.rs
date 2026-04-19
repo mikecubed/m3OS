@@ -15,6 +15,22 @@ const SBSIGN_TOOL_HINT: &str = "Install `sbsigntool` to use `cargo xtask sign`."
 const KERNEL_CORE_HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
 const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04";
 
+/// QEMU arguments enabling an emulated Intel VT-d IOMMU on the q35 machine.
+///
+/// Phase 55a Track F.1: exported as a single reusable slice so every
+/// IOMMU-aware launcher (cmd_run, cmd_run_gui, cmd_test) appends the same
+/// pair. `-device intel-iommu,x-scalable-mode=off` activates the legacy-mode
+/// IOMMU that Phase 55a's VT-d driver targets; `-machine kernel_irqchip=split`
+/// is required because QEMU rejects `intel-iommu` under the default `on`
+/// irqchip model. Constant lives once, consumed via
+/// [`append_iommu_args`] in QEMU-args assembly.
+pub const IOMMU_QEMU_ARGS: &[&str] = &[
+    "-device",
+    "intel-iommu,x-scalable-mode=off",
+    "-machine",
+    "kernel_irqchip=split",
+];
+
 /// QEMU process exit codes produced by the ISA debug-exit device.
 /// The device computes `(value << 1) | 1`, so kernel writing 0x10 → exit 0x21,
 /// and kernel writing 0x11 → exit 0x23.
@@ -33,19 +49,29 @@ enum QemuDisplayMode {
 /// `--device nvme` appends an NVMe drive; `--device e1000` replaces the default
 /// virtio-net NIC with the Intel 82540EM classic e1000. Defaults (all fields
 /// `false`) preserve the legacy VirtIO-blk + VirtIO-net behavior.
+///
+/// Phase 55a Track F.1 adds the `iommu` field, driven by `--iommu`: when set,
+/// [`IOMMU_QEMU_ARGS`] is appended to the QEMU command line so the guest
+/// boots on top of an emulated Intel VT-d unit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeviceSet {
     /// Attach a QEMU NVMe controller with a 64 MiB backing image.
     nvme: bool,
     /// Replace the default virtio-net NIC with the Intel 82540EM e1000.
     e1000: bool,
+    /// Enable the emulated Intel VT-d IOMMU (`--iommu`).
+    iommu: bool,
 }
 
-/// Parse `--device <name>` flags out of `args` and return the resulting
-/// [`DeviceSet`] plus the remaining arguments.
+/// Parse `--device <name>` and `--iommu` flags out of `args`, returning the
+/// resulting [`DeviceSet`] plus the remaining arguments.
 ///
-/// Supported names: `nvme`, `e1000`. Unknown names return an error rather than
-/// silently dropping through so a typo is caught immediately.
+/// Supported `--device` names: `nvme`, `e1000`. Unknown names return an error
+/// rather than silently dropping through so a typo is caught immediately.
+///
+/// Phase 55a Track F.1 adds `--iommu`, a standalone flag (no value) that sets
+/// [`DeviceSet::iommu`] so launchers append [`IOMMU_QEMU_ARGS`] to the QEMU
+/// command line. Remaining args (e.g. `--fresh`, `--gui`) pass through.
 fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), String> {
     let mut devices = DeviceSet::default();
     let mut remaining = Vec::with_capacity(args.len());
@@ -61,6 +87,8 @@ fn extract_device_flags(args: &[String]) -> Result<(DeviceSet, Vec<String>), Str
             apply_device_flag(name.as_str(), &mut devices)?;
         } else if let Some(name) = arg.strip_prefix("--device=") {
             apply_device_flag(name, &mut devices)?;
+        } else if arg == "--iommu" {
+            devices.iommu = true;
         } else {
             remaining.push(arg.clone());
         }
@@ -205,7 +233,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--device nvme|e1000]...|run-gui [--fresh] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -1649,6 +1677,15 @@ fn qemu_args_with_devices_resolved(
             "-device".to_string(),
             "nvme,serial=deadbeef,drive=nvme0".to_string(),
         ]);
+    }
+
+    // Phase 55a Track F.1: `--iommu` enables an emulated Intel VT-d unit on
+    // the q35 machine. `IOMMU_QEMU_ARGS` carries both the `-device
+    // intel-iommu,x-scalable-mode=off` pair and the required
+    // `-machine kernel_irqchip=split` override (QEMU rejects `intel-iommu`
+    // under the default `on` irqchip model).
+    if devices.iommu {
+        args.extend(IOMMU_QEMU_ARGS.iter().map(|s| (*s).to_string()));
     }
 
     args.extend(["-no-reboot".to_string()]);
@@ -7559,6 +7596,7 @@ mod tests {
             DeviceSet {
                 nvme: false,
                 e1000: true,
+                iommu: false,
             },
         );
         assert!(
@@ -7585,6 +7623,7 @@ mod tests {
             DeviceSet {
                 nvme: true,
                 e1000: false,
+                iommu: false,
             },
             Some(fake_nvme),
         );
@@ -7611,6 +7650,115 @@ mod tests {
             !fake_nvme.exists(),
             "qemu_args_with_devices_resolved must not create the NVMe backing image"
         );
+    }
+
+    // --------------------------------------------------------------
+    // Phase 55a Track F.1: `--iommu` flag parsing + QEMU wiring
+    // --------------------------------------------------------------
+
+    #[test]
+    fn extract_iommu_flag_sets_device_set() {
+        let input = string_args(&["--iommu"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert!(devices.iommu);
+        assert!(!devices.nvme);
+        assert!(!devices.e1000);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn extract_iommu_flag_composes_with_fresh_and_device() {
+        let input = string_args(&["--iommu", "--fresh", "--device", "nvme"]);
+        let (devices, rest) = extract_device_flags(&input).unwrap();
+        assert!(devices.iommu);
+        assert!(devices.nvme);
+        assert_eq!(rest, vec!["--fresh".to_string()]);
+    }
+
+    #[test]
+    fn qemu_args_with_iommu_appends_intel_iommu_and_split_irqchip() {
+        // Phase 55a F.1: `--iommu` must inject both the intel-iommu device
+        // and the `kernel_irqchip=split` override (QEMU rejects `intel-iommu`
+        // under the default `on` irqchip model on q35).
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: false,
+                e1000: false,
+                iommu: true,
+            },
+            None,
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-device", "intel-iommu,x-scalable-mode=off"]),
+            "expected `-device intel-iommu,x-scalable-mode=off` pair when --iommu is set"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-machine", "kernel_irqchip=split"]),
+            "expected `-machine kernel_irqchip=split` pair when --iommu is set"
+        );
+    }
+
+    #[test]
+    fn qemu_args_without_iommu_omits_intel_iommu_and_split_irqchip() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet::default(),
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("intel-iommu")),
+            "default DeviceSet must not enable intel-iommu"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["-machine", "kernel_irqchip=split"]),
+            "default DeviceSet must not set kernel_irqchip=split"
+        );
+    }
+
+    #[test]
+    fn iommu_qemu_args_constant_matches_live_wiring() {
+        // F.1 acceptance: the IOMMU args live as one reusable slice so
+        // callers never hand-roll them. Round-trip: constant value equals
+        // what qemu_args_with_devices emits when `iommu = true`.
+        assert_eq!(
+            IOMMU_QEMU_ARGS,
+            &[
+                "-device",
+                "intel-iommu,x-scalable-mode=off",
+                "-machine",
+                "kernel_irqchip=split",
+            ]
+        );
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet {
+                nvme: false,
+                e1000: false,
+                iommu: true,
+            },
+            None,
+        );
+        let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Every constant entry must appear, in order, somewhere in argv.
+        let mut i = 0;
+        for &want in IOMMU_QEMU_ARGS {
+            let rel = strs[i..]
+                .iter()
+                .position(|a| *a == want)
+                .unwrap_or_else(|| panic!("IOMMU_QEMU_ARGS entry {want:?} missing from argv"));
+            i += rel + 1;
+        }
     }
 
     #[test]
