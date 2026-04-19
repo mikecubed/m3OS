@@ -19,16 +19,18 @@ const QEMU_ISA_DEBUG_EXIT_DEVICE: &str = "isa-debug-exit,iobase=0xf4,iosize=0x04
 ///
 /// Phase 55a Track F.1: exported as a single reusable slice so every
 /// IOMMU-aware launcher (cmd_run, cmd_run_gui, cmd_test) appends the same
-/// pair. `-device intel-iommu,x-scalable-mode=off` activates the legacy-mode
-/// IOMMU that Phase 55a's VT-d driver targets; `-machine kernel_irqchip=split`
-/// is required because QEMU rejects `intel-iommu` under the default `on`
-/// irqchip model. Constant lives once, consumed via
-/// [`append_iommu_args`] in QEMU-args assembly.
+/// arguments. The legacy QEMU default is `pc-i440fx`, which does not
+/// accept `intel-iommu`; the single `-machine q35,kernel_irqchip=split`
+/// pair both switches to the q35 chipset and satisfies the
+/// `kernel_irqchip=split` requirement. `-device intel-iommu,x-scalable-mode=off`
+/// then activates the legacy-mode VT-d unit that Phase 55a targets.
+/// Constant lives once, consumed via [`append_iommu_args`] in QEMU-args
+/// assembly.
 pub const IOMMU_QEMU_ARGS: &[&str] = &[
+    "-machine",
+    "q35,kernel_irqchip=split",
     "-device",
     "intel-iommu,x-scalable-mode=off",
-    "-machine",
-    "kernel_irqchip=split",
 ];
 
 /// QEMU process exit codes produced by the ISA debug-exit device.
@@ -7698,8 +7700,9 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|w| w == ["-machine", "kernel_irqchip=split"]),
-            "expected `-machine kernel_irqchip=split` pair when --iommu is set"
+                .any(|w| w == ["-machine", "q35,kernel_irqchip=split"]),
+            "expected `-machine q35,kernel_irqchip=split` pair when --iommu is set \
+             (intel-iommu requires q35 chipset and split irqchip)"
         );
     }
 
@@ -7719,8 +7722,8 @@ mod tests {
         assert!(
             !args
                 .windows(2)
-                .any(|w| w == ["-machine", "kernel_irqchip=split"]),
-            "default DeviceSet must not set kernel_irqchip=split"
+                .any(|w| w == ["-machine", "q35,kernel_irqchip=split"]),
+            "default DeviceSet must not switch to q35 or set kernel_irqchip=split"
         );
     }
 

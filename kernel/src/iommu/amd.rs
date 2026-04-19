@@ -521,10 +521,16 @@ impl IommuUnit for AmdViUnit {
 
         self.brought_up = true;
         self.caps = Some(self.compute_capabilities());
+        let caps = self.caps.as_ref().expect("caps set on line above");
         log::info!(
-            "[iommu] unit.brought_up: vendor=amdvi unit={} register_base={:#x}",
+            "[iommu] iommu.unit.brought_up vendor=amdvi unit={} register_base={:#x} \
+             aw={}b page_sizes={:#x} qi={} ir={}",
             self.unit_index,
             self.register_base,
+            caps.address_width_bits,
+            caps.supported_page_sizes,
+            caps.queued_invalidation,
+            caps.interrupt_remapping,
         );
         Ok(())
     }
@@ -578,7 +584,7 @@ impl IommuUnit for AmdViUnit {
             }
         }
         log::info!(
-            "[iommu] domain.created: vendor=amdvi unit={} domain_id={:#x} root_phys={:#x}",
+            "[iommu] iommu.domain.created vendor=amdvi unit={} domain_id={:#x} root_phys={:#x}",
             self.unit_index,
             id.0,
             root_phys,

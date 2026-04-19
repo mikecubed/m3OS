@@ -43,6 +43,17 @@ pub fn current() -> Option<FaultHandlerFn> {
     *FAULT_HANDLER.lock()
 }
 
+/// Default IOMMU fault handler installed at boot so the IRQ vector is
+/// always reserved, the trampoline is always in the IDT, and hardware
+/// FEDATA / FEADDR are always programmed to deliver faults. The body is
+/// intentionally empty — [`log_fault_event`] has already recorded the
+/// fault before this function runs, which is the only observable the
+/// kernel needs today. A test or diagnostic tool can replace this with
+/// a richer handler via [`install`].
+pub fn default_handler(_record: &FaultRecord) {
+    // Intentionally empty — the shared log already captured the event.
+}
+
 /// Structured log line emitted for every IOMMU fault the kernel
 /// handles. Format is stable so F.3's integration test can search
 /// serial logs for it.

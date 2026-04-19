@@ -271,21 +271,31 @@ pub fn init() {
     }
 }
 
-/// Construct and bring up an Intel VT-d unit. On any failure (allocator
-/// exhaustion, GSTS poll timeout, etc.) returns the `IommuError` so the
-/// caller can log and fall back.
+/// Construct and bring up an Intel VT-d unit, then install the shared
+/// fault handler so hardware fault-event delivery is wired end-to-end.
+/// On any failure (allocator exhaustion, GSTS poll timeout, fault-IRQ
+/// reservation failure) returns the `IommuError` so the caller can log
+/// and fall back.
 fn build_and_bring_up_vtd(slot: usize, register_base: u64) -> Result<RegisteredUnit, IommuError> {
     let mut unit = intel::VtdUnit::new(slot, PhysAddr(register_base));
     unit.bring_up()?;
+    // bring_up is enough for translation to start, but without
+    // install_fault_handler the hardware has no MSI destination and the
+    // IDT has no trampoline — faults would fire silently. A default
+    // (empty) handler is sufficient because the ISR already calls
+    // log_fault_event before dispatching to the user handler.
+    unit.install_fault_handler(fault::default_handler)?;
     Ok(RegisteredUnit::Vtd(unit))
 }
 
-/// Construct and bring up an AMD-Vi unit. Returns the `IommuError` on
-/// any failure (register-base mapping, allocator exhaustion, etc.) so
-/// the caller can log and fall back.
+/// Construct and bring up an AMD-Vi unit and install the shared fault
+/// handler. Returns the `IommuError` on any failure (register-base
+/// mapping, allocator exhaustion, MSI programming failure) so the
+/// caller can log and fall back.
 fn build_and_bring_up_amdvi(slot: usize, register_base: u64) -> Result<RegisteredUnit, IommuError> {
     let mut unit = amd::AmdViUnit::new(register_base, slot)?;
     unit.bring_up()?;
+    unit.install_fault_handler(fault::default_handler)?;
     Ok(RegisteredUnit::AmdVi(unit))
 }
 

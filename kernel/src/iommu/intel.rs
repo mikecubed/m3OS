@@ -676,8 +676,10 @@ impl IommuUnit for VtdUnit {
 
         self.up = true;
         log::info!(
-            "[iommu] vtd unit[{}] brought up: aw={}b page_sizes={:#x} qi={} ir={}",
+            "[iommu] iommu.unit.brought_up vendor=vtd unit={} register_base={:#x} \
+             aw={}b page_sizes={:#x} qi={} ir={}",
             self.unit_index,
+            self.regs_virt as u64 - phys_offset(),
             self.capabilities.address_width_bits,
             self.capabilities.supported_page_sizes,
             self.capabilities.queued_invalidation,
@@ -722,6 +724,13 @@ impl IommuUnit for VtdUnit {
         // Flush the context cache so a subsequent map is observed by
         // the hardware walker on first DMA.
         self.invalidate_context_cache_global();
+
+        log::info!(
+            "[iommu] iommu.domain.created vendor=vtd unit={} domain_id={:#x} root_phys={:#x}",
+            self.unit_index,
+            id.0,
+            pml4_phys,
+        );
 
         Ok(DmaDomain::new(id, self.unit_index))
     }
