@@ -196,9 +196,18 @@ fn do_read_ipc(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8
     if reply_hdr.status != BlockDriverError::Ok {
         return Err(reply_hdr.status.to_byte());
     }
+    // A short payload after status=Ok is corrupt/truncated data; fail the
+    // read rather than silently hand partial sectors to the VFS.
+    const SECTOR_SIZE: usize = 512;
+    let expected_len = count.checked_mul(SECTOR_SIZE).ok_or(0xFFu8)?;
+    if buf.len() < expected_len {
+        return Err(0xFFu8);
+    }
     let payload = &bulk[BLK_REPLY_HEADER_SIZE..];
-    let n = payload.len().min(buf.len());
-    buf[..n].copy_from_slice(&payload[..n]);
+    if payload.len() < expected_len {
+        return Err(0xFFu8);
+    }
+    buf[..expected_len].copy_from_slice(&payload[..expected_len]);
     Ok(())
 }
 

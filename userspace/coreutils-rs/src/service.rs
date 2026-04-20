@@ -394,37 +394,45 @@ fn cmd_kill(name: &str) -> i32 {
     if ret < 0 {
         write_str(STDERR_FILENO, "service: kill(");
         write_str(STDERR_FILENO, name);
-        write_str(STDERR_FILENO, ") failed\n");
+        write_str(STDERR_FILENO, ", pid=");
+        let mut pid_buf = [0u8; 12];
+        let pos = format_u64(pid as u64, &mut pid_buf);
+        syscall_lib::write(STDERR_FILENO, &pid_buf[..pos]);
+        write_str(STDERR_FILENO, ") failed (ret=-");
+        let mut ret_buf = [0u8; 12];
+        let rpos = format_u64((ret as i64).unsigned_abs(), &mut ret_buf);
+        syscall_lib::write(STDERR_FILENO, &ret_buf[..rpos]);
+        write_str(STDERR_FILENO, ")\n");
         return 1;
     }
 
     write_str(STDOUT_FILENO, "service: SIGKILL delivered to '");
     write_str(STDOUT_FILENO, name);
     write_str(STDOUT_FILENO, "' (pid=");
-    // Write the PID numerically — we don't have format!, so write digit by digit.
     let mut pid_buf = [0u8; 12];
-    let mut pos = 0usize;
-    let mut v = pid as u64;
-    if v == 0 {
-        pid_buf[0] = b'0';
-        pos = 1;
-    } else {
-        let mut tmp = [0u8; 12];
-        let mut tlen = 0;
-        while v > 0 {
-            tmp[tlen] = b'0' + (v % 10) as u8;
-            v /= 10;
-            tlen += 1;
-        }
-        // reverse
-        for i in 0..tlen {
-            pid_buf[pos] = tmp[tlen - 1 - i];
-            pos += 1;
-        }
-    }
+    let pos = format_u64(pid as u64, &mut pid_buf);
     syscall_lib::write(STDOUT_FILENO, &pid_buf[..pos]);
     write_str(STDOUT_FILENO, ")\n");
     0
+}
+
+/// Write decimal digits of `v` into `buf`, left-aligned. Returns bytes written.
+fn format_u64(mut v: u64, buf: &mut [u8]) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut tlen = 0;
+    while v > 0 {
+        tmp[tlen] = b'0' + (v % 10) as u8;
+        v /= 10;
+        tlen += 1;
+    }
+    for i in 0..tlen {
+        buf[i] = tmp[tlen - 1 - i];
+    }
+    tlen
 }
 
 fn main(args: &[&str]) -> i32 {

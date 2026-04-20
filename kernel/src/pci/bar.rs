@@ -505,7 +505,9 @@ pub(crate) fn map_mmio_region_to_user(
         let insert = unsafe { mapper.map_to(page, frame, flags, &mut alloc) };
         match insert {
             Ok(flush) => {
-                flush.flush();
+                // The single range shootdown below covers the local core too;
+                // per-page flushes here would be redundant on the hot path.
+                flush.ignore();
                 installed.push(page);
             }
             Err(_) => {
@@ -611,7 +613,9 @@ pub(crate) fn unmap_mmio_region_from_user(
         let v = user_va + (i as u64) * 4096;
         let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(v));
         match mapper.unmap(page) {
-            Ok((_frame, flush)) => flush.flush(),
+            // The range shootdown below covers the local core too; skip the
+            // per-page flush to avoid double-flushing large BAR teardowns.
+            Ok((_frame, flush)) => flush.ignore(),
             Err(e) => {
                 log::warn!(
                     "[device-host] unmap_mmio: page {:#x} unmap failed: {:?}",
