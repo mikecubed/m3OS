@@ -238,6 +238,21 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: bring-up complete\n");
             ctx
         }
+        // When the sentinel BDF is absent (default QEMU machine has no
+        // NVMe device), `sys_device_claim` returns ENODEV, lifted into
+        // `DeviceHostError::NotClaimed`. That is not a restart-worthy
+        // failure — exit cleanly so init's `on-failure` policy leaves
+        // the service permanently stopped rather than burning the
+        // restart budget.
+        Err(InitError::Runtime(DriverRuntimeError::Device(
+            kernel_core::device_host::DeviceHostError::NotClaimed,
+        ))) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "nvme_driver: no NVMe device present — exiting cleanly\n",
+            );
+            return 0;
+        }
         Err(e) => {
             // Log the specific variant so the reader can correlate.
             let _collapsed: BlockDriverError = e.into();

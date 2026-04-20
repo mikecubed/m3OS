@@ -30,7 +30,11 @@ extern crate std;
 #[cfg(not(test))]
 use core::alloc::Layout;
 #[cfg(not(test))]
+use driver_runtime::DriverRuntimeError;
+#[cfg(not(test))]
 use driver_runtime::ipc::EndpointCap;
+#[cfg(not(test))]
+use kernel_core::device_host::DeviceHostError;
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
 #[cfg(not(test))]
@@ -141,6 +145,21 @@ fn program_main(_args: &[&str]) -> i32 {
         Err(init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: reset timeout\n");
             2
+        }
+        // When the sentinel BDF is absent (default QEMU machine has no
+        // e1000 device), `sys_device_claim` returns ENODEV which the
+        // driver_runtime lifts into `DeviceHostError::NotClaimed`. That
+        // is not a restart-worthy failure — exit cleanly so init's
+        // `on-failure` policy leaves the service permanently stopped
+        // rather than burning the restart budget.
+        Err(init::BringUpError::Runtime(DriverRuntimeError::Device(
+            DeviceHostError::NotClaimed,
+        ))) => {
+            syscall_lib::write_str(
+                STDOUT_FILENO,
+                "e1000_driver: no e1000 device present — exiting cleanly\n",
+            );
+            0
         }
         Err(init::BringUpError::Runtime(_)) => {
             syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: bring-up failed\n");
