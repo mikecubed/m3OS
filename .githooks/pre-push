@@ -7,8 +7,15 @@
 # developer hardware instead (and in the nightly workflow for scheduled
 # coverage).
 #
-# To bypass in an emergency: git push --no-verify
-# To skip just the QEMU tests: M3OS_SKIP_QEMU_TESTS=1 git push
+# Skipping the QEMU gates is not supported. The M3OS_SKIP_QEMU_TESTS
+# env-var escape was removed because it let pre-existing regressions ride
+# along with otherwise-clean commits (see PR #116, Phase 55b driver
+# crash-loop incident).
+#
+# If you hit a genuine infra blocker (e.g., QEMU missing on a migration
+# laptop), install QEMU + OVMF before pushing. In a true emergency
+# `git push --no-verify` still works, but it is an explicit, visible
+# opt-out — not an env-var that silently persists.
 
 set -e
 
@@ -17,24 +24,18 @@ if ! command -v cargo >/dev/null 2>&1; then
     if [ -f "$HOME/.cargo/env" ]; then
         . "$HOME/.cargo/env"
     else
-        echo "pre-push: cargo not found, skipping check"
-        exit 0
+        echo "pre-push: cargo not found — install Rust toolchain before pushing" >&2
+        exit 1
     fi
 fi
 
 echo "pre-push: running cargo xtask check..."
 cargo xtask check
 
-if [ "${M3OS_SKIP_QEMU_TESTS:-0}" = "1" ]; then
-    echo "pre-push: M3OS_SKIP_QEMU_TESTS=1 — skipping smoke + regression"
-    exit 0
-fi
-
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    echo "pre-push: qemu-system-x86_64 not found — skipping smoke + regression"
-    echo "          install QEMU and OVMF to exercise the full-system gate locally,"
-    echo "          or set M3OS_SKIP_QEMU_TESTS=1 to silence this notice."
-    exit 0
+    echo "pre-push: qemu-system-x86_64 not found — install QEMU and OVMF" >&2
+    echo "          to run the full-system smoke + regression gates." >&2
+    exit 1
 fi
 
 echo "pre-push: running cargo xtask smoke-test..."
