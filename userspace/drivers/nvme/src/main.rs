@@ -505,6 +505,18 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
 
     // Step 7: enter the block-server loop.
     let server = BlockServer::new(endpoint);
+
+    // Consecutive `handle_next` error counter. A single recv / reply
+    // failure is not fatal — the next iteration re-enters the loop. If
+    // the error repeats `MAX_CONSECUTIVE_ERRORS` times we exit non-zero
+    // so init's `on-failure` policy restarts the driver and the remote
+    // facade's restart-timeout logic (`kernel/src/blk/remote.rs`)
+    // transitions cleanly. Phase 50's IPC surface does not yet
+    // distinguish transient from fatal, so this bounded retry keeps the
+    // driver alive through single-shot flakes without spinning forever.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 8;
+    let mut consecutive_errors: u32 = 0;
+
     loop {
         let result = server.handle_next(|req| {
             match req.header.kind {
@@ -562,15 +574,22 @@ fn run_io_server(mut ctx: BringUpContext) -> Result<(), InitError> {
                 },
             }
         });
-        if let Err(e) = result {
-            // A single recv / reply failure is not fatal — the next
-            // iteration re-enters `handle_next`. But if the error
-            // repeats we exit so the service manager restarts the
-            // driver; Phase 50's IPC surface does not distinguish
-            // transient from fatal today.
-            syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: handle_next error\n");
-            let _ = e;
-            return Ok(());
+        match result {
+            Ok(()) => consecutive_errors = 0,
+            Err(e) => {
+                consecutive_errors += 1;
+                syscall_lib::write_str(
+                    STDOUT_FILENO,
+                    "nvme_driver: handle_next transient error — continuing\n",
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "nvme_driver: too many consecutive handle_next errors — exiting for restart\n",
+                    );
+                    return Err(InitError::Runtime(e));
+                }
+            }
         }
     }
 }

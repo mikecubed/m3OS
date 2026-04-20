@@ -82,6 +82,17 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 /// returns `true` — so the block dispatch layer immediately starts routing
 /// through the ring-3 path without any explicit boot-time wiring call.
 ///
+/// **Cold-path gate:** the auto-registration only fires when the in-kernel
+/// virtio-blk driver is *not* serving the root filesystem
+/// (`VIRTIO_BLK_READY == false`). When virtio-blk is active the VFS's
+/// block I/O targets the virtio data disk — a ring-3 NVMe driver attached
+/// to a separate physical device (e.g. QEMU's `--device nvme`) must not
+/// hijack that path, otherwise reads of `/etc/shadow` et al. would be
+/// misrouted to a device that does not contain the filesystem. An
+/// explicit [`register`] call from a caller that knows better (e.g. the
+/// Phase 55b test harness that boots without a virtio data disk) still
+/// works regardless of `VIRTIO_BLK_READY`.
+///
 /// Subsequent calls are fast: once `g.endpoint` is `Some`, the registry
 /// lookup is skipped entirely.
 pub fn is_registered() -> bool {
@@ -91,6 +102,13 @@ pub fn is_registered() -> bool {
         if g.state.is_registered() {
             return true;
         }
+    }
+    // Cold-path gate: defer to virtio-blk when it is the root block device.
+    // See function docs for rationale. An explicit `register` call bypasses
+    // this gate because it writes to `g.state` directly and the fast path
+    // above catches it before we ever reach the service-registry lookup.
+    if crate::blk::virtio_blk::VIRTIO_BLK_READY.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
     }
     // Cold path — attempt a one-shot service-registry lookup.
     if let Some(ep) = registry::lookup_endpoint_id("nvme.block") {
