@@ -38,7 +38,7 @@
 //! on link-down, calls `tcp::on_link_down()` — the one-line hook that resets
 //! pending retransmit timers per the Phase 16 contract.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[allow(dead_code)]
 use alloc::collections::VecDeque;
@@ -87,6 +87,19 @@ static REMOTE_NIC_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// the Phase 55b D.4b / F.2b semantics for the block path.
 static RESTART_SUSPECTED: AtomicBool = AtomicBool::new(false);
 
+/// Cold-path miss counter used by `is_registered` to rate-limit repeated
+/// service-registry lookups when no ring-3 NIC driver is present. An actual
+/// registry lookup is attempted only when the low `LOOKUP_RETRY_MASK` bits
+/// are zero, so one lookup is performed per `LOOKUP_RETRY_MASK + 1` misses
+/// instead of one lookup per TX frame. Reset to zero by `register` so the
+/// re-registration path does not defer the first post-restart lookup.
+static LOOKUP_MISS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Cold-path retry cadence — an actual service-registry lookup runs once
+/// every `LOOKUP_RETRY_MASK + 1` calls while the fast-path atomic is false.
+/// Power-of-two minus one so the check compiles to a single `AND`.
+const LOOKUP_RETRY_MASK: u32 = 0x3ff;
+
 // ---------------------------------------------------------------------------
 // RemoteNic public API
 // ---------------------------------------------------------------------------
@@ -117,6 +130,9 @@ impl RemoteNic {
         // Clear restart-suspected on successful re-registration so subsequent
         // send_frame calls are admitted again.
         RESTART_SUSPECTED.store(false, Ordering::Release);
+        // Reset the cold-path miss counter so the first post-(re)registration
+        // lookup is not deferred by the retry cadence.
+        LOOKUP_MISS_COUNTER.store(0, Ordering::Relaxed);
         log::info!(
             "[remote_nic] registered ring-3 NIC driver: endpoint={:?} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             endpoint,
@@ -144,12 +160,18 @@ impl RemoteNic {
     ///
     /// Fast path: lock-free `AtomicBool` read with `Acquire` ordering.
     ///
-    /// Cold path: if the atomic is `false` a one-shot lookup of `"net.nic"` in
-    /// the IPC service registry is attempted.  When the ring-3 e1000 driver has
-    /// published its endpoint under that name, the facade installs it with a
-    /// placeholder MAC (`[0; 6]`) and returns `true`.  The real MAC is filled in
-    /// when the driver emits a `NET_LINK_STATE` IPC message that reaches
-    /// `handle_link_state` → `apply_link_event`, which updates the stored MAC.
+    /// Cold path: when the atomic is `false` the facade tries a service-registry
+    /// lookup for `"net.nic"`. To avoid per-packet lock contention on systems
+    /// that boot without a ring-3 e1000 driver, the cold-path lookup is rate-
+    /// limited: it runs once every `LOOKUP_RETRY_MASK + 1` calls while the
+    /// fast-path atomic stays false. Successful registration clears the counter
+    /// so the first post-(re)registration lookup runs immediately.
+    ///
+    /// When the ring-3 e1000 driver has published its endpoint under that name,
+    /// the facade installs it with a placeholder MAC (`[0; 6]`) and returns
+    /// `true`. The real MAC is filled in when the driver emits a
+    /// `NET_LINK_STATE` IPC message that reaches `handle_link_state` →
+    /// `apply_link_event`, which updates the stored MAC.
     ///
     /// After the first successful cold-path lookup all subsequent calls return
     /// immediately via the atomic.
@@ -158,7 +180,15 @@ impl RemoteNic {
         if REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
             return true;
         }
-        // Cold path — one-shot service-registry lookup.
+        // Negative-latch: only attempt an actual registry lookup every
+        // `LOOKUP_RETRY_MASK + 1` misses. This keeps the hot TX path lock-free
+        // on systems where no ring-3 NIC driver ever registers while still
+        // catching a driver that registers lazily after early boot.
+        let miss = LOOKUP_MISS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if (miss & LOOKUP_RETRY_MASK) != 0 {
+            return false;
+        }
+        // Cold path — service-registry lookup (throttled to once per 1024 misses).
         if let Some(ep) = crate::ipc::registry::lookup_endpoint_id("net.nic") {
             {
                 let mut slot = REMOTE_NIC.lock();
@@ -271,7 +301,8 @@ impl RemoteNic {
             (ep, frames)
         };
         let mut forwarded = 0usize;
-        for frame in &frames {
+        let total = frames.len();
+        for (idx, frame) in frames.iter().enumerate() {
             let header = NetFrameHeader {
                 kind: NET_SEND_FRAME,
                 frame_len: frame.len() as u16,
@@ -289,10 +320,21 @@ impl RemoteNic {
             if endpoint::send(task_id, endpoint, msg) {
                 forwarded += 1;
             } else {
+                // First IPC failure: mark restart-suspected and stop draining.
+                // Continuing would overwrite the bulk buffer on every iteration
+                // and emit one warn line per remaining frame; the driver is
+                // already presumed down, so remaining frames are dropped and
+                // future send_frame() calls will surface DriverRestarting until
+                // the driver re-registers.
+                let dropped = total.saturating_sub(idx + 1);
                 log::warn!(
-                    "[remote_nic] drain_tx_queue: IPC send failed for frame — marking restart-suspected"
+                    "[remote_nic] drain_tx_queue: IPC send failed after {} forwarded, \
+                     dropping {} remaining — marking restart-suspected",
+                    forwarded,
+                    dropped,
                 );
                 Self::on_ipc_error();
+                break;
             }
         }
         forwarded
@@ -324,7 +366,9 @@ impl RemoteNic {
     ///
     /// On success, the frame is passed to `dispatch::process_rx_frames` and
     /// `NIC_WOKEN` is set to wake the net task's next poll iteration.
-    /// Returns the number of frames injected (0 or 1).
+    /// Returns the number of frames actually dispatched (0 or 1) — a frame
+    /// rejected by the Ethernet parser is counted as zero so metrics and
+    /// callers that read the return value do not over-report throughput.
     pub fn inject_rx_frame(header_and_frame: &[u8]) -> usize {
         match decode_net_rx_notify(header_and_frame) {
             Ok(hdr) => {
@@ -338,9 +382,16 @@ impl RemoteNic {
                     return 0;
                 }
                 let frame = &header_and_frame[header_size..header_size + frame_len];
-                super::dispatch::process_rx_frames(frame);
-                NIC_WOKEN.store(true, Ordering::Release);
-                1
+                if super::dispatch::process_rx_frames(frame) {
+                    NIC_WOKEN.store(true, Ordering::Release);
+                    1
+                } else {
+                    log::warn!(
+                        "[remote_nic] RX: malformed Ethernet frame dropped ({} bytes)",
+                        frame.len(),
+                    );
+                    0
+                }
             }
             Err(e) => {
                 log::warn!("[remote_nic] RX: bad NET_RX_FRAME header: {:?}", e);

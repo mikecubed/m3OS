@@ -91,13 +91,18 @@ and bus addresses the driver uses for descriptor rings and data buffers. A
 driver process without a `Device` capability cannot call this syscall; the
 kernel rejects the request before touching the IOMMU.
 
-`sys_device_irq_subscribe(device_cap)` enables MSI/MSI-X for the device,
-installs a ring-0 ISR that does nothing except signal a Phase 6 `Notification`
-object owned by the calling process, and returns a `DeviceIrq` capability.
-The driver calls `sys_notification_wait` on that object to block until the next
-interrupt. The ISR is twelve instructions: read MSI data, find the notification
-via a lock-free lookup, set the bit, EOI. No allocation, no IPC, no scheduling
-from interrupt context.
+`sys_device_irq_subscribe(device_cap, bit_index, notification_arg)` enables
+MSI/MSI-X for the device, installs a ring-0 ISR whose only effect is to set
+bit `bit_index` on a 64-bit `Notification` word, and returns a `DeviceIrq`
+capability. `bit_index` must be in the range `0..=63`. `notification_arg`
+selects the target notification object: passing the sentinel
+`NOTIFICATION_SENTINEL_NEW` asks the kernel to allocate a fresh
+`Notification` owned by the caller; any other value is treated as a
+`CapHandle` to an existing `Capability::Notification` the caller already
+holds. The driver calls `sys_notification_wait` on that object to block
+until the next interrupt. The ISR is twelve instructions: read MSI data,
+find the notification via a lock-free lookup, set the bit, EOI. No
+allocation, no IPC, no scheduling from interrupt context.
 
 `sys_device_dma_handle_info(dma_cap)` is a query-only primitive that returns
 the bus address and byte length recorded when the buffer was allocated. Drivers

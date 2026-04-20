@@ -21,10 +21,17 @@ use super::virtio_net;
 /// driver and the ring-3 e1000 driver via `RemoteNic::inject_rx_frame`. The
 /// frame must be a complete Ethernet frame starting at the 6-byte destination
 /// MAC.
-pub fn process_rx_frames(raw: &[u8]) {
+///
+/// Returns `true` when the frame parsed as a valid Ethernet frame and was
+/// routed to an EtherType arm (including the unknown-EtherType drop path);
+/// returns `false` when the Ethernet header itself was malformed and the
+/// frame was rejected before any dispatch. Callers that surface an
+/// "injected" count (e.g. `RemoteNic::inject_rx_frame`) use this to avoid
+/// reporting rejected frames as successfully delivered.
+pub fn process_rx_frames(raw: &[u8]) -> bool {
     let frame = match ethernet::parse(raw) {
         Some(f) => f,
-        None => return,
+        None => return false,
     };
     match frame.ethertype {
         ethernet::ETHERTYPE_ARP => {
@@ -41,6 +48,7 @@ pub fn process_rx_frames(raw: &[u8]) {
             // Unknown EtherType — drop silently.
         }
     }
+    true
 }
 
 /// Process all pending received frames from the in-kernel VirtIO-net driver.
@@ -52,6 +60,8 @@ pub fn process_rx_frames(raw: &[u8]) {
 /// this function.
 pub fn process_rx() {
     for raw in &virtio_net::recv_frames() {
-        process_rx_frames(raw);
+        // virtio-net callers do not track per-frame dispatch outcome; the
+        // return value is used by `RemoteNic::inject_rx_frame` only.
+        let _ = process_rx_frames(raw);
     }
 }
