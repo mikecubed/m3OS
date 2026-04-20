@@ -1042,8 +1042,10 @@ pub fn sys_device_dma_handle_info(dma_cap: u32, out_user_ptr: usize) -> isize {
 /// `notification_arg` sentinel — caller passes this value to request that the
 /// kernel allocate a fresh `Notification` on its behalf. Any other value is
 /// treated as a `CapHandle` pointing to an existing `Capability::Notification`
-/// in the caller's capability table.
-pub const NOTIFICATION_SENTINEL_NEW: u32 = u32::MAX;
+/// in the caller's capability table. Re-exported from `kernel_core` so the
+/// ring-3 `driver_runtime` backend and the kernel syscall handler share a
+/// single source of truth for the ABI sentinel.
+pub use kernel_core::device_host::syscalls::NOTIFICATION_SENTINEL_NEW;
 
 /// Negative errno `-ENFILE` (23) — per-driver IRQ cap exceeded.
 const NEG_ENFILE: isize = -23;

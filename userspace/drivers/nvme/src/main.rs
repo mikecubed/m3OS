@@ -238,18 +238,32 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::write_str(STDOUT_FILENO, "nvme_driver: bring-up complete\n");
             ctx
         }
-        // When the sentinel BDF is absent (default QEMU machine has no
-        // NVMe device), `sys_device_claim` returns ENODEV, lifted into
-        // `DeviceHostError::NotClaimed`. That is not a restart-worthy
-        // failure — exit cleanly so init's `on-failure` policy leaves
-        // the service permanently stopped rather than burning the
-        // restart budget.
+        // The target NVMe controller is not available to us. Two cases
+        // collapse to the same outcome from the driver's perspective and
+        // are both non-restart-worthy:
+        //
+        //   * `NotClaimed` — the sentinel BDF is not enumerated in PCI,
+        //     i.e. QEMU was launched without `--device nvme` and the
+        //     slot is empty. `sys_device_claim` returns ENODEV.
+        //
+        //   * `AlreadyClaimed` — the sentinel BDF is occupied by an
+        //     unrelated device already owned by an in-kernel driver
+        //     (e.g. QEMU's default machine places virtio-blk at slot 4,
+        //     which collides with `SENTINEL_BDF`). `sys_device_claim`
+        //     returns EBUSY. From the driver's perspective the NVMe
+        //     controller simply isn't there — the fact that some other
+        //     device occupies the slot is incidental.
+        //
+        // Exit cleanly in both cases so init's `on-failure` policy
+        // marks the service permanently stopped rather than burning
+        // the restart budget on a device that will never appear.
         Err(InitError::Runtime(DriverRuntimeError::Device(
-            kernel_core::device_host::DeviceHostError::NotClaimed,
+            kernel_core::device_host::DeviceHostError::NotClaimed
+            | kernel_core::device_host::DeviceHostError::AlreadyClaimed,
         ))) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "nvme_driver: no NVMe device present — exiting cleanly\n",
+                "nvme_driver: no NVMe device present at sentinel BDF — exiting cleanly\n",
             );
             return 0;
         }

@@ -146,18 +146,31 @@ fn program_main(_args: &[&str]) -> i32 {
             syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: reset timeout\n");
             2
         }
-        // When the sentinel BDF is absent (default QEMU machine has no
-        // e1000 device), `sys_device_claim` returns ENODEV which the
-        // driver_runtime lifts into `DeviceHostError::NotClaimed`. That
-        // is not a restart-worthy failure — exit cleanly so init's
-        // `on-failure` policy leaves the service permanently stopped
-        // rather than burning the restart budget.
+        // The target e1000 NIC is not available to us. Two cases collapse
+        // to the same outcome from the driver's perspective and are both
+        // non-restart-worthy:
+        //
+        //   * `NotClaimed` — the sentinel BDF is not enumerated in PCI,
+        //     i.e. QEMU was launched without `--device e1000` and no
+        //     device occupies the slot. `sys_device_claim` returns
+        //     ENODEV.
+        //
+        //   * `AlreadyClaimed` — the sentinel BDF is occupied by an
+        //     unrelated device already owned by an in-kernel driver
+        //     (e.g. QEMU's default machine places virtio-net-pci at
+        //     slot 3, which collides with `SENTINEL_BDF`).
+        //     `sys_device_claim` returns EBUSY. From the driver's
+        //     perspective the e1000 NIC simply isn't there.
+        //
+        // Exit cleanly in both cases so init's `on-failure` policy
+        // marks the service permanently stopped rather than burning
+        // the restart budget on a device that will never appear.
         Err(init::BringUpError::Runtime(DriverRuntimeError::Device(
-            DeviceHostError::NotClaimed,
+            DeviceHostError::NotClaimed | DeviceHostError::AlreadyClaimed,
         ))) => {
             syscall_lib::write_str(
                 STDOUT_FILENO,
-                "e1000_driver: no e1000 device present — exiting cleanly\n",
+                "e1000_driver: no e1000 device present at sentinel BDF — exiting cleanly\n",
             );
             0
         }

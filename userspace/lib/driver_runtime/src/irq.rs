@@ -89,6 +89,13 @@ pub use kernel_core::driver_runtime::contract::{IrqNotificationContract, IrqNoti
 /// (re-exported from `kernel-core` as the single source of truth).
 pub use kernel_core::device_host::syscalls::SYS_DEVICE_IRQ_SUBSCRIBE;
 
+/// Sentinel passed in the `notification_arg` slot of
+/// [`SYS_DEVICE_IRQ_SUBSCRIBE`] to request that the kernel allocate a fresh
+/// [`kernel_core::ipc::notification_logic::Notification`] on the caller's
+/// behalf. Re-exported from `kernel-core` so the ABI sentinel has one
+/// definition shared by the kernel handler and this backend.
+pub use kernel_core::device_host::syscalls::NOTIFICATION_SENTINEL_NEW;
+
 // ---------------------------------------------------------------------------
 // DeviceCapHandle — minimal view of a claimed device
 // ---------------------------------------------------------------------------
@@ -164,17 +171,36 @@ impl IrqBackend for SyscallBackend {
         vector_hint: Option<u8>,
         notification_index: u32,
     ) -> Result<u32, DriverRuntimeError> {
-        // Pack `vector_hint` into a u32. `None` → `u32::MAX` so the
-        // kernel treats it as "no hint"; `Some(v)` → `v as u32`.
-        let hint_arg: u32 = match vector_hint {
-            None => u32::MAX,
-            Some(v) => v as u32,
-        };
+        // B.4b ABI: `sys_device_irq_subscribe(dev_cap, bit_index, notification_arg)`.
+        //
+        // The old (pre-B.4b) ABI carried `vector_hint` in arg2 and the
+        // notification bit in arg3. B.4b repurposed arg2 as `bit_index`
+        // (range 0..=63; values ≥ 64 return -EINVAL) and arg3 as a
+        // `notification_arg` that is either a CapHandle to an existing
+        // `Capability::Notification` or the sentinel
+        // `NOTIFICATION_SENTINEL_NEW` (= u32::MAX) asking the kernel to
+        // allocate a fresh `Notification` on the caller's behalf.
+        //
+        // We map the trait's `notification_index` parameter onto
+        // `bit_index` and always pass `NOTIFICATION_SENTINEL_NEW` for
+        // `notification_arg` — this backend does not yet expose the
+        // "bind to caller-owned notification" path, so a fresh kernel-
+        // allocated notification is always requested. `vector_hint` is
+        // accepted for backwards source-compat with the C.3 API but
+        // ignored on the wire: the old kernel arm2 interpretation was
+        // retired by B.4b.
+        let _ = vector_hint;
+        if notification_index >= 64 {
+            // Fail locally with the same errno the kernel would emit
+            // rather than paying the syscall round-trip just to be
+            // rejected. Keeps the trait boundary well-defined.
+            return Err(errno_to_driver_runtime_error(-22));
+        }
         // `syscall3` maps (rax, rdi, rsi, rdx) to
-        // (SYS_DEVICE_IRQ_SUBSCRIBE, dev_cap, vector_hint, notif_index).
+        // (SYS_DEVICE_IRQ_SUBSCRIBE, dev_cap, bit_index, notification_arg).
         //
         // SAFETY: the syscall number is the `kernel-core` constant
-        // reserved in the device-host block; B.4 (`sys_device_irq_subscribe`
+        // reserved in the device-host block; B.4b (`sys_device_irq_subscribe`
         // in `kernel/src/syscall/device_host.rs`) accepts three u64
         // arguments in exactly this order and returns an isize. No
         // pointer arguments; no memory aliasing concerns.
@@ -182,8 +208,8 @@ impl IrqBackend for SyscallBackend {
             syscall_lib::syscall3(
                 SYS_DEVICE_IRQ_SUBSCRIBE,
                 dev_cap as u64,
-                hint_arg as u64,
                 notification_index as u64,
+                NOTIFICATION_SENTINEL_NEW as u64,
             )
         };
         // Non-negative return values are cap handles. Negative

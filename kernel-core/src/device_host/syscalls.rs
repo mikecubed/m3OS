@@ -31,14 +31,25 @@ pub const SYS_DEVICE_DMA_ALLOC: u64 = 0x1122;
 pub const SYS_DEVICE_DMA_HANDLE_INFO: u64 = 0x1123;
 
 /// Subscribe to a device-originated IRQ and receive it as a notification.
-/// Track B.4 — `sys_device_irq_subscribe(dev_cap, vector_hint, notification_index) -> isize`.
+/// Track B.4b — `sys_device_irq_subscribe(dev_cap, bit_index, notification_arg) -> isize`.
 ///
-/// `notification_index` names the caller-provided notification object that
-/// the kernel will signal when the IRQ fires; the notification is *not*
-/// allocated implicitly by this call. The ABI shape (three `u32` args) is
-/// enforced by the arch dispatcher in `kernel/src/arch/x86_64/syscall/mod.rs`
-/// and by `syscall_numbers_are_pinned_in_the_device_host_block()` below.
+/// `bit_index` (arg2, 0..=63) selects the bit within the 64-bit notification
+/// word the ISR will set on delivery. `notification_arg` (arg3) is either the
+/// sentinel [`NOTIFICATION_SENTINEL_NEW`] — in which case the kernel allocates
+/// a fresh `Notification` owned by the caller — or a `CapHandle` to an
+/// existing `Capability::Notification` the caller already holds. The ABI
+/// shape (three `u32` args) is enforced by the arch dispatcher in
+/// `kernel/src/arch/x86_64/syscall/mod.rs` and by
+/// `syscall_numbers_are_pinned_in_the_device_host_block()` below.
 pub const SYS_DEVICE_IRQ_SUBSCRIBE: u64 = 0x1124;
+
+/// Sentinel passed as `notification_arg` (arg3) of [`SYS_DEVICE_IRQ_SUBSCRIBE`]
+/// to request that the kernel allocate a fresh `Notification` object on the
+/// caller's behalf, rather than binding the IRQ to an existing notification
+/// the caller already holds. Any other value in that slot is interpreted as a
+/// `CapHandle` into the caller's capability table. Single source of truth for
+/// both the kernel syscall handler and ring-3 driver_runtime backends.
+pub const NOTIFICATION_SENTINEL_NEW: u32 = u32::MAX;
 
 /// Lowest syscall number in the reserved device-host block.
 ///
