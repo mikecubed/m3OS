@@ -2,7 +2,7 @@
 
 **Status:** Planned
 **Source Ref:** phase-56
-**Depends on:** Phase 46 (System Services) ✅, Phase 47 (DOOM) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate), Phase 55b (Ring-3 Driver Host)
+**Depends on:** Phase 46 (System Services) ✅, Phase 47 (DOOM) ✅, Phase 50 (IPC Completion) ✅, Phase 51 (Service Model Maturity) ✅, Phase 52 (First Service Extractions) ✅, Phase 55 (Hardware Substrate) ✅, Phase 55a (IOMMU Substrate) ✅ (with one known open bug — see `docs/appendix/phase-55b-residuals.md` R2), Phase 55b (Ring-3 Driver Host) ✅
 **Goal:** Replace the kernel-owned framebuffer and single-app input model with a single userspace display service that owns presentation, arbitrates surfaces for multiple graphical clients, routes focus-aware keyboard and mouse events, and exposes the four contract points a tiling-first compositor experience (Goal A in `docs/appendix/gui/tiling-compositor-path.md`) needs so the tiling UX can land on top without protocol rework.
 
 ## Track Layout
@@ -582,11 +582,14 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Symbol:** `service_record`, `restart_policy`
 **Why it matters:** The phase's service-model baseline (Phase 46/51) must actually supervise the graphical stack; otherwise a crash leaves the system without pixels.
 
+**Precedent:** Phase 55b (Track F.1) landed two concrete ring-3-service manifests — `etc/services.d/nvme_driver.conf` and `etc/services.d/e1000_driver.conf` — embedded through `xtask/src/main.rs::populate_ext2_files` and registered in `userspace/init/src/main.rs::KNOWN_CONFIGS`. Both use `restart=on-failure, max_restart=5, type=daemon`. Phase 56's three service manifests should mirror that shape; differences (e.g. an `on-restart` verb for `display_server` that re-acquires the framebuffer) are Phase 56-specific extensions on top of the baseline.
+
 **Acceptance:**
 - [ ] `kbd_server`, `mouse_server`, and `display_server` all have service records with explicit startup order (`kbd_server` and `mouse_server` before `display_server`) and restart policies
 - [ ] `display_server` has an `on-restart` policy that re-acquires the framebuffer via B.1 (retry with bounded backoff) and re-establishes the control socket
 - [ ] Input services emit a one-time log on startup identifying which input endpoint they will target on `display_server` (useful for diagnosing reordering during the session bringup)
 - [ ] The boot-log evidence that the three services are live at the expected point in boot is captured (e.g. a test harness reads the service-manager status)
+- [ ] Manifest-shape consistency with Phase 55b's `nvme_driver.conf` / `e1000_driver.conf` — same keys (`name`, `command`, `type`, `restart`, `max_restart`), same ext2-embedding pattern, same `KNOWN_CONFIGS` registration
 
 ### F.2 — Display-service crash recovery
 
@@ -598,11 +601,19 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 **Symbol:** `on_display_server_death`
 **Why it matters:** The design doc's acceptance criterion explicitly allows either "recoverable" *or* "failure-mode-and-recovery-path documented and testable." The recovery path has to be real, not rhetorical.
 
+**Precedent:** Phase 55b (Tracks F.2b / F.3b / F.3d) established the template for a crash-and-restart regression:
+- A guest shell command `service kill <name>` (delivered in F.2b, `userspace/coreutils-rs/src/service.rs`) SIGKILLs a named service via its PID from `/run/services.status`.
+- `cargo xtask regression --test driver-restart-guest` (F.2b) boots, kills a supervised driver, observes the `init: started '<name>' pid=` re-registration, and asserts post-restart status.
+- `cargo xtask regression --test max-restart-exceeded` (F.3d-1, gated `M3OS_ENABLE_CRASH_SMOKE`) validates the `max_restart` cap transition to `permanently-stopped`.
+- A small guest binary (`userspace/nvme-crash-smoke/`, F.3b) issues pre-crash work, invokes `service kill`, observes mid-crash transport failure, polls for restart, retries, and asserts post-restart correctness.
+
+Phase 56 should model its `display_server` crash regression on this shape — a guest binary that opens a client socket, triggers the debug `panic!` verb, observes the socket closing cleanly, waits for restart, and reconnects. The xtask harness pattern is reusable verbatim; only the guest-binary logic is new.
+
 **Acceptance:**
 - [ ] When `display_server` exits (crash or clean shutdown without `sys_fb_release`), the kernel reclaims the framebuffer and resumes the kernel console so the system is not left with a dead screen
 - [ ] The init/service-manager restarts `display_server` within a bounded number of attempts; exceeding the cap triggers a documented fallback (serial shell remains usable, kernel console is active)
 - [ ] Clients connected to `display_server` see their socket close cleanly and are responsible for reconnecting; no client-side crashes are required
-- [ ] A regression test triggers a `display_server` crash (e.g. via a debug `panic!` gated behind a test-only verb), confirms the kernel console returns, confirms the service manager restarts `display_server`, and confirms a new client can connect after restart
+- [ ] A regression test triggers a `display_server` crash (e.g. via a debug `panic!` gated behind a test-only verb OR via `service kill display_server` following the Phase 55b precedent), confirms the kernel console returns, confirms the service manager restarts `display_server`, and confirms a new client can connect after restart
 - [ ] The learning doc documents the failure-and-recovery path explicitly
 
 ### F.3 — Fallback to text-mode administration
@@ -790,6 +801,10 @@ Pure logic belongs in `kernel-core`. Hardware-dependent and IPC-dependent wiring
 - Phase 50 supplies the page-grant buffer transport. Phase 56 validates and uses this transport for client-to-server surface buffers (Track B.4); it does **not** introduce a new shared-memory mechanism.
 - Phase 55's hardware-access layer is not used directly by Phase 56 — the chosen mouse path (PS/2 AUX via IRQ12) predates Phase 55's PCIe/MSI work. USB HID mouse support is explicitly deferred to a later phase per the design doc's "Deferred Until Later" list.
 - **Relationship to Phase 55a (IOMMU Substrate) and Phase 55b (Ring-3 Driver Host).** The roadmap graph schedules 55a → 55b → 56, and the Phase 56 design doc's `Depends on` line reflects that ordering. Architecturally, however, nothing in this task list requires either phase: the mouse path (B.2) uses PS/2 AUX (IRQ12) in ring 0 and does not interact with IOMMU-routed DMA or with userspace-extracted drivers; the surface buffer transport (B.4) uses Phase 50 page grants rather than hardware DMA; the framebuffer (B.1) is a linear BAR mapped by the bootloader, not a DRM/KMS device. Phase 56 can therefore proceed independently of 55a/55b if the project chooses to parallelize. This distinction between scheduling and architectural dependency is noted here so implementation planners do not treat the roadmap ordering as a hard architectural block.
+
+  **Status update (post-Phase-55b close):** Phase 55a and 55b are now both landed (v0.55.2). Phase 56 pulls two *soft* precedents from Phase 55b, both reflected in the F.1 / F.2 tasks above: (a) the `etc/services.d/*.conf` manifest shape from `nvme_driver.conf` / `e1000_driver.conf`, and (b) the `service kill <name>` + `cargo xtask regression --test driver-restart-guest` crash-regression harness. Neither is an architectural dependency — if Phase 56 re-runs before 55b lands (counterfactual), both F.1 and F.2 would invent equivalent precedent from Phase 46/51 directly. The one open 55a item (R2 IOMMU VT-d MMIO bug, see `docs/appendix/phase-55b-residuals.md`) does not affect Phase 56 because Phase 56 introduces no new PCIe devices.
+
+- **`driver_runtime` API as future template.** Phase 56's three services (`display_server`, `kbd_server`, `mouse_server`) do not own PCIe hardware and therefore do not consume `userspace/lib/driver_runtime/` directly. When a later phase adds a USB HID driver or a GPU/display-engine driver — both explicitly deferred to post-56 phases — that driver should adopt the Phase 55b `driver_runtime` API shape (`DeviceHandle`, `Mmio<T>`, `DmaBuffer<T>`, `IrqNotification`, `BlockServer` / `NetServer` IPC helper pattern) rather than reinvent the capability-gated hardware-access surface. The Phase 55b learning doc at `docs/55b-ring-3-driver-host.md` documents this template stability promise.
 - **Goal-A contract points are explicit.** The four design decisions from `docs/appendix/gui/tiling-compositor-path.md` (swappable layout module, keybind grab hook, layer-shell-equivalent role, control socket) are delivered by A.7/E.1, A.5/D.4, A.6/E.2, and A.8/E.4 respectively. Each contract point ships a trait / role / hook / socket in Phase 56; the tiling-specific *implementations* built on top of them (tiling layout engine, chord engine, bar/launcher clients) ship in Phase 56b / 57b and are explicitly out of scope here.
 - **Explicit non-Wayland framing.** The client protocol (A.3) is m3OS-native, not Wayland. `docs/appendix/gui/wayland-gap-analysis.md` Path A (`wl_shm` adapter) is not in Phase 56 scope and is only reachable as an *additive* phase after Phase 56 lands.
 - **Mouse scope is narrow.** Phase 56 ships PS/2 AUX motion + 3 buttons + optional wheel. Touchpad gestures, tablet/pen input, touch, and USB HID breadth are all deferred.
