@@ -448,16 +448,14 @@ pub(crate) fn map_mmio_region_to_user(
     let _page_table_guard = addr_space.lock_page_tables();
 
     const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
-    // `ANON_MMAP_BASE` is declared in the arch syscall module; inline its
-    // value here to avoid a cross-module pub(crate) leak for a single
-    // constant. Kept as a local const so a future mismatch is a compile-time
-    // error rather than a silent drift.
-    const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
     let base =
         match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
             let current = if *mmap_next == 0 {
-                ANON_MMAP_BASE
+                // Reference the canonical anonymous-mmap base directly so
+                // this mapping cannot silently diverge from the mmap
+                // syscall's layout.
+                crate::arch::x86_64::syscall::ANON_MMAP_BASE
             } else {
                 *mmap_next
             };

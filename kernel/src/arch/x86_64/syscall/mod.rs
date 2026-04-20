@@ -1597,29 +1597,55 @@ pub extern "C" fn syscall_handler(
             }
         }
         SYS_DEVICE_MMIO_MAP => {
-            // Signature: sys_device_mmio_map(dev_cap: CapHandle, bar_index: u8) -> isize
-            crate::syscall::device_host::sys_device_mmio_map(arg0 as u32, arg1 as u8) as u64
+            // Signature: sys_device_mmio_map(dev_cap: CapHandle, bar_index: u8) -> isize.
+            // CapHandle is u32 and bar_index is u8 — reject out-of-range
+            // user arguments with -EINVAL rather than silently truncating
+            // (e.g. `bar_index = 256` would become 0 and change which
+            // BAR is addressed).
+            if arg0 > u64::from(u32::MAX) || arg1 > u64::from(u8::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_mmio_map(arg0 as u32, arg1 as u8) as u64
+            }
         }
         SYS_DEVICE_DMA_ALLOC => {
-            // Signature: sys_device_dma_alloc(dev_cap: CapHandle, size: usize, align: usize) -> isize
-            crate::syscall::device_host::sys_device_dma_alloc(
-                arg0 as u32,
-                arg1 as usize,
-                arg2 as usize,
-            ) as u64
+            // Signature: sys_device_dma_alloc(dev_cap: CapHandle, size: usize, align: usize) -> isize.
+            // CapHandle is u32 — narrower than a syscall register, so
+            // validate before truncation to keep the errno contract
+            // consistent with the rest of the device-host dispatch.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_alloc(
+                    arg0 as u32,
+                    arg1 as usize,
+                    arg2 as usize,
+                ) as u64
+            }
         }
         SYS_DEVICE_DMA_HANDLE_INFO => {
-            // Signature: sys_device_dma_handle_info(dma_cap: CapHandle, out: *mut DmaHandle) -> isize
-            crate::syscall::device_host::sys_device_dma_handle_info(arg0 as u32, arg1 as usize)
-                as u64
+            // Signature: sys_device_dma_handle_info(dma_cap: CapHandle, out: *mut DmaHandle) -> isize.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_handle_info(arg0 as u32, arg1 as usize)
+                    as u64
+            }
         }
         SYS_DEVICE_IRQ_SUBSCRIBE => {
-            // Signature: sys_device_irq_subscribe(dev_cap: CapHandle, vector_hint: u32, notification_index: u32) -> isize
-            crate::syscall::device_host::sys_device_irq_subscribe(
-                arg0 as u32,
-                arg1 as u32,
-                arg2 as u32,
-            ) as u64
+            // Signature: sys_device_irq_subscribe(dev_cap: CapHandle, vector_hint: u32, notification_index: u32) -> isize.
+            if arg0 > u64::from(u32::MAX)
+                || arg1 > u64::from(u32::MAX)
+                || arg2 > u64::from(u32::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_irq_subscribe(
+                    arg0 as u32,
+                    arg1 as u32,
+                    arg2 as u32,
+                ) as u64
+            }
         }
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -4273,7 +4299,9 @@ const BRK_BASE: u64 = 0x0000_0002_0000_0000;
 /// Initial virtual address for anonymous mmap allocations.
 ///
 /// Placed at 128 GiB — above the brk heap region and below the stack.
-const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
+/// Re-used by `kernel::pci::bar` for device-MMIO BAR mappings, so
+/// visibility is `pub(crate)` to keep a single source of truth.
+pub(crate) const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
 // Re-export FD types from process module (Phase 14 — per-process FD table).
 use crate::process::{FdBackend, FdEntry, MAX_FDS};

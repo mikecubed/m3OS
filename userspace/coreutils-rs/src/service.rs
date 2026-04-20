@@ -329,16 +329,25 @@ fn parse_u64_prefix(s: &[u8]) -> Option<u64> {
 /// `name` or if the `pid=` field is absent / zero.
 fn extract_pid_from_status(text: &str, name: &str) -> Option<i32> {
     for line in text.split('\n') {
-        let rest = line.strip_prefix(name)?;
+        // Using `?` on `strip_prefix` would short-circuit the whole
+        // function on the first non-matching line, missing services that
+        // aren't on the first row of `/run/services.status`.
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
         if !rest.starts_with(' ') && !rest.starts_with('\t') {
             continue;
         }
-        for field in line.split(' ') {
+        // Init separates fields with a single space today but the prefix
+        // check above already accepts tab, so tolerate tab-separated
+        // fields here too.
+        for field in line.split_whitespace() {
             if let Some(val_str) = field.strip_prefix("pid=") {
-                let pid = parse_u64_prefix(val_str.as_bytes())? as i32;
-                if pid > 0 {
-                    return Some(pid);
+                let pid_u64 = parse_u64_prefix(val_str.as_bytes())?;
+                if pid_u64 == 0 || pid_u64 > i32::MAX as u64 {
+                    return None;
                 }
+                return Some(pid_u64 as i32);
             }
         }
         return None; // found the line but no usable pid

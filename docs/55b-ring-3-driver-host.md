@@ -68,7 +68,7 @@ simplicity at the cost of crash isolation. Kernel modules share the ring-0
 address space; a bug in one module can corrupt all kernel state. DKMS and
 BPF-based sandboxing are bolt-on mitigations rather than structural.
 
-### The four device-host primitives
+### The five device-host primitives
 
 `sys_device_claim(bdf)` is the entry point. The kernel looks up the PCI Bus /
 Device / Function address in its enumerated device table, asserts no other
@@ -76,13 +76,13 @@ process has claimed it, installs the IOMMU translation domain (Phase 55a), and
 returns a `Device` capability — an opaque integer index into the calling
 process's capability table that acts as a receipt for the hardware ownership.
 
-`sys_device_mmio_map(device_cap, bar_index, offset, length)` accepts a `Device`
-capability, verifies that `bar_index` is a valid BAR for that device and that
-`[offset, offset+length)` fits inside it, maps the physical range into the
-calling process's address space as device-memory (non-cacheable, write-through),
-and returns an `Mmio` capability that records the exact virtual range.
-Any access outside that range is a regular page fault; the kernel does not need
-a special MMIO guard because the page table enforces the bounds.
+`sys_device_mmio_map(device_cap, bar_index)` accepts a `Device` capability and a
+BAR index, verifies that `bar_index` is a valid BAR for that device, maps the
+BAR's full physical range into the calling process's address space as
+device-memory (non-cacheable, write-through), and returns an `Mmio`
+capability that records the exact virtual range. Any access outside that
+range is a regular page fault; the kernel does not need a special MMIO guard
+because the page table enforces the bounds.
 
 `sys_device_dma_alloc(device_cap, size, align)` asks the IOMMU unit to carve
 a contiguous physical region, add a host-to-device mapping entry in the

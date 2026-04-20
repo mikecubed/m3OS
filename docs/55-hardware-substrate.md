@@ -299,10 +299,11 @@ if anything is wrong.
   takes a handler) rather than being baked into kernel-only call sites.
   That extraction is completed in
   [Phase 55b — Ring-3 Driver Host](./roadmap/55b-ring-3-driver-host.md),
-  which adds the `device_host` kernel subsystem, the four device-host
-  syscalls (`sys_device_claim`, `sys_device_bar_map`,
-  `sys_device_dma_alloc`, `sys_device_irq_subscribe`), and supervised
-  ring-3 `nvme_drv` / `e1000_drv` services built on
+  which adds the `device_host` kernel subsystem, the five device-host
+  syscalls (`sys_device_claim`, `sys_device_mmio_map`,
+  `sys_device_dma_alloc`, `sys_device_dma_handle_info`,
+  `sys_device_irq_subscribe`), and supervised ring-3
+  `nvme_driver` / `e1000_driver` services built on
   `userspace/lib/driver_runtime/`.
 - **Narrow device coverage.** Phase 55 does not attempt broad NIC or
   storage coverage. The e1000e family (82574, 82576) is explicitly **out**
