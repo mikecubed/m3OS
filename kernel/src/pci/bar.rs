@@ -627,7 +627,11 @@ pub(crate) fn unmap_mmio_region_from_user(
     }
 
     addr_space.bump_generation();
-    crate::smp::tlb::tlb_shootdown_range(addr_space, user_va, user_va + (len as u64));
+    // Match the shootdown range to the pages actually unmapped (page-rounded
+    // end). `tlb_shootdown_range` page-aligns internally today, so this is
+    // defence-in-depth against future contract changes rather than a bug fix.
+    let flush_end = user_va + (page_count as u64) * 4096;
+    crate::smp::tlb::tlb_shootdown_range(addr_space, user_va, flush_end);
 }
 
 // ---------------------------------------------------------------------------

@@ -420,20 +420,18 @@ impl PciDeviceHandle {
         )
     }
 
-    /// Consume this handle and turn it into the inert
-    /// `Capability::Device` carried in the driver's capability table.
+    /// Create the inert `Capability::Device` descriptor for this handle.
     ///
-    /// Phase 55b Track B.1: the syscall dispatcher stores the returned
+    /// Phase 55b Track B.1: the syscall dispatcher stores the underlying
     /// handle in `DeviceHostRegistry` (keyed by PID + `DeviceCapKey`) so the
     /// claim, its IOMMU domain, and its PCI-registry slot all stay alive
     /// for the life of the driver process. The returned `Capability::Device`
-    /// is what the driver receives via `CapabilityTable::insert`.
+    /// is the descriptor the driver receives via `CapabilityTable::insert`.
     ///
-    /// The name intentionally echoes the B.1 task-doc symbol
-    /// (`PciDeviceHandle::into_capability`) even though the signature is
-    /// split across this method and the registry's `insert_claim` — the
-    /// registry needs to keep `self` alive, so the method returns the
-    /// pair rather than consuming the handle.
+    /// The method borrows `self` and only constructs the capability
+    /// descriptor; ownership of the handle remains with the registry path
+    /// that tracks the claim (the name echoes the B.1 task-doc symbol
+    /// `PciDeviceHandle::into_capability`, but no `self` is consumed here).
     pub fn as_capability(&self) -> kernel_core::ipc::Capability {
         kernel_core::ipc::Capability::Device {
             key: self.device_cap_key(),

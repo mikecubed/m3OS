@@ -849,7 +849,7 @@ fn task_pid(idx: usize) -> u32 {
     SCHEDULER.lock().tasks[idx].pid
 }
 
-/// Resolve a [`TaskId`] to its owning process PID, if the task is alive.
+/// Resolve a [`TaskId`] to its owning process PID, if the task exists.
 ///
 /// Used by kernel-side facades that need to validate the provenance of a
 /// service registration (e.g. `kernel::blk::remote::is_registered` must

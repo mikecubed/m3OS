@@ -51,6 +51,7 @@ const NEG_EBADF: u64 = (-9_i64) as u64;
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EFAULT: u64 = (-14_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
+const NEG_ENODEV: u64 = (-19_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
@@ -1585,7 +1586,7 @@ pub extern "C" fn syscall_handler(
                 || arg2 > u64::from(u8::MAX)
                 || per_core_syscall_arg3() > u64::from(u8::MAX)
             {
-                (-19_i64) as u64 // -ENODEV
+                NEG_ENODEV
             } else {
                 let result = crate::syscall::device_host::sys_device_claim(
                     segment,
@@ -10901,7 +10902,6 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
             Some(p) => p,
             None => {
                 log::error!("[mount] no ext2 partition found on virtio-blk");
-                const NEG_ENODEV: u64 = (-19_i64) as u64;
                 return NEG_ENODEV;
             }
         };
@@ -10920,7 +10920,6 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
             Some(p) => p,
             None => {
                 log::error!("[mount] no FAT32 partition found on virtio-blk");
-                const NEG_ENODEV: u64 = (-19_i64) as u64;
                 return NEG_ENODEV;
             }
         };

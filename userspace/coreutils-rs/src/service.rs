@@ -408,13 +408,13 @@ fn cmd_kill(name: &str) -> i32 {
 
     let ret = syscall_lib::kill(pid, SIGKILL);
     if ret < 0 {
-        write_str(STDERR_FILENO, "service: kill(");
+        write_str(STDERR_FILENO, "service: '");
         write_str(STDERR_FILENO, name);
-        write_str(STDERR_FILENO, ", pid=");
+        write_str(STDERR_FILENO, "': kill(pid=");
         let mut pid_buf = [0u8; 12];
         let pos = format_u64(pid as u64, &mut pid_buf);
         syscall_lib::write(STDERR_FILENO, &pid_buf[..pos]);
-        write_str(STDERR_FILENO, ") failed (ret=-");
+        write_str(STDERR_FILENO, ", sig=SIGKILL) failed (ret=-");
         let mut ret_buf = [0u8; 12];
         let rpos = format_u64((ret as i64).unsigned_abs(), &mut ret_buf);
         syscall_lib::write(STDERR_FILENO, &ret_buf[..rpos]);

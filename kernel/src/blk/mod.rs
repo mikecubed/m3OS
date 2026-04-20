@@ -53,10 +53,12 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
 
 /// Write `count` sectors starting at `start_sector` from `buf`.
 ///
-/// Dispatch order mirrors [`read_sectors`]. For remote writes `payload_grant`
-/// is the IPC capability grant handle carrying the bulk write data (pass `0`
-/// when the caller does not use the grant path; the facade will encode it
-/// accordingly). For the VirtIO-blk path the grant is unused.
+/// Dispatch order mirrors [`read_sectors`].
+///
+/// This legacy API does not expose any caller-supplied IPC grant handle.
+/// When writes are forwarded to `RemoteBlockDevice`, the facade encodes
+/// "no separate grant payload" and embeds the write data inline in the
+/// bulk buffer.
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
     if remote::is_registered() {
