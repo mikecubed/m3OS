@@ -1,0 +1,23 @@
+# flow model overrides — Claude Code
+#
+# Profile B (speed / cost tradeoff):
+#   - Sonnet 4.6 drives implementation (faster than Opus, still strong on code).
+#   - Opus 4.7 keeps authoritative judgment on plan / review / final-diff passes.
+#   - Haiku 4.5 handles bounded discovery/triage where cost dominates.
+#
+# Template source: docs/models-config-template.md in the flow plugin cache.
+# Update this file when switching to a newer model release.
+
+# plan
+planner: claude-opus-4.7
+reviewer: claude-opus-4.7
+
+# parallel-impl and pr-resolve
+implementer: claude-sonnet-4.6
+
+# pr-ready
+structured-check: claude-opus-4.7
+final-reviewer: claude-opus-4.7
+
+# bounded discovery/triage (all skills)
+scout: claude-haiku-4.5
