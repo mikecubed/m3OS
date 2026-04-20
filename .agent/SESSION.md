@@ -1,42 +1,45 @@
 ---
-current-task: "PR #114 review resolution — 8 unresolved copilot-reviewer threads on feat/55a-iommu-substrate"
+current-task: "PR #116 review resolution — 9 new unresolved copilot threads at commit 7813757 (round 2)"
 current-phase: "triage-complete"
-next-action: "begin fix batch 1 (IOMMU correctness group)"
-workspace: "feat/55a-iommu-substrate (PR #114)"
-last-updated: "2026-04-19T00:00:00Z"
+next-action: "begin fix batch 1 (e1000+nvme endpoint truncation)"
+workspace: "feat/phase-55b-ring-3-driver-host (PR #116)"
+last-updated: "2026-04-20T03:50:00Z"
 ---
 
 ## Review surface
 
-PR #114: feat/55a-iommu-substrate → main, 9 review threads from
-copilot-pull-request-reviewer + github-advanced-security (devskim).
-1 thread already resolved (devskim TODO). 8 unresolved — all triaged below.
+PR #116 — round-2 re-review. After the 7813757 fix commit, copilot generated
+9 new review threads. Round-1 (11 threads) is already resolved. All 9 new
+threads are from `copilot-pull-request-reviewer`; no new devskim items.
 
-## Decisions
+## Decisions (round 2 — 9 new unresolved threads)
 
-| # | Thread ID | File:Line | Verdict | Action | Notes |
-|---|---|---|---|---|---|
-| 1 | PRRT_kwDORTRVIM57-9y8 | kernel-core/src/iommu/identity.rs:94 | valid | fix | Gate create_domain + other methods on brought_up; make install_identity_fallback call bring_up first (and the per-slot identity fallback in init()). |
-| 2 | PRRT_kwDORTRVIM57_Ggh | kernel/src/iommu/mod.rs | (already resolved/outdated) | skip | devskim TODO warning — already closed. |
-| 3 | PRRT_kwDORTRVIM57_P1l | kernel/src/iommu/registry.rs:237 | valid | fix | destroy_domain error path drops DmaDomain without release → debug_assert panic. |
-| 4 | PRRT_kwDORTRVIM57_P1t | kernel/src/iommu/fault.rs:59 | valid | fix | Replace spin::Mutex with AtomicPtr — IRQ-path must be lock-free per module contract. |
-| 5 | PRRT_kwDORTRVIM57_P10 | kernel/src/net/virtio_net.rs:238 | partially valid | fix scoped | Rename phys_base → bus_base + log field. buf_phys Vec stays (out of scope). |
-| 6 | PRRT_kwDORTRVIM57_P12 | kernel/src/blk/virtio_blk.rs:189 | partially valid | fix scoped | Rename phys_base → bus_base + log field. |
-| 7 | PRRT_kwDORTRVIM57_P15 | kernel/src/net/e1000.rs:126 | valid | fix | Rename ring_phys → ring_bus (struct field + all uses). |
-| 8 | PRRT_kwDORTRVIM57_P17 | xtask/src/main.rs:1691 | valid | fix | --gui + --iommu emits two -machine args → last one wins → pcspk setting lost. Consolidate into one -machine. |
-| 9 | PRRT_kwDORTRVIM57_P1- | xtask/src/main.rs:7742 | valid | fix | Test assertion mismatches IOMMU_QEMU_ARGS constant (confirmed failing via cargo test). |
+| Thread ID | File:Line | Verdict | Action |
+|---|---|---|---|
+| PRRT_kwDORTRVIM58E_aq | userspace/drivers/e1000/src/main.rs:120 | valid — `(ep & u32::MAX as u64) as u32` silently truncates; `u32::try_from` + error is the right guard (same bug in nvme driver too) | fix (both e1000 + nvme) |
+| PRRT_kwDORTRVIM58E_a8 | kernel-core/src/device_host/syscalls.rs:34 | valid — doc shows `(dev_cap, vector_hint)` but dispatcher passes 3 args | fix (doc only) |
+| PRRT_kwDORTRVIM58E_bG | kernel/src/syscall/mod.rs:9 | valid — module doc says only SYS_DEVICE_CLAIM is routed; dispatcher now routes all 5 | fix (doc only) |
+| PRRT_kwDORTRVIM58E_bK | kernel/src/net/remote.rs:259 | valid — drain-before-task-check path silently drops frames if `current_task_id()` returns None | fix (move check above drain) |
+| PRRT_kwDORTRVIM58E_bR | kernel/src/net/remote.rs:290 | duplicate of E_bK — same function, same concern | fix (covered by one change) |
+| PRRT_kwDORTRVIM58E_bU | kernel/src/pci/bar.rs:532 | partially valid — raw `0x3` and `1` are undocumented magic; the existing comment already concedes a future central constant; local named constants are a low-risk readability win | fix (local named constants only; defer cross-crate centralization per existing comment) |
+| PRRT_kwDORTRVIM58E_bZ | kernel/src/net/tcp.rs:346 | valid — one-line doc says "resets retransmit timers" but the body transitions connections to Closed | fix (doc only) |
+| PRRT_kwDORTRVIM58E_bf | kernel/src/net/tcp.rs:353 | duplicate of E_bZ — same doc comment block | fix (covered by one change) |
+| PRRT_kwDORTRVIM58E_bi | kernel/src/net/tcp.rs:372 | duplicate of E_bZ — same doc comment block | fix (covered by one change) |
 
 ## Files Touched
 
-(read so far)
-- kernel-core/src/iommu/identity.rs, kernel-core/src/iommu/contract.rs
-- kernel/src/iommu/registry.rs, kernel/src/iommu/mod.rs, kernel/src/iommu/fault.rs, kernel/src/iommu/intel.rs
-- kernel/src/net/virtio_net.rs, kernel/src/net/e1000.rs, kernel/src/blk/virtio_blk.rs
-- xtask/src/main.rs
+(round-2 fix scope)
+- userspace/drivers/e1000/src/main.rs
+- userspace/drivers/nvme/src/main.rs
+- kernel-core/src/device_host/syscalls.rs
+- kernel/src/syscall/mod.rs
+- kernel/src/net/remote.rs
+- kernel/src/pci/bar.rs
+- kernel/src/net/tcp.rs
 
 ## Open Questions
 
-(none — fixes derive from code evidence)
+(none — all 9 triaged with evidence verdicts)
 
 ## Blockers
 

@@ -1,6 +1,6 @@
 // Device-host syscall numbers — Phase 55b Track B.
 //
-// Single source of truth for the four device-host syscall numbers reserved in
+// Single source of truth for the five device-host syscall numbers reserved in
 // the `0x11xx` block. Declared in `kernel-core` so the kernel-side dispatcher
 // (Track B) and the userspace `driver_runtime` wrappers (Track C) compile
 // against the same constants — per the Phase 55b DRY discipline, no other
@@ -31,7 +31,13 @@ pub const SYS_DEVICE_DMA_ALLOC: u64 = 0x1122;
 pub const SYS_DEVICE_DMA_HANDLE_INFO: u64 = 0x1123;
 
 /// Subscribe to a device-originated IRQ and receive it as a notification.
-/// Track B.4 — `sys_device_irq_subscribe(dev_cap, vector_hint) -> isize`.
+/// Track B.4 — `sys_device_irq_subscribe(dev_cap, vector_hint, notification_index) -> isize`.
+///
+/// `notification_index` names the caller-provided notification object that
+/// the kernel will signal when the IRQ fires; the notification is *not*
+/// allocated implicitly by this call. The ABI shape (three `u32` args) is
+/// enforced by the arch dispatcher in `kernel/src/arch/x86_64/syscall/mod.rs`
+/// and by `syscall_numbers_are_pinned_in_the_device_host_block()` below.
 pub const SYS_DEVICE_IRQ_SUBSCRIBE: u64 = 0x1124;
 
 /// Lowest syscall number in the reserved device-host block.

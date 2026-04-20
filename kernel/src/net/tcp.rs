@@ -343,14 +343,17 @@ pub fn has_recv_data(conn_idx: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// Reset pending retransmit timers on all TCP connections on link-down.
+/// Force-close active TCP connections on link-down.
 // Called by RemoteNic::apply_link_event; allow dead_code until E.5 wires it.
 #[allow(dead_code)]
 ///
 /// Phase 16 / Phase 55b E.4: called by `RemoteNic::apply_link_event` when the
 /// PHY goes down. Transitions every `Established` / `SynSent` / `SynReceived`
-/// connection to `Closed` so the upper layers (VFS, application) observe an
-/// error rather than a silent hang. The one-line call site in `remote.rs` is:
+/// / `FinWait1` / `FinWait2` connection to `Closed` so the upper layers
+/// (VFS, application) observe an error rather than a silent hang. Retransmit
+/// timer state lives on the per-connection slot and is released when the
+/// connection slot is dropped; this function does not touch it directly.
+/// The one-line call site in `remote.rs` is:
 ///
 /// ```rust,ignore
 /// super::tcp::on_link_down();

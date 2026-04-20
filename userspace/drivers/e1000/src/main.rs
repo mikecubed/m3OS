@@ -117,7 +117,16 @@ fn program_main(_args: &[&str]) -> i32 {
                 syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: endpoint create failed\n");
                 return 4;
             }
-            let ep_u32 = (ep & u32::MAX as u64) as u32;
+            let ep_u32 = match u32::try_from(ep) {
+                Ok(id) => id,
+                Err(_) => {
+                    syscall_lib::write_str(
+                        STDOUT_FILENO,
+                        "e1000_driver: endpoint id out of u32 range\n",
+                    );
+                    return 6;
+                }
+            };
             let rc = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
             if rc == u64::MAX {
                 syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: service register failed\n");

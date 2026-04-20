@@ -648,7 +648,11 @@ fn create_service_endpoint(name: &str) -> Result<EndpointCap, InitError> {
             kernel_core::device_host::DeviceHostError::Internal,
         )));
     }
-    let ep_u32 = (ep & u32::MAX as u64) as u32;
+    let ep_u32 = u32::try_from(ep).map_err(|_| {
+        InitError::Runtime(DriverRuntimeError::Device(
+            kernel_core::device_host::DeviceHostError::Internal,
+        ))
+    })?;
     let rc = syscall_lib::ipc_register_service(ep_u32, name);
     if rc == u64::MAX {
         return Err(InitError::Runtime(DriverRuntimeError::Device(

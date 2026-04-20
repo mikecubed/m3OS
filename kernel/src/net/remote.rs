@@ -247,6 +247,19 @@ impl RemoteNic {
     /// will queue the message; the driver will drain it when it next calls
     /// `ipc_recv_msg`. This is safe because the TX queue is bounded.
     pub fn drain_tx_queue() -> usize {
+        use crate::ipc::endpoint;
+        use crate::ipc::message::Message;
+        use crate::task::scheduler;
+        use kernel_core::driver_ipc::net::{NET_SEND_FRAME, NetFrameHeader, encode_net_send};
+
+        // Validate task context before touching the queue. If there is no
+        // current task (e.g., we were called outside a scheduled kernel task
+        // somehow) we must leave queued frames in place rather than draining
+        // them into the floor — the next call will retry.
+        let task_id = match scheduler::current_task_id() {
+            Some(id) => id,
+            None => return 0,
+        };
         let (endpoint, frames) = {
             let mut slot = REMOTE_NIC.lock();
             let entry = match slot.as_mut() {
@@ -259,7 +272,6 @@ impl RemoteNic {
         };
         let mut forwarded = 0usize;
         for frame in &frames {
-            use kernel_core::driver_ipc::net::{NET_SEND_FRAME, NetFrameHeader, encode_net_send};
             let header = NetFrameHeader {
                 kind: NET_SEND_FRAME,
                 frame_len: frame.len() as u16,
@@ -269,24 +281,18 @@ impl RemoteNic {
             // Deliver header + frame through the IPC send_bulk path. Since
             // this runs in the kernel net task (not an ISR), blocking briefly
             // while the driver loop catches up is acceptable.
-            use crate::ipc::endpoint;
-            use crate::ipc::message::Message;
-            use crate::task::scheduler;
-            if let Some(task_id) = scheduler::current_task_id() {
-                // Encode bulk payload: header bytes followed by frame bytes.
-                let mut bulk = alloc::vec::Vec::with_capacity(hdr_bytes.len() + frame.len());
-                bulk.extend_from_slice(&hdr_bytes);
-                bulk.extend_from_slice(frame);
-                scheduler::deliver_bulk(task_id, bulk);
-                let msg = Message::with2(NET_SEND_FRAME as u64, frame.len() as u64, 0);
-                if endpoint::send(task_id, endpoint, msg) {
-                    forwarded += 1;
-                } else {
-                    log::warn!(
-                        "[remote_nic] drain_tx_queue: IPC send failed for frame — marking restart-suspected"
-                    );
-                    Self::on_ipc_error();
-                }
+            let mut bulk = alloc::vec::Vec::with_capacity(hdr_bytes.len() + frame.len());
+            bulk.extend_from_slice(&hdr_bytes);
+            bulk.extend_from_slice(frame);
+            scheduler::deliver_bulk(task_id, bulk);
+            let msg = Message::with2(NET_SEND_FRAME as u64, frame.len() as u64, 0);
+            if endpoint::send(task_id, endpoint, msg) {
+                forwarded += 1;
+            } else {
+                log::warn!(
+                    "[remote_nic] drain_tx_queue: IPC send failed for frame — marking restart-suspected"
+                );
+                Self::on_ipc_error();
             }
         }
         forwarded

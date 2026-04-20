@@ -523,13 +523,21 @@ pub(crate) fn map_mmio_region_to_user(
     // low bits; we use `1 << 30` here as a B.2-local marker until a
     // central `MMIO_MAPPING_FLAG` is introduced alongside the framebuffer
     // one in a later phase.
+    //
+    // Prot/flags bits are named locally (rather than raw `0x3` / `1`)
+    // so this security-adjacent mapping code is self-documenting; the
+    // values mirror the Linux `PROT_*` / `MAP_*` semantics consumed by
+    // `sys_linux_munmap`.
+    const VMA_PROT_READ: u64 = 1 << 0;
+    const VMA_PROT_WRITE: u64 = 1 << 1;
+    const VMA_MAP_SHARED: u64 = 1 << 0;
     const MMIO_MAPPING_FLAG: u64 = 1 << 30;
     let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
         vma_tree.insert(crate::process::MemoryMapping {
             start: base,
             len: total_size,
-            prot: 0x3, // PROT_READ | PROT_WRITE
-            flags: 1 | MMIO_MAPPING_FLAG,
+            prot: VMA_PROT_READ | VMA_PROT_WRITE,
+            flags: VMA_MAP_SHARED | MMIO_MAPPING_FLAG,
         });
     });
 
