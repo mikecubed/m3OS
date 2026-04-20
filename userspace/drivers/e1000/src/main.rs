@@ -61,6 +61,21 @@ pub mod rings;
 /// so the exact spelling is load-bearing.
 pub const BOOT_LOG_MARKER: &str = "e1000_driver: spawned\n";
 
+/// Sentinel emitted immediately before entering the IRQ / IPC server loop.
+///
+/// F.4b's `device-smoke --device e1000` script waits for this line to
+/// confirm the driver is live and accepting TX requests — replacing the
+/// old `E1000_SMOKE:icmp:SKIP` deferred marker that signalled a clean
+/// post-bring-up exit without a server loop.
+pub const SERVER_READY_SENTINEL: &str = "E1000_SMOKE:server:READY\n";
+
+/// Service name under which the driver registers its TX endpoint.
+///
+/// The kernel's `RemoteNic::register` (Track E.4) will look this up in the
+/// IPC registry and install the forwarding entry; until E.4 lands the
+/// registration just makes the endpoint discoverable by name.
+pub const SERVICE_NAME: &str = "net.nic";
+
 /// Sentinel PCI BDF QEMU uses for `-device e1000` under m3OS (bus 0,
 /// device 3, function 0 — slot +3, the net family's conventional
 /// location). Parallel to the `nvme_driver` sentinel.
@@ -145,7 +160,7 @@ fn log_mac(label: &str, mac: [u8; 6]) {
 
 #[cfg(test)]
 mod tests {
-    use super::BOOT_LOG_MARKER;
+    use super::{BOOT_LOG_MARKER, SERVER_READY_SENTINEL, SERVICE_NAME};
 
     #[test]
     fn boot_log_marker_matches_acceptance() {
@@ -153,5 +168,24 @@ mod tests {
         // `e1000_driver: spawned`. Preserved so Track F.1's config
         // smoke can grep the boot log for this line.
         assert_eq!(BOOT_LOG_MARKER, "e1000_driver: spawned\n");
+    }
+
+    /// Track E.3b acceptance: the server-ready sentinel must match the
+    /// string that `device-smoke --device e1000` and the `F.4b` xtask
+    /// script grep for.  The exact spelling is load-bearing — changing
+    /// it here without updating `xtask/src/main.rs`
+    /// `device_smoke_script_e1000` will cause the CI smoke to hang.
+    #[test]
+    fn server_ready_sentinel_matches_acceptance() {
+        assert_eq!(SERVER_READY_SENTINEL, "E1000_SMOKE:server:READY\n");
+    }
+
+    /// Track E.3b acceptance: the service name under which the driver
+    /// registers its TX endpoint must stay in sync with the kernel-side
+    /// `RemoteNic` Track E.4 lookup key and the crash-restart smoke
+    /// (F.3d-3).  One constant, one test, one source of truth.
+    #[test]
+    fn service_name_matches_acceptance() {
+        assert_eq!(SERVICE_NAME, "net.nic");
     }
 }
