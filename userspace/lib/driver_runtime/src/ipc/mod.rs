@@ -86,6 +86,15 @@ impl NotificationCap {
 /// A received IPC frame decoded into the shape the server helpers care
 /// about: the message label, the first data word, and a bulk-data
 /// payload the kernel copied into the server's recv buffer.
+///
+/// `bulk` is truncated to the authoritative length the kernel reported
+/// in `msg.data[1]` (the bulk-length slot populated by `ipc_send_buf` /
+/// `ipc_call_buf`). Handlers therefore see exactly the bytes the sender
+/// wrote — no trailing zero padding from an over-sized recv buffer.
+/// Prior to Track D.4b this field was the full `MAX_BULK_RECV`-sized
+/// buffer, which let a short direct IPC to a public driver endpoint be
+/// misread as a full-sized payload (dangerous on the block-write path
+/// because the missing tail became zero bytes written to disk).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecvFrame {
     /// Message label the peer sent.
@@ -94,8 +103,8 @@ pub struct RecvFrame {
     /// protocols (all state rides in the bulk buffer), but surfaced
     /// anyway so future protocols can piggyback on the same backend.
     pub data0: u64,
-    /// Bulk-data payload; matches the layout in
-    /// [`kernel_core::driver_ipc::block`] or
+    /// Bulk-data payload the kernel reported via `msg.data[1]`.
+    /// Matches the layout in [`kernel_core::driver_ipc::block`] or
     /// [`kernel_core::driver_ipc::net`] depending on the peer.
     pub bulk: alloc::vec::Vec<u8>,
 }
@@ -188,6 +197,15 @@ impl IpcBackend for SyscallBackend {
                 kernel_core::device_host::DeviceHostError::Internal,
             ));
         }
+        // Truncate the recv buffer to the real bulk length the kernel
+        // reported in `msg.data[1]` (see kernel/src/ipc/mod.rs:
+        // `ipc_send_with_bulk` sets this slot to the payload's byte
+        // count). Without this truncation every short IPC would be
+        // surfaced as a `MAX_BULK_RECV`-sized zero-padded buffer,
+        // which the block-write closure would happily write straight
+        // through to disk.
+        let real_len = (msg.data[1] as usize).min(buf.len());
+        buf.truncate(real_len);
         Ok(RecvFrame {
             label: msg.label,
             data0: msg.data[0],

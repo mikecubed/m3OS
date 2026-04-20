@@ -198,6 +198,29 @@ impl Registry {
         }
         None
     }
+
+    /// Look up a named service endpoint *and* its recorded owner task id.
+    ///
+    /// Returns `Some((ep_id, owner))` when the service is registered. The
+    /// `owner` is `0` for kernel-registered entries (pre-userspace init)
+    /// and the ring-3 task id for services registered via
+    /// `sys_ipc_register_service`. Callers that need to verify a service
+    /// is owned by a privileged / trusted process (e.g. the kernel-side
+    /// `RemoteBlockDevice` facade) use this overload instead of
+    /// [`Self::lookup`].
+    pub fn lookup_with_owner(&self, name: &str) -> Option<(EndpointId, u64)> {
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > MAX_NAME_LEN {
+            return None;
+        }
+
+        for slot in self.entries.iter().flatten() {
+            if slot.name_matches(name_bytes) {
+                return Some((slot.ep_id, slot.owner));
+            }
+        }
+        None
+    }
 }
 
 impl Default for Registry {

@@ -78,9 +78,21 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 ///
 /// On the cold path (no endpoint cached yet) performs a one-shot lookup of
 /// `"nvme.block"` in the IPC service registry.  If the ring-3 NVMe driver
-/// has published its endpoint under that name the facade installs it and
-/// returns `true` — so the block dispatch layer immediately starts routing
-/// through the ring-3 path without any explicit boot-time wiring call.
+/// has published its endpoint under that name **and** the publishing task
+/// is a supervised driver process, the facade installs it and returns
+/// `true` — so the block dispatch layer immediately starts routing through
+/// the ring-3 path without any explicit boot-time wiring call.
+///
+/// **Owner gate:** the auto-registration only fires when the owner of the
+/// `nvme.block` service registration is a trusted driver process — its
+/// `exec_path` must live under `/drivers/` (the same prefix
+/// `sys_device_claim` uses to authorize PCI claims). An arbitrary ring-3
+/// task that grabs the name first is ignored: `ipc_register_service`
+/// accepts any non-private name, so without this check, a spoofed
+/// `nvme.block` endpoint would steer kernel filesystem I/O through an
+/// untrusted process. Explicit [`register`] calls from a caller that
+/// knows better bypass this gate because they write `g.state` directly
+/// and the fast path above catches them before the registry lookup.
 ///
 /// **Cold-path gate:** the auto-registration only fires when the in-kernel
 /// virtio-blk driver is *not* serving the root filesystem
@@ -88,10 +100,7 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 /// block I/O targets the virtio data disk — a ring-3 NVMe driver attached
 /// to a separate physical device (e.g. QEMU's `--device nvme`) must not
 /// hijack that path, otherwise reads of `/etc/shadow` et al. would be
-/// misrouted to a device that does not contain the filesystem. An
-/// explicit [`register`] call from a caller that knows better (e.g. the
-/// Phase 55b test harness that boots without a virtio data disk) still
-/// works regardless of `VIRTIO_BLK_READY`.
+/// misrouted to a device that does not contain the filesystem.
 ///
 /// Subsequent calls are fast: once `g.endpoint` is `Some`, the registry
 /// lookup is skipped entirely.
@@ -110,22 +119,57 @@ pub fn is_registered() -> bool {
     if crate::blk::virtio_blk::VIRTIO_BLK_READY.load(core::sync::atomic::Ordering::Acquire) {
         return false;
     }
-    // Cold path — attempt a one-shot service-registry lookup.
-    if let Some(ep) = registry::lookup_endpoint_id("nvme.block") {
-        let mut g = REMOTE_BLOCK.lock();
-        // Guard against a race where two callers both hit the cold path.
-        if !g.state.is_registered() {
-            g.state.register("nvme0");
-            g.endpoint = Some(ep);
-            log::info!(
-                "[blk::remote] auto-registered ring-3 NVMe driver via service \
-                 registry ('nvme.block' → endpoint {:?})",
-                ep
-            );
-        }
-        return true;
+    // Cold path — attempt a one-shot service-registry lookup *with owner*.
+    let (ep, owner_task_id) = match registry::lookup_endpoint_with_owner("nvme.block") {
+        Some(pair) => pair,
+        None => return false,
+    };
+    // Owner gate: reject registrations from processes that are not
+    // supervised drivers. `owner == 0` (kernel-registered) is treated as
+    // trusted so the boot-time wiring path still works.
+    if owner_task_id != 0 && !is_trusted_driver_task(owner_task_id) {
+        // Log once per cold-path miss so a spoofed registration is
+        // visible in the boot log without spamming every VFS call.
+        log::warn!(
+            "[blk::remote] ignoring 'nvme.block' registration from untrusted \
+             task_id={} (not a /drivers/ process)",
+            owner_task_id
+        );
+        return false;
     }
-    false
+    let mut g = REMOTE_BLOCK.lock();
+    // Guard against a race where two callers both hit the cold path.
+    if !g.state.is_registered() {
+        g.state.register("nvme0");
+        g.endpoint = Some(ep);
+        log::info!(
+            "[blk::remote] auto-registered ring-3 NVMe driver via service \
+             registry ('nvme.block' → endpoint {:?}, owner task_id={})",
+            ep,
+            owner_task_id
+        );
+    }
+    true
+}
+
+/// `true` when `owner_task_id` belongs to a supervised driver process —
+/// i.e. its `exec_path` starts with `/drivers/`. Mirrors the authorization
+/// gate in `sys_device_claim` so the kernel's trust classification is
+/// consistent across the device-host and the block-dispatch entry points.
+fn is_trusted_driver_task(owner_task_id: u64) -> bool {
+    use kernel_core::types::TaskId;
+    let task_id = TaskId(owner_task_id);
+    let Some(pid) = scheduler::pid_for_task_id(task_id) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => p.exec_path.starts_with("/drivers/"),
+        None => false,
+    }
 }
 
 /// Re-register after a driver restart; clears the mid-restart flag.
@@ -242,8 +286,54 @@ pub fn write_sectors(
     if count > MAX_SECTORS_PER_REQUEST as usize {
         return Err(0xFF);
     }
-    // Enforce Phase 50 single-use grant contract before any IPC.
-    {
+    // If the driver is already mid-restart on entry, wait for it first.
+    // On timeout, surface DriverRestarting so the caller can distinguish
+    // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
+    //
+    // The grant is deliberately NOT consumed before this check: if the
+    // driver is still down when the budget expires, no write ever
+    // reached the wire, and burning the grant here would turn a
+    // legitimate retry from the caller into a spurious GrantReplayed.
+    // The grant is consumed in `do_write_ipc` immediately before the
+    // IPC call so the single-use contract is still enforced against
+    // concurrent writers racing on the same grant id.
+    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
+    }
+    // Attempt the IPC call with the grant consumed as part of the first
+    // attempt. On failure wait + retry once; the retry must NOT re-consume
+    // the grant because (a) the tracker would now reject it as replayed
+    // and (b) the first attempt has already claimed the single-use slot —
+    // this is the same logical write retrying, not a fresh use.
+    match do_write_ipc(start_sector, count, buf, payload_grant, true) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            on_ipc_error();
+            if wait_for_driver_restart() {
+                do_write_ipc(start_sector, count, buf, payload_grant, false)
+            } else {
+                Err(BlockDriverError::DriverRestarting.to_byte())
+            }
+        }
+    }
+}
+
+/// Inner IPC call for writes — no restart logic.
+///
+/// When `consume_grant` is `true`, the Phase 50 single-use grant contract
+/// is enforced by calling [`GrantIdTracker::consume`] before building the
+/// request. When `false`, the caller has already consumed the grant on an
+/// earlier attempt and this is an internal restart retry — the grant id
+/// is passed unchanged over the wire so the driver reassembles the same
+/// logical write.
+fn do_write_ipc(
+    start_sector: u64,
+    count: usize,
+    buf: &[u8],
+    payload_grant: u32,
+    consume_grant: bool,
+) -> Result<(), u8> {
+    if consume_grant {
         let mut g = REMOTE_BLOCK.lock();
         match g.grants.consume(payload_grant) {
             Ok(()) => {}
@@ -257,28 +347,6 @@ pub fn write_sectors(
             Err(_) => return Err(0xFF),
         }
     }
-    // If the driver is already mid-restart on entry, wait for it first.
-    // On timeout, surface DriverRestarting so the caller can distinguish
-    // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
-    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
-        return Err(BlockDriverError::DriverRestarting.to_byte());
-    }
-    // Attempt the IPC call; on failure wait + retry once.
-    match do_write_ipc(start_sector, count, buf, payload_grant) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            on_ipc_error();
-            if wait_for_driver_restart() {
-                do_write_ipc(start_sector, count, buf, payload_grant)
-            } else {
-                Err(BlockDriverError::DriverRestarting.to_byte())
-            }
-        }
-    }
-}
-
-/// Inner IPC call for writes — no restart logic.
-fn do_write_ipc(start_sector: u64, count: usize, buf: &[u8], payload_grant: u32) -> Result<(), u8> {
     let (ep, task) = endpoint_and_task()?;
     let hdr = BlkRequestHeader {
         kind: BLK_WRITE,

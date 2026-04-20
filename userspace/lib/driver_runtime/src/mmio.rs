@@ -61,11 +61,18 @@ pub enum MmioConstructError {
 /// null-pointer and alignment safety invariants up front so subsequent
 /// `read_reg` / `write_reg` calls can skip the checks on the hot path.
 pub struct Mmio<T> {
-    /// Capability handle for the `Capability::Mmio` slot in the driver
-    /// process's cap table. Retained on the wrapper so future tracks
-    /// (C.3 IRQ, C.4 IPC client) can forward the cap across IPC
-    /// without re-deriving it.
-    cap: CapHandle,
+    /// Capability handle for the `Capability::Device` slot that this
+    /// window was mapped against — **not** a separate `Capability::Mmio`.
+    ///
+    /// Track B.2's `sys_device_mmio_map` does not return a dedicated
+    /// MMIO capability: the kernel records the mapping in
+    /// `MMIO_REGISTRY` and reclaims it with the owning device cap on
+    /// process exit. Storing the device cap here keeps the window's
+    /// provenance on the wrapper without inventing a handle the kernel
+    /// never issued. The accessor is [`Self::device_cap`];
+    /// [`Self::cap`] is a deprecated alias retained for existing in-
+    /// tree callers.
+    device_cap: CapHandle,
     /// Driver-process virtual address of the mapped BAR window.
     /// Volatile accesses are computed as `user_va + offset`.
     user_va: usize,
@@ -143,7 +150,7 @@ impl<T> Mmio<T> {
             return Err(MmioConstructError::ZeroLength);
         }
         Ok(Self {
-            cap,
+            device_cap: cap,
             user_va,
             len,
             descriptor,
@@ -157,10 +164,25 @@ impl<T> Mmio<T> {
         self.descriptor
     }
 
-    /// Capability handle for the underlying `Capability::Mmio` slot.
+    /// Capability handle for the `Capability::Device` slot this window
+    /// was mapped against.
+    ///
+    /// Returns the *device* cap, not an MMIO cap — Track B.2 does not
+    /// mint a separate MMIO capability. See [`Self::device_cap`] in the
+    /// field docs for the rationale.
+    #[inline]
+    pub fn device_cap(&self) -> CapHandle {
+        self.device_cap
+    }
+
+    /// Deprecated alias for [`Self::device_cap`].
+    ///
+    /// Exists so pre-review callers that stored the return value as "the
+    /// MMIO cap handle" still compile; those sites actually receive the
+    /// device cap, matching the kernel's actual behaviour.
     #[inline]
     pub fn cap(&self) -> CapHandle {
-        self.cap
+        self.device_cap
     }
 
     /// Length of the mapped window in bytes.
@@ -227,7 +249,7 @@ impl<T> Mmio<T> {
 impl<T> core::fmt::Debug for Mmio<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Mmio")
-            .field("cap", &self.cap)
+            .field("device_cap", &self.device_cap)
             .field("user_va", &format_args!("{:#x}", self.user_va))
             .field("len", &format_args!("{:#x}", self.len))
             .field("bar_index", &self.descriptor.bar_index)

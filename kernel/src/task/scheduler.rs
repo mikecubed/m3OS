@@ -849,6 +849,18 @@ fn task_pid(idx: usize) -> u32 {
     SCHEDULER.lock().tasks[idx].pid
 }
 
+/// Resolve a [`TaskId`] to its owning process PID, if the task is alive.
+///
+/// Used by kernel-side facades that need to validate the provenance of a
+/// service registration (e.g. `kernel::blk::remote::is_registered` must
+/// check that whoever registered `nvme.block` is a supervised driver
+/// process, not an arbitrary ring-3 task that grabbed the name first).
+/// Returns `None` if no task with the given id exists.
+pub fn pid_for_task_id(task_id: TaskId) -> Option<u32> {
+    let sched = SCHEDULER.lock();
+    sched.tasks.iter().find(|t| t.id == task_id).map(|t| t.pid)
+}
+
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;

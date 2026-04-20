@@ -96,6 +96,35 @@ const NEG_EFAULT: isize = -14;
 /// on its `.conf` side. For B.1 the tag is shared by every ring-3 driver.
 const RING3_DRIVER_TAG: &str = "ring3-driver";
 
+/// Exec-path prefix that identifies a process as a ring-3 device driver.
+///
+/// The userspace init (`userspace/init`) stages driver binaries under
+/// `/drivers/` on the initrd and classifies services whose `command`
+/// starts with this prefix as drivers (see `init`'s `driver.registered`
+/// event). The kernel-side claim gate mirrors that classification: a
+/// process whose `exec_path` starts with `/drivers/` is authorized to
+/// call `sys_device_claim`. Other processes are rejected with `-EACCES`.
+///
+/// `exec_path` is written by the kernel during `execve`, so a ring-3
+/// process cannot forge it. This is the minimum bar until the Phase 48
+/// credential system lands — at which point this lookup is replaced by
+/// the real policy decision point.
+const DRIVER_EXEC_PATH_PREFIX: &str = "/drivers/";
+
+/// Whether `pid` is authorized to claim PCI devices via `sys_device_claim`.
+///
+/// Returns `true` when the process's recorded `exec_path` starts with
+/// [`DRIVER_EXEC_PATH_PREFIX`]. A missing process entry (e.g. kernel task
+/// context where `pid == 0`) is treated as unauthorized — those callers
+/// should use the in-kernel `claim_pci_device_by_bdf` directly.
+fn is_authorized_driver_process(pid: Pid) -> bool {
+    let table = crate::process::PROCESS_TABLE.lock();
+    match table.find(pid) {
+        Some(p) => p.exec_path.starts_with(DRIVER_EXEC_PATH_PREFIX),
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry state
 // ---------------------------------------------------------------------------
@@ -163,6 +192,23 @@ impl DeviceHostRegistry {
         let before = self.slots.len();
         self.slots.retain(|s| s.pid != pid);
         before - self.slots.len()
+    }
+
+    /// Release exactly one claim, identified by `(pid, key)`. Returns `true`
+    /// if the slot was present and removed, `false` otherwise.
+    ///
+    /// Used by [`sys_device_claim`] to unwind a failed capability-table
+    /// insertion without disturbing any other claim the same PID already
+    /// holds. Using `release_for_pid` at that point would tear down every
+    /// unrelated claim (and leave their derived MMIO/DMA/IRQ state stranded,
+    /// because the full cascade is skipped).
+    fn release_single(&mut self, pid: Pid, key: DeviceCapKey) -> bool {
+        if self.core.release(pid, key).is_err() {
+            return false;
+        }
+        let before = self.slots.len();
+        self.slots.retain(|s| !(s.pid == pid && s.key == key));
+        before != self.slots.len()
     }
 
     /// Find the `ClaimSlot` owned by `pid` for `key`, if any.
@@ -543,16 +589,13 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
         None => return NEG_ESRCH,
     };
 
-    // FIXME(phase-48): enforce the Phase 48 credential gate — only drivers
-    // spawned under the `driver` policy should be permitted to claim
-    // devices. Phase 48 credentials are not yet exposed through a policy
-    // decision point (see `kernel_core::cred`), so for B.1 the gate is
-    // syntactically present (this block) but always permissive. The
-    // acceptance contract is: when Phase 48 lands, flip `false` to the
-    // real cred check and EACCES will start firing on unauthorized
-    // callers without any other change in this file.
-    #[allow(clippy::overly_complex_bool_expr)]
-    if false {
+    // Authorization gate — fail closed. Only processes spawned as ring-3
+    // drivers (exec_path under `/drivers/`) may claim PCI devices. Phase
+    // 48 credentials will later replace this check with a real policy
+    // decision point; until then the exec-path prefix is the durable
+    // signal init uses to classify drivers, and the kernel sets
+    // `exec_path` on `execve` so ring-3 cannot forge it.
+    if !is_authorized_driver_process(pid) {
         return NEG_EACCES;
     }
 
@@ -605,18 +648,16 @@ pub fn sys_device_claim(segment: u16, bus: u8, dev: u8, func: u8) -> isize {
         Ok(h) => h,
         Err(_) => {
             // Unwind: the caller could not receive the capability — drop
-            // the registry entry so the device is not left orphaned. A
+            // the registry entry for *this* claim only. We must not call
+            // `release_for_pid`, which would revoke every unrelated claim
+            // the same PID already holds and leave their derived MMIO /
+            // DMA / IRQ state stranded (the full teardown cascade runs in
+            // `release_claims_for_pid`, not here). Removing only the
+            // just-inserted key lets other in-use claims survive; a
             // subsequent claim attempt from the same or another process
-            // can succeed.
+            // can still succeed against the freed BDF.
             let mut reg = DEVICE_HOST_REGISTRY.lock();
-            let _freed = reg.release_for_pid(pid);
-            // Note: release_for_pid frees *every* claim for pid, which is
-            // correct here because any prior successful claim this pid
-            // held would also have an installed capability; unwinding the
-            // current one while leaving others is not observable because
-            // the cap-table insertion failed and therefore `pid` cannot
-            // make progress. In the common case pid has exactly one
-            // claim (the one we just inserted).
+            let _ = reg.release_single(pid, key);
             return NEG_ENOMEM;
         }
     };
