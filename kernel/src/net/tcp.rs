@@ -2,6 +2,7 @@
 //! connection state machine and global state remain in kernel.
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::arp::Ipv4Addr;
@@ -9,6 +10,35 @@ use super::ipv4::{self, Ipv4Header};
 
 pub use kernel_core::net::tcp::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, TcpHeader};
 use kernel_core::net::tcp::{TcpBuildParams, build, parse};
+
+/// Outbound TCP segments queued during `handle_segment` or other state-machine
+/// methods that run under `TCP_CONNS.lock()`. Sending must happen AFTER the
+/// lock is released: `ipv4::send` calls into ARP, virtio-net / RemoteNic and
+/// allocates, and any of those paths may reacquire locks in an order that
+/// would deadlock if held alongside `TCP_CONNS`. The cap of 2 covers the
+/// worst case (Established with both data-ACK and FIN-ACK in one packet).
+#[derive(Default)]
+struct PendingTx {
+    items: [Option<(Ipv4Addr, Vec<u8>)>; 2],
+}
+
+impl PendingTx {
+    fn push(&mut self, dst: Ipv4Addr, bytes: Vec<u8>) {
+        for slot in &mut self.items {
+            if slot.is_none() {
+                *slot = Some((dst, bytes));
+                return;
+            }
+        }
+        log::warn!("[tcp] PendingTx overflow — outbound segment dropped");
+    }
+
+    fn flush(self) {
+        for slot in self.items.into_iter().flatten() {
+            ipv4::send(slot.0, ipv4::PROTO_TCP, &slot.1);
+        }
+    }
+}
 
 // ===========================================================================
 // TCP State
@@ -79,13 +109,16 @@ impl TcpConnection {
         }
     }
 
-    fn send_segment(&self, flags: u8, payload: &[u8]) {
+    /// Build an outbound TCP segment and queue it on `pending`. The caller
+    /// must call `pending.flush()` after dropping `TCP_CONNS.lock()` —
+    /// never send while the lock is held (see `PendingTx` docs).
+    fn queue_segment(&self, pending: &mut PendingTx, flags: u8, payload: &[u8]) {
         let p = self.build_params(flags);
         let seg = build(&p, payload);
-        ipv4::send(self.remote_ip, ipv4::PROTO_TCP, &seg);
+        pending.push(self.remote_ip, seg);
     }
 
-    fn connect(&mut self, remote_ip: Ipv4Addr, remote_port: u16) {
+    fn connect(&mut self, remote_ip: Ipv4Addr, remote_port: u16, pending: &mut PendingTx) {
         self.remote_ip = remote_ip;
         self.remote_port = remote_port;
         self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
@@ -102,7 +135,7 @@ impl TcpConnection {
             window: self.rcv_wnd,
         };
         let syn = build(&p, &[]);
-        ipv4::send(self.remote_ip, ipv4::PROTO_TCP, &syn);
+        pending.push(self.remote_ip, syn);
         self.snd_nxt = self.snd_nxt.wrapping_add(1);
         self.state = TcpState::SynSent;
 
@@ -120,18 +153,18 @@ impl TcpConnection {
         self.state = TcpState::Listen;
     }
 
-    fn tcp_send(&mut self, data: &[u8]) {
+    fn tcp_send(&mut self, data: &[u8], pending: &mut PendingTx) {
         if self.state != TcpState::Established {
             return;
         }
-        self.send_segment(TCP_ACK | TCP_PSH, data);
+        self.queue_segment(pending, TCP_ACK | TCP_PSH, data);
         self.snd_nxt = self.snd_nxt.wrapping_add(data.len() as u32);
     }
 
-    fn close(&mut self) {
+    fn close(&mut self, pending: &mut PendingTx) {
         match self.state {
             TcpState::Established | TcpState::CloseWait => {
-                self.send_segment(TCP_FIN | TCP_ACK, &[]);
+                self.queue_segment(pending, TCP_FIN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
                 self.state = if self.state == TcpState::Established {
                     TcpState::FinWait1
@@ -143,7 +176,7 @@ impl TcpConnection {
         }
     }
 
-    fn handle_segment(&mut self, header: &TcpHeader, payload: &[u8]) {
+    fn handle_segment(&mut self, header: &TcpHeader, payload: &[u8], pending: &mut PendingTx) {
         if header.flags & TCP_RST != 0 {
             log::info!("[tcp] RST received — connection closed");
             self.state = TcpState::Closed;
@@ -159,7 +192,7 @@ impl TcpConnection {
                 self.rcv_nxt = header.seq.wrapping_add(1);
                 self.snd_una = header.ack;
                 self.snd_wnd = header.window;
-                self.send_segment(TCP_ACK, &[]);
+                self.queue_segment(pending, TCP_ACK, &[]);
                 self.state = TcpState::Established;
                 log::info!("[tcp] connection established (active)");
             }
@@ -168,7 +201,7 @@ impl TcpConnection {
                 self.rcv_nxt = header.seq.wrapping_add(1);
                 self.snd_nxt = crate::arch::x86_64::interrupts::tick_count() as u32;
                 self.snd_una = self.snd_nxt;
-                self.send_segment(TCP_SYN | TCP_ACK, &[]);
+                self.queue_segment(pending, TCP_SYN | TCP_ACK, &[]);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
                 self.state = TcpState::SynReceived;
                 log::debug!("[tcp] SYN-ACK sent (passive open)");
@@ -187,11 +220,11 @@ impl TcpConnection {
                 if !payload.is_empty() && header.seq == self.rcv_nxt {
                     self.recv_buf.extend(payload);
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
-                    self.send_segment(TCP_ACK, &[]);
+                    self.queue_segment(pending, TCP_ACK, &[]);
                 }
                 if has_fin {
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.send_segment(TCP_ACK, &[]);
+                    self.queue_segment(pending, TCP_ACK, &[]);
                     self.state = TcpState::CloseWait;
                     log::debug!("[tcp] FIN received → CloseWait");
                 }
@@ -200,7 +233,7 @@ impl TcpConnection {
                 self.snd_una = header.ack;
                 if has_fin {
                     self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    self.send_segment(TCP_ACK, &[]);
+                    self.queue_segment(pending, TCP_ACK, &[]);
                     self.state = TcpState::TimeWait;
                 } else {
                     self.state = TcpState::FinWait2;
@@ -208,7 +241,7 @@ impl TcpConnection {
             }
             TcpState::FinWait2 if has_fin => {
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                self.send_segment(TCP_ACK, &[]);
+                self.queue_segment(pending, TCP_ACK, &[]);
                 self.state = TcpState::TimeWait;
                 log::debug!("[tcp] FIN received in FinWait2 → TimeWait");
             }
@@ -257,12 +290,16 @@ pub fn create(local_port: u16) -> Option<usize> {
 }
 
 pub fn connect(conn_idx: usize, remote_ip: Ipv4Addr, remote_port: u16) {
-    let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx)
-        && let Some(conn) = slot.as_mut()
+    let mut pending = PendingTx::default();
     {
-        conn.connect(remote_ip, remote_port);
+        let mut conns = TCP_CONNS.lock();
+        if let Some(slot) = conns.conns.get_mut(conn_idx)
+            && let Some(conn) = slot.as_mut()
+        {
+            conn.connect(remote_ip, remote_port, &mut pending);
+        }
     }
+    pending.flush();
 }
 
 pub fn listen(conn_idx: usize) {
@@ -275,12 +312,16 @@ pub fn listen(conn_idx: usize) {
 }
 
 pub fn send(conn_idx: usize, data: &[u8]) {
-    let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx)
-        && let Some(conn) = slot.as_mut()
+    let mut pending = PendingTx::default();
     {
-        conn.tcp_send(data);
+        let mut conns = TCP_CONNS.lock();
+        if let Some(slot) = conns.conns.get_mut(conn_idx)
+            && let Some(conn) = slot.as_mut()
+        {
+            conn.tcp_send(data, &mut pending);
+        }
     }
+    pending.flush();
 }
 
 pub fn recv(conn_idx: usize, buf: &mut [u8]) -> usize {
@@ -307,12 +348,16 @@ pub fn state(conn_idx: usize) -> TcpState {
 }
 
 pub fn close(conn_idx: usize) {
-    let mut conns = TCP_CONNS.lock();
-    if let Some(slot) = conns.conns.get_mut(conn_idx)
-        && let Some(conn) = slot.as_mut()
+    let mut pending = PendingTx::default();
     {
-        conn.close();
+        let mut conns = TCP_CONNS.lock();
+        if let Some(slot) = conns.conns.get_mut(conn_idx)
+            && let Some(conn) = slot.as_mut()
+        {
+            conn.close(&mut pending);
+        }
     }
+    pending.flush();
 }
 
 pub fn destroy(conn_idx: usize) {
@@ -384,44 +429,59 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
         None => return,
     };
 
-    let mut conns = TCP_CONNS.lock();
+    // Outputs computed under the lock; actual sends + socket wakes happen
+    // after `drop(conns)` so the ARP / NIC / allocator paths never run
+    // with `TCP_CONNS` held.
+    let mut pending = PendingTx::default();
+    let mut wake_slot: Option<usize> = None;
+    let mut send_rst = false;
 
-    // First pass: prefer exact (established) match over listen match.
-    // This prevents a listen socket on the same port from stealing
-    // data segments destined for an established connection.
-    let mut listen_idx: Option<usize> = None;
-    for (i, conn) in conns.conns.iter_mut().enumerate() {
-        let conn = match conn.as_mut() {
-            Some(c) => c,
-            None => continue,
-        };
-        let port_match = conn.local_port == tcp_hdr.dst_port;
-        if !port_match {
-            continue;
-        }
-        let full_match = conn.remote_ip == ip_header.src && conn.remote_port == tcp_hdr.src_port;
-        if full_match {
-            conn.handle_segment(&tcp_hdr, tcp_data);
-            drop(conns);
-            super::wake_sockets_for_tcp_slot(i);
-            return;
-        }
-        if conn.state == TcpState::Listen && listen_idx.is_none() {
-            listen_idx = Some(i);
-        }
-    }
-    // No established match — fall back to listen socket (for SYN).
-    if let Some(idx) = listen_idx
-        && let Some(conn) = conns.conns[idx].as_mut()
     {
-        conn.remote_ip = ip_header.src;
-        conn.handle_segment(&tcp_hdr, tcp_data);
-        drop(conns);
-        super::wake_sockets_for_tcp_slot(idx);
-        return;
+        let mut conns = TCP_CONNS.lock();
+
+        // First pass: prefer exact (established) match over listen match.
+        // This prevents a listen socket on the same port from stealing
+        // data segments destined for an established connection.
+        let mut listen_idx: Option<usize> = None;
+        let mut matched = false;
+        for (i, conn) in conns.conns.iter_mut().enumerate() {
+            let conn = match conn.as_mut() {
+                Some(c) => c,
+                None => continue,
+            };
+            let port_match = conn.local_port == tcp_hdr.dst_port;
+            if !port_match {
+                continue;
+            }
+            let full_match =
+                conn.remote_ip == ip_header.src && conn.remote_port == tcp_hdr.src_port;
+            if full_match {
+                conn.handle_segment(&tcp_hdr, tcp_data, &mut pending);
+                wake_slot = Some(i);
+                matched = true;
+                break;
+            }
+            if conn.state == TcpState::Listen && listen_idx.is_none() {
+                listen_idx = Some(i);
+            }
+        }
+        if !matched {
+            // No established match — fall back to listen socket (for SYN).
+            if let Some(idx) = listen_idx
+                && let Some(conn) = conns.conns[idx].as_mut()
+            {
+                conn.remote_ip = ip_header.src;
+                conn.handle_segment(&tcp_hdr, tcp_data, &mut pending);
+                wake_slot = Some(idx);
+                matched = true;
+            }
+        }
+        if !matched && tcp_hdr.flags & TCP_RST == 0 {
+            send_rst = true;
+        }
     }
 
-    if tcp_hdr.flags & TCP_RST == 0 {
+    if send_rst {
         let local_ip = super::config::our_ip();
         let has_ack = tcp_hdr.flags & TCP_ACK != 0;
 
@@ -446,6 +506,14 @@ pub fn handle_tcp(ip_header: &Ipv4Header, payload: &[u8]) {
             window: 0,
         };
         let rst = build(&p, &[]);
-        ipv4::send(ip_header.src, ipv4::PROTO_TCP, &rst);
+        pending.push(ip_header.src, rst);
+    }
+
+    // Flush outbound segments with the lock released so ARP / NIC / heap
+    // paths cannot deadlock against `TCP_CONNS`.
+    pending.flush();
+
+    if let Some(idx) = wake_slot {
+        super::wake_sockets_for_tcp_slot(idx);
     }
 }
