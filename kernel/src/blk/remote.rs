@@ -161,24 +161,18 @@ pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(
     // If the driver is already mid-restart on entry, wait for it first.
     // On timeout, surface DriverRestarting so the caller can distinguish
     // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
-    if REMOTE_BLOCK.lock().state.is_restarting() {
-        match wait_for_driver_restart() {
-            WaitOutcome::Ready => {}
-            WaitOutcome::TimedOut | WaitOutcome::Waiting => {
-                return Err(BlockDriverError::DriverRestarting.to_byte());
-            }
-        }
+    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     // Attempt the IPC call; on failure wait + retry once.
     match do_read_ipc(start_sector, count, buf) {
         Ok(()) => Ok(()),
         Err(_) => {
             on_ipc_error();
-            match wait_for_driver_restart() {
-                WaitOutcome::Ready => do_read_ipc(start_sector, count, buf),
-                WaitOutcome::TimedOut | WaitOutcome::Waiting => {
-                    Err(BlockDriverError::DriverRestarting.to_byte())
-                }
+            if wait_for_driver_restart() {
+                do_read_ipc(start_sector, count, buf)
+            } else {
+                Err(BlockDriverError::DriverRestarting.to_byte())
             }
         }
     }
@@ -266,24 +260,18 @@ pub fn write_sectors(
     // If the driver is already mid-restart on entry, wait for it first.
     // On timeout, surface DriverRestarting so the caller can distinguish
     // "driver still down" from a generic I/O error (Phase 55b Track F.2b).
-    if REMOTE_BLOCK.lock().state.is_restarting() {
-        match wait_for_driver_restart() {
-            WaitOutcome::Ready => {}
-            WaitOutcome::TimedOut | WaitOutcome::Waiting => {
-                return Err(BlockDriverError::DriverRestarting.to_byte());
-            }
-        }
+    if REMOTE_BLOCK.lock().state.is_restarting() && !wait_for_driver_restart() {
+        return Err(BlockDriverError::DriverRestarting.to_byte());
     }
     // Attempt the IPC call; on failure wait + retry once.
     match do_write_ipc(start_sector, count, buf, payload_grant) {
         Ok(()) => Ok(()),
         Err(_) => {
             on_ipc_error();
-            match wait_for_driver_restart() {
-                WaitOutcome::Ready => do_write_ipc(start_sector, count, buf, payload_grant),
-                WaitOutcome::TimedOut | WaitOutcome::Waiting => {
-                    Err(BlockDriverError::DriverRestarting.to_byte())
-                }
+            if wait_for_driver_restart() {
+                do_write_ipc(start_sector, count, buf, payload_grant)
+            } else {
+                Err(BlockDriverError::DriverRestarting.to_byte())
             }
         }
     }
@@ -354,8 +342,13 @@ fn on_ipc_error() {
 /// was false, or because an IPC call returned a failure sentinel). The function
 /// polls `is_restarting()` at each scheduler yield until either:
 ///
-/// - The flag clears → returns `WaitOutcome::Ready` (caller should retry IPC).
-/// - The budget expires → returns `WaitOutcome::TimedOut` (caller returns EIO).
+/// - The flag clears → returns `true` (caller should retry IPC).
+/// - The budget expires → returns `false` (caller returns `DriverRestarting`).
+///
+/// The pure-logic [`WaitOutcome::Waiting`] variant never escapes this loop —
+/// it is the keep-yielding signal, which is why callers only see a two-way
+/// ready/timed-out decision. Folding that into a `bool` at this boundary makes
+/// the call sites exhaustive without unreachable match arms.
 ///
 /// **Lock discipline:** the `REMOTE_BLOCK` mutex is acquired only for a brief
 /// snapshot on each iteration and is released before `yield_now()`. This
@@ -366,7 +359,7 @@ fn on_ipc_error() {
 /// monotonically increasing u64 at 1 tick per millisecond (1000 Hz BSP timer).
 /// The restart-deadline budget is read once at the start of the wait from
 /// `state.restart_deadline_ms` (defaults to `DRIVER_RESTART_TIMEOUT_MS`).
-fn wait_for_driver_restart() -> WaitOutcome {
+fn wait_for_driver_restart() -> bool {
     // Snapshot the restart budget without holding the lock across yields.
     let budget_ms = {
         let g = REMOTE_BLOCK.lock();
@@ -382,8 +375,8 @@ fn wait_for_driver_restart() -> WaitOutcome {
             !g.state.is_restarting()
         };
         match BlockDispatchState::check_restart_wait(now_tick, deadline_tick, is_ready) {
-            WaitOutcome::Ready => return WaitOutcome::Ready,
-            WaitOutcome::TimedOut => return WaitOutcome::TimedOut,
+            WaitOutcome::Ready => return true,
+            WaitOutcome::TimedOut => return false,
             // Within budget, driver still absent: yield and retry.
             WaitOutcome::Waiting => {
                 scheduler::yield_now();

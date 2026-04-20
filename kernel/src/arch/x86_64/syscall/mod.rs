@@ -1633,7 +1633,12 @@ pub extern "C" fn syscall_handler(
             }
         }
         SYS_DEVICE_IRQ_SUBSCRIBE => {
-            // Signature: sys_device_irq_subscribe(dev_cap: CapHandle, vector_hint: u32, notification_index: u32) -> isize.
+            // Signature (Track B.4b): sys_device_irq_subscribe(dev_cap: CapHandle, bit_index: u32, notification_arg: u32) -> isize.
+            // `bit_index` selects the bit (0..=63) within the 64-bit Notification
+            // word the ISR will set. `notification_arg` is either
+            // `NOTIFICATION_SENTINEL_NEW` (allocate a fresh Notification) or a
+            // `CapHandle` to an existing `Capability::Notification` the caller
+            // holds. See `kernel/src/syscall/device_host.rs` for full ABI docs.
             if arg0 > u64::from(u32::MAX)
                 || arg1 > u64::from(u32::MAX)
                 || arg2 > u64::from(u32::MAX)

@@ -320,13 +320,22 @@ fn parse_u64_prefix(s: &[u8]) -> Option<u64> {
     if any { Some(val) } else { None }
 }
 
-/// Extract the `pid=<N>` value from a status file line for the given service.
+/// Extract the `pid=<N>` value from a status file line for the given service,
+/// but only when the service is in the `running` state.
 ///
 /// Status-file line format (written by init):
 ///   `<name> <status> pid=<N> restarts=<N> changed=<N>`
 ///
-/// Returns the PID as `i32`, or `None` if the line doesn't belong to
-/// `name` or if the `pid=` field is absent / zero.
+/// `<status>` can be `never-started`, `starting`, `running`, `stopping`,
+/// `stopped:<code>`, `permanently-stopped`, or `disabled`. Only `running`
+/// implies the recorded PID is live — other states may leave a stale `pid=`
+/// behind for a window until init's next status write, and acting on those
+/// PIDs risks SIGKILL-ing an unrelated process that later reused the PID.
+/// `service kill` is a Phase 55b Track F.2 crash-and-restart test helper,
+/// so refusing anything but `running` keeps it targeted.
+///
+/// Returns the PID as `i32`, or `None` if the line doesn't belong to `name`,
+/// if the service is not `running`, or if the `pid=` field is absent / zero.
 fn extract_pid_from_status(text: &str, name: &str) -> Option<i32> {
     for line in text.split('\n') {
         // Using `?` on `strip_prefix` would short-circuit the whole
@@ -340,8 +349,15 @@ fn extract_pid_from_status(text: &str, name: &str) -> Option<i32> {
         }
         // Init separates fields with a single space today but the prefix
         // check above already accepts tab, so tolerate tab-separated
-        // fields here too.
-        for field in line.split_whitespace() {
+        // fields here too. The second whitespace token after the name is
+        // the status field; anything other than "running" is refused here.
+        let mut fields = line.split_whitespace();
+        let _name_tok = fields.next()?;
+        let status_tok = fields.next()?;
+        if status_tok != "running" {
+            return None;
+        }
+        for field in fields {
             if let Some(val_str) = field.strip_prefix("pid=") {
                 let pid_u64 = parse_u64_prefix(val_str.as_bytes())?;
                 if pid_u64 == 0 || pid_u64 > i32::MAX as u64 {
@@ -385,7 +401,7 @@ fn cmd_kill(name: &str) -> i32 {
         None => {
             write_str(STDERR_FILENO, "service: '");
             write_str(STDERR_FILENO, name);
-            write_str(STDERR_FILENO, "' not found or not running (pid=0)\n");
+            write_str(STDERR_FILENO, "' not found, not running, or pid=0\n");
             return 1;
         }
     };
