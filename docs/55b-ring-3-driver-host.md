@@ -230,8 +230,18 @@ planning gap rather than an implementation failure.
 
 - [Phase 55b roadmap doc](./roadmap/55b-ring-3-driver-host.md)
 - [Phase 55b task doc](./roadmap/tasks/55b-ring-3-driver-host-tasks.md)
+- [Phase 55b residuals — scheduling record](./appendix/phase-55b-residuals.md) (two follow-ups that surfaced during closure)
 
 ## Deferred or Later-Phase Topics
+
+> **Note:** Two concrete follow-ups discovered during the Phase 55b closure
+> pass — `sys_net_send` for userspace-observable EAGAIN (owner: Phase 60)
+> and the IOMMU VT-d MMIO translation bug (owner: Phase 55a follow-up,
+> must-fix before Phase 58) — are tracked separately in
+> [`docs/appendix/phase-55b-residuals.md`](./appendix/phase-55b-residuals.md)
+> so they can be scheduled against their real owners rather than left
+> implicit here.
+
 
 - **VirtIO-blk / VirtIO-net extraction** — Phase 57 extracts these using the
   Track B and C machinery established here.

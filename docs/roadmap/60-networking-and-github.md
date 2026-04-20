@@ -117,6 +117,10 @@ The GitHub CLI is a useful test because it exercises authenticated HTTPS, API ac
 - The goal is not to duplicate a modern Linux workstation; it is to support a small, credible remote developer workflow.
 - Strong trust boundaries matter even more once the system starts handling real authenticated network traffic.
 
+## Inherited Follow-ups from Earlier Phases
+
+- **Phase 55b `sys_net_send` EAGAIN surfacing** — the Phase 55b `RemoteNic::send_frame` facade returns `NetDriverError::DriverRestarting` to kernel-side callers, but no userspace-observable surface exists for a `sendto()` to see that EAGAIN. Candidate owner per [`docs/appendix/phase-55b-residuals.md`](../appendix/phase-55b-residuals.md) (item R1). Closing this unblocks one `#[ignore]` stub in `kernel-core/tests/driver_restart.rs` and lets `userspace/e1000-crash-smoke/` assert end-to-end mid-restart behaviour. Not must-fix-before-1.0; a "known limitation" note in Phase 58 is acceptable.
+
 ## Deferred Until Later
 
 - Full workstation-grade browser and GUI networking stack
