@@ -645,4 +645,111 @@ mod tests {
             "is_ready=true takes priority over expired deadline"
         );
     }
+
+    // ---- Lazy-lookup state machine (Phase 55b-wire) --------------------------
+    //
+    // These tests exercise the pure-logic side of the lazy-registration path
+    // implemented in `kernel/src/blk/remote.rs::is_registered()`.
+    // They simulate the decision tree without a running kernel, IPC registry,
+    // or scheduler.
+
+    /// Before any registration the state must report unregistered regardless of
+    /// how many times it is queried — there must be no side-effects from repeated
+    /// "cold path" calls.
+    #[test]
+    fn lazy_lookup_cold_path_is_idempotent_without_registry() {
+        let s = BlockDispatchState::new();
+        // Without a registry entry the cold path finds nothing and leaves the
+        // state unchanged.  `is_registered` must remain false.
+        assert!(!s.is_registered());
+        assert!(!s.is_registered());
+        assert!(!s.is_registered());
+    }
+
+    /// Once `register` is called (simulating a successful registry lookup) the
+    /// state must immediately report registered and continue to do so.
+    #[test]
+    fn lazy_lookup_transitions_to_registered_after_one_register_call() {
+        let mut s = BlockDispatchState::new();
+        // Simulate the cold-path finding the endpoint in the registry and
+        // calling `s.register("nvme0")`.
+        assert!(!s.is_registered(), "must start unregistered");
+        s.register("nvme0");
+        assert!(
+            s.is_registered(),
+            "must be registered after one register call"
+        );
+        // Subsequent reads must be stable (fast path in the real code).
+        assert!(s.is_registered());
+    }
+
+    /// Dispatch routing must flip from VirtIO to remote exactly once
+    /// (simulating the lazy endpoint install).
+    #[test]
+    fn lazy_lookup_routing_flips_from_virtio_to_remote_on_first_registration() {
+        let mut s = BlockDispatchState::new();
+
+        // --- Cold path: endpoint not yet published by the driver. ---
+        // `check_dispatch` returns NotRegistered → block layer uses VirtIO.
+        assert_eq!(
+            s.check_dispatch(false),
+            Err(RemoteDeviceError::NotRegistered),
+            "before lazy lookup: dispatch must fall through to VirtIO"
+        );
+
+        // --- Driver publishes its endpoint; lazy lookup installs it. ---
+        // This is what `is_registered()` does internally on the cold path
+        // when `registry::lookup_endpoint_id("nvme.block")` returns Some(_).
+        s.register("nvme0");
+
+        // Now `check_dispatch` returns Ok → block layer forwards via IPC.
+        assert_eq!(
+            s.check_dispatch(false),
+            Ok(()),
+            "after lazy lookup: dispatch must route to remote driver"
+        );
+    }
+
+    /// After lazy registration a driver restart must not un-register the device
+    /// name — `is_registered()` must remain true even during the restart window.
+    #[test]
+    fn lazy_lookup_registered_name_survives_mark_restarting() {
+        let mut s = BlockDispatchState::new();
+        s.register("nvme0");
+        s.mark_restarting();
+        // Device name is still present; only the restarting flag is set.
+        assert!(
+            s.is_registered(),
+            "device name must survive mark_restarting"
+        );
+        assert!(s.is_restarting());
+        // Once the service manager calls mark_ready (or re-registers), the
+        // facade should recover cleanly.
+        s.mark_ready();
+        assert!(!s.is_restarting());
+        assert_eq!(
+            s.check_dispatch(false),
+            Ok(()),
+            "after mark_ready dispatch must succeed again"
+        );
+    }
+
+    /// Re-registering with the same name after a restart must clear the
+    /// restarting flag — this is the service manager's re-register path.
+    #[test]
+    fn lazy_lookup_re_register_after_restart_clears_restarting_and_routes_remote() {
+        let mut s = BlockDispatchState::new();
+        s.register("nvme0");
+        s.mark_restarting();
+        assert!(s.is_restarting());
+
+        // Service manager brings the driver back up and calls register again.
+        s.register("nvme0");
+        assert!(!s.is_restarting(), "re-register must clear restarting flag");
+        assert_eq!(
+            s.check_dispatch(false),
+            Ok(()),
+            "re-registered driver must route to remote"
+        );
+    }
 }
