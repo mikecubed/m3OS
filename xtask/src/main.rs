@@ -4446,20 +4446,16 @@ fn device_smoke_script_nvme() -> Vec<SmokeStep> {
 
 /// Expect-style smoke script for `--device e1000`.
 ///
-/// Phase 55b F.4b — link-state confirmation + honest ICMP/TCP skip:
+/// Phase 55b Track E.3b — link-state confirmation + server-loop entry:
 ///
 /// 1. Waits for the kernel first-message.
 /// 2. Waits for init to register the e1000_driver service config.
 /// 3. Waits for `E1000_SMOKE:link:PASS` — emitted by e1000_driver after
 ///    bring-up confirms link state (up or transitioning).
-///
-/// ICMP echo and TCP connect are deferred: the full TX/RX server loop that
-/// would send and receive Ethernet frames lands in Track E.3; until that
-/// track completes the driver exits after bring-up and emits honest-skip
-/// sentinels (`E1000_SMOKE:icmp:SKIP`, `E1000_SMOKE:tcp:SKIP`).  The skip
-/// markers are present in the driver source so the smoke harness can grep
-/// for them but this script does not block on them — a wait for a
-/// per-boot SKIP sentinel would just race with the bring-up log.
+/// 4. Waits for `E1000_SMOKE:server:READY` — emitted immediately before the
+///    driver enters its IRQ / IPC server loop (Track E.3b).  This replaces
+///    the old deferred `icmp:SKIP` marker: the driver no longer exits after
+///    bring-up, so a clean post-bring-up exit is no longer the observable.
 fn device_smoke_script_e1000() -> Vec<SmokeStep> {
     vec![
         SmokeStep::Wait {
@@ -4476,6 +4472,11 @@ fn device_smoke_script_e1000() -> Vec<SmokeStep> {
             pattern: "E1000_SMOKE:link:PASS",
             timeout_secs: 90,
             label: "wait for e1000_driver link-state confirmation at bring-up",
+        },
+        SmokeStep::Wait {
+            pattern: "E1000_SMOKE:server:READY",
+            timeout_secs: 10,
+            label: "wait for e1000_driver to enter its IRQ/IPC server loop (Track E.3b)",
         },
     ]
 }
@@ -9399,9 +9400,10 @@ mod tests {
         );
     }
 
-    /// `device_smoke_script_e1000` must contain a Wait step for
-    /// `E1000_SMOKE:link:PASS` — the sentinel the e1000_driver prints
-    /// when initial bring-up reports link up.
+    /// `device_smoke_script_e1000` must contain Wait steps for both
+    /// `E1000_SMOKE:link:PASS` and `E1000_SMOKE:server:READY` — the
+    /// sentinel the e1000_driver prints when initial bring-up reports
+    /// link up and when it enters the IRQ / IPC server loop (Track E.3b).
     #[test]
     fn e1000_smoke_script_asserts_link_pass() {
         let source = workspace_file("xtask/src/main.rs");
@@ -9417,13 +9419,20 @@ mod tests {
              `E1000_SMOKE:link:PASS` — printed by e1000_driver after \
              link-up is confirmed at bring-up"
         );
+        assert!(
+            fn_window.contains("E1000_SMOKE:server:READY"),
+            "device_smoke_script_e1000() must include a Wait step for \
+             `E1000_SMOKE:server:READY` — printed by e1000_driver immediately \
+             before entering the IRQ / IPC server loop (Track E.3b)"
+        );
     }
 
-    /// The e1000_driver source must contain the `E1000_SMOKE:link:PASS`
-    /// sentinel it is expected to emit when link is up after bring-up,
-    /// plus an honest-skip sentinel for ICMP (deferred until E.3).
+    /// Track E.3b: the e1000_driver source must emit `E1000_SMOKE:link:PASS`
+    /// at bring-up and `E1000_SMOKE:server:READY` immediately before entering
+    /// the IRQ / IPC server loop.  The `icmp:SKIP` deferred marker is retired
+    /// now that the full loop is live.
     #[test]
-    fn e1000_driver_source_emits_link_and_icmp_sentinels() {
+    fn e1000_driver_source_emits_link_and_server_ready_sentinels() {
         let source = workspace_file("userspace/drivers/e1000/src/main.rs");
         assert!(
             source.contains("E1000_SMOKE:link:PASS"),
@@ -9431,10 +9440,15 @@ mod tests {
              initial link-up is confirmed at bring-up"
         );
         assert!(
-            source.contains("E1000_SMOKE:icmp:SKIP"),
-            "e1000_driver main.rs must emit `E1000_SMOKE:icmp:SKIP` \
-             (honest-skip with reason) until the full TX/RX server loop \
-             lands in Track E.3"
+            source.contains("E1000_SMOKE:server:READY"),
+            "e1000_driver main.rs must emit `E1000_SMOKE:server:READY` \
+             immediately before entering the IRQ / IPC server loop (Track E.3b)"
+        );
+        assert!(
+            !source.contains("E1000_SMOKE:icmp:SKIP"),
+            "e1000_driver main.rs must NOT contain the deferred `icmp:SKIP` \
+             sentinel once the server loop is live — remove it to keep smoke \
+             expectations coherent"
         );
     }
 }

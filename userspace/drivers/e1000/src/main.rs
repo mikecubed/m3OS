@@ -1,19 +1,23 @@
 //! Phase 55b Track E — ring-3 e1000 driver.
 //!
-//! Track E.1 landed the crate scaffold. Track E.2 (this commit) ports the
-//! Phase 55 in-kernel E.1/E.2 bring-up path (global reset, MAC read,
-//! TX/RX descriptor rings, RCTL/TCTL programming) onto
-//! `driver_runtime`. The RX/TX hot path + IRQ wiring is Track E.3; the
-//! kernel-facing `RemoteNic` facade is Track E.4. Service-manager
-//! registration is deferred to Track F.1, so today this binary still
-//! exits after a best-effort bring-up — F.1 flips it into a run-forever
-//! daemon.
+//! Track E.1 landed the crate scaffold. Track E.2 ported the Phase 55
+//! in-kernel E.1/E.2 bring-up path (global reset, MAC read, TX/RX
+//! descriptor rings, RCTL/TCTL programming) onto `driver_runtime`.
+//! Track E.3 delivered the pure-logic `io.rs` (IRQ outcome decoding, RX
+//! drain, TX slot handling, link-state atomic) with 51 passing tests.
+//! Track E.3b (this commit) wires the main loop: after bring-up the
+//! driver creates an IPC endpoint, registers it as `"net.nic"`, emits
+//! `E1000_SMOKE:server:READY`, and enters `io::run_io_loop` — a
+//! non-returning IRQ / IPC dispatch loop.  The kernel-facing `RemoteNic`
+//! facade is Track E.4; service-manager re-registration after restarts
+//! is Track F.1.
 //!
-//! Spawning today: the driver writes its boot marker, attempts to
-//! claim the sentinel BDF QEMU uses for `-device e1000`, and if that
-//! succeeds runs the full Track E.2 bring-up. Any failure is logged
-//! and the process exits with a stable non-zero code so F.2's
-//! crash-and-restart regression can observe the outcome.
+//! Run-time flow: the driver writes its boot marker, claims the sentinel
+//! BDF QEMU uses for `-device e1000`, runs the full bring-up state
+//! machine, opens an IPC endpoint, and enters the server loop. Any
+//! bring-up failure is logged and the process exits with a stable
+//! non-zero code so the service manager's restart path (Phase 46 / 51)
+//! observes the failure.
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -25,6 +29,8 @@ extern crate std;
 
 #[cfg(not(test))]
 use core::alloc::Layout;
+#[cfg(not(test))]
+use driver_runtime::ipc::EndpointCap;
 #[cfg(not(test))]
 use syscall_lib::STDOUT_FILENO;
 #[cfg(not(test))]
@@ -64,9 +70,9 @@ pub const BOOT_LOG_MARKER: &str = "e1000_driver: spawned\n";
 /// Sentinel emitted immediately before entering the IRQ / IPC server loop.
 ///
 /// F.4b's `device-smoke --device e1000` script waits for this line to
-/// confirm the driver is live and accepting TX requests — replacing the
-/// old `E1000_SMOKE:icmp:SKIP` deferred marker that signalled a clean
-/// post-bring-up exit without a server loop.
+/// confirm the driver is live and accepting TX requests. Track E.3b
+/// replaces the old deferred post-bring-up exit with a run-forever loop;
+/// this sentinel is the observable boundary between the two phases.
 pub const SERVER_READY_SENTINEL: &str = "E1000_SMOKE:server:READY\n";
 
 /// Service name under which the driver registers its TX endpoint.
@@ -104,22 +110,24 @@ fn program_main(_args: &[&str]) -> i32 {
                 // state is confirmed via the IRQ/LSC path in E.3.
                 syscall_lib::write_str(STDOUT_FILENO, "E1000_SMOKE:link:PASS\n");
             }
-            // Phase 55b F.4b: ICMP echo deferred — the full TX/RX server loop
-            // (Track E.3) is required to send and receive Ethernet frames.
-            // Until that lands this driver exits after bring-up.
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "E1000_SMOKE:icmp:SKIP deferred-no-tx-rx-server\n",
-            );
-            // Phase 55b F.4b: TCP connect deferred for the same reason.
-            syscall_lib::write_str(
-                STDOUT_FILENO,
-                "E1000_SMOKE:tcp:SKIP deferred-no-tx-rx-server\n",
-            );
-            // E.3 replaces this exit with a `notification_wait` loop.
-            // Today we exit zero so F.2's crash regression can observe
-            // a clean post-bring-up exit.
-            0
+            // Track E.3: create the IPC endpoint and register it so the
+            // kernel's RemoteNic facade (Track E.4) can forward TX requests.
+            let ep = syscall_lib::create_endpoint();
+            if ep == u64::MAX {
+                syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: endpoint create failed\n");
+                return 4;
+            }
+            let ep_u32 = (ep & u32::MAX as u64) as u32;
+            let rc = syscall_lib::ipc_register_service(ep_u32, SERVICE_NAME);
+            if rc == u64::MAX {
+                syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: service register failed\n");
+                return 5;
+            }
+            // Sentinel: the driver is live and entering its server loop.
+            // F.4b's device-smoke script waits for this line.
+            syscall_lib::write_str(STDOUT_FILENO, SERVER_READY_SENTINEL);
+            // Enter the IRQ / IPC server loop — never returns.
+            io::run_io_loop(dev, EndpointCap::new(ep_u32))
         }
         Err(init::BringUpError::ResetTimeout) => {
             syscall_lib::write_str(STDOUT_FILENO, "e1000_driver: reset timeout\n");
