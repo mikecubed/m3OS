@@ -75,8 +75,39 @@ pub fn register(endpoint_name: &str, device_name: &str) -> Result<(), ()> {
 }
 
 /// `true` when a remote driver is installed and ready.
+///
+/// On the cold path (no endpoint cached yet) performs a one-shot lookup of
+/// `"nvme.block"` in the IPC service registry.  If the ring-3 NVMe driver
+/// has published its endpoint under that name the facade installs it and
+/// returns `true` — so the block dispatch layer immediately starts routing
+/// through the ring-3 path without any explicit boot-time wiring call.
+///
+/// Subsequent calls are fast: once `g.endpoint` is `Some`, the registry
+/// lookup is skipped entirely.
 pub fn is_registered() -> bool {
-    REMOTE_BLOCK.lock().state.is_registered()
+    // Fast path — already cached.
+    {
+        let g = REMOTE_BLOCK.lock();
+        if g.state.is_registered() {
+            return true;
+        }
+    }
+    // Cold path — attempt a one-shot service-registry lookup.
+    if let Some(ep) = registry::lookup_endpoint_id("nvme.block") {
+        let mut g = REMOTE_BLOCK.lock();
+        // Guard against a race where two callers both hit the cold path.
+        if !g.state.is_registered() {
+            g.state.register("nvme0");
+            g.endpoint = Some(ep);
+            log::info!(
+                "[blk::remote] auto-registered ring-3 NVMe driver via service \
+                 registry ('nvme.block' → endpoint {:?})",
+                ep
+            );
+        }
+        return true;
+    }
+    false
 }
 
 /// Re-register after a driver restart; clears the mid-restart flag.

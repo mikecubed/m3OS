@@ -142,11 +142,45 @@ impl RemoteNic {
 
     /// Return `true` when a ring-3 NIC driver is currently registered.
     ///
-    /// Lock-free — reads the `AtomicBool` with `Acquire` ordering. Safe to
-    /// call from the hot TX path.
-    #[inline]
+    /// Fast path: lock-free `AtomicBool` read with `Acquire` ordering.
+    ///
+    /// Cold path: if the atomic is `false` a one-shot lookup of `"net.nic"` in
+    /// the IPC service registry is attempted.  When the ring-3 e1000 driver has
+    /// published its endpoint under that name, the facade installs it with a
+    /// placeholder MAC (`[0; 6]`) and returns `true`.  The real MAC is filled in
+    /// when the driver emits a `NET_LINK_STATE` IPC message that reaches
+    /// `handle_link_state` → `apply_link_event`, which updates the stored MAC.
+    ///
+    /// After the first successful cold-path lookup all subsequent calls return
+    /// immediately via the atomic.
     pub fn is_registered() -> bool {
-        REMOTE_NIC_REGISTERED.load(Ordering::Acquire)
+        // Fast path.
+        if REMOTE_NIC_REGISTERED.load(Ordering::Acquire) {
+            return true;
+        }
+        // Cold path — one-shot service-registry lookup.
+        if let Some(ep) = crate::ipc::registry::lookup_endpoint_id("net.nic") {
+            {
+                let mut slot = REMOTE_NIC.lock();
+                // Guard against a concurrent cold-path race.
+                if slot.is_none() {
+                    *slot = Some(NicEntry {
+                        endpoint: ep,
+                        mac: [0u8; 6],
+                        tx_queue: VecDeque::new(),
+                    });
+                }
+            }
+            REMOTE_NIC_REGISTERED.store(true, Ordering::Release);
+            RESTART_SUSPECTED.store(false, Ordering::Release);
+            log::info!(
+                "[remote_nic] auto-registered ring-3 e1000 driver via service \
+                 registry ('net.nic' → endpoint {:?}); MAC pending NET_LINK_STATE",
+                ep
+            );
+            return true;
+        }
+        false
     }
 
     /// Return the MAC address of the registered ring-3 NIC, or `None` if no
@@ -342,6 +376,15 @@ impl RemoteNic {
             event.mac[4],
             event.mac[5],
         );
+        // Update the stored MAC so `mac_address()` returns the real hardware
+        // address.  On the lazy-registration path the MAC is initialised to
+        // `[0; 6]`; the first `NET_LINK_STATE` from the driver overwrites it.
+        {
+            let mut slot = REMOTE_NIC.lock();
+            if let Some(entry) = slot.as_mut() {
+                entry.mac = event.mac;
+            }
+        }
         if !event.up {
             // One-line hook: link-down resets TCP retransmit timers per Phase 16.
             super::tcp::on_link_down();
