@@ -228,6 +228,18 @@ pub struct Task {
     /// Counts dispatch/switch cycles for `debug_sshd_fork_child` tasks so logs
     /// can be rate-limited.
     pub debug_sshd_fork_child_cycles: u32,
+    /// Optional tick deadline at which a `Blocked*` task should be force-woken.
+    ///
+    /// `Some(deadline)` when set by `block_current_unless_woken_until`. The
+    /// scheduler's dispatch path (`pick_next`'s caller) scans for blocked
+    /// tasks whose `wake_deadline` is in the past and transitions them to
+    /// `Ready`. `None` for tasks that have no timeout, which is the default.
+    ///
+    /// This is the safe replacement for a timer-ISR wake: the expiry check
+    /// runs inside the scheduler dispatch loop (already holding
+    /// `SCHEDULER.lock`), not from the timer ISR, so there is no same-core
+    /// re-entrance hazard.
+    pub wake_deadline: Option<u64>,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
@@ -271,6 +283,7 @@ impl Task {
             fork_ctx: None,
             debug_sshd_fork_child: false,
             debug_sshd_fork_child_cycles: 0,
+            wake_deadline: None,
             _stack: Some(stack),
         }
     }

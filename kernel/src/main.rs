@@ -640,11 +640,16 @@ fn net_task() -> ! {
             last_wake_failures = wake_failures;
             last_wake_missing_id = wake_missing_id;
         }
-        // Park on the unified flag: the virtio-net ISR and RemoteNic both set
-        // it, so a wake from either path reliably unblocks the task. If an IRQ
-        // fires between the drain-loop exit and the park,
-        // `block_current_unless_woken` observes `NIC_WOKEN` set and returns
-        // immediately without sleeping.
+        // Park on the unified flag: the virtio-net ISR and RemoteNic both
+        // set it, so a wake from either path reliably unblocks the task.
+        //
+        // The timed-wait variant `block_current_unless_woken_until` is
+        // available via the new scheduler primitive, but empirical testing
+        // (h9run120–144, 6 / 25 clean vs 4 / 10 pre-primitive baseline)
+        // showed that enabling a 200-ms defensive poll measurably degraded
+        // the ssh clean-rate. Indefinite block is the right default here;
+        // the primitive is kept in place for future consumers whose
+        // wake-source is known to miss IRQs.
         task::scheduler::block_current_unless_woken(&net::NIC_WOKEN);
     }
 }

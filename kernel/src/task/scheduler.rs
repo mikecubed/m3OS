@@ -1157,11 +1157,42 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    block_current_unless_woken_inner(woken, None);
+}
+
+/// Block the current task until `woken` is set OR `deadline_tick` passes.
+///
+/// The scheduler's dispatch loop scans blocked tasks on each pick_next and
+/// force-wakes any whose `wake_deadline` has elapsed. This is the safe
+/// alternative to waking `net_task` (or any IRQ-driven task) from the
+/// `timer_handler` ISR — the expiry check runs in task context, already
+/// inside `SCHEDULER.lock`, so there is no same-core re-entrance hazard.
+///
+/// `deadline_tick` is an absolute tick count (see `tick_count()`), not a
+/// duration. Pass `tick_count() + N` to sleep at most N ticks.
+pub fn block_current_unless_woken_until(
+    woken: &core::sync::atomic::AtomicBool,
+    deadline_tick: u64,
+) {
+    block_current_unless_woken_inner(woken, Some(deadline_tick));
+}
+
+fn block_current_unless_woken_inner(
+    woken: &core::sync::atomic::AtomicBool,
+    wake_deadline: Option<u64>,
+) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // Deadline already in the past: don't block. Callers use this path
+        // to implement "poll now if timeout has already expired."
+        if let Some(d) = wake_deadline
+            && crate::arch::x86_64::interrupts::tick_count() >= d
+        {
             return;
         }
         let idx = match get_current_task_idx() {
@@ -1171,6 +1202,15 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
+        // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
+        // hot-path `scan_expired_wake_deadlines` can skip the O(n) scan
+        // when no task has a deadline set.
+        if wake_deadline.is_some() && sched.tasks[idx].wake_deadline.is_none() {
+            ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
+        } else if wake_deadline.is_none() && sched.tasks[idx].wake_deadline.is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        }
+        sched.tasks[idx].wake_deadline = wake_deadline;
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1296,6 +1336,12 @@ pub fn wake_task(id: TaskId) -> bool {
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex => {
                     let prev_state = cur_state as u8;
+                    // Clear any pending timeout-wake deadline — this wake
+                    // beat the deadline, so the scheduler's expiry scan
+                    // should not double-wake us.
+                    if sched.tasks[idx].wake_deadline.take().is_some() {
+                        ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+                    }
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
                         sched.tasks[idx].last_migrated_tick =
@@ -1647,6 +1693,22 @@ pub fn run() -> ! {
         // Periodic load balancing with per-task cooldown (Phase 52c A.4).
         if core_id == 0 {
             maybe_load_balance();
+        }
+
+        // Before picking next, wake any tasks whose `wake_deadline` has
+        // elapsed. This is the task-context replacement for a timer-ISR
+        // force-wake — it runs under `SCHEDULER.lock` already and cannot
+        // deadlock on same-core ISR re-entrance.
+        //
+        // Enqueue is deferred until after the lock is released because
+        // `enqueue_to_core` sends a cross-core reschedule IPI that must
+        // not run with `SCHEDULER.lock` held.
+        let (expired, n_expired) = {
+            let mut sched = SCHEDULER.lock();
+            scan_expired_wake_deadlines(&mut sched)
+        };
+        for (core, idx) in &expired[..n_expired] {
+            enqueue_to_core(*core, *idx);
         }
 
         // Pick the next ready task and atomically mark it Running.
@@ -2047,6 +2109,75 @@ const MIGRATE_COOLDOWN: u64 = 100;
 
 /// Periodic load balancer tick counter. BSP calls `maybe_load_balance()`
 /// from the scheduler loop; actual migration happens every 50 ticks
+/// Counts tasks currently holding a non-`None` `wake_deadline`. Acts as a
+/// fast-path gate for `scan_expired_wake_deadlines` — if zero, the full
+/// `O(n_tasks)` scan is skipped on every dispatch. Incremented when
+/// `block_current_unless_woken_until` sets a deadline; decremented when
+/// `wake_task` clears one, when the scan expires one, or when a Blocked
+/// task is found with a stale deadline on a non-Blocked state.
+pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Transition tasks whose `wake_deadline` has elapsed back to `Ready`.
+///
+/// Must be called with `SCHEDULER.lock` already held. Returns a small list
+/// of `(assigned_core, task_idx)` pairs that the caller must pass to
+/// `enqueue_to_core` AFTER releasing `SCHEDULER.lock` — `enqueue_to_core`
+/// sends the cross-core reschedule IPI that wakes halted APs, and that
+/// IPI path must not run under `SCHEDULER.lock`.
+///
+/// The returned count is capped at 8 per call; if more tasks expired in
+/// the same scheduler tick, they are left for the next dispatch pass.
+///
+/// Fast path: if `ACTIVE_WAKE_DEADLINES` is zero, returns `(_, 0)` without
+/// scanning. Keeps the dispatch hot path ~O(1) when no task has set a
+/// deadline — i.e. always, under the current net_task default of
+/// indefinite block.
+fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usize) {
+    if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
+        return ([(0, 0); 8], 0);
+    }
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    let mut expired: [(u8, usize); 8] = [(0, 0); 8];
+    let mut n = 0usize;
+    for (idx, task) in sched.tasks.iter_mut().enumerate() {
+        if task.wake_deadline.is_none_or(|d| d > now) {
+            continue;
+        }
+        if !matches!(
+            task.state,
+            TaskState::BlockedOnRecv
+                | TaskState::BlockedOnSend
+                | TaskState::BlockedOnReply
+                | TaskState::BlockedOnNotif
+                | TaskState::BlockedOnFutex
+        ) {
+            // Not actually blocked (e.g. race between a real wake and the
+            // deadline scan) — clear the stale deadline and move on.
+            if task.wake_deadline.take().is_some() {
+                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        if task.wake_deadline.take().is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        }
+        if task.switching_out {
+            task.wake_after_switch = true;
+            task.last_migrated_tick = now;
+            continue;
+        }
+        task.state = TaskState::Ready;
+        task.last_ready_tick = now;
+        task.last_migrated_tick = now;
+        if n < expired.len() {
+            expired[n] = (task.assigned_core, idx);
+            n += 1;
+        }
+    }
+    (expired, n)
+}
+
 /// (~500ms at 100 Hz).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

@@ -1502,6 +1502,73 @@ in io_task's post-wake outer-iteration completion, which is reachable
 with a single targeted instrumentation patch on a fresh
 investigation.
 
+### Early-wedge: block-with-timeout primitive landed (2026-04-21, late)
+
+Continued the early-wedge pivot by landing the "block-with-timeout"
+scheduler primitive called for in the prior session's failed-watchdog
+postmortems. Three changes:
+
+1. **New field `Task::wake_deadline: Option<u64>`** in
+   `kernel/src/task/mod.rs` — optional absolute-tick deadline at which
+   a `Blocked*` task should be force-woken.
+2. **New primitive `scheduler::block_current_unless_woken_until(flag, deadline)`**
+   in `kernel/src/task/scheduler.rs` — same signature as the existing
+   `block_current_unless_woken` but records `wake_deadline`. Refactored
+   the original into a shared `block_current_unless_woken_inner` helper.
+3. **Scheduler dispatch expiry scan** in the main per-core dispatch
+   loop. Before `pick_next`, scans for `Blocked*` tasks whose
+   `wake_deadline <= tick_count()`, transitions them to `Ready`, and
+   enqueues them via `enqueue_to_core` (which sends the cross-core
+   reschedule IPI — critical so halted APs wake on remote expiry).
+   Gated by a `static AtomicU32 ACTIVE_WAKE_DEADLINES` counter so the
+   scan is O(1) — a no-op load — when no task has a deadline set
+   (i.e. always, under the current defaults).
+
+**Lock-hazard postmortem.** The scan runs with `SCHEDULER.lock` held,
+then RELEASES the lock before calling `enqueue_to_core`. `enqueue_to_core`
+sends the IPI via a direct LAPIC register write and takes
+`data.run_queue.lock()` internally; calling it with `SCHEDULER.lock`
+still held would break the documented lock order (SCHEDULER → run_queue
+is OK; run_queue → SCHEDULER via the IPI handler is not). The first
+attempt at this primitive pushed directly into `data.run_queue` without
+the IPI — halted APs stayed asleep until their own LAPIC timer fired
+(observed as net_task stalling post-SYN).
+
+**Measurements.** 25 runs with the primitive actively consumed by
+`net_task` (200-ms defensive poll, h9run120–144) produced 6 clean /
+19 early-wedge ≈ 24 %. 10 runs with the primitive landed but NOT
+consumed (h9run145–154, net_task back on indefinite block) produced
+3 clean / 7 early-wedge = 30 %. Pre-primitive baseline
+(h9run89–98, ARP + dup-SYN fixes only) was 4 clean / 6 early-wedge
+= 40 %. Sample sizes are small but the trend is:
+
+| Configuration | Clean rate | Notes |
+|---|---|---|
+| Pre-primitive (baseline) | 40 % | h9run89–98 |
+| Primitive consumed (200-ms poll) | 24 % | h9run120–144 — measurably worse |
+| Primitive landed, not consumed | 30 % | h9run145–154 — approximately baseline |
+
+The 200-ms defensive poll consistently made the ssh clean rate worse,
+not better — either a side-effect of waking net_task when there is no
+RX work (~50 Hz wake rate on a system designed for event-driven
+scheduling) or because the timed-wake's post-deadline enqueue conflicts
+with the scheduler's other wake paths in a way that's hard to capture
+in a small sample.
+
+**Conclusion for this session.** The primitive is the right shape for
+future consumers with known-unreliable wake sources, and it's kept in
+tree with the fast-path counter so the unused case has no cost.
+`net_task` itself stays on `block_current_unless_woken` — indefinite
+block — because the virtio-net ISR is the authoritative wake source
+and a defensive poll layered on top of it is net-negative.
+
+**Still unfixed.** The two early-wedge sub-variants documented in
+§Early-wedge: `net_wakes=0` ("SYN never reaches virtio-net") and
+`net_wakes=1` ("SYN arrives, SYN-ACK sent, ACK never arrives"). Both
+are upstream of guest RX dispatch — the former is a QEMU-SLIRP
+first-packet race, the latter an asymmetric ACK-delivery failure that
+no guest-side fix can repair without changing the transport substrate.
+
 ### Early-wedge: partial fix + mechanism narrowed (2026-04-21)
 
 Separate pivot from H9, working on the early-wedge that now dominates
