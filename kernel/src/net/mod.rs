@@ -370,6 +370,33 @@ pub fn wake_sockets_for_tcp_slot(tcp_idx: usize) {
             }
         }
     }
+    // H8 instrumentation: sparse log of TCP wake calls and how many socket
+    // handles + waiters each tcp_idx resolved to.
+    static TCP_WAKE_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static TCP_WAKE_ZERO_SOCKETS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    static TCP_WAKE_ZERO_WAITERS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    let calls = TCP_WAKE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    let total_waiters: usize = handles[..count]
+        .iter()
+        .map(|h| SOCKET_WAITQUEUES[*h as usize].len())
+        .sum();
+    if count == 0 {
+        TCP_WAKE_ZERO_SOCKETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    if total_waiters == 0 {
+        TCP_WAKE_ZERO_WAITERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    log::info!(
+        "[tcp-wake] call#{} tcp_idx={} sockets_matched={} waiters={} zero_sock_cumulative={} zero_wait_cumulative={}",
+        calls,
+        tcp_idx,
+        count,
+        total_waiters,
+        TCP_WAKE_ZERO_SOCKETS.load(core::sync::atomic::Ordering::Relaxed),
+        TCP_WAKE_ZERO_WAITERS.load(core::sync::atomic::Ordering::Relaxed),
+    );
     for h in &handles[..count] {
         wake_socket(*h);
     }

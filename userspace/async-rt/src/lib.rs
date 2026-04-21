@@ -13,6 +13,8 @@ pub mod reactor;
 pub mod slab;
 pub mod sync;
 pub mod task;
+pub mod r#yield;
 
 pub use executor::{block_on, spawn};
 pub use task::JoinHandle;
+pub use r#yield::yield_now;

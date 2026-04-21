@@ -114,7 +114,13 @@ impl Executor {
         if id >= self.high_water {
             self.high_water = id + 1;
         }
+        self.tasks
+            .get_mut(id)
+            .expect("executor insert returned invalid task id")
+            .header
+            .mark_queued();
         self.run_queue.push_back(id);
+        h9_log_spawn(id);
         id
     }
 
@@ -130,6 +136,7 @@ impl Executor {
 
             // Safety: single-threaded executor, exclusive access.
             let slot_ref = unsafe { &mut *slot };
+            slot_ref.header.clear_queued();
 
             if !slot_ref.header.is_woken() {
                 continue;
@@ -147,20 +154,139 @@ impl Executor {
             }
         }
 
-        self.run_queue = to_poll;
+        // Preserve tasks spawned while polling this batch. `spawn()` pushes
+        // directly into `self.run_queue`, so replacing it here would drop
+        // those freshly spawned tasks before their first poll.
+        if !to_poll.is_empty() {
+            self.run_queue.append(&mut to_poll);
+        }
     }
 
     /// Re-scan all tasks for woken state and add to run queue.
     fn requeue_woken(&mut self) {
         for i in 0..self.high_water {
             if let Some(slot) = self.tasks.get(i) {
-                if slot.header.is_woken() {
+                if slot.header.is_woken() && !slot.header.is_queued() {
+                    slot.header.mark_queued();
                     self.run_queue.push_back(i);
                 }
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// H9 instrumentation: low-volume `block_on` heartbeat
+// ---------------------------------------------------------------------------
+
+/// Emit a single line to fd=1 describing executor state at this tick.
+///
+/// Format: `[h9-block-on] iter=N pid=P run_queue=L root_woken=B\n`
+/// Used to distinguish "executor spinning" from "executor stalled" when
+/// paired with kernel-side dispatch counters during the SSH wedge
+/// investigation.
+#[cfg(not(feature = "std"))]
+fn h9_log_block_on_tick(iter: u64, run_queue_len: usize, root_woken: bool) {
+    use syscall_lib::{getpid, write_str, write_u64};
+    write_str(1, "[h9-block-on] iter=");
+    write_u64(1, iter);
+    write_str(1, " pid=");
+    write_u64(1, getpid() as u64);
+    write_str(1, " run_queue=");
+    write_u64(1, run_queue_len as u64);
+    write_str(1, " root_woken=");
+    write_str(1, if root_woken { "1" } else { "0" });
+    write_str(1, "\n");
+}
+
+#[cfg(feature = "std")]
+fn h9_log_block_on_tick(_iter: u64, _run_queue_len: usize, _root_woken: bool) {
+    // Std builds (host tests) intentionally silent; the wedge only repros in
+    // the no_std target.
+}
+
+/// Emit one line per occupied slab slot describing its waker state.
+///
+/// Format: `[h9-tasks] iter=N pid=P slot=S woken=B queued=B wake_count=W\n`
+/// Pairs with `h9_log_block_on_tick` so a session-child wedge can be
+/// attributed to the specific spawned future that keeps the run queue
+/// non-empty.
+#[cfg(not(feature = "std"))]
+fn h9_log_executor_tasks(iter: u64, executor: &Executor) {
+    use core::sync::atomic::Ordering;
+    use syscall_lib::{getpid, write_str, write_u64};
+    let pid = getpid() as u64;
+    for slot_id in 0..executor.high_water {
+        let Some(slot) = executor.tasks.get(slot_id) else {
+            continue;
+        };
+        let woken = slot.header.is_woken();
+        let queued = slot.header.is_queued();
+        let wake_count = slot.header.wake_count.load(Ordering::Relaxed);
+        write_str(1, "[h9-tasks] iter=");
+        write_u64(1, iter);
+        write_str(1, " pid=");
+        write_u64(1, pid);
+        write_str(1, " slot=");
+        write_u64(1, slot_id as u64);
+        write_str(1, " woken=");
+        write_str(1, if woken { "1" } else { "0" });
+        write_str(1, " queued=");
+        write_str(1, if queued { "1" } else { "0" });
+        write_str(1, " wake_count=");
+        write_u64(1, wake_count);
+        write_str(1, "\n");
+    }
+}
+
+#[cfg(feature = "std")]
+fn h9_log_executor_tasks(_iter: u64, _executor: &Executor) {}
+
+/// Emit a single line on `Executor::insert` so spawn order can be matched
+/// against existing `sshd:` spawn-site log lines.
+///
+/// Format: `[h9-spawn] pid=P slot=S\n`
+#[cfg(not(feature = "std"))]
+fn h9_log_spawn(slot_id: usize) {
+    use syscall_lib::{getpid, write_str, write_u64};
+    write_str(1, "[h9-spawn] pid=");
+    write_u64(1, getpid() as u64);
+    write_str(1, " slot=");
+    write_u64(1, slot_id as u64);
+    write_str(1, "\n");
+}
+
+#[cfg(feature = "std")]
+fn h9_log_spawn(_slot_id: usize) {}
+
+/// Dump global wake-source counters (Notify::signal, Mutex guard-drop) so
+/// per-task `wake_count` growth can be attributed to a specific async-rt
+/// primitive.
+///
+/// Format: `[h9-sources] iter=N pid=P notify_fired=A notify_pending=B mutex_handoff=C mutex_drop_idle=D\n`
+#[cfg(not(feature = "std"))]
+fn h9_log_wake_sources(iter: u64) {
+    use crate::sync::mutex::{MUTEX_DROP_NO_WAITER, MUTEX_HANDOFF_WAKES};
+    use crate::sync::notify::{NOTIFY_SIGNAL_FIRED, NOTIFY_SIGNAL_PENDING};
+    use core::sync::atomic::Ordering;
+    use syscall_lib::{getpid, write_str, write_u64};
+    write_str(1, "[h9-sources] iter=");
+    write_u64(1, iter);
+    write_str(1, " pid=");
+    write_u64(1, getpid() as u64);
+    write_str(1, " notify_fired=");
+    write_u64(1, NOTIFY_SIGNAL_FIRED.load(Ordering::Relaxed));
+    write_str(1, " notify_pending=");
+    write_u64(1, NOTIFY_SIGNAL_PENDING.load(Ordering::Relaxed));
+    write_str(1, " mutex_handoff=");
+    write_u64(1, MUTEX_HANDOFF_WAKES.load(Ordering::Relaxed));
+    write_str(1, " mutex_drop_idle=");
+    write_u64(1, MUTEX_DROP_NO_WAITER.load(Ordering::Relaxed));
+    write_str(1, "\n");
+}
+
+#[cfg(feature = "std")]
+fn h9_log_wake_sources(_iter: u64) {}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -192,7 +318,20 @@ pub fn block_on<F: Future>(reactor: &mut Reactor, future: F) -> F::Output {
     let root_header = Arc::new(TaskHeader::new());
     let mut future = core::pin::pin!(future);
 
+    // H9 instrumentation: block_on iteration counter. Distinguishes "process
+    // is spinning in its executor" from "process not running at all" when
+    // paired with kernel-side dispatch counters. Iter <= 10 always logs to
+    // confirm warm-up; thereafter every 200th iteration so the steady-state
+    // cadence is visible without spam.
+    let mut h9_iter: u64 = 0;
     let result = loop {
+        h9_iter = h9_iter.wrapping_add(1);
+        if h9_iter <= 10 || h9_iter.is_multiple_of(200) {
+            h9_log_block_on_tick(h9_iter, executor.run_queue.len(), root_header.is_woken());
+            h9_log_executor_tasks(h9_iter, &executor);
+            h9_log_wake_sources(h9_iter);
+        }
+
         // 1. Poll spawned tasks first (they may wake the root future)
         executor.poll_spawned_tasks();
 
@@ -547,6 +686,70 @@ mod tests {
         });
 
         // The spawned task should have run (it was ready immediately).
+        assert!(ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_requeue_woken_does_not_duplicate_run_queue_entries() {
+        let mut executor = Executor::new();
+        let (header, _result) = create_task_parts::<()>();
+        let future = Box::pin(async {});
+        let id = executor.insert(future, header.clone());
+
+        assert_eq!(executor.run_queue.len(), 1);
+        assert!(header.is_queued());
+
+        // Requeueing a still-woken task should not add duplicates.
+        executor.requeue_woken();
+        executor.requeue_woken();
+        assert_eq!(executor.run_queue.len(), 1);
+
+        // Once the task is popped, it can be requeued again.
+        let _ = executor.run_queue.pop_front();
+        header.clear_queued();
+        executor.requeue_woken();
+        assert_eq!(executor.run_queue.len(), 1);
+        assert_eq!(executor.run_queue.front().copied(), Some(id));
+    }
+
+    #[test]
+    fn test_spawn_during_poll_is_not_dropped() {
+        use core::future::poll_fn;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+
+        let mut reactor = Reactor::new();
+        block_on(&mut reactor, async move {
+            let parent = spawn(async move {
+                spawn(async move {
+                    ran2.store(true, Ordering::Release);
+                });
+
+                // Return Pending once so the executor completes another pass
+                // after the nested spawn.
+                poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    Poll::<()>::Pending
+                })
+                .await;
+            });
+
+            drop(parent);
+
+            // Keep the root future alive for another executor turn.
+            poll_fn(|cx| {
+                if ran.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        });
+
         assert!(ran.load(Ordering::Acquire));
     }
 }

@@ -11,7 +11,17 @@
 use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
+
+/// H9 instrumentation: total `Notify::signal()` calls that found a stored
+/// waker and fired it. Read by the executor to attribute per-task wake
+/// counts.
+pub static NOTIFY_SIGNAL_FIRED: AtomicU64 = AtomicU64::new(0);
+/// H9 instrumentation: total `Notify::signal()` calls that landed on an
+/// empty (no-stored-waker) Notify. These do not increment a `wake_count`
+/// but mark the signal as pending.
+pub static NOTIFY_SIGNAL_PENDING: AtomicU64 = AtomicU64::new(0);
 
 /// A single-consumer notification signal.
 ///
@@ -20,6 +30,12 @@ use core::task::{Context, Poll, Waker};
 pub struct Notify {
     waker: Cell<Option<Waker>>,
     signalled: Cell<bool>,
+    /// H9 instrumentation: per-instance counter of `signal()` calls that
+    /// fired a stored waker.
+    fired: AtomicU64,
+    /// H9 instrumentation: per-instance counter of `signal()` calls that
+    /// landed on an empty Notify (marked pending but no wake).
+    pending: AtomicU64,
 }
 
 impl Notify {
@@ -28,7 +44,20 @@ impl Notify {
         Self {
             waker: Cell::new(None),
             signalled: Cell::new(false),
+            fired: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
         }
+    }
+
+    /// H9: per-instance count of `signal()` calls that woke a stored waker.
+    pub fn debug_fired(&self) -> u64 {
+        self.fired.load(Ordering::Relaxed)
+    }
+
+    /// H9: per-instance count of `signal()` calls that landed on an empty
+    /// Notify (signal stored as pending; no waker fired).
+    pub fn debug_pending(&self) -> u64 {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Signal the waiting task. If a waker is registered, it is woken.
@@ -40,7 +69,12 @@ impl Notify {
         // available for non-Copy types on Cell). Use a swap-with-None pattern.
         let waker = self.waker.replace(None);
         if let Some(w) = waker {
+            self.fired.fetch_add(1, Ordering::Relaxed);
+            NOTIFY_SIGNAL_FIRED.fetch_add(1, Ordering::Relaxed);
             w.wake();
+        } else {
+            self.pending.fetch_add(1, Ordering::Relaxed);
+            NOTIFY_SIGNAL_PENDING.fetch_add(1, Ordering::Relaxed);
         }
     }
 

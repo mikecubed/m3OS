@@ -462,6 +462,12 @@ pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 /// otherwise deadlock on a spin::Mutex held with interrupts enabled.
 static NET_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Wake telemetry for scheduler-fairness debugging.
+static NET_WAKE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static NET_WAKE_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static NET_WAKE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static NET_WAKE_MISSING_TASK_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Signal flag for `block_current_unless_woken` in the network task.
 /// The ISR sets it, `net_task` consumes it via swap. Public so the task
 /// running in `main.rs::net_task` can use it directly.
@@ -472,6 +478,17 @@ pub static NET_IRQ_WOKEN: AtomicBool = AtomicBool::new(false);
 /// parks.
 pub fn set_net_task_id(id: TaskId) {
     NET_TASK_ID.store(id.0, Ordering::Release);
+    log::info!("[net] registered net_task id={}", id.0);
+}
+
+/// Return wake telemetry for scheduler-fairness debugging.
+pub fn wake_debug_counters() -> (u64, u64, u64, u64) {
+    (
+        NET_WAKE_ATTEMPTS.load(Ordering::Relaxed),
+        NET_WAKE_SUCCESSES.load(Ordering::Relaxed),
+        NET_WAKE_FAILURES.load(Ordering::Relaxed),
+        NET_WAKE_MISSING_TASK_ID.load(Ordering::Relaxed),
+    )
 }
 
 /// Returns the MAC address of the virtio-net device, if initialized.
@@ -530,9 +547,16 @@ fn virtio_net_irq_handler() {
     // parks on, so set it alongside the driver-specific flag.
     NET_IRQ_WOKEN.store(true, Ordering::Release);
     crate::net::NIC_WOKEN.store(true, Ordering::Release);
+    NET_WAKE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let raw = NET_TASK_ID.load(Ordering::Acquire);
     if raw != 0 {
-        let _ = wake_task(TaskId(raw));
+        if wake_task(TaskId(raw)) {
+            NET_WAKE_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+        } else {
+            NET_WAKE_FAILURES.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        NET_WAKE_MISSING_TASK_ID.fetch_add(1, Ordering::Relaxed);
     }
 }
 

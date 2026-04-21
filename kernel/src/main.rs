@@ -559,8 +559,36 @@ fn net_task() -> ! {
     if let Some(id) = task::scheduler::current_task_id() {
         net::virtio_net::set_net_task_id(id);
     }
+    if let Some((
+        id,
+        pid,
+        name,
+        state,
+        assigned_core,
+        affinity_mask,
+        last_ready_tick,
+        last_migrated_tick,
+    )) = task::scheduler::current_task_debug_snapshot()
+    {
+        log::info!(
+            "[net] task snapshot: id={} pid={} name={} state={:?} assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
+            id.0,
+            pid,
+            name,
+            state,
+            assigned_core,
+            affinity_mask,
+            last_ready_tick,
+            last_migrated_tick
+        );
+    }
     log::info!("[net] network processing task started");
 
+    let mut wake_summary_seq: u64 = 0;
+    let mut last_wake_attempts = 0;
+    let mut last_wake_successes = 0;
+    let mut last_wake_failures = 0;
+    let mut last_wake_missing_id = 0;
     loop {
         // Clear the unified wake flag up front so any edge set between now
         // and park is still observable.
@@ -570,6 +598,47 @@ fn net_task() -> ! {
         while any {
             net::dispatch::process_rx();
             any = net::virtio_net::NET_IRQ_WOKEN.swap(false, core::sync::atomic::Ordering::Acquire);
+        }
+        let (wake_attempts, wake_successes, wake_failures, wake_missing_id) =
+            net::virtio_net::wake_debug_counters();
+        if wake_attempts != last_wake_attempts
+            || wake_successes != last_wake_successes
+            || wake_failures != last_wake_failures
+            || wake_missing_id != last_wake_missing_id
+        {
+            wake_summary_seq = wake_summary_seq.wrapping_add(1);
+            if let Some((
+                id,
+                pid,
+                name,
+                state,
+                assigned_core,
+                affinity_mask,
+                last_ready_tick,
+                last_migrated_tick,
+            )) = task::scheduler::current_task_debug_snapshot()
+            {
+                log::info!(
+                    "[net] wake-summary#{}: id={} pid={} name={} state={:?} assigned_core={} affinity={:#x} ready_at={} migrated_at={} attempts={} successes={} failures={} missing_task_id={}",
+                    wake_summary_seq,
+                    id.0,
+                    pid,
+                    name,
+                    state,
+                    assigned_core,
+                    affinity_mask,
+                    last_ready_tick,
+                    last_migrated_tick,
+                    wake_attempts,
+                    wake_successes,
+                    wake_failures,
+                    wake_missing_id
+                );
+            }
+            last_wake_attempts = wake_attempts;
+            last_wake_successes = wake_successes;
+            last_wake_failures = wake_failures;
+            last_wake_missing_id = wake_missing_id;
         }
         // Park on the unified flag: the virtio-net ISR and RemoteNic both set
         // it, so a wake from either path reliably unblocks the task. If an IRQ

@@ -10,7 +10,7 @@ use core::future::Future;
 use core::pin::Pin;
 #[cfg(not(feature = "std"))]
 use core::sync::atomic::AtomicI32;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 // ---------------------------------------------------------------------------
@@ -71,8 +71,14 @@ fn signal_wake_pipe() {
 pub struct TaskHeader {
     /// Whether this task has been woken and needs polling.
     pub woken: AtomicBool,
+    /// Whether this task is already present in the executor run queue.
+    pub queued: AtomicBool,
     /// Whether this task has completed execution.
     pub completed: AtomicBool,
+    /// H9 instrumentation: how many times this task has been woken since
+    /// creation. Incremented by every `wake()` / `wake_by_ref()`. Used by
+    /// `block_on`'s per-iteration dump to identify the persistent waker.
+    pub wake_count: AtomicU64,
     /// Waker registered by a `JoinHandle` awaiting this task's completion.
     pub join_waker: UnsafeCell<Option<Waker>>,
 }
@@ -87,7 +93,9 @@ impl TaskHeader {
     pub fn new() -> Self {
         Self {
             woken: AtomicBool::new(true),
+            queued: AtomicBool::new(false),
             completed: AtomicBool::new(false),
+            wake_count: AtomicU64::new(0),
             join_waker: UnsafeCell::new(None),
         }
     }
@@ -100,6 +108,21 @@ impl TaskHeader {
     /// Clear the woken flag (called before polling).
     pub fn clear_woken(&self) {
         self.woken.store(false, Ordering::Release);
+    }
+
+    /// Check whether this task is already queued for polling.
+    pub fn is_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    /// Mark the task as queued.
+    pub fn mark_queued(&self) {
+        self.queued.store(true, Ordering::Release);
+    }
+
+    /// Clear the queued flag after the executor pops the task.
+    pub fn clear_queued(&self) {
+        self.queued.store(false, Ordering::Release);
     }
 
     /// Mark the task as completed and wake any join waker.
@@ -135,6 +158,7 @@ unsafe fn clone_fn(ptr: *const ()) -> RawWaker {
 
 unsafe fn wake_fn(ptr: *const ()) {
     let arc = unsafe { Arc::from_raw(ptr as *const TaskHeader) };
+    arc.wake_count.fetch_add(1, Ordering::Relaxed);
     arc.woken.store(true, Ordering::Release);
     signal_wake_pipe();
     // arc is dropped here, decrementing refcount
@@ -142,6 +166,7 @@ unsafe fn wake_fn(ptr: *const ()) {
 
 unsafe fn wake_by_ref_fn(ptr: *const ()) {
     let arc = unsafe { Arc::from_raw(ptr as *const TaskHeader) };
+    arc.wake_count.fetch_add(1, Ordering::Relaxed);
     arc.woken.store(true, Ordering::Release);
     signal_wake_pipe();
     // Don't drop — this is wake_by_ref

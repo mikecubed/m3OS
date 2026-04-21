@@ -183,6 +183,24 @@ fn is_current_exec_path(expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_interactive_debug_exec_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/bin/sshd"
+            | "/bin/login"
+            | "/bin/sh0"
+            | "/bin/vfs_server"
+            | "/bin/console_server"
+            | "/bin/ls"
+    )
+}
+
+fn current_exec_path_for_debug() -> Option<alloc::string::String> {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table.find(pid).map(|proc| proc.exec_path.clone())
+}
+
 enum PathNodeKind {
     File,
     Dir,
@@ -3552,7 +3570,18 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         "fork-child",
     );
 
-    log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    if let Some(parent_exec_path) = current_exec_path_for_debug()
+        && is_interactive_debug_exec_path(parent_exec_path.as_str())
+    {
+        log::info!(
+            "[proc] fork: parent_pid={} parent_exec={} child_pid={}",
+            parent_pid,
+            parent_exec_path,
+            child_pid
+        );
+    } else {
+        log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    }
     child_pid as u64
 }
 
@@ -3820,6 +3849,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 proc.shared_signal_actions = None;
             }
         }
+    }
+    if is_interactive_debug_exec_path(name) {
+        log::info!("[proc] execve: pid={} path={}", pid, name);
     }
 
     // Switch to the new page table and enter ring 3.
@@ -14475,7 +14507,45 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         }
     }
 
-    loop {
+    // H8 fix: register waiters ONCE up front and keep them registered for
+    // the lifetime of the syscall. Previously the code re-registered on
+    // every loop iteration, and in the positive-timeout branch deregistered
+    // before yield_now(), creating a window where wakes arriving during
+    // yield hit empty WaitQueues and were silently lost. With a single
+    // registration held across all iterations, wakes always find a waiter
+    // and set the shared `woken` flag; the top-of-loop readiness scan then
+    // sees the state change on the next iteration.
+    let task_id = match crate::task::scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINTR,
+    };
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+    let mut registered_any = false;
+    if timeout_i != 0 {
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i]
+                && fd_register_waiter(entry, task_id, &woken)
+            {
+                registered_any = true;
+            }
+        }
+    }
+
+    let deregister_all = |entries: &[Option<FdEntry>; 256]| {
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i] {
+                fd_deregister_waiter(entry, task_id);
+            }
+        }
+    };
+
+    let result = loop {
+        // Clear the woken flag before scanning. If a wake fires after this
+        // clear, the flag will be set again and we'll see it on the next
+        // iteration's check (or the FD will show ready in the scan).
+        woken.store(false, core::sync::atomic::Ordering::Release);
+
         let mut ready_count = 0u64;
 
         for i in 0..nfds {
@@ -14503,97 +14573,50 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         let timed_out =
             deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
         if ready_count > 0 || timeout_i == 0 || timed_out {
-            // Write results back to userspace.
-            for i in 0..nfds {
-                let base = match fds_ptr.checked_add((i * 8) as u64) {
-                    Some(a) => a,
-                    None => return NEG_EFAULT,
-                };
-                if UserSliceWo::new(base, pfds[i].len())
-                    .and_then(|s| s.copy_from_kernel(&pfds[i]))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-            }
-            return ready_count;
+            break ready_count;
         }
 
         if has_pending_signal() {
-            return NEG_EINTR;
-        }
-
-        // Nothing ready — register on all FD wait queues and block.
-        let task_id = match crate::task::scheduler::current_task_id() {
-            Some(id) => id,
-            None => return NEG_EINTR,
-        };
-        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-
-        let mut registered_any = false;
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i]
-                && fd_register_waiter(entry, task_id, &woken)
-            {
-                registered_any = true;
-            }
+            break NEG_EINTR;
         }
 
         // If no FDs could be registered (all non-pollable), yield to avoid
-        // blocking forever with no wake source.
+        // spinning at full CPU with no wake source.
         if !registered_any {
             crate::task::yield_now();
             continue;
         }
 
-        // Re-check readiness after registration to close the TOCTOU window.
-        // If an event arrived between the first scan and registration, the
-        // woken flag may not be set, so we must re-scan before blocking.
-        let mut any_ready = false;
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i] {
-                let events = i16::from_ne_bytes([pfds[i][4], pfds[i][5]]);
-                let ready = fd_poll_events(entry);
-                if (ready & events) != 0 || (ready & (POLLHUP | POLLERR)) != 0 {
-                    any_ready = true;
-                    break;
-                }
-            }
-        }
-
-        if any_ready {
-            // Something became ready — deregister and re-scan on next loop iteration.
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
-            }
-            continue;
-        }
-
-        // Block until woken by an FD event. For positive timeouts, use
-        // yield instead of full block so the tick counter advances and the
-        // deadline check at the top of the loop can fire.
+        // Block until woken by an FD event. For positive timeouts, yield
+        // so the tick counter advances and the deadline check at the top
+        // of the loop can fire; for indefinite timeouts, fully block.
+        // In both cases, waiters remain registered across the suspend.
         if deadline_tick.is_some() {
-            // Positive timeout: yield once to let timer ticks advance.
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
-            }
             crate::task::yield_now();
         } else {
-            // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
+        }
+    };
+
+    deregister_all(&entries);
+
+    // Write results back to userspace.
+    if result != NEG_EINTR {
+        for i in 0..nfds {
+            let base = match fds_ptr.checked_add((i * 8) as u64) {
+                Some(a) => a,
+                None => return NEG_EFAULT,
+            };
+            if UserSliceWo::new(base, pfds[i].len())
+                .and_then(|s| s.copy_from_kernel(&pfds[i]))
+                .is_err()
+            {
+                return NEG_EFAULT;
             }
         }
-
-        // Re-scan on next iteration of the loop.
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

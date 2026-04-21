@@ -222,6 +222,12 @@ pub struct Task {
     /// Userspace register frame restored by `fork_child_trampoline`, if this
     /// task was spawned to finish a fork/clone handoff.
     fork_ctx: Option<crate::process::ForkChildCtx>,
+    /// True when this task slot was spawned as an `sshd` fork child and should
+    /// emit compact lifecycle diagnostics.
+    pub debug_sshd_fork_child: bool,
+    /// Counts dispatch/switch cycles for `debug_sshd_fork_child` tasks so logs
+    /// can be rate-limited.
+    pub debug_sshd_fork_child_cycles: u32,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
@@ -263,6 +269,8 @@ impl Task {
             group_exit_pending: false,
             user_return: None,
             fork_ctx: None,
+            debug_sshd_fork_child: false,
+            debug_sshd_fork_child_cycles: 0,
             _stack: Some(stack),
         }
     }

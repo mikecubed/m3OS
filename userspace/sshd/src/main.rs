@@ -21,7 +21,8 @@ use core::alloc::Layout;
 use syscall_lib::heap::BrkAllocator;
 use syscall_lib::{
     AF_INET, NEG_EEXIST, POLLIN, PollFd, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, STDOUT_FILENO,
-    WNOHANG, accept, close, fork, listen, mkdir, poll, socket, waitpid, write_str,
+    WNOHANG, accept, close, fork, getpid, listen, mkdir, poll, socket, waitpid, write_str,
+    write_u64,
 };
 
 #[cfg(not(test))]
@@ -118,6 +119,8 @@ fn setup_listener(port: u16) -> Result<i32, ()> {
 /// with the login shell during boot.
 fn accept_loop(listen_fd: i32) -> ! {
     let mut host_key: Option<host_key::HostKey> = None;
+    let mut listener_ready_count = 0u64;
+    let mut accepted_count = 0u64;
 
     loop {
         reap_finished_children();
@@ -125,17 +128,34 @@ fn accept_loop(listen_fd: i32) -> ! {
         if !wait_for_listener(listen_fd, LISTENER_POLL_TIMEOUT_MS) {
             continue;
         }
+        listener_ready_count = listener_ready_count.saturating_add(1);
+        if listener_ready_count == 1 || listener_ready_count.is_multiple_of(100) {
+            write_str(STDOUT_FILENO, "sshd: listener ready count=");
+            write_u64(STDOUT_FILENO, listener_ready_count);
+            write_str(STDOUT_FILENO, "\n");
+        }
 
         let client_fd = accept(listen_fd, None);
         if client_fd < 0 {
+            write_str(STDOUT_FILENO, "sshd: accept failed\n");
             continue;
         }
         let client_fd = client_fd as i32;
+        accepted_count = accepted_count.saturating_add(1);
+        write_str(STDOUT_FILENO, "sshd: accepted client fd=");
+        write_u64(STDOUT_FILENO, client_fd as u64);
+        write_str(STDOUT_FILENO, " count=");
+        write_u64(STDOUT_FILENO, accepted_count);
+        write_str(STDOUT_FILENO, "\n");
 
         // Generate host key on first connection.
         if host_key.is_none() {
+            write_str(STDOUT_FILENO, "sshd: loading host key\n");
             match host_key::load_or_generate() {
-                Ok(k) => host_key = Some(k),
+                Ok(k) => {
+                    write_str(STDOUT_FILENO, "sshd: host key ready\n");
+                    host_key = Some(k)
+                }
                 Err(_) => {
                     write_str(STDOUT_FILENO, "sshd: failed to load/generate host key\n");
                     close(client_fd);
@@ -152,19 +172,46 @@ fn accept_loop(listen_fd: i32) -> ! {
         }
         if pid == 0 {
             // Child: handle the SSH session.
+            write_str(STDOUT_FILENO, "sshd: session child pid=");
+            write_u64(STDOUT_FILENO, getpid() as u64);
+            write_str(STDOUT_FILENO, " sock_fd=");
+            write_u64(STDOUT_FILENO, client_fd as u64);
+            write_str(STDOUT_FILENO, "\n");
             close(listen_fd);
             let exit_code = session::run_session(client_fd, host_key.as_ref().unwrap());
             close(client_fd);
             syscall_lib::exit(exit_code);
         }
         // Parent: close client fd and continue accepting.
+        write_str(STDOUT_FILENO, "sshd: parent forked child pid=");
+        write_u64(STDOUT_FILENO, pid as u64);
+        write_str(STDOUT_FILENO, " client_fd=");
+        write_u64(STDOUT_FILENO, client_fd as u64);
+        write_str(STDOUT_FILENO, "\n");
         close(client_fd);
     }
 }
 
 fn reap_finished_children() {
     let mut status: i32 = 0;
-    while waitpid(-1, &mut status, WNOHANG) > 0 {}
+    loop {
+        let pid = waitpid(-1, &mut status, WNOHANG);
+        if pid <= 0 {
+            break;
+        }
+        write_str(STDOUT_FILENO, "sshd: reaped child pid=");
+        write_u64(STDOUT_FILENO, pid as u64);
+        write_str(STDOUT_FILENO, " status=");
+        write_u64(STDOUT_FILENO, status as u64);
+        if (status & 0x7f) == 0 {
+            write_str(STDOUT_FILENO, " exit_code=");
+            write_u64(STDOUT_FILENO, ((status >> 8) & 0xff) as u64);
+        } else {
+            write_str(STDOUT_FILENO, " signal=");
+            write_u64(STDOUT_FILENO, (status & 0x7f) as u64);
+        }
+        write_str(STDOUT_FILENO, "\n");
+    }
 }
 
 fn wait_for_listener(_listen_fd: i32, _timeout_ms: i32) -> bool {
