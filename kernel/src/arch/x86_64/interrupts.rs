@@ -1,3 +1,48 @@
+//! IDT handlers and the kernel ISR contract.
+//!
+//! Every `extern "x86-interrupt" fn …_handler` in this file — plus the
+//! per-device handlers registered at runtime via
+//! `register_device_irq` (e.g. `virtio_net_irq_handler`,
+//! `virtio_blk_irq_handler`) — runs in interrupt context with
+//! interrupts automatically disabled on the current CPU. They must obey
+//! the following invariants:
+//!
+//! 1. **No allocation.** The global allocator may be held by the
+//!    interrupted task.
+//! 2. **No blocking.** No syscall dispatch, no IPC send / recv / reply,
+//!    no `switch_context`, no userspace return. The handler runs to
+//!    completion, acks the device, and returns.
+//! 3. **No plain `spin::Mutex` acquisition on a lock that task-context
+//!    callers hold with interrupts enabled.** A same-core ISR landing
+//!    on such a lock spins forever (the interrupted holder cannot
+//!    release while the ISR runs). A shared lock reachable from an
+//!    ISR must be one of:
+//!    - an `IrqSafeMutex` (canonical impl: `kernel/src/task/scheduler.rs`)
+//!      that masks interrupts for the duration of its critical section,
+//!      OR
+//!    - a `spin::Mutex` whose every task-context acquisition runs
+//!      inside `interrupts::without_interrupts(…)` (the
+//!      `virtio_net::DRIVER`, `virtio_blk::DRIVER`, and
+//!      `RAW_INPUT_ROUTER` patterns), OR
+//!    - only accessed from ISR context (no task-context holder exists).
+//! 4. **`scheduler::wake_task` is ISR-safe by design.** `SCHEDULER` is
+//!    an `IrqSafeMutex<Scheduler>` and `enqueue_to_core` wraps its
+//!    per-core `run_queue.lock()` in `without_interrupts`. Handlers
+//!    may call it freely. Any new lock added along the wake callpath
+//!    must extend the IRQ-safety audit.
+//! 5. **EOI last.** Either `super::apic::lapic_eoi()` (APIC mode) or
+//!    `PICS.lock().notify_end_of_interrupt(…)` (PIC mode). `PICS` is
+//!    only acquired at boot (before interrupts are enabled) and from
+//!    ISR context, so it is trivially ISR-safe.
+//!
+//! The 2026-04-21 post-mortem
+//! (`docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`)
+//! formalised rule 3 after a pair of virtio IRQ handlers called
+//! `wake_task` on top of a plain `spin::Mutex<Scheduler>` and
+//! deterministically deadlocked same-core task-context holders. Rule
+//! 3 is the rule that class of bug violated. Every handler below
+//! relies on at least one of the three lock disciplines it enumerates.
+
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_core::input::{ScancodeRouter, ScancodeSink};
@@ -810,23 +855,38 @@ pub fn read_scancode() -> Option<u8> {
 }
 
 /// Pop one scancode from the **raw / game-input** ring buffer, or `None`.
+///
+/// `RAW_INPUT_ROUTER` is also held by `keyboard_handler` in ISR context,
+/// so task-context acquisition must run with interrupts masked on the
+/// current CPU — otherwise a same-core keyboard IRQ landing here while a
+/// task holds the lock deadlocks the ISR (same bug class as the 2026-04-21
+/// `SCHEDULER.lock` post-mortem). See
+/// `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`.
 pub fn read_raw_scancode() -> Option<u8> {
-    let _guard = RAW_INPUT_ROUTER.lock();
-    let head = RAW_SCANCODE_BUF_HEAD.load(Ordering::Acquire);
-    let tail = RAW_SCANCODE_BUF_TAIL.load(Ordering::Acquire);
-    if head == tail {
-        return None;
-    }
-    let byte = unsafe { RAW_SCANCODE_BUF[head] };
-    RAW_SCANCODE_BUF_HEAD.store((head + 1) & (SCANCODE_BUF_SIZE - 1), Ordering::Release);
-    Some(byte)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _guard = RAW_INPUT_ROUTER.lock();
+        let head = RAW_SCANCODE_BUF_HEAD.load(Ordering::Acquire);
+        let tail = RAW_SCANCODE_BUF_TAIL.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        let byte = unsafe { RAW_SCANCODE_BUF[head] };
+        RAW_SCANCODE_BUF_HEAD.store((head + 1) & (SCANCODE_BUF_SIZE - 1), Ordering::Release);
+        Some(byte)
+    })
 }
 
+/// Reset the raw/game-input router state and drain its ring buffer.
+///
+/// See [`read_raw_scancode`] for the ISR-safety rationale around
+/// `RAW_INPUT_ROUTER`.
 pub fn reset_raw_input_state() {
-    let mut router = RAW_INPUT_ROUTER.lock();
-    router.reset();
-    RAW_SCANCODE_BUF_HEAD.store(0, Ordering::Release);
-    RAW_SCANCODE_BUF_TAIL.store(0, Ordering::Release);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut router = RAW_INPUT_ROUTER.lock();
+        router.reset();
+        RAW_SCANCODE_BUF_HEAD.store(0, Ordering::Release);
+        RAW_SCANCODE_BUF_TAIL.store(0, Ordering::Release);
+    });
 }
 
 #[inline(always)]

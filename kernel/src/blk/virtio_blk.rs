@@ -419,6 +419,23 @@ static REQ_WOKEN: AtomicBool = AtomicBool::new(false);
 // IRQ handler
 // ===========================================================================
 
+/// Acknowledge the device interrupt, drain the used ring, and wake any
+/// waiters on completed requests. Runs in ISR context — see the
+/// module-level contract in `kernel/src/arch/x86_64/interrupts.rs`.
+///
+/// ISR-safe lock use:
+/// - `DRIVER.lock()` — plain `spin::Mutex`, but every task-context
+///   acquisition wraps itself in `without_interrupts(…)` (see the
+///   Fix 1 pattern), so a same-core ISR cannot reach a held lock.
+/// - `drain_used_from_irq` calls `wake_task(waiter.task)` for each
+///   completed request. Safe because `scheduler::SCHEDULER` is an
+///   `IrqSafeMutex<Scheduler>` and `enqueue_to_core` wraps its per-core
+///   `run_queue.lock()` in `without_interrupts`. Prior to the
+///   2026-04-21 post-mortem fix this path could deadlock a same-core
+///   `SCHEDULER.lock` holder; see
+///   `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`.
+///
+/// No allocation, no blocking, no IPC.
 fn virtio_blk_irq_handler() {
     // Acknowledge the device interrupt and drain the used ring.
     let mut driver = DRIVER.lock();

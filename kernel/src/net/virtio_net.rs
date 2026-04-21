@@ -509,16 +509,23 @@ pub fn pci_interrupt_line() -> Option<u8> {
 // ===========================================================================
 
 /// Acknowledge the device interrupt (read-to-clear ISR status) and wake the
-/// network task so it can drain the RX ring. Runs in ISR context.
+/// network task so it can drain the RX ring. Runs in ISR context — see
+/// the module-level contract in `kernel/src/arch/x86_64/interrupts.rs`.
 ///
-/// Must obey the ISR contract: no allocation, no blocking, no IPC. The only
-/// work it does under `DRIVER.lock()` is read a single port byte; all frame
-/// processing happens in `net_task`.
+/// ISR-safe lock use:
+/// - `DRIVER.lock()` — plain `spin::Mutex`, but every task-context
+///   acquisition (`recv_frames`, `send_frame`, `mac_address`,
+///   `pci_interrupt_line`) wraps itself in `without_interrupts(…)`, so
+///   a same-core ISR cannot reach a held lock. The ISR-side acquisition
+///   here only reads `ISR_STATUS` and returns.
+/// - `wake_task(TaskId(NET_TASK_ID))` — safe because
+///   `scheduler::SCHEDULER` is an `IrqSafeMutex<Scheduler>` and
+///   `enqueue_to_core` wraps its per-core `run_queue.lock()` in
+///   `without_interrupts`. Prior to the 2026-04-21 post-mortem fix this
+///   path deadlocked on a same-core `SCHEDULER.lock` holder; see
+///   `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`.
 ///
-/// Correctness — see the Fix 1 note in `blk/virtio_blk.rs`: the
-/// `send_frame`/`recv_frames` task-path takes `DRIVER.lock()` and must wrap
-/// that in `without_interrupts` so the ISR cannot fire on this CPU while
-/// the lock is held.
+/// No allocation, no blocking, no IPC.
 fn virtio_net_irq_handler() {
     // Legacy INTx requires reading ISR_STATUS to clear the device-level
     // interrupt latch (per virtio 0.9.5 §2.1.2.4 — "reading this register
