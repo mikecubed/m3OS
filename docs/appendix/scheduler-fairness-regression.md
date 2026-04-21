@@ -1,18 +1,22 @@
 # Scheduler Fairness Regression: SSH Session Spin / Core-0 Fairness Investigation
 
-**Status:** **Early-wedge root cause fixed (2026-04-21)** — `SCHEDULER.lock()`
-converted to an IRQ-safe mutex (`IrqSafeMutex<Scheduler>`) so that a same-core
-ISR (virtio-net, virtio-blk) calling `wake_task` can no longer deadlock a
-task-context holder of the lock. 15-run validation sample with the fix and
-**no** heavy-logging mitigation: **15/15 clean-auth-rejected** (100 %) vs the
-30–40 % pre-fix baseline. `enqueue_to_core` additionally wraps its per-core
-`run_queue.lock()` in `without_interrupts` to close the follow-on window where
-the run queue was held with IF on. `wake_task`'s redundant second
-`SCHEDULER.lock()` (and the `PROCESS_TABLE.lock()` re-entry via the old
-`task_log_label`) are folded into the first critical section. Late-wedge
-(~8 % pre-fix) is still open but the dominant failure mode is closed — the
-follow-up #7 instrumentation stays in-tree so the next sampling pass can
-capture one.
+**Status:** **Resolved (2026-04-21).** Early-wedge root cause fixed by
+converting `SCHEDULER: Mutex<Scheduler>` to `SCHEDULER:
+IrqSafeMutex<Scheduler>` so that a same-core ISR (virtio-net, virtio-blk)
+calling `wake_task` can no longer deadlock a task-context holder of the
+lock. `enqueue_to_core` additionally wraps its per-core `run_queue.lock()`
+in `without_interrupts` to close the follow-on window where the run queue
+was held with IF on. `wake_task`'s redundant second `SCHEDULER.lock()`
+(and the `PROCESS_TABLE.lock()` re-entry via the old `task_log_label`)
+are folded into the first critical section. **60-run validation sample**
+without heavy-logging mitigation: **60/60 clean-auth-rejected** (100 %)
+vs the 30–40 % pre-fix baseline. The late-wedge variant (~8 % pre-fix)
+came in at 0/60 in this pass, confirming it was tail mis-classification
+of the early-wedge — the short banner window (`ConnectTimeout=20`) caught
+the edge of slow early-wedge completions as `exit=124` rather than a
+separate bug. Appendix closed. The H9 follow-up #7 instrumentation
+(`[h9-iox] / [h9-fo] / [h9-ww]`) stays in-tree so a future regression
+can be pinned against the same fingerprints.
 **Severity:** High for interactive SSH and related userspace workloads. The VM
 can hang at multiple points in the SSH path: before key exchange, during key
 exchange, before the password prompt, after login, or on the first typed input.
@@ -1870,21 +1874,32 @@ It stays in-tree for any future consumer that genuinely needs a
 timeout-bounded block (e.g. a real user-facing `nanosleep(2)`
 implementation).
 
-**Late-wedge.** With the early-wedge gone, the observed
-distribution in the 15-run sample is 100 % clean — no
-late-wedge was captured either. That could mean the late-wedge
-has always been a tail mis-classification caused by the
-early-wedge's heavy tail (`ssh exit=124 + "Permanently added"`
-can occur when the banner window elapsed narrowly before the
-connection completed), or it could simply be noise below the
-sampling threshold of 15 runs. A larger sample (50–100 runs) is
-needed to confirm whether the late-wedge is a separate real bug
-or an artefact of the early-wedge. The H9 follow-up #7
-instrumentation (`[h9-iox]` / `[h9-fo]` / `[h9-ww]` in
-`userspace/sshd/src/session.rs`) stays in-tree ready for the
-next sampling pass; if the late-wedge is genuine, this
-instrumentation pins the sub-hypothesis directly from the last
-logged step.
+**Late-wedge — confirmed subsumed (60-run pass).** After the
+15-run validation came in at 0 late-wedges, a larger 60-run
+confirmation batch was run to rule out "noise below the
+sampling threshold." Result: **60/60 clean-auth-rejected**,
+**0 late-wedges**. At the pre-fix ~8 % late-wedge rate, a clean
+60-run streak has probability ~0.7 %; the hypothesis that the
+late-wedge was a distinct real bug is rejected. The observed
+late-wedges (`ssh exit=124 + "Permanently added"` in the
+pre-fix samples) were tail mis-classifications of slow
+early-wedges where the banner window (`ConnectTimeout=20`)
+elapsed narrowly before the three-way handshake completed.
+Per-run serial-log fingerprints across the 60 runs were
+consistent: clean boot, 15 `[tcp-wake]` events, 1
+`[tcp] connection established (passive)`, `sshd: accepted
+client fd=4 count=1`, `sshd: session child pid=14 sock_fd=4`,
+and 6–7 early-boot `[sched] stale-ready` entries (all at
+`ready_at_tick <= 2714`; none during or after the SSH
+handshake).
+
+The H9 follow-up #7 instrumentation (`[h9-iox]` / `[h9-fo]` /
+`[h9-ww]` in `userspace/sshd/src/session.rs`) stays in-tree as
+a diagnostic fallback — if a future regression reintroduces a
+wedge variant, the same instrumentation will pin the
+sub-hypothesis (wake-chain broken / stuck inside flush / stuck
+inside runner.lock) directly from the last logged step. No
+further action on this appendix.
 
 #### H9 follow-up #7: io_task inner-step instrumentation (12 more runs, no late-wedge caught)
 
