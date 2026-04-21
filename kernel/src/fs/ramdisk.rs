@@ -187,6 +187,18 @@ static VFS_SERVER_ELF: &[u8] = generated_initrd_asset!("vfs_server");
 static NET_SERVER_ELF: &[u8] = generated_initrd_asset!("net_server");
 // Phase 47: DOOM binary
 static DOOM_BIN: &[u8] = generated_initrd_asset!("doom");
+// Phase 55b Tracks D.1 / E.1: ring-3 driver scaffolds. Exposed under
+// `/drivers/<name>` so init (F.1) and `execve` can find them at the
+// canonical driver path.
+static NVME_DRIVER_ELF: &[u8] = generated_initrd_asset!("nvme_driver");
+static E1000_DRIVER_ELF: &[u8] = generated_initrd_asset!("e1000_driver");
+// Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke client.
+// Exposed under /bin so the QEMU regression can launch it from the shell.
+static NVME_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("nvme-crash-smoke");
+// Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+static MAX_RESTART_SMOKE_ELF: &[u8] = generated_initrd_asset!("max-restart-smoke");
+// Phase 55b Track F.3d-3: e1000 crash-and-restart end-to-end smoke client.
+static E1000_CRASH_SMOKE_ELF: &[u8] = generated_initrd_asset!("e1000-crash-smoke");
 
 // ---------------------------------------------------------------------------
 // Static tree construction (separate statics to work around const-eval limits)
@@ -525,6 +537,27 @@ static BIN_ENTRIES: &[(&str, RamdiskNode)] = &[
     ),
     // Phase 47: DOOM
     ("doom", RamdiskNode::File { content: DOOM_BIN }),
+    // Phase 55b Track F.3b: NVMe crash-and-restart smoke client.
+    (
+        "nvme-crash-smoke",
+        RamdiskNode::File {
+            content: NVME_CRASH_SMOKE_ELF,
+        },
+    ),
+    // Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+    (
+        "max-restart-smoke",
+        RamdiskNode::File {
+            content: MAX_RESTART_SMOKE_ELF,
+        },
+    ),
+    // Phase 55b Track F.3d-3: e1000 crash-and-restart smoke client.
+    (
+        "e1000-crash-smoke",
+        RamdiskNode::File {
+            content: E1000_CRASH_SMOKE_ELF,
+        },
+    ),
 ];
 
 static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
@@ -538,6 +571,25 @@ static ETC_ENTRIES: &[(&str, RamdiskNode)] = &[
 ];
 
 static SBIN_ENTRIES: &[(&str, RamdiskNode)] = &[("init", RamdiskNode::File { content: INIT_ELF })];
+
+// Phase 55b Tracks D.1 / E.1 — hardware driver ELFs. Ring-3 drivers live
+// under `/drivers/<name>` so init's service registration (Track F.1) and
+// any future `execve` call can target a canonical path that is not mixed
+// in with general userspace utilities under `/bin/`.
+static DRIVERS_ENTRIES: &[(&str, RamdiskNode)] = &[
+    (
+        "nvme",
+        RamdiskNode::File {
+            content: NVME_DRIVER_ELF,
+        },
+    ),
+    (
+        "e1000",
+        RamdiskNode::File {
+            content: E1000_DRIVER_ELF,
+        },
+    ),
+];
 
 static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
     (
@@ -556,6 +608,12 @@ static ROOT_ENTRIES: &[(&str, RamdiskNode)] = &[
         "etc",
         RamdiskNode::Dir {
             children: ETC_ENTRIES,
+        },
+    ),
+    (
+        "drivers",
+        RamdiskNode::Dir {
+            children: DRIVERS_ENTRIES,
         },
     ),
 ];

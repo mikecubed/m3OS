@@ -462,6 +462,13 @@ pub static VIRTIO_NET_READY: AtomicBool = AtomicBool::new(false);
 /// otherwise deadlock on a spin::Mutex held with interrupts enabled.
 static NET_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
+/// `true` when the device is configured for legacy INTx IRQ delivery; `false`
+/// for MSI-X. The ISR uses this to decide whether to read `ISR_STATUS` (which
+/// clears it on read, required for INTx to avoid spurious continued delivery),
+/// or to skip the read (which is unnecessary for MSI-X and may on some
+/// QEMU / legacy-virtio interactions suppress the next MSI-X delivery).
+static USING_LEGACY_INTX: AtomicBool = AtomicBool::new(false);
+
 /// Signal flag for `block_current_unless_woken` in the network task.
 /// The ISR sets it, `net_task` consumes it via swap. Public so the task
 /// running in `main.rs::net_task` can use it directly.
@@ -472,6 +479,7 @@ pub static NET_IRQ_WOKEN: AtomicBool = AtomicBool::new(false);
 /// parks.
 pub fn set_net_task_id(id: TaskId) {
     NET_TASK_ID.store(id.0, Ordering::Release);
+    log::info!("[net] registered net_task id={}", id.0);
 }
 
 /// Returns the MAC address of the virtio-net device, if initialized.
@@ -501,24 +509,36 @@ pub fn pci_interrupt_line() -> Option<u8> {
 // ===========================================================================
 
 /// Acknowledge the device interrupt (read-to-clear ISR status) and wake the
-/// network task so it can drain the RX ring. Runs in ISR context.
+/// network task so it can drain the RX ring. Runs in ISR context — see
+/// the module-level contract in `kernel/src/arch/x86_64/interrupts.rs`.
 ///
-/// Must obey the ISR contract: no allocation, no blocking, no IPC. The only
-/// work it does under `DRIVER.lock()` is read a single port byte; all frame
-/// processing happens in `net_task`.
+/// ISR-safe lock use:
+/// - `DRIVER.lock()` — plain `spin::Mutex`, but every task-context
+///   acquisition (`recv_frames`, `send_frame`, `mac_address`,
+///   `pci_interrupt_line`) wraps itself in `without_interrupts(…)`, so
+///   a same-core ISR cannot reach a held lock. The ISR-side acquisition
+///   here only reads `ISR_STATUS` and returns.
+/// - `wake_task(TaskId(NET_TASK_ID))` — safe because
+///   `scheduler::SCHEDULER` is an `IrqSafeMutex<Scheduler>` and
+///   `enqueue_to_core` wraps its per-core `run_queue.lock()` in
+///   `without_interrupts`. Prior to the 2026-04-21 post-mortem fix this
+///   path deadlocked on a same-core `SCHEDULER.lock` holder; see
+///   `docs/post-mortems/2026-04-21-scheduler-lock-isr-deadlock.md`.
 ///
-/// Correctness — see the Fix 1 note in `blk/virtio_blk.rs`: the
-/// `send_frame`/`recv_frames` task-path takes `DRIVER.lock()` and must wrap
-/// that in `without_interrupts` so the ISR cannot fire on this CPU while
-/// the lock is held.
+/// No allocation, no blocking, no IPC.
 fn virtio_net_irq_handler() {
-    // Ack the device-side interrupt by reading ISR status. We take the
-    // driver lock briefly to get the port base — which is cheap and safe
-    // because task-path callers wrap their critical sections in
-    // without_interrupts.
-    if let Some(d) = DRIVER.lock().as_ref() {
+    // Legacy INTx requires reading ISR_STATUS to clear the device-level
+    // interrupt latch (per virtio 0.9.5 §2.1.2.4 — "reading this register
+    // has the side effect of clearing it"). MSI-X delivers per-vector
+    // without needing the shared-ISR latch; skipping the read in MSI-X
+    // mode avoids a QEMU / transitional-virtio interaction where reading
+    // ISR_STATUS while MSI-X is enabled can suppress the next MSI-X edge.
+    if USING_LEGACY_INTX.load(Ordering::Relaxed)
+        && let Some(d) = DRIVER.lock().as_ref()
+    {
         // SAFETY: io_base is a valid legacy virtio I/O base the driver
-        // probed and owns; reading ISR status is a side-effect-free ack.
+        // probed and owns; reading ISR status is a side-effect-free ack
+        // beyond clearing the INTx latch.
         unsafe {
             let _isr = Port::<u8>::new(d.io_base + VIRTIO_ISR_STATUS).read();
         }
@@ -809,6 +829,9 @@ fn init_with_handle(handle: pci::PciDeviceHandle) {
             const NET_INTX_VECTOR: u8 = crate::arch::x86_64::interrupts::DEVICE_IRQ_VECTOR_BASE + 3;
             let intx_result = handle.install_intx_irq(NET_INTX_VECTOR, virtio_net_irq_handler);
             if let Ok(i) = intx_result {
+                // ISR handler must read ISR_STATUS in legacy INTx mode to
+                // clear the shared-IRQ latch.
+                USING_LEGACY_INTX.store(true, Ordering::Release);
                 if dev_copy.interrupt_line != 0xFF && crate::acpi::io_apic_address().is_some() {
                     crate::arch::x86_64::apic::route_pci_irq(
                         dev_copy.interrupt_line,

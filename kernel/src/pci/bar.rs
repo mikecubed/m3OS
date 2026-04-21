@@ -312,6 +312,326 @@ impl BarMapping {
             BarMapping::Pio { .. } => kpci::BarType::Io,
         }
     }
+
+    /// Map this (MMIO) BAR into a ring-3 address space — Phase 55b Track B.2.
+    ///
+    /// Reserves a contiguous user-VA window sized to the BAR, installs 4 KiB
+    /// PTEs pointing at the BAR's physical frames with the right cache mode
+    /// (`UC` for MMIO, `WC` for prefetchable BARs), and records a VMA so
+    /// `sys_linux_munmap` / process-exit teardown skip the frames rather
+    /// than return them to the RAM allocator. `BIT_11` marks the leaves
+    /// as "device frame — do not free on teardown" in the same convention
+    /// established for the UEFI framebuffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` — the PID of the driver process to map into. Must already
+    ///   own the `AddressSpace` referenced by `addr_space`.
+    /// * `addr_space` — cloned `Arc<AddressSpace>` captured under the
+    ///   process-table lock so its page-table-mutation lock can be held
+    ///   for the duration of the mapping.
+    /// * `prefetchable` — the BAR's prefetchable bit, used to pick `UC`
+    ///   (uncacheable) vs `WC` (write-combining) cache mode.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(user_va)` — the 4 KiB-aligned base of the new user mapping.
+    /// * `Err(UserMapError)` — the mapping could not be installed (no free
+    ///   user VA, page-table insert failed, etc.). The method leaves the
+    ///   caller's AS exactly as it found it — any partial mapping is
+    ///   rolled back before returning.
+    ///
+    /// Returns [`UserMapError::NotMmio`] on a PIO BAR — I/O port BARs are
+    /// not mappable through the paging hardware.
+    ///
+    /// The production device-host syscall path (`sys_device_mmio_map`)
+    /// calls [`map_mmio_region_to_user`] directly with the already-resolved
+    /// `(phys_base, size)` tuple; this method is the ergonomic API for
+    /// future callers (Track C.2's `driver_runtime::Mmio::map`) that hold
+    /// a [`BarMapping`] instead.
+    #[allow(dead_code)]
+    pub fn map_to_user(
+        &self,
+        pid: crate::process::Pid,
+        addr_space: &alloc::sync::Arc<crate::mm::AddressSpace>,
+        prefetchable: bool,
+    ) -> Result<u64, UserMapError> {
+        let region = match self {
+            BarMapping::Mmio { region, .. } => region,
+            BarMapping::Pio { .. } => return Err(UserMapError::NotMmio),
+        };
+        map_mmio_region_to_user(pid, addr_space, region.phys_base, region.size, prefetchable)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User-space mapping of an MMIO BAR (Phase 55b Track B.2)
+// ---------------------------------------------------------------------------
+
+/// Failure surface for [`BarMapping::map_to_user`].
+///
+/// Kept as a typed enum rather than a `&'static str` so the device-host
+/// syscall path can map each variant to a distinct errno deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserMapError {
+    /// The BAR is an I/O port BAR and cannot be mapped into a user address
+    /// space.
+    NotMmio,
+    /// The caller's AS has no free user-virtual-address range for the BAR.
+    NoFreeUserVa,
+    /// A page-table insert failed (either frame alloc failed for an
+    /// intermediate table, or the target VA was already mapped).
+    PageTableInsertFailed,
+    /// The BAR's physical base is not page-aligned or its size overflows
+    /// `usize::MAX` when expressed in pages.
+    InvalidBarGeometry,
+    /// The caller's PID has no process-table entry — scheduling race or
+    /// bogus PID.
+    NoProcess,
+}
+
+/// Core user-side mapping routine — used by [`BarMapping::map_to_user`] and
+/// by the device-host syscall dispatcher directly when it already holds
+/// `(phys_base, size)` and does not need a full [`BarMapping`] handle.
+///
+/// Holds the target AS's page-table-mutation lock for the duration of the
+/// mapping, bumps the generation counter on success, and records a VMA so
+/// `sys_linux_munmap` recognises the range. `BIT_11` is set on every leaf
+/// so process-teardown's `free_process_page_table` treats the frames as
+/// device memory and does not return them to the RAM allocator.
+///
+/// Rolls back cleanly on failure: any partial mapping is undone and the
+/// `mmap_next` cursor is restored to its pre-call position so a retry does
+/// not leak VA.
+pub(crate) fn map_mmio_region_to_user(
+    pid: crate::process::Pid,
+    addr_space: &alloc::sync::Arc<crate::mm::AddressSpace>,
+    phys_base: u64,
+    size: u64,
+    prefetchable: bool,
+) -> Result<u64, UserMapError> {
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
+
+    // Geometry check — phys_base must be page-aligned and size > 0.
+    if phys_base & 0xFFF != 0 || size == 0 {
+        return Err(UserMapError::InvalidBarGeometry);
+    }
+    let page_count = match size.checked_add(0xFFF).map(|v| v >> 12) {
+        Some(p) if p > 0 => p as usize,
+        _ => return Err(UserMapError::InvalidBarGeometry),
+    };
+    let total_size = (page_count as u64) * 4096;
+
+    // Cache flags per the task-doc acceptance:
+    //   - UC (uncacheable) for MMIO → NO_CACHE | WRITE_THROUGH
+    //   - WC (write-combining) for prefetchable → NO_CACHE only
+    // Without PAT slots (deferred) this is the best approximation the
+    // existing kernel supports; the kernel-core unit tests pin the cache
+    // mode selection so a future PAT upgrade is a single-site change.
+    let cache_flags = if prefetchable {
+        PageTableFlags::NO_CACHE
+    } else {
+        PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH
+    };
+    // BIT_11: "device frame — do not return to the frame allocator on
+    // teardown". Same convention as the framebuffer mapping in
+    // `sys_framebuffer_mmap`; `free_process_page_table` skips any leaf
+    // with this bit set.
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::BIT_11
+        | cache_flags;
+
+    // Claim a user-VA range under the AS page-table lock.
+    let _page_table_guard = addr_space.lock_page_tables();
+
+    const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
+    let base =
+        match crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+            let current = if *mmap_next == 0 {
+                // Reference the canonical anonymous-mmap base directly so
+                // this mapping cannot silently diverge from the mmap
+                // syscall's layout.
+                crate::arch::x86_64::syscall::ANON_MMAP_BASE
+            } else {
+                *mmap_next
+            };
+            // Align up to 4 KiB — mmap_next is page-aligned in practice but
+            // a future caller might leave a sub-page fragment.
+            let base = (current + 0xFFF) & !0xFFF;
+            let end = base
+                .checked_add(total_size)
+                .filter(|v| *v <= USER_SPACE_END)?;
+            *mmap_next = end;
+            Some(base)
+        }) {
+            Some(Some(base)) => base,
+            Some(None) => return Err(UserMapError::NoFreeUserVa),
+            None => return Err(UserMapError::NoProcess),
+        };
+    let reservation_end = base + total_size;
+
+    // Walk the process's PML4 and install each 4 KiB PTE.
+    let cr3_phys = x86_64::PhysAddr::new(addr_space.pml4_phys().as_u64());
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => return Err(UserMapError::PageTableInsertFailed),
+    };
+    // SAFETY: `addr_space.lock_page_tables()` is held, so no concurrent
+    // `OffsetPageTable` is alive over this PML4 within the mapping
+    // critical section.
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+    let mut alloc = crate::mm::paging::GlobalFrameAlloc;
+
+    let mut installed: alloc::vec::Vec<Page<Size4KiB>> = alloc::vec::Vec::new();
+    for i in 0..page_count {
+        let v = base + (i as u64) * 4096;
+        let p = phys_base + (i as u64) * 4096;
+        let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(v));
+        let frame = match PhysFrame::<Size4KiB>::from_start_address(x86_64::PhysAddr::new(p)) {
+            Ok(f) => f,
+            Err(_) => {
+                rollback_user_mmio_mapping(&mut mapper, &installed);
+                rollback_user_mmio_reservation(pid, base, reservation_end);
+                return Err(UserMapError::InvalidBarGeometry);
+            }
+        };
+        // SAFETY: mapper and frame are valid; the PTE insert is serialized
+        // by the page-table lock; the frame is device MMIO (not in the
+        // RAM allocator's pool) so there is no aliasing.
+        let insert = unsafe { mapper.map_to(page, frame, flags, &mut alloc) };
+        match insert {
+            Ok(flush) => {
+                // The single range shootdown below covers the local core too;
+                // per-page flushes here would be redundant on the hot path.
+                flush.ignore();
+                installed.push(page);
+            }
+            Err(_) => {
+                rollback_user_mmio_mapping(&mut mapper, &installed);
+                rollback_user_mmio_reservation(pid, base, reservation_end);
+                return Err(UserMapError::PageTableInsertFailed);
+            }
+        }
+    }
+
+    // Record a VMA so `sys_linux_munmap` treats the range sensibly. We
+    // don't expect drivers to munmap MMIO (the cap-drop cascade owns
+    // teardown), but the VMA keeps diagnostics correct. `flags` carries
+    // the MMIO marker bit — reserved in `process::MemoryMapping` flags'
+    // low bits; we use `1 << 30` here as a B.2-local marker until a
+    // central `MMIO_MAPPING_FLAG` is introduced alongside the framebuffer
+    // one in a later phase.
+    //
+    // Prot/flags bits are named locally (rather than raw `0x3` / `1`)
+    // so this security-adjacent mapping code is self-documenting; the
+    // values mirror the Linux `PROT_*` / `MAP_*` semantics consumed by
+    // `sys_linux_munmap`.
+    const VMA_PROT_READ: u64 = 1 << 0;
+    const VMA_PROT_WRITE: u64 = 1 << 1;
+    const VMA_MAP_SHARED: u64 = 1 << 0;
+    const MMIO_MAPPING_FLAG: u64 = 1 << 30;
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, _mmap_next, vma_tree| {
+        vma_tree.insert(crate::process::MemoryMapping {
+            start: base,
+            len: total_size,
+            prot: VMA_PROT_READ | VMA_PROT_WRITE,
+            flags: VMA_MAP_SHARED | MMIO_MAPPING_FLAG,
+        });
+    });
+
+    addr_space.bump_generation();
+    crate::smp::tlb::tlb_shootdown_range(addr_space, base, base + total_size);
+
+    Ok(base)
+}
+
+/// Tear down a partially-installed user MMIO mapping — used on the
+/// map-failure rollback path and by `unmap_mmio_region_from_user`.
+fn rollback_user_mmio_mapping(
+    mapper: &mut x86_64::structures::paging::OffsetPageTable<'_>,
+    pages: &[x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>],
+) {
+    use x86_64::structures::paging::Mapper;
+    for page in pages {
+        if let Ok((_frame, flush)) = mapper.unmap(*page) {
+            flush.flush();
+        }
+    }
+}
+
+/// Reverse the `mmap_next` reservation if no later allocation has moved it.
+fn rollback_user_mmio_reservation(pid: crate::process::Pid, base: u64, reservation_end: u64) {
+    let _ = crate::process::with_shared_mm_mut(pid, |_brk_current, mmap_next, _vma_tree| {
+        if *mmap_next == reservation_end {
+            *mmap_next = base;
+        }
+    });
+}
+
+/// Unmap an MMIO range from a ring-3 address space — Phase 55b Track B.2
+/// cleanup cascade.
+///
+/// Called from the device-host registry's cleanup path when a
+/// `Capability::Device` is released (either explicitly or via process exit).
+/// Removes the PTEs for every 4 KiB page in `[user_va, user_va + len)`,
+/// flushes the TLB, and bumps the AS generation. The frames are MMIO and
+/// are never returned to the RAM allocator (BIT_11 convention).
+///
+/// Failures to unmap individual pages are logged but not propagated — the
+/// caller is already in the tear-down path and cannot meaningfully recover.
+pub(crate) fn unmap_mmio_region_from_user(
+    addr_space: &alloc::sync::Arc<crate::mm::AddressSpace>,
+    user_va: u64,
+    len: usize,
+) {
+    use x86_64::structures::paging::{Mapper, Page, PhysFrame, Size4KiB};
+
+    if len == 0 || user_va == 0 {
+        return;
+    }
+    let page_count = len.div_ceil(4096);
+
+    let _page_table_guard = addr_space.lock_page_tables();
+    let cr3_phys = x86_64::PhysAddr::new(addr_space.pml4_phys().as_u64());
+    let cr3_frame = match PhysFrame::<Size4KiB>::from_start_address(cr3_phys) {
+        Ok(f) => f,
+        Err(_) => {
+            log::warn!(
+                "[device-host] unmap_mmio: invalid CR3 phys {:#x}",
+                cr3_phys.as_u64()
+            );
+            return;
+        }
+    };
+    // SAFETY: page-table lock held; no aliasing OffsetPageTable.
+    let mut mapper = unsafe { crate::mm::mapper_for_frame(cr3_frame) };
+    for i in 0..page_count {
+        let v = user_va + (i as u64) * 4096;
+        let page: Page<Size4KiB> = Page::containing_address(x86_64::VirtAddr::new(v));
+        match mapper.unmap(page) {
+            // The range shootdown below covers the local core too; skip the
+            // per-page flush to avoid double-flushing large BAR teardowns.
+            Ok((_frame, flush)) => flush.ignore(),
+            Err(e) => {
+                log::warn!(
+                    "[device-host] unmap_mmio: page {:#x} unmap failed: {:?}",
+                    v,
+                    e
+                );
+            }
+        }
+    }
+
+    addr_space.bump_generation();
+    // Match the shootdown range to the pages actually unmapped (page-rounded
+    // end). `tlb_shootdown_range` page-aligns internally today, so this is
+    // defence-in-depth against future contract changes rather than a bug fix.
+    let flush_end = user_va + (page_count as u64) * 4096;
+    crate::smp::tlb::tlb_shootdown_range(addr_space, user_va, flush_end);
 }
 
 // ---------------------------------------------------------------------------

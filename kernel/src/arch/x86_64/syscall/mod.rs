@@ -51,6 +51,7 @@ const NEG_EBADF: u64 = (-9_i64) as u64;
 const NEG_EAGAIN: u64 = (-11_i64) as u64;
 const NEG_EFAULT: u64 = (-14_i64) as u64;
 const NEG_EINVAL: u64 = (-22_i64) as u64;
+const NEG_ENODEV: u64 = (-19_i64) as u64;
 const NEG_EMFILE: u64 = (-24_i64) as u64;
 const NEG_EEXIST: u64 = (-17_i64) as u64;
 const NEG_ENOSPC: u64 = (-28_i64) as u64;
@@ -180,6 +181,24 @@ fn is_current_exec_path(expected: &str) -> bool {
         .find(pid)
         .map(|proc| proc.exec_path.as_str() == expected)
         .unwrap_or(false)
+}
+
+fn is_interactive_debug_exec_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/bin/sshd"
+            | "/bin/login"
+            | "/bin/sh0"
+            | "/bin/vfs_server"
+            | "/bin/console_server"
+            | "/bin/ls"
+    )
+}
+
+fn current_exec_path_for_debug() -> Option<alloc::string::String> {
+    let pid = crate::process::current_pid();
+    let table = crate::process::PROCESS_TABLE.lock();
+    table.find(pid).map(|proc| proc.exec_path.clone())
 }
 
 enum PathNodeKind {
@@ -1204,10 +1223,26 @@ mod syscall_nr {
     pub const PUSH_RAW_INPUT: u64 = 0x1010;
     /// Phase 54: read raw disk sectors from userspace (for ring-3 storage servers).
     pub const BLOCK_READ: u64 = 0x1011;
+    /// Phase 55b Track F.3d-2: write raw disk sectors from userspace.
+    pub const BLOCK_WRITE: u64 = 0x1012;
 
     // -- ipc --
     pub const IPC_BASE: u64 = 0x1100;
     pub const IPC_LAST: u64 = 0x1110;
+
+    // -- device host (Phase 55b Track B) --
+    //
+    // Numbers are canonically declared in
+    // `kernel_core::device_host::syscalls`; re-exported here so the arch
+    // dispatcher's `match` arms can stay in one place. Do not redefine the
+    // numeric values — import the constants. `DEVICE_HOST_BASE` /
+    // `DEVICE_HOST_LAST` are re-exported for the Track B.2–B.4 implementers
+    // to match against once they land.
+    #[allow(unused_imports)]
+    pub use kernel_core::device_host::syscalls::{
+        DEVICE_HOST_BASE, DEVICE_HOST_LAST, SYS_DEVICE_CLAIM, SYS_DEVICE_DMA_ALLOC,
+        SYS_DEVICE_DMA_HANDLE_INFO, SYS_DEVICE_IRQ_SUBSCRIBE, SYS_DEVICE_MMIO_MAP,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1579,7 @@ pub extern "C" fn syscall_handler(
         GET_TERMIOS_OFLAG => crate::tty::TTY0.lock().ldisc.termios.c_oflag as u64,
         PUSH_RAW_INPUT => sys_push_raw_input(arg0),
         BLOCK_READ => sys_block_read(arg0, arg1, arg2, per_core_syscall_arg3()),
+        BLOCK_WRITE => sys_block_write(arg0, arg1, arg2, per_core_syscall_arg3()),
         // -- ipc --
         IPC_BASE..=IPC_LAST => {
             let dispatch_number = (number - IPC_BASE) + 1;
@@ -1555,6 +1591,85 @@ pub extern "C" fn syscall_handler(
                 per_core_syscall_arg3(),
                 crate::smp::per_core().syscall_user_r8,
             )
+        }
+        // -- device host (Phase 55b Track B) --
+        SYS_DEVICE_CLAIM => {
+            // Signature: sys_device_claim(segment, bus, dev, func) -> isize.
+            // Pack the four u8/u16 args out of u64 registers. Out-of-range
+            // values for the u8 fields are rejected as -ENODEV because the
+            // BDF cannot exist.
+            let segment = arg0 as u16;
+            if arg0 > u64::from(u16::MAX)
+                || arg1 > u64::from(u8::MAX)
+                || arg2 > u64::from(u8::MAX)
+                || per_core_syscall_arg3() > u64::from(u8::MAX)
+            {
+                NEG_ENODEV
+            } else {
+                let result = crate::syscall::device_host::sys_device_claim(
+                    segment,
+                    arg1 as u8,
+                    arg2 as u8,
+                    per_core_syscall_arg3() as u8,
+                );
+                result as u64
+            }
+        }
+        SYS_DEVICE_MMIO_MAP => {
+            // Signature: sys_device_mmio_map(dev_cap: CapHandle, bar_index: u8) -> isize.
+            // CapHandle is u32 and bar_index is u8 — reject out-of-range
+            // user arguments with -EINVAL rather than silently truncating
+            // (e.g. `bar_index = 256` would become 0 and change which
+            // BAR is addressed).
+            if arg0 > u64::from(u32::MAX) || arg1 > u64::from(u8::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_mmio_map(arg0 as u32, arg1 as u8) as u64
+            }
+        }
+        SYS_DEVICE_DMA_ALLOC => {
+            // Signature: sys_device_dma_alloc(dev_cap: CapHandle, size: usize, align: usize) -> isize.
+            // CapHandle is u32 — narrower than a syscall register, so
+            // validate before truncation to keep the errno contract
+            // consistent with the rest of the device-host dispatch.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_alloc(
+                    arg0 as u32,
+                    arg1 as usize,
+                    arg2 as usize,
+                ) as u64
+            }
+        }
+        SYS_DEVICE_DMA_HANDLE_INFO => {
+            // Signature: sys_device_dma_handle_info(dma_cap: CapHandle, out: *mut DmaHandle) -> isize.
+            if arg0 > u64::from(u32::MAX) {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_dma_handle_info(arg0 as u32, arg1 as usize)
+                    as u64
+            }
+        }
+        SYS_DEVICE_IRQ_SUBSCRIBE => {
+            // Signature (Track B.4b): sys_device_irq_subscribe(dev_cap: CapHandle, bit_index: u32, notification_arg: u32) -> isize.
+            // `bit_index` selects the bit (0..=63) within the 64-bit Notification
+            // word the ISR will set. `notification_arg` is either
+            // `NOTIFICATION_SENTINEL_NEW` (allocate a fresh Notification) or a
+            // `CapHandle` to an existing `Capability::Notification` the caller
+            // holds. See `kernel/src/syscall/device_host.rs` for full ABI docs.
+            if arg0 > u64::from(u32::MAX)
+                || arg1 > u64::from(u32::MAX)
+                || arg2 > u64::from(u32::MAX)
+            {
+                NEG_EINVAL
+            } else {
+                crate::syscall::device_host::sys_device_irq_subscribe(
+                    arg0 as u32,
+                    arg1 as u32,
+                    arg2 as u32,
+                ) as u64
+            }
         }
         _ => {
             log::warn!("unhandled syscall {number} (args: {arg0:#x}, {arg1:#x}, {arg2:#x})");
@@ -1910,6 +2025,22 @@ fn do_full_process_exit(pid: crate::process::Pid, code: i32) -> ! {
     if let Some(task_id) = crate::task::scheduler::current_task_id() {
         crate::ipc::cleanup::cleanup_task_ipc(task_id);
     }
+
+    // Phase 55b Track B.3: release every `Capability::Dma` held by this
+    // process BEFORE releasing the device claims so the `DmaSlot::drop`
+    // path can unmap IOVA against a still-live IOMMU domain. If the
+    // device claims were released first the domain would already be
+    // destroyed by `PciDeviceHandle::drop` and the IOVA unmap would be a
+    // no-op against a freed domain.
+    let _ = crate::syscall::device_host::release_dma_for_pid(pid);
+
+    // Phase 55b Track B.1: release every `Capability::Device` held by this
+    // process so the supervisor (Phase 46 / Phase 51) can restart a fresh
+    // driver instance on the same BDF. Must run before FD close so the
+    // PciDeviceHandle's Drop (IOMMU domain teardown, PCI registry slot
+    // return) completes while the address space is still around for any
+    // per-BAR cleanup we might need later.
+    crate::syscall::device_host::release_claims_for_pid(pid);
 
     // Close all open FDs so pipe ref-counts reach 0 and EOF propagates.
     crate::process::close_all_fds_for(pid);
@@ -3439,7 +3570,18 @@ pub(super) fn sys_fork(user_rip: u64, user_rsp: u64) -> u64 {
         "fork-child",
     );
 
-    log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    if let Some(parent_exec_path) = current_exec_path_for_debug()
+        && is_interactive_debug_exec_path(parent_exec_path.as_str())
+    {
+        log::info!(
+            "[proc] fork: parent_pid={} parent_exec={} child_pid={}",
+            parent_pid,
+            parent_exec_path,
+            child_pid
+        );
+    } else {
+        log::debug!("[p{}] fork() → child pid {}", parent_pid, child_pid);
+    }
     child_pid as u64
 }
 
@@ -3707,6 +3849,9 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
                 proc.shared_signal_actions = None;
             }
         }
+    }
+    if is_interactive_debug_exec_path(name) {
+        log::info!("[proc] execve: pid={} path={}", pid, name);
     }
 
     // Switch to the new page table and enter ring 3.
@@ -4192,7 +4337,9 @@ const BRK_BASE: u64 = 0x0000_0002_0000_0000;
 /// Initial virtual address for anonymous mmap allocations.
 ///
 /// Placed at 128 GiB — above the brk heap region and below the stack.
-const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
+/// Re-used by `kernel::pci::bar` for device-MMIO BAR mappings, so
+/// visibility is `pub(crate)` to keep a single source of truth.
+pub(crate) const ANON_MMAP_BASE: u64 = 0x0000_0020_0000_0000;
 
 // Re-export FD types from process module (Phase 14 — per-process FD table).
 use crate::process::{FdBackend, FdEntry, MAX_FDS};
@@ -6694,6 +6841,13 @@ fn privileged_exec_credentials(path: &str, exec_is_static_ramdisk: bool) -> Opti
         // effective identity so it can verify passwords via /etc/shadow and
         // then perform the authenticated credential transition.
         ("/bin/su", true) => Some((0, 0)),
+        // Phase 55b Track F.3c: nvme-crash-smoke must run with euid=200 so
+        // sys_block_read admits it through the privilege gate. Without this,
+        // the binary would be rejected before ever reaching the errno mapping.
+        // Only granted when the kernel is NOT in hardened mode (the whitelist
+        // in BLOCK_READ_ALLOWED is also cfg-gated on !hardened).
+        #[cfg(not(feature = "hardened"))]
+        ("/bin/nvme-crash-smoke", _) => Some((200, 200)),
         _ => None,
     }
 }
@@ -8883,24 +9037,57 @@ fn serial_echo_bytes(bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// Allowed caller binaries for raw block reads.
+///
+/// In production (`hardened` feature), only supervised storage servers
+/// may call `sys_block_read`. Without `hardened`, the integration test
+/// binary `/bin/nvme-crash-smoke` is also permitted so it can observe
+/// `EAGAIN` from the kernel facade's `DriverRestarting` path — a
+/// behaviour that is only visible through `RemoteBlockDevice`, not through
+/// the direct IPC channel the smoke binary normally uses.
 const STORAGE_SERVICE_UID: u32 = 200;
+#[cfg(not(feature = "hardened"))]
+const BLOCK_READ_ALLOWED: &[&str] = &[
+    "/bin/vfs_server",
+    "/bin/fat_server",
+    "/bin/nvme-crash-smoke",
+];
+#[cfg(feature = "hardened")]
 const BLOCK_READ_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
 
 /// Read raw disk sectors into a userspace buffer.
 ///
-/// Args:
+/// # Arguments
 ///   - `start_sector`: absolute LBA of the first sector
 ///   - `count`: number of 512-byte sectors to read
 ///   - `buf_ptr`: userspace destination address
 ///   - `buf_len`: size of the destination buffer in bytes
 ///
-/// Returns 0 on success, or a negative errno on error.
+/// # Returns
+///
+/// Returns 0 on success, or a negative errno on error:
+///
+/// | `BlockDriverError` | byte | errno returned     |
+/// |---|---|---|
+/// | `Ok`               | 0    | 0 (success)        |
+/// | `IoError`          | 1    | `NEG_EIO` (-5)     |
+/// | `InvalidLba`       | 2    | `NEG_EIO` (-5)     |
+/// | `DeviceAbsent`     | 3    | `NEG_EIO` (-5)     |
+/// | `Busy`             | 4    | `NEG_EAGAIN` (-11) |
+/// | `DriverRestarting` | 5    | `NEG_EAGAIN` (-11) |
+/// | `InvalidRequest`   | 6    | `NEG_EIO` (-5)     |
+///
+/// `Busy` and `DriverRestarting` map to `EAGAIN` so callers can distinguish
+/// a temporary driver restart from a permanent I/O failure. The mapping is
+/// the single source of truth in
+/// `kernel_core::driver_ipc::block::block_error_to_neg_errno`
+/// (tested in `kernel-core/src/driver_ipc/block.rs`, Phase 55b Track F.3c).
+///
 /// Capped at 128 sectors (64 KiB) per call for safety.
 ///
 /// Only supervised storage services may call this syscall. The kernel requires
-/// both a dedicated service euid and an expected service binary path so
-/// ordinary users cannot gain raw-disk access by directly exec'ing a public
-/// `/bin/*_server` binary.
+/// both a dedicated service euid (`STORAGE_SERVICE_UID = 200`) and an expected
+/// service binary path so ordinary users cannot gain raw-disk access by
+/// directly exec'ing a public `/bin/*_server` binary.
 fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     // Restrict to supervised storage services.
     {
@@ -8937,7 +9124,113 @@ fn sys_block_read(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> 
             }
             0
         }
-        Err(_) => NEG_EIO,
+        // Propagate the driver error byte through the documented errno mapping.
+        // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
+        // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
+        Err(error_byte) => {
+            kernel_core::driver_ipc::block::block_error_to_neg_errno(error_byte) as u64
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 55b Track F.3d-2: sys_block_write — raw sector writes for ring-3
+// storage servers and integration tests
+// ---------------------------------------------------------------------------
+
+/// Allowed caller binaries for raw block writes.
+///
+/// The write whitelist is intentionally identical to `BLOCK_READ_ALLOWED`:
+/// only supervised storage servers and (in non-hardened builds) the
+/// `nvme-crash-smoke` integration test binary may issue raw disk writes.
+/// The symmetric design means the same privilege gate governs both paths,
+/// simplifying the audit surface.
+#[cfg(not(feature = "hardened"))]
+const BLOCK_WRITE_ALLOWED: &[&str] = &[
+    "/bin/vfs_server",
+    "/bin/fat_server",
+    "/bin/nvme-crash-smoke",
+];
+#[cfg(feature = "hardened")]
+const BLOCK_WRITE_ALLOWED: &[&str] = &["/bin/vfs_server", "/bin/fat_server"];
+
+/// Write raw disk sectors from a userspace buffer.
+///
+/// # Arguments
+///   - `start_sector`: absolute LBA of the first sector
+///   - `count`: number of 512-byte sectors to write
+///   - `buf_ptr`: userspace source address
+///   - `buf_len`: size of the source buffer in bytes
+///
+/// # Returns
+///
+/// Returns 0 on success, or a negative errno on error.
+/// The errno mapping is identical to `sys_block_read`:
+///
+/// | `BlockDriverError` | byte | errno returned     |
+/// |---|---|---|
+/// | `Ok`               | 0    | 0 (success)        |
+/// | `IoError`          | 1    | `NEG_EIO` (-5)     |
+/// | `InvalidLba`       | 2    | `NEG_EIO` (-5)     |
+/// | `DeviceAbsent`     | 3    | `NEG_EIO` (-5)     |
+/// | `Busy`             | 4    | `NEG_EAGAIN` (-11) |
+/// | `DriverRestarting` | 5    | `NEG_EAGAIN` (-11) |
+/// | `InvalidRequest`   | 6    | `NEG_EIO` (-5)     |
+///
+/// `DriverRestarting` maps to `EAGAIN` so callers can distinguish a temporary
+/// driver restart from a permanent I/O failure. Single source of truth:
+/// `kernel_core::driver_ipc::block::block_error_to_neg_errno`.
+///
+/// Capped at 128 sectors (64 KiB) per call, matching `sys_block_read`.
+///
+/// Privilege gate is symmetric with `sys_block_read`: euid must equal
+/// `STORAGE_SERVICE_UID` (200) and the exec path must appear in
+/// `BLOCK_WRITE_ALLOWED`. This prevents unprivileged callers from issuing
+/// raw disk writes through the facade.
+fn sys_block_write(start_sector: u64, count: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    // Restrict to supervised storage services (symmetric with sys_block_read).
+    {
+        let pid = crate::process::current_pid();
+        let table = crate::process::PROCESS_TABLE.lock();
+        let allowed = table.find(pid).is_some_and(|p| {
+            p.euid == STORAGE_SERVICE_UID && BLOCK_WRITE_ALLOWED.iter().any(|a| p.exec_path == *a)
+        });
+        if !allowed {
+            return NEG_EPERM;
+        }
+    }
+
+    const MAX_SECTORS: usize = 128; // 64 KiB — matches sys_block_read cap
+
+    let count = count as usize;
+    if count == 0 || count > MAX_SECTORS {
+        return NEG_EINVAL;
+    }
+
+    let needed = count * 512;
+    if needed > buf_len as usize {
+        return NEG_EINVAL;
+    }
+
+    // Copy the data from userspace into a kernel-owned buffer before
+    // dispatching to the block layer so we hold no user pointer across
+    // the potential IPC boundary to the ring-3 NVMe driver.
+    let mut kernel_buf = alloc::vec![0u8; needed];
+    if UserSliceRo::new(buf_ptr, needed)
+        .and_then(|s| s.copy_to_kernel(&mut kernel_buf))
+        .is_err()
+    {
+        return NEG_EFAULT;
+    }
+
+    match crate::blk::write_sectors(start_sector, count, &kernel_buf) {
+        Ok(()) => 0,
+        // Propagate the driver error byte through the documented errno mapping.
+        // DriverRestarting (5) and Busy (4) → EAGAIN (-11); all others → EIO (-5).
+        // Single source of truth: kernel_core::driver_ipc::block::block_error_to_neg_errno.
+        Err(error_byte) => {
+            kernel_core::driver_ipc::block::block_error_to_neg_errno(error_byte) as u64
+        }
     }
 }
 
@@ -10641,7 +10934,6 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
             Some(p) => p,
             None => {
                 log::error!("[mount] no ext2 partition found on virtio-blk");
-                const NEG_ENODEV: u64 = (-19_i64) as u64;
                 return NEG_ENODEV;
             }
         };
@@ -10660,7 +10952,6 @@ pub(super) fn sys_linux_mount(_source_ptr: u64, target_ptr: u64, fstype_ptr: u64
             Some(p) => p,
             None => {
                 log::error!("[mount] no FAT32 partition found on virtio-blk");
-                const NEG_ENODEV: u64 = (-19_i64) as u64;
                 return NEG_ENODEV;
             }
         };
@@ -14216,7 +14507,45 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         }
     }
 
-    loop {
+    // H8 fix: register waiters ONCE up front and keep them registered for
+    // the lifetime of the syscall. Previously the code re-registered on
+    // every loop iteration, and in the positive-timeout branch deregistered
+    // before yield_now(), creating a window where wakes arriving during
+    // yield hit empty WaitQueues and were silently lost. With a single
+    // registration held across all iterations, wakes always find a waiter
+    // and set the shared `woken` flag; the top-of-loop readiness scan then
+    // sees the state change on the next iteration.
+    let task_id = match crate::task::scheduler::current_task_id() {
+        Some(id) => id,
+        None => return NEG_EINTR,
+    };
+    let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+    let mut registered_any = false;
+    if timeout_i != 0 {
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i]
+                && fd_register_waiter(entry, task_id, &woken)
+            {
+                registered_any = true;
+            }
+        }
+    }
+
+    let deregister_all = |entries: &[Option<FdEntry>; 256]| {
+        for i in 0..nfds {
+            if let Some(entry) = &entries[i] {
+                fd_deregister_waiter(entry, task_id);
+            }
+        }
+    };
+
+    let result = loop {
+        // Clear the woken flag before scanning. If a wake fires after this
+        // clear, the flag will be set again and we'll see it on the next
+        // iteration's check (or the FD will show ready in the scan).
+        woken.store(false, core::sync::atomic::Ordering::Release);
+
         let mut ready_count = 0u64;
 
         for i in 0..nfds {
@@ -14244,97 +14573,50 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout: u64) -> u64 {
         let timed_out =
             deadline_tick.is_some_and(|d| crate::arch::x86_64::interrupts::tick_count() >= d);
         if ready_count > 0 || timeout_i == 0 || timed_out {
-            // Write results back to userspace.
-            for i in 0..nfds {
-                let base = match fds_ptr.checked_add((i * 8) as u64) {
-                    Some(a) => a,
-                    None => return NEG_EFAULT,
-                };
-                if UserSliceWo::new(base, pfds[i].len())
-                    .and_then(|s| s.copy_from_kernel(&pfds[i]))
-                    .is_err()
-                {
-                    return NEG_EFAULT;
-                }
-            }
-            return ready_count;
+            break ready_count;
         }
 
         if has_pending_signal() {
-            return NEG_EINTR;
-        }
-
-        // Nothing ready — register on all FD wait queues and block.
-        let task_id = match crate::task::scheduler::current_task_id() {
-            Some(id) => id,
-            None => return NEG_EINTR,
-        };
-        let woken = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-
-        let mut registered_any = false;
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i]
-                && fd_register_waiter(entry, task_id, &woken)
-            {
-                registered_any = true;
-            }
+            break NEG_EINTR;
         }
 
         // If no FDs could be registered (all non-pollable), yield to avoid
-        // blocking forever with no wake source.
+        // spinning at full CPU with no wake source.
         if !registered_any {
             crate::task::yield_now();
             continue;
         }
 
-        // Re-check readiness after registration to close the TOCTOU window.
-        // If an event arrived between the first scan and registration, the
-        // woken flag may not be set, so we must re-scan before blocking.
-        let mut any_ready = false;
-        for i in 0..nfds {
-            if let Some(entry) = &entries[i] {
-                let events = i16::from_ne_bytes([pfds[i][4], pfds[i][5]]);
-                let ready = fd_poll_events(entry);
-                if (ready & events) != 0 || (ready & (POLLHUP | POLLERR)) != 0 {
-                    any_ready = true;
-                    break;
-                }
-            }
-        }
-
-        if any_ready {
-            // Something became ready — deregister and re-scan on next loop iteration.
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
-            }
-            continue;
-        }
-
-        // Block until woken by an FD event. For positive timeouts, use
-        // yield instead of full block so the tick counter advances and the
-        // deadline check at the top of the loop can fire.
+        // Block until woken by an FD event. For positive timeouts, yield
+        // so the tick counter advances and the deadline check at the top
+        // of the loop can fire; for indefinite timeouts, fully block.
+        // In both cases, waiters remain registered across the suspend.
         if deadline_tick.is_some() {
-            // Positive timeout: yield once to let timer ticks advance.
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
-            }
             crate::task::yield_now();
         } else {
-            // Indefinite timeout (-1): block on wait queues.
             crate::task::scheduler::block_current_unless_woken(&woken);
-            for i in 0..nfds {
-                if let Some(entry) = &entries[i] {
-                    fd_deregister_waiter(entry, task_id);
-                }
+        }
+    };
+
+    deregister_all(&entries);
+
+    // Write results back to userspace.
+    if result != NEG_EINTR {
+        for i in 0..nfds {
+            let base = match fds_ptr.checked_add((i * 8) as u64) {
+                Some(a) => a,
+                None => return NEG_EFAULT,
+            };
+            if UserSliceWo::new(base, pfds[i].len())
+                .and_then(|s| s.copy_from_kernel(&pfds[i]))
+                .is_err()
+            {
+                return NEG_EFAULT;
             }
         }
-
-        // Re-scan on next iteration of the loop.
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------

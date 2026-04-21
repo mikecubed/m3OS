@@ -421,6 +421,7 @@ fn decode_handle(handle: u64) -> (u16, u16) {
 
 const REPLY_CAP_HANDLE: u32 = 1;
 const MAX_BULK_BUF: usize = VFS_MAX_READ;
+const SLOW_REQUEST_USEC: u64 = 50_000;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -532,12 +533,23 @@ fn server_loop(ext2: &Ext2State, ep_handle: u32) -> ! {
     let mut handles = HandleTable::new();
     let mut msg = syscall_lib::IpcMessage::new(0);
     let mut recv_buf = [0u8; MAX_BULK_BUF];
+    let mut req_seq: u64 = 0;
 
     // First receive — blocks until the kernel sends us a request.
     syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
 
     loop {
+        req_seq = req_seq.wrapping_add(1);
+        let start_us = now_usec();
         let (reply_label, reply_data0) = handle_request(ext2, &mut handles, &msg, &recv_buf);
+        let elapsed_us = now_usec().saturating_sub(start_us);
+        // H9 follow-up: per-request start/done logging was investigative
+        // only and added ~24 syscalls per request via write_str chains.
+        // Under the security-floor regression (which spawns ion via
+        // /bin/su user), that overhead saturated init's status-write
+        // cadence and starved ion's first-config read for >30s. Log
+        // ONLY slow requests now.
+        log_request_done(req_seq, &msg, reply_label, reply_data0, elapsed_us);
 
         // Store reply bulk data if any was prepared by handle_request.
         // (read path stores data via ipc_store_reply_bulk before we get here)
@@ -551,6 +563,50 @@ fn server_loop(ext2: &Ext2State, ep_handle: u32) -> ! {
         msg = syscall_lib::IpcMessage::new(0);
         syscall_lib::ipc_recv_msg(ep_handle, &mut msg, &mut recv_buf);
     }
+}
+
+fn now_usec() -> u64 {
+    let (sec, usec) = syscall_lib::gettimeofday();
+    if sec < 0 || usec < 0 {
+        0
+    } else {
+        (sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add(usec as u64)
+    }
+}
+
+fn request_name(label: u64) -> &'static str {
+    match label {
+        VFS_OPEN => "OPEN",
+        VFS_READ => "READ",
+        VFS_CLOSE => "CLOSE",
+        VFS_STAT_PATH => "STAT_PATH",
+        VFS_LIST_DIR => "LIST_DIR",
+        VFS_ACCESS_PATH => "ACCESS_PATH",
+        VFS_MOUNT_POLICY => "MOUNT_POLICY",
+        VFS_UMOUNT_POLICY => "UMOUNT_POLICY",
+        _ => "UNKNOWN",
+    }
+}
+
+fn log_request_done(
+    seq: u64,
+    msg: &syscall_lib::IpcMessage,
+    _reply_label: u64,
+    _reply_data0: u64,
+    elapsed_us: u64,
+) {
+    if elapsed_us < SLOW_REQUEST_USEC {
+        return;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "vfs_server: slow req#");
+    syscall_lib::write_u64(STDOUT_FILENO, seq);
+    syscall_lib::write_str(STDOUT_FILENO, " ");
+    syscall_lib::write_str(STDOUT_FILENO, request_name(msg.label));
+    syscall_lib::write_str(STDOUT_FILENO, " elapsed_us=");
+    syscall_lib::write_u64(STDOUT_FILENO, elapsed_us);
+    syscall_lib::write_str(STDOUT_FILENO, "\n");
 }
 
 /// Dispatch a single request.  Returns `(reply_label, reply_data0)`.

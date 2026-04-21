@@ -1,0 +1,11 @@
+[package]
+name = "max-restart-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "max-restart-smoke"
+path = "src/main.rs"
+
+[dependencies]
+syscall-lib = { path = "../syscall-lib" }

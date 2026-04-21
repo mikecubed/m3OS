@@ -68,11 +68,108 @@ use x86_64::instructions::interrupts;
 use super::{Task, TaskId, TaskState, switch_context};
 use crate::ipc::{CapError, CapHandle, Capability, EndpointId, Message, NotifId};
 
+type TaskDebugSnapshot = (u32, &'static str, TaskState, u8, u64, u64, u64);
+type CurrentTaskDebugSnapshot = (TaskId, u32, &'static str, TaskState, u8, u64, u64, u64);
+
+// ---------------------------------------------------------------------------
+// IRQ-safe scheduler lock wrapper
+// ---------------------------------------------------------------------------
+//
+// A same-core interrupt that calls `wake_task` can deadlock a task-context
+// holder of `SCHEDULER.lock()`. [`IrqSafeMutex`] prevents that by masking
+// interrupts for the duration of the critical section — the same pattern
+// used by `virtio_net::DRIVER` (wrapped in `without_interrupts`) and the
+// frame allocator's `with_frame_alloc_irq_safe` helper. Root cause analysis
+// is in `docs/appendix/scheduler-fairness-regression.md` (early-wedge).
+//
+// The guard's fields are dropped in declaration order: the inner spin
+// guard releases the lock *before* [`InterruptRestore`] re-enables IF,
+// so an ISR cannot fire during the unlock window and reach a just-freed
+// lock with stale `was_enabled` state.
+pub(crate) struct IrqSafeMutex<T: ?Sized> {
+    inner: Mutex<T>,
+}
+
+pub(crate) struct IrqSafeGuard<'a, T: ?Sized + 'a> {
+    guard: spin::MutexGuard<'a, T>,
+    _restore: InterruptRestore,
+}
+
+struct InterruptRestore {
+    was_enabled: bool,
+}
+
+impl<T> IrqSafeMutex<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+}
+
+impl<T: ?Sized> IrqSafeMutex<T> {
+    pub(crate) fn lock(&self) -> IrqSafeGuard<'_, T> {
+        let was_enabled = interrupts::are_enabled();
+        if was_enabled {
+            interrupts::disable();
+        }
+        let guard = self.inner.lock();
+        IrqSafeGuard {
+            guard,
+            _restore: InterruptRestore { was_enabled },
+        }
+    }
+
+    /// Non-blocking lock attempt — returns `None` if the inner spinlock is
+    /// already held. Used by the panic-diagnostic path so it can inspect
+    /// task state without deadlocking if the scheduler was holding the lock
+    /// at the moment the panic fired.
+    pub(crate) fn try_lock(&self) -> Option<IrqSafeGuard<'_, T>> {
+        let was_enabled = interrupts::are_enabled();
+        if was_enabled {
+            interrupts::disable();
+        }
+        match self.inner.try_lock() {
+            Some(guard) => Some(IrqSafeGuard {
+                guard,
+                _restore: InterruptRestore { was_enabled },
+            }),
+            None => {
+                if was_enabled {
+                    interrupts::enable();
+                }
+                None
+            }
+        }
+    }
+}
+
+impl<T: ?Sized> core::ops::Deref for IrqSafeGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T: ?Sized> core::ops::DerefMut for IrqSafeGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl Drop for InterruptRestore {
+    fn drop(&mut self) {
+        if self.was_enabled {
+            interrupts::enable();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statics
 // ---------------------------------------------------------------------------
 
-pub(super) static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+pub(super) static SCHEDULER: IrqSafeMutex<Scheduler> = IrqSafeMutex::new(Scheduler::new());
 
 // ---------------------------------------------------------------------------
 // Per-core helpers
@@ -527,6 +624,13 @@ fn least_loaded_core(sched: &Scheduler) -> u8 {
 }
 
 /// Enqueue a task index into a specific core's run queue and signal it.
+///
+/// The body runs with interrupts masked on the current CPU so that a
+/// same-core ISR cannot re-enter and deadlock on `run_queue.lock()` —
+/// the ISR-callable wake path (virtio-net, virtio-blk) funnels through
+/// `wake_task` → `enqueue_to_core`, and the task-context holder must not
+/// be preempted while the per-core run queue is locked. See the root-cause
+/// note at [`IrqSafeMutex`].
 fn enqueue_to_core(core_id: u8, idx: usize) {
     debug_assert!(
         (core_id as usize) < crate::smp::MAX_CORES,
@@ -534,32 +638,34 @@ fn enqueue_to_core(core_id: u8, idx: usize) {
         core_id,
         crate::smp::MAX_CORES
     );
-    if let Some(data) = crate::smp::get_core_data(core_id) {
-        data.run_queue.lock().push_back(idx);
-        crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
-            task_idx: idx as u32,
-            core: core_id,
-        });
-        data.reschedule.store(true, Ordering::Relaxed);
-        // Phase 54: when we enqueue onto a DIFFERENT core than the caller's,
-        // setting the reschedule flag alone won't wake a halted target core
-        // — `hlt` only wakes on an interrupt. Send a reschedule IPI so the
-        // target picks up the new task immediately instead of waiting for
-        // its next local timer tick (~10 ms on APs).
-        //
-        // Without this, the high-volume cross-core IPC introduced by the
-        // broadened VFS routing in commit 3944b9b causes deterministic
-        // login hangs on `/etc/services.d` STAT and intermittent hangs
-        // during subsequent interactive commands — wake_task returns true
-        // (state flips Blocked→Ready) but the idle target core never
-        // notices the new run-queue entry.
-        if crate::smp::is_per_core_ready() {
-            let current = crate::smp::per_core().core_id;
-            if current != core_id {
-                crate::smp::ipi::send_ipi_to_core(core_id, crate::smp::ipi::IPI_RESCHEDULE);
+    interrupts::without_interrupts(|| {
+        if let Some(data) = crate::smp::get_core_data(core_id) {
+            data.run_queue.lock().push_back(idx);
+            crate::trace::trace_event(kernel_core::trace_ring::TraceEvent::RunQueueEnqueue {
+                task_idx: idx as u32,
+                core: core_id,
+            });
+            data.reschedule.store(true, Ordering::Relaxed);
+            // Phase 54: when we enqueue onto a DIFFERENT core than the caller's,
+            // setting the reschedule flag alone won't wake a halted target core
+            // — `hlt` only wakes on an interrupt. Send a reschedule IPI so the
+            // target picks up the new task immediately instead of waiting for
+            // its next local timer tick (~10 ms on APs).
+            //
+            // Without this, the high-volume cross-core IPC introduced by the
+            // broadened VFS routing in commit 3944b9b causes deterministic
+            // login hangs on `/etc/services.d` STAT and intermittent hangs
+            // during subsequent interactive commands — wake_task returns true
+            // (state flips Blocked→Ready) but the idle target core never
+            // notices the new run-queue entry.
+            if crate::smp::is_per_core_ready() {
+                let current = crate::smp::per_core().core_id;
+                if current != core_id {
+                    crate::smp::ipi::send_ipi_to_core(core_id, crate::smp::ipi::IPI_RESCHEDULE);
+                }
             }
         }
-    }
+    });
 }
 
 /// Allocate a slot for a new task, reusing a dead slot from the free list
@@ -849,6 +955,18 @@ fn task_pid(idx: usize) -> u32 {
     SCHEDULER.lock().tasks[idx].pid
 }
 
+/// Resolve a [`TaskId`] to its owning process PID, if the task exists.
+///
+/// Used by kernel-side facades that need to validate the provenance of a
+/// service registration (e.g. `kernel::blk::remote::is_registered` must
+/// check that whoever registered `nvme.block` is a supervised driver
+/// process, not an arbitrary ring-3 task that grabbed the name first).
+/// Returns `None` if no task with the given id exists.
+pub fn pid_for_task_id(task_id: TaskId) -> Option<u32> {
+    let sched = SCHEDULER.lock();
+    sched.tasks.iter().find(|t| t.id == task_id).map(|t| t.pid)
+}
+
 /// Return the user and system tick counts for the current task.
 pub fn current_task_times() -> Option<(u64, u64)> {
     let idx = get_current_task_idx()?;
@@ -861,6 +979,39 @@ pub fn current_task_id() -> Option<TaskId> {
     let idx = get_current_task_idx()?;
     let sched = SCHEDULER.lock();
     Some(sched.tasks[idx].id)
+}
+
+/// Best-effort debug snapshot for the task currently running on this core.
+pub fn current_task_debug_snapshot() -> Option<CurrentTaskDebugSnapshot> {
+    let idx = get_current_task_idx()?;
+    let sched = SCHEDULER.lock();
+    let task = sched.tasks.get(idx)?;
+    Some((
+        task.id,
+        task.pid,
+        task.name,
+        task.state,
+        task.assigned_core,
+        task.affinity_mask,
+        task.last_ready_tick,
+        task.last_migrated_tick,
+    ))
+}
+
+/// Best-effort debug snapshot for an arbitrary task id.
+pub fn task_debug_snapshot(id: TaskId) -> Option<TaskDebugSnapshot> {
+    let sched = SCHEDULER.lock();
+    let idx = sched.find(id)?;
+    let task = sched.tasks.get(idx)?;
+    Some((
+        task.pid,
+        task.name,
+        task.state,
+        task.assigned_core,
+        task.affinity_mask,
+        task.last_ready_tick,
+        task.last_migrated_tick,
+    ))
 }
 
 /// Return dead tasks whose IPC state still needs deferred cleanup.
@@ -1044,11 +1195,42 @@ pub fn block_current_on_futex_unless_woken(woken: &core::sync::atomic::AtomicBoo
 /// Block the current task unless `woken` is already set.
 /// The check is performed under the SCHEDULER lock to be atomic with wake_task.
 pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
+    block_current_unless_woken_inner(woken, None);
+}
+
+/// Block the current task until `woken` is set OR `deadline_tick` passes.
+///
+/// The scheduler's dispatch loop scans blocked tasks on each pick_next and
+/// force-wakes any whose `wake_deadline` has elapsed. This is the safe
+/// alternative to waking `net_task` (or any IRQ-driven task) from the
+/// `timer_handler` ISR — the expiry check runs in task context, already
+/// inside `SCHEDULER.lock`, so there is no same-core re-entrance hazard.
+///
+/// `deadline_tick` is an absolute tick count (see `tick_count()`), not a
+/// duration. Pass `tick_count() + N` to sleep at most N ticks.
+pub fn block_current_unless_woken_until(
+    woken: &core::sync::atomic::AtomicBool,
+    deadline_tick: u64,
+) {
+    block_current_unless_woken_inner(woken, Some(deadline_tick));
+}
+
+fn block_current_unless_woken_inner(
+    woken: &core::sync::atomic::AtomicBool,
+    wake_deadline: Option<u64>,
+) {
     let addr_space_snapshot =
         current_user_return_addr_space_snapshot(crate::process::current_pid());
     let idx = {
         let mut sched = SCHEDULER.lock();
         if woken.load(core::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // Deadline already in the past: don't block. Callers use this path
+        // to implement "poll now if timeout has already expired."
+        if let Some(d) = wake_deadline
+            && crate::arch::x86_64::interrupts::tick_count() >= d
+        {
             return;
         }
         let idx = match get_current_task_idx() {
@@ -1058,6 +1240,15 @@ pub fn block_current_unless_woken(woken: &core::sync::atomic::AtomicBool) {
         accumulate_ticks(&mut sched, idx);
         sched.tasks[idx].state = TaskState::BlockedOnRecv;
         sched.tasks[idx].switching_out = true;
+        // Counter mirrors `wake_deadline`'s Some-ness so the scheduler's
+        // hot-path `scan_expired_wake_deadlines` can skip the O(n) scan
+        // when no task has a deadline set.
+        if wake_deadline.is_some() && sched.tasks[idx].wake_deadline.is_none() {
+            ACTIVE_WAKE_DEADLINES.fetch_add(1, Ordering::Relaxed);
+        } else if wake_deadline.is_none() && sched.tasks[idx].wake_deadline.is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        }
+        sched.tasks[idx].wake_deadline = wake_deadline;
         save_user_return_state(
             &mut sched.tasks[idx],
             addr_space_snapshot.0,
@@ -1158,8 +1349,19 @@ pub fn quiesce_task_for_remote_reap_by_pid(pid: u32) -> bool {
 }
 
 /// Wake a blocked task, making it `Ready` for the next scheduler tick.
+///
+/// ISR-safe. The critical section below runs under `SCHEDULER.lock()` which
+/// now masks interrupts for its duration; the follow-up `enqueue_to_core`
+/// call does the same for the per-core run queue. Callers from interrupt
+/// context (virtio-net, virtio-blk) therefore cannot re-enter a task-context
+/// holder on the same core — see the root-cause note at [`IrqSafeMutex`].
 pub fn wake_task(id: TaskId) -> bool {
-    let (enqueue, woke) = {
+    // Capture everything we need for the optional diagnostic log in the
+    // same critical section so we don't need a second `SCHEDULER.lock()` —
+    // a second acquisition on this path formerly re-entered a
+    // PROCESS_TABLE lookup via `task_log_label`, reintroducing the ISR
+    // deadlock class this primitive exists to prevent.
+    let (enqueue, woke, snapshot) = {
         let mut sched = SCHEDULER.lock();
         if let Some(idx) = sched.find(id) {
             debug_assert!(
@@ -1168,18 +1370,37 @@ pub fn wake_task(id: TaskId) -> bool {
                 idx,
                 sched.tasks.len()
             );
-            match sched.tasks[idx].state {
+            let pid_for_log = sched.tasks[idx].pid;
+            let name_for_log = sched.tasks[idx].name;
+            let cur_state = sched.tasks[idx].state;
+            let label = label_from_name_only(name_for_log, pid_for_log);
+            let snapshot_tuple = (
+                label,
+                pid_for_log,
+                name_for_log,
+                sched.tasks[idx].assigned_core,
+                sched.tasks[idx].affinity_mask,
+                sched.tasks[idx].last_ready_tick,
+                sched.tasks[idx].last_migrated_tick,
+            );
+            match cur_state {
                 TaskState::BlockedOnRecv
                 | TaskState::BlockedOnSend
                 | TaskState::BlockedOnReply
                 | TaskState::BlockedOnNotif
                 | TaskState::BlockedOnFutex => {
-                    let prev_state = sched.tasks[idx].state as u8;
+                    let prev_state = cur_state as u8;
+                    // Clear any pending timeout-wake deadline — this wake
+                    // beat the deadline, so the scheduler's expiry scan
+                    // should not double-wake us.
+                    if sched.tasks[idx].wake_deadline.take().is_some() {
+                        ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+                    }
                     if sched.tasks[idx].switching_out {
                         sched.tasks[idx].wake_after_switch = true;
                         sched.tasks[idx].last_migrated_tick =
                             crate::arch::x86_64::interrupts::tick_count();
-                        (None, true)
+                        (None, true, snapshot_tuple)
                     } else {
                         let now = crate::arch::x86_64::interrupts::tick_count();
                         sched.tasks[idx].state = TaskState::Ready;
@@ -1188,13 +1409,14 @@ pub fn wake_task(id: TaskId) -> bool {
                         (
                             Some((sched.tasks[idx].assigned_core, idx, prev_state)),
                             true,
+                            snapshot_tuple,
                         )
                     }
                 }
-                _ => (None, false),
+                _ => (None, false, snapshot_tuple),
             }
         } else {
-            (None, false)
+            (None, false, (None, 0, "<missing>", 0, 0, 0, 0))
         }
     };
     if let Some((core, idx, prev_state)) = enqueue {
@@ -1203,11 +1425,46 @@ pub fn wake_task(id: TaskId) -> bool {
             state_before: prev_state,
             core,
         });
+        let (
+            label,
+            pid_for_log,
+            name_for_log,
+            assigned_core,
+            affinity_mask,
+            last_ready_tick,
+            last_migrated_tick,
+        ) = snapshot;
+        if let Some(label) = label {
+            log::debug!(
+                "[sched] wake_task: id={} pid={} name={} label={} prev_state={} -> Ready assigned_core={} affinity={:#x} ready_at={} migrated_at={}",
+                id.0,
+                pid_for_log,
+                name_for_log,
+                label,
+                prev_state,
+                assigned_core,
+                affinity_mask,
+                last_ready_tick,
+                last_migrated_tick
+            );
+        }
         enqueue_to_core(core, idx);
         true
     } else {
         woke
     }
+}
+
+/// ISR-safe label lookup: classifies kernel tasks (pid == 0) by name so
+/// the `[sched] wake_task` diagnostic log can fire for `net`, `console`,
+/// and `serial-stdin` without touching `PROCESS_TABLE.lock()` — doing
+/// that would reintroduce the ISR-deadlock class the `IrqSafeMutex`
+/// refactor just eliminated. Userspace tasks are not labelled here.
+fn label_from_name_only(task_name: &'static str, pid: u32) -> Option<&'static str> {
+    if pid == 0 {
+        return matches!(task_name, "net" | "console" | "serial-stdin").then_some(task_name);
+    }
+    None
 }
 
 /// Store a [`Message`] in a task's pending slot.
@@ -1461,6 +1718,22 @@ pub fn run() -> ! {
             maybe_load_balance();
         }
 
+        // Before picking next, wake any tasks whose `wake_deadline` has
+        // elapsed. This is the task-context replacement for a timer-ISR
+        // force-wake — it runs under `SCHEDULER.lock` already and cannot
+        // deadlock on same-core ISR re-entrance.
+        //
+        // Enqueue is deferred until after the lock is released because
+        // `enqueue_to_core` sends a cross-core reschedule IPI that must
+        // not run with `SCHEDULER.lock` held.
+        let (expired, n_expired) = {
+            let mut sched = SCHEDULER.lock();
+            scan_expired_wake_deadlines(&mut sched)
+        };
+        for (core, idx) in &expired[..n_expired] {
+            enqueue_to_core(*core, *idx);
+        }
+
         // Pick the next ready task and atomically mark it Running.
         // `stale_info` carries (pid, name, last_ready_tick, ticks_stale) when
         // ready-to-running latency exceeds the diagnostic threshold; logged
@@ -1481,7 +1754,7 @@ pub fn run() -> ! {
                 task.state = TaskState::Running;
                 task.start_tick = now;
                 debug_assert!(
-                    sched.tasks[idx].state == TaskState::Running,
+                    task.state == TaskState::Running,
                     "dispatch: task idx={} not Running after mark on core {}",
                     idx,
                     core_id
@@ -1701,7 +1974,13 @@ pub fn run() -> ! {
             // `hog_info` carries (pid, name, ran_ticks, final_state) when the
             // task held the CPU for longer than the diagnostic threshold;
             // logged after the SCHEDULER lock is dropped.
-            let mut hog_info: Option<(u32, &'static str, u64, TaskState)> = None;
+            let mut hog_info: Option<(
+                u32,
+                &'static str,
+                u64,
+                TaskState,
+                Option<alloc::string::String>,
+            )> = None;
             let enqueue = {
                 let mut sched = SCHEDULER.lock();
                 debug_assert!(
@@ -1736,7 +2015,13 @@ pub fn run() -> ! {
                     let now = crate::arch::x86_64::interrupts::tick_count();
                     let ran_ticks = now.saturating_sub(task.start_tick);
                     if ran_ticks >= 20 {
-                        hog_info = Some((task.pid, task.name, ran_ticks, task.state));
+                        let exec_path = if task.pid != 0 {
+                            let table = crate::process::PROCESS_TABLE.lock();
+                            table.find(task.pid).map(|proc| proc.exec_path.clone())
+                        } else {
+                            None
+                        };
+                        hog_info = Some((task.pid, task.name, ran_ticks, task.state, exec_path));
                     }
 
                     let wake_after_switch = task.wake_after_switch;
@@ -1768,11 +2053,12 @@ pub fn run() -> ! {
                 }
             };
 
-            if let Some((pid, name, ran_ticks, final_state)) = hog_info {
+            if let Some((pid, name, ran_ticks, final_state, exec_path)) = hog_info {
                 log::warn!(
-                    "[sched] cpu-hog: pid={} name={} core={} ran~{}ms final_state={:?}",
+                    "[sched] cpu-hog: pid={} name={} exec_path={} core={} ran~{}ms final_state={:?}",
                     pid,
                     name,
+                    exec_path.as_deref().unwrap_or("-"),
                     core_id,
                     ran_ticks * 10,
                     final_state
@@ -1800,6 +2086,75 @@ const MIGRATE_COOLDOWN: u64 = 100;
 
 /// Periodic load balancer tick counter. BSP calls `maybe_load_balance()`
 /// from the scheduler loop; actual migration happens every 50 ticks
+/// Counts tasks currently holding a non-`None` `wake_deadline`. Acts as a
+/// fast-path gate for `scan_expired_wake_deadlines` — if zero, the full
+/// `O(n_tasks)` scan is skipped on every dispatch. Incremented when
+/// `block_current_unless_woken_until` sets a deadline; decremented when
+/// `wake_task` clears one, when the scan expires one, or when a Blocked
+/// task is found with a stale deadline on a non-Blocked state.
+pub(crate) static ACTIVE_WAKE_DEADLINES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Transition tasks whose `wake_deadline` has elapsed back to `Ready`.
+///
+/// Must be called with `SCHEDULER.lock` already held. Returns a small list
+/// of `(assigned_core, task_idx)` pairs that the caller must pass to
+/// `enqueue_to_core` AFTER releasing `SCHEDULER.lock` — `enqueue_to_core`
+/// sends the cross-core reschedule IPI that wakes halted APs, and that
+/// IPI path must not run under `SCHEDULER.lock`.
+///
+/// The returned count is capped at 8 per call; if more tasks expired in
+/// the same scheduler tick, they are left for the next dispatch pass.
+///
+/// Fast path: if `ACTIVE_WAKE_DEADLINES` is zero, returns `(_, 0)` without
+/// scanning. Keeps the dispatch hot path ~O(1) when no task has set a
+/// deadline — i.e. always, under the current net_task default of
+/// indefinite block.
+fn scan_expired_wake_deadlines(sched: &mut Scheduler) -> ([(u8, usize); 8], usize) {
+    if ACTIVE_WAKE_DEADLINES.load(Ordering::Relaxed) == 0 {
+        return ([(0, 0); 8], 0);
+    }
+    let now = crate::arch::x86_64::interrupts::tick_count();
+    let mut expired: [(u8, usize); 8] = [(0, 0); 8];
+    let mut n = 0usize;
+    for (idx, task) in sched.tasks.iter_mut().enumerate() {
+        if task.wake_deadline.is_none_or(|d| d > now) {
+            continue;
+        }
+        if !matches!(
+            task.state,
+            TaskState::BlockedOnRecv
+                | TaskState::BlockedOnSend
+                | TaskState::BlockedOnReply
+                | TaskState::BlockedOnNotif
+                | TaskState::BlockedOnFutex
+        ) {
+            // Not actually blocked (e.g. race between a real wake and the
+            // deadline scan) — clear the stale deadline and move on.
+            if task.wake_deadline.take().is_some() {
+                ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        if task.wake_deadline.take().is_some() {
+            ACTIVE_WAKE_DEADLINES.fetch_sub(1, Ordering::Relaxed);
+        }
+        if task.switching_out {
+            task.wake_after_switch = true;
+            task.last_migrated_tick = now;
+            continue;
+        }
+        task.state = TaskState::Ready;
+        task.last_ready_tick = now;
+        task.last_migrated_tick = now;
+        if n < expired.len() {
+            expired[n] = (task.assigned_core, idx);
+            n += 1;
+        }
+    }
+    (expired, n)
+}
+
 /// (~500ms at 100 Hz).
 static BALANCE_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

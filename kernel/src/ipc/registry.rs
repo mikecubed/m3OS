@@ -62,3 +62,14 @@ pub fn is_registered(name: &str) -> bool {
 pub fn lookup_endpoint_id(name: &str) -> Option<EndpointId> {
     lookup(name)
 }
+
+/// Look up a service and return `(endpoint_id, owner_task_id)`.
+///
+/// Used by kernel facades that need to verify the registering task is a
+/// trusted / privileged process before binding kernel resources to the
+/// endpoint (see `kernel::blk::remote::is_registered`). `owner` is `0` for
+/// kernel-registered entries, or the ring-3 task id for user-registered
+/// services.
+pub fn lookup_endpoint_with_owner(name: &str) -> Option<(EndpointId, u64)> {
+    REGISTRY.lock().lookup_with_owner(name)
+}

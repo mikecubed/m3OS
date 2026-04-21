@@ -76,7 +76,8 @@ pub use scheduler::{
 ///
 /// Returns `None` if the lock is already held (e.g. during a panic while
 /// the scheduler is running). Used by `panic_diag` to safely inspect tasks.
-pub(crate) fn try_lock_scheduler() -> Option<spin::MutexGuard<'static, scheduler::Scheduler>> {
+pub(crate) fn try_lock_scheduler() -> Option<scheduler::IrqSafeGuard<'static, scheduler::Scheduler>>
+{
     scheduler::SCHEDULER.try_lock()
 }
 
@@ -222,6 +223,18 @@ pub struct Task {
     /// Userspace register frame restored by `fork_child_trampoline`, if this
     /// task was spawned to finish a fork/clone handoff.
     fork_ctx: Option<crate::process::ForkChildCtx>,
+    /// Optional tick deadline at which a `Blocked*` task should be force-woken.
+    ///
+    /// `Some(deadline)` when set by `block_current_unless_woken_until`. The
+    /// scheduler's dispatch path (`pick_next`'s caller) scans for blocked
+    /// tasks whose `wake_deadline` is in the past and transitions them to
+    /// `Ready`. `None` for tasks that have no timeout, which is the default.
+    ///
+    /// This is the safe replacement for a timer-ISR wake: the expiry check
+    /// runs inside the scheduler dispatch loop (already holding
+    /// `SCHEDULER.lock`), not from the timer ISR, so there is no same-core
+    /// re-entrance hazard.
+    pub wake_deadline: Option<u64>,
     /// Owns the allocated kernel stack — dropped when the `Task` is dropped.
     /// Wrapped in `Option` so `drain_dead` can `.take()` the allocation to
     /// free stack memory for dead tasks without removing them from the vec.
@@ -263,6 +276,7 @@ impl Task {
             group_exit_pending: false,
             user_return: None,
             fork_ctx: None,
+            wake_deadline: None,
             _stack: Some(stack),
         }
     }

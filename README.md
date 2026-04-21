@@ -8,8 +8,8 @@ networking) on top of the VirtIO baseline, an IOMMU substrate that routes
 device DMA through per-device VT-d / AMD-Vi translation domains, and a roadmap
 toward stronger service isolation and broader platform support.
 
-**Current kernel version:** v0.55.1 (Phase 55 hardware substrate + Phase 55a
-IOMMU substrate).
+**Current kernel version:** v0.55.2 (Phase 55 hardware substrate + Phase 55a
+IOMMU substrate + Phase 55b ring-3 driver host).
 
 ## Quick Start
 
@@ -49,7 +49,12 @@ yay -S musl-gcc-cross-bin
 The xtask build system auto-detects both Debian/Ubuntu toolchain names
 (`x86_64-linux-musl-gcc`) and Arch cross-compiler names
 (`x86_64-unknown-linux-musl1.2-gcc`), and searches the OVMF paths for both
-distros.
+distros. Minimal/static-only musl cross builds (e.g. a hand-installed
+`musl-cross-make` / raiden toolchain under `/opt/`) are missing the empty
+`libdl.a` / `libpthread.a` / `librt.a` stubs that ports like TCC expect;
+install the distro package (`musl-tools` on Debian/Ubuntu,
+`musl-gcc-cross-bin` on Arch) instead of relying on a minimal toolchain
+for the full-fat Phase 31 build.
 
 #### Install Rust
 

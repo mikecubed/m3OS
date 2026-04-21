@@ -326,6 +326,9 @@ pub const SYS_IPC_STORE_REPLY_BULK: u64 = 0x1110;
 /// Read raw disk sectors from userspace (Phase 54).
 pub const SYS_BLOCK_READ: u64 = 0x1011;
 
+/// Write raw disk sectors from userspace (Phase 55b Track F.3d-2).
+pub const SYS_BLOCK_WRITE: u64 = 0x1012;
+
 // ===========================================================================
 // IPC wrappers (Phase 52)
 // ===========================================================================
@@ -568,6 +571,28 @@ pub fn block_read(start_sector: u64, count: usize, buf: &mut [u8]) -> i64 {
             start_sector,
             count as u64,
             buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+        ) as i64
+    }
+}
+
+/// Write raw disk sectors from a userspace buffer (Phase 55b Track F.3d-2).
+///
+/// Writes `count` 512-byte sectors starting at `start_sector` (absolute LBA)
+/// from `buf`.  `buf` must be at least `count * 512` bytes.
+///
+/// Returns 0 on success, negative errno on error (EAGAIN = -11 when driver
+/// is mid-restart; EIO = -5 for hard failures; EPERM = -1 if caller lacks
+/// storage-service credentials).
+pub fn block_write(start_sector: u64, count: usize, buf: &[u8]) -> i64 {
+    unsafe {
+        syscall6(
+            SYS_BLOCK_WRITE,
+            start_sector,
+            count as u64,
+            buf.as_ptr() as u64,
             buf.len() as u64,
             0,
             0,

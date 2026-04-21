@@ -183,6 +183,14 @@ fn main() {
             });
             cmd_smoke_test(&smoke_args);
         }
+        Some("device-smoke") => {
+            let device_smoke_args = parse_device_smoke_args(&args[2..]).unwrap_or_else(|err| {
+                eprintln!("Error: {err}");
+                eprintln!("Usage: {}", usage());
+                std::process::exit(1);
+            });
+            cmd_device_smoke(&device_smoke_args);
+        }
         Some("runner") => {
             let kernel_binary = args
                 .get(2)
@@ -228,7 +236,7 @@ fn main() {
 }
 
 fn usage() -> &'static str {
-    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
+    "cargo xtask <image [--sign [--key <path>] [--cert <path>]] [--enable-telnet]|run [--fresh] [--iommu] [--device nvme|e1000]...|run-gui [--fresh] [--iommu] [--device nvme|e1000]...|clean|check|fmt [--fix]|test [--test <name>] [--timeout <secs>] [--display] [--iommu] [--device nvme|e1000]...|smoke-test [--display] [--timeout <secs>]|device-smoke --device nvme|e1000 [--iommu] [--timeout <secs>] [--display]|regression [--test <name>] [--timeout <secs>] [--display]|stress [--test <name>] [--iterations <N>] [--timeout <secs>] [--seed <u64>] [--continue-on-failure] [--display]|runner <kernel-binary>|sign <unsigned-efi> [--key <path>] [--cert <path>]>"
 }
 
 fn workspace_root() -> PathBuf {
@@ -295,6 +303,20 @@ fn build_userspace_bins() {
         ("fat_server", "fat_server", true),         // Phase 54: ring-3 FAT storage (alloc)
         ("vfs_server", "vfs_server", true),         // Phase 54: ring-3 VFS service (alloc)
         ("net_server", "net_server", true),         // Phase 54: ring-3 UDP network service (alloc)
+        // Phase 55b Tracks D.1 / E.1: ring-3 device driver scaffolds
+        // (`needs_alloc = true` for driver_runtime + kernel-core deps).
+        // Real bring-up lands in D.2/D.3 and E.2/E.3.
+        ("nvme_driver", "nvme_driver", true),
+        ("e1000_driver", "e1000_driver", true),
+        // Phase 55b Track F.3b: NVMe crash-and-restart end-to-end smoke
+        // client. No alloc dependency — syscall_lib only.
+        ("nvme-crash-smoke", "nvme-crash-smoke", false),
+        // Phase 55b Track F.3d-1: max_restart 6-kill loop smoke client.
+        // No alloc dependency — syscall_lib only.
+        ("max-restart-smoke", "max-restart-smoke", false),
+        // Phase 55b Track F.3d-3: e1000 crash-and-restart end-to-end smoke
+        // client. No alloc dependency — syscall_lib only.
+        ("e1000-crash-smoke", "e1000-crash-smoke", false),
     ];
 
     for &(pkg, bin, needs_alloc) in bins {
@@ -1821,6 +1843,10 @@ fn cmd_check() {
         "crypto-lib",
         "crypto-test",
         "coreutils-rs",
+        // Phase 55b Track C.1 — ring-3 driver runtime library
+        "driver_runtime",
+        // Phase 55b Track D.1 — ring-3 NVMe driver scaffold
+        "nvme_driver",
     ];
     let mut clippy_args = vec![
         "clippy".to_string(),
@@ -1940,6 +1966,31 @@ fn cmd_check() {
         std::process::exit(1);
     }
 
+    // Phase 55b Track C.1: ensure the driver_runtime crate's host-side
+    // smoke tests (module surface + DriverRuntimeError lift) stay
+    // green. The authoritative behavioral suite against the abstract
+    // contracts lives in `kernel-core/tests/driver_runtime_contract.rs`
+    // and runs as part of the kernel-core tests invoked above; this
+    // runs the re-export smoke tests against the crate itself.
+    let status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "test",
+            "--package",
+            "driver_runtime",
+            "--target",
+            KERNEL_CORE_HOST_TARGET,
+        ])
+        .status()
+        .expect("failed to run driver_runtime tests");
+
+    if !status.success() {
+        eprintln!(
+            "driver_runtime host tests failed — rerun `cargo test -p driver_runtime --target {KERNEL_CORE_HOST_TARGET}`"
+        );
+        std::process::exit(1);
+    }
+
     // Format check for both kernel and kernel-core.
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
@@ -1953,7 +2004,7 @@ fn cmd_check() {
     }
 
     println!(
-        "check passed: clippy clean, formatting correct, kernel-core and passwd host tests pass"
+        "check passed: clippy clean, formatting correct, kernel-core, passwd, and driver_runtime host tests pass"
     );
 }
 
@@ -4307,6 +4358,257 @@ fn cmd_smoke_test(smoke_args: &SmokeTestArgs) {
     std::process::exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 55b Track F.4 — device-path data smokes through ring-3 drivers
+// ---------------------------------------------------------------------------
+
+/// Arguments for `cargo xtask device-smoke`.
+///
+/// Accepts the same `--device` and `--iommu` flags as `run` and `test` so
+/// callers can run the NVMe or e1000 smoke in any combination of hardware
+/// configuration.  `--timeout` overrides the per-attempt wall-clock budget.
+/// `--display` opens the QEMU SDL window (useful for local debugging).
+#[derive(Debug, Clone)]
+struct DeviceSmokeArgs {
+    devices: DeviceSet,
+    timeout_secs: u64,
+    display: bool,
+}
+
+/// Parse `cargo xtask device-smoke [--device nvme|e1000] [--iommu]
+///   [--timeout <secs>] [--display]` into a [`DeviceSmokeArgs`].
+///
+/// Device and IOMMU flags are handled by [`extract_device_flags`]; the
+/// remaining tokens are walked for `--timeout` / `--display`.
+fn parse_device_smoke_args(args: &[String]) -> Result<DeviceSmokeArgs, String> {
+    let (devices, remaining) = extract_device_flags(args)?;
+    let mut timeout_secs = 120u64;
+    let mut display = false;
+    let mut index = 0;
+
+    while index < remaining.len() {
+        match remaining[index].as_str() {
+            "--display" => display = true,
+            "--timeout" => {
+                index += 1;
+                timeout_secs = remaining
+                    .get(index)
+                    .ok_or("--timeout requires a value")?
+                    .parse()
+                    .map_err(|_| "invalid --timeout value")?;
+            }
+            other => return Err(format!("unknown device-smoke flag: {other}")),
+        }
+        index += 1;
+    }
+
+    Ok(DeviceSmokeArgs {
+        devices,
+        timeout_secs,
+        display,
+    })
+}
+
+/// Expect-style smoke script for `--device nvme`.
+///
+/// Phase 55b F.4b — full data-path round-trip:
+///
+/// 1. Waits for the kernel first-message.
+/// 2. Waits for init to register the nvme_driver service config.
+/// 3. Waits for `NVME_SMOKE:rw:PASS` — the sentinel emitted by nvme_driver
+///    itself after a successful 512 B write+read round-trip at LBA 0.  This
+///    exercises the full DMA / PRP / doorbell / completion chain through the
+///    ring-3 driver, not just the service-config loading step.
+///
+/// The self-test runs inside the driver before the IPC endpoint is
+/// registered, so no concurrent client can race with the pattern on LBA 0.
+/// A timeout of 120 s covers the bring-up state machine + Identify + I/O
+/// queue creation + the round-trip itself on a TCG QEMU instance.
+fn device_smoke_script_nvme() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "wait for kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "init: driver.registered name=nvme_driver",
+            timeout_secs: 60,
+            label: "wait for nvme_driver service-config registration in init",
+        },
+        SmokeStep::Wait {
+            pattern: "NVME_SMOKE:rw:PASS",
+            timeout_secs: 120,
+            label: "wait for nvme_driver 512 B LBA-0 round-trip self-test to pass",
+        },
+    ]
+}
+
+/// Expect-style smoke script for `--device e1000`.
+///
+/// Phase 55b Track E.3b — link-state confirmation + server-loop entry:
+///
+/// 1. Waits for the kernel first-message.
+/// 2. Waits for init to register the e1000_driver service config.
+/// 3. Waits for `E1000_SMOKE:link:PASS` — emitted by e1000_driver after
+///    bring-up confirms link state (up or transitioning).
+/// 4. Waits for `E1000_SMOKE:server:READY` — emitted immediately before the
+///    driver enters its IRQ / IPC server loop (Track E.3b).  This replaces
+///    the old deferred `icmp:SKIP` marker: the driver no longer exits after
+///    bring-up, so a clean post-bring-up exit is no longer the observable.
+fn device_smoke_script_e1000() -> Vec<SmokeStep> {
+    vec![
+        SmokeStep::Wait {
+            pattern: "[m3os] Hello from kernel",
+            timeout_secs: 30,
+            label: "wait for kernel first message",
+        },
+        SmokeStep::Wait {
+            pattern: "init: driver.registered name=e1000_driver",
+            timeout_secs: 60,
+            label: "wait for e1000_driver service-config registration in init",
+        },
+        SmokeStep::Wait {
+            pattern: "E1000_SMOKE:link:PASS",
+            timeout_secs: 90,
+            label: "wait for e1000_driver link-state confirmation at bring-up",
+        },
+        SmokeStep::Wait {
+            pattern: "E1000_SMOKE:server:READY",
+            timeout_secs: 10,
+            label: "wait for e1000_driver to enter its IRQ/IPC server loop (Track E.3b)",
+        },
+    ]
+}
+
+/// Run the Phase 55b F.4 device-path data smoke for the requested `devices`.
+///
+/// Builds the kernel, creates the UEFI image and data disk, then launches QEMU
+/// with the selected device set.  Reads the serial log via an expect-style
+/// script and asserts the `driver.registered: <name>` line appears within the
+/// timeout budget.  Exits non-zero on failure.
+///
+/// When neither `--device nvme` nor `--device e1000` is given the command
+/// prints a helpful diagnostic and exits 1 rather than running a no-op smoke.
+fn cmd_device_smoke(args: &DeviceSmokeArgs) {
+    if !args.devices.nvme && !args.devices.e1000 {
+        eprintln!(
+            "device-smoke: no device selected — pass --device nvme or --device e1000\n\
+             Usage: cargo xtask device-smoke [--device nvme|e1000] [--iommu] \
+             [--timeout <secs>] [--display]"
+        );
+        std::process::exit(1);
+    }
+
+    let kernel_binary = build_kernel();
+    let uefi_image = create_uefi_image(&kernel_binary);
+    convert_to_vhdx(&uefi_image);
+
+    let disk_img = uefi_image.parent().unwrap().join("disk.img");
+    if disk_img.exists() {
+        let _ = fs::remove_file(&disk_img);
+    }
+    create_data_disk(uefi_image.parent().unwrap(), false, false);
+
+    let ovmf = find_ovmf();
+    let display_mode = if args.display {
+        QemuDisplayMode::Gui
+    } else {
+        QemuDisplayMode::Headless
+    };
+    let mut qemu_args = qemu_args_with_devices(&uefi_image, &ovmf, display_mode, args.devices);
+    // Strip hostfwd to avoid port conflicts in CI (same as qemu_test_args).
+    for arg in qemu_args.iter_mut() {
+        if arg.starts_with("user,id=net0,hostfwd=") {
+            *arg = "user,id=net0".to_string();
+        }
+    }
+
+    // Select the appropriate smoke script based on the requested device.
+    // When both are requested (nvme + e1000) we concatenate both scripts so a
+    // single QEMU boot asserts both `driver.registered` events.
+    let mut steps: Vec<SmokeStep> = Vec::new();
+    if args.devices.nvme {
+        steps.extend(device_smoke_script_nvme());
+    }
+    if args.devices.e1000 {
+        // Re-use the UEFI-stub and kernel-main Wait steps only if nvme wasn't
+        // already requested (they appear once in the log regardless).
+        if args.devices.nvme {
+            // Only append the driver registration wait — the early-boot waits
+            // already passed in the nvme script above.
+            steps.push(SmokeStep::Wait {
+                pattern: "driver.registered: e1000_driver",
+                timeout_secs: 60,
+                label: "wait for e1000_driver to register with device host",
+            });
+        } else {
+            steps.extend(device_smoke_script_e1000());
+        }
+    }
+
+    let base_timeout_secs = args.timeout_secs;
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let timeout_secs = base_timeout_secs + (attempt as u64 - 1) * (base_timeout_secs / 2);
+        let global_timeout = std::time::Duration::from_secs(timeout_secs);
+        println!(
+            "device-smoke: launching QEMU (attempt {}/{attempt}, timeout {}s)",
+            MAX_ATTEMPTS, timeout_secs
+        );
+
+        // Recreate the disk on retry to avoid state from a previous partial boot.
+        if attempt > 1 {
+            let disk_img = uefi_image.parent().unwrap().join("disk.img");
+            if disk_img.exists() {
+                let _ = fs::remove_file(&disk_img);
+            }
+            create_data_disk(uefi_image.parent().unwrap(), false, false);
+        }
+
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(&qemu_args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to launch QEMU");
+
+        let start = std::time::Instant::now();
+
+        match run_smoke_script(&mut child, &steps, global_timeout) {
+            Ok(()) => {
+                let elapsed = start.elapsed().as_secs();
+                if attempt > 1 {
+                    println!(
+                        "device-smoke: PASSED on attempt {attempt} ({} steps in {elapsed}s)",
+                        steps.len()
+                    );
+                } else {
+                    println!("device-smoke: PASSED ({} steps in {elapsed}s)", steps.len());
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Err(msg) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                last_err = msg;
+                if attempt < MAX_ATTEMPTS {
+                    eprintln!("device-smoke: attempt {attempt} failed, retrying...\n{last_err}");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            }
+        }
+    }
+
+    eprintln!("device-smoke: FAILED after {MAX_ATTEMPTS} attempts\n{last_err}");
+    std::process::exit(1);
+}
+
 fn cmd_fmt(fix: bool) {
     let root = workspace_root();
     let mut args = vec!["fmt", "--all"];
@@ -4703,6 +5005,14 @@ fn populate_ext2_files(
     // Phase 54 Track C: UDP network service.
     let net_server_conf = "name=net_udp\ncommand=/bin/net_server\ntype=daemon\nrestart=never\nmax_restart=0\ndepends=\n";
 
+    // Phase 55b F.1: ring-3 driver process service configs.
+    // No `depends=` line — the IOMMU substrate (Phase 55a) is kernel-internal
+    // init, not a supervised service.  restart=on-failure with max_restart=5
+    // provides supervised crash recovery without infinite loops.
+    let nvme_driver_conf =
+        "name=nvme_driver\ncommand=/drivers/nvme\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+    let e1000_driver_conf = "name=e1000_driver\ncommand=/drivers/e1000\ntype=daemon\nrestart=on-failure\nmax_restart=5\n";
+
     let hostname_content = "m3os\n";
     let smoke_mode_content = "enabled\n";
     let empty_content = "";
@@ -4721,6 +5031,8 @@ fn populate_ext2_files(
     let fat_server_conf_tmp = output_dir.join("_tmp_fat_server_conf");
     let vfs_server_conf_tmp = output_dir.join("_tmp_vfs_server_conf");
     let net_server_conf_tmp = output_dir.join("_tmp_net_server_conf");
+    let nvme_driver_conf_tmp = output_dir.join("_tmp_nvme_driver_conf");
+    let e1000_driver_conf_tmp = output_dir.join("_tmp_e1000_driver_conf");
     let hostname_tmp = output_dir.join("_tmp_hostname");
     let smoke_mode_tmp = output_dir.join("_tmp_smoke_mode");
     let empty_tmp = output_dir.join("_tmp_empty");
@@ -4736,6 +5048,8 @@ fn populate_ext2_files(
     fs::write(&fat_server_conf_tmp, fat_server_conf).expect("write temp fat_server.conf");
     fs::write(&vfs_server_conf_tmp, vfs_server_conf).expect("write temp vfs_server.conf");
     fs::write(&net_server_conf_tmp, net_server_conf).expect("write temp net_server.conf");
+    fs::write(&nvme_driver_conf_tmp, nvme_driver_conf).expect("write temp nvme_driver.conf");
+    fs::write(&e1000_driver_conf_tmp, e1000_driver_conf).expect("write temp e1000_driver.conf");
     fs::write(&hostname_tmp, hostname_content).expect("write temp hostname");
     fs::write(&empty_tmp, empty_content).expect("write temp empty file");
     if smoke_test_mode {
@@ -4950,6 +5264,14 @@ fn populate_ext2_files(
          sif etc/services.d/net_server.conf mode 0x81A4\n\
          sif etc/services.d/net_server.conf uid 0\n\
          sif etc/services.d/net_server.conf gid 0\n\
+         write \"{nvme_driver_conf}\" etc/services.d/nvme_driver.conf\n\
+         sif etc/services.d/nvme_driver.conf mode 0x81A4\n\
+         sif etc/services.d/nvme_driver.conf uid 0\n\
+         sif etc/services.d/nvme_driver.conf gid 0\n\
+         write \"{e1000_driver_conf}\" etc/services.d/e1000_driver.conf\n\
+         sif etc/services.d/e1000_driver.conf mode 0x81A4\n\
+         sif etc/services.d/e1000_driver.conf uid 0\n\
+         sif etc/services.d/e1000_driver.conf gid 0\n\
          write \"{hostname}\" etc/hostname\n\
          sif etc/hostname mode 0x81A4\n\
          sif etc/hostname uid 0\n\
@@ -4970,6 +5292,8 @@ fn populate_ext2_files(
         fat_server_conf = fat_server_conf_tmp.display(),
         vfs_server_conf = vfs_server_conf_tmp.display(),
         net_server_conf = net_server_conf_tmp.display(),
+        nvme_driver_conf = nvme_driver_conf_tmp.display(),
+        e1000_driver_conf = e1000_driver_conf_tmp.display(),
         hostname = hostname_tmp.display(),
         empty = empty_tmp.display(),
         smoke_mode_cmds = smoke_mode_cmds,
@@ -6181,6 +6505,52 @@ fn parse_regression_args(args: &[String]) -> Result<RegressionArgs, String> {
     })
 }
 
+/// A host-only regression test: runs entirely on the build host via
+/// `cargo test`, no QEMU required.
+///
+/// Introduced in Phase 55b Track F.2 to wire pure-logic state-machine
+/// tests into `cargo xtask regression --test driver-restart`.
+struct HostRegressionTest {
+    name: &'static str,
+    #[allow(dead_code)]
+    description: &'static str,
+    /// `cargo test -p <pkg>` target package.
+    package: &'static str,
+    /// `--test <name>` integration-test target inside the package.
+    test_target: &'static str,
+    /// Target triple to pass (`--target`). `None` → native.
+    target: Option<&'static str>,
+}
+
+/// Return the list of registered host-only regression tests.
+fn host_regression_tests() -> Vec<HostRegressionTest> {
+    vec![HostRegressionTest {
+        name: "driver-restart",
+        description: "Phase 55b F.2: crash-and-restart state-machine regression (pure host logic)",
+        package: "kernel-core",
+        test_target: "driver_restart",
+        target: Some("x86_64-unknown-linux-gnu"),
+    }]
+}
+
+/// Run a host-only regression test. Returns `Ok(())` on success or
+/// `Err(exit_status_code)` if the process exits non-zero.
+fn run_host_regression_test(t: &HostRegressionTest) -> Result<(), i32> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("test");
+    cmd.args(["-p", t.package]);
+    if let Some(triple) = t.target {
+        cmd.args(["--target", triple]);
+    }
+    cmd.args(["--test", t.test_target]);
+    let status = cmd.status().expect("cargo test failed to start");
+    if status.success() {
+        Ok(())
+    } else {
+        Err(status.code().unwrap_or(1))
+    }
+}
+
 /// A registered regression test with QEMU configuration and pass/fail patterns.
 struct RegressionTest {
     name: &'static str,
@@ -6190,6 +6560,9 @@ struct RegressionTest {
     guest_steps: fn() -> Vec<SmokeStep>,
     /// How long the entire regression gets before being killed.
     timeout_secs: u64,
+    /// Optional device attachments (NVMe, e1000, IOMMU). Defaults to all-false
+    /// (VirtIO-blk + VirtIO-net) when not set.
+    devices: DeviceSet,
 }
 
 /// Return the list of registered regression tests.
@@ -6200,60 +6573,70 @@ fn regression_tests() -> Vec<RegressionTest> {
             description: "Rapid concurrent fork() from multiple parents",
             guest_steps: fork_overlap_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "ipc-wake",
             description: "Overlapping IPC send/recv/call/reply cycles",
             guest_steps: ipc_wake_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "pty-overlap",
             description: "Overlapping PTY allocation and shell spawning",
             guest_steps: pty_overlap_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "signal-reset",
             description: "Exec-time signal disposition reset (POSIX: handlers → SIG_DFL)",
             guest_steps: signal_reset_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "kbd-echo",
             description: "Keyboard input reaches shell via serial→TTY→stdin pipeline",
             guest_steps: kbd_echo_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "service-lifecycle",
             description: "Service list/status in the headless operator workflow",
             guest_steps: service_lifecycle_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "storage-roundtrip",
             description: "Ext2 write/read/delete round-trip on persistent storage",
             guest_steps: storage_roundtrip_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "serverization-fallback",
             description: "Phase 54 degraded-mode behavior after stopping vfs and net_udp",
             guest_steps: serverization_fallback_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "log-pipeline",
             description: "Logger injection via /dev/log and /var/log/messages verification",
             guest_steps: log_pipeline_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
         },
         RegressionTest {
             name: "security-floor",
             description: "Phase 48 security floor: shadow auth, credential transition, hash format",
             guest_steps: security_floor_steps,
             timeout_secs: 90,
+            devices: DeviceSet::default(),
         },
     ];
 
@@ -6267,6 +6650,103 @@ fn regression_tests() -> Vec<RegressionTest> {
             description: "exit_group() reaps a live spinning sibling only after it quiesces",
             guest_steps: exit_group_teardown_steps,
             timeout_secs: 60,
+            devices: DeviceSet::default(),
+        });
+    }
+
+    // Phase 55b Track F.2: crash-and-restart regression.
+    //
+    // Requires the emulated NVMe device to be present so the nvme_driver
+    // service stays alive long enough to be killed via `service kill`.
+    // Gated behind M3OS_ENABLE_DRIVER_RESTART_REGRESSION because:
+    //   (a) it needs --device nvme QEMU args (heavier than standard tests),
+    //   (b) the "observe DriverRestarting from I/O path" acceptance bullet
+    //       is deferred to Track F.3 (userspace I/O client interception).
+    // Remove the env-gate when F.3 lands and the NVMe QEMU arg is folded
+    // into the base regression image.
+    if std::env::var_os("M3OS_ENABLE_DRIVER_RESTART_REGRESSION").is_some() {
+        tests.push(RegressionTest {
+            name: "driver-restart-guest",
+            description: "Phase 55b F.2: service kill nvme_driver → restart cycle in QEMU",
+            guest_steps: driver_restart_guest_steps,
+            timeout_secs: 120,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
+        });
+    }
+
+    // Phase 55b Track F.3b: end-to-end NVMe crash smoke.
+    //
+    // Runs the `nvme-crash-smoke` guest binary which:
+    //   1. Sends a BLK_READ to the `nvme.block` IPC endpoint.
+    //   2. Forks a child that runs `service kill nvme_driver`.
+    //   3. Issues another BLK_READ mid-kill to catch the transport error.
+    //   4. Polls /run/services.status until nvme_driver shows `running`.
+    //   5. Retries the BLK_READ and expects success.
+    //   6. Emits `NVME_CRASH_SMOKE:PASS` on success.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE because it requires --device nvme
+    // and its timing depends on QEMU TCG speed; under CI the broader
+    // `driver-restart-guest` regression already exercises the restart cycle.
+    // This gate is a separate env-var so the two regressions can be run
+    // independently.
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "driver-restart-crash",
+            description: "Phase 55b F.3b: nvme-crash-smoke — kill mid-I/O → transport error → \
+                 restart → retry success",
+            guest_steps: driver_restart_crash_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
+        });
+        // Phase 55b Track F.3d-3: e1000 crash-and-restart smoke.
+        // Exercises RemoteNic::send_frame → DriverRestarting (kernel log)
+        // and the kill → restart → send cycle. Requires --device e1000.
+        // Gated behind the same M3OS_ENABLE_CRASH_SMOKE env-var as the NVMe
+        // smoke; pass --test e1000-restart-crash to select only this test.
+        tests.push(RegressionTest {
+            name: "e1000-restart-crash",
+            description: "Phase 55b F.3d-3: e1000-crash-smoke — kill e1000_driver → \
+                 RESTART_SUSPECTED → restart → post-restart send success",
+            guest_steps: e1000_restart_crash_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: false,
+                e1000: true,
+                iommu: false,
+            },
+        });
+    }
+
+    // Phase 55b Track F.3d-1: max_restart 6-kill loop regression.
+    //
+    // Drives `nvme_driver` to crash 6 times in quick succession (max_restart=5
+    // configured in the service conf), then asserts that init transitions the
+    // service to `permanently-stopped` in `/run/services.status`.
+    //
+    // Gated behind M3OS_ENABLE_CRASH_SMOKE (same gate as driver-restart-crash)
+    // because it also requires --device nvme and QEMU TCG timing.
+    // Use `--test max-restart-exceeded` to run it directly:
+    //   M3OS_ENABLE_CRASH_SMOKE=1 cargo xtask regression --test max-restart-exceeded
+    if std::env::var_os("M3OS_ENABLE_CRASH_SMOKE").is_some() {
+        tests.push(RegressionTest {
+            name: "max-restart-exceeded",
+            description: "Phase 55b F.3d-1: max-restart-smoke — 6 kills → service \
+                 permanently-stopped (max_restart=5 exceeded)",
+            guest_steps: max_restart_exceeded_steps,
+            timeout_secs: 180,
+            devices: DeviceSet {
+                nvme: true,
+                e1000: false,
+                iommu: false,
+            },
         });
     }
 
@@ -6438,6 +6918,282 @@ fn service_lifecycle_steps() -> Vec<SmokeStep> {
         timeout_secs: 15,
         label: "guest/service: prompt after status sshd",
     });
+    steps
+}
+
+/// Guest steps for the Phase 55b F.2 driver-restart regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// nvme_driver service is running and has a stable PID for `service kill`.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Verify nvme_driver is listed by init (`service status nvme_driver`).
+///   3. Deliver SIGKILL via `service kill nvme_driver`.
+///   4. Wait for init to log the restart event (`init: started 'nvme_driver'`).
+///   5. Verify subsequent `service status nvme_driver` shows running state.
+///
+/// "Observe DriverRestarting from the block I/O path" (Phase 55b F.2b) is
+/// deferred to Track F.3: it requires a userspace I/O client binary that
+/// can trigger a write mid-restart and inspect the error code returned by
+/// the `RemoteBlockDevice` facade. The xtask-level harness for that will
+/// replace this stub once F.3 lands.
+fn driver_restart_guest_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+    // Let nvme_driver finish init and stabilise before querying status.
+    steps.push(SmokeStep::Sleep { millis: 3000 });
+
+    // Step 1 — verify nvme_driver is listed.
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status nvme_driver\n",
+        label: "guest/driver-restart: query nvme_driver status",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "Name:",
+        timeout_secs: 15,
+        label: "guest/driver-restart: status shows Name field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: prompt after status",
+    });
+
+    // Step 2 — deliver SIGKILL to nvme_driver.
+    steps.push(SmokeStep::Send {
+        input: "/bin/service kill nvme_driver\n",
+        label: "guest/driver-restart: deliver SIGKILL to nvme_driver",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "SIGKILL delivered",
+        timeout_secs: 10,
+        label: "guest/driver-restart: confirm SIGKILL delivered",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: prompt after kill",
+    });
+
+    // Step 3 — wait for init to restart nvme_driver.
+    // Init logs "init: started '<name>' pid=<N>" on each (re)start.
+    steps.push(SmokeStep::Wait {
+        pattern: "init: started 'nvme_driver' pid=",
+        timeout_secs: 30,
+        label: "guest/driver-restart: init restarts nvme_driver",
+    });
+
+    // Step 4 — verify service shows running (or at least re-registered).
+    steps.push(SmokeStep::Sleep { millis: 1000 });
+    steps.push(SmokeStep::Send {
+        input: "/bin/service status nvme_driver\n",
+        label: "guest/driver-restart: re-query nvme_driver status after restart",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "State:",
+        timeout_secs: 15,
+        label: "guest/driver-restart: status after restart shows State field",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/driver-restart: final prompt",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3b driver-restart-crash regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// `nvme_driver` service is alive and its `nvme.block` IPC endpoint is
+/// reachable before the smoke binary is launched.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for nvme_driver to finish bring-up (NVME_SMOKE:rw:PASS).
+///   3. Launch `/bin/nvme-crash-smoke`.
+///   4. Confirm `NVME_CRASH_SMOKE:kill-delivered` appears (kill raced with I/O).
+///   5. Confirm `NVME_CRASH_SMOKE:restart-confirmed` appears (driver back up).
+///   6. Confirm `NVME_CRASH_SMOKE:PASS` appears (post-restart read succeeded).
+fn driver_restart_crash_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Let nvme_driver finish full bring-up (NVME_SMOKE:rw:PASS is emitted
+    // before the IPC endpoint is registered, so once it appears the endpoint
+    // is open for business).
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_SMOKE:rw:PASS",
+        timeout_secs: 120,
+        label: "guest/crash-smoke: wait for nvme self-test PASS",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/nvme-crash-smoke\n",
+        label: "guest/crash-smoke: launch nvme-crash-smoke",
+    });
+
+    // Step 3 — pre-crash read must succeed.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:pre-crash-read:OK",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: pre-crash read OK",
+    });
+
+    // Step 4 — SIGKILL delivered (transport error or reply-before-kill logged).
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:kill-delivered",
+        timeout_secs: 20,
+        label: "guest/crash-smoke: SIGKILL delivered to nvme_driver",
+    });
+
+    // Step 5 — driver restarted.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:restart-confirmed",
+        timeout_secs: 30,
+        label: "guest/crash-smoke: driver restart confirmed",
+    });
+
+    // Step 6 — post-restart read and overall PASS.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/crash-smoke: shell prompt after smoke",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3d-1 max-restart-exceeded regression.
+///
+/// Requires `--device nvme` (enforced via `RegressionTest::devices`) so the
+/// `nvme_driver` service is alive before the smoke binary is launched.
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for nvme_driver to finish bring-up (NVME_SMOKE:rw:PASS).
+///   3. Launch `/bin/max-restart-smoke`.
+///   4. Confirm each kill is delivered (kills 1–6).
+///   5. Confirm kills 1–5 each result in a restart (MAX_RESTART_SMOKE:kill:N:restarted).
+///   6. Confirm `MAX_RESTART_SMOKE:PASS` appears (nvme_driver permanently-stopped).
+fn max_restart_exceeded_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Wait for nvme_driver to finish full bring-up.
+    steps.push(SmokeStep::Wait {
+        pattern: "NVME_SMOKE:rw:PASS",
+        timeout_secs: 120,
+        label: "guest/max-restart: wait for nvme self-test PASS",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the max-restart smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/max-restart-smoke\n",
+        label: "guest/max-restart: launch max-restart-smoke",
+    });
+
+    // Precondition — driver confirmed running.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:precondition:OK",
+        timeout_secs: 15,
+        label: "guest/max-restart: precondition nvme_driver running",
+    });
+
+    // Kills 1–5 deliver and restart.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:kill:5:restarted",
+        timeout_secs: 60,
+        label: "guest/max-restart: kills 1-5 each restarted",
+    });
+
+    // Kill 6 delivered.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:kill:6:delivered",
+        timeout_secs: 15,
+        label: "guest/max-restart: kill 6 delivered",
+    });
+
+    // Overall PASS — permanently-stopped observed.
+    steps.push(SmokeStep::Wait {
+        pattern: "MAX_RESTART_SMOKE:PASS",
+        timeout_secs: 20,
+        label: "guest/max-restart: PASS (permanently-stopped confirmed)",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/max-restart: shell prompt after smoke",
+    });
+
+    steps
+}
+
+/// Guest steps for the Phase 55b F.3d-3 e1000-restart-crash regression.
+///
+/// Requires `--device e1000` (enforced via `RegressionTest::devices`).
+///
+/// Sequence:
+///   1. Boot and login.
+///   2. Wait for the e1000 driver bring-up marker (E1000_SMOKE:link:PASS).
+///   3. Launch `/bin/e1000-crash-smoke`.
+///   4. Confirm `E1000_CRASH_SMOKE:pre-crash-send:OK`.
+///   5. Confirm `E1000_CRASH_SMOKE:kill-delivered`.
+///   6. Confirm `E1000_CRASH_SMOKE:post-restart-send:OK`.
+///   7. Confirm `E1000_CRASH_SMOKE:PASS`.
+fn e1000_restart_crash_steps() -> Vec<SmokeStep> {
+    let mut steps = boot_and_login_steps();
+
+    // Wait for e1000 bring-up before launching the smoke binary.
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_SMOKE:link:PASS",
+        timeout_secs: 120,
+        label: "guest/e1000-crash-smoke: wait for e1000 bring-up",
+    });
+    steps.push(SmokeStep::Sleep { millis: 500 });
+
+    // Launch the smoke client.
+    steps.push(SmokeStep::Send {
+        input: "/bin/e1000-crash-smoke\n",
+        label: "guest/e1000-crash-smoke: launch e1000-crash-smoke",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:pre-crash-send:OK",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: pre-crash send OK",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:kill-delivered",
+        timeout_secs: 20,
+        label: "guest/e1000-crash-smoke: SIGKILL delivered to e1000_driver",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:post-restart-send:OK",
+        timeout_secs: 30,
+        label: "guest/e1000-crash-smoke: post-restart send OK",
+    });
+
+    steps.push(SmokeStep::Wait {
+        pattern: "E1000_CRASH_SMOKE:PASS",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: PASS",
+    });
+    steps.push(SmokeStep::Wait {
+        pattern: "# ",
+        timeout_secs: 15,
+        label: "guest/e1000-crash-smoke: shell prompt after smoke",
+    });
+
     steps
 }
 
@@ -6635,14 +7391,18 @@ fn security_floor_steps() -> Vec<SmokeStep> {
     //    the target shell (ion) reads its per-user config + history from ext2
     //    via multi-hop IPC (syscall -> vfs_server -> fat_server -> block I/O).
     //    Under -smp 2 TCG in CI this reliably exceeds 10s; aligned to 30s to
-    //    match the login bootstrap budget in boot_and_login_steps.
+    //    match the login bootstrap budget in boot_and_login_steps. Raised to
+    //    60s after observing intermittent timeouts in the full regression
+    //    suite under serial QEMU load — the prior 30s budget had no slack
+    //    when init's reap loop and vfs_server's ext2 traffic both hit
+    //    core 0 during ion's first-config read.
     steps.push(SmokeStep::Send {
         input: "/bin/su user\n",
         label: "guest/auth: drop into user shell via su",
     });
     steps.push(SmokeStep::Wait {
         pattern: "$ ",
-        timeout_secs: 30,
+        timeout_secs: 60,
         label: "guest/auth: user shell prompt after su user",
     });
     steps.push(SmokeStep::Send {
@@ -6767,21 +7527,39 @@ fn boot_and_login_steps() -> Vec<SmokeStep> {
 }
 
 fn cmd_regression(args: &RegressionArgs) {
+    // ---- Host-only regression tests (no QEMU required) ----
+    // Checked first so `--test driver-restart` returns immediately without
+    // building the kernel or pulling OVMF.
+    let all_host_tests = host_regression_tests();
+    if let Some(name) = &args.test_name {
+        if let Some(t) = all_host_tests.iter().find(|t| t.name == *name) {
+            println!("regression: running host-only test '{}'", t.name);
+            match run_host_regression_test(t) {
+                Ok(()) => {
+                    println!("\nregression: 1 passed, 0 failed");
+                    return;
+                }
+                Err(code) => {
+                    eprintln!("\nregression: 0 passed, 1 failed (exit code {code})");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    // ---- QEMU-based regression tests ----
     let all_tests = regression_tests();
     let tests_to_run: Vec<&RegressionTest> = if let Some(name) = &args.test_name {
         let found = all_tests.iter().find(|t| t.name == name);
         match found {
             Some(t) => vec![t],
             None => {
+                // Report both QEMU and host test names in the error.
+                let qemu_names: Vec<_> = all_tests.iter().map(|t| t.name).collect();
+                let host_names: Vec<_> = all_host_tests.iter().map(|t| t.name).collect();
                 eprintln!("Unknown regression test: {name}");
-                eprintln!(
-                    "Available: {}",
-                    all_tests
-                        .iter()
-                        .map(|t| t.name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                eprintln!("  QEMU tests: {}", qemu_names.join(", "));
+                eprintln!("  Host tests: {}", host_names.join(", "));
                 std::process::exit(1);
             }
         }
@@ -6842,7 +7620,11 @@ fn run_regression_test(
     } else {
         QemuDisplayMode::Headless
     };
-    let mut args = qemu_args(uefi_image, ovmf, display_mode);
+    let mut args = if test.devices == DeviceSet::default() {
+        qemu_args(uefi_image, ovmf, display_mode)
+    } else {
+        qemu_args_with_devices(uefi_image, ovmf, display_mode, test.devices)
+    };
     // Strip hostfwd to avoid port conflicts.
     for arg in args.iter_mut() {
         if arg.starts_with("user,id=net0,hostfwd=") {
@@ -8274,5 +9056,403 @@ mod tests {
 
         assert_eq!(serial, "login: Password:");
         assert_eq!(history, "login: Password:");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 55b Track D.1 — nvme_driver ramdisk wiring.
+    //
+    // These tests encode the AGENTS.md "four places for a new userspace
+    // binary" rule specifically for the D.1 nvme_driver scaffold:
+    //
+    //   1. workspace member (`Cargo.toml`)
+    //   2. xtask build pipeline (the `bins` array in this file)
+    //   3. ramdisk embedding (`kernel/src/fs/ramdisk.rs`)
+    //   4. service config — deferred to F.1
+    //
+    // Place 2 is static text inside `build_userspace_bins`, and Place 3
+    // is a `BIN_ENTRIES` tuple keyed by `"/drivers/nvme"` in the kernel
+    // ramdisk source. The tests below read both source files from the
+    // workspace and assert the nvme_driver strings are present. This
+    // catches the most common D.1 regression — a ramdisk entry silently
+    // dropped during a refactor — without requiring a full QEMU boot.
+
+    fn workspace_file(relative: &str) -> String {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir)
+            .parent()
+            .expect("xtask/ lives under the workspace root")
+            .join(relative);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn nvme_driver_registered_in_xtask_bins_array() {
+        // Phase 55b D.1 — `build_userspace_bins` must build nvme_driver
+        // so the generated ELF lands in `target/generated-initrd/` for
+        // ramdisk embedding. `needs_alloc = true` because the crate
+        // depends on `driver_runtime` and `kernel-core`.
+        let source = workspace_file("xtask/src/main.rs");
+        assert!(
+            source.contains("(\"nvme_driver\", \"nvme_driver\", true)"),
+            "xtask `bins` array must include nvme_driver with needs_alloc = true"
+        );
+    }
+
+    #[test]
+    fn nvme_driver_embedded_in_ramdisk_under_drivers_path() {
+        // Phase 55b D.1 — the ramdisk must expose the compiled ELF at
+        // `/drivers/nvme` so init can `execve` it from the standard
+        // driver path. Track F.1 wires the service config that spawns
+        // it; this test pins the ramdisk half of that contract.
+        let source = workspace_file("kernel/src/fs/ramdisk.rs");
+        assert!(
+            source.contains("generated_initrd_asset!(\"nvme_driver\")"),
+            "ramdisk must `include_bytes!` the nvme_driver ELF"
+        );
+        assert!(
+            source.contains("\"nvme\""),
+            "ramdisk must register nvme under a /drivers/ BIN_ENTRIES tuple"
+        );
+        assert!(
+            source.contains("DRIVERS_ENTRIES") || source.contains("/drivers"),
+            "ramdisk must expose a /drivers directory containing nvme"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.1 — service-manager registration for nvme_driver + e1000_driver
+    // -----------------------------------------------------------------------
+
+    /// Assert that nvme_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.  We look for the conf content string *before*
+    /// the tests module boundary so the test cannot be satisfied by the
+    /// assertion strings themselves.
+    #[test]
+    fn nvme_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        // The marker that delimits where production code ends and tests begin.
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=nvme_driver"),
+            "populate_ext2_files must embed a conf string containing `name=nvme_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/nvme"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/nvme`"
+        );
+        // Find the conf literal and verify no depends= key is present.
+        let start = prod
+            .find("name=nvme_driver")
+            .expect("name=nvme_driver not found");
+        // Find closing delimiter of the string literal (the next `"` after start).
+        let end = prod[start..]
+            .find('"')
+            .map(|i| start + i)
+            .unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "nvme_driver.conf must NOT contain a depends= line (IOMMU substrate is kernel-internal)"
+        );
+        assert!(
+            prod.contains("restart=on-failure"),
+            "nvme_driver.conf must contain `restart=on-failure`"
+        );
+        assert!(
+            prod.contains("max_restart=5"),
+            "nvme_driver.conf must contain `max_restart=5`"
+        );
+    }
+
+    /// Assert that e1000_driver.conf is embedded in the ext2 data disk via
+    /// `populate_ext2_files`.
+    #[test]
+    fn e1000_driver_conf_embedded_in_ext2() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("name=e1000_driver"),
+            "populate_ext2_files must embed a conf string containing `name=e1000_driver`"
+        );
+        assert!(
+            prod.contains("command=/drivers/e1000"),
+            "populate_ext2_files must embed a conf string containing `command=/drivers/e1000`"
+        );
+        let start = prod
+            .find("name=e1000_driver")
+            .expect("name=e1000_driver not found");
+        let end = prod[start..]
+            .find('"')
+            .map(|i| start + i)
+            .unwrap_or(prod.len());
+        assert!(
+            !prod[start..end].contains("depends="),
+            "e1000_driver.conf must NOT contain a depends= line"
+        );
+    }
+
+    /// Assert that both driver service names appear in init's KNOWN_CONFIGS list.
+    #[test]
+    fn driver_confs_in_init_known_configs() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("nvme_driver.conf"),
+            "init KNOWN_CONFIGS must include nvme_driver.conf"
+        );
+        assert!(
+            source.contains("e1000_driver.conf"),
+            "init KNOWN_CONFIGS must include e1000_driver.conf"
+        );
+    }
+
+    /// Assert that init emits a driver.registered structured event when a
+    /// driver service config is loaded.
+    #[test]
+    fn init_emits_driver_registered_event() {
+        let source = workspace_file("userspace/init/src/main.rs");
+        assert!(
+            source.contains("driver.registered"),
+            "init must emit a structured `driver.registered` log event when a driver service is loaded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.4 — device-path data smoke assertions
+    //
+    // These tests use source-text assertions (like F.1 above) so they compile
+    // immediately but fail at test time until the implementation is present.
+    // This lets the pre-commit hook pass the compilation step while still
+    // recording the expected contracts.
+    // -----------------------------------------------------------------------
+
+    /// The `device-smoke` subcommand must appear in the usage string so that
+    /// CI scripts can discover it without reading source.
+    #[test]
+    fn usage_string_contains_device_smoke_subcommand() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("\"device-smoke\""),
+            "xtask main dispatch must handle the `device-smoke` subcommand"
+        );
+        assert!(
+            prod.contains("device-smoke"),
+            "usage() must advertise the `device-smoke` subcommand for CI discoverability"
+        );
+    }
+
+    /// `device_smoke_script_nvme` must be defined in production code and its
+    /// body must contain the `driver.registered name=nvme_driver` pattern
+    /// literal that the smoke Wait step checks for in the boot log.  The
+    /// actual serial line emitted by init is
+    /// `init: driver.registered name=nvme_driver command=/drivers/nvme`.
+    #[test]
+    fn nvme_smoke_script_contains_driver_registered_marker() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn device_smoke_script_nvme"),
+            "production code must define `device_smoke_script_nvme()`"
+        );
+        assert!(
+            prod.contains("driver.registered name=nvme_driver"),
+            "device_smoke_script_nvme() must include a Wait pattern that \
+             matches the init log line `init: driver.registered name=nvme_driver`"
+        );
+    }
+
+    /// `device_smoke_script_e1000` must be defined in production code and its
+    /// body must contain the `driver.registered name=e1000_driver` pattern
+    /// literal that the smoke Wait step checks for in the boot log.
+    #[test]
+    fn e1000_smoke_script_contains_driver_registered_marker() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn device_smoke_script_e1000"),
+            "production code must define `device_smoke_script_e1000()`"
+        );
+        assert!(
+            prod.contains("driver.registered name=e1000_driver"),
+            "device_smoke_script_e1000() must include a Wait pattern that \
+             matches the init log line `init: driver.registered name=e1000_driver`"
+        );
+    }
+
+    /// `parse_device_smoke_args` must be defined in production code and must
+    /// accept `--device` and `--iommu` flags (verified by searching for those
+    /// string literals inside the function body).
+    #[test]
+    fn parse_device_smoke_args_is_defined_and_handles_device_and_iommu() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn parse_device_smoke_args"),
+            "production code must define `parse_device_smoke_args()`"
+        );
+        // The function delegates to extract_device_flags which handles
+        // --device and --iommu.  Verify the delegation call is present.
+        let fn_start = prod
+            .find("fn parse_device_smoke_args")
+            .expect("already asserted above");
+        let fn_body = &prod[fn_start..];
+        assert!(
+            fn_body.contains("extract_device_flags"),
+            "parse_device_smoke_args must delegate to extract_device_flags \
+             to handle --device and --iommu flags"
+        );
+    }
+
+    /// `cmd_device_smoke` must be defined so it is callable from the main
+    /// dispatch loop, and it must use `run_smoke_script` (or the captured
+    /// variant) to execute the boot-log assertion steps.
+    #[test]
+    fn cmd_device_smoke_is_defined_and_uses_smoke_runner() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        assert!(
+            prod.contains("fn cmd_device_smoke"),
+            "production code must define `cmd_device_smoke()`"
+        );
+        let fn_start = prod
+            .find("fn cmd_device_smoke")
+            .expect("already asserted above");
+        let fn_body = &prod[fn_start..];
+        assert!(
+            fn_body.contains("run_smoke_script")
+                || fn_body.contains("run_smoke_steps_with_capture"),
+            "cmd_device_smoke must run the smoke step script via run_smoke_script \
+             or run_smoke_steps_with_capture"
+        );
+    }
+
+    /// Default `cargo xtask run` (no --device) must not include the NVMe
+    /// controller or the e1000 NIC in the QEMU argument list, guaranteeing
+    /// the VirtIO-only path is unchanged.
+    #[test]
+    fn default_run_qemu_args_have_no_nvme_or_e1000() {
+        let args = qemu_args_with_devices_resolved(
+            Path::new("target/boot-uefi-m3os.img"),
+            Path::new("/usr/share/OVMF/OVMF_CODE.fd"),
+            QemuDisplayMode::Headless,
+            DeviceSet::default(),
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("nvme")),
+            "default DeviceSet must not include any nvme argument"
+        );
+        assert!(
+            !args.iter().any(|a| a == "e1000,netdev=net0"),
+            "default DeviceSet must use virtio-net, not e1000"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 55b F.4b — full data-path round-trip assertions
+    //
+    // TDD red: these tests fail until the implementation emits the right
+    // markers in the production sources and smoke scripts.
+    // -----------------------------------------------------------------------
+
+    /// `device_smoke_script_nvme` must contain a Wait step for
+    /// `NVME_SMOKE:rw:PASS` — the sentinel the nvme_driver itself prints
+    /// after a successful 512 B write+read round-trip at LBA 0.
+    #[test]
+    fn nvme_smoke_script_asserts_rw_round_trip() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        let fn_start = prod
+            .find("fn device_smoke_script_nvme")
+            .expect("device_smoke_script_nvme must exist");
+        // Find the closing brace of that function's returned Vec block.
+        // We look for the sentinel within a liberal window after the
+        // function start instead of parsing braces.
+        let fn_window = &prod[fn_start..];
+        assert!(
+            fn_window.contains("NVME_SMOKE:rw:PASS"),
+            "device_smoke_script_nvme() must include a Wait step for \
+             `NVME_SMOKE:rw:PASS` — printed by nvme_driver after a \
+             successful 512 B round-trip at LBA 0"
+        );
+    }
+
+    /// The nvme_driver source must contain the `NVME_SMOKE:rw:PASS`
+    /// sentinel string it is expected to emit after a successful
+    /// 512 B write+read round-trip, and a `NVME_SMOKE:rw:FAIL` marker
+    /// for the failure path (no silent drop on failure).
+    #[test]
+    fn nvme_driver_source_emits_rw_round_trip_sentinels() {
+        let source = workspace_file("userspace/drivers/nvme/src/main.rs");
+        assert!(
+            source.contains("NVME_SMOKE:rw:PASS"),
+            "nvme_driver main.rs must emit `NVME_SMOKE:rw:PASS` after a \
+             successful 512 B write+read round-trip at LBA 0"
+        );
+        assert!(
+            source.contains("NVME_SMOKE:rw:FAIL"),
+            "nvme_driver main.rs must emit `NVME_SMOKE:rw:FAIL` on failure \
+             so the smoke harness does not silently miss a broken round-trip"
+        );
+    }
+
+    /// `device_smoke_script_e1000` must contain Wait steps for both
+    /// `E1000_SMOKE:link:PASS` and `E1000_SMOKE:server:READY` — the
+    /// sentinel the e1000_driver prints when initial bring-up reports
+    /// link up and when it enters the IRQ / IPC server loop (Track E.3b).
+    #[test]
+    fn e1000_smoke_script_asserts_link_pass() {
+        let source = workspace_file("xtask/src/main.rs");
+        let tests_boundary = source.find("mod tests {").unwrap_or(source.len());
+        let prod = &source[..tests_boundary];
+        let fn_start = prod
+            .find("fn device_smoke_script_e1000")
+            .expect("device_smoke_script_e1000 must exist");
+        let fn_window = &prod[fn_start..];
+        assert!(
+            fn_window.contains("E1000_SMOKE:link:PASS"),
+            "device_smoke_script_e1000() must include a Wait step for \
+             `E1000_SMOKE:link:PASS` — printed by e1000_driver after \
+             link-up is confirmed at bring-up"
+        );
+        assert!(
+            fn_window.contains("E1000_SMOKE:server:READY"),
+            "device_smoke_script_e1000() must include a Wait step for \
+             `E1000_SMOKE:server:READY` — printed by e1000_driver immediately \
+             before entering the IRQ / IPC server loop (Track E.3b)"
+        );
+    }
+
+    /// Track E.3b: the e1000_driver source must emit `E1000_SMOKE:link:PASS`
+    /// at bring-up and `E1000_SMOKE:server:READY` immediately before entering
+    /// the IRQ / IPC server loop.  The `icmp:SKIP` deferred marker is retired
+    /// now that the full loop is live.
+    #[test]
+    fn e1000_driver_source_emits_link_and_server_ready_sentinels() {
+        let source = workspace_file("userspace/drivers/e1000/src/main.rs");
+        assert!(
+            source.contains("E1000_SMOKE:link:PASS"),
+            "e1000_driver main.rs must emit `E1000_SMOKE:link:PASS` when \
+             initial link-up is confirmed at bring-up"
+        );
+        assert!(
+            source.contains("E1000_SMOKE:server:READY"),
+            "e1000_driver main.rs must emit `E1000_SMOKE:server:READY` \
+             immediately before entering the IRQ / IPC server loop (Track E.3b)"
+        );
+        assert!(
+            !source.contains("E1000_SMOKE:icmp:SKIP"),
+            "e1000_driver main.rs must NOT contain the deferred `icmp:SKIP` \
+             sentinel once the server loop is live — remove it to keep smoke \
+             expectations coherent"
+        );
     }
 }

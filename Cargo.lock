@@ -451,6 +451,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver_runtime"
+version = "0.55.2"
+dependencies = [
+ "kernel-core",
+ "spin",
+ "syscall-lib",
+]
+
+[[package]]
+name = "e1000-crash-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
+name = "e1000_driver"
+version = "0.55.2"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
+]
+
+[[package]]
 name = "echo-args"
 version = "0.1.0"
 dependencies = [
@@ -828,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.55.1"
+version = "0.55.2"
 dependencies = [
  "bootloader_api",
  "kernel-core",
@@ -930,6 +955,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
+]
+
+[[package]]
+name = "max-restart-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
 ]
 
 [[package]]
@@ -1036,6 +1068,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "nvme-crash-smoke"
+version = "0.1.0"
+dependencies = [
+ "syscall-lib",
+]
+
+[[package]]
+name = "nvme_driver"
+version = "0.55.2"
+dependencies = [
+ "driver_runtime",
+ "kernel-core",
+ "syscall-lib",
 ]
 
 [[package]]

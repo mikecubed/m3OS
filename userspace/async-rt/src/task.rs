@@ -71,6 +71,8 @@ fn signal_wake_pipe() {
 pub struct TaskHeader {
     /// Whether this task has been woken and needs polling.
     pub woken: AtomicBool,
+    /// Whether this task is already present in the executor run queue.
+    pub queued: AtomicBool,
     /// Whether this task has completed execution.
     pub completed: AtomicBool,
     /// Waker registered by a `JoinHandle` awaiting this task's completion.
@@ -87,6 +89,7 @@ impl TaskHeader {
     pub fn new() -> Self {
         Self {
             woken: AtomicBool::new(true),
+            queued: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             join_waker: UnsafeCell::new(None),
         }
@@ -100,6 +103,21 @@ impl TaskHeader {
     /// Clear the woken flag (called before polling).
     pub fn clear_woken(&self) {
         self.woken.store(false, Ordering::Release);
+    }
+
+    /// Check whether this task is already queued for polling.
+    pub fn is_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    /// Mark the task as queued.
+    pub fn mark_queued(&self) {
+        self.queued.store(true, Ordering::Release);
+    }
+
+    /// Clear the queued flag after the executor pops the task.
+    pub fn clear_queued(&self) {
+        self.queued.store(false, Ordering::Release);
     }
 
     /// Mark the task as completed and wake any join waker.

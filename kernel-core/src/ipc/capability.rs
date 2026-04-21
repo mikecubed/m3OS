@@ -1,6 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::device_host::types::DeviceCapKey;
 use crate::types::{EndpointId, NotifId, TaskId};
 
 /// An opaque integer index into a [`CapabilityTable`].
@@ -24,6 +25,37 @@ pub enum Capability {
         frame: u64,
         page_count: u16,
         writable: bool,
+    },
+    /// Phase 55b: ownership of a PCI(e) device, keyed by segment/BDF.
+    ///
+    /// Held by the driver process that claimed the device via
+    /// `sys_device_claim`. All derived capabilities (`Mmio`, `Dma`,
+    /// `DeviceIrq`) carry a back-reference to the owning key so the kernel
+    /// can revoke them in one sweep when the device is released.
+    Device { key: DeviceCapKey },
+    /// Phase 55b: access right to a BAR window mapped into the driver's
+    /// address space. `bar_index` and `len` must match the descriptor the
+    /// kernel returned at map time — the kernel re-validates on every use.
+    Mmio {
+        device: DeviceCapKey,
+        bar_index: u8,
+        len: usize,
+    },
+    /// Phase 55b: access right to a DMA-mapped buffer.
+    ///
+    /// `iova` is the device-visible I/O virtual address (or identity-mapped
+    /// physical address, per Phase 55a's `DmaBuffer<T>` fallback); `len` is
+    /// the mapped length in bytes.
+    Dma {
+        device: DeviceCapKey,
+        iova: u64,
+        len: usize,
+    },
+    /// Phase 55b: subscription to a device-originated IRQ, delivered to the
+    /// driver via the referenced `Notification` object.
+    DeviceIrq {
+        device: DeviceCapKey,
+        notif: NotifId,
     },
 }
 

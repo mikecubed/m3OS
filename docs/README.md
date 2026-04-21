@@ -63,6 +63,7 @@ and a roadmap toward stronger service isolation and broader platform support.
 | [Headless Hardening](./53-headless-hardening.md) | 53 | Supported headless/reference workflow, validation gates, operator model, and non-goals |
 | [Deep Serverization](./54-deep-serverization.md) | 54 | Userspace-owned storage/VFS and UDP policy slices, degraded-mode fallback contracts, and the signal/IPC shutdown fix needed to make them operable |
 | [Hardware Substrate](./55-hardware-substrate.md) | 55 | PCIe MCFG + MSI/MSI-X, reusable hardware-access layer (BAR mapping, DMA, device IRQ), NVMe storage driver, Intel 82540EM classic e1000 network driver, reference hardware matrix |
+| [Ring-3 Driver Host](./55b-ring-3-driver-host.md) | 55b | Device-host capability primitives, MMIO bounds-checking, IOMMU-gated DMA, notification-forwarded IRQs, NVMe and e1000 extracted to supervised ring-3 processes |
 
 ### Roadmap
 

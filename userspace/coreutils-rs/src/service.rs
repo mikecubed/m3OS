@@ -1,4 +1,4 @@
-//! service -- manage system services (Phase 46).
+//! service -- manage system services (Phase 46 / Phase 55b F.2).
 //!
 //! Subcommands:
 //!   service list             -- show all services and their status
@@ -8,10 +8,14 @@
 //!   service restart <name>   -- restart a service
 //!   service enable <name>    -- enable a disabled service
 //!   service disable <name>   -- disable a service (prevent auto-start)
+//!   service kill <name>      -- deliver SIGKILL to a running service (Phase 55b F.2)
+//!                               Reads the PID from /run/services.status and calls kill(2).
+//!                               Useful for crash-and-restart regression testing from the
+//!                               guest shell without a dedicated kill-driver helper binary.
 #![no_std]
 #![no_main]
 
-use syscall_lib::{STDERR_FILENO, STDOUT_FILENO, nanosleep, write_str};
+use syscall_lib::{SIGKILL, STDERR_FILENO, STDOUT_FILENO, nanosleep, write_str};
 
 syscall_lib::entry_point!(main);
 
@@ -297,11 +301,168 @@ fn send_command(cmd: &str, name: &str) -> i32 {
     0
 }
 
+/// Parse a decimal integer from a byte string. Returns `None` on overflow or
+/// if the slice is empty. Stops at the first non-digit byte.
+fn parse_u64_prefix(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut val: u64 = 0;
+    let mut any = false;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        let digit = (b - b'0') as u64;
+        val = val.checked_mul(10)?.checked_add(digit)?;
+        any = true;
+    }
+    if any { Some(val) } else { None }
+}
+
+/// Extract the `pid=<N>` value from a status file line for the given service,
+/// but only when the service is in the `running` state.
+///
+/// Status-file line format (written by init):
+///   `<name> <status> pid=<N> restarts=<N> changed=<N>`
+///
+/// `<status>` can be `never-started`, `starting`, `running`, `stopping`,
+/// `stopped:<code>`, `permanently-stopped`, or `disabled`. Only `running`
+/// implies the recorded PID is live — other states may leave a stale `pid=`
+/// behind for a window until init's next status write, and acting on those
+/// PIDs risks SIGKILL-ing an unrelated process that later reused the PID.
+/// `service kill` is a Phase 55b Track F.2 crash-and-restart test helper,
+/// so refusing anything but `running` keeps it targeted.
+///
+/// Returns the PID as `i32`, or `None` if the line doesn't belong to `name`,
+/// if the service is not `running`, or if the `pid=` field is absent / zero.
+fn extract_pid_from_status(text: &str, name: &str) -> Option<i32> {
+    for line in text.split('\n') {
+        // Using `?` on `strip_prefix` would short-circuit the whole
+        // function on the first non-matching line, missing services that
+        // aren't on the first row of `/run/services.status`.
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        if !rest.starts_with(' ') && !rest.starts_with('\t') {
+            continue;
+        }
+        // Init separates fields with a single space today but the prefix
+        // check above already accepts tab, so tolerate tab-separated
+        // fields here too. The second whitespace token after the name is
+        // the status field; anything other than "running" is refused here.
+        let mut fields = line.split_whitespace();
+        let _name_tok = fields.next()?;
+        let status_tok = fields.next()?;
+        if status_tok != "running" {
+            return None;
+        }
+        for field in fields {
+            if let Some(val_str) = field.strip_prefix("pid=") {
+                let pid_u64 = parse_u64_prefix(val_str.as_bytes())?;
+                if pid_u64 == 0 || pid_u64 > i32::MAX as u64 {
+                    return None;
+                }
+                return Some(pid_u64 as i32);
+            }
+        }
+        return None; // found the line but no usable pid
+    }
+    None
+}
+
+/// Deliver SIGKILL directly to the running service process.
+///
+/// The PID is obtained from `/run/services.status` (written by init every
+/// 10 s and on every state transition). This lets the guest shell trigger a
+/// crash-and-restart cycle without a dedicated helper binary, which is the
+/// primary use-case for Phase 55b Track F.2 regression testing.
+///
+/// Exit codes:
+///   0 — SIGKILL delivered successfully
+///   1 — service not found, not running, or kill(2) failed
+fn cmd_kill(name: &str) -> i32 {
+    let mut buf = [0u8; 4096];
+    let n = read_file(STATUS_PATH, &mut buf);
+    if n <= 0 {
+        write_str(STDERR_FILENO, "service: no status available\n");
+        return 1;
+    }
+    if n as usize >= buf.len() {
+        write_str(
+            STDERR_FILENO,
+            "service: status file too large or truncated\n",
+        );
+        return 1;
+    }
+    let text = match core::str::from_utf8(&buf[..n as usize]) {
+        Ok(s) => s,
+        Err(_) => {
+            write_str(STDERR_FILENO, "service: invalid UTF-8 in status file\n");
+            return 1;
+        }
+    };
+
+    let pid = match extract_pid_from_status(text, name) {
+        Some(p) => p,
+        None => {
+            write_str(STDERR_FILENO, "service: '");
+            write_str(STDERR_FILENO, name);
+            write_str(STDERR_FILENO, "' not found, not running, or pid=0\n");
+            return 1;
+        }
+    };
+
+    let ret = syscall_lib::kill(pid, SIGKILL);
+    if ret < 0 {
+        write_str(STDERR_FILENO, "service: '");
+        write_str(STDERR_FILENO, name);
+        write_str(STDERR_FILENO, "': kill(pid=");
+        let mut pid_buf = [0u8; 12];
+        let pos = format_u64(pid as u64, &mut pid_buf);
+        syscall_lib::write(STDERR_FILENO, &pid_buf[..pos]);
+        write_str(STDERR_FILENO, ", sig=SIGKILL) failed (ret=-");
+        let mut ret_buf = [0u8; 12];
+        let rpos = format_u64((ret as i64).unsigned_abs(), &mut ret_buf);
+        syscall_lib::write(STDERR_FILENO, &ret_buf[..rpos]);
+        write_str(STDERR_FILENO, ")\n");
+        return 1;
+    }
+
+    write_str(STDOUT_FILENO, "service: SIGKILL delivered to '");
+    write_str(STDOUT_FILENO, name);
+    write_str(STDOUT_FILENO, "' (pid=");
+    let mut pid_buf = [0u8; 12];
+    let pos = format_u64(pid as u64, &mut pid_buf);
+    syscall_lib::write(STDOUT_FILENO, &pid_buf[..pos]);
+    write_str(STDOUT_FILENO, ")\n");
+    0
+}
+
+/// Write decimal digits of `v` into `buf`, left-aligned. Returns bytes written.
+fn format_u64(mut v: u64, buf: &mut [u8]) -> usize {
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut tlen = 0;
+    while v > 0 {
+        tmp[tlen] = b'0' + (v % 10) as u8;
+        v /= 10;
+        tlen += 1;
+    }
+    for i in 0..tlen {
+        buf[i] = tmp[tlen - 1 - i];
+    }
+    tlen
+}
+
 fn main(args: &[&str]) -> i32 {
     if args.len() < 2 {
         write_str(
             STDERR_FILENO,
-            "usage: service {list|status|start|stop|restart|enable|disable} [name]\n",
+            "usage: service {list|status|start|stop|restart|enable|disable|kill} [name]\n",
         );
         return 1;
     }
@@ -368,6 +529,16 @@ fn main(args: &[&str]) -> i32 {
                 return 1;
             }
             send_command("disable", args[2])
+        }
+        "kill" => {
+            if args.len() < 3 {
+                write_str(STDERR_FILENO, "usage: service kill <name>\n");
+                return 1;
+            }
+            if !require_root("kill") {
+                return 1;
+            }
+            cmd_kill(args[2])
         }
         _ => {
             write_str(STDERR_FILENO, "service: unknown subcommand '");

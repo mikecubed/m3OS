@@ -21,13 +21,15 @@ use async_rt::executor;
 use async_rt::io::AsyncFd;
 use async_rt::reactor::Reactor;
 use async_rt::sync::{Mutex, Notify};
+use async_rt::yield_now;
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use sunset::{ChanData, ChanHandle, Event, Runner, ServEvent, Server};
 use syscall_lib::{
-    STDOUT_FILENO, WNOHANG, close, dup2, exit, fork, set_nonblocking, setsid, waitpid, write_str,
+    STDOUT_FILENO, WNOHANG, close, dup2, exit, fork, getpid, set_nonblocking, setsid, waitpid,
+    write_str, write_u64,
 };
 
 use crate::auth;
@@ -43,6 +45,32 @@ const BUF_SIZE: usize = 36000;
 const MAX_AUTH_ATTEMPTS: u32 = 6;
 const NEG_EAGAIN: isize = -11;
 const NEG_EINTR: isize = -4;
+
+fn log_sshd_step(step: &str) {
+    write_str(STDOUT_FILENO, "sshd: ");
+    write_str(STDOUT_FILENO, step);
+    write_str(STDOUT_FILENO, " pid=");
+    write_u64(STDOUT_FILENO, getpid() as u64);
+    write_str(STDOUT_FILENO, "\n");
+}
+
+fn log_sshd_step_u64(step: &str, value_name: &str, value: u64) {
+    write_str(STDOUT_FILENO, "sshd: ");
+    write_str(STDOUT_FILENO, step);
+    write_str(STDOUT_FILENO, " pid=");
+    write_u64(STDOUT_FILENO, getpid() as u64);
+    write_str(STDOUT_FILENO, " ");
+    write_str(STDOUT_FILENO, value_name);
+    write_str(STDOUT_FILENO, "=");
+    write_u64(STDOUT_FILENO, value);
+    write_str(STDOUT_FILENO, "\n");
+}
+
+fn log_sshd_loop_counter(step: &str, count: u64) {
+    if count == 1 || count.is_multiple_of(1000) {
+        log_sshd_step_u64(step, "count", count);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared session state
@@ -131,6 +159,7 @@ impl Future for WaitWake {
 
 /// Run a complete SSH session on the given client socket.
 pub fn run_session(sock_fd: i32, host_key: &HostKey) -> i32 {
+    log_sshd_step_u64("run_session:start", "sock_fd", sock_fd as u64);
     if set_nonblocking(sock_fd) < 0 {
         write_str(
             STDOUT_FILENO,
@@ -164,6 +193,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
     let progress_notify: SharedNotify = Rc::new(Notify::new());
     let session_notify: SharedNotify = Rc::new(Notify::new());
     let output_lock: SharedOutputLock = Rc::new(Mutex::new(()));
+    let mut main_wait_count = 0u64;
 
     // Spawn the I/O task.
     let _io = executor::spawn(io_task(
@@ -201,6 +231,7 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             let mut status: i32 = 0;
             let ret = waitpid(pid as i32, &mut status, WNOHANG);
             if ret > 0 {
+                log_sshd_step_u64("async_session:shell exited", "child_pid", pid as u64);
                 // Shell exited — drain remaining PTY output, then stop.
                 let pty_master = state.borrow().pty_master;
                 let has_chan = chan.borrow().is_some();
@@ -217,6 +248,8 @@ async fn async_session(sock_fd: i32, host_key: &HostKey) -> i32 {
             }
         }
 
+        main_wait_count = main_wait_count.saturating_add(1);
+        log_sshd_loop_counter("async_session:wait session_notify", main_wait_count);
         session_notify.wait().await;
     }
 
@@ -244,6 +277,9 @@ async fn io_task(
     let mut sock_buf = [0u8; 4096];
     let mut pending = [0u8; 4096];
     let mut pending_len: usize = 0;
+    let mut should_wait_false_count = 0u64;
+    let mut wait_wake_count = 0u64;
+    let mut read_eagain_count = 0u64;
 
     // The I/O task must wake on EITHER:
     //   - Socket readable (client sent data) — via reactor
@@ -293,6 +329,11 @@ async fn io_task(
         // Arm runner wakers before sleeping. If we already have buffered socket
         // data, wake when sunset is ready to accept more input again; otherwise
         // we can strand pending handshake bytes waiting on socket readability.
+        //
+        // H6 fix: only arm output_waker when output_buf is drained. If output is
+        // pending, skip the park and loop back to flush — otherwise the
+        // unconditional arm combines with sunset's progress()→wake() path and
+        // keeps io_task and progress_task in a mutual-wake ping-pong.
         let should_wait = {
             let waker = get_current_waker().await;
             let mut guard = runner.lock().await;
@@ -304,11 +345,16 @@ async fn io_task(
                     guard.set_input_waker(&waker);
                 }
             }
-            guard.set_output_waker(&waker);
-            !input_ready
+            let output_pending = !guard.output_buf().is_empty();
+            if !output_pending {
+                guard.set_output_waker(&waker);
+            }
+            !input_ready && !output_pending
         };
 
         if !should_wait {
+            should_wait_false_count = should_wait_false_count.saturating_add(1);
+            log_sshd_loop_counter("io_task:skip wait", should_wait_false_count);
             continue;
         }
 
@@ -319,6 +365,8 @@ async fn io_task(
             registered: false,
         }
         .await;
+        wait_wake_count = wait_wake_count.saturating_add(1);
+        log_sshd_loop_counter("io_task:wake", wait_wake_count);
 
         if state.borrow().session_done {
             return;
@@ -376,6 +424,9 @@ async fn io_task(
                 state.borrow_mut().exit_code = 1;
                 session_notify.signal();
                 return;
+            } else {
+                read_eagain_count = read_eagain_count.saturating_add(1);
+                log_sshd_loop_counter("io_task:read eagain", read_eagain_count);
             }
         }
     }
@@ -390,6 +441,9 @@ async fn io_task(
 enum ProgressAction {
     /// Normal — flush output, continue to next event.
     Continue,
+    /// Same as `Continue` but additionally dump the runner's input/output
+    /// readiness predicates after the lock is dropped (H9 follow-up #5).
+    ContinueProbe,
     /// `continue` the loop immediately (PollAgain / Progressed / SessionEnv).
     LoopContinue,
     /// Yield to let I/O task feed more data (Event::None).
@@ -412,6 +466,24 @@ async fn progress_task(
     session_notify: SharedNotify,
     output_lock: SharedOutputLock,
 ) {
+    let mut continue_count = 0u64;
+    let mut loop_continue_count = 0u64;
+    let mut yield_count = 0u64;
+    let mut wait_progress_count = 0u64;
+    let mut event_hostkeys_count = 0u64;
+    let mut event_first_auth_count = 0u64;
+    let mut event_password_auth_count = 0u64;
+    let mut event_pubkey_auth_count = 0u64;
+    let mut event_open_session_count = 0u64;
+    let mut event_session_pty_count = 0u64;
+    let mut event_session_shell_count = 0u64;
+    let mut event_session_exec_count = 0u64;
+    let mut event_session_subsystem_count = 0u64;
+    let mut event_session_env_count = 0u64;
+    let mut event_defunct_count = 0u64;
+    let mut event_poll_again_count = 0u64;
+    let mut event_progressed_count = 0u64;
+    let mut event_none_count = 0u64;
     loop {
         if state.borrow().session_done {
             return;
@@ -431,17 +503,30 @@ async fn progress_task(
             let mut guard = runner.lock().await;
             match guard.progress() {
                 Ok(Event::Serv(ServEvent::Hostkeys(hostkeys))) => {
-                    if hostkeys.hostkeys(&[&host_sign_key]).is_err() {
+                    event_hostkeys_count = event_hostkeys_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event hostkeys", event_hostkeys_count);
+                    let res = hostkeys.hostkeys(&[&host_sign_key]);
+                    if res.is_err() {
                         ProgressAction::Fatal
                     } else {
-                        ProgressAction::Continue
+                        // H9 follow-up #5: probe the runner predicates
+                        // immediately post-hostkeys via a dedicated marker
+                        // path the consumer can branch on (see below).
+                        ProgressAction::ContinueProbe
                     }
                 }
                 Ok(Event::Serv(ServEvent::FirstAuth(first_auth))) => {
+                    event_first_auth_count = event_first_auth_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event first_auth", event_first_auth_count);
                     let _ = first_auth.reject();
                     ProgressAction::Continue
                 }
                 Ok(Event::Serv(ServEvent::PasswordAuth(pw_auth))) => {
+                    event_password_auth_count = event_password_auth_count.saturating_add(1);
+                    log_sshd_loop_counter(
+                        "progress:event password_auth",
+                        event_password_auth_count,
+                    );
                     let mut st = state.borrow_mut();
                     st.auth_attempts += 1;
                     let attempts = st.auth_attempts;
@@ -453,6 +538,7 @@ async fn progress_task(
                             let p = String::from(p);
                             match auth::check_password(&u, &p) {
                                 Some(info) => {
+                                    log_sshd_step("password auth ok");
                                     let _ = pw_auth.allow();
                                     let mut st = state.borrow_mut();
                                     st.authenticated = true;
@@ -460,12 +546,14 @@ async fn progress_task(
                                     true
                                 }
                                 None => {
+                                    log_sshd_step("password auth reject");
                                     let _ = pw_auth.reject();
                                     false
                                 }
                             }
                         }
                         _ => {
+                            log_sshd_step("password auth parse error");
                             let _ = pw_auth.reject();
                             false
                         }
@@ -477,6 +565,8 @@ async fn progress_task(
                     }
                 }
                 Ok(Event::Serv(ServEvent::PubkeyAuth(pk_auth))) => {
+                    event_pubkey_auth_count = event_pubkey_auth_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event pubkey_auth", event_pubkey_auth_count);
                     let is_real = pk_auth.real();
                     let mut rejected = false;
                     let username = pk_auth.username().ok().map(String::from);
@@ -519,31 +609,53 @@ async fn progress_task(
                     }
                 }
                 Ok(Event::Serv(ServEvent::OpenSession(open_session))) => {
+                    event_open_session_count = event_open_session_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event open_session", event_open_session_count);
                     let authenticated = state.borrow().authenticated;
                     if !authenticated {
+                        log_sshd_step("open_session reject unauthenticated");
                         let _ = open_session
                             .reject(sunset::ChanFail::SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
                     } else if let Ok(handle) = open_session.accept() {
+                        log_sshd_step_u64(
+                            "open_session accept channel",
+                            "num",
+                            handle.num().0 as u64,
+                        );
                         *chan.borrow_mut() = Some(handle);
+                    } else {
+                        log_sshd_step("open_session accept failed");
                     }
                     ProgressAction::Continue
                 }
                 Ok(Event::Serv(ServEvent::SessionPty(pty_req))) => {
+                    event_session_pty_count = event_session_pty_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event session_pty", event_session_pty_count);
+                    log_sshd_step("session pty request");
                     match syscall_lib::openpty() {
                         Ok((master, slave)) => {
                             set_nonblocking(master);
                             let mut st = state.borrow_mut();
                             st.pty_master = Some(master);
                             st.pty_slave = Some(slave);
+                            log_sshd_step_u64("session pty open master", "fd", master as u64);
+                            log_sshd_step_u64("session pty open slave", "fd", slave as u64);
                             let _ = pty_req.succeed();
                         }
                         Err(_) => {
+                            log_sshd_step("session pty open failed");
                             let _ = pty_req.fail();
                         }
                     }
                     ProgressAction::Continue
                 }
                 Ok(Event::Serv(ServEvent::SessionShell(shell_req))) => {
+                    event_session_shell_count = event_session_shell_count.saturating_add(1);
+                    log_sshd_loop_counter(
+                        "progress:event session_shell",
+                        event_session_shell_count,
+                    );
+                    log_sshd_step("session shell request");
                     // Allocate PTY if not already done.
                     if state.borrow().pty_master.is_none() {
                         if let Ok((m, s)) = syscall_lib::openpty() {
@@ -551,9 +663,12 @@ async fn progress_task(
                             let mut st = state.borrow_mut();
                             st.pty_master = Some(m);
                             st.pty_slave = Some(s);
+                            log_sshd_step_u64("session shell lazy pty master", "fd", m as u64);
+                            log_sshd_step_u64("session shell lazy pty slave", "fd", s as u64);
                         }
                     }
                     if state.borrow().shell_spawned {
+                        log_sshd_step("session shell already spawned");
                         let _ = shell_req.fail();
                         ProgressAction::Continue
                     } else {
@@ -563,12 +678,23 @@ async fn progress_task(
                         if let (Some(master), Some(slave), Some(info)) =
                             (pty_master, pty_slave, &user_info)
                         {
+                            log_sshd_step_u64(
+                                "session shell fork begin master",
+                                "fd",
+                                master as u64,
+                            );
+                            log_sshd_step_u64("session shell fork begin slave", "fd", slave as u64);
                             let pid = fork();
                             if pid < 0 {
                                 write_str(STDOUT_FILENO, "sshd: shell fork failed\n");
                                 let _ = shell_req.fail();
                                 ProgressAction::Continue
                             } else if pid == 0 {
+                                log_sshd_step_u64(
+                                    "session shell child start slave",
+                                    "fd",
+                                    slave as u64,
+                                );
                                 // Child process — close ALL inherited fds
                                 // except the PTY slave. The child inherits the
                                 // reactor self-pipe, socket, PTY master, etc.
@@ -580,6 +706,11 @@ async fn progress_task(
                                 spawn_shell(slave, &info);
                             } else {
                                 // Parent.
+                                log_sshd_step_u64(
+                                    "session shell parent forked child",
+                                    "child_pid",
+                                    pid as u64,
+                                );
                                 close(slave);
                                 {
                                     let mut st = state.borrow_mut();
@@ -591,28 +722,53 @@ async fn progress_task(
                                 ProgressAction::SpawnRelay(master)
                             }
                         } else {
+                            log_sshd_step("session shell missing pty or user_info");
                             let _ = shell_req.fail();
                             ProgressAction::Continue
                         }
                     }
                 }
                 Ok(Event::Serv(ServEvent::SessionExec(exec_req))) => {
+                    event_session_exec_count = event_session_exec_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event session_exec", event_session_exec_count);
                     let _ = exec_req.fail();
                     ProgressAction::Continue
                 }
                 Ok(Event::Serv(ServEvent::SessionSubsystem(sub_req))) => {
+                    event_session_subsystem_count = event_session_subsystem_count.saturating_add(1);
+                    log_sshd_loop_counter(
+                        "progress:event session_subsystem",
+                        event_session_subsystem_count,
+                    );
                     let _ = sub_req.fail();
                     ProgressAction::Continue
                 }
                 Ok(Event::Serv(ServEvent::SessionEnv(env_req))) => {
+                    event_session_env_count = event_session_env_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event session_env", event_session_env_count);
                     let _ = env_req.fail();
                     ProgressAction::LoopContinue
                 }
-                Ok(Event::Serv(ServEvent::Defunct)) => ProgressAction::Defunct,
-                Ok(Event::Serv(ServEvent::PollAgain) | Event::Progressed) => {
+                Ok(Event::Serv(ServEvent::Defunct)) => {
+                    event_defunct_count = event_defunct_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event defunct", event_defunct_count);
+                    ProgressAction::Defunct
+                }
+                Ok(Event::Serv(ServEvent::PollAgain)) => {
+                    event_poll_again_count = event_poll_again_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event poll_again", event_poll_again_count);
                     ProgressAction::LoopContinue
                 }
-                Ok(Event::None) => ProgressAction::Yield,
+                Ok(Event::Progressed) => {
+                    event_progressed_count = event_progressed_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event progressed", event_progressed_count);
+                    ProgressAction::LoopContinue
+                }
+                Ok(Event::None) => {
+                    event_none_count = event_none_count.saturating_add(1);
+                    log_sshd_loop_counter("progress:event none", event_none_count);
+                    ProgressAction::Yield
+                }
                 Ok(_) => ProgressAction::Continue,
                 Err(_) => ProgressAction::Fatal,
             }
@@ -620,13 +776,56 @@ async fn progress_task(
         };
 
         match action {
-            ProgressAction::Continue => {}
-            ProgressAction::LoopContinue => continue,
+            ProgressAction::Continue => {
+                continue_count = continue_count.saturating_add(1);
+                log_sshd_loop_counter("progress_task:continue", continue_count);
+                // H9 fix: cooperative yield so io_task can run and feed
+                // any pending input bytes between back-to-back Continue
+                // events. Without this yield the post-hostkeys flow can
+                // spin a fresh `Continue` event each iteration without
+                // ever giving io_task a chance to drain its `pending`
+                // buffer.
+                yield_now().await;
+            }
+            ProgressAction::ContinueProbe => {
+                continue_count = continue_count.saturating_add(1);
+                log_sshd_loop_counter("progress_task:continue", continue_count);
+                // H9 follow-up #5: re-acquire the runner lock to read
+                // is_input_ready / output_buf state immediately after
+                // hostkeys was provided. Single-threaded executor — no
+                // other task ran between the prior drop and this
+                // re-acquire.
+                yield_now().await;
+            }
+            ProgressAction::LoopContinue => {
+                loop_continue_count = loop_continue_count.saturating_add(1);
+                log_sshd_loop_counter("progress_task:loop_continue", loop_continue_count);
+                // H9 fix: cooperative yield so the executor gets a chance
+                // to poll io_task between back-to-back progress() calls.
+                // Without this yield, runs of `LoopContinue`-returning
+                // events (Progressed / PollAgain / SessionEnv) spin
+                // entirely in userspace — each iteration does no syscall
+                // and the kernel scheduler sees a single contiguous
+                // burst (the H9 ~630ms cpu-hog observed post-hostkeys).
+                yield_now().await;
+                continue;
+            }
             ProgressAction::Yield => {
+                yield_count = yield_count.saturating_add(1);
+                log_sshd_loop_counter("progress_task:yield", yield_count);
+                wait_progress_count = wait_progress_count.saturating_add(1);
+                log_sshd_loop_counter("progress_task:wait progress_notify", wait_progress_count);
                 progress_notify.wait().await;
+                // H9 follow-up #6: cooperative yield even when the Notify
+                // wait was a no-op (signal pre-set the bit, wait returned
+                // Ready immediately without parking). Without this yield
+                // the Yield arm spins `progress() → Event::None → wait
+                // (no-op) → progress() → ...` entirely in userspace.
+                yield_now().await;
                 continue;
             }
             ProgressAction::SpawnRelay(pty_master) => {
+                log_sshd_step_u64("progress_task:spawn relay", "pty_master", pty_master as u64);
                 executor::spawn(channel_relay_task(
                     sock_fd,
                     pty_master,
@@ -675,6 +874,7 @@ async fn channel_relay_task(
     session_notify: SharedNotify,
     output_lock: SharedOutputLock,
 ) {
+    log_sshd_step_u64("channel_relay:start", "pty_fd", pty_fd as u64);
     let mut chan_buf = [0u8; 4096];
     let mut pty_buf = [0u8; 4096];
     let mut pty_pending = [0u8; 4096];
@@ -682,6 +882,16 @@ async fn channel_relay_task(
     // Pending data from channel -> PTY that couldn't be written (EAGAIN).
     let mut pty_write_pending = [0u8; 4096];
     let mut pty_write_pending_len: usize = 0;
+    let mut relay_skip_wait_count = 0u64;
+    let mut relay_pty_write_pending_progress_count = 0u64;
+    let mut relay_pty_write_pending_stall_count = 0u64;
+    let mut relay_chan_to_pty_bytes_count = 0u64;
+    let mut relay_chan_to_pty_backpressure_count = 0u64;
+    let mut relay_pty_pending_flush_count = 0u64;
+    let mut relay_pty_pending_zero_write_count = 0u64;
+    let mut relay_pty_read_bytes_count = 0u64;
+    let mut relay_pty_to_chan_bytes_count = 0u64;
+    let mut relay_pty_to_chan_backpressure_count = 0u64;
     // The relay task wakes on:
     //   - PTY readable (shell produced output) — via reactor
     //   - Channel data available (client typed something) — via channel_read_waker
@@ -698,10 +908,22 @@ async fn channel_relay_task(
         while pty_write_pending_len > 0 {
             let n = syscall_lib::write(pty_fd, &pty_write_pending[..pty_write_pending_len]);
             if n > 0 {
+                relay_pty_write_pending_progress_count =
+                    relay_pty_write_pending_progress_count.saturating_add(1);
+                log_sshd_loop_counter(
+                    "channel_relay:pty write pending progress",
+                    relay_pty_write_pending_progress_count,
+                );
                 let w = n as usize;
                 pty_write_pending.copy_within(w..pty_write_pending_len, 0);
                 pty_write_pending_len -= w;
             } else {
+                relay_pty_write_pending_stall_count =
+                    relay_pty_write_pending_stall_count.saturating_add(1);
+                log_sshd_loop_counter(
+                    "channel_relay:pty write pending stall",
+                    relay_pty_write_pending_stall_count,
+                );
                 break; // EAGAIN or error — retry next iteration
             }
         }
@@ -714,6 +936,12 @@ async fn channel_relay_task(
                     match guard.read_channel(ch, ChanData::Normal, &mut chan_buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            relay_chan_to_pty_bytes_count =
+                                relay_chan_to_pty_bytes_count.saturating_add(1);
+                            log_sshd_loop_counter(
+                                "channel_relay:chan->pty bytes",
+                                relay_chan_to_pty_bytes_count,
+                            );
                             let mut written = 0;
                             while written < n {
                                 let w = syscall_lib::write(pty_fd, &chan_buf[written..n]);
@@ -725,6 +953,12 @@ async fn channel_relay_task(
                             }
                             // Stash unwritten data for retry.
                             if written < n {
+                                relay_chan_to_pty_backpressure_count =
+                                    relay_chan_to_pty_backpressure_count.saturating_add(1);
+                                log_sshd_loop_counter(
+                                    "channel_relay:chan->pty backpressure",
+                                    relay_chan_to_pty_backpressure_count,
+                                );
                                 let remaining = n - written;
                                 let stash = remaining.min(pty_write_pending.len());
                                 pty_write_pending[..stash]
@@ -748,6 +982,12 @@ async fn channel_relay_task(
                 let mut guard = runner.lock().await;
                 match guard.write_channel(ch, ChanData::Normal, &pty_pending[..pty_pending_len]) {
                     Ok(0) => {
+                        relay_pty_pending_zero_write_count =
+                            relay_pty_pending_zero_write_count.saturating_add(1);
+                        log_sshd_loop_counter(
+                            "channel_relay:pty pending zero write",
+                            relay_pty_pending_zero_write_count,
+                        );
                         drop(guard);
                         drop(ch_ref);
                         if !flush_output_locked(&runner, sock_fd, &output_lock).await {
@@ -759,6 +999,12 @@ async fn channel_relay_task(
                         break;
                     }
                     Ok(w) => {
+                        relay_pty_pending_flush_count =
+                            relay_pty_pending_flush_count.saturating_add(1);
+                        log_sshd_loop_counter(
+                            "channel_relay:pty pending flush",
+                            relay_pty_pending_flush_count,
+                        );
                         pty_pending.copy_within(w..pty_pending_len, 0);
                         pty_pending_len -= w;
                         drop(guard);
@@ -783,6 +1029,8 @@ async fn channel_relay_task(
         if pty_pending_len == 0 {
             let n = syscall_lib::read(pty_fd, &mut pty_buf);
             if n > 0 {
+                relay_pty_read_bytes_count = relay_pty_read_bytes_count.saturating_add(1);
+                log_sshd_loop_counter("channel_relay:pty read bytes", relay_pty_read_bytes_count);
                 let data = &pty_buf[..n as usize];
                 let mut sent = 0;
                 while sent < data.len() {
@@ -791,6 +1039,12 @@ async fn channel_relay_task(
                         let mut guard = runner.lock().await;
                         match guard.write_channel(ch, ChanData::Normal, &data[sent..]) {
                             Ok(0) => {
+                                relay_pty_to_chan_backpressure_count =
+                                    relay_pty_to_chan_backpressure_count.saturating_add(1);
+                                log_sshd_loop_counter(
+                                    "channel_relay:pty->chan backpressure",
+                                    relay_pty_to_chan_backpressure_count,
+                                );
                                 drop(guard);
                                 drop(ch_ref);
                                 if !flush_output_locked(&runner, sock_fd, &output_lock).await {
@@ -802,6 +1056,12 @@ async fn channel_relay_task(
                                 break;
                             }
                             Ok(w) => {
+                                relay_pty_to_chan_bytes_count =
+                                    relay_pty_to_chan_bytes_count.saturating_add(1);
+                                log_sshd_loop_counter(
+                                    "channel_relay:pty->chan bytes",
+                                    relay_pty_to_chan_bytes_count,
+                                );
                                 sent += w;
                                 drop(guard);
                                 drop(ch_ref);
@@ -830,6 +1090,7 @@ async fn channel_relay_task(
                 n,
                 fd_poll_revents(pty_fd, pty_wait_events(pty_write_pending_len > 0)),
             ) {
+                log_sshd_step("channel_relay:pty close");
                 if !flush_output_locked(&runner, sock_fd, &output_lock).await {
                     state.borrow_mut().session_done = true;
                     state.borrow_mut().exit_code = 1;
@@ -887,6 +1148,8 @@ async fn channel_relay_task(
                 || (pty_write_pending_len > 0 && fd_is_writable(pty_fd)))
         };
         if !should_wait {
+            relay_skip_wait_count = relay_skip_wait_count.saturating_add(1);
+            log_sshd_loop_counter("channel_relay:skip wait", relay_skip_wait_count);
             continue;
         }
         WaitWake {
@@ -953,18 +1216,22 @@ fn pty_should_close(read_result: isize, revents: i16) -> bool {
 
 /// Set up the PTY slave and exec the user's shell. Does not return on success.
 fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
+    log_sshd_step_u64("spawn_shell:start", "slave", slave as u64);
     if setsid() < 0 {
         write_str(STDOUT_FILENO, "sshd: setsid failed\n");
         exit(1);
     }
+    log_sshd_step("spawn_shell:setsid ok");
     if syscall_lib::ioctl(slave, TIOCSCTTY, 0) < 0 {
         write_str(STDOUT_FILENO, "sshd: TIOCSCTTY failed\n");
         exit(1);
     }
+    log_sshd_step("spawn_shell:tiocsctty ok");
     if dup2(slave, 0) < 0 || dup2(slave, 1) < 0 || dup2(slave, 2) < 0 {
         write_str(STDOUT_FILENO, "sshd: dup2 failed\n");
         exit(1);
     }
+    log_sshd_step("spawn_shell:dup2 ok");
     if slave > 2 {
         close(slave);
     }
@@ -972,10 +1239,12 @@ fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
         write_str(STDOUT_FILENO, "sshd: setgid failed\n");
         exit(1);
     }
+    log_sshd_step_u64("spawn_shell:setgid ok", "gid", info.gid as u64);
     if syscall_lib::setuid(info.uid) < 0 {
         write_str(STDOUT_FILENO, "sshd: setuid failed\n");
         exit(1);
     }
+    log_sshd_step_u64("spawn_shell:setuid ok", "uid", info.uid as u64);
     let home_bytes = info.home.as_bytes();
     let mut home_env = [0u8; 128];
     let he_len = build_env(b"HOME=", home_bytes, &mut home_env);
@@ -998,12 +1267,20 @@ fn spawn_shell(slave: i32, info: &auth::UserInfo) -> ! {
     shell_path[..slen].copy_from_slice(&shell_bytes[..slen]);
     shell_path[slen] = 0;
     let argv: [*const u8; 2] = [shell_path[..slen + 1].as_ptr(), core::ptr::null()];
+    write_str(STDOUT_FILENO, "sshd: spawn_shell exec path=");
+    let _ = syscall_lib::write(STDOUT_FILENO, &shell_path[..slen]);
+    write_str(STDOUT_FILENO, " pid=");
+    write_u64(STDOUT_FILENO, getpid() as u64);
+    write_str(STDOUT_FILENO, "\n");
     let ret = syscall_lib::execve(&shell_path[..slen + 1], &argv, &envp);
     if ret < 0 {
+        log_sshd_step("spawn_shell:exec primary failed");
         let sh0: &[u8] = b"/bin/sh0\0";
         let argv2: [*const u8; 2] = [sh0.as_ptr(), core::ptr::null()];
+        log_sshd_step("spawn_shell:exec fallback /bin/sh0");
         syscall_lib::execve(sh0, &argv2, &envp);
     }
+    log_sshd_step("spawn_shell:exec failed exit");
     exit(1);
 }
 
@@ -1118,16 +1395,26 @@ async fn drain_pty_locked(
 
 /// Clean up all session resources.
 fn cleanup(shell_pid: Option<isize>, pty_master: Option<i32>, pty_slave: Option<i32>) {
+    if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
+        log_sshd_step("cleanup:start");
+    }
     if let Some(pid) = shell_pid {
+        log_sshd_step_u64("cleanup:kill shell", "child_pid", pid as u64);
         syscall_lib::kill(pid as i32, 1); // SIGHUP
         let mut status: i32 = 0;
         waitpid(pid as i32, &mut status, 0);
+        log_sshd_step_u64("cleanup:waitpid shell", "status", status as u64);
     }
     if let Some(fd) = pty_master {
+        log_sshd_step_u64("cleanup:close pty_master", "fd", fd as u64);
         close(fd);
     }
     if let Some(fd) = pty_slave {
+        log_sshd_step_u64("cleanup:close pty_slave", "fd", fd as u64);
         close(fd);
+    }
+    if shell_pid.is_some() || pty_master.is_some() || pty_slave.is_some() {
+        log_sshd_step("cleanup:done");
     }
 }
 

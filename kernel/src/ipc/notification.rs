@@ -346,6 +346,60 @@ pub fn signal_irq(irq: u8) {
     // safe from ISR context on a single-CPU kernel.
 }
 
+/// Signal a single bit on a `NotifId` from interrupt context.
+///
+/// **ISR-safe** — uses only `AtomicU64::fetch_or` and a per-core `push` on
+/// the lock-free `IsrWakeQueue`. No allocation, no mutex, no IPC. This is
+/// the lower-level sibling of [`signal_irq`] used by the Phase 55b device
+/// IRQ subscription path (`sys_device_irq_subscribe` → MSI / MSI-X / INTx
+/// → this function) where the kernel needs to deliver to an arbitrary
+/// `NotifId` rather than the legacy IRQ-line indirection in `IRQ_MAP`.
+///
+/// `bit` must be < 64 — callers validate at the syscall boundary so the
+/// ISR path is branchless past the allocation. An out-of-range bit is
+/// silently dropped here (preserving ISR-safety: we cannot `panic!` from
+/// interrupt context).
+pub fn signal_irq_bit(notif_id: NotifId, bit: u8) {
+    let idx = notif_id.0 as usize;
+    if idx >= MAX_NOTIFS || bit >= 64 {
+        return;
+    }
+    // Set the requested bit atomically. `fetch_or` is commutative, so
+    // concurrent ISRs targeting the same notification accumulate bits
+    // without loss.
+    PENDING[idx].fetch_or(1u64 << (bit as u32), Ordering::Release);
+
+    // Push the waiter (if any) to the per-core ISR wake queue — mirrors
+    // the logic in `signal_irq` but without the `IRQ_MAP` indirection.
+    if let Some(isr_waiter) = ISR_WAITERS.get(idx) {
+        let waiter_idx = isr_waiter.load(Ordering::Acquire);
+        if waiter_idx >= 0
+            && isr_waiter
+                .compare_exchange(waiter_idx, -1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            && let Some(data) = crate::smp::try_per_core()
+        {
+            let _ = data.isr_wake_queue.push(waiter_idx as usize);
+        }
+    }
+
+    scheduler::signal_reschedule();
+}
+
+/// Test-only accessor for the pending-bit word on a notification.
+///
+/// Returns the current `PENDING[idx]` value without draining it. Used by
+/// the Phase 55b Track B.4 synthetic-IRQ test to inspect what the ISR
+/// shim delivered without disturbing the waiter-wake state.
+#[cfg(test)]
+pub fn test_peek_pending(idx: u8) -> u64 {
+    let i = idx as usize;
+    if i >= MAX_NOTIFS {
+        return 0;
+    }
+    PENDING[i].load(Ordering::Acquire)
+}
+
 /// Signal one or more bits on a notification object.
 ///
 /// **Task-context safe** (not ISR-safe — may call [`wake_task`]).

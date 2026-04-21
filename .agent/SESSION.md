@@ -1,42 +1,47 @@
 ---
-current-task: "PR #114 review resolution — 8 unresolved copilot-reviewer threads on feat/55a-iommu-substrate"
+current-task: "PR #116 review resolution — 11 new unresolved copilot threads (round 6)"
 current-phase: "triage-complete"
-next-action: "begin fix batch 1 (IOMMU correctness group)"
-workspace: "feat/55a-iommu-substrate (PR #114)"
-last-updated: "2026-04-19T00:00:00Z"
+next-action: "begin fix batch 1"
+workspace: "feat/phase-55b-ring-3-driver-host (PR #116)"
+last-updated: "2026-04-20T12:00:00Z"
 ---
 
 ## Review surface
 
-PR #114: feat/55a-iommu-substrate → main, 9 review threads from
-copilot-pull-request-reviewer + github-advanced-security (devskim).
-1 thread already resolved (devskim TODO). 8 unresolved — all triaged below.
+PR #116 — new copilot round. 11 unresolved threads, all from
+`copilot-pull-request-reviewer`. Previous rounds (1–5) resolved.
+7 distinct fixes close all 11 threads (several threads are duplicates on the
+same line / docstring / function).
 
-## Decisions
+## Decisions (round 6 — 11 new unresolved threads)
 
-| # | Thread ID | File:Line | Verdict | Action | Notes |
-|---|---|---|---|---|---|
-| 1 | PRRT_kwDORTRVIM57-9y8 | kernel-core/src/iommu/identity.rs:94 | valid | fix | Gate create_domain + other methods on brought_up; make install_identity_fallback call bring_up first (and the per-slot identity fallback in init()). |
-| 2 | PRRT_kwDORTRVIM57_Ggh | kernel/src/iommu/mod.rs | (already resolved/outdated) | skip | devskim TODO warning — already closed. |
-| 3 | PRRT_kwDORTRVIM57_P1l | kernel/src/iommu/registry.rs:237 | valid | fix | destroy_domain error path drops DmaDomain without release → debug_assert panic. |
-| 4 | PRRT_kwDORTRVIM57_P1t | kernel/src/iommu/fault.rs:59 | valid | fix | Replace spin::Mutex with AtomicPtr — IRQ-path must be lock-free per module contract. |
-| 5 | PRRT_kwDORTRVIM57_P10 | kernel/src/net/virtio_net.rs:238 | partially valid | fix scoped | Rename phys_base → bus_base + log field. buf_phys Vec stays (out of scope). |
-| 6 | PRRT_kwDORTRVIM57_P12 | kernel/src/blk/virtio_blk.rs:189 | partially valid | fix scoped | Rename phys_base → bus_base + log field. |
-| 7 | PRRT_kwDORTRVIM57_P15 | kernel/src/net/e1000.rs:126 | valid | fix | Rename ring_phys → ring_bus (struct field + all uses). |
-| 8 | PRRT_kwDORTRVIM57_P17 | xtask/src/main.rs:1691 | valid | fix | --gui + --iommu emits two -machine args → last one wins → pcspk setting lost. Consolidate into one -machine. |
-| 9 | PRRT_kwDORTRVIM57_P1- | xtask/src/main.rs:7742 | valid | fix | Test assertion mismatches IOMMU_QEMU_ARGS constant (confirmed failing via cargo test). |
+| Thread ID | File:Line | Verdict | Action |
+|---|---|---|---|
+| PRRT_kwDORTRVIM58QGTk | kernel/src/blk/mod.rs:59 | valid — `write_sectors` doc mentions `payload_grant` parameter that isn't in the signature | fix (doc only) |
+| PRRT_kwDORTRVIM58QGUm | kernel/src/pci/mod.rs:436 | valid — doc says "Consume this handle" but signature is `&self` | fix (doc only) |
+| PRRT_kwDORTRVIM58QGU- | kernel/src/pci/mod.rs:441 | duplicate of QGUm — same docstring | fix (covered by one change) |
+| PRRT_kwDORTRVIM58QGVa | kernel/src/arch/x86_64/syscall/mod.rs:1588 | valid — inline `-19_i64` for ENODEV; codebase has `NEG_ENODEV` elsewhere | fix (add file-level const, use it here and at two function-local occurrences) |
+| PRRT_kwDORTRVIM58QGVv | kernel/src/pci/bar.rs:590 | partially valid — `tlb_shootdown_range` already page-aligns internally, so no real bug today; explicit page-rounded end removes implicit coupling | fix (defense-in-depth) |
+| PRRT_kwDORTRVIM58QGWG | kernel/src/pci/bar.rs:596 | duplicate of QGVv | fix (covered by one change) |
+| PRRT_kwDORTRVIM58QGWj | kernel/src/pci/bar.rs:615 | duplicate of QGVv | fix (covered by one change) |
+| PRRT_kwDORTRVIM58QGW8 | kernel/src/pci/bar.rs:630 | duplicate of QGVv | fix (covered by one change) |
+| PRRT_kwDORTRVIM58QGXM | userspace/coreutils-rs/src/service.rs:421 | valid — error-message format `kill(<name>, pid=<n>)` reads like a syscall signature but mixes name + pid | fix (reformat to separate label from syscall form) |
+| PRRT_kwDORTRVIM58QGXe | kernel/src/task/scheduler.rs:852 | valid — doc says "if the task is alive"; impl only checks existence | fix (doc only → "if the task exists") |
+| PRRT_kwDORTRVIM58QGX7 | kernel/src/task/scheduler.rs:862 | duplicate of QGXe — same docstring | fix (covered by one change) |
 
 ## Files Touched
 
-(read so far)
-- kernel-core/src/iommu/identity.rs, kernel-core/src/iommu/contract.rs
-- kernel/src/iommu/registry.rs, kernel/src/iommu/mod.rs, kernel/src/iommu/fault.rs, kernel/src/iommu/intel.rs
-- kernel/src/net/virtio_net.rs, kernel/src/net/e1000.rs, kernel/src/blk/virtio_blk.rs
-- xtask/src/main.rs
+(round-6 fix scope, not yet edited)
+- kernel/src/blk/mod.rs
+- kernel/src/pci/mod.rs
+- kernel/src/arch/x86_64/syscall/mod.rs
+- kernel/src/pci/bar.rs
+- userspace/coreutils-rs/src/service.rs
+- kernel/src/task/scheduler.rs
 
 ## Open Questions
 
-(none — fixes derive from code evidence)
+(none — all 11 triaged)
 
 ## Blockers
 

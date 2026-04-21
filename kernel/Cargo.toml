@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-version = "0.55.1"
+version = "0.55.2"
 edition = "2024"
 
 [dependencies]
@@ -16,3 +16,9 @@ kernel-core = { path = "../kernel-core", default-features = false }
 default = ["trace"]
 trace = []
 legacy-bootstrap-allocator = []
+# When `hardened` is enabled, the `sys_block_read` whitelist is restricted to
+# production storage servers only (vfs_server, fat_server). Without this flag,
+# test binaries such as `nvme-crash-smoke` are also permitted, which allows
+# EAGAIN observation from the kernel facade path during integration testing.
+# Enable this feature for production / secure-boot images.
+hardened = []

@@ -17,6 +17,12 @@
 # Local agent/orchestration session artifacts
 .agent/
 .workflow-orchestration/artifacts/
+.codex/
+.claude/scheduled_tasks.lock
+
+# Local debug captures (cargo xtask run > foo.log etc.)
+*.log
+output*.txt
 
 # QEMU runtime files
 *.qcow2

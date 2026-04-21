@@ -114,6 +114,11 @@ impl Executor {
         if id >= self.high_water {
             self.high_water = id + 1;
         }
+        self.tasks
+            .get_mut(id)
+            .expect("executor insert returned invalid task id")
+            .header
+            .mark_queued();
         self.run_queue.push_back(id);
         id
     }
@@ -130,6 +135,7 @@ impl Executor {
 
             // Safety: single-threaded executor, exclusive access.
             let slot_ref = unsafe { &mut *slot };
+            slot_ref.header.clear_queued();
 
             if !slot_ref.header.is_woken() {
                 continue;
@@ -147,14 +153,20 @@ impl Executor {
             }
         }
 
-        self.run_queue = to_poll;
+        // Preserve tasks spawned while polling this batch. `spawn()` pushes
+        // directly into `self.run_queue`, so replacing it here would drop
+        // those freshly spawned tasks before their first poll.
+        if !to_poll.is_empty() {
+            self.run_queue.append(&mut to_poll);
+        }
     }
 
     /// Re-scan all tasks for woken state and add to run queue.
     fn requeue_woken(&mut self) {
         for i in 0..self.high_water {
             if let Some(slot) = self.tasks.get(i) {
-                if slot.header.is_woken() {
+                if slot.header.is_woken() && !slot.header.is_queued() {
+                    slot.header.mark_queued();
                     self.run_queue.push_back(i);
                 }
             }
@@ -547,6 +559,70 @@ mod tests {
         });
 
         // The spawned task should have run (it was ready immediately).
+        assert!(ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_requeue_woken_does_not_duplicate_run_queue_entries() {
+        let mut executor = Executor::new();
+        let (header, _result) = create_task_parts::<()>();
+        let future = Box::pin(async {});
+        let id = executor.insert(future, header.clone());
+
+        assert_eq!(executor.run_queue.len(), 1);
+        assert!(header.is_queued());
+
+        // Requeueing a still-woken task should not add duplicates.
+        executor.requeue_woken();
+        executor.requeue_woken();
+        assert_eq!(executor.run_queue.len(), 1);
+
+        // Once the task is popped, it can be requeued again.
+        let _ = executor.run_queue.pop_front();
+        header.clear_queued();
+        executor.requeue_woken();
+        assert_eq!(executor.run_queue.len(), 1);
+        assert_eq!(executor.run_queue.front().copied(), Some(id));
+    }
+
+    #[test]
+    fn test_spawn_during_poll_is_not_dropped() {
+        use core::future::poll_fn;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = ran.clone();
+
+        let mut reactor = Reactor::new();
+        block_on(&mut reactor, async move {
+            let parent = spawn(async move {
+                spawn(async move {
+                    ran2.store(true, Ordering::Release);
+                });
+
+                // Return Pending once so the executor completes another pass
+                // after the nested spawn.
+                poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    Poll::<()>::Pending
+                })
+                .await;
+            });
+
+            drop(parent);
+
+            // Keep the root future alive for another executor turn.
+            poll_fn(|cx| {
+                if ran.load(Ordering::Acquire) {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        });
+
         assert!(ran.load(Ordering::Acquire));
     }
 }

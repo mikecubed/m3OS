@@ -1,17 +1,27 @@
 //! Block device subsystem — Phase 24.
 //!
 //! Provides a virtio-blk driver for reading and writing disk sectors,
-//! and MBR partition parsing. Phase 55 Track D adds an NVMe driver on the
-//! same hardware-access layer; [`read_sectors`] / [`write_sectors`] below
-//! dispatch between the two based on which is ready. The policy is
-//! deliberately simple for Phase 55: NVMe wins if present, otherwise
-//! virtio-blk. A proper multi-device block layer is a later phase.
+//! and MBR partition parsing.
+//!
+//! # Dispatch priority (Phase 55b)
+//!
+//! Phase 55b Track D.4 added `remote::RemoteBlockDevice`, a kernel-side
+//! forwarding facade that speaks to the ring-3 NVMe driver process over IPC.
+//! Track D.5 deleted the in-kernel NVMe driver (`kernel/src/blk/nvme.rs`).
+//! The dispatch policy in [`read_sectors`] / [`write_sectors`] is:
+//!
+//!   1. **`RemoteBlockDevice`** — if `remote::register` has been called, all
+//!      block I/O is forwarded to the ring-3 NVMe driver via IPC.
+//!      Cross-reference: `userspace/drivers/nvme/` owns all device-specific
+//!      NVMe logic; `kernel_core::nvme` retains shared register/command types.
+//!   2. **VirtIO-blk** — if no remote driver is registered.
+//!
+//! The pure-logic dispatch state machine lives in
+//! `kernel_core::driver_ipc::blk_dispatch` where it is host-testable.
 
 pub mod mbr;
-pub mod nvme;
+pub mod remote;
 pub mod virtio_blk;
-
-use core::sync::atomic::Ordering;
 
 #[allow(unused_imports)]
 pub use virtio_blk::VIRTIO_BLK_READY;
@@ -20,34 +30,42 @@ pub use virtio_blk::VIRTIO_BLK_READY;
 /// PCI HAL and run a probe pass so whichever controller is present binds.
 pub fn init() {
     virtio_blk::register();
-    nvme::register();
     crate::pci::probe_all_drivers();
 }
 
-/// Read `count` sectors starting at `start_sector` into `buf`. Dispatches
-/// to the best available block device — NVMe when `NVME_READY`, virtio-blk
-/// otherwise.
+/// Read `count` sectors starting at `start_sector` into `buf`.
 ///
-/// Returns a `u8` status for backwards compatibility with the virtio-blk
-/// surface — virtio-blk always fits in a byte and NVMe status codes are
-/// truncated to their low 8 bits (most errors are in that range; the full
-/// status is logged at error level by the NVMe driver).
+/// Dispatch order:
+/// 1. `RemoteBlockDevice` (ring-3 NVMe driver via IPC) if registered.
+/// 2. VirtIO-blk otherwise.
+///
+/// Returns `Ok(())` on success or `Err(u8)` with a status byte on failure.
+/// The VirtIO-blk surface returns a byte natively; remote errors are
+/// truncated to their low 8 bits (most codes live there; full status is logged
+/// by the driver).
 #[allow(dead_code)]
 pub fn read_sectors(start_sector: u64, count: usize, buf: &mut [u8]) -> Result<(), u8> {
-    if nvme::NVME_READY.load(Ordering::Acquire) {
-        nvme::read_sectors(start_sector, count, buf).map_err(|e| (e & 0xFF) as u8)
-    } else {
-        virtio_blk::read_sectors(start_sector, count, buf)
+    if remote::is_registered() {
+        return remote::read_sectors(start_sector, count, buf);
     }
+    virtio_blk::read_sectors(start_sector, count, buf)
 }
 
-/// Write `count` sectors starting at `start_sector` from `buf`. Dispatches
-/// identically to [`read_sectors`].
+/// Write `count` sectors starting at `start_sector` from `buf`.
+///
+/// Dispatch order mirrors [`read_sectors`].
+///
+/// This legacy API does not expose any caller-supplied IPC grant handle.
+/// When writes are forwarded to `RemoteBlockDevice`, the facade encodes
+/// "no separate grant payload" and embeds the write data inline in the
+/// bulk buffer.
 #[allow(dead_code)]
 pub fn write_sectors(start_sector: u64, count: usize, buf: &[u8]) -> Result<(), u8> {
-    if nvme::NVME_READY.load(Ordering::Acquire) {
-        nvme::write_sectors(start_sector, count, buf).map_err(|e| (e & 0xFF) as u8)
-    } else {
-        virtio_blk::write_sectors(start_sector, count, buf)
+    if remote::is_registered() {
+        // No caller-supplied grant when writing through the legacy API — pass
+        // `0` so the facade encodes "no separate grant payload" and embeds the
+        // write data inline in the bulk buffer instead.
+        return remote::write_sectors(start_sector, count, buf, 0);
     }
+    virtio_blk::write_sectors(start_sector, count, buf)
 }

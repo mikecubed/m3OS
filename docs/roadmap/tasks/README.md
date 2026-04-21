@@ -154,6 +154,7 @@ flowchart TD
     P54a --> P55["Phase 55 Tasks"]
     P55 --> P55a["Phase 55a Tasks"]
     P55a --> P55b["Phase 55b Tasks"]
+    P55b --> P56["Phase 56 Tasks"]
 ```
 
 ## Task Documents
@@ -267,7 +268,7 @@ flowchart TD
 | 54a | Post-serverization kernel hygiene | Planned | `phase-54a` | [Tasks](./54a-post-serverization-kernel-hygiene-tasks.md) |
 | 55 | Hardware Substrate (PCIe MCFG, MSI/MSI-X, hardware-access layer, NVMe, Intel 82540EM e1000) | Complete | `phase-55` | [Tasks](./55-hardware-substrate-tasks.md) |
 | 55a | IOMMU Substrate (ACPI DMAR/IVRS, per-device VT-d/AMD-Vi domains, IOMMU-routed DMA) | Complete | `phase-55a` | [Tasks](./55a-iommu-substrate-tasks.md) |
-| 55b | Ring-3 Driver Host (capability-gated device-host syscalls, supervised userspace NVMe + e1000 drivers) | Planned | `phase-55b` | [Tasks](./55b-ring-3-driver-host-tasks.md) |
+| 55b | Ring-3 Driver Host (capability-gated device-host syscalls, supervised userspace NVMe + e1000 drivers) | Complete | `phase-55b` | [Tasks](./55b-ring-3-driver-host-tasks.md) |
 | 56 | Display and Input Architecture | Planned | `phase-56` | [Tasks](./56-display-and-input-architecture-tasks.md) |
 
 ### Future Task Docs
