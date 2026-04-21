@@ -541,9 +541,14 @@ fn server_loop(ext2: &Ext2State, ep_handle: u32) -> ! {
     loop {
         req_seq = req_seq.wrapping_add(1);
         let start_us = now_usec();
-        log_request_start(req_seq, &msg, &recv_buf);
         let (reply_label, reply_data0) = handle_request(ext2, &mut handles, &msg, &recv_buf);
         let elapsed_us = now_usec().saturating_sub(start_us);
+        // H9 follow-up: per-request start/done logging was investigative
+        // only and added ~24 syscalls per request via write_str chains.
+        // Under the security-floor regression (which spawns ion via
+        // /bin/su user), that overhead saturated init's status-write
+        // cadence and starved ion's first-config read for >30s. Log
+        // ONLY slow requests now.
         log_request_done(req_seq, &msg, reply_label, reply_data0, elapsed_us);
 
         // Store reply bulk data if any was prepared by handle_request.
@@ -585,61 +590,23 @@ fn request_name(label: u64) -> &'static str {
     }
 }
 
-fn request_path_len(msg: &syscall_lib::IpcMessage) -> Option<usize> {
-    match msg.label {
-        VFS_OPEN => Some(msg.data[1] as usize),
-        VFS_STAT_PATH | VFS_LIST_DIR | VFS_ACCESS_PATH | VFS_UMOUNT_POLICY => {
-            Some(msg.data[0] as usize)
-        }
-        _ => None,
-    }
-}
-
-fn log_request_start(seq: u64, msg: &syscall_lib::IpcMessage, recv_buf: &[u8]) {
-    syscall_lib::write_str(STDOUT_FILENO, "vfs_server: req#");
-    syscall_lib::write_u64(STDOUT_FILENO, seq);
-    syscall_lib::write_str(STDOUT_FILENO, " start ");
-    syscall_lib::write_str(STDOUT_FILENO, request_name(msg.label));
-    syscall_lib::write_str(STDOUT_FILENO, " label=");
-    syscall_lib::write_u64(STDOUT_FILENO, msg.label);
-    if let Some(path_len) = request_path_len(msg)
-        && path_len > 0
-        && path_len <= recv_buf.len()
-    {
-        syscall_lib::write_str(STDOUT_FILENO, " path=");
-        let _ = syscall_lib::write(STDOUT_FILENO, &recv_buf[..path_len]);
-    }
-    syscall_lib::write_str(STDOUT_FILENO, "\n");
-}
-
 fn log_request_done(
     seq: u64,
     msg: &syscall_lib::IpcMessage,
-    reply_label: u64,
-    reply_data0: u64,
+    _reply_label: u64,
+    _reply_data0: u64,
     elapsed_us: u64,
 ) {
-    syscall_lib::write_str(STDOUT_FILENO, "vfs_server: req#");
+    if elapsed_us < SLOW_REQUEST_USEC {
+        return;
+    }
+    syscall_lib::write_str(STDOUT_FILENO, "vfs_server: slow req#");
     syscall_lib::write_u64(STDOUT_FILENO, seq);
-    syscall_lib::write_str(STDOUT_FILENO, " done ");
+    syscall_lib::write_str(STDOUT_FILENO, " ");
     syscall_lib::write_str(STDOUT_FILENO, request_name(msg.label));
-    syscall_lib::write_str(STDOUT_FILENO, " reply_label=");
-    syscall_lib::write_u64(STDOUT_FILENO, reply_label);
-    syscall_lib::write_str(STDOUT_FILENO, " reply_data0=");
-    syscall_lib::write_u64(STDOUT_FILENO, reply_data0);
     syscall_lib::write_str(STDOUT_FILENO, " elapsed_us=");
     syscall_lib::write_u64(STDOUT_FILENO, elapsed_us);
     syscall_lib::write_str(STDOUT_FILENO, "\n");
-
-    if elapsed_us >= SLOW_REQUEST_USEC {
-        syscall_lib::write_str(STDOUT_FILENO, "vfs_server: slow req#");
-        syscall_lib::write_u64(STDOUT_FILENO, seq);
-        syscall_lib::write_str(STDOUT_FILENO, " ");
-        syscall_lib::write_str(STDOUT_FILENO, request_name(msg.label));
-        syscall_lib::write_str(STDOUT_FILENO, " elapsed_us=");
-        syscall_lib::write_u64(STDOUT_FILENO, elapsed_us);
-        syscall_lib::write_str(STDOUT_FILENO, "\n");
-    }
 }
 
 /// Dispatch a single request.  Returns `(reply_label, reply_data0)`.
